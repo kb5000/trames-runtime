@@ -30,10 +30,68 @@ pub(super) struct FileMeta {
     pub mode: u32,
     pub times: [Timestamp; 3],
 }
+/// Original offset/pending transaction, with a lock-free committed observation.
+/// Proc rendering can observe its own OFD while a read holds the transaction.
+/// A relaxed scalar snapshot needs no new guest ordering or mutation authority.
 #[derive(Default)]
 pub(super) struct FilePosition {
+    state: Mutex<PositionState>,
+    committed: AtomicU64,
+}
+#[derive(Default)]
+pub(super) struct PositionState {
     pub value: u64,
     pub pending: usize,
+}
+pub(super) struct PositionGuard<'a> {
+    state: std::sync::MutexGuard<'a, PositionState>,
+    committed: &'a AtomicU64,
+}
+impl std::ops::Deref for PositionGuard<'_> {
+    type Target = PositionState;
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+impl std::ops::DerefMut for PositionGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
+}
+impl Drop for PositionGuard<'_> {
+    fn drop(&mut self) {
+        // Publish before the original mutex unlock. Observers may see the old
+        // committed offset during an operation, never wait on their own read.
+        self.committed.store(self.state.value, Ordering::Relaxed);
+    }
+}
+impl FilePosition {
+    pub fn snapshot(&self) -> u64 {
+        self.committed.load(Ordering::Relaxed)
+    }
+    fn guard<'a>(&'a self, state: std::sync::MutexGuard<'a, PositionState>) -> PositionGuard<'a> {
+        PositionGuard {
+            state,
+            committed: &self.committed,
+        }
+    }
+    pub fn lock(&self) -> std::sync::LockResult<PositionGuard<'_>> {
+        self.state
+            .lock()
+            .map(|state| self.guard(state))
+            .map_err(|error| std::sync::PoisonError::new(self.guard(error.into_inner())))
+    }
+    pub fn try_lock(&self) -> std::sync::TryLockResult<PositionGuard<'_>> {
+        match self.state.try_lock() {
+            Ok(state) => Ok(self.guard(state)),
+            Err(std::sync::TryLockError::WouldBlock) => Err(std::sync::TryLockError::WouldBlock),
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                Err(std::sync::TryLockError::Poisoned(
+                    std::sync::PoisonError::new(self.guard(error.into_inner())),
+                ))
+            }
+        }
+    }
 }
 pub(super) struct ReadLease {
     data: Arc<PlainFile>,

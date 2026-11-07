@@ -21,7 +21,7 @@ pub(super) fn metadata(filesystem: &super::FsHandle, key: &[u8]) -> BTreeMap<Vec
 /// Host/private enumeration shares the same actual OFD cursor. The lock covers
 /// only encoding and its cursor commit, never namespace lookup or resource drop.
 pub(super) fn encode(
-    position: &std::sync::Mutex<super::file_data::FilePosition>,
+    position: &super::file_data::FilePosition,
     count: usize,
     entries: &[(Vec<u8>, u64, u8)],
 ) -> super::Result<Vec<u8>> {

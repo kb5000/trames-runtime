@@ -113,10 +113,34 @@ mod tests {
         }
         let (mut memory, cursor, view) = results.pop().unwrap();
         let mut other = cursor.share();
+        let before = memory
+            .parallel_cache
+            .as_ref()
+            .unwrap()
+            .source_backing_revision;
         let resumed = memory.parallel_view(&mut other).unwrap();
-        assert!(Arc::ptr_eq(&resumed.snapshot, &view.snapshot));
-        assert_eq!(other.metrics.cache_hits, 1);
-        assert_eq!(other.metrics.full_rebuilds, 0);
+        let after = memory
+            .parallel_cache
+            .as_ref()
+            .unwrap()
+            .source_backing_revision;
+        // Other tests can legitimately advance the process-wide backing
+        // revision while this mm is unchanged. Require the cache hit only
+        // when eligible; original physical/code identity must always survive.
+        if before == after {
+            assert!(Arc::ptr_eq(&resumed.snapshot, &view.snapshot));
+            assert_eq!(other.metrics.cache_hits, 1);
+            assert_eq!(other.metrics.full_rebuilds, 0);
+        }
+        assert!(Arc::ptr_eq(
+            &resumed.frame(0x40000, Access::Read).unwrap().bytes,
+            &canonical
+        ));
+        assert!(Arc::ptr_eq(
+            &resumed.snapshot.code_epoch,
+            &registry.code_epoch
+        ));
+        assert_eq!(resumed.read_u64(0x40000).unwrap(), 42);
         assert_eq!(
             registry.metrics.full_rebuilds, 0,
             "metrics stay caller-local"

@@ -254,7 +254,7 @@ struct SharedOpenDescription {
     owner: (u32, u32),
     kind: FdKind,
     flags: StatusFlags,
-    file_position: Arc<std::sync::Mutex<file_data::FilePosition>>,
+    file_position: Arc<file_data::FilePosition>,
     flock: std::sync::OnceLock<Arc<flock::Owner>>,
     ofd_records: std::sync::OnceLock<locks::OfdOwner>,
     node: Option<NodeRef>,
@@ -319,7 +319,7 @@ impl OpenDescription {
         if let Some(log) = &self.kernel_log {
             return log.position();
         }
-        self.file_position.lock().unwrap().value
+        self.file_position.snapshot()
     }
     fn data_node(&self) -> Option<NodeRef> {
         self.read_node.clone().or_else(|| self.node.clone())
@@ -2631,10 +2631,7 @@ impl Vfs {
                         FdKind::Node(p.key.clone())
                     },
                     flags: (flags & !O_CLOEXEC).into(),
-                    file_position: Arc::new(std::sync::Mutex::new(file_data::FilePosition {
-                        value: 0,
-                        pending: 0,
-                    })),
+                    file_position: Arc::default(),
                     flock: std::sync::OnceLock::new(),
                     ofd_records: Default::default(),
                     node: Some(node),

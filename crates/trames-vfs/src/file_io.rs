@@ -2,13 +2,12 @@
 //! Prepared file authority is weak; accepted operations retain the original OFD.
 use super::*;
 use file_data::{FilePosition, PlainFile};
-use std::sync::Mutex;
 
 /// One accepted operation. Prepared caches carry no inode, data or OFD lease.
 #[derive(Clone)]
 pub struct DirectFile {
     data: Arc<PlainFile>,
-    position: Arc<Mutex<FilePosition>>,
+    position: Arc<FilePosition>,
     locks: Arc<locks::Records>,
     prepared: PreparedFile,
     file: Option<SharedFd>,
@@ -21,7 +20,7 @@ pub struct DirectFile {
 pub struct PreparedFile(Arc<FileAuthority>, FileSizeLimit);
 struct FileAuthority {
     data: std::sync::Weak<PlainFile>,
-    position: std::sync::Weak<Mutex<FilePosition>>,
+    position: std::sync::Weak<FilePosition>,
     locks: std::sync::Weak<locks::Records>,
     origin: OfdIdentity,
     flock: std::sync::Weak<flock::Owner>,
@@ -334,7 +333,7 @@ impl FileEpoch {
     pub fn finish(self) {}
 }
 impl DirectFile {
-    fn try_position(&self) -> Option<std::sync::MutexGuard<'_, FilePosition>> {
+    fn try_position(&self) -> Option<file_data::PositionGuard<'_>> {
         match self.position.try_lock() {
             Ok(position) => Some(position),
             Err(std::sync::TryLockError::WouldBlock) => None,
@@ -552,6 +551,7 @@ impl DirectFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     fn memory_file(bytes: Vec<u8>) -> (Vfs, u32) {
         let mut vfs = Vfs::default();
         vfs.import_file(b"/data", bytes).unwrap();

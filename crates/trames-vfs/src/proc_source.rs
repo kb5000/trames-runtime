@@ -1193,6 +1193,109 @@ mod tests {
     }
 
     #[test]
+    fn original_proc_fdinfo_read_observes_its_own_position_without_relocking() {
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            struct Source(std::sync::Weak<ProcessView>);
+            struct Task(std::sync::Weak<ProcessView>);
+            impl ProcTask for Task {
+                fn identity(&self) -> u64 {
+                    self.0.upgrade().unwrap().identity()
+                }
+                fn pid(&self) -> u32 {
+                    1
+                }
+                fn observe(
+                    &self,
+                    demand: ProcRefresh,
+                    residency: Option<usize>,
+                ) -> Option<ProcessInfo> {
+                    self.0.upgrade()?.observe_with_residency(demand, residency)
+                }
+                fn memory_report(&self) -> Option<trames_memory::MemoryReport> {
+                    None
+                }
+            }
+            impl ProcSource for Source {
+                fn observe(&self, query: ProcQuery<'_>) -> RuntimeInfo {
+                    RuntimeInfo {
+                        processes: self
+                            .0
+                            .upgrade()
+                            .and_then(|view| view.observe(query.demand))
+                            .into_iter()
+                            .collect(),
+                        ..Default::default()
+                    }
+                }
+                fn task(&self, pid: u32) -> Option<Arc<dyn ProcTask>> {
+                    (pid == 1 && self.0.upgrade().is_some())
+                        .then(|| Arc::new(Task(self.0.clone())) as Arc<dyn ProcTask>)
+                }
+            }
+            let mut vfs = Vfs::default();
+            let info = ProcessInfo {
+                pid: 1,
+                tgid: 1,
+                ..Default::default()
+            };
+            vfs.set_runtime_info(
+                1,
+                RuntimeInfo {
+                    processes: vec![info.clone()],
+                    ..Default::default()
+                },
+            );
+            let view = Arc::new(ProcessView::default());
+            view.publish(&info, vfs.proc_resources());
+            vfs.set_proc_source(Arc::new(Source(Arc::downgrade(&view))));
+            vfs.import_file(b"/payload", b"abcdef".to_vec()).unwrap();
+            let file = vfs.open_at(AT_FDCWD, b"/payload", 0, 0).unwrap();
+            let path = format!("/proc/self/fdinfo/{file}");
+            let fd = vfs
+                .path_queries()
+                .open_at_resolve(AT_FDCWD, path.as_bytes(), 0, 0, 0, &DirectFiles::default())
+                .expect("original source proc open")
+                .unwrap();
+            let target = vfs
+                .shared_files()
+                .lookup(fd)
+                .unwrap()
+                .unwrap()
+                .file_target()
+                .unwrap();
+            for (source, offset) in [(false, 3), (true, 5)] {
+                vfs.seek(file, offset, 0).unwrap();
+                vfs.seek(fd, 0, 0).unwrap();
+                let command = FileCommand::Read {
+                    count: 4096,
+                    offset: None,
+                };
+                let result = if source {
+                    FileWork::from_vfs(&vfs, target.clone(), command).run()
+                } else {
+                    FileWork::run_owned(&mut vfs, target.clone(), command)
+                };
+                let FileOutcome::Complete(reply) = result else {
+                    panic!("proc metadata read deferred")
+                };
+                let FileValue::Bytes(bytes) = reply.result.unwrap() else {
+                    panic!("proc bytes")
+                };
+                assert!(String::from_utf8(bytes.clone())
+                    .unwrap()
+                    .contains(&format!("pos:\t{offset}\n")));
+                assert_eq!(vfs.seek(fd, 0, 1).unwrap(), bytes.len() as u64);
+            }
+            send.send(()).unwrap();
+        });
+        receive
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("original proc metadata must not deadlock its own position transaction");
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn namespace_descriptors_retain_original_nsfs_identity_and_mount_authority() {
         struct Source(Arc<ProcessView>);
         impl ProcSource for Source {

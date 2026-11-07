@@ -42,7 +42,7 @@ pub struct DiskRead {
     node: NodeRef,
     backing: Arc<storage::DiskBacking>,
     positioned: bool,
-    position: Arc<std::sync::Mutex<file_data::FilePosition>>,
+    position: Arc<file_data::FilePosition>,
     _lease: Option<file_data::ReadLease>,
     count: usize,
 }

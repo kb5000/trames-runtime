@@ -2204,3 +2204,35 @@ normally. All 384 process assertions pass on Mac and ARM64 Linux (two ignored),
 both runtime workflows and strict checks pass, and the corrected real 12-CPU
 Docker binary completes all eight start/health/exec/inspect/stop/remove cycles.
 The 1.5.4 release record contains exact final package/deployment evidence.
+
+
+### Stable-release gate: proc observation of its original file offset — 2026-11-07
+
+A native stack sample of a stuck one-CPU systemd boot identified a self-deadlock:
+FileWork held a proc file's original offset transaction while rendering fdinfo;
+that rendering enumerated the same Files table and tried to lock this offset
+again. Original OFD retention exposed the old observational lock dependency.
+
+Offset changes and pending disk-read counts retain their original object mutex
+and multi-field transaction. Each offset resource now publishes its committed
+scalar offset with a relaxed atomic store before unlock; metadata observes that
+scalar without taking the transaction. An in-progress operation can expose its
+previous committed value, without synthetic guest errors, stronger memory fences
+or a new global lock. The extra scalar lives in the same original offset resource;
+no guest bytes or original permissions change. Actual lseek/read/write operations
+still use the same exclusive offset transaction.
+
+The regression uses original weak PID resources and actual typed fdinfo reads
+through owned and source FileWork. It checks observed positions and complete
+cursor advancement while bounding a possible host self-deadlock. Real one/four-CPU
+systemd boot, services, D-Bus, journal, notify, stop/restart and backup/restore pass.
+A separate Mac management correction requires an actual connectable listener
+instead of an old socket pathname when reporting a restarted environment ready;
+it adds no work to guest execution. Systemd's getty can exit before its remaining
+units, so its integration test waits under the product's existing 90-second stop
+contract rather than assuming the terminal's exit implies PID 1 is already done.
+
+An unchanged concurrent Memory test also assumed its snapshot cache could not be
+invalidated by another test advancing the global backing revision. Its cache-hit
+assertion now requires an unchanged revision; physical alias, code-domain and byte
+visibility assertions remain unconditional. No Memory production algorithm changes.
