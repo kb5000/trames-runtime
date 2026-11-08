@@ -12,6 +12,8 @@ pub(super) mod layouts;
 mod maintenance;
 #[path = "process_lifecycle_mapping.rs"]
 pub(crate) mod mapping;
+#[path = "process_lifecycle_native.rs"]
+mod native;
 #[path = "process_lifecycle_retirement.rs"]
 mod retirement;
 type Groups<C> = BTreeMap<usize, Vec<(u32, tasks::Handle<C>)>>;
@@ -73,16 +75,20 @@ pub(crate) fn eligible<'a, C: Cpu>(
         if job.work.task.is_none() {
             return false;
         }
-        if job.checkpoint.is_some() {
+        if let Some(outcome) = &job.checkpoint {
             requested = true;
-            if !crate::worker_syscalls::custody_entry(&job.work.cpu)
-                || job.work.syscalls.as_ref().is_none_or(|s| s.owner_syscalls)
-                || job
-                    .seccomp_entry
-                    .as_ref()
-                    .is_some_and(|entry| !entry.allowed())
-            {
+            if job.work.syscalls.as_ref().is_none_or(|s| s.owner_syscalls) {
                 return false;
+            }
+            match outcome {
+                SliceOutcome::NativeCall { .. } => {}
+                SliceOutcome::Syscall { .. }
+                    if crate::worker_syscalls::custody_entry(&job.work.cpu)
+                        && job
+                            .seccomp_entry
+                            .as_ref()
+                            .is_none_or(|entry| entry.allowed()) => {}
+                _ => return false,
             }
         }
     }
@@ -241,7 +247,7 @@ impl<C: Cpu> Lifecycle<C> {
                 .jobs
                 .iter()
                 .filter(|j| j.checkpoint.is_some())
-                .all(|j| matches!(j.work.cpu.x(8) as u32, 220 | 221 | 281));
+                .all(|j| matches!(j.checkpoint_syscall(), Some(220 | 221 | 281)));
         for job in &mut checkpoint.jobs {
             drop(job.work.memory.take());
             job.work.cpu.clear_exclusive();
@@ -354,7 +360,7 @@ impl<C: Cpu> Lifecycle<C> {
         for job in checkpoint
             .jobs
             .iter()
-            .filter(|job| job.checkpoint.is_some() && matches!(job.work.cpu.x(8), 220 | 221 | 281))
+            .filter(|job| matches!(job.checkpoint_syscall(), Some(220 | 221 | 281)))
         {
             let task = job
                 .work
@@ -415,6 +421,7 @@ impl<C: Cpu> Lifecycle<C> {
         } as u64;
         let replaced = self.replace_images(epoch, checkpoint, groups, report)?;
         self.capture_created(epoch, checkpoint, replaced);
+        self.native_calls(epoch, checkpoint, report, slot);
         *pending_image = self.edit_mappings(epoch, checkpoint, registry, report, slot, engine);
         if let Some(wait) = pending_image {
             self.commit_layout_roots(checkpoint, &wait.signal, &mut wait.subscriptions)?;

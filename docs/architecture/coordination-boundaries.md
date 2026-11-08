@@ -1,12 +1,29 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 68, original guest
-terminal/session/job control, reviewed on 2026-11-09. The prior shared runtime
-baseline is `17e7d5b5394c0d079aec5b4dda1086d4eb01dfab`.
+This is the consolidated implementation audit through stage 69, original native
+mapping/entry checkpoints, reviewed on 2026-11-09. The prior shared runtime
+baseline is `b234928a70ee63ed4ec65618d68327d17996cdda`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-09
+
+Stage 69 removes admitted NativeCall mapping/entry checkpoints from joined
+fallback. An original-task HLT that defers before effects enters the existing
+source lifecycle executor with only its affected mm/backing closure quiesced.
+Vulkan host-allocation import, live/private native memory and cold entry
+revalidation use the original Memory and the same native/device implementations.
+Normal native bodies, permission checks, backing hooks and object synchronization
+are unchanged. There is no new service thread, copied owner request or global lock.
+
+Original task/mm contention parks on its existing readiness and releases the CPU
+slot. GPU context/compile/fence waits retain the original Pending operation after
+the scope releases its memory permits; accepted HLTs retire once. A reservation
+that has not entered a body is returned on contention, cancellation or fault.
+Unstable entries use the existing bounded pre-effects retry/fault rule. A checkpoint
+is classified by its actual SVC/HLT outcome, never a stale x8 from an earlier call.
+Tracing, absent original task capabilities and actual host/solo invocation remain
+explicit. The overall coordinator-removal goal is still active.
 
 Stage 68 closes the supported guest PTY/session/job-control execution category.
 PGID/SID are one original process resource; CLONE_THREAD shares it and controlling
@@ -116,7 +133,7 @@ is not a claim that all coordinator work is removed.
 | Individual/group/default-fatal exit, STOP/CONT, parent notification and vfork release | Original source task/group resources | Returned CPU/statistics and cold task cleanup use existing source workers; only the original live mm pauses when necessary. Outside-cohort/solo and tracing/capability-less embeddings retain their boundary |
 | fork/clone/vfork and execve/execveat | Existing workers handle pure and mixed mapping scopes, nonleader replacement and original old-mm retirement; existing disk pool prepares native images without a CPU slot | Affected actors still quiesce. Tracing/capability-less embeddings, solo and host invocation remain separate |
 | Structural VM edits, pins and mapped-file layout changes | Supported mapping/buffer-registration checkpoints publish on existing workers with original task/mm custody; additive anonymous mmap runs directly while peers continue | Proc/cold-mm checkpoints and supported mapped-file transactions now run on existing workers. Unsupported backing/lifetime/policy and capability-less embeddings retain explicit boundaries |
-| Native libc/GPU/video/audio normal bodies and waits | Source/shared-resource execution or resource waits; existing disk/device workers retain their role | Mapping import, unstable entry, live-private backing and actual native lifecycle/teardown checkpoints can still reach the owner. Local libc/DirectFile/HVF fallback alone is not an owner transition |
+| Native libc/GPU/video/audio bodies, waits and before-effects mapping/entry checkpoints | Calling/shared-resource execution; exceptional access uses original task/mm custody on an existing executor, then retains resource waits | Tracing, capability-less embeddings and actual platform/host lifecycle retain their boundary. Single-CPU/solo calls use their existing caller. Local libc/DirectFile/HVF fallback alone is not an owner transition |
 | Dynamic proc/sys views and proc pathname/FD consumers | Original PID/mm/Files/fs/namespace resources on the calling worker; owner/solo queries use the same provider | First cross-mm byte export and invalidation now activate on an existing worker using only original task/mm custody. Legacy embeddings without a provider and actual policy remain separate |
 | Mount topology administration | Calling worker and original namespace/fs_struct resources, with existing disk workers only for host-backed path work | Busy transactions park the caller on original readiness. Tracing and genuinely excluded path controls keep separate boundaries |
 | Task namespace membership and Files/fs detachment | Calling worker; supported unshare/setns and close_range update original per-task bindings and all future-call consumers; busy namespace transactions return the execution slot | Tracing and capability-less embeddings remain. Clone namespace creation retains creator-mm custody; unsupported user/time namespace semantics remain separate |
@@ -251,7 +268,7 @@ Tracing and security decisions with lifecycle effects retain joined boundaries. 
 | VM and pin topology | brk growth, munmap/mremap, non-additive mmap, mprotect, mincore/madvise and io_uring buffer pin/register variants requiring mm edits | Affected mm/backing checkpoint on the existing run queue. Existing workers commit and rebuild supported Views, including proc byte activation and cold-mm cleanup; unsupported backing and tracing/security effects retain explicit boundaries. Retained external byte borrowers park only the actual dependency. Pure policy errors complete before quiescence; accepted decisions travel with the original entry. Additive private-anonymous mmap publishes directly. | [VM ABI classification](../../crates/trames-session/src/worker_syscalls.rs), [domain queue](../../crates/trames-session/src/run_queue.rs), [VM commit](../../crates/trames-session/src/process_vm.rs), [View admission](../../crates/trames-memory/src/parallel.rs) |
 | Mapped-file layout | Truncate/growth/allocate that changes a live mapped backing layout | Original backing publication leases identify affected mms. Existing workers return their bytes, then the same disk pool runs the accepted mutation while holding its original exclusive ticket. New aliases wait on that backing; original mmap/OFD authority survives cancellation. No process-wide pause counters or actor scan remain. Byte transfer and sync alone do not imply this checkpoint. | [file checkpoint](../../crates/trames-session/src/process_file_io.rs), [original file job](../../crates/trames-vfs/src/file_work.rs), [resize](../../crates/trames-vfs/src/memfd.rs) |
 | io_uring explicit capability/resource escalation | Missing typed source provider, unavailable native event subscription after source retry, actual unsupported body/pinning | Original-Files registration/import and source CQ execution stay direct. Layout and signal completion side transports are deleted: accepted dependencies remain on the request, and legacy signals publish to the original task actor. Production mapped layout uses original FileLayouts. Only the two actual maintenance failure sites still set `owner_required`. | [actor](../../crates/trames-linux/src/direct/uring/actor.rs), [source maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [subscriptions](../../crates/trames-linux/src/direct/uring/wait.rs), [file results](../../crates/trames-linux/src/direct/uring/actor_file.rs) |
-| Native guest mapping and exceptional native memory entry | Vulkan shared host-allocation mapping import where `can_import_mapping` is false; unstable native entry code; live-private backing or a native access mode requiring a checkpoint | GPU/native typed checkpoint before body effects; current worker returns the pending HLT to the owner. Ordinary CPU/native bytes keep the common permission/backing model. The GPU context mutex and compiler/fence waits are normally resource waits. | [Vulkan import](../../crates/trames-vulkan/src/backend.rs) (`Invocation::Checkpoint`), [native memory](../../crates/trames-memory/src/parallel/native.rs), [entry registry](../../crates/trames-accel/src/native.rs), [GPU wait](../../crates/trames-session/src/gpu.rs) |
+| Native guest mapping and exceptional native memory entry | Original task/mm source checkpoint before body effects; Vulkan import, live-private backing and unstable entry use original Memory | No joined execution category remains for admitted original tasks. Actual tracing and capability-less/solo embeddings retain their own route. Affected bytes still quiesce; permission/backing errors and bounded entry retries use the existing common model. | [source native scope](../../crates/trames-session/src/process_lifecycle_native.rs), [Vulkan import](../../crates/trames-vulkan/src/backend.rs), [native memory](../../crates/trames-memory/src/parallel/native.rs), [entry registry](../../crates/trames-accel/src/native.rs), [GPU waits](../../crates/trames-session/src/gpu.rs) |
 | Scheduler/cohort membership | Initial guest admission and legacy nonmember wake; ordinary scheduling metadata and live affinity no longer require the owner | Initial/legacy orchestration retains its boundary. Existing members migrate/park/wake locally; children and exec replacements enter the live queue. Original CPU slots can start directly and lazily from that queue. Periodic checks alone do not tear down the cohort: `cohort_control` tests actual events and original dependencies. | [legacy wake](../../crates/trames-session/src/futex.rs), [queue](../../crates/trames-session/src/run_queue.rs), [owner metadata](../../crates/trames-session/src/process_scheduling.rs), [control checks](../../crates/trames-session/src/process_vm.rs) |
 | Host/legacy embedding lifecycle | Transfer/timezone command, pause/cancel, UI terminal launch/close, legacy terminal-ID-0 events, actual systemd supervision event; Mac admin/shutdown/deadline/memory-pressure request; host-authorized exec process creation and process-group signal | Host control requests a join for actual lifecycle work. Routine FFI status snapshots, retained exec pipe I/O and live PTY byte pumping can run without a join. Host exec reuses the same process kernel, ELF/script loader, shared resources and memory budgets; it creates no additional runtime owner or service thread. FileProvider writeback deliberately pauses the session when applying staged edits, as chosen by the owner. | [FFI adapter](https://github.com/kb5000/trames-ipad/blob/80304113124ba34a829c4f61f2cb65bc7dad0e39/crates/trames-ffi/src/session.rs), [iPad lifecycle](https://github.com/kb5000/trames-ipad/blob/80304113124ba34a829c4f61f2cb65bc7dad0e39/apps/ios/Trames/TerminalSession.swift), [Mac control](https://github.com/kb5000/trames-mac/blob/aed5daab61092b468bb89a1af5159cc935dd5ea5/crates/trames-mac/src/session.rs) |
 | Final teardown and faults | Actual session/backend teardown, non-notifying native stop and unhandled fault exits | Ordinary last/group/default-fatal exit is source work; CPUs and cold Rc projections return asynchronously, with actual same-mm byte custody where needed. These are not ordinary whole-cohort exit boundaries. Accepted guest faults use the original signal path; actual unhandled/backend failures and final host teardown retain their explicit boundary. A host backend error is not an automatic full-VM or software fallback. | [source completion](../../crates/trames-session/src/process_exit.rs), [fault/dispatch](../../crates/trames-session/src/workers.rs), [native lifecycle](execution-backends.md#live-native-device-authority--2026-11-03) |
@@ -2396,3 +2413,64 @@ limits remain. This closes one subsystem, not the overall coordinator goal.
 Validation and bounded native/baseline performance data are recorded in the
 product's `docs/validation/job-control-20261109.json`. Stable 1.5.4 and business
 environments remain unchanged; only Mac Dev is updated after validation.
+
+
+## 69. Original native mapping/entry checkpoint closure — 2026-11-09
+
+The worker's pre-effects native defer no longer stops the cohort. It reserves its
+HLT and publishes the original CPU/job to the existing affected-domain queue.
+The original task/mm admission, backing closure, byte return and mapping commit
+are reused, with no Kernel projection or resource thread. An unrelated mm stays
+runnable. The same original native registry, device ABI and GPU Pending code run
+against the root Memory; the resulting Views publish through normal lifecycle
+restoration. This covers Vulkan host-allocation import and native live/private
+memory gates, not just an added fast path for one Vulkan opcode.
+
+Task/mm contention and source retries remain resource-owned. GPU context waiting
+before acceptance refunds the HLT reservation; an accepted compile/fence keeps its
+Pending record and retirement. Context waits release the scope before parking.
+Cancellation preserves an unissued HLT and its original operands. Faults re-enter
+the existing source signal path, and an unstable entry gets the same bounded
+pre-effects retry as solo execution. Scoped native bodies participate in original
+execution leases for requested memory barriers. No ordinary access fence, new
+policy, global native lock, polling bus or coordinator thread is introduced.
+
+Native checkpoints can contain a stale syscall number in x8. All lifecycle/exec,
+policy and mapping classification now checks the actual SVC outcome before using
+that register; HLTs cannot accidentally become clone/exec/mmap requests. Tests cover
+stale numbers, private COW, persistent entry instability, all three device entry
+profiles, context contention, exact retirement, original task/mm contention and
+cancellation while another mm owns the only CPU slot. Device entry tests explicitly
+submit a pre-effects HLT checkpoint: a stable worker View can legitimately retain
+its original instruction observation until the root-memory scope is entered.
+
+The actual static ELF runs read/private-COW, shared-file writeback and Vulkan
+host-allocation import with three concurrent query threads, on HVF and the iPad
+interpreter at 1/4/12 CPUs. HVF verifies exact imported-map counts and no native HLT
+cohort returns. The interpreter read path records actual native checkpoint retries
+while staying in its execution cohort. Native Linux runs the identical ELF with
+its absent Trames auxv selecting ordinary libc for the file workflows.
+
+Five counterbalanced pairs time the full GPU allocation/map/write/check/unmap/
+teardown workflow, with 32 shared imports and the same peers:
+
+| HVF CPUs | Before | After | Native HLT cohort returns |
+| --- | ---: | ---: | --- |
+| 1 | 9.379 ms | 9.118 ms | 0 → 0; solo caller unchanged |
+| 4 | 12.182 ms | 10.426 ms | 32 → 0 |
+| 12 | 12.188 ms | 10.400 ms | 32 → 0 |
+
+File mapping controls (1,000 rounds) stay within -1.2% to +0.5%. They use ordinary
+libc/hardware on HVF; the pure-HLT memory path is exercised separately by the
+interpreter. Native macOS file medians are 7.470/15.744 ms (read/write); native
+ARM64 Linux is 4.388/100.055 ms. Guest file backing is ephemeral VFS, while host
+filesystems and MS_SYNC durability differ; those are controls, not equivalent
+storage-throughput claims. Darwin adapts only absent auxv, dormant HLT wrappers
+and the unmeasured one-shot startup barrier. GPU native-driver initialization and
+teardown remain inside the measurement. No Firefox/general speedup is inferred.
+
+The source-bound [validation record](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/native-checkpoint-20261109.json)
+contains exact hashes, sample order, reused unchanged gates and final delta tests.
+Mac Dev alone is updated. Stable 1.5.4, business environments and physical iPad
+installations remain unchanged. Actual host/UI lifecycle, tracing, capability-less
+embeddings and other recorded last-resort dispatch dependencies remain.

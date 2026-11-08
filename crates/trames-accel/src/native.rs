@@ -17,7 +17,7 @@ pub const VULKAN_PROFILE: u64 = 0x0001_0006;
 pub const AUDIO_PROFILE: u64 = 0x0001_0008;
 pub const VIDEO_PROFILE: u64 = 0x0001_0007;
 pub const MAX_BYTES: usize = 64 * 1024;
-/// Bulk operations remain bounded inside a joined NativeCall checkpoint.
+/// Bulk operations remain bounded inside a NativeCall execution/checkpoint.
 /// Larger operations fall back before any effects; no partial replay.
 pub const MAX_BULK_BYTES: usize = 1024 * 1024;
 pub const MAX_STRING_BYTES: usize = 1024 * 1024;

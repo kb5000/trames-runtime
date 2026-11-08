@@ -47,7 +47,8 @@ pub trait CpuMemory {
         None
     }
 
-    /// Structural replacement requires the same joined mapping boundary as mmap.
+    /// Structural replacement requires the original mapping authority, as mmap
+    /// does. A worker View defers to its affected-mm checkpoint before effects.
     fn can_import_mapping(&self) -> bool {
         false
     }

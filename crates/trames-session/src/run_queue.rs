@@ -447,6 +447,10 @@ pub(super) struct Job<C: Cpu> {
     pub seccomp_entry: Option<crate::process::seccomp::EntryDecision>,
 }
 impl<C: Cpu> Job<C> {
+    pub fn checkpoint_syscall(&self) -> Option<u32> {
+        matches!(self.checkpoint, Some(SliceOutcome::Syscall { .. }))
+            .then(|| self.work.cpu.x(8) as u32)
+    }
     pub fn new(
         work: Work<C>,
         affinity: u64,
@@ -1145,7 +1149,7 @@ impl<C: Cpu> Epoch<C> {
         q.running -= 1;
         q.domains.returned(job.work.pid);
         job.checkpoint = Some(outcome);
-        if matches!(job.work.cpu.x(8) as u32, 220 | 221 | 281) {
+        if matches!(job.checkpoint_syscall(), Some(220 | 221 | 281)) {
             q.domains.pause_bytes(id);
         } else {
             q.domains.pause(BTreeSet::from([id]));

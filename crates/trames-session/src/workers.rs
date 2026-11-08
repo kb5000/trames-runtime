@@ -37,6 +37,9 @@ impl Control {
     pub fn stopped(&self) -> bool {
         self.stop.load(Ordering::Acquire)
     }
+    pub fn refund(&self, instructions: u64) {
+        self.remaining.fetch_add(instructions, Ordering::Relaxed);
+    }
     fn claim(&self) -> Option<u64> {
         if self.stop.load(Ordering::Acquire) {
             return None;
@@ -164,7 +167,7 @@ pub(super) enum Event<C: Cpu> {
     Retired,
     Idle,
 }
-fn native_fault(
+pub(super) fn native_fault(
     error: trames_accel::native::Error,
     pc: u64,
     module: u64,
@@ -187,6 +190,11 @@ fn native_fault(
         }
     };
     SliceOutcome::Fault(fault)
+}
+fn source_native<C: Cpu>(work: &Work<C>, epoch: Option<&crate::run_queue::Epoch<C>>) -> bool {
+    epoch.is_some_and(|epoch| epoch.local_vm)
+        && work.task.is_some()
+        && work.syscalls.as_ref().is_some_and(|s| !s.owner_syscalls)
 }
 /// Native scopes begin after stub validation; even unwinding releases the count.
 struct NativeScope<'a>(Option<&'a AtomicUsize>);
@@ -734,6 +742,7 @@ impl<C: Cpu> Starter<C> {
                                     crate::gpu::Attempt::Checkpoint => {
                                         assert!(!accepted, "cannot replay an accepted GPU compile");
                                         credit -= 1;
+                                        vm_checkpoint = source_native(work, Some(epoch));
                                         break SliceOutcome::NativeCall { instructions: 0, pc: call.pc, module: trames_vulkan::PROFILE, function: 1 };
                                     }
                                 }
@@ -1564,7 +1573,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                                                     if pending.compile.is_some() { instructions += 1; credit -= 1; }
                                                     parked_gpu = Some(pending); break SliceOutcome::Yield { instructions: 0 };
                                                 }
-                                                crate::gpu::Attempt::Checkpoint => { credit -= 1; break result; }
+                                                crate::gpu::Attempt::Checkpoint => { credit -= 1; vm_checkpoint = source_native(work, Some(epoch)); break result; }
                                             }
                                         } else {
                                             let (value, transfers) = authority.context.invoke(work.memory.as_deref_mut().expect("worker view"), args[0], args[1], args[2], None);
@@ -1602,9 +1611,11 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                                         continue;
                                     }
                                     Err(trames_accel::native::Error::Checkpoint) => {
-                                        // The pending HLT is reserved for the
-                                        // coordinator, and has no body effects.
+                                        // Reserve the pending HLT before effects.
+                                        // Original task/mm custody runs the cold
+                                        // body on an existing source executor.
                                         credit -= 1;
+                                        vm_checkpoint = source_native(work, epoch.as_deref());
                                         break result;
                                     }
                                     Err(error) => {
@@ -1705,7 +1716,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                     // only its Box pointer enters the shared queues.
                     if let Some(epoch) = &epoch {
                         if vm_checkpoint {
-                            epoch.checkpoint(job, outcome.expect("VM syscall outcome"));
+                            epoch.checkpoint(job, outcome.expect("scoped CPU outcome"));
                             continue;
                         }
                         if maintenance { epoch.park_maintenance(job); continue; }

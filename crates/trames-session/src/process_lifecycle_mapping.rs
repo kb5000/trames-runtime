@@ -71,7 +71,9 @@ impl<C: Cpu> Lifecycle<C> {
         let batch = !C::EXACT_INSTRUCTIONS && epoch.checkpoint_owns_all_jobs(checkpoint);
         let deadline = Instant::now() + Duration::from_micros(250);
         for job in &mut checkpoint.jobs {
-            if job.checkpoint.is_none() || !crate::worker_syscalls::vm_entry(&job.work.cpu) {
+            if job.checkpoint_syscall().is_none()
+                || !crate::worker_syscalls::vm_entry(&job.work.cpu)
+            {
                 continue;
             }
             let original = job

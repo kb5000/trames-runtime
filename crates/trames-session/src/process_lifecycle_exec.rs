@@ -16,7 +16,7 @@ impl<C: Cpu> Lifecycle<C> {
         for job in checkpoint
             .jobs
             .iter()
-            .filter(|job| job.checkpoint.is_some() && matches!(job.work.cpu.x(8) as u32, 221 | 281))
+            .filter(|job| matches!(job.checkpoint_syscall(), Some(221 | 281)))
         {
             let original = job.work.task.as_ref().expect("original exec task");
             let p = &mut *original.write();
@@ -67,7 +67,7 @@ impl<C: Cpu> Lifecycle<C> {
         for job in checkpoint
             .jobs
             .iter()
-            .filter(|job| job.checkpoint.is_some() && matches!(job.work.cpu.x(8) as u32, 221 | 281))
+            .filter(|job| matches!(job.checkpoint_syscall(), Some(221 | 281)))
         {
             let group = job
                 .work
@@ -106,9 +106,11 @@ impl<C: Cpu> Lifecycle<C> {
         report: &mut Report,
     ) -> Result<Vec<(u32, usize)>, RuntimeError> {
         let mut replaced = Vec::new();
-        while let Some(index) = checkpoint.jobs.iter().position(|job| {
-            job.checkpoint.is_some() && matches!(job.work.cpu.x(8) as u32, 221 | 281)
-        }) {
+        while let Some(index) = checkpoint
+            .jobs
+            .iter()
+            .position(|job| matches!(job.checkpoint_syscall(), Some(221 | 281)))
+        {
             let mut job = checkpoint.jobs.remove(index);
             let pid = job.work.pid;
             let task = job.work.task.as_ref().expect("original exec task").clone();
