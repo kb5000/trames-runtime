@@ -409,16 +409,19 @@ impl<C: Cpu> Kernel<C> {
             if p.frozen(pid) {
                 return false;
             }
+            // Read queue membership before the original exit flag. A source
+            // CPU publishes exit before removing its queue member; the queue
+            // mutex orders this later liveness read. Checking live first could
+            // misclassify the cold Ready projection while its cleanup waits.
+            let controlled =
+                members.contains(&pid) || epoch.is_some_and(|epoch| epoch.controls(pid));
             if epoch.is_some_and(|epoch| epoch.source_lifecycle())
                 && p.signals.io.tgid() != 0
                 && !p.signals.io.live()
             {
-                // Source exit has already retired this actor. Its original
-                // task/mm cleanup may still await custody; the cold Ready
-                // projection is never a newly runnable owner-side process.
                 return false;
             }
-            if members.contains(&pid) || epoch.is_some_and(|epoch| epoch.controls(pid)) {
+            if controlled {
                 // An excluded original resource still needs its actual owner;
                 // a stopped task cannot acknowledge before that work finishes.
                 return p.stopped() && p.stop_held() && !p.control_candidate(pid);

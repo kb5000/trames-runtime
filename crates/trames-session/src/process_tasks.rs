@@ -299,6 +299,18 @@ impl<C: Cpu> Directory<C> {
             .map(|id| (*id, members.tasks[id].clone()))
             .collect()
     }
+    // Cold projections are lookup hints, not accepted source capabilities.
+    // Resolve the original body first, then validate its current PID while
+    // custody prevents rekey/consumption. Never hold the directory while
+    // waiting for a body. Retained source Handles keep their own semantics.
+    fn read_entry(&self, id: u32, task: &Handle<C>) -> Option<Read<C>> {
+        let body = task.try_read_body()?;
+        self.contains_original(id, task).then_some(body)
+    }
+    fn write_entry(&self, id: u32, task: &Handle<C>) -> Option<Write<C>> {
+        let body = task.write();
+        (body.value.is_some() && self.contains_original(id, task)).then_some(body)
+    }
     pub fn contains_original(&self, id: u32, task: &Handle<C>) -> bool {
         self.0
             .lock()
@@ -327,6 +339,7 @@ impl<C: Cpu> Directory<C> {
         memory.wake_requested_reads();
         old
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn remove(&self, id: &u32) -> Option<Handle<C>> {
         let (old, snapshot) = {
             let mut members = self.0.lock();
@@ -335,16 +348,17 @@ impl<C: Cpu> Directory<C> {
         drop(snapshot);
         old
     }
-    fn remove_original(&self, id: u32, task: &Cell<C>) {
+    fn remove_original(&self, id: u32, task: &Cell<C>) -> bool {
         let (old, snapshot) = {
             let mut members = self.0.lock();
             if !members.tasks.get(&id).is_some_and(|old| old.0.same(task)) {
-                return;
+                return false;
             }
             (members.remove(id), members.snapshot.take())
         };
         drop(snapshot);
         drop(old);
+        true
     }
     pub fn retire(&self, id: u32, task: &Handle<C>) {
         self.remove_original(id, &task.0);
@@ -414,10 +428,10 @@ impl<C: Cpu> Table<C> {
         self.directory.clone()
     }
     pub fn get(&self, id: &u32) -> Option<Read<C>> {
-        self.handle(id).map(|task| task.read())
+        self.directory.read_entry(*id, &self.handle(id)?)
     }
     pub fn get_mut(&self, id: &u32) -> Option<Write<C>> {
-        self.handle(id).map(|task| task.write())
+        self.directory.write_entry(*id, &self.handle(id)?)
     }
     pub fn read(&self, id: &u32) -> Read<C> {
         self.get(id).expect("original task identity")
@@ -434,7 +448,7 @@ impl<C: Cpu> Table<C> {
     }
     pub fn checkout(&self, id: &u32) -> Option<Checkout<C>> {
         let task = self.handle(id)?;
-        let value = task.write();
+        let value = self.directory.write_entry(*id, &task)?;
         assert!(self.excluded.borrow_mut().insert(*id));
         Some(Checkout {
             value: Some(value),
@@ -444,7 +458,11 @@ impl<C: Cpu> Table<C> {
         })
     }
     pub fn remove(&mut self, id: &u32) -> Option<Write<C>> {
-        self.directory.remove(id).map(|task| task.write())
+        let task = self.directory.handle(id)?;
+        let value = self.directory.write_entry(*id, &task)?;
+        self.directory
+            .remove_original(*id, &task.0)
+            .then_some(value)
     }
     pub fn contains_key(&self, id: &u32) -> bool {
         self.handle(id).is_some()
@@ -471,22 +489,27 @@ impl<C: Cpu> Table<C> {
         })
     }
     pub fn values(&self) -> impl Iterator<Item = Read<C>> {
-        self.entries().map(|(_, task)| task.read())
+        self.iter().map(|(_, body)| body)
     }
     pub fn values_mut(&self) -> impl Iterator<Item = Write<C>> {
-        self.entries().map(|(_, task)| task.write())
+        self.iter_mut().map(|(_, body)| body)
     }
     pub fn iter(&self) -> impl Iterator<Item = (u32, Read<C>)> {
-        self.entries().map(|(id, task)| (id, task.read()))
+        let directory = self.directory.clone();
+        self.entries()
+            .filter_map(move |(id, task)| directory.read_entry(id, &task).map(|body| (id, body)))
     }
     pub fn iter_mut(&self) -> impl Iterator<Item = (u32, Write<C>)> {
-        self.entries().map(|(id, task)| (id, task.write()))
+        let directory = self.directory.clone();
+        self.entries()
+            .filter_map(move |(id, task)| directory.write_entry(id, &task).map(|body| (id, body)))
     }
     pub fn retain(&mut self, mut retain: impl FnMut(&u32, &Process<C>) -> bool) {
         for (id, task) in self.entries() {
-            let keep = retain(&id, &task.read());
-            if !keep {
-                self.directory.remove_original(id, &task.0);
+            if let Some(body) = self.directory.read_entry(id, &task) {
+                if !retain(&id, &body) {
+                    self.directory.remove_original(id, &task.0);
+                }
             }
         }
     }
@@ -560,6 +583,101 @@ mod tests {
     type Table = super::Table<Cpu>;
     fn task() -> Box<Process<Cpu>> {
         super::super::tests::process()
+    }
+
+    #[test]
+    fn cold_snapshot_iteration_never_pairs_a_rekeyed_body_with_its_retired_pid() {
+        for mutable in [false, true] {
+            let mut table = Table::default();
+            table.insert(2, task());
+            let original = table.handle(&2).unwrap();
+            let directory = table.directory();
+            if mutable {
+                let mut snapshot = table.iter_mut();
+                directory.restore(2, 3, &original.write());
+                assert!(
+                    snapshot.next().is_none(),
+                    "old PID exposed a rekeyed mutable body"
+                );
+            } else {
+                let mut snapshot = table.iter();
+                directory.restore(2, 3, &original.write());
+                assert!(snapshot.next().is_none(), "old PID exposed a rekeyed body");
+            }
+            assert_eq!(table.iter().map(|(id, _)| id).collect::<Vec<_>>(), [3]);
+        }
+    }
+    #[test]
+    fn cold_value_snapshots_skip_removed_replaced_and_consumed_originals() {
+        for mode in 0..3 {
+            let mut table = Table::default();
+            table.insert(2, task());
+            let original = table.handle(&2).unwrap();
+            let directory = table.directory();
+            let mut reads = table.values();
+            let mut writes = table.values_mut();
+            directory.retire(2, &original);
+            if mode == 1 {
+                directory.publish(2, task().into());
+            }
+            if mode == 2 {
+                drop(original.write().into_inner());
+            }
+            assert!(
+                reads.next().is_none(),
+                "retired original remained a current value"
+            );
+            assert!(writes.next().is_none(), "retired original remained mutable");
+        }
+    }
+    #[test]
+    fn cold_lookup_revalidates_after_waiting_for_original_body_custody() {
+        for mutable in [false, true] {
+            let mut table = Table::default();
+            table.insert(2, task());
+            let original = table.handle(&2).unwrap();
+            let directory = table.directory();
+            let held = original.write();
+            let remote = directory.clone();
+            let selected = original.clone();
+            let (send, receive) = std::sync::mpsc::channel();
+            let observer = std::thread::spawn(move || {
+                let absent = if mutable {
+                    remote.write_entry(2, &selected).is_none()
+                } else {
+                    remote.read_entry(2, &selected).is_none()
+                };
+                send.send(absent).unwrap();
+            });
+            // The observer may wait on a body, never on the directory lock.
+            directory.restore(2, 3, &held);
+            drop(held);
+            assert!(receive.recv_timeout(Duration::from_secs(2)).unwrap());
+            observer.join().unwrap();
+            assert!(directory.read_entry(3, &original).is_some());
+            assert_eq!(original.read().memory.coordinator_ownership().1, 1);
+        }
+    }
+    #[test]
+    fn cold_retain_does_not_visit_or_delete_a_replacement_from_its_old_snapshot() {
+        let mut table = Table::default();
+        table.insert(1, task());
+        table.insert(2, task());
+        let old = table.handle(&2).unwrap();
+        let directory = table.directory();
+        let mut visited = Vec::new();
+        table.retain(|id, _| {
+            visited.push(*id);
+            if *id == 1 {
+                directory.retire(2, &old);
+                directory.publish(2, task().into());
+                drop(old.write().into_inner());
+            }
+            *id == 1
+        });
+        assert_eq!(visited, [1]);
+        assert!(table.contains_key(&2));
+        assert_eq!(table.iter().count(), 2);
     }
 
     #[test]

@@ -1,12 +1,27 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 70, original host process/terminal
-lifecycle, reviewed on 2026-11-09. The prior shared runtime
-baseline is `44e8866b912785f5c638fe3ef868a95f7200b2a7`.
+This is the consolidated implementation audit through stage 71, original process observation/ownership, reviewed on 2026-11-09. The prior shared runtime
+baseline is `c8a59a634b8544e6d690d847fb252966c58b5850`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-09
+
+Stage 71 closes the cold process observation/ownership dependency across
+lookup, mutable lookup, checkout, iteration, value enumeration, retention and
+removal. Original membership is validated after body custody, so an old PID
+snapshot cannot expose a rekeyed, replaced or consumed body as current. The
+original directory is never held while waiting for body custody. Already accepted
+source Handles retain their identity/lifetime and ordinary source syscalls gain
+no extra lookup, check or fence.
+
+Owner admission now reads queue membership before original liveness. A source
+CPU publishes exit before withdrawing its queue member; that existing queue
+mutex orders the later exit read. The previous order could observe live=true,
+then no queue member, and stop the cohort for a cold Ready projection awaiting
+cleanup. This requires no new synchronization primitive or ordinary memory fence.
+Actual host administration and generic excluded/traced/legacy dispatch remain;
+the overall coordinator-removal goal is still active.
 
 Stage 70 removes host process admission/group control and native terminal
 open/close/input/resize/hangup from joined execution. Accepted launches live on
@@ -159,6 +174,7 @@ is not a claim that all coordinator work is removed.
 | Entropy and random devices | getrandom, original random/urandom OFDs and UUID resources run on the caller; unsupported random-device controls return locally on the accepted OFD | Explicit tracing and absent descriptor capabilities retain their own route. Supported getrandom flags remain 0..3 and the existing transfer bound/fault behavior is retained; guest entropy credit/reseed controls remain unsupported |
 | BPF and cgroup device policy | Supported program load/identity/reopen and attachment controls use original registry/Files/hierarchy resources on the caller; cgroup target directories and control files resolve/open on workers | Existing unsupported BPF commands/types remain explicit errors; tracing and capability-less embeddings keep their boundaries. Device opens/mknod/PTY peer and proc reopening consume the same live rules |
 | Seccomp and tracing | Supported seccomp/prctl installation, TSYNC and entry results use original source task/group resources; busy installation releases the slot; proc and future entries observe live policy | Explicit tracing remains joined. Capability-less embeddings retain signal/exit handling; unsupported listener/logging/notification features remain unsupported. An allowed syscall may still encounter its own excluded resource or generic fallback |
+| Cold process observation and source ownership | Original body custody and current original PID identity; queue publication orders the exit observation | Cold snapshots are lookup hints, not accepted source capabilities. Source Handles and genuinely excluded actors retain their original routes |
 | Host process and native terminal lifecycle | Original process/group/PTY resources and existing execution/disk workers | Accepted launches survive cohort replacement; loading and custody waits release the CPU slot. Legacy terminal ID 0, one-time adapter setup and genuine missing/excluded providers remain explicit |
 | Actual host/embedding administration | Joined owner handling of the accepted event | Legacy terminal-ID-0 events and unpumpable console I/O, pause/cancel, timezone/transfer, supervision/admin/deadline/pressure and actual shutdown. FileProvider staged writeback deliberately pauses as previously chosen |
 | Last-resort SVC/HLT/fault dispatch | Truly unimplemented numbers complete locally using generated conservative recognition and the original diagnostic log | Known handlers whose actual resource/subcommand is excluded, legacy embeddings, tracing and unhandled HLT/fault exits still retain joined fallback. An implemented number returning an errno is not classified as globally unimplemented |
@@ -2530,3 +2546,34 @@ Only Mac Dev is deployed. Stable 1.5.4, existing business environments and physi
 iPad installs remain unchanged. Solo execution, legacy terminal ID 0, actual host
 administration, tracing/excluded providers and generic joined dispatch remain;
 the overall coordinator-removal goal stays active.
+
+## 71. Original process observation/ownership closure — 2026-11-09
+
+A real native-terminal/host-exec stress flow exposed a source-retirement race:
+the owner observed a task as live, the CPU retired it and removed its queue member,
+then the owner mistook its cold Ready body for a foreign runnable process. The
+existing queue mutex now orders membership before the exit read. Initial static
+members already remain source-owned; actual excluded/legacy actors are not hidden.
+
+The same observer audit found stale PID snapshots exposing rekeyed, removed,
+replaced or consumed task bodies. All cold Table body consumers now use original
+custody plus current identity validation; enumeration skips stale originals,
+checkout/point lookup revalidate after waiting, and removal can delete only that
+original member. Retention cannot inspect or delete a replacement from its old
+snapshot. Directory locks never cover body waits. Accepted source Handles keep
+their original authority; this does not add checks/fences to ordinary guest memory,
+CPU/native entry or source syscall bodies, nor any coordinator/resource thread.
+
+Both stale-snapshot assertions fail on the baseline and pass after the change.
+Four new regression tests cover read/write observation, retirement, rekey,
+replacement, consumed bodies, blocked custody and retention. Both full local runtime
+workflows, 401 process tests on each host and both iPad compile targets pass.
+Eighty real HVF flows, 40 each at 4/12 CPUs, require exactly one final shutdown
+cohort instead of allowing the intermittent extra join. A three-pair single-CPU
+million-getpid control is approximately flat, 1340.7 to 1334.3 ms. Raw samples,
+cold-start outliers, native macOS/Linux references and limits are recorded in the
+[validation record](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/process-observation-20261109.json).
+Only Mac Dev is deployed; stable 1.5.4, existing business environments and physical
+iPad installations stay unchanged. Actual administration, legacy terminal ID 0,
+solo dispatch, excluded/traced providers and generic joined fallback remain;
+the overall goal is active.
