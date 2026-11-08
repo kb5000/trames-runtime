@@ -6,16 +6,17 @@ use trames_vfs::{FileCommand, FileOutcome, FileTarget, FileValue, FileWork};
 pub(super) struct FileIo {
     pub(super) result: Arc<crate::FileResult>,
     pub(super) wait_revision: u64,
-    waiting: Option<FileWork>,
+    dependency: Option<Box<FileDependency>>,
     parts: Vec<(u64, usize)>,
     buffer: Option<Arc<trames_memory::PinnedBuffer>>,
     address: u64,
 }
-pub struct UringFileLayout {
-    pub work: FileWork,
-    pub result: Arc<crate::FileResult>,
-    pub owner: u64,
-    pub task: u32,
+enum FileDependency {
+    Resource(FileWork),
+    Layout {
+        work: FileWork,
+        ticket: Option<trames_memory::layout::LayoutWrite>,
+    },
 }
 struct SelectionLease {
     ring: Weak<Uring>,
@@ -35,37 +36,58 @@ impl Drop for SelectionLease {
         }
     }
 }
-impl UringActor {
-    pub fn take_file_layouts(&self) -> Vec<UringFileLayout> {
-        std::mem::take(&mut *self.layouts.lock().unwrap())
-    }
-    pub fn restore_file_layout(&self, layout: UringFileLayout) {
-        self.layouts.lock().unwrap().push(layout);
-        self.require_owner();
-    }
-    pub(crate) fn has_file_layouts(&self) -> bool {
-        !self.layouts.lock().unwrap().is_empty()
-    }
-}
 impl FileIo {
     pub(super) fn subscribe(&self, signal: &Arc<IoSignal>) -> Vec<trames_vfs::IoSubscription> {
-        match &self.waiting {
-            Some(work) => {
+        match self.dependency.as_deref() {
+            Some(FileDependency::Resource(work)) => {
                 work.wait_sources(signal)
                     .expect("data reads subscribe to original memory resources")
                     .subscriptions
             }
+            Some(FileDependency::Layout { ticket, .. }) => vec![ticket
+                .as_ref()
+                .expect("accepted layout")
+                .layout()
+                .subscribe(signal)],
             None => vec![self.result.subscribe(signal)],
         }
     }
-    fn take_outcome(&mut self) -> Option<FileOutcome> {
-        if let Some(work) = &self.waiting {
-            if !work.ready() {
-                return None;
+    pub(super) fn pending_native(&self) -> bool {
+        self.dependency.is_none() && !self.result.ready()
+    }
+    fn take_outcome(&mut self, execution: &Execution) -> Option<FileOutcome> {
+        match self.dependency.as_deref_mut() {
+            Some(FileDependency::Resource(work)) => {
+                if !work.ready() {
+                    return None;
+                }
+                let FileDependency::Resource(work) = *self.dependency.take().unwrap() else {
+                    unreachable!();
+                };
+                Some(work.run())
             }
-            return Some(self.waiting.take().unwrap().run());
+            Some(FileDependency::Layout { ticket, .. }) => {
+                let exclusive = match ticket.take().expect("accepted layout").try_enter() {
+                    Ok(exclusive) => exclusive,
+                    Err(pending) => {
+                        *ticket = Some(pending);
+                        return None;
+                    }
+                };
+                self.wait_revision = self.wait_revision.wrapping_add(1);
+                let FileDependency::Layout { work, .. } = *self.dependency.take().unwrap() else {
+                    unreachable!();
+                };
+                let work = work.enter_layout(exclusive);
+                if let Some(executor) = execution.disk.as_ref().filter(|_| work.host_work()) {
+                    self.result.begin();
+                    executor.submit_file(work, self.result.clone());
+                    return self.result.take();
+                }
+                Some(work.run())
+            }
+            None => self.result.take(),
         }
-        self.result.take()
     }
     fn finish(
         &mut self,
@@ -77,7 +99,7 @@ impl FileIo {
     ) -> Result<(i32, bool)> {
         match outcome {
             FileOutcome::Waiting(work) => {
-                self.waiting = Some(work);
+                self.dependency = Some(Box::new(FileDependency::Resource(work)));
                 self.wait_revision = self.wait_revision.wrapping_add(1);
                 Err(Errno(11))
             }
@@ -90,13 +112,17 @@ impl FileIo {
                 let Err(work) = fallback else {
                     return Err(Errno(11));
                 };
-                actor.layouts.lock().unwrap().push(UringFileLayout {
+                // An embedding without a FileLayouts driver still owns its
+                // accepted mutation. Wait on the original backing publication;
+                // never transfer work to an unconsumed owner queue.
+                let ticket = work
+                    .begin_layout()
+                    .expect("io_uring layout retains its inode");
+                self.dependency = Some(Box::new(FileDependency::Layout {
                     work,
-                    result: self.result.clone(),
-                    owner: request.owner,
-                    task: request.task,
-                });
-                actor.require_owner();
+                    ticket: Some(ticket),
+                }));
+                self.wait_revision = self.wait_revision.wrapping_add(1);
                 Err(Errno(11))
             }
             FileOutcome::Complete(reply) => {
@@ -104,12 +130,7 @@ impl FileIo {
                     if let Some(task) = &execution.signal {
                         task.raise(25);
                     } else {
-                        actor
-                            .file_signals
-                            .lock()
-                            .unwrap()
-                            .push((request.owner, request.task));
-                        actor.require_owner();
+                        actor.file_size_signal.store(true, Ordering::Relaxed);
                     }
                 }
                 let n = match reply.result? {
@@ -209,7 +230,7 @@ pub(super) fn execute(
     ring: &Uring,
 ) -> Option<Result<(i32, bool)>> {
     if let Some(io) = &mut call.file {
-        return Some(match io.take_outcome() {
+        return Some(match io.take_outcome(execution) {
             Some(outcome) => io.finish(outcome, request, memory, actor, execution),
             None => Err(Errno(11)),
         });
@@ -222,7 +243,7 @@ pub(super) fn execute(
     let mut io = FileIo {
         result: Arc::default(),
         wait_revision: 0,
-        waiting: None,
+        dependency: None,
         parts,
         buffer: request.buffer.clone(),
         address: request.sqe.address(),
@@ -319,7 +340,7 @@ pub(super) fn open(
     policy: u64,
 ) -> Option<Result<(i32, bool)>> {
     if let Some(io) = &mut call.file {
-        return Some(match io.take_outcome() {
+        return Some(match io.take_outcome(execution) {
             Some(outcome) => io.finish(outcome, request, memory, actor, execution),
             None => Err(Errno(11)),
         });
@@ -342,7 +363,7 @@ pub(super) fn open(
     let mut io = FileIo {
         result: Arc::default(),
         wait_revision: 0,
-        waiting: None,
+        dependency: None,
         parts: Vec::new(),
         buffer: None,
         address: 0,

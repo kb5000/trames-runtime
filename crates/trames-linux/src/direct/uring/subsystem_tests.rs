@@ -119,7 +119,6 @@ fn mapped_layout_sqe_uses_source_resource_and_keeps_accepted_work_after_cancella
             IoAttempt::Complete(Ok(0))
         ));
         assert!(!d.urings.actor().owner_required());
-        assert!(d.urings.actor().take_file_layouts().is_empty());
         let request = driver.take_ready().pop().unwrap();
         let request = layouts.try_submit(request).err().unwrap();
         layouts.restore(request);
@@ -823,7 +822,7 @@ fn fixed_file_size_failure_keeps_original_submitter_signal_when_another_context_
     assert_eq!(cq(&mut m, &r), (77, -27));
     assert_eq!(a.0.load(std::sync::atomic::Ordering::Relaxed), 1);
     assert_eq!(b.0.load(std::sync::atomic::Ordering::Relaxed), 0);
-    assert!(d.urings.actor().take_file_signals().is_empty());
+    assert!(!l.take_file_size_signal());
     assert!(!d.urings.actor().owner_required());
     drop((d, pump, l));
     files.finish();
@@ -970,4 +969,146 @@ fn corrupt_cq_during_accepted_enter_returns_error_without_replay_or_owner_pump()
         assert_eq!(ring.load_queue(68), 1);
         assert!(ring.state.lock().unwrap().pending.is_empty());
     }
+}
+
+#[test]
+fn layout_completion_without_driver_waits_on_original_backing_and_cancels_cleanly() {
+    struct Queue(std::sync::mpsc::Sender<(trames_vfs::FileWork, Arc<crate::FileResult>)>);
+    impl FileExecutor for Queue {
+        fn submit_file(&self, work: trames_vfs::FileWork, result: Arc<crate::FileResult>) {
+            result.begin();
+            self.0.send((work.queued(), result)).unwrap();
+        }
+    }
+    for queued in [false, true] {
+        for cancellation in 0..=2 {
+            if !queued && cancellation == 2 {
+                continue;
+            }
+            let cancel = cancellation == 1;
+            let cancel_native = cancellation == 2;
+            let (mut l, mut m, ring_fd, ring) = setup(8);
+            l.vfs
+                .import_file(
+                    b"/layout-original",
+                    vec![7; trames_memory::PAGE_SIZE as usize],
+                )
+                .unwrap();
+            let fd = l.vfs.open_at(-100, b"/layout-original", 2, 0).unwrap();
+            m.map_backed(
+                0x30000,
+                l.vfs
+                    .mapping_pages(fd, 0, trames_memory::PAGE_SIZE, true, true)
+                    .unwrap(),
+                true,
+                Permissions::RW,
+                false,
+            )
+            .unwrap();
+            let mut epoch = UringEpoch::default();
+            let (send, receive) = std::sync::mpsc::channel();
+            let mut d = direct(&l, &m, &mut epoch, &Default::default());
+            if queued {
+                d = d.with_file_executor(Arc::new(Queue(send)));
+            }
+            let t = target();
+            let view = m.parallel_view(&mut Default::default()).unwrap();
+            let mut truncate = sqe(55, fd, 991);
+            truncate[8..16].copy_from_slice(&1u64.to_le_bytes());
+            add(&mut m, &ring, truncate);
+            assert!(matches!(
+                enter(&d, ring_fd, 1, 0, &mut m, &t),
+                IoAttempt::Complete(Ok(1))
+            ));
+            if queued {
+                let (work, result) = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+                result.complete(work.run());
+            }
+            let mut background = d.uring_background(7, &Arc::downgrade(&t)).unwrap();
+            assert!(background.progress(&mut m));
+            assert!(background.progress(&mut m));
+            assert!(
+                !background.external(),
+                "a backing publication is not a native disk completion"
+            );
+            assert!(!l.uring_requires_owner());
+            l.vfs.close(fd).unwrap();
+            assert_eq!(l.vfs.eventfd(9, 0).unwrap(), fd);
+            if cancel {
+                d.urings.actor().cancel_task(m.instruction_identity().0, 7);
+                assert_eq!(cq(&mut m, &ring), (991, -125));
+            }
+            drop(view);
+            m.commit_parallel().unwrap();
+            if !cancel {
+                assert!(
+                    background.signal.ready(),
+                    "original publication release must wake its request"
+                );
+                assert!(background.progress(&mut m));
+                if queued {
+                    let (work, result) = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+                    if cancel_native {
+                        d.urings.actor().cancel_task(m.instruction_identity().0, 7);
+                        assert_eq!(cq(&mut m, &ring), (991, -125));
+                        assert!(
+                            m.parallel_view(&mut Default::default()).is_none(),
+                            "accepted native work retains original publication exclusion"
+                        );
+                    }
+                    result.complete(work.run());
+                    assert!(background.progress(&mut m));
+                }
+                if !cancel_native {
+                    assert_eq!(cq(&mut m, &ring), (991, 0));
+                }
+                let publication = m
+                    .parallel_view(&mut Default::default())
+                    .expect("native completion releases its original ticket");
+                drop(publication);
+                m.commit_parallel().unwrap();
+            }
+            let original = l.vfs.open_at(-100, b"/layout-original", 0, 0).unwrap();
+            assert_eq!(
+                l.vfs.read(original, 2).unwrap(),
+                if cancel { vec![7, 7] } else { vec![7] }
+            );
+            assert_eq!(l.vfs.read(fd, 8).unwrap(), 9u64.to_le_bytes());
+            assert!(receive.try_recv().is_err(), "no replay or post-cancel job");
+            assert!(!l.uring_requires_owner());
+        }
+    }
+}
+
+#[test]
+fn file_size_completion_without_mailbox_uses_original_task_flag_not_an_owner_message() {
+    let (mut l, mut m, fd, ring) = setup(8);
+    l.vfs.import_file(b"/limit", Vec::new()).unwrap();
+    let file = l.vfs.open_at(-100, b"/limit", 2, 0).unwrap();
+    l.vfs.file_size_limit_handle().set(0);
+    m.write(0x2200, b"x").unwrap();
+    let mut epoch = UringEpoch::default();
+    let d = direct(&l, &m, &mut epoch, &Default::default());
+    let t = target();
+    for tag in [1, 2] {
+        add(&mut m, &ring, scalar(23, file, 0x2200, 1, tag));
+    }
+    assert!(matches!(
+        enter(&d, fd, 2, 2, &mut m, &t),
+        IoAttempt::Complete(Ok(2))
+    ));
+    assert_eq!(cq(&mut m, &ring), (1, -27));
+    assert_eq!(cq(&mut m, &ring), (2, -27));
+    let child = l.clone_with_files(true);
+    assert!(
+        !child.take_file_size_signal(),
+        "a new task must not inherit pending source signals"
+    );
+    assert!(l.take_file_size_signal());
+    assert!(
+        !l.take_file_size_signal(),
+        "standard signals coalesce and consume once"
+    );
+    assert!(!l.uring_requires_owner());
+    assert!(l.vfs.read(file, 1).unwrap().is_empty());
 }

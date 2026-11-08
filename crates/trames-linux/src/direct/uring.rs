@@ -11,7 +11,7 @@ use trames_vfs::{
 type Result<T> = std::result::Result<T, Errno>;
 pub(crate) mod actor;
 mod background;
-pub use actor::{UringActor, UringFileLayout};
+pub use actor::UringActor;
 pub use background::UringBackground;
 
 trait ResourceOps: Sized {

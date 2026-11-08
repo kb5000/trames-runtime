@@ -20,7 +20,7 @@ pub use direct::{
     epoll_parameters, epoll_scatter, Aio, DirectSyscalls, FileBoundary, FileCheckpoint,
     FileExecutor, FileOutput, FilePending, FileResult, IoAttempt, PendingIo, RetainedAio,
     RetainedByte, RetainedSocket, UringActor, UringBackground, UringEnter, UringEpoch,
-    UringFileLayout, UringSnapshot,
+    UringSnapshot,
 };
 mod file_calls;
 mod file_layouts;

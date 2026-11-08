@@ -2958,7 +2958,7 @@ impl<C: Cpu> Kernel<C> {
         if signal_pipe && !packet_unix && raw == Some(error(Errno(32))) || batch_pipe_signal {
             Self::queue_one(pid, p, 13, pid);
         }
-        if p.linux.vfs.take_file_size_signal() {
+        if p.linux.take_file_size_signal() {
             trames_vfs::TaskSignal::raise(&*p.signals.io, 25);
         }
         for target in p.linux.vfs.take_cgroup_kills() {

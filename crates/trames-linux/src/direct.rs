@@ -25,9 +25,7 @@ mod socket_wait;
 pub use file::{FileBoundary, FileCheckpoint, FileExecutor, FileOutput, FilePending, FileResult};
 pub(crate) mod uring;
 pub use socket_wait::RetainedSocket;
-pub use uring::{
-    UringActor, UringBackground, UringEnter, UringEpoch, UringFileLayout, UringSnapshot,
-};
+pub use uring::{UringActor, UringBackground, UringEnter, UringEpoch, UringSnapshot};
 
 fn tcp_wait_fd(tcp: &trames_net::DirectTcp) -> std::io::Result<trames_vfs::HostFd> {
     let (fd, lease) = tcp.readiness_fd()?;

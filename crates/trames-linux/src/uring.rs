@@ -27,6 +27,17 @@ fn put(bytes: &mut [u8], i: usize, v: u32) {
     bytes[i..i + 4].copy_from_slice(&v.to_le_bytes());
 }
 impl Linux {
+    /// Source io_uring completion and solo VFS operations publish to the
+    /// original task. A capability-less embedding consumes this level flag;
+    /// production callers retain their original TaskSignal mailbox directly.
+    pub fn take_file_size_signal(&self) -> bool {
+        let local = self.vfs.take_file_size_signal();
+        let asynchronous = self
+            .uring_actor
+            .get()
+            .is_some_and(|actor| actor.take_file_size_signal());
+        local | asynchronous
+    }
     pub fn worker_uring_event(&self, memory: &Memory, task: u32) -> bool {
         self.uring_actor.get().is_some_and(|actor| {
             actor.active()

@@ -4,7 +4,6 @@
 use super::*;
 #[path = "actor_file.rs"]
 mod file;
-pub use file::UringFileLayout;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Mutex,
@@ -31,8 +30,7 @@ pub struct UringActor {
     owner_required: AtomicBool,
     revision: AtomicU64,
     accepted: Mutex<BTreeMap<Key, Accepted>>,
-    layouts: Mutex<Vec<file::UringFileLayout>>,
-    file_signals: Mutex<Vec<(u64, u32)>>,
+    file_size_signal: AtomicBool,
 }
 impl trames_vfs::UringSource for UringActor {}
 struct Lease {
@@ -225,8 +223,9 @@ impl UringActor {
             ring.notify_completion(event);
         }
     }
-    pub fn take_file_signals(&self) -> Vec<(u64, u32)> {
-        std::mem::take(&mut *self.file_signals.lock().unwrap())
+    pub(crate) fn take_file_size_signal(&self) -> bool {
+        self.file_size_signal.load(Ordering::Relaxed)
+            && self.file_size_signal.swap(false, Ordering::Relaxed)
     }
     pub(crate) fn require_owner(&self) {
         self.owner_required.store(true, Ordering::Relaxed);
@@ -245,7 +244,7 @@ impl UringActor {
             .lock()
             .unwrap()
             .values()
-            .any(|call| call.file.as_ref().is_some_and(|file| !file.result.ready()))
+            .any(|call| call.file.as_ref().is_some_and(file::FileIo::pending_native))
     }
 
     pub(crate) fn event_wait(&self, owner: u64, task: u32) -> bool {

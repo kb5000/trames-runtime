@@ -1,29 +1,36 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 66, original io_uring
-Files and source-context closure, reviewed on 2026-11-09. The prior shared runtime
-baseline is `eb047dc35351f8d9a623afd9325a6974adae47bb` (stable 1.5.4).
+This is the consolidated implementation audit through stage 67, source-owned
+io_uring completion dependencies, reviewed on 2026-11-09. The prior shared runtime
+baseline is `dd671dfa62c99dc0d69aee2c72b9477e07ae4536`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-09
 
-Stage 66 removes the shared-versus-owner registration mode and opaque-FD import
-refusals. Registrations and accepted SQEs retain complete original OFDs; sealed
-source resolvers use those originals without converting metadata into authority.
-Solo acceptance now supplies the same execution context immediately. CQ observers
-never recover another task's guest-memory context. Corrupt CQ indices complete
-enter with EINVAL while preserving accepted requests/overflow; stale native
-interests get one source progress/rearm pass before actual capability escalation.
-Normal shared-FD lookup stays on its existing fast path. No new service thread,
-message bus, ordinary memory fence or global resource lock is introduced.
+Stage 67 deletes io_uring's owner layout-work transport, its public take/restore
+API and its owner signal-message queue. Neither queue had a current consumer.
+Accepted file completions now own an original backing ticket when an embedding
+has no FileLayouts driver; resource readiness retries that exact work, cancellation
+releases its ticket and native work uses the existing file pool. Real production
+FileLayouts publication retains its original scoped execution mechanism. Missing
+a driver no longer requests owner escalation or silently abandons accepted work.
 
-This closes those io_uring handoffs, **not every possible io_uring fallback**.
-Missing typed proc/path providers, actual unavailable native subscriptions,
-unsupported resource bodies and absent layout/signal embedding capabilities retain
-their explicit boundary. `owner_required` remains for those actual cases. The
-inventory does not rename or count them as removed. Supported production mapping
-publication continues through original FileLayouts on existing execution slots.
+Production completions retain their original TaskSignal mailbox. A legacy source
+without one publishes SIGXFSZ to its original task actor's atomic level flag;
+ordinary solo signal collection consumes it without PID lookup or an owner message.
+Forked tasks start with a separate actor. Standard signals coalesce normally.
+Only actual pending dependencies allocate their private boxed state; common file
+requests no longer embed the large FileWork object. This keeps the ownership change
+off ordinary guest memory accesses and creates no resource thread or polling bus.
+
+Stage 66 removed original-Files import/registration refusals, supplied the same
+accepted context on solo/source execution, and closed foreign CQ recovery, corrupt
+CQ-index and stale native-subscription handoffs. `owner_required` now has only the
+two source-maintenance escalation sites: a genuinely unpumpable original body or
+unavailable wait capability. Missing layout/signal capabilities are no longer its
+triggers. Missing typed providers, excluded resources/pins, tracing and host
+lifecycle remain explicit; the coordinator-removal goal is not complete.
 
 Stage 65 removed the Unix ancillary owner ledger, reaping join, mixed-rights
 exclusion and separate accepted-message owner executor. The original ownership
@@ -223,7 +230,7 @@ Tracing and security decisions with lifecycle effects retain joined boundaries. 
 | Event waits and remaining owner/mixed cases | Admitted pselect6, ppoll, epoll_pwait and epoll_pwait2, including temporary masks, use workers; excluded owner/dynamic FDs, tracing, unavailable source pumps and actual lifecycle/task-policy effects retain their boundary | One imported wait retains original OFDs/sets, mask and deadline through parking and cohort handoff. Source I/O signals interrupt locally and sigreturn restores the pre-wait mask. All pending sources now use the same queues. Caught signals interrupt locally; STOP/CONT retains the original wait and uses shared group control. Default termination uses original source group cleanup. | [poll ownership](../../crates/trames-linux/src/poll.rs), [wait admission](../../crates/trames-session/src/process.rs), [cohort control](../../crates/trames-session/src/process_vm.rs) |
 | VM and pin topology | brk growth, munmap/mremap, non-additive mmap, mprotect, mincore/madvise and io_uring buffer pin/register variants requiring mm edits | Affected mm/backing checkpoint on the existing run queue. Existing workers commit and rebuild supported Views, including proc byte activation and cold-mm cleanup; unsupported backing and tracing/security effects retain explicit boundaries. Retained external byte borrowers park only the actual dependency. Pure policy errors complete before quiescence; accepted decisions travel with the original entry. Additive private-anonymous mmap publishes directly. | [VM ABI classification](../../crates/trames-session/src/worker_syscalls.rs), [domain queue](../../crates/trames-session/src/run_queue.rs), [VM commit](../../crates/trames-session/src/process_vm.rs), [View admission](../../crates/trames-memory/src/parallel.rs) |
 | Mapped-file layout | Truncate/growth/allocate that changes a live mapped backing layout | Original backing publication leases identify affected mms. Existing workers return their bytes, then the same disk pool runs the accepted mutation while holding its original exclusive ticket. New aliases wait on that backing; original mmap/OFD authority survives cancellation. No process-wide pause counters or actor scan remain. Byte transfer and sync alone do not imply this checkpoint. | [file checkpoint](../../crates/trames-session/src/process_file_io.rs), [original file job](../../crates/trames-vfs/src/file_work.rs), [resize](../../crates/trames-vfs/src/memfd.rs) |
-| io_uring explicit capability/resource escalation | Missing typed source provider, unavailable native event subscription after source retry, actual unsupported body/pinning or absent layout/signal capability | Complete original Files registration, import, close and ordinary source execution no longer refuse merely opaque OFDs. Solo/source share execution context. Foreign CQ observations and corrupt CQ heads do not request owner recovery. Actual `owner_required` cases remain explicit; production layout uses original FileLayouts. | [actor](../../crates/trames-linux/src/direct/uring/actor.rs), [source maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [subscriptions](../../crates/trames-linux/src/direct/uring/wait.rs), [file results](../../crates/trames-linux/src/direct/uring/actor_file.rs) |
+| io_uring explicit capability/resource escalation | Missing typed source provider, unavailable native event subscription after source retry, actual unsupported body/pinning | Original-Files registration/import and source CQ execution stay direct. Layout and signal completion side transports are deleted: accepted dependencies remain on the request, and legacy signals publish to the original task actor. Production mapped layout uses original FileLayouts. Only the two actual maintenance failure sites still set `owner_required`. | [actor](../../crates/trames-linux/src/direct/uring/actor.rs), [source maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [subscriptions](../../crates/trames-linux/src/direct/uring/wait.rs), [file results](../../crates/trames-linux/src/direct/uring/actor_file.rs) |
 | Native guest mapping and exceptional native memory entry | Vulkan shared host-allocation mapping import where `can_import_mapping` is false; unstable native entry code; live-private backing or a native access mode requiring a checkpoint | GPU/native typed checkpoint before body effects; current worker returns the pending HLT to the owner. Ordinary CPU/native bytes keep the common permission/backing model. The GPU context mutex and compiler/fence waits are normally resource waits. | [Vulkan import](../../crates/trames-vulkan/src/backend.rs) (`Invocation::Checkpoint`), [native memory](../../crates/trames-memory/src/parallel/native.rs), [entry registry](../../crates/trames-accel/src/native.rs), [GPU wait](../../crates/trames-session/src/gpu.rs) |
 | Scheduler/cohort membership | Initial guest admission and legacy nonmember wake; ordinary scheduling metadata and live affinity no longer require the owner | Initial/legacy orchestration retains its boundary. Existing members migrate/park/wake locally; children and exec replacements enter the live queue. Original CPU slots can start directly and lazily from that queue. Periodic checks alone do not tear down the cohort: `cohort_control` tests actual events and original dependencies. | [legacy wake](../../crates/trames-session/src/futex.rs), [queue](../../crates/trames-session/src/run_queue.rs), [owner metadata](../../crates/trames-session/src/process_scheduling.rs), [control checks](../../crates/trames-session/src/process_vm.rs) |
 | Embedding and terminal/session lifecycle | Transfer/timezone command, pause/cancel, terminal create/close/resize, foreground group signal/hangup, actual systemd supervision event; Mac admin/shutdown/deadline/memory-pressure request; host-authorized exec process creation and process-group signal | Host control requests a join for actual lifecycle work. Routine FFI status snapshots, retained exec pipe I/O and live PTY byte pumping can run without a join. Host exec reuses the same process kernel, ELF/script loader, shared resources and memory budgets; it creates no additional runtime owner or service thread. FileProvider writeback deliberately pauses the session when applying staged edits, as chosen by the owner. | [FFI adapter](https://github.com/kb5000/trames-ipad/blob/80304113124ba34a829c4f61f2cb65bc7dad0e39/crates/trames-ffi/src/session.rs), [iPad lifecycle](https://github.com/kb5000/trames-ipad/blob/80304113124ba34a829c4f61f2cb65bc7dad0e39/apps/ios/Trames/TerminalSession.swift), [Mac control](https://github.com/kb5000/trames-mac/blob/aed5daab61092b468bb89a1af5159cc935dd5ea5/crates/trames-mac/src/session.rs) |
@@ -2292,3 +2299,40 @@ not a claimed Firefox speedup. Native Linux timings use the same static executab
 in the dedicated ARM64 CI environment, with different filesystem backing for
 statx. Exact hashes, results and limitations are recorded in the product validation.
 Stable 1.5.4 applications and business environments are not changed by this batch.
+
+
+## 67. Source-owned io_uring completion dependencies — 2026-11-09
+
+The former layout fallback stored `(FileWork, FileResult, owner, task)` in an
+actor side queue and requested coordinator execution; its take/restore API had no
+current consumer. The signal fallback similarly queued original IDs without a
+consumer. These transports and the exported UringFileLayout type are deleted,
+rather than renamed or backed by a new resource-service thread.
+
+A pending file completion owns one private dependency. A normal external file
+result stores no FileWork in the common actor entry. Actual memory-resource waits
+and the original layout work/ticket allocate a dependency only when needed. Layout
+retry keeps that allocation, asks the original backing for exclusive publication,
+and resumes the exact accepted command. Native work returns to the existing file
+pool while the ticket remains in that operation. It does not re-read a pathname,
+FD number, SQE or guest input. Original publication release wakes the request;
+waiting on publication is not falsely treated as an outstanding native disk job.
+Cancel/exit retire the command and ticket outside the ring/actor metadata locks.
+Existing production FileLayouts transactions still retain work through native
+completion under their established cancellation contract.
+
+File-size failures continue raising the source's captured TaskSignal when present.
+Without a mailbox, the original task actor publishes a relaxed atomic level flag.
+Linux's ordinary solo signal collector consumes both that original completion and
+the existing VFS flag. No owner ID message, separate signal service or guest memory
+fence is introduced. A cold false check avoids an atomic write when no legacy
+signal is pending. Actors are task-local and fork creates a fresh one.
+
+Regression covers queued/inline layout waits, cancellation, close/reuse and actual
+backing-release wakes without a FileLayouts driver; original signal targeting,
+coalescing and noninheritance; and the existing production driver, fixed buffers,
+foreign completion, CQ, multishot and native pool cases. Both runtime workflows,
+384 process assertions per host and both iPad compile targets pass. The product
+validation records actual backend acceptance and paired file read/write/truncate
+measurements, including the initial small-sample variation and native Linux limits.
+Stable 1.5.4 and business environments remain unchanged in this development batch.
