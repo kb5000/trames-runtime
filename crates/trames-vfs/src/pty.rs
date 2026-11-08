@@ -2,6 +2,8 @@
 //! Guest-owned PTYs. Descriptor aliases share an endpoint; the last close hangs up.
 use super::*;
 use terminal::Terminal;
+mod control;
+pub use control::{ControllingTerminal, TerminalIo, TerminalSignals, TerminalTask};
 mod shared;
 pub use shared::{PtyIo, PtySlaveEndpoint, TerminalAccess};
 
@@ -39,6 +41,9 @@ impl Drop for PtyEnd {
     fn drop(&mut self) {
         if self.master {
             self.pair.master_alive.store(false, Ordering::Relaxed);
+            if self.pair.hangup() {
+                self.pair.hangup_notified.store(true, Ordering::Relaxed);
+            }
             self.pair.notify();
             if let Some(mount) = self.pair.mount.as_ref().filter(|m| m.devpts.is_some()) {
                 let key = format!("/{}", self.pair.number).into_bytes();
@@ -71,8 +76,10 @@ impl Pty {
         let before = tty.window;
         tty.resize(rows, columns);
         if before != tty.window {
-            self.host_resize_pending
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+            drop(tty);
+            if !self.signal_foreground(28) {
+                self.host_resize_pending.store(true, Ordering::Relaxed);
+            }
         }
     }
     pub(super) fn private(&self) -> bool {
@@ -80,12 +87,12 @@ impl Pty {
     }
 }
 impl Vfs {
-    pub fn set_controlling_terminal(&mut self, id: Option<u32>) -> Result<()> {
-        self.controlling_pair = match id {
+    pub fn set_controlling_terminal(&self, id: Option<u32>) -> Result<()> {
+        let pair = match id {
             Some(id) if id != 0 => Some(self.pty_by_id(id).ok_or(Errno(6))?),
             _ => None,
         };
-        self.controlling_terminal = id;
+        self.controlling_state().set(id.map(|id| (id, pair)));
         Ok(())
     }
     pub fn pty(&self, fd: u32) -> Result<Option<Arc<PtyEnd>>> {
@@ -122,10 +129,12 @@ impl Vfs {
                 .and_then(|p| p.mount)
                 .filter(|m| m.kind == mounts::Kind::Devpts)
         };
-        // Only actual devpts resources are admitted by the private query view.
-        // Pseudo devpts allocation still needs its owner-side node cache.
+        // The compatibility devpts registry/cache are original shared objects
+        // too. Capability-less views retain their explicit legacy boundary.
         if let Some(query) = &self.query {
-            if !mount.as_ref().is_some_and(|m| m.devpts.is_some()) {
+            if !mount.as_ref().is_some_and(|m| m.devpts.is_some())
+                && self.terminal_task.get().is_none()
+            {
                 return query.defer();
             }
         }
@@ -163,6 +172,9 @@ impl Vfs {
             host_signals: AtomicU64::new(0),
         });
         registry.insert(id, Arc::downgrade(&pair));
+        if let Some(task) = self.terminal_task() {
+            pair.bind_signal_route(task);
+        }
         Ok(PtyEnd::new(pair, true))
     }
     /// TIOCGPTPEER follows the master's devpts identity even after chroot or

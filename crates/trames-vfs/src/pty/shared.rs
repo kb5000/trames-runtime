@@ -87,6 +87,8 @@ pub struct PtyIo {
     pub(super) slave_opened: AtomicBool,
     pub packet: AtomicBool,
     pub packet_status: AtomicU8,
+    route: std::sync::OnceLock<Arc<dyn TerminalSignals>>,
+    job_references: Mutex<[Option<crate::PidReference>; 2]>,
 }
 
 /// The real slave open, independent of its owner-side inode/mount projection.
@@ -120,6 +122,8 @@ impl PtyIo {
             slave_opened: AtomicBool::new(false),
             packet: AtomicBool::new(false),
             packet_status: AtomicU8::new(0),
+            route: Default::default(),
+            job_references: Default::default(),
         }
     }
     pub(crate) fn subscribe(&self, signal: &Arc<crate::IoSignal>) -> crate::IoSubscription {
@@ -236,7 +240,124 @@ impl PtyIo {
     }
     /// Owner input also uses this operation, then delivers the returned signals.
     pub fn master_write(&self, bytes: &[u8]) -> Result<(usize, Vec<u32>)> {
-        self.input_locked(&mut self.terminal.borrow_mut(), bytes)
+        let mut tty = self.terminal.borrow_mut();
+        let (count, mut signals) = self.input_locked(&mut tty, bytes)?;
+        let (session, group) = (tty.session, tty.foreground);
+        drop(tty);
+        if let Some(route) = self.route.get() {
+            for signal in signals.drain(..) {
+                route.signal(session, group, signal);
+            }
+        }
+        Ok((count, signals))
+    }
+    pub fn bind_signal_route(&self, route: Arc<dyn TerminalSignals>) {
+        self.route.get_or_init(|| route);
+    }
+    pub fn has_signal_route(&self) -> bool {
+        self.route.get().is_some()
+    }
+    pub fn retain_job_ids(&self, namespace: &crate::PidNamespace, session: u32, group: u32) {
+        *self.job_references.lock().unwrap() = [namespace.retain(session), namespace.retain(group)];
+    }
+    pub fn signal_foreground(&self, signal: u32) -> bool {
+        let Some(route) = self.route.get() else {
+            return false;
+        };
+        let tty = self.terminal.borrow();
+        let (session, group) = (tty.session, tty.foreground);
+        drop(tty);
+        route.signal(session, group, signal);
+        true
+    }
+    pub fn hangup(&self) -> bool {
+        let Some(route) = self.route.get() else {
+            return false;
+        };
+        let mut tty = self.terminal.borrow_mut();
+        let (session, group) = (tty.session, tty.foreground);
+        tty.flush_input();
+        tty.eof = true;
+        tty.session = 0;
+        tty.foreground = 0;
+        drop(tty);
+        // Retain PID identities until the notifications address the originals.
+        route.hangup(self.id, session, group);
+        *self.job_references.lock().unwrap() = Default::default();
+        true
+    }
+    fn stop_job(task: &dyn TerminalTask, access: TerminalAccess, signal: u32) -> TerminalIo<()> {
+        if task.ignored(signal) {
+            return TerminalIo::Complete(if signal == 21 { Err(Errno(5)) } else { Ok(()) });
+        }
+        if task.orphaned() {
+            return TerminalIo::Complete(Err(Errno(5)));
+        }
+        task.signal(access.session, access.group, signal);
+        TerminalIo::Stopped
+    }
+    pub fn check_job(&self, task: &dyn TerminalTask, signal: u32) -> TerminalIo<()> {
+        let tty = self.terminal.borrow();
+        let access = task.access();
+        let background = self.background(&tty, access);
+        drop(tty);
+        if background {
+            Self::stop_job(task, access, signal)
+        } else {
+            TerminalIo::Complete(Ok(()))
+        }
+    }
+    pub fn read_live(
+        &self,
+        master: bool,
+        count: usize,
+        task: &dyn TerminalTask,
+    ) -> TerminalIo<Vec<u8>> {
+        if master {
+            return TerminalIo::Complete(self.master_read(count));
+        }
+        let mut tty = self.terminal.borrow_mut();
+        if count == 0 || !self.master_alive.load(Ordering::Relaxed) {
+            return TerminalIo::Complete(Ok(Vec::new()));
+        }
+        let access = task.access();
+        if self.background(&tty, access) {
+            drop(tty);
+            return match Self::stop_job(task, access, 21) {
+                TerminalIo::Complete(Err(e)) => TerminalIo::Complete(Err(e)),
+                TerminalIo::Stopped => TerminalIo::Stopped,
+                TerminalIo::Complete(Ok(())) => {
+                    unreachable!("SIGTTIN never bypasses a background read")
+                }
+            };
+        }
+        TerminalIo::Complete(tty.read(count))
+    }
+    pub fn write_live(
+        &self,
+        master: bool,
+        bytes: &[u8],
+        task: &dyn TerminalTask,
+    ) -> TerminalIo<usize> {
+        if master {
+            return TerminalIo::Complete(self.master_write(bytes).map(|(n, _)| n));
+        }
+        let mut tty = self.terminal.borrow_mut();
+        if !self.master_alive.load(Ordering::Relaxed) {
+            return TerminalIo::Complete(Err(Errno(5)));
+        }
+        let access = task.access();
+        if tty.lflag() & 256 != 0 && self.background(&tty, access) && !task.ignored(22) {
+            drop(tty);
+            return match Self::stop_job(task, access, 22) {
+                TerminalIo::Complete(Err(e)) => TerminalIo::Complete(Err(e)),
+                TerminalIo::Stopped => TerminalIo::Stopped,
+                TerminalIo::Complete(Ok(())) => {
+                    TerminalIo::Complete(self.terminal.borrow_mut().queue_output(bytes))
+                }
+            };
+        }
+        TerminalIo::Complete(tty.queue_output(bytes))
     }
     fn background(&self, tty: &Terminal, access: TerminalAccess) -> bool {
         access.controlling == Some(self.id)

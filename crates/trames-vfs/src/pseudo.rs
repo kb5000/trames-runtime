@@ -1574,6 +1574,12 @@ impl Vfs {
         if let Some(content) = simple_device::builtin(path) {
             return Ok(Some(content));
         }
+        if path == b"/dev/tty"
+            && self.terminal_task.get().is_some()
+            && self.controlling_terminal() != Some(0)
+        {
+            return Ok(Some((Content::Terminal, 0o20666)));
+        }
         if path == b"/dev" || path.starts_with(b"/dev/") {
             let owner = matches!(
                 path,
@@ -1599,7 +1605,13 @@ impl Vfs {
                 return Ok(None);
             }
             if let Some(query) = &self.query {
-                return query.defer();
+                if self.terminal_task.get().is_none()
+                    || !(path == b"/dev/ptmx"
+                        || path == b"/dev/pts"
+                        || path.starts_with(b"/dev/pts/"))
+                {
+                    return query.defer();
+                }
             }
         }
         let pseudo = self.pseudo.borrow();

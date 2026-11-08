@@ -1113,6 +1113,7 @@ impl UringSnapshot {
                 native_tcp: None,
                 epoll_revision: None,
                 retained_poll: None,
+                terminal_job: false,
                 _subscriptions: Vec::new(),
                 socket_subscriptions: Vec::new(),
                 host_subscription: None,

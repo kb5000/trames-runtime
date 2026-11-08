@@ -1,12 +1,31 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 67, source-owned
-io_uring completion dependencies, reviewed on 2026-11-09. The prior shared runtime
-baseline is `dd671dfa62c99dc0d69aee2c72b9477e07ae4536`.
+This is the consolidated implementation audit through stage 68, original guest
+terminal/session/job control, reviewed on 2026-11-09. The prior shared runtime
+baseline is `17e7d5b5394c0d079aec5b4dda1086d4eb01dfab`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-09
+
+Stage 68 closes the supported guest PTY/session/job-control execution category.
+PGID/SID are one original process resource; CLONE_THREAD shares it and controlling
+TTY state. setpgid/setsid, family wait selection, proc and signal target indexes
+commit against original membership. Neither a frozen CPU snapshot nor an observer
+refresh can overwrite a source membership change. Fork commits current job/TTY
+inheritance in the existing family transaction; exec and last-thread exit retain
+and retire the same original authority.
+
+Both real and compatibility devpts, automatic slave opens, /dev/tty, supported
+termios/foreground/session/winsize controls, input signals, detach/steal and final
+master hangup use original resources. Background read/write/ioctl stops retain the
+accepted SVC/OFD even with O_NONBLOCK, FD close/reuse, filters and cohort handoff.
+Actual job stops lazily subscribe to original group CONT/termination readiness;
+solo execution does not poll or depend on a worker-only wake. Read-only controls
+use a shared direct ABI, not an async envelope or unrelated task-policy query.
+No service thread, copied signal owner, ordinary memory fence or global byte lock
+is added. Legacy terminal-ID-0 GuestOutput, host launch/control and tracing remain
+explicit host/embedding boundaries; unsupported tty/io_uring APIs are not added.
 
 Stage 67 deletes io_uring's owner layout-work transport, its public take/restore
 API and its owner signal-message queue. Neither queue had a current consumer.
@@ -43,7 +62,7 @@ in-flight service state. Original console resources, complete epoll controls and
 FD observations execute from the source; native host bytes use the existing
 bounded I/O pool. EPIPE/SIGPIPE for source byte operations completes locally.
 The former service's blocking/error cases are not redirected to whole-cohort
-fallback. Separate excluded terminal, mixed wait, tracing and native/mapping
+fallback. Separate legacy host-terminal, mixed wait, tracing and native/mapping
 boundaries remain in the inventory below.
 
 Stage 63 moves getrandom into one shared source/solo
@@ -92,6 +111,7 @@ is not a claim that all coordinator work is removed.
 | --- | --- | --- |
 | Admitted file/path/FD, Unix/TCP I/O, transfers, AIO and io_uring operations | Calling worker and original shared resources; resource waits return the execution slot | Excluded descriptor/path/SQE kinds, owner controls, missing pumps/subscriptions retain explicit boundaries; production mapped-layout effects now use original backing admission |
 | Futexes, clocks/timers, admitted poll/epoll/signalfd/child waits and caught signals | Calling workers and original readiness/mailboxes | Legacy nonmember waiter adoption, excluded wait resources, tracing and capability-less lifecycle embeddings can still require the owner |
+| Guest terminals, sessions and job control | Original process/TTY/Files/namespace resources on the caller; source and solo share the ABI; only actual stops allocate readiness | Legacy terminal-ID-0 GuestOutput and capability-less/traced embeddings retain their adapter. Existing unsupported tty controls and tty io_uring remain explicit errors |
 | Scheduling attributes and CPU affinity | Calling worker and original task atomics/authority; migration waits for only the original target's running lease and releases the caller's execution slot | Tracing and capability-less embeddings keep their boundary. Existing unsupported scheduling features return their original errno locally; no compatibility owner service is needed |
 | Individual/group/default-fatal exit, STOP/CONT, parent notification and vfork release | Original source task/group resources | Returned CPU/statistics and cold task cleanup use existing source workers; only the original live mm pauses when necessary. Outside-cohort/solo and tracing/capability-less embeddings retain their boundary |
 | fork/clone/vfork and execve/execveat | Existing workers handle pure and mixed mapping scopes, nonleader replacement and original old-mm retirement; existing disk pool prepares native images without a CPU slot | Affected actors still quiesce. Tracing/capability-less embeddings, solo and host invocation remain separate |
@@ -105,7 +125,7 @@ is not a claim that all coordinator work is removed.
 | Entropy and random devices | getrandom, original random/urandom OFDs and UUID resources run on the caller; unsupported random-device controls return locally on the accepted OFD | Explicit tracing and absent descriptor capabilities retain their own route. Supported getrandom flags remain 0..3 and the existing transfer bound/fault behavior is retained; guest entropy credit/reseed controls remain unsupported |
 | BPF and cgroup device policy | Supported program load/identity/reopen and attachment controls use original registry/Files/hierarchy resources on the caller; cgroup target directories and control files resolve/open on workers | Existing unsupported BPF commands/types remain explicit errors; tracing and capability-less embeddings keep their boundaries. Device opens/mknod/PTY peer and proc reopening consume the same live rules |
 | Seccomp and tracing | Supported seccomp/prctl installation, TSYNC and entry results use original source task/group resources; busy installation releases the slot; proc and future entries observe live policy | Explicit tracing remains joined. Capability-less embeddings retain signal/exit handling; unsupported listener/logging/notification features remain unsupported. An allowed syscall may still encounter its own excluded resource or generic fallback |
-| Actual host/embedding lifecycle | Joined owner handling of the accepted event | Host-authorized exec creation/group control, terminal create/close/resize/hangup, legacy unpumpable console I/O, pause/cancel, timezone/transfer, supervision/admin/deadline/pressure and actual shutdown. Routine live PTY bytes/status/presentation do not imply a join; FileProvider staged writeback deliberately pauses as previously chosen |
+| Actual host/embedding lifecycle | Joined owner handling of the accepted event | Host-authorized exec creation/group control, UI terminal launch/close, legacy terminal-ID-0 events and unpumpable console I/O, pause/cancel, timezone/transfer, supervision/admin/deadline/pressure and actual shutdown. Routine live PTY bytes/status/presentation do not imply a join; FileProvider staged writeback deliberately pauses as previously chosen |
 | Last-resort SVC/HLT/fault dispatch | Truly unimplemented numbers complete locally using generated conservative recognition and the original diagnostic log | Known handlers whose actual resource/subcommand is excluded, legacy embeddings, tracing and unhandled HLT/fault exits still retain joined fallback. An implemented number returning an errno is not classified as globally unimplemented |
 | Single-CPU/solo execution | Existing coordinated caller path | The owner may itself be the guest executor; this is not evidence of an extra cross-thread syscall RPC |
 
@@ -224,7 +244,7 @@ Tracing and security decisions with lifecycle effects retain joined boundaries. 
 | Task lifecycle and process graph | clone/fork/vfork, exec/execveat, exit/group exit, wait/waitid, reparenting and cancellation | Shared wait4/waitid, STOP/CONT, set_tid_address and admitted vfork waits run on source workers. Individual exit(93), exit_group(94) and default-fatal termination retire original resources on their source workers, including the final member and Files with opaque owner controls. Namespace-init victims use original groups. Full returned CPUs and cold task projections now complete on source workers; cold same-mm peers need only that mm byte checkpoint. Fork/clone/vfork construction uses a creator-mm checkpoint; children join the live queue without stopping unrelated mms. The complete task and original-resource child builder are movable; pure lifecycle scopes claim nonblocking original task/mm/group custody on existing workers without VmReady/Service requests. Exec preparation/commit, nonleader identity replacement, failed-image recovery and detached old-mm retirement use original resources. Supported mixed mapping/lifecycle scopes now use the same source authority. Native image loading retains accepted resources on the original task and uses the existing disk pool; waiting releases task/mm permits and the CPU slot. Resident private-store namespace lookup/errors remain local. Untraced continuous-worker custody entries complete pure policy errors before quiescence. Tracing, policy effects requiring full task handling and legacy unadmitted waiter adoption retain joined boundaries. | [process lifecycle](../../crates/trames-session/src/process.rs) (`fork_state`, `exit_one`, `wait`, `syscall`), [image replacement](../../crates/trames-session/src/process_exec.rs) (`prepare_exec_request`, `install_exec`, `commit_exec_task`) |
 | Signals and mutable security/task policy | Supported signals, credentials/capabilities, affinity and seccomp installation/TSYNC/result effects are source-owned; explicit tracing and capability-less embeddings remain | One private/process mailbox serves ordinary guest sends, timers, FASYNC, faults and owner producers. Ordinary kill/tkill/tgkill routing, altstack/actions/masks/pending, sigtimedwait/sigsuspend and signalfd read/readv run on the source worker. Caught handlers and sigreturn share the same frames. STOP/CONT uses the original group state and parent wait/SIGCHLD; default termination uses source group cleanup. ERRNO/unsupported TRACE/USER_NOTIF, TRAP and KILL use original source resources. Tracing retains its explicit boundary; accepted ALLOW calls can still encounter an excluded underlying resource. | [entry and delivery](../../crates/trames-session/src/process.rs), [shared I/O signals](../../crates/trames-kernel/src/signal/io.rs), [worker decisions](../../crates/trames-session/src/workers.rs), [seccomp](../../crates/trames-session/src/process_seccomp.rs) |
 | Structural namespaces and administrative controls | mount/umount/pivot_root, unshare/setns, BPF and credential/capability changes | Admitted mount/umount/pivot_root run on the caller and original mount/fs resources; a busy namespace parks only its caller. Supported unshare/setns and credentials/capabilities run on the caller with their complete captured consumers. Supported BPF administration now uses original source registry/Files/hierarchy transactions; unsupported APIs keep their original errors. Metadata projections remain observation rather than mutable authority. | [owner dispatch](../../crates/trames-session/src/process.rs), [mount topology](../../crates/trames-vfs/src/mounts.rs), [namespace authority](../../crates/trames-vfs/src/linux_namespace.rs) |
-| Dynamic/special pathname and FD resources | Proc PID/task directories, magic links, dynamic bodies, nsfs descriptors, controlling terminals and excluded types | Proc views and original mount namespace FDs are admitted through the common resolver and shared OFDs. Cwd/root/exe/FD reopening retains original resources, not descriptor numbers. Actual excluded owner graphs, mqueue and terminal acquisition retain explicit before-effects boundaries. | [proc provider](../../crates/trames-vfs/src/proc_source.rs), [proc files](../../crates/trames-vfs/src/proc_file.rs), [path authority](../../crates/trames-vfs/src/path_queries.rs) |
+| Dynamic/special pathname and FD resources | Proc PID/task directories, magic links, dynamic bodies, nsfs descriptors and excluded types | Proc views and original mount namespace FDs are admitted through the common resolver and shared OFDs. Cwd/root/exe/FD reopening retains original resources, not descriptor numbers. Guest PTY paths and automatic controlling opens use original resources. Actual excluded owner graphs and mqueue retain explicit before-effects boundaries. | [proc provider](../../crates/trames-vfs/src/proc_source.rs), [proc files](../../crates/trames-vfs/src/proc_file.rs), [path authority](../../crates/trames-vfs/src/path_queries.rs) |
 | Cross-resource transfer | sendfile/splice between admitted regular files, pipes, Unix streams and TCP | Original OFD pairs execute on the calling worker. Backpressure parks only that task on original readiness; native disk jobs reuse the existing pool. Joined short operations borrow the original VFS without building a retained island. Actual mapped-file layout changes keep affected-domain checkpoints; excluded owner/dynamic resources defer before effects. tee/vmsplice remain unsupported. | [accepted transfer](../../crates/trames-vfs/src/stream_transfer.rs), [source execution and waits](../../crates/trames-linux/src/direct/file.rs) |
 | POSIX and real interval timers | timer_create/gettime/getoverrun/settime/delete and getitimer/setitimer | Shared timer objects execute on the caller. A short deadline-index transaction updates the original execution queue; existing workers process a bounded batch of due timers outside that queue's mutex. SIGEV_NONE keeps lazy periodic phase without an armed host deadline. Process/thread signal targets retain their original incarnation. Timer STOP/CONT uses shared group control. Default termination uses original source group cleanup; unsupported CPU-clock/virtual/profiling timers are not added. | [shared timer ABI and index](../../crates/trames-kernel/src/timers.rs), [original signal targets](../../crates/trames-kernel/src/signal/io.rs), [execution queue](../../crates/trames-session/src/run_queue.rs) |
 | Event waits and remaining owner/mixed cases | Admitted pselect6, ppoll, epoll_pwait and epoll_pwait2, including temporary masks, use workers; excluded owner/dynamic FDs, tracing, unavailable source pumps and actual lifecycle/task-policy effects retain their boundary | One imported wait retains original OFDs/sets, mask and deadline through parking and cohort handoff. Source I/O signals interrupt locally and sigreturn restores the pre-wait mask. All pending sources now use the same queues. Caught signals interrupt locally; STOP/CONT retains the original wait and uses shared group control. Default termination uses original source group cleanup. | [poll ownership](../../crates/trames-linux/src/poll.rs), [wait admission](../../crates/trames-session/src/process.rs), [cohort control](../../crates/trames-session/src/process_vm.rs) |
@@ -233,7 +253,7 @@ Tracing and security decisions with lifecycle effects retain joined boundaries. 
 | io_uring explicit capability/resource escalation | Missing typed source provider, unavailable native event subscription after source retry, actual unsupported body/pinning | Original-Files registration/import and source CQ execution stay direct. Layout and signal completion side transports are deleted: accepted dependencies remain on the request, and legacy signals publish to the original task actor. Production mapped layout uses original FileLayouts. Only the two actual maintenance failure sites still set `owner_required`. | [actor](../../crates/trames-linux/src/direct/uring/actor.rs), [source maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [subscriptions](../../crates/trames-linux/src/direct/uring/wait.rs), [file results](../../crates/trames-linux/src/direct/uring/actor_file.rs) |
 | Native guest mapping and exceptional native memory entry | Vulkan shared host-allocation mapping import where `can_import_mapping` is false; unstable native entry code; live-private backing or a native access mode requiring a checkpoint | GPU/native typed checkpoint before body effects; current worker returns the pending HLT to the owner. Ordinary CPU/native bytes keep the common permission/backing model. The GPU context mutex and compiler/fence waits are normally resource waits. | [Vulkan import](../../crates/trames-vulkan/src/backend.rs) (`Invocation::Checkpoint`), [native memory](../../crates/trames-memory/src/parallel/native.rs), [entry registry](../../crates/trames-accel/src/native.rs), [GPU wait](../../crates/trames-session/src/gpu.rs) |
 | Scheduler/cohort membership | Initial guest admission and legacy nonmember wake; ordinary scheduling metadata and live affinity no longer require the owner | Initial/legacy orchestration retains its boundary. Existing members migrate/park/wake locally; children and exec replacements enter the live queue. Original CPU slots can start directly and lazily from that queue. Periodic checks alone do not tear down the cohort: `cohort_control` tests actual events and original dependencies. | [legacy wake](../../crates/trames-session/src/futex.rs), [queue](../../crates/trames-session/src/run_queue.rs), [owner metadata](../../crates/trames-session/src/process_scheduling.rs), [control checks](../../crates/trames-session/src/process_vm.rs) |
-| Embedding and terminal/session lifecycle | Transfer/timezone command, pause/cancel, terminal create/close/resize, foreground group signal/hangup, actual systemd supervision event; Mac admin/shutdown/deadline/memory-pressure request; host-authorized exec process creation and process-group signal | Host control requests a join for actual lifecycle work. Routine FFI status snapshots, retained exec pipe I/O and live PTY byte pumping can run without a join. Host exec reuses the same process kernel, ELF/script loader, shared resources and memory budgets; it creates no additional runtime owner or service thread. FileProvider writeback deliberately pauses the session when applying staged edits, as chosen by the owner. | [FFI adapter](https://github.com/kb5000/trames-ipad/blob/80304113124ba34a829c4f61f2cb65bc7dad0e39/crates/trames-ffi/src/session.rs), [iPad lifecycle](https://github.com/kb5000/trames-ipad/blob/80304113124ba34a829c4f61f2cb65bc7dad0e39/apps/ios/Trames/TerminalSession.swift), [Mac control](https://github.com/kb5000/trames-mac/blob/aed5daab61092b468bb89a1af5159cc935dd5ea5/crates/trames-mac/src/session.rs) |
+| Host/legacy embedding lifecycle | Transfer/timezone command, pause/cancel, UI terminal launch/close, legacy terminal-ID-0 events, actual systemd supervision event; Mac admin/shutdown/deadline/memory-pressure request; host-authorized exec process creation and process-group signal | Host control requests a join for actual lifecycle work. Routine FFI status snapshots, retained exec pipe I/O and live PTY byte pumping can run without a join. Host exec reuses the same process kernel, ELF/script loader, shared resources and memory budgets; it creates no additional runtime owner or service thread. FileProvider writeback deliberately pauses the session when applying staged edits, as chosen by the owner. | [FFI adapter](https://github.com/kb5000/trames-ipad/blob/80304113124ba34a829c4f61f2cb65bc7dad0e39/crates/trames-ffi/src/session.rs), [iPad lifecycle](https://github.com/kb5000/trames-ipad/blob/80304113124ba34a829c4f61f2cb65bc7dad0e39/apps/ios/Trames/TerminalSession.swift), [Mac control](https://github.com/kb5000/trames-mac/blob/aed5daab61092b468bb89a1af5159cc935dd5ea5/crates/trames-mac/src/session.rs) |
 | Final teardown and faults | Actual session/backend teardown, non-notifying native stop and unhandled fault exits | Ordinary last/group/default-fatal exit is source work; CPUs and cold Rc projections return asynchronously, with actual same-mm byte custody where needed. These are not ordinary whole-cohort exit boundaries. Accepted guest faults use the original signal path; actual unhandled/backend failures and final host teardown retain their explicit boundary. A host backend error is not an automatic full-VM or software fallback. | [source completion](../../crates/trames-session/src/process_exit.rs), [fault/dispatch](../../crates/trames-session/src/workers.rs), [native lifecycle](execution-backends.md#live-native-device-authority--2026-11-03) |
 
 The final worker-dispatch catch-all remains authoritative: an exit without a
@@ -2336,3 +2356,43 @@ foreign completion, CQ, multishot and native pool cases. Both runtime workflows,
 validation records actual backend acceptance and paired file read/write/truncate
 measurements, including the initial small-sample variation and native Linux limits.
 Stable 1.5.4 and business environments remain unchanged in this development batch.
+
+
+## 68. Original guest terminal/session/job-control closure — 2026-11-09
+
+`IoTask`/task-control Group now own packed PGID/SID. The original family graph
+serializes structural birth/reparent/membership and session-wide TTY changes;
+normal bytes and queries do not acquire that graph lock. The existing PID/group
+index is an index of originals, not another writable process projection. Retained
+PID namespace references keep departed PGID/SID translations valid. Observer
+publication reindexes committed IDs, and child wait metadata updates in the same
+membership transaction. A parent cannot setpgid a post-exec child; cross-session
+EPERM precedes post-exec EACCES, checked against native Linux.
+
+A process's original controlling-terminal binding is shared by its threads and
+path views. Fork copies it at birth; exec preserves it. The terminal resource
+retains its original signal route and PGID/SID identities, independently of the
+opening task's CPU/lifetime. Input, resize, detach/steal, final master close and
+last-thread exit select and signal original process resources after dropping
+TTY/reference/index locks. Ordinary tty bytes never acquire family membership.
+Read-only termios/window queries need no caller job metadata; caller identity is
+read only for controls which actually require it.
+
+Background TTIN/TTOU consumes no byte/control effect before stopping. The original
+SVC/OFD is retained through parking, signal handling, close/reuse and filtered
+adoption. Ignored/blocked signals and orphan groups use their supported Linux
+results. Actual stop waits subscribe once to a lazily allocated original group
+readiness object, then recheck for CONT-before-subscribe. CONT/termination notifies
+outside control locks. This fixes the serial write/ioctl wake gap without periodic
+retry, another thread or an owner queue.
+
+Mounted and compatibility devpts share original PTY registry/inodes; the sealed
+resolver uses the same resources for allocation and automatic controlling opens.
+The old real-PTY body in `Kernel::terminal_call` is removed. Its remaining adapter
+is explicitly the legacy host GuestOutput terminal (ID 0), not production guest
+PTY execution. Unknown controls retain ENOTTY; existing termios and tty io_uring
+limits remain. This closes one subsystem, not the overall coordinator goal.
+
+Validation and bounded native/baseline performance data are recorded in the
+product's `docs/validation/job-control-20261109.json`. Stable 1.5.4 and business
+environments remain unchanged; only Mac Dev is updated after validation.

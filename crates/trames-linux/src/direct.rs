@@ -49,6 +49,7 @@ pub struct PendingIo {
     resource_deadline: Option<Instant>,
     pub retained_poll: Option<Arc<crate::RetainedWait>>,
     epoll_revision: Option<u64>,
+    terminal_job: bool,
     _subscriptions: Vec<IoSubscription>,
     host_subscription: Option<trames_vfs::HostSubscription>,
     socket_subscriptions: Vec<trames_vfs::HostSubscription>,
@@ -80,6 +81,9 @@ impl RetainedByte {
     }
     pub fn is_unix(&self) -> bool {
         self.fd.is_unix()
+    }
+    pub fn is_pty(&self) -> bool {
+        self.fd.is_pty()
     }
     pub fn pty_endpoint(&self) -> Option<(Arc<trames_vfs::PtyEnd>, u32)> {
         self.fd.retained_pty()
@@ -225,6 +229,9 @@ pub struct DirectSyscalls {
     descriptors: DirectFds,
     network: trames_vfs::DirectNetwork,
     terminal: Option<trames_vfs::TerminalAccess>,
+    terminal_task: Option<Arc<dyn trames_vfs::TerminalTask>>,
+    // Private outcome of this executor-local transfer. Never a guest errno.
+    terminal_stop: Cell<bool>,
     kernel_log: Option<trames_vfs::KernelLogAccess>,
     files: trames_vfs::DirectFiles,
     membership: Option<trames_vfs::SharedFiles>,
@@ -311,6 +318,8 @@ impl DirectSyscalls {
             descriptors,
             network: Default::default(),
             terminal: None,
+            terminal_task: None,
+            terminal_stop: Cell::new(false),
             kernel_log: None,
             files: Default::default(),
             membership,
@@ -577,6 +586,10 @@ impl DirectSyscalls {
         self.record_fd_control();
         Some(result.map(u64::from))
     }
+    pub fn with_terminal_task(mut self, task: Option<Arc<dyn trames_vfs::TerminalTask>>) -> Self {
+        self.terminal_task = task;
+        self
+    }
     pub fn with_terminal(mut self, access: trames_vfs::TerminalAccess) -> Self {
         self.terminal = Some(access);
         self
@@ -725,7 +738,7 @@ impl DirectSyscalls {
             && (number != 29
                 || fd.is_entropy_device() && !matches!(args[1] as u32, 0x5421 | 0x5452)
                 || args[1] as u32 == 0x541b
-                || fd.is_pty() && matches!(args[1] as u32, 0x5401 | 0x5413)
+                || fd.is_pty() && !matches!(args[1] as u32, 0x5421 | 0x5452)
                 || fd.pty_endpoint().is_some()
                     && (crate::pty_control_request(args[1] as u32) || args[1] as u32 == 0x5441))
     }
@@ -791,7 +804,8 @@ impl DirectSyscalls {
                     .descriptors
                     .get(args[0] as u32)
                     .is_some_and(|fd| fd.is_pty())
-                    && (matches!(args[1] as u32, 0x5401 | 0x5413)
+                    && (self.terminal_task.is_some() && !matches!(args[1] as u32, 0x5421 | 0x5452)
+                        || matches!(args[1] as u32, 0x5401 | 0x5413)
                         || crate::pty_control_request(args[1] as u32)
                         || args[1] as u32 == 0x5441 && self.resources.is_some()))
     }
@@ -923,6 +937,7 @@ impl DirectSyscalls {
                 resource_deadline: None,
                 epoll_revision: None,
                 retained_poll: None,
+                terminal_job: false,
                 _subscriptions: Vec::new(),
                 socket_subscriptions: Vec::new(),
                 host_subscription: Some(subscription),
@@ -941,8 +956,14 @@ impl DirectSyscalls {
         args: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
+        self.terminal_stop.set(false);
         if !Self::supports_fd_call(number, args, fd) {
             return None;
+        }
+        if let (Some(task), Some(end)) = (&self.terminal_task, fd.pty_endpoint()) {
+            if !end.pair.has_signal_route() {
+                end.pair.bind_signal_route(task.clone());
+            }
         }
         if number == 29 && fd.is_entropy_device() {
             // This kernel has no guest entropy pool/credit/reseed controls.
@@ -974,7 +995,17 @@ impl DirectSyscalls {
         let flags = socket_flags(number, args);
         let read = |count| {
             let result = if fd.is_pty() {
-                fd.terminal_read(count, self.terminal)
+                if let Some(task) = &self.terminal_task {
+                    Some(match fd.terminal_read_live(count, task.as_ref()) {
+                        trames_vfs::TerminalIo::Complete(result) => result,
+                        trames_vfs::TerminalIo::Stopped => {
+                            self.terminal_stop.set(true);
+                            Err(Errno(11))
+                        }
+                    })
+                } else {
+                    fd.terminal_read(count, self.terminal)
+                }
             } else if matches!(number, 207 | 212) {
                 fd.recv(count, flags | if fd.nonblocking() { 0x40 } else { 0 })
             } else {
@@ -987,7 +1018,17 @@ impl DirectSyscalls {
         };
         let write = |bytes: &[u8]| {
             let result = if fd.is_pty() {
-                fd.terminal_write(bytes, self.terminal)
+                if let Some(task) = &self.terminal_task {
+                    Some(match fd.terminal_write_live(bytes, task.as_ref()) {
+                        trames_vfs::TerminalIo::Complete(result) => result,
+                        trames_vfs::TerminalIo::Stopped => {
+                            self.terminal_stop.set(true);
+                            Err(Errno(11))
+                        }
+                    })
+                } else {
+                    fd.terminal_write(bytes, self.terminal)
+                }
             } else if fd.is_unix() {
                 Some(fd.send_credentials(
                     bytes,
@@ -1028,8 +1069,27 @@ impl DirectSyscalls {
                         memory,
                     );
                 }
+                if let (Some(task), Some(end)) = (&self.terminal_task, fd.pty_endpoint()) {
+                    return match crate::pty::terminal_control(
+                        end,
+                        args[1] as u32,
+                        args[2],
+                        u32::from(fd.check_read_access().is_err()),
+                        task.as_ref(),
+                        memory,
+                    ) {
+                        trames_vfs::TerminalIo::Complete(result) => result,
+                        trames_vfs::TerminalIo::Stopped => {
+                            self.terminal_stop.set(true);
+                            Err(Errno(11))
+                        }
+                    };
+                }
                 if args[1] as u32 != 0x541b {
-                    let bytes = fd.terminal_query(args[1] as u32).expect("terminal query");
+                    let Some(bytes) = fd.terminal_query(args[1] as u32) else {
+                        deferred.set(true);
+                        return Err(Errno(11));
+                    };
                     Linux::check(memory, args[2], bytes.len(), Access::Write)?;
                     memory.write(args[2], &bytes).map_err(|_| Errno(14))?;
                     return Ok(0);
@@ -1164,6 +1224,11 @@ impl DirectSyscalls {
         target: &Weak<dyn IoWake>,
         saved_deadline: Option<Instant>,
     ) -> Option<IoAttempt> {
+        if number == 29 && !crate::pty::terminal_job_request(args[1] as u32) {
+            if let Some(result) = self.invoke_control(number, args, memory) {
+                return Some(IoAttempt::Complete(result));
+            }
+        }
         if Self::aio_call(number) {
             return self.start_aio(number, args, memory, pid, target, saved_deadline);
         }
@@ -1307,6 +1372,7 @@ impl DirectSyscalls {
                 retained_socket: None,
                 retained_byte: None,
                 native_tcp: None,
+                terminal_job: false,
                 _subscriptions: subscriptions,
                 socket_subscriptions: Vec::new(),
                 host_subscription,
@@ -1319,7 +1385,12 @@ impl DirectSyscalls {
         ))
     }
     fn retain_byte(&self, number: u32, args: [u64; 6]) -> Option<Result<RetainedByte, Errno>> {
-        if !matches!(number, 63..=70) {
+        if !matches!(number, 29 | 63..=70) {
+            return None;
+        }
+        if number == 29
+            && (self.terminal_task.is_none() || !crate::pty::terminal_job_request(args[1] as u32))
+        {
             return None;
         }
         let file = match self.membership.as_ref()?.lookup(args[0] as u32)? {
@@ -1327,6 +1398,9 @@ impl DirectSyscalls {
             Err(error) => return Some(Err(error)),
         };
         let fd = self.descriptors.byte_file(file)?;
+        if number == 29 && (!fd.is_pty() || !Self::supports_fd_call(number, args, &fd)) {
+            return None;
+        }
         if fd.host_console() {
             return None;
         }
@@ -1391,6 +1465,7 @@ impl DirectSyscalls {
                 native_tcp: None,
                 flock: None,
                 resource_deadline: None,
+                terminal_job: false,
                 _subscriptions: subscriptions,
                 socket_subscriptions: Vec::new(),
                 host_subscription: None,
@@ -1413,6 +1488,9 @@ impl DirectSyscalls {
         pid: u32,
         target: &Weak<dyn IoWake>,
     ) -> Option<IoAttempt> {
+        if number == 29 && retained.is_none() {
+            return self.start(number, args, memory, pid, target, None);
+        }
         let retained = retained
             .map(Ok)
             .or_else(|| self.retain_byte(number, args))?;
@@ -1508,7 +1586,8 @@ impl DirectSyscalls {
         };
         match result {
             Some(Err(Errno(11)))
-                if !file.fd.nonblocking() && socket_flags(number, args) & 0x40 == 0 => {}
+                if self.terminal_stop.get()
+                    || !file.fd.nonblocking() && socket_flags(number, args) & 0x40 == 0 => {}
             Some(result) => {
                 let result = if checkpoint_pipe {
                     self.byte_pipe_signal(&file.fd, number, args, result)
@@ -1541,6 +1620,7 @@ impl DirectSyscalls {
                 resource_deadline: None,
                 epoll_revision: None,
                 retained_poll: None,
+                terminal_job: false,
                 _subscriptions: subscriptions,
                 socket_subscriptions: Vec::new(),
                 host_subscription: None,
@@ -1584,6 +1664,7 @@ impl DirectSyscalls {
                 resource_deadline: None,
                 epoll_revision: None,
                 retained_poll: None,
+                terminal_job: false,
                 _subscriptions: subscriptions,
                 socket_subscriptions: Vec::new(),
                 host_subscription: None,
@@ -1633,6 +1714,7 @@ impl DirectSyscalls {
         checkpoint_pipe: bool,
         original_paths: Option<&trames_vfs::Vfs>,
     ) -> IoAttempt {
+        self.terminal_stop.set(false);
         if Self::aio_call(pending.number) {
             return self.start_retained_aio(
                 pending.aio.take().expect("accepted AIO"),
@@ -1738,20 +1820,34 @@ impl DirectSyscalls {
             };
             result
         };
+        if self.terminal_stop.get() && !pending.terminal_job {
+            if let Some(subscription) = self
+                .terminal_task
+                .as_ref()
+                .and_then(|task| task.subscribe_job(&pending.signal))
+            {
+                pending.terminal_job = true;
+                pending._subscriptions.push(subscription);
+                // Subscribe, then recheck the actual tty/job state: a CONT
+                // between the first stop and registration must not be lost.
+                return self.resume_inner_in(pending, memory, checkpoint_pipe, original_paths);
+            }
+        }
         match result {
             Err(Errno(11)) => {
-                if (matches!(pending.number, 63..=66 | 206 | 207 | 210..=212 | 269)
-                    && pending.retained_byte.as_ref().map_or_else(
-                        || {
-                            pending.native_tcp.as_ref().map_or_else(
-                                || self.nonblocking(pending.number, pending.args),
-                                |fd| fd.nonblocking(),
-                            )
-                        },
-                        |file| file.fd.nonblocking(),
-                    ))
-                    || pending.external_wait()
-                        && pending.deadline.is_some_and(|d| Instant::now() >= d)
+                if !self.terminal_stop.get()
+                    && ((matches!(pending.number, 63..=66 | 206 | 207 | 210..=212 | 269)
+                        && pending.retained_byte.as_ref().map_or_else(
+                            || {
+                                pending.native_tcp.as_ref().map_or_else(
+                                    || self.nonblocking(pending.number, pending.args),
+                                    |fd| fd.nonblocking(),
+                                )
+                            },
+                            |file| file.fd.nonblocking(),
+                        ))
+                        || pending.external_wait()
+                            && pending.deadline.is_some_and(|d| Instant::now() >= d))
                 {
                     return self.complete_pending(&pending, Err(Errno(11)), memory);
                 }
@@ -1811,7 +1907,7 @@ impl DirectSyscalls {
                 }
             };
             return match self.transfer_fd(&file.fd, number, args, memory)? {
-                Err(Errno(11)) if !file.fd.nonblocking() => None,
+                Err(Errno(11)) if self.terminal_stop.get() || !file.fd.nonblocking() => None,
                 result => {
                     let result = self.byte_pipe_signal(&file.fd, number, args, result);
                     self.complete_byte(&file, result);

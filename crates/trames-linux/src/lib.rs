@@ -36,7 +36,9 @@ mod poll;
 pub use event_wait::{event_wait, wait_mask, RetainedWait};
 mod pty;
 pub use poll::{RetainedPoll, RetainedSelect};
-pub use pty::{pty_control, pty_control_request};
+pub use pty::{
+    pty_control, pty_control_request, terminal_control, terminal_query, terminal_query_request,
+};
 mod record_locks;
 mod state;
 mod syslog;

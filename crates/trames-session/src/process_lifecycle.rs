@@ -880,7 +880,7 @@ mod tests {
                 foreign.cpu.set_x(8, 93);
                 foreign.cpu.set_x(0, 7);
                 foreign.tgid = 4;
-                foreign.group = 4;
+                foreign.set_group(4);
                 let foreign_family = foreign.family.clone();
                 k.processes.insert(1, root);
                 k.processes.insert(4, foreign);

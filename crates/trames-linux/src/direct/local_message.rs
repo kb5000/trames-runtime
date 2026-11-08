@@ -228,6 +228,7 @@ impl DirectSyscalls {
         memory: &mut impl CpuMemory,
         original_paths: Option<&trames_vfs::Vfs>,
     ) -> Option<Result<u64, Errno>> {
+        self.terminal_stop.set(false);
         if let ByteOperation::Signal(read) = &file.operation {
             return Some(read.check(&file.fd, memory));
         }

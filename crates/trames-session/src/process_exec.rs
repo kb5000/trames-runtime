@@ -145,6 +145,7 @@ impl<C: Cpu> Kernel<C> {
         p.space.retire();
         p.space = Default::default();
         let old_memory = std::mem::replace(&mut p.memory, runtime.memory);
+        p.family.mark_exec();
         p.signals.exec();
         p.membarrier_registered = Arc::new(std::sync::atomic::AtomicBool::new(false));
         p.state = State::Ready;
@@ -432,7 +433,7 @@ mod tests {
         p.linux.vfs.credentials = trames_vfs::Credentials::user(1000, 1000);
         k.publish_task(1, &p);
         let mut peer = p.fork();
-        peer.signals.io.share_process(&p.signals.io);
+        peer.share_process_context(&p);
         peer.bind_signals();
         peer.seccomp.inherit(
             &p.seccomp,

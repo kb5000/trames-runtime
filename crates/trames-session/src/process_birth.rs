@@ -69,7 +69,7 @@ impl Birth {
             &p.family,
             trames_kernel::family::Binding {
                 id,
-                group: p.group,
+                group: p.group(),
                 credentials: p.signals.io.credentials().clone(),
                 namespace: p.linux.vfs.pid_namespace().clone(),
                 child: p.wait_event.clone(),
@@ -109,19 +109,29 @@ impl Birth {
             .io_directory
             .parents
             .publish(&p.signals.io, id, &p.parentage);
-        p.signals.io.retain_pid_references(
-            p.linux.vfs.pid_namespace(),
-            [id, p.tgid, p.group, p.session],
-        );
-        p.signals.io.set_session(p.session);
+        if p.signals.io.session() == 0 {
+            p.signals.io.set_session(p.session());
+        }
+        p.signals
+            .io
+            .lifecycle()
+            .bind_controlling(&p.linux.vfs.controlling_state());
         p.signals.io_directory.publish(
             &p.signals.io,
             id,
             p.tgid,
-            p.group,
+            p.group(),
             p.linux.vfs.credentials.uid,
             p.linux.vfs.credentials.suid,
         );
+        p.linux.vfs.bind_terminal_task(|| {
+            let task = p
+                .signals
+                .io_directory
+                .terminal_task(&p.signals.io, p.linux.vfs.pid_namespace());
+            p.signals.io.bind_terminal_task(&task);
+            task
+        });
     }
     pub(super) fn publish_proc<C: Cpu>(&self, pid: u32, p: &Process<C>) {
         let Some(source) = &self.proc_source else {
@@ -164,12 +174,22 @@ impl Birth {
         id: u32,
         child: &mut Process<C>,
         threaded: bool,
+        inherit_job: bool,
     ) -> Result<(), Errno> {
         let family = child.family.clone();
         let mut cgroup_birth = None;
         let result = self.families.birth(&family, || {
             if !parent_control.permits_birth() {
                 return Err(Errno(4));
+            }
+            if inherit_job && !threaded {
+                let (group, session) = parent_control.job_ids();
+                child.set_group(group);
+                child.set_session(session);
+                child
+                    .linux
+                    .vfs
+                    .inherit_controlling(parent_control.controlling().as_deref());
             }
             let birth = child.linux.vfs.activate_child_birth(parent, id, child.tgid);
             let admitted = birth.result();
@@ -180,7 +200,7 @@ impl Birth {
             self.publish_task_core(id, child);
             let binding = (!threaded).then(|| trames_kernel::family::Binding {
                 id,
-                group: child.group,
+                group: child.group(),
                 credentials: child.signals.io.credentials().clone(),
                 namespace: child.linux.vfs.pid_namespace().clone(),
                 child: child.wait_event.clone(),
@@ -281,7 +301,7 @@ impl Birth {
             child.children = p.children.clone();
             child.wait_event = p.wait_event.clone();
             child.oom = Arc::new(p.oom.thread());
-            child.signals.io.share_process(&p.signals.io);
+            child.share_process_context(p);
             child.family = p.family.clone();
             child.limits = p.limits.clone();
             child.limits.bind(&mut child.linux.vfs);
@@ -331,7 +351,14 @@ impl Birth {
             &child.linux.vfs.credentials.caps.no_new_privs,
             &p.linux.vfs.credentials.caps.no_new_privs,
         );
-        self.admit_child(pid, p.signals.io.lifecycle(), id, &mut child, threaded)?;
+        self.admit_child(
+            pid,
+            p.signals.io.lifecycle(),
+            id,
+            &mut child,
+            threaded,
+            true,
+        )?;
         // Linux stores these user TIDs after task birth and ignores
         // copyout faults. CHILD_CLEARTID only records its address.
         let parent_tid = p.linux.vfs.visible_pid(id);

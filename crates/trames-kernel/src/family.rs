@@ -21,6 +21,7 @@ pub struct Family {
     parent: AtomicU32,
     subreaper: AtomicBool,
     live: AtomicBool,
+    execed: AtomicBool,
     metadata: AtomicU64,
     credential_identity: AtomicUsize,
     presence: AtomicUsize,
@@ -36,6 +37,7 @@ impl Default for Family {
             parent: AtomicU32::new(0),
             subreaper: AtomicBool::new(false),
             live: AtomicBool::new(true),
+            execed: AtomicBool::new(false),
             metadata: AtomicU64::new(u64::MAX),
             credential_identity: AtomicUsize::new(0),
             presence: AtomicUsize::new(0),
@@ -47,6 +49,12 @@ impl Default for Family {
     }
 }
 impl Family {
+    pub fn execed(&self) -> bool {
+        self.execed.load(Ordering::Relaxed)
+    }
+    pub fn mark_exec(&self) {
+        self.execed.store(true, Ordering::Relaxed);
+    }
     pub fn parent(&self) -> u32 {
         self.parent.load(Ordering::Relaxed)
     }
@@ -98,7 +106,15 @@ struct State {
     entries: BTreeMap<u32, Entry>,
 }
 impl State {
-    fn publish(&mut self, family: &Arc<Family>, binding: Binding) -> Vec<crate::children::Notice> {
+    fn publish(
+        &mut self,
+        family: &Arc<Family>,
+        mut binding: Binding,
+    ) -> Vec<crate::children::Notice> {
+        let group = binding.control.job_ids().0;
+        if group != 0 {
+            binding.group = group;
+        }
         let metadata = binding.group as u64;
         let id = binding.id;
         let presence = binding.presence.identity();
@@ -241,6 +257,33 @@ impl Families {
             notice.notify();
         }
         Ok(value)
+    }
+    /// Original job membership changes serialize with family birth/reparenting.
+    /// The operation touches only shared task/index resources, never CPU bytes.
+    pub fn job_change<R>(
+        &self,
+        operation: impl FnOnce() -> Result<(Arc<Family>, u32, R), trames_vfs::Errno>,
+    ) -> Result<R, trames_vfs::Errno> {
+        let (notices, result) = {
+            let mut state = self.0.lock().unwrap();
+            let (family, group, result) = operation()?;
+            let entry = state.original(&family).expect("original job family");
+            let id = entry.binding.id;
+            let parent = entry.parent.upgrade();
+            state.entries.get_mut(&id).unwrap().binding.group = group;
+            family.metadata.store(group as u64, Ordering::Relaxed);
+            (state.attach(id, parent), result)
+        };
+        for notice in notices {
+            notice.notify();
+        }
+        Ok(result)
+    }
+    /// Session-wide TTY transitions share birth/reparent exclusion. Ordinary
+    /// terminal bytes and signals never acquire this structural lock.
+    pub(crate) fn terminal_change<R>(&self, operation: impl FnOnce() -> R) -> R {
+        let _state = self.0.lock().unwrap();
+        operation()
     }
     pub fn prune(&self) {
         let removed = {

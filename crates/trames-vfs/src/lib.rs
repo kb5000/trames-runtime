@@ -133,7 +133,10 @@ pub use proc_source::{
 };
 mod pty;
 pub mod terminal;
-pub use pty::{Pty, PtyEnd, PtyIo, PtySlaveEndpoint, TerminalAccess};
+pub use pty::{
+    ControllingTerminal, Pty, PtyEnd, PtyIo, PtySlaveEndpoint, TerminalAccess, TerminalIo,
+    TerminalSignals, TerminalTask,
+};
 mod storage;
 #[cfg(test)]
 mod storage_tests;
@@ -763,8 +766,8 @@ pub struct Vfs {
     source_observed: Cell<Option<proc_source::Observation>>,
     ptys: Arc<std::sync::Mutex<BTreeMap<u32, std::sync::Weak<Pty>>>>,
     embedding_terminal: Arc<std::sync::atomic::AtomicBool>,
-    pub controlling_terminal: Option<u32>,
-    controlling_pair: Option<Arc<Pty>>,
+    controlling: std::sync::OnceLock<Arc<pty::ControllingTerminal>>,
+    terminal_task: std::sync::OnceLock<Arc<dyn pty::TerminalTask>>,
     bridge: Option<trames_bridge::Broker>,
 }
 impl Clone for Vfs {
@@ -847,8 +850,10 @@ impl Vfs {
             source_observed: Cell::new(None),
             ptys: self.ptys.clone(),
             embedding_terminal: self.embedding_terminal.clone(),
-            controlling_terminal: self.controlling_terminal,
-            controlling_pair: self.controlling_pair.clone(),
+            controlling: self.controlling.get().map_or_else(Default::default, |s| {
+                std::sync::OnceLock::from(Arc::new(s.fork()))
+            }),
+            terminal_task: Default::default(),
             bridge: self.bridge.clone(),
         }
     }
@@ -891,8 +896,8 @@ impl Vfs {
             pid: 1,
             ptys: Arc::default(),
             embedding_terminal: Arc::default(),
-            controlling_terminal: None,
-            controlling_pair: None,
+            controlling: Default::default(),
+            terminal_task: Default::default(),
             lock_owner: 1,
             record_locks: Arc::default(),
             file_size_limit: FileSizeLimit::default(),
@@ -1275,7 +1280,8 @@ impl Vfs {
     }
     pub fn enable_terminal(&mut self) -> Result<()> {
         self.embedding_terminal.store(true, Ordering::Relaxed);
-        self.controlling_terminal = Some(0);
+        self.set_controlling_terminal(Some(0))
+            .expect("embedding terminal");
         if self.node(b"/dev/tty").is_err() {
             self.insert(b"/dev/tty".to_vec(), Content::Terminal, 0o20666)?;
         }
@@ -2361,19 +2367,23 @@ impl Vfs {
                     if flags & O_PATH == 0 && matches!(n.content, Content::Symlink(_)) {
                         return Err(Errno(if flags & O_DIRECTORY != 0 { 20 } else { 40 }));
                     }
-                    let pty = p
-                        .mount
-                        .as_ref()
-                        .is_some_and(|m| m.devpts.is_some() && m.shared_resources().is_some())
+                    let pty = (self.terminal_task.get().is_some()
+                        || p.mount
+                            .as_ref()
+                            .is_some_and(|m| m.devpts.is_some() && m.shared_resources().is_some()))
                         && flags & O_PATH == 0
                         && match n.content {
                             Content::Device(pseudo::Device::Ptmx) => true,
-                            // Opening a slave may acquire a controlling terminal.
-                            // That task transition keeps its original joined path.
-                            Content::Device(pseudo::Device::Pts(_, _)) => flags & 0x100 != 0,
+                            Content::Device(pseudo::Device::Pts(_, _)) => {
+                                flags & 0x100 != 0 || self.terminal_task.get().is_some()
+                            }
                             _ => false,
                         };
+                    let controlling_tty = matches!(n.content, Content::Terminal)
+                        && self.terminal_task.get().is_some()
+                        && self.controlling_terminal() != Some(0);
                     if !pty
+                        && !controlling_tty
                         && node.simple_device.is_none()
                         && oom.is_none()
                         && network_control.is_none()
@@ -2560,7 +2570,7 @@ impl Vfs {
                     }
                     Some(PtyEnd::new(pair, false))
                 }
-                Content::Terminal => match self.controlling_terminal {
+                Content::Terminal => match self.controlling_terminal() {
                     None => return Err(Errno(6)),
                     Some(0) => None,
                     Some(id) => {
@@ -2595,6 +2605,10 @@ impl Vfs {
         let cgroup_control = self
             .cgroup_file(&p, &node)?
             .map(events::SharedControl::Cgroup);
+        let automatic_terminal = pty
+            .as_ref()
+            .filter(|end| !end.master && flags & 0x100 == 0)
+            .cloned();
         let descriptor = Descriptor {
             open: OpenHandle::new(OpenDescription {
                 shared: Arc::new(SharedOpenDescription {
@@ -2673,7 +2687,12 @@ impl Vfs {
         if let Some(files) = publication {
             files.publish_open(self, &descriptor.open.borrow());
         }
-        reservation.publish(descriptor, self.query.is_none().then_some(&self.fds))
+        let number = reservation.publish(descriptor, self.query.is_none().then_some(&self.fds))?;
+        if let (Some(end), Some(task)) = (automatic_terminal, self.terminal_task()) {
+            end.pair.bind_signal_route(task.clone());
+            let _ = task.acquire(&end.pair, false, flags & 3 != 1, true);
+        }
+        Ok(number)
     }
     pub fn close(&mut self, fd: u32) -> Result<()> {
         if let Some(result) = self.fds.membership().close(fd, self.lock_owner) {

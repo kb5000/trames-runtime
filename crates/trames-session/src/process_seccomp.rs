@@ -1114,7 +1114,7 @@ mod tests {
     }
     fn join(parent: &Process<Cpu>, child: &mut Process<Cpu>, id: u32) {
         child.tgid = parent.tgid;
-        child.signals.io.share_process(&parent.signals.io);
+        child.share_process_context(parent);
         child.bind_signals();
         child.seccomp.inherit(
             &parent.seccomp,
@@ -1773,7 +1773,7 @@ mod tests {
             peer.family = subject.family.clone();
             peer.children = subject.children.clone();
             peer.wait_event = subject.wait_event.clone();
-            peer.signals.io.share_process(&subject.signals.io);
+            peer.share_process_context(&subject);
             peer.cpu = Cpu::new(0x4004, 0x9000);
             let mut foreign = process();
             foreign

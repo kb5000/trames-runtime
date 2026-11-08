@@ -646,7 +646,7 @@ impl<C: Cpu> Starter<C> {
                                                 let interrupted=if let Some(wait)=&pending.retained_poll {
                                                     wait.finish(work.memory.as_deref_mut().expect("signal View"),Err(trames_vfs::Errno(4)))
                                                 }else{Err(trames_vfs::Errno(4))};
-                                                if action.flags & 0x10000000 != 0 && matches!(pending.number, 25 | 32 | 63..=66 | 71 | 76 | 206 | 207 | 211 | 212 | 269) && pending.deadline.is_none() {
+                                                if action.flags & 0x10000000 != 0 && matches!(pending.number, 25 | 29 | 32 | 63..=66 | 71 | 76 | 206 | 207 | 211 | 212 | 269) && pending.deadline.is_none() {
                                                     for (i, value) in pending.args.iter().enumerate() { work.cpu.set_x(i, *value); }
                                                     work.cpu.set_pc(work.cpu.pc().wrapping_sub(4));
                                                 } else { work.cpu.set_x(0, 0u64.wrapping_sub(interrupted.err().unwrap().0 as u64)); }

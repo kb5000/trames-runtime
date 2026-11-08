@@ -766,7 +766,7 @@ impl Snapshot {
         // futex/epoll checkpoint. Ordinary unfiltered calls keep the old path.
         if !matches!(
             cpu.x(8) as u32,
-            25 | 101 | 113..=115 | 124 | 139 | 163 | 164 | 261 | 166 | 168 | 172..=178 | 278
+            25 | 101 | 113..=115 | 124 | 139 | 154..=157 | 163 | 164 | 261 | 166 | 168 | 172..=178 | 278
         ) && !(cpu.x(8) as u32 == 29 && matches!(cpu.x(1) as u32, 0x5421 | 0x5452))
             && !(matches!(cpu.x(8) as u32, 160..=162) && self.uts.is_some())
             && !(cpu.x(8) as u32 == 32 && (cpu.x(1) as u32 & 4 != 0 || cpu.x(1) as u32 == 8))
@@ -815,6 +815,11 @@ impl Snapshot {
             }
         }
         let result = match cpu.x(8) as u32 {
+            number @ 154..=157 => self.io_routes.job_call(
+                &self.io_signals,
+                number,
+                std::array::from_fn(|i| cpu.x(i)),
+            )?,
             number if trames_kernel::scheduling::call(number) => self.io_routes.scheduling(
                 &self.io_signals,
                 self.cpus,

@@ -200,8 +200,8 @@ impl<C: Cpu> Process<C> {
             pid,
             tgid: self.tgid,
             parent: self.family.parent(),
-            group: self.group,
-            session: self.session,
+            group: self.group(),
+            session: self.session(),
             state: if self.stopped() && !matches!(self.state, State::Zombie(_)) {
                 'T'
             } else {
@@ -214,7 +214,7 @@ impl<C: Cpu> Process<C> {
             credentials: self.linux.vfs.credentials.clone(),
             namespaces: self.linux.vfs.namespace_snapshot(),
             namespace_projection: None,
-            namespace_ids: [self.tgid, pid, self.group, self.session]
+            namespace_ids: [self.tgid, pid, self.group(), self.session()]
                 .map(|id| self.linux.vfs.pid_namespace().hierarchy(id)),
             command: self.linux.command_name.clone(),
             cgroup: self.linux.vfs.cgroup_path(pid),
@@ -246,8 +246,8 @@ impl<C: Cpu> Process<C> {
             scheduler: self.signals.io.scheduling.policy(),
             user_ticks: (self.cpu_time.as_millis() / 10) as u64,
             start_ticks: (self.started.saturating_duration_since(origin).as_millis() / 10) as u64,
-            terminal: self.linux.vfs.controlling_terminal.is_some(),
-            terminal_number: self.linux.vfs.controlling_terminal.unwrap_or(0),
+            terminal: self.linux.vfs.controlling_terminal().is_some(),
+            terminal_number: self.linux.vfs.controlling_terminal().unwrap_or(0),
             fds: if demand.descriptors() {
                 self.linux.vfs.fd_snapshot()
             } else {

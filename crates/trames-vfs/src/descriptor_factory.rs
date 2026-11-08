@@ -12,6 +12,7 @@ pub struct DescriptorFactory {
     credentials: Credentials,
     local_identity: [u32; 3],
     pid_namespace: PidNamespace,
+    terminal_task: Option<Arc<dyn pty::TerminalTask>>,
     devices: cgroup::DeviceAuthority,
     pub(super) cgroups: Arc<SharedCell<cgroup::Cgroups>>,
 }
@@ -29,6 +30,7 @@ impl Vfs {
             credentials: self.credentials.clone(),
             local_identity: self.local_sender_credentials(),
             pid_namespace: self.pid_namespace().clone(),
+            terminal_task: self.terminal_task(),
             devices: self.device_access(),
             cgroups: self.cgroups.clone(),
         }
@@ -113,7 +115,14 @@ impl DescriptorFactory {
             self.devices.check(node.mode, device.rdev(), 6)?;
         }
         let descriptor = pty::peer_descriptor(end, flags, self.open_id(), self.owner);
-        reservation.publish(descriptor, None)
+        let number = reservation.publish(descriptor, None)?;
+        if let Some(task) = &self.terminal_task {
+            end.pair.bind_signal_route(task.clone());
+            if flags & 0x100 == 0 {
+                let _ = task.acquire(&end.pair, false, true, true);
+            }
+        }
+        Ok(number)
     }
     /// Signals belong to the reading task, while the mask belongs to this OFD.
     /// None defers an owner-only type before any mask or membership effects.

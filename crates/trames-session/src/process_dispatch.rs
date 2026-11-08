@@ -241,13 +241,7 @@ impl Dispatch {
                     .with_network(network_epoch.capture(&p.linux.vfs))
                     .with_clock(self.started)
                     .with_boot_clock(p.linux.boot_clock())
-                    .with_terminal(trames_vfs::TerminalAccess {
-                        session: p.session,
-                        group: p.group,
-                        controlling: p.linux.vfs.controlling_terminal,
-                        ignore_ttou: p.signals.mask & (1 << 21) != 0
-                            || p.signals.actions.get(22).handler == 1,
-                    })
+                    .with_terminal_task(p.linux.vfs.terminal_task())
                     .with_files(direct_files)
                     .with_lock_context(p.linux.vfs.record_lock_context(p.tgid))
                     .with_signal_reader(p.signals.reader(p.linux.vfs.pid_namespace())),

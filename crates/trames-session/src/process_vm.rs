@@ -347,15 +347,22 @@ impl<C: Cpu> Kernel<C> {
             {
                 return Ok(true);
             }
-            if root.linux.vfs.live_ptys().iter().any(|pair| {
-                pair.host_resize_pending
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    || pair.host_signals.load(std::sync::atomic::Ordering::Relaxed) != 0
-                    || !pair.master_alive.load(std::sync::atomic::Ordering::Relaxed)
-                        && !pair
-                            .hangup_notified
-                            .load(std::sync::atomic::Ordering::Relaxed)
-            }) {
+            if root
+                .linux
+                .vfs
+                .live_ptys()
+                .iter()
+                .filter(|pair| !pair.has_signal_route())
+                .any(|pair| {
+                    pair.host_resize_pending
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        || pair.host_signals.load(std::sync::atomic::Ordering::Relaxed) != 0
+                        || !pair.master_alive.load(std::sync::atomic::Ordering::Relaxed)
+                            && !pair
+                                .hangup_notified
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                })
+            {
                 return Ok(true);
             }
         }

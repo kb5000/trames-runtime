@@ -8,17 +8,20 @@ use crate::{
 use std::{
     collections::BTreeMap,
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc, Mutex, Weak,
     },
 };
 
 #[derive(Default)]
 pub struct Group {
+    job_ids: AtomicU64,
+    controlling: std::sync::OnceLock<Weak<trames_vfs::ControllingTerminal>>,
     stopped: AtomicBool,
     termination: AtomicU32,
     state: Mutex<State>,
     exit_ready: Arc<trames_shared::Readiness>,
+    job_ready: std::sync::OnceLock<Arc<trames_shared::Readiness>>,
 }
 #[derive(Default)]
 struct State {
@@ -108,6 +111,36 @@ impl State {
     }
 }
 impl Group {
+    pub fn job_ids(&self) -> (u32, u32) {
+        let ids = self.job_ids.load(Ordering::Relaxed);
+        (ids as u32, (ids >> 32) as u32) // process group, session
+    }
+    pub fn set_job_ids(&self, group: u32, session: u32) {
+        self.job_ids
+            .store(group as u64 | (session as u64) << 32, Ordering::Relaxed);
+    }
+    pub fn set_job_group(&self, group: u32) {
+        let _ = self
+            .job_ids
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |ids| {
+                Some((ids & !(u32::MAX as u64)) | group as u64)
+            });
+    }
+    pub fn set_job_session(&self, session: u32) {
+        let _ = self
+            .job_ids
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |ids| {
+                Some((ids & u32::MAX as u64) | (session as u64) << 32)
+            });
+    }
+    pub fn bind_controlling(&self, controlling: &Arc<trames_vfs::ControllingTerminal>) {
+        self.controlling.get_or_init(|| Arc::downgrade(controlling));
+    }
+    pub fn controlling(&self) -> Option<Arc<trames_vfs::ControllingTerminal>> {
+        self.controlling.get()?.upgrade()
+    }
+}
+impl Group {
     pub fn survivor(&self) -> Option<(u32, Arc<IoTask>)> {
         self.state
             .lock()
@@ -184,6 +217,9 @@ impl Group {
             task.wake_control();
         }
         self.exit_ready.notify_atomic();
+        if let Some(ready) = self.job_ready.get() {
+            ready.notify_atomic();
+        }
         status
     }
     /// Original terminal state also wakes dormant members' existing executor.
@@ -197,6 +233,12 @@ impl Group {
             signal.notify();
         }
         subscription
+    }
+    pub fn subscribe_job(
+        &self,
+        signal: &Arc<trames_shared::IoSignal>,
+    ) -> trames_shared::IoSubscription {
+        self.job_ready.get_or_init(Arc::default).subscribe(signal)
     }
     pub fn termination(&self) -> Option<i32> {
         self.termination
@@ -489,6 +531,11 @@ impl Group {
         if signal == 18 {
             for task in tasks {
                 task.wake_control();
+            }
+        }
+        if matches!(signal, 9 | 18) {
+            if let Some(ready) = self.job_ready.get() {
+                ready.notify_atomic();
             }
         }
         value

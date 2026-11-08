@@ -502,6 +502,7 @@ impl DirectSyscalls {
                 resource_deadline: None,
                 retained_poll: None,
                 epoll_revision: None,
+                terminal_job: false,
                 _subscriptions: subscriptions,
                 host_subscription: None,
                 socket_subscriptions: Vec::new(),

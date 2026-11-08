@@ -1008,6 +1008,32 @@ impl DirectFd {
             _ => None,
         }
     }
+    pub fn terminal_read_live(
+        &self,
+        count: usize,
+        task: &dyn pty::TerminalTask,
+    ) -> pty::TerminalIo<Vec<u8>> {
+        if self.flags & O_PATH != 0 || self.flags & 3 == 1 {
+            return pty::TerminalIo::Complete(Err(Errno(9)));
+        }
+        let ByteResource::Pty { data, master } = &self.resource else {
+            unreachable!("PTY read authority");
+        };
+        data.read_live(*master, count, task)
+    }
+    pub fn terminal_write_live(
+        &self,
+        bytes: &[u8],
+        task: &dyn pty::TerminalTask,
+    ) -> pty::TerminalIo<usize> {
+        if self.flags & O_PATH != 0 || self.flags & 3 == 0 {
+            return pty::TerminalIo::Complete(Err(Errno(9)));
+        }
+        let ByteResource::Pty { data, master } = &self.resource else {
+            unreachable!("PTY write authority");
+        };
+        data.write_live(*master, bytes, task)
+    }
     pub fn timer(&self) -> Option<&TimerFd> {
         if let ByteResource::Timer(timer) = &self.resource {
             Some(timer)

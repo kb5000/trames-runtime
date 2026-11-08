@@ -921,7 +921,7 @@ fn owner_control(v: &mut trames_vfs::Vfs) -> u32 {
     v.open_at(-100, b"/proc/sys/net/ipv4/ip_forward", 2, 0)
         .unwrap()
 }
-fn program(p: &mut Process<Interpreter>, code: Vec<u32>) {
+pub(super) fn program(p: &mut Process<Interpreter>, code: Vec<u32>) {
     for (i, word) in code.into_iter().enumerate() {
         p.memory
             .write_array(0x4000 + i as u64 * 4, word.to_le_bytes())
@@ -933,10 +933,10 @@ fn program(p: &mut Process<Interpreter>, code: Vec<u32>) {
     p.cpu = Interpreter::new(0x4000, 0);
     p.signals.io.scheduling.set_affinity(1);
 }
-fn mov(rd: u32, value: u32) -> u32 {
+pub(super) fn mov(rd: u32, value: u32) -> u32 {
     0xd2800000 | (value << 5) | rd
 }
-fn filter(k: &mut Kernel<Interpreter>, p: &mut Process<Interpreter>, value: u32) {
+pub(super) fn filter(k: &mut Kernel<Interpreter>, p: &mut Process<Interpreter>, value: u32) {
     p.memory.write(0x1700, &[6, 0, 0, 0]).unwrap();
     p.memory.write(0x1704, &value.to_le_bytes()).unwrap();
     p.memory.write(0x1600, &1u16.to_le_bytes()).unwrap();
@@ -1576,8 +1576,8 @@ fn joined_pty_wait_and_signal_handoff_keep_accepted_endpoints_after_fd_reuse() {
     pair.locked
         .store(false, std::sync::atomic::Ordering::Relaxed);
     let slave = p.linux.vfs.open_pty_peer(master, 2).unwrap();
-    p.session = 1;
-    p.group = 1;
+    p.set_session(1);
+    p.set_group(1);
     p.linux.vfs.set_controlling_terminal(Some(pair.id)).unwrap();
     {
         let mut tty = pair.terminal.borrow_mut();
@@ -1623,7 +1623,7 @@ fn joined_pty_wait_and_signal_handoff_keep_accepted_endpoints_after_fd_reuse() {
     p.retained_byte = Some(accepted);
     k.call(1, &mut p, 64, write, &mut output);
     assert_eq!(p.cpu.x(0), 1);
-    assert!(p.signals.io.inbox.contains_key(&2));
+    assert!(p.signals.io.process().contains_key(&2));
     assert!(p.retained_byte.is_none());
     assert!(!pair.master_alive.load(std::sync::atomic::Ordering::Relaxed));
 }

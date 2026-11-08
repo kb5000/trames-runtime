@@ -124,6 +124,7 @@ fn group_and_session_members_retain_identity_after_leader_task_retires() {
     member
         .io
         .retain_pid_references(namespace, [201, 201, 201, 200]);
+    member.io.set_group(201);
     member.io_directory.publish(&member.io, 201, 201, 201, 0, 0);
     assert_eq!(init.visible_pid(200), 2);
     member

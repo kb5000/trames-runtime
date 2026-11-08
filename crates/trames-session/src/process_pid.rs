@@ -54,9 +54,12 @@ impl<C: Cpu> Kernel<C> {
     }
     pub(super) fn waitid(&mut self, p: &mut Process<C>, a: [u64; 6]) -> Result<Option<u64>, Errno> {
         let request = trames_kernel::children::Wait::prepare(95, a)?;
-        let result = p
-            .children
-            .wait(request, p.linux.vfs.pid_namespace(), p.group, &mut p.memory);
+        let result = p.children.wait(
+            request,
+            p.linux.vfs.pid_namespace(),
+            p.group(),
+            &mut p.memory,
+        );
         if p.children.take_reaped() {
             self.reap_waited();
         }

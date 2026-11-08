@@ -12,10 +12,14 @@ use std::{
 use trames_vfs::{AsyncOwner, AsyncOwners, IoSignal, PidNamespace};
 #[path = "io_guest.rs"]
 mod guest;
+#[path = "io_job.rs"]
+mod job;
 #[path = "io_proc.rs"]
 mod proc_views;
 #[path = "io_scheduling.rs"]
 mod scheduling;
+#[path = "io_terminal.rs"]
+mod terminal;
 
 pub struct Inbox {
     pending: Mutex<Pending>,
@@ -198,7 +202,8 @@ pub struct IoTask {
     thread_addresses: std::sync::OnceLock<Arc<trames_execution::ThreadAddresses>>,
     parentage: std::sync::OnceLock<Arc<crate::task_parent::Parentage>>,
     family: std::sync::OnceLock<Arc<crate::family::Family>>,
-    session: AtomicU32,
+    terminal_task: std::sync::OnceLock<Weak<dyn trames_vfs::TerminalTask>>,
+    published_session: AtomicU32,
     pub context: Mutex<IoContext>,
     mask: AtomicU64,
     live: AtomicBool,
@@ -206,7 +211,7 @@ pub struct IoTask {
     policy: RwLock<Option<Policy>>,
     pid: AtomicU32,
     tgid: AtomicU32,
-    group: AtomicU32,
+    published_group: AtomicU32,
     pid_references: Mutex<[Option<trames_vfs::PidReference>; 4]>,
     wake: Mutex<Weak<IoSignal>>,
 }
@@ -225,7 +230,8 @@ impl Default for IoTask {
             thread_addresses: Default::default(),
             parentage: Default::default(),
             family: Default::default(),
-            session: AtomicU32::new(0),
+            terminal_task: Default::default(),
+            published_session: AtomicU32::new(0),
             context: Default::default(),
             mask: AtomicU64::new(0),
             live: AtomicBool::new(true),
@@ -233,7 +239,7 @@ impl Default for IoTask {
             policy: RwLock::default(),
             pid: AtomicU32::new(0),
             tgid: AtomicU32::new(0),
-            group: AtomicU32::new(0),
+            published_group: AtomicU32::new(0),
             pid_references: Mutex::new(Default::default()),
             wake: Mutex::new(Weak::new()),
         }
@@ -248,8 +254,8 @@ impl IoTask {
                 == [
                     self.pid.load(Ordering::Relaxed),
                     self.tgid(),
-                    self.group(),
-                    self.session(),
+                    self.published_group.load(Ordering::Relaxed),
+                    self.published_session.load(Ordering::Relaxed),
                 ]
         {
             return;
@@ -267,14 +273,17 @@ impl IoTask {
         ) && match kind {
             0 => self.pid.load(Ordering::Relaxed) == id,
             1 => self.tgid() == id,
-            _ => self.group.load(Ordering::Relaxed) == id,
+            _ => self.group() == id,
         }
+    }
+    pub fn set_group(&self, group: u32) {
+        self.lifecycle().set_job_group(group);
     }
     pub fn tgid(&self) -> u32 {
         self.tgid.load(Ordering::Relaxed)
     }
     pub fn group(&self) -> u32 {
-        self.group.load(Ordering::Relaxed)
+        self.lifecycle().job_ids().0
     }
     fn belongs(&self, kind: u32, id: u32) -> bool {
         self.live.load(Ordering::Relaxed) && self.identifies(kind, id)
@@ -320,10 +329,10 @@ impl IoTask {
         }
     }
     pub fn session(&self) -> u32 {
-        self.session.load(Ordering::Relaxed)
+        self.lifecycle().job_ids().1
     }
     pub fn set_session(&self, session: u32) {
-        self.session.store(session, Ordering::Relaxed);
+        self.lifecycle().set_job_session(session);
     }
     pub fn live(&self) -> bool {
         self.live.load(Ordering::Relaxed) && self.presence.get().is_none_or(|p| p.present())
@@ -504,7 +513,19 @@ impl IoTask {
         })
     }
     pub fn finish_exit(self: &Arc<Self>, pid: u32) -> Option<i32> {
-        self.lifecycle().finish_exit(pid, self)
+        let status = self.lifecycle().finish_exit(pid, self);
+        if status.is_some() {
+            if let (Some(task), Some(pair)) = (
+                self.terminal_task.get().and_then(Weak::upgrade),
+                self.lifecycle().controlling().and_then(|c| c.pair()),
+            ) {
+                let _ = task.detach(&pair, true);
+            }
+        }
+        status
+    }
+    pub fn bind_terminal_task(&self, task: &Arc<dyn trames_vfs::TerminalTask>) {
+        self.terminal_task.get_or_init(|| Arc::downgrade(task));
     }
     pub fn reap_thread_presence(&self) {
         if self.pid.load(Ordering::Relaxed) != self.tgid() {
@@ -747,15 +768,28 @@ impl IoDirectory {
         task.credentials().publish_signal_ids(uid, euid);
         if task.pid.load(Ordering::Relaxed) == pid
             && task.tgid.load(Ordering::Relaxed) == tgid
-            && task.group.load(Ordering::Relaxed) == group
+            && task.published_group.load(Ordering::Relaxed) == group
+            && task.published_session.load(Ordering::Relaxed) == task.session()
+            && task.group() == group
         {
             return;
+        }
+        let mut groups = self.groups.lock().unwrap();
+        // Refresh may race a source setpgid/setsid. Published projections must
+        // never overwrite the original job IDs with an earlier observation.
+        if task.tgid() == 0 {
+            task.set_group(group);
+        }
+        let group = task.group();
+        if let Some(namespace) = task.inbox.namespace.get() {
+            task.retain_pid_references(namespace, [pid, tgid, group, task.session()]);
         }
         task.bind_proc_pid(pid);
         task.pid.store(pid, Ordering::Relaxed);
         task.tgid.store(tgid, Ordering::Relaxed);
-        task.group.store(group, Ordering::Relaxed);
-        let mut groups = self.groups.lock().unwrap();
+        task.published_group.store(group, Ordering::Relaxed);
+        task.published_session
+            .store(task.session(), Ordering::Relaxed);
         for key in [(0, pid), (1, tgid), (2, group)] {
             if groups.get(&key).is_some_and(|g| {
                 g.members

@@ -104,13 +104,10 @@ impl IoRoutes {
                         let Some(t) = tasks.first() else { continue };
                         let visible = self.namespace.local(id);
                         if visible != 0
-                            && (target == 0
-                                && t.group.load(Ordering::Relaxed)
-                                    == source.group.load(Ordering::Relaxed)
+                            && (target == 0 && t.group() == source.group()
                                 || target == -1 && visible != 1 && id != source.tgid()
                                 || target < -1
-                                    && self.namespace.local(t.group.load(Ordering::Relaxed))
-                                        == target.unsigned_abs())
+                                    && self.namespace.local(t.group()) == target.unsigned_abs())
                         {
                             groups.push(tasks);
                         }

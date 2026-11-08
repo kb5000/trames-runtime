@@ -121,6 +121,7 @@ impl Authority {
         if file.open.node.as_ref().is_some_and(|n| {
             let state = n.borrow();
             n.simple_device.is_none()
+                && file.open.pty.is_none()
                 && state.volatile
                 && !(n.proc_node.get().is_some()
                     && (file.open.flags.get() & O_PATH != 0
@@ -152,6 +153,7 @@ pub(super) fn ordinary_mount(mount: &Mount) -> bool {
             | mounts::Kind::Cgroup
             | mounts::Kind::Proc
             | mounts::Kind::Sysfs
+            | mounts::Kind::Devpts
             | mounts::Kind::Nsfs
     ) || cfg!(all(feature = "hostfs", unix)) && host_mount(mount)
 }
@@ -177,6 +179,8 @@ impl Vfs {
     pub fn path_queries(&self) -> PathQueries {
         let mut view = Vfs::empty(self.fs.clone());
         view.context.share_paths(&self.context);
+        view.controlling = std::sync::OnceLock::from(self.controlling_state());
+        view.terminal_task = self.terminal_task.clone();
         // Namespace topology is the original synchronized resource. Taking a
         // static graph here would hide mounts made by another live executor.
         view.mounts = self.mounts.clone();
@@ -206,6 +210,7 @@ impl Vfs {
         view.record_locks = self.record_locks.clone();
         view.next_open = self.next_open.clone();
         view.ptys = self.ptys.clone();
+        view.embedding_terminal = self.embedding_terminal.clone();
         view.path_bindings = self.path_bindings.clone();
         {
             let source = self.pseudo.borrow();
