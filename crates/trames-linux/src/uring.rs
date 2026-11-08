@@ -81,10 +81,8 @@ impl Linux {
     }
     pub(crate) fn uring_register(&mut self, a: [u64; 6], memory: &mut Memory) -> Result<u64> {
         let ring = self.vfs.uring(a[0] as u32)?;
-        register(&ring, a, memory, true, |fd| {
-            Some(self.vfs.retain_uring_file(fd))
-        })
-        .expect("owner has original Files and pin authority")
+        register(&ring, a, memory, |fd| Some(self.vfs.retain_uring_file(fd)))
+            .expect("owner has original Files and pin authority")
     }
 
     fn uring_request(
@@ -137,17 +135,15 @@ impl Linux {
         if a[2] > ring.cq_entries as u64 {
             return Err(Errno(22));
         }
-        let execution = self.file_executor.as_ref().map(|disk| {
-            let paths = self.vfs.path_queries();
-            Arc::new(crate::direct::uring::actor::Execution::new(
-                &paths,
-                &self.vfs.descriptor_factory(),
-                &Default::default(),
-                Some(disk.clone()),
-                self.file_layouts.clone(),
-                self.vfs.task_signal(),
-            ))
-        });
+        let paths = self.vfs.path_queries();
+        let execution = Arc::new(crate::direct::uring::actor::Execution::new(
+            &paths,
+            &self.vfs.descriptor_factory(),
+            &Default::default(),
+            self.file_executor.clone(),
+            self.file_layouts.clone(),
+            self.vfs.task_signal(),
+        ));
         let submitted = if let Some(n) = saved {
             n
         } else {
@@ -226,9 +222,7 @@ impl Linux {
                 request.source = Some(Arc::downgrade(
                     &(actor.clone() as Arc<dyn trames_vfs::UringSource>),
                 ));
-                if let Some(context) = &execution {
-                    actor.accept(&ring, &mut request, context.clone());
-                }
+                actor.accept(&ring, &mut request, execution.clone());
                 state.insert(request);
             }
             if consumed == 0 && count != 0 {
@@ -285,7 +279,9 @@ impl Linux {
             &mut |request, memory, selected| {
                 actor
                     .and_then(|actor| actor.execute(ring, request, memory, selected))
-                    .or_else(|| Some(execute::owner(&mut self.vfs, request, memory, selected)))
+                    // Legacy embeddings may have no typed proc/path provider.
+                    // Use the same original-resource body on their solo VFS.
+                    .or_else(|| Some(execute::retained(&mut self.vfs, request, memory, selected)))
             },
         );
         let mut state = ring.state.lock().unwrap();
@@ -434,13 +430,12 @@ pub(crate) fn setup_parameters(
     Ok((entries, cq_entries, output))
 }
 
-/// One registration algorithm over the original ring. Excluded owner controls
-/// and structural pinning defer before publishing any registration change.
+/// One registration algorithm over original OFDs and the original ring.
+/// Structural pinning can defer before any registration change is published.
 pub(crate) fn register(
     ring: &Arc<Uring>,
     a: [u64; 6],
     memory: &mut impl trames_memory::CpuMemory,
-    owner: bool,
     mut accept: impl FnMut(u32) -> Option<Result<trames_vfs::UringFile>>,
 ) -> Option<Result<u64>> {
     let deferred = std::cell::Cell::new(false);
@@ -545,17 +540,6 @@ pub(crate) fn register(
             if a[2] != 0 || a[3] != 0 {
                 return Err(Errno(22));
             }
-            if !owner
-                && state.files.as_ref().is_some_and(|files| {
-                    files
-                        .iter()
-                        .flatten()
-                        .any(|file| file.shared_file().is_none())
-                })
-            {
-                deferred.set(true);
-                return Err(Errno(95));
-            }
             retired_files = Some(state.files.take().ok_or(Errno(6))?);
             Ok(0)
         }
@@ -625,15 +609,6 @@ pub(crate) fn register(
                     }
                     Err(_) => break,
                 }
-            }
-            if !owner
-                && updates.iter().any(|(index, _)| {
-                    files[*index]
-                        .as_ref()
-                        .is_some_and(|file| file.shared_file().is_none())
-                })
-            {
-                deferred.set(true);
             }
             if deferred.get() {
                 return Err(Errno(95));

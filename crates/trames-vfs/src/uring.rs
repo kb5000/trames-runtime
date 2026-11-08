@@ -156,14 +156,12 @@ impl UringFile {
         self.file.ofd_identity()
     }
     pub fn retained(&self) -> RetainedFd {
-        assert!(
-            self.original.is_none(),
-            "owner control needs its original VFS"
-        );
-        self.file.clone().retained()
+        self.original
+            .clone()
+            .unwrap_or_else(|| self.file.clone().retained())
     }
     fn retained_in(&self, _vfs: &Vfs) -> RetainedFd {
-        self.original.clone().unwrap_or_else(|| self.retained())
+        self.retained()
     }
     pub fn same_file(&self, other: &Self) -> bool {
         self.identity() == other.identity()
@@ -172,43 +170,43 @@ impl UringFile {
         self.retained_in(vfs).local_socket(vfs)
     }
     pub fn close_notification(&self) -> Option<Arc<FileClose>> {
-        self.shared_file()?.retained().close_notification()
+        self.retained().close_notification()
     }
     pub fn inotify_instance(&self) -> Option<Arc<InotifyInstance>> {
-        self.shared_file()?.retained().inotify_instance()
+        self.retained().inotify_instance()
     }
     pub fn pipe_endpoint(&self) -> Option<Arc<PipeEndpoint>> {
-        self.shared_file()?.retained().pipe_endpoint()
+        self.retained().pipe_endpoint()
     }
     pub fn direct_byte(&self) -> Option<DirectFd> {
-        self.shared_file()?.retained().direct_byte()
+        self.retained().direct_byte()
     }
     pub fn tcp_lease(&self) -> Option<trames_net::TcpLease> {
-        self.shared_file()?.retained().tcp_lease()
+        self.retained().tcp_lease()
     }
     pub fn socket(&self) -> Option<Arc<NetSocket>> {
         self.file.open.socket.clone()
     }
     pub fn direct_tcp(&self) -> Option<DirectTcpFd> {
-        self.shared_file()?.retained().direct_tcp()
+        self.retained().direct_tcp()
     }
     pub fn kind(&self) -> FdKind {
         self.file.open.kind.clone()
     }
     pub fn stream(&self) -> bool {
-        self.file.clone().retained().stream()
+        self.retained().stream()
     }
     pub fn poll(&self, events: u16) -> u16 {
-        self.file.clone().retained().poll(events)
+        self.retained().poll(events)
     }
     pub fn datagram(&self) -> bool {
-        self.file.clone().retained().datagram()
+        self.retained().datagram()
     }
     pub fn readiness(&self, events: u16) -> (u16, [u64; 2]) {
-        self.file.clone().retained().readiness(events)
+        self.retained().readiness(events)
     }
     pub fn native_wait_fds(&self) -> Vec<HostFd> {
-        self.file.clone().retained().native_wait_fds()
+        self.retained().native_wait_fds()
     }
 }
 impl RetainedFd {
@@ -230,13 +228,18 @@ impl RetainedFd {
     }
     pub fn uring_file(&self) -> Result<UringFile> {
         Self::uring_supported(&self.0.open.borrow())?;
-        self.shared_file()
-            .map(|file| UringFile {
+        Ok(match self.shared_file() {
+            Some(file) => UringFile {
                 lease: None,
                 file,
                 original: None,
-            })
-            .ok_or(Errno(95))
+            },
+            None => UringFile {
+                lease: None,
+                file: SharedFd::new(self.0.open.borrow().shared.clone()),
+                original: Some(self.clone()),
+            },
+        })
     }
 }
 pub trait UringFileView {
@@ -785,16 +788,7 @@ impl Vfs {
             .collect()
     }
     pub fn retain_uring_file(&self, fd: u32) -> Result<UringFile> {
-        let retained = self.retain_uring_fd(fd)?;
-        if retained.shared_file().is_some() {
-            return retained.uring_file();
-        }
-        let file = SharedFd::new(retained.0.open.borrow().shared.clone());
-        Ok(UringFile {
-            lease: None,
-            file,
-            original: Some(retained),
-        })
+        self.retain_uring_fd(fd)?.uring_file()
     }
     pub fn retain_uring_fd(&self, fd: u32) -> Result<RetainedFd> {
         let descriptor = self.descriptor(fd)?;
@@ -805,7 +799,7 @@ impl Vfs {
     /// A private descriptor view lets existing VFS operations act on the exact
     /// retained OFD after close/dup/reuse, without installing a guest-visible FD.
     /// The original table/identity is restored even if a host operation panics.
-    /// Only joined resource operations run here; no guest code/callback runs.
+    /// Only accepted resource operations run here; no guest code/callback runs.
     pub fn with_uring_fd<T>(
         &mut self,
         file: &impl UringFileView,
@@ -837,7 +831,7 @@ impl Vfs {
         struct Restore<'a> {
             vfs: &'a mut Vfs,
             saved: DescriptorTable,
-            retained: Option<(u32, SharedFd)>,
+            retained: Option<(u32, RetainedFd)>,
         }
         impl Drop for Restore<'_> {
             fn drop(&mut self) {
@@ -857,11 +851,7 @@ impl Vfs {
         self.fds.insert(alias, file.0.clone());
         let retained = if let Some(query) = &mut self.query {
             let old = query.retained.take();
-            query.retained = Some((
-                alias,
-                file.shared_file()
-                    .expect("query has shared retained authority"),
-            ));
+            query.retained = Some((alias, file.clone()));
             old
         } else {
             None
@@ -935,5 +925,106 @@ impl DirectPoll for Uring {
 impl Drop for Uring {
     fn drop(&mut self) {
         self.readiness.notify_locked();
+    }
+}
+
+impl SharedFiles {
+    pub fn uring(&self, fd: u32) -> Result<Arc<Uring>> {
+        if let Some(file) = self.lookup(fd) {
+            return file?.uring().ok_or(Errno(9));
+        }
+        let descriptor = self.observation_descriptor(fd)?;
+        let open = descriptor.open.borrow();
+        match &open.anonymous {
+            Some(events::Anonymous::Uring(ring)) => Ok(ring.clone()),
+            _ => Err(Errno(9)),
+        }
+    }
+    /// Capture the original complete OFD outside the membership lock. This
+    /// does not grant byte/path admission to its metadata-only projection.
+    pub fn uring_file(&self, fd: u32) -> Result<UringFile> {
+        if let Some(file) = self.lookup(fd) {
+            return file?.retained().uring_file();
+        }
+        RetainedFd(self.observation_descriptor(fd)?).uring_file()
+    }
+}
+
+#[cfg(test)]
+mod original_tests {
+    use super::*;
+
+    #[test]
+    fn opaque_registration_capture_and_source_query_retain_full_original_after_close_reuse() {
+        for regular in [false, true] {
+            let mut v = Vfs::default();
+            let fd = if regular {
+                let fd = v.open_at(AT_FDCWD, b"/original", 0x42, 0o600).unwrap();
+                v.write(fd, b"original").unwrap();
+                v.seek(fd, 0, 0).unwrap();
+                fd
+            } else {
+                v.eventfd(7, 0).unwrap()
+            };
+            // Exercise an intentionally opaque original rather than granting
+            // body authority by reconstructing it from shared metadata.
+            let descriptor = v.descriptor(fd).unwrap();
+            let open = OpenHandle::Owner(Arc::new(SharedCell::new(
+                OpenDescription::shared_projection(descriptor.open.borrow().shared.clone()),
+            )));
+            let weak = open.downgrade();
+            v.fds.insert(
+                fd,
+                Descriptor {
+                    open,
+                    cloexec: descriptor.cloexec,
+                },
+            );
+            let files = v.shared_files();
+            assert!(files.lookup(fd).is_none());
+            let accepted = files.uring_file(fd).unwrap();
+            assert!(accepted.shared_file().is_none());
+            let (ring_fd, ring) = v.uring_create(4, 8).unwrap();
+            ring.state.lock().unwrap().files = Some(vec![Some(ring.bind_file(&accepted).unwrap())]);
+            drop(accepted);
+            assert_eq!(files.close(fd, 1), Some(Ok(())));
+            assert_eq!(v.eventfd(99, 0).unwrap(), fd);
+            assert!(weak.upgrade().is_some());
+            let paths = v.path_queries();
+            std::thread::spawn(move || {
+                let accepted = ring
+                    .state
+                    .lock()
+                    .unwrap()
+                    .files
+                    .take()
+                    .unwrap()
+                    .pop()
+                    .unwrap()
+                    .unwrap();
+                let bytes = paths
+                    .uring_query(|v| v.with_uring_fd(&accepted, |v, alias| v.read(alias, 8)))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    bytes,
+                    if regular {
+                        b"original".to_vec()
+                    } else {
+                        7u64.to_le_bytes().to_vec()
+                    }
+                );
+                // The temporary alias must not replace the live Files table.
+                assert_eq!(
+                    paths.uring_query(|v| v.read(fd, 8)).unwrap().unwrap(),
+                    99u64.to_le_bytes()
+                );
+                drop(accepted);
+            })
+            .join()
+            .unwrap();
+            assert!(weak.upgrade().is_none());
+            v.close(ring_fd).unwrap();
+        }
     }
 }

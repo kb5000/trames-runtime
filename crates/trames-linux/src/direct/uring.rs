@@ -791,8 +791,8 @@ impl UringSnapshot {
     }
 
     fn ring(&self, fd: u32) -> Option<Arc<Ring>> {
-        if let Some(file) = self.membership.as_ref().and_then(|files| files.lookup(fd)) {
-            return file.ok()?.uring();
+        if let Some(files) = &self.membership {
+            return files.uring(fd).ok();
         }
         #[cfg(test)]
         {
@@ -804,10 +804,8 @@ impl UringSnapshot {
         }
     }
     fn accepted_resource(&self, file: &UringFile) -> Option<Resource> {
-        let shared = file.shared_file()?;
-        self.descriptors
-            .as_ref()
-            .and_then(|fds| fds.byte_file(shared))
+        file.shared_file()
+            .and_then(|shared| self.descriptors.as_ref()?.byte_file(shared))
             .map(|f| Resource {
                 object: Object::Byte(f),
                 identity: file.identity(),
@@ -864,11 +862,8 @@ impl UringSnapshot {
             self.record_completed();
             return Some(IoAttempt::Complete(Err(Errno(9))));
         };
-        let result = crate::uring::register(&ring, args, memory, false, |fd| {
-            self.membership
-                .as_ref()?
-                .lookup(fd)
-                .map(|r| r.and_then(|file| file.retained().uring_file()))
+        let result = crate::uring::register(&ring, args, memory, |fd| {
+            Some(self.membership.as_ref()?.uring_file(fd))
         });
         ring.readiness.notify_locked();
         match result {
@@ -946,8 +941,8 @@ impl UringSnapshot {
             {
                 return Some(IoAttempt::Complete(Err(Errno(16))));
             }
-            // Import the complete accepted batch before the first effect. A
-            // mixed/unsupported batch takes the owner path without consuming it.
+            // Import the complete accepted batch before the first effect.
+            // Original opaque OFDs are retained just like ordinary resources.
             let mut metadata = state.inflight_metadata
                 + state.pending.iter().map(Request::metadata).sum::<usize>();
             let mut previous = None;
@@ -966,12 +961,7 @@ impl UringSnapshot {
                     pid,
                     previous,
                     self.clock.unwrap_or_else(Instant::now),
-                    |fd| {
-                        self.membership
-                            .as_ref()?
-                            .lookup(fd)
-                            .map(|r| r.and_then(|file| file.retained().uring_file()))
-                    },
+                    |fd| Some(self.membership.as_ref()?.uring_file(fd)),
                 ) else {
                     return Some(IoAttempt::Checkpoint);
                 };
@@ -987,21 +977,7 @@ impl UringSnapshot {
                     }
                     match bound {
                         Ok(bound) => {
-                            if bound.shared_file().is_none() {
-                                r.file = Some(bound);
-                                prepared.push(Some(r));
-                                return Some(IoAttempt::Checkpoint);
-                            }
                             r.resource = self.accepted_resource(&bound);
-                            if r.resource.is_none()
-                                && !(self.context.get().is_some()
-                                    && bound.shared_file().and_then(|f| f.file_target()).is_some())
-                                && matches!(r.sqe.opcode(), 1 | 2 | 4 | 5 | 22 | 23)
-                            {
-                                r.file = Some(bound);
-                                prepared.push(Some(r));
-                                return Some(IoAttempt::Checkpoint);
-                            }
                             r.file = Some(bound);
                         }
                         Err(error) => {
@@ -1020,11 +996,7 @@ impl UringSnapshot {
                 }
                 let context = matches!(r.sqe.opcode(), 1 | 2 | 4 | 5 | 22 | 23)
                     && (self.context.get().is_some() || r.resource.is_none())
-                    && r.file
-                        .as_ref()
-                        .and_then(|f| f.shared_file())
-                        .and_then(|f| f.file_target())
-                        .is_some()
+                    && r.file.is_some()
                     || matches!(
                         r.sqe.opcode(),
                         3 | 13 | 16 | 17 | 18 | 19 | 21 | 28 | 34 | 45 | 55 | 56 | 57
@@ -1086,10 +1058,20 @@ impl UringSnapshot {
         drop(state);
         let deferred = self.progress(&ring, memory, pid);
         let mut state = ring.state.lock().unwrap();
+        if state
+            .pending
+            .iter()
+            .any(|r| r.owner == self.owner && r.task == pid)
+        {
+            self.actor().track(&ring);
+        }
         let tail = state.tail;
         let count = match ring.flush(&mut state) {
             Ok(count) => count,
-            Err(_) => return Some(IoAttempt::Checkpoint),
+            Err(error) => {
+                state.waits.remove(&pid);
+                return Some(IoAttempt::Complete(Err(error)));
+            }
         };
         let completion_event = ring.completion_event(&state, count);
         let ready = args[3] & 1 == 0
@@ -1099,13 +1081,6 @@ impl UringSnapshot {
         let expired = deadline.is_some_and(|d| Instant::now() >= d);
         if ready || expired {
             state.waits.remove(&pid);
-        }
-        if state
-            .pending
-            .iter()
-            .any(|r| r.owner == self.owner && r.task == pid)
-        {
-            self.actor().track(&ring);
         }
         let changed = tail != state.tail;
         drop(state);
@@ -1160,13 +1135,14 @@ impl UringSnapshot {
     pub(super) fn resume(&self, mut pending: PendingIo, memory: &mut impl CpuMemory) -> IoAttempt {
         pending.signal.reset();
         let wait = pending.uring.as_mut().unwrap();
-        if !wait.sources.refresh(
+        if !wait.sources.prepare(
             std::slice::from_ref(&wait.ring),
             wait.owner,
             wait.task,
             &pending.signal,
             &wait.target,
             &wait.actor,
+            memory,
         ) {
             return IoAttempt::Checkpoint;
         }
@@ -1175,7 +1151,10 @@ impl UringSnapshot {
         let tail = state.tail;
         let count = match wait.ring.flush(&mut state) {
             Ok(count) => count,
-            Err(_) => return IoAttempt::Checkpoint,
+            Err(error) => {
+                state.waits.remove(&wait.task);
+                return IoAttempt::Complete(Err(error));
+            }
         };
         let completion_event = wait.ring.completion_event(&state, count);
         let changed = tail != state.tail;

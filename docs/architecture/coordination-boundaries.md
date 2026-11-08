@@ -1,21 +1,33 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 65, closure of the Unix
-ancillary lifetime and message handoff subsystem, reviewed on 2026-11-07.
-The prior runtime baseline is `4d6926ba47d574250557314ea9335cb5ac4d8f1a`.
+This is the consolidated implementation audit through stage 66, original io_uring
+Files and source-context closure, reviewed on 2026-11-09. The prior shared runtime
+baseline is `eb047dc35351f8d9a623afd9325a6974adae47bb` (stable 1.5.4).
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
-## Current status at a glance — 2026-11-07
+## Current status at a glance — 2026-11-09
 
-The Kernel owner still exists. Stage 65 removes the Unix ancillary owner ledger,
-its reaping-triggered cohort join, the mixed-rights exclusion and the separate
-accepted-message owner executor. Ordinary and opaque SCM_RIGHTS sets retain the
-actual full original OFDs. Capture, import, final release, accepted packet retry
-and sendmmsg completion use the same source resource path. io_uring's opaque FD
-lifetime now retains its original object directly; actual excluded SQE execution
-remains a separate boundary. Existing cycle rejection and iterative destruction
-are retained. No new coordinator, resource-service thread or global lock is added.
+Stage 66 removes the shared-versus-owner registration mode and opaque-FD import
+refusals. Registrations and accepted SQEs retain complete original OFDs; sealed
+source resolvers use those originals without converting metadata into authority.
+Solo acceptance now supplies the same execution context immediately. CQ observers
+never recover another task's guest-memory context. Corrupt CQ indices complete
+enter with EINVAL while preserving accepted requests/overflow; stale native
+interests get one source progress/rearm pass before actual capability escalation.
+Normal shared-FD lookup stays on its existing fast path. No new service thread,
+message bus, ordinary memory fence or global resource lock is introduced.
+
+This closes those io_uring handoffs, **not every possible io_uring fallback**.
+Missing typed proc/path providers, actual unavailable native subscriptions,
+unsupported resource bodies and absent layout/signal embedding capabilities retain
+their explicit boundary. `owner_required` remains for those actual cases. The
+inventory does not rename or count them as removed. Supported production mapping
+publication continues through original FileLayouts on existing execution slots.
+
+Stage 65 removed the Unix ancillary owner ledger, reaping join, mixed-rights
+exclusion and separate accepted-message owner executor. The original ownership
+cycle graph and source-thread final release remain.
 
 Stage 64 deletes the FD/network compatibility
 RPC as an execution category: there is no Service event, caller-View loan,
@@ -77,7 +89,6 @@ is not a claim that all coordinator work is removed.
 | Individual/group/default-fatal exit, STOP/CONT, parent notification and vfork release | Original source task/group resources | Returned CPU/statistics and cold task cleanup use existing source workers; only the original live mm pauses when necessary. Outside-cohort/solo and tracing/capability-less embeddings retain their boundary |
 | fork/clone/vfork and execve/execveat | Existing workers handle pure and mixed mapping scopes, nonleader replacement and original old-mm retirement; existing disk pool prepares native images without a CPU slot | Affected actors still quiesce. Tracing/capability-less embeddings, solo and host invocation remain separate |
 | Structural VM edits, pins and mapped-file layout changes | Supported mapping/buffer-registration checkpoints publish on existing workers with original task/mm custody; additive anonymous mmap runs directly while peers continue | Proc/cold-mm checkpoints and supported mapped-file transactions now run on existing workers. Unsupported backing/lifetime/policy and capability-less embeddings retain explicit boundaries |
-| Residual generic FD/network compatibility | In-cohort owner service when the actual resource is admitted; only the caller waits | Refusal before effects uses the joined owner path. Candidate syscall numbers do not mean ordinary admitted calls take this route |
 | Native libc/GPU/video/audio normal bodies and waits | Source/shared-resource execution or resource waits; existing disk/device workers retain their role | Mapping import, unstable entry, live-private backing and actual native lifecycle/teardown checkpoints can still reach the owner. Local libc/DirectFile/HVF fallback alone is not an owner transition |
 | Dynamic proc/sys views and proc pathname/FD consumers | Original PID/mm/Files/fs/namespace resources on the calling worker; owner/solo queries use the same provider | First cross-mm byte export and invalidation now activate on an existing worker using only original task/mm custody. Legacy embeddings without a provider and actual policy remain separate |
 | Mount topology administration | Calling worker and original namespace/fs_struct resources, with existing disk workers only for host-backed path work | Busy transactions park the caller on original readiness. Tracing and genuinely excluded path controls keep separate boundaries |
@@ -212,7 +223,7 @@ Tracing and security decisions with lifecycle effects retain joined boundaries. 
 | Event waits and remaining owner/mixed cases | Admitted pselect6, ppoll, epoll_pwait and epoll_pwait2, including temporary masks, use workers; excluded owner/dynamic FDs, tracing, unavailable source pumps and actual lifecycle/task-policy effects retain their boundary | One imported wait retains original OFDs/sets, mask and deadline through parking and cohort handoff. Source I/O signals interrupt locally and sigreturn restores the pre-wait mask. All pending sources now use the same queues. Caught signals interrupt locally; STOP/CONT retains the original wait and uses shared group control. Default termination uses original source group cleanup. | [poll ownership](../../crates/trames-linux/src/poll.rs), [wait admission](../../crates/trames-session/src/process.rs), [cohort control](../../crates/trames-session/src/process_vm.rs) |
 | VM and pin topology | brk growth, munmap/mremap, non-additive mmap, mprotect, mincore/madvise and io_uring buffer pin/register variants requiring mm edits | Affected mm/backing checkpoint on the existing run queue. Existing workers commit and rebuild supported Views, including proc byte activation and cold-mm cleanup; unsupported backing and tracing/security effects retain explicit boundaries. Retained external byte borrowers park only the actual dependency. Pure policy errors complete before quiescence; accepted decisions travel with the original entry. Additive private-anonymous mmap publishes directly. | [VM ABI classification](../../crates/trames-session/src/worker_syscalls.rs), [domain queue](../../crates/trames-session/src/run_queue.rs), [VM commit](../../crates/trames-session/src/process_vm.rs), [View admission](../../crates/trames-memory/src/parallel.rs) |
 | Mapped-file layout | Truncate/growth/allocate that changes a live mapped backing layout | Original backing publication leases identify affected mms. Existing workers return their bytes, then the same disk pool runs the accepted mutation while holding its original exclusive ticket. New aliases wait on that backing; original mmap/OFD authority survives cancellation. No process-wide pause counters or actor scan remain. Byte transfer and sync alone do not imply this checkpoint. | [file checkpoint](../../crates/trames-session/src/process_file_io.rs), [original file job](../../crates/trames-vfs/src/file_work.rs), [resize](../../crates/trames-vfs/src/memfd.rs) |
-| io_uring owner escalation | Actual owner resource/SQE or unavailable event subscription/source pump; unsupported structural authority | Canonical ring state stays shared. Production mapped-layout SQEs use the original FileLayouts resource; `owner_required` still hands excluded owner work back to the Kernel. Accepted SQEs keep their original source context. Source background progress on sleep/futex is ordinarily event-driven. No separate ring service thread exists. New namespace SQE opcodes are not added by the namespace batch. | [actor](../../crates/trames-linux/src/direct/uring/actor.rs), [source maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [subscriptions](../../crates/trames-linux/src/direct/uring/wait.rs), [file results](../../crates/trames-linux/src/direct/uring/actor_file.rs) |
+| io_uring explicit capability/resource escalation | Missing typed source provider, unavailable native event subscription after source retry, actual unsupported body/pinning or absent layout/signal capability | Complete original Files registration, import, close and ordinary source execution no longer refuse merely opaque OFDs. Solo/source share execution context. Foreign CQ observations and corrupt CQ heads do not request owner recovery. Actual `owner_required` cases remain explicit; production layout uses original FileLayouts. | [actor](../../crates/trames-linux/src/direct/uring/actor.rs), [source maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [subscriptions](../../crates/trames-linux/src/direct/uring/wait.rs), [file results](../../crates/trames-linux/src/direct/uring/actor_file.rs) |
 | Native guest mapping and exceptional native memory entry | Vulkan shared host-allocation mapping import where `can_import_mapping` is false; unstable native entry code; live-private backing or a native access mode requiring a checkpoint | GPU/native typed checkpoint before body effects; current worker returns the pending HLT to the owner. Ordinary CPU/native bytes keep the common permission/backing model. The GPU context mutex and compiler/fence waits are normally resource waits. | [Vulkan import](../../crates/trames-vulkan/src/backend.rs) (`Invocation::Checkpoint`), [native memory](../../crates/trames-memory/src/parallel/native.rs), [entry registry](../../crates/trames-accel/src/native.rs), [GPU wait](../../crates/trames-session/src/gpu.rs) |
 | Scheduler/cohort membership | Initial guest admission and legacy nonmember wake; ordinary scheduling metadata and live affinity no longer require the owner | Initial/legacy orchestration retains its boundary. Existing members migrate/park/wake locally; children and exec replacements enter the live queue. Original CPU slots can start directly and lazily from that queue. Periodic checks alone do not tear down the cohort: `cohort_control` tests actual events and original dependencies. | [legacy wake](../../crates/trames-session/src/futex.rs), [queue](../../crates/trames-session/src/run_queue.rs), [owner metadata](../../crates/trames-session/src/process_scheduling.rs), [control checks](../../crates/trames-session/src/process_vm.rs) |
 | Embedding and terminal/session lifecycle | Transfer/timezone command, pause/cancel, terminal create/close/resize, foreground group signal/hangup, actual systemd supervision event; Mac admin/shutdown/deadline/memory-pressure request; host-authorized exec process creation and process-group signal | Host control requests a join for actual lifecycle work. Routine FFI status snapshots, retained exec pipe I/O and live PTY byte pumping can run without a join. Host exec reuses the same process kernel, ELF/script loader, shared resources and memory budgets; it creates no additional runtime owner or service thread. FileProvider writeback deliberately pauses the session when applying staged edits, as chosen by the owner. | [FFI adapter](https://github.com/kb5000/trames-ipad/blob/80304113124ba34a829c4f61f2cb65bc7dad0e39/crates/trames-ffi/src/session.rs), [iPad lifecycle](https://github.com/kb5000/trames-ipad/blob/80304113124ba34a829c4f61f2cb65bc7dad0e39/apps/ios/Trames/TerminalSession.swift), [Mac control](https://github.com/kb5000/trames-mac/blob/aed5daab61092b468bb89a1af5159cc935dd5ea5/crates/trames-mac/src/session.rs) |
@@ -2236,3 +2247,48 @@ An unchanged concurrent Memory test also assumed its snapshot cache could not be
 invalidated by another test advancing the global backing revision. Its cache-hit
 assertion now requires an unchanged revision; physical alias, code-domain and byte
 visibility assertions remain unconditional. No Memory production algorithm changes.
+
+
+## 66. Original io_uring Files and source-context closure — 2026-11-09
+
+One complete batch covers registration/update/unregistration, accepted source
+contexts, resource bodies, CQ observation, background progress, cancellation and
+original lifetime. It does not add new opcodes or extend terminal/epoll/ring
+registration admission. Existing ownership cycle rejection remains in force.
+
+`SharedFiles` captures a complete original OFD when a shared capability is absent;
+ordinary shared lookups keep their previous path. `UringFile` retains that handle
+through registration, close/reuse and request retirement. Temporary source aliases
+retain the exact description, restore the sealed resolver on unwind, and do not
+publish a guest FD or turn a metadata-only description into a complete one. Close
+consumes original membership/lifetime without requiring byte/control admission;
+record-lock release and last-close callbacks run outside the Files lock.
+
+Solo submission now attaches the same accepted execution context and original byte
+resource immediately. The retained-resource decoder is shared with the sealed
+source path; a legacy solo VFS remains available only when its provider cannot be
+represented by the source context. A CQ observer pumps its own original task/mm
+and waits for foreign source completion, without acquiring another task's memory.
+Exit/cancel continue retiring original requests outside the ring lock. Accepted
+native staging survives cancellation and uses the existing bounded file pool.
+
+A corrupt CQ head returns the existing EINVAL directly from enter/resume. Already
+accepted requests and overflow remain live, wait metadata is removed, and repairing
+the head followed by a new enter publishes each result once. Background CQ
+observation does not escalate just because the guest has not repaired its head.
+On a subscription failure, the source gets one progress attempt and refreshes its
+actual remaining interests. A ready native request can finish even when that
+embedding has no dispatcher. A still-unpumpable live request retains its explicit
+capability boundary; no error is fabricated and no busy retry loop is added.
+
+Mac and native ARM64 Linux runtime workflows pass. Actual Mac HVF and interpreter
+acceptance covers 108 workflows on 1/4/12 CPUs, including IPv4/IPv6, CQ poll/epoll,
+fixed/selected buffers, multishot pressure, close/reuse, task exit and cancellation.
+The async worker fixture completes exactly 707 io_uring entries on the source;
+the registered fixture completes 129. Both iPad compile targets pass. Five paired,
+counterbalanced Mac timing samples at 5,000 operations per worker stay within
+about ±1.5% for NOP, registration and statx; this is handoff/compatibility closure,
+not a claimed Firefox speedup. Native Linux timings use the same static executable
+in the dedicated ARM64 CI environment, with different filesystem backing for
+statx. Exact hashes, results and limitations are recorded in the product validation.
+Stable 1.5.4 applications and business environments are not changed by this batch.

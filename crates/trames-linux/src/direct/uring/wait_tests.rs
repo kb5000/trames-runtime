@@ -338,3 +338,61 @@ fn subscription_lifetime_cost() {
         println!("subscription lifetime: sample={sample} retries={N} rebuilt_ns={} retained_ns={} ratio={:.2}", rebuilt.as_nanos()/N as u128, retained.as_nanos()/N as u128, rebuilt.as_secs_f64()/retained.as_secs_f64());
     }
 }
+
+#[test]
+fn ready_native_request_finishes_before_missing_event_capability_escalation() {
+    struct NoEvents;
+    impl IoWake for NoEvents {
+        fn wake_io(&self, _: &Arc<IoSignal>) {}
+    }
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let (mut l, mut m, ring_fd, ring) = setup(8);
+    l.vfs
+        .configure_network(trames_vfs::NetworkMode::Loopback)
+        .unwrap();
+    let fd = l.vfs.socket(2, 1, 0).unwrap();
+    let socket = l.vfs.socket_fd(fd).unwrap();
+    assert!(matches!(
+        socket.connect(listener.local_addr().unwrap()),
+        Ok(()) | Err(trames_net::NetError(115))
+    ));
+    let (mut peer, _) = listener.accept().unwrap();
+    assert_eq!(socket.connect_complete(), Ok(true));
+    let mut epoch = UringEpoch::default();
+    let d = DirectSyscalls::new(l.vfs.direct_descriptors()).with_urings(
+        epoch
+            .capture(&l.vfs, m.instruction_identity().0, 7)
+            .with_actor(l.uring_actor_root()),
+    );
+    let t: Arc<dyn IoWake> = Arc::new(NoEvents);
+    add(&mut m, &ring, read(fd, 0x2200, 95));
+    assert!(matches!(
+        d.start(
+            426,
+            [ring_fd as u64, 1, 0, 0, 0, 0],
+            &mut m,
+            7,
+            &Arc::downgrade(&t),
+            None
+        )
+        .unwrap(),
+        IoAttempt::Complete(Ok(1))
+    ));
+    let mut background = d.uring_background(7, &Arc::downgrade(&t)).unwrap();
+    // Independently wait for real host readiness, without giving the source
+    // actor a dispatcher. This makes the source's cold recovery deterministic.
+    let (ready_target, hub) = target();
+    let ready = IoSignal::new(0, Arc::downgrade(&ready_target));
+    let tcp = l.vfs.direct_network().get(fd).unwrap().tcp.clone();
+    let _subscription = hub
+        .subscribe(tcp_wait_fd(&tcp).unwrap(), false, &ready)
+        .unwrap();
+    peer.write_all(b"x").unwrap();
+    wait(&hub);
+    assert!(ready.ready());
+    assert!(background.progress(&mut m));
+    assert!(!background.active());
+    assert!(!l.uring_requires_owner());
+    assert_eq!(cq(&mut m, &ring), (95, 1));
+    assert_eq!(m.read_array::<1>(0x2200).unwrap(), *b"x");
+}

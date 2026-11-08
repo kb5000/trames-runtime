@@ -34,13 +34,14 @@ impl UringBackground {
         self.armed = true;
         self.revision = self.actor.revision();
         let rings = self.actor.rings();
-        if !self.sources.refresh(
+        if !self.sources.prepare(
             &rings,
             self.owner,
             self.task,
             &self.signal,
             &self.target,
             &self.actor,
+            memory,
         ) {
             self.actor.require_owner();
             return false;

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Shared, retained request interests for enter and CQ poll actors.
+use super::poll::PollRingOps;
 use super::*;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -72,6 +73,26 @@ impl WaitSources {
     }
     pub(super) fn next_deadline(&self) -> Option<Instant> {
         self.deadline
+    }
+    /// Keep the normal subscribe-before-retry path. A failed stale interest
+    /// gets one original-resource progress pass before capability escalation;
+    /// a request that can finish needs no host subscription or owner pump.
+    #[allow(clippy::too_many_arguments)] // Original source identity and wait resources.
+    pub(super) fn prepare(
+        &mut self,
+        rings: &[Arc<Ring>],
+        owner: u64,
+        task: u32,
+        signal: &Arc<IoSignal>,
+        target: &Weak<dyn IoWake>,
+        actor: &UringActor,
+        memory: &mut impl CpuMemory,
+    ) -> bool {
+        self.refresh(rings, owner, task, signal, target, actor)
+            || rings
+                .iter()
+                .all(|ring| ring.poll_pump(owner, task, memory, actor))
+                && self.refresh(rings, owner, task, signal, target, actor)
     }
     pub(super) fn refresh(
         &mut self,

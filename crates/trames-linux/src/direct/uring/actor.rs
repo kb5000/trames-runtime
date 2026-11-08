@@ -20,6 +20,7 @@ pub(crate) struct Execution {
 }
 struct Accepted {
     context: Arc<Execution>,
+    retained: bool,
     socket: Option<socket_wait::RetainedSocket>,
     file: Option<file::FileIo>,
 }
@@ -73,6 +74,13 @@ impl Execution {
         actor: &UringActor,
         ring: &Uring,
     ) -> Option<Result<(i32, bool)>> {
+        if call.retained {
+            return self
+                .paths
+                .lock()
+                .unwrap()
+                .uring_query(|vfs| crate::uring::execute::retained(vfs, request, memory, None));
+        }
         let s = &request.sqe;
         Some(match s.opcode() {
             1 | 2 | 3 | 4 | 5 | 17 | 22 | 23 | 55 => {
@@ -113,12 +121,7 @@ impl Execution {
             19 => {
                 if s.op_flags() != 0 || s.length() != 0 {
                     Err(Errno(22))
-                } else if self
-                    .factory
-                    .files()
-                    .lookup(s.fd() as u32)
-                    .is_some_and(|f| f.is_ok_and(|f| f.uring().is_some()))
-                {
+                } else if self.factory.files().uring(s.fd() as u32).is_ok() {
                     Err(Errno(9))
                 } else {
                     self.factory
@@ -287,15 +290,26 @@ impl UringActor {
         request: &mut Request,
         context: Arc<Execution>,
     ) {
+        if request.resource.is_none() {
+            request.resource = request.file.as_ref().and_then(Resource::capture);
+        }
         let key = (Arc::as_ptr(ring) as usize, request.sequence);
         self.rings
             .lock()
             .unwrap()
             .insert(key.0, Arc::downgrade(ring));
+        // Decide original body admission once, not on every retry/byte copy.
+        let retained = request.file.as_ref().is_some_and(|file| {
+            let shared = file.shared_file();
+            shared.is_none()
+                || matches!(request.sqe.opcode(), 1 | 2 | 3 | 4 | 5 | 17 | 22 | 23 | 55)
+                    && shared.and_then(|f| f.file_target()).is_none()
+        });
         self.accepted.lock().unwrap().insert(
             key,
             Accepted {
                 context,
+                retained,
                 socket: None,
                 file: None,
             },

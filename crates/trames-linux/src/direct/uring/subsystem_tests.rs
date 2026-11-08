@@ -389,7 +389,7 @@ fn source_maintenance_owns_the_original_vm_after_the_ring_fd_is_closed() {
 }
 
 #[test]
-fn owner_accepted_drain_gains_source_context_and_real_fallback_stops_readmission() {
+fn solo_accepted_drain_keeps_source_context_across_worker_admission() {
     let (mut l, mut m, fd, r) = setup(8);
     l.vfs.mkdir_at(-100, b"/tmp", 0o777).unwrap();
     let [reader, writer] = l.vfs.pipe(0).unwrap();
@@ -406,7 +406,7 @@ fn owner_accepted_drain_gains_source_context_and_real_fallback_stops_readmission
         .unwrap()
         .pending
         .iter()
-        .all(|r| r.execution.is_none()));
+        .all(|r| r.execution.is_some()));
     let mut epoch = UringEpoch::default();
     let mut files = trames_vfs::FileEpoch::default();
     let caps = files.capture(&l.vfs, true);
@@ -644,9 +644,9 @@ fn shared_volatile_registered_file_keeps_its_body_boundary_and_original_ofd() {
         enter(&d, fd, 1, 1, &mut m, &target()),
         IoAttempt::Checkpoint
     ));
-    assert_eq!(r.load_queue(0), 0);
+    assert_eq!(r.load_queue(0), 1);
     assert_eq!(
-        l.uring_enter([fd as u64, 1, 1, 1, 0, 0], &mut m, None, 7),
+        l.uring_enter([fd as u64, 0, 1, 1, 0, 0], &mut m, Some(1), 7),
         Ok((1, true))
     );
     let completion = cq(&mut m, &r);
@@ -930,4 +930,44 @@ fn credential_drop_keeps_accepted_sqe_authority_but_rejects_future_opens() {
     open[1] = 0;
     open[32..40].copy_from_slice(&3u64.to_le_bytes());
     assert_eq!(submit(&d, &mut m, fd, &r, open, &t), -13);
+}
+
+#[test]
+fn corrupt_cq_during_accepted_enter_returns_error_without_replay_or_owner_pump() {
+    for complete_before_repair in [false, true] {
+        let (mut l, mut m, fd, ring) = setup(8);
+        let [reader, writer] = l.vfs.pipe(0).unwrap();
+        let mut epoch = UringEpoch::default();
+        let d = direct(&l, &m, &mut epoch, &Default::default());
+        let t = target();
+        add(&mut m, &ring, scalar(22, reader, 0x2200, 1, 91));
+        let IoAttempt::Blocked(wait) = enter(&d, fd, 1, 1, &mut m, &t) else {
+            panic!("accepted read must wait");
+        };
+        m.write_array(0x10040, 1000u32.to_le_bytes()).unwrap();
+        if complete_before_repair {
+            l.vfs.write(writer, b"x").unwrap();
+        }
+        assert!(matches!(
+            d.urings.resume(wait, &mut m),
+            IoAttempt::Complete(Err(Errno(22)))
+        ));
+        assert_eq!(ring.load_queue(0), 1);
+        assert!(!ring.state.lock().unwrap().waits.contains_key(&7));
+        let mut background = d.uring_background(7, &Arc::downgrade(&t)).unwrap();
+        assert!(background.progress(&mut m));
+        assert!(!l.uring_requires_owner());
+        m.write_array(0x10040, 0u32.to_le_bytes()).unwrap();
+        if !complete_before_repair {
+            l.vfs.write(writer, b"x").unwrap();
+        }
+        assert!(matches!(
+            enter(&d, fd, 0, 1, &mut m, &t),
+            IoAttempt::Complete(Ok(0))
+        ));
+        assert_eq!(cq(&mut m, &ring), (91, 1));
+        assert_eq!(m.read_array::<1>(0x2200).unwrap(), *b"x");
+        assert_eq!(ring.load_queue(68), 1);
+        assert!(ring.state.lock().unwrap().pending.is_empty());
+    }
 }

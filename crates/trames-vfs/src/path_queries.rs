@@ -9,7 +9,7 @@ pub(super) struct Authority {
     pub(super) files: SharedFiles,
     pub(super) devices: cgroup::DeviceAuthority,
     pub(super) namespace_io: bool,
-    pub(super) retained: Option<(u32, SharedFd)>,
+    pub(super) retained: Option<(u32, RetainedFd)>,
     pub(super) peer: Option<(u32, SharedFd)>,
     pub(super) accepted: Option<BTreeMap<u32, Option<Result<SharedFd>>>>,
     deferred: Arc<std::sync::atomic::AtomicBool>,
@@ -97,10 +97,7 @@ impl Authority {
     pub(super) fn descriptor(&self, fd: u32) -> Result<Descriptor> {
         if let Some((alias, file)) = &self.retained {
             if *alias == fd {
-                return Ok(Descriptor {
-                    open: OpenHandle::Shared(file.open.clone()),
-                    cloexec: false.into(),
-                });
+                return Ok(Descriptor { ..file.0.clone() });
             }
         }
         if let Some((alias, file)) = &self.peer {
@@ -260,9 +257,6 @@ impl PathQueries {
         policy: u64,
         files: &DirectFiles,
     ) -> Option<Result<u32>> {
-        if file.is_some_and(|f| f.shared_file().is_none()) {
-            return None;
-        }
         self.uring_query(|v| {
             if let Some(file) = file {
                 v.with_uring_path_fd(file, |v, alias| {
@@ -287,9 +281,6 @@ impl PathQueries {
         path: &[u8],
         flags: u32,
     ) -> Option<Result<([u8; 128], u64)>> {
-        if file.is_some_and(|f| f.shared_file().is_none()) {
-            return None;
-        }
         self.uring_query(|v| {
             let operation = |v: &mut Vfs, dirfd: i32| {
                 if path.is_empty() && flags & 0x1000 != 0 {
@@ -309,7 +300,13 @@ impl PathQueries {
             }
         })
     }
-    fn uring_query<T>(&self, operation: impl FnOnce(&mut Vfs) -> Result<T>) -> Option<Result<T>> {
+    /// Execute accepted original-resource operations in this source task's
+    /// sealed resolver. Existing query admission remains in force; retaining
+    /// an opaque OFD grants access only through its temporary descriptor alias.
+    pub fn uring_query<T>(
+        &self,
+        operation: impl FnOnce(&mut Vfs) -> Result<T>,
+    ) -> Option<Result<T>> {
         let mut view = self.view.borrow_mut();
         let deferred = view.query.as_ref().unwrap().deferred.clone();
         deferred.store(false, Ordering::Relaxed);

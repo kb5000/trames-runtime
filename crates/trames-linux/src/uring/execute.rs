@@ -184,7 +184,9 @@ pub(crate) fn resource_network(
     })
 }
 
-pub(crate) fn owner(
+/// Cold opaque-resource body. Called only inside the submitting task's sealed
+/// query context; ordinary shared resources use the common actor paths.
+pub(crate) fn retained(
     vfs: &mut trames_vfs::Vfs,
     request: &mut UringRequest,
     memory: &mut impl trames_memory::CpuMemory,

@@ -28,19 +28,8 @@ impl PollRingOps for Ring {
         memory: &mut impl CpuMemory,
         actor: &UringActor,
     ) -> bool {
-        {
-            let state = self.state.lock().unwrap();
-            // A CQ observer does not acquire another task's execution context.
-            // A foreign request is observed only if its submitting task kept an
-            // enter actor. Otherwise the lifecycle checkpoint must recover it.
-            if state.pending.iter().any(|r| {
-                (r.owner != owner || r.task != task)
-                    && r.source.as_ref().and_then(Weak::upgrade).is_none()
-                    && !state.waits.contains_key(&r.task)
-            }) {
-                return false;
-            }
-        }
+        // Observe foreign CQ work only. Its original source actor owns guest
+        // memory and execution; an observer never needs to recover that task.
         if self.progress_with(memory, owner, task, &mut |r, memory, selected| {
             actor.execute(self, r, memory, selected)
         }) {
@@ -48,10 +37,9 @@ impl PollRingOps for Ring {
         }
         let mut state = self.state.lock().unwrap();
         let tail = state.tail;
-        let count = match self.flush(&mut state) {
-            Ok(count) => count,
-            Err(_) => return false,
-        };
+        // A corrupt guest CQ head prevents publication, not source execution.
+        // Enter reports EINVAL; observers retain overflow until the head is fixed.
+        let count = self.flush(&mut state).unwrap_or(0);
         let event = self.completion_event(&state, count);
         let changed = tail != state.tail;
         drop(state);
@@ -111,13 +99,14 @@ impl PollWait {
     }
     pub(crate) fn refresh(&mut self, signal: &Arc<IoSignal>, memory: &mut impl CpuMemory) -> bool {
         self.deadline = None;
-        if !self.sources.refresh(
+        if !self.sources.prepare(
             &self.rings,
             self.owner,
             self.task,
             signal,
             &self.target,
             &self.actor,
+            memory,
         ) {
             return false;
         }

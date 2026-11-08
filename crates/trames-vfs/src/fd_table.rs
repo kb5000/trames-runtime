@@ -802,16 +802,26 @@ impl SharedFiles {
             let Some(slot) = entries.get(&fd) else {
                 return Some(Err(Errno(9)));
             };
-            if let Err(error) = slot.shared_open()? {
-                return Some(Err(error));
+            // Closing consumes membership/lifetime, not byte/control authority.
+            // The published weak metadata is complete enough for FIFO readiness;
+            // no opaque OFD lock or last-close callback runs under Files.
+            let retained;
+            let open = match &slot.open {
+                SlotOpen::Shared(open) => open,
+                SlotOpen::Owner(..) => {
+                    retained = slot.proc.as_ref()?.open.upgrade()?;
+                    &retained
+                }
+            };
+            if open.pipe.as_ref().is_some_and(|pipe| pipe.has_waiter()) {
+                return Some(Err(Errno(9)));
             }
             let old = entries.remove(&fd).expect("validated membership");
             self.changed(&mut entries);
             old
         };
-        if let SlotOpen::Shared(open) = removed.open {
-            open.release_record_locks(lock_owner);
-        }
+        removed.release_record_locks(lock_owner);
+        drop(removed); // Final original close runs outside membership.
         Some(Ok(()))
     }
 }
