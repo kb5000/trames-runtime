@@ -1190,7 +1190,7 @@ fn all_blocked_related_accepts_are_adopted_without_an_interactive_service() {
     k.processes.insert(1, p);
     k.processes.insert(2, peer);
     assert!(
-        k.parallel_candidate(),
+        k.parallel_candidate(false),
         "related parked sockets must retain worker adoption"
     );
     let _a = std::net::TcpStream::connect(address).unwrap();

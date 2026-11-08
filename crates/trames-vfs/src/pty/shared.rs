@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Shared terminal queues and endpoint leases. Full PTY OFDs retain the real
-//! devpts resources; task/job-control signal delivery still joins its owner.
+//! devpts resources and original task/job-control signal authority.
 use super::*;
 use crate::readiness::Readiness;
 use std::sync::{
@@ -8,7 +8,7 @@ use std::sync::{
     Mutex, MutexGuard,
 };
 
-/// Frozen process authority; session/group and controlling-TTY changes join.
+/// Original caller authority captured for this byte/control attempt.
 #[derive(Clone, Copy)]
 pub struct TerminalAccess {
     pub session: u32,
@@ -145,6 +145,9 @@ impl PtyIo {
             }
         }
         let mut tty = self.terminal.borrow_mut();
+        if tty.flow_stopped {
+            return Err(Errno(11));
+        }
         if tty.output_queue.is_empty() {
             return Err(Errno(
                 if self.slave_opened.load(Ordering::Relaxed)
@@ -168,7 +171,7 @@ impl PtyIo {
         if master {
             let status = self.packet.load(Ordering::Relaxed)
                 && self.packet_status.load(Ordering::Relaxed) != 0;
-            (if !tty.output_queue.is_empty() || status {
+            (if !tty.flow_stopped && !tty.output_queue.is_empty() || status {
                 events & 1
             } else {
                 0

@@ -16,6 +16,31 @@ pub struct Pty {
     pub hangup_notified: std::sync::atomic::AtomicBool,
     pub host_resize_pending: std::sync::atomic::AtomicBool,
     pub host_signals: AtomicU64,
+    embedding_route: Option<Arc<EmbeddingRoute>>,
+}
+/// A host session may resume the same terminal with new original task actors.
+/// Only actual signal events read this binding; ordinary byte I/O does not.
+#[derive(Default)]
+struct EmbeddingRoute(std::sync::RwLock<Option<Arc<dyn TerminalSignals>>>);
+impl TerminalSignals for EmbeddingRoute {
+    fn signal(&self, session: u32, group: u32, signal: u32) {
+        let route = self.0.read().unwrap().clone();
+        if let Some(route) = route {
+            route.signal(session, group, signal);
+        }
+    }
+    fn clear_session(&self, terminal: u32, session: u32) {
+        let route = self.0.read().unwrap().clone();
+        if let Some(route) = route {
+            route.clear_session(terminal, session);
+        }
+    }
+    fn hangup(&self, terminal: u32, session: u32, group: u32) {
+        let route = self.0.read().unwrap().clone();
+        if let Some(route) = route {
+            route.hangup(terminal, session, group);
+        }
+    }
 }
 pub struct PtyEnd {
     pub pair: Arc<Pty>,
@@ -69,8 +94,27 @@ impl std::ops::Deref for Pty {
     }
 }
 impl Pty {
+    pub(crate) fn embedding(slave: NodeRef) -> Arc<Self> {
+        Arc::new(Self {
+            number: 0,
+            mount: None,
+            slave,
+            io: Arc::new(PtyIo::new(0, Terminal::default())),
+            locked: std::sync::atomic::AtomicBool::new(false),
+            hangup_notified: Default::default(),
+            host_resize_pending: Default::default(),
+            host_signals: Default::default(),
+            embedding_route: Some(Arc::default()),
+        })
+    }
     pub fn bind_signal_route(&self, route: Arc<dyn TerminalSignals>) {
-        self.io.bind_signal_route(route);
+        if let Some(binding) = &self.embedding_route {
+            let old = binding.0.write().unwrap().replace(route);
+            drop(old);
+            self.io.bind_signal_route(binding.clone());
+        } else {
+            self.io.bind_signal_route(route);
+        }
         self.flush_host_events();
     }
     /// Publish/recheck closes the route-install race. Legacy embeddings keep
@@ -124,9 +168,16 @@ impl Pty {
     }
 }
 impl Vfs {
+    pub fn embedding_terminal(&self) -> Option<Arc<Pty>> {
+        self.embedding_terminal.get().cloned()
+    }
+    /// Before a resumed host session publishes its new root actor.
+    pub fn reset_terminal_task(&mut self) {
+        self.terminal_task = Default::default();
+    }
     pub fn set_controlling_terminal(&self, id: Option<u32>) -> Result<()> {
         let pair = match id {
-            Some(id) if id != 0 => Some(self.pty_by_id(id).ok_or(Errno(6))?),
+            Some(id) => Some(self.pty_by_id(id).ok_or(Errno(6))?),
             _ => None,
         };
         self.controlling_state().set(id.map(|id| (id, pair)));
@@ -207,6 +258,7 @@ impl Vfs {
             hangup_notified: std::sync::atomic::AtomicBool::new(false),
             host_resize_pending: std::sync::atomic::AtomicBool::new(false),
             host_signals: AtomicU64::new(0),
+            embedding_route: None,
         });
         registry.insert(id, Arc::downgrade(&pair));
         if let Some(task) = self.terminal_task() {
@@ -408,6 +460,31 @@ mod tests {
         fn hangup(&self, _: u32, _: u32, _: u32) {
             self.0.lock().unwrap().push(1);
         }
+    }
+    #[test]
+    fn embedding_stdio_aliases_share_original_endpoints_and_session_signal_rebinding() {
+        let mut vfs = Vfs::default();
+        vfs.enable_terminal().unwrap();
+        let pair = vfs.embedding_terminal().unwrap();
+        assert!(Arc::ptr_eq(&pair, &vfs.pty(0).unwrap().unwrap().pair));
+        assert_eq!(pair.slaves.load(Ordering::Relaxed), 3);
+        let alias = vfs.dup(0, 10, false).unwrap();
+        assert_eq!(pair.slaves.load(Ordering::Relaxed), 3);
+        let old = Arc::new(HostRoute::default());
+        pair.bind_signal_route(old.clone());
+        pair.resize_from_host(30, 100);
+        let new = Arc::new(HostRoute::default());
+        pair.bind_signal_route(new.clone());
+        pair.resize_from_host(40, 120);
+        pair.queue_host_signals(vec![2]);
+        assert_eq!(*old.0.lock().unwrap(), [28]);
+        assert_eq!(*new.0.lock().unwrap(), [28, 2]);
+        for fd in 0..3 {
+            vfs.close(fd).unwrap();
+        }
+        assert_eq!(pair.slaves.load(Ordering::Relaxed), 1);
+        vfs.close(alias).unwrap();
+        assert_eq!(pair.slaves.load(Ordering::Relaxed), 0);
     }
     #[test]
     fn initial_host_events_do_not_escape_to_a_future_job_and_route_install_drains_pending_events() {

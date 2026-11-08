@@ -66,13 +66,7 @@ impl<C: Cpu> Kernel<C> {
                         },
                         [0; 2],
                     )),
-                    FdKind::Terminal => {
-                        let t = self.terminal.as_ref().ok_or(Errno(25))?;
-                        Some((
-                            (events & 4) | if t.readable() { events & 1 } else { 0 },
-                            [t.input_epoch, t.output_space_epoch],
-                        ))
-                    }
+                    FdKind::Terminal => None,
                     _ => None,
                 })
             },

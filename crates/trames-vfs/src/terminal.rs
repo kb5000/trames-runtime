@@ -3,6 +3,7 @@
 use crate::Errno;
 use std::collections::VecDeque;
 
+#[derive(Clone)]
 pub struct Terminal {
     pub attributes: [u8; 36],
     pub window: [u8; 8],

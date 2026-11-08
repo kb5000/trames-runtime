@@ -1,11 +1,25 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 71, original process observation/ownership, reviewed on 2026-11-09. The prior shared runtime
-baseline is `c8a59a634b8544e6d690d847fb252966c58b5850`.
+This is the consolidated implementation audit through stage 72, original embedding terminal transport, reviewed on 2026-11-09. The prior shared runtime
+baseline is `7c7d1f068145e2eea39997886a1c51deea37a802`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-09
+
+Stage 72 deletes the separate Kernel terminal-ID-0 syscall body, line discipline,
+signal scan, readiness projection and byte-triggered cohort stop. Embedding stdio,
+/dev/tty and /dev/pts/0 now retain original PTY endpoints and the same direct ABI
+as other guest terminals. A host adapter pumps original input/resize/signals while
+the cohort stays live. Potentially blocking native output uses the original bounded
+file/image I/O pool; no new pool, coordinator or resource thread is created.
+
+Partial output retains its original accepted bytes through guest flush and Runtime
+handoff. Host input EOF is a half-close. Original signal authority rebinds on a
+resumed host session; ordinary byte I/O does not inspect that binding. Actual
+platform administration, tracing, excluded resources and generic dispatch remain.
+The overall coordinator-removal goal is active. Earlier stage descriptions below
+record their then-current remaining boundaries; the inventory is authoritative.
 
 Stage 71 closes the cold process observation/ownership dependency across
 lookup, mutable lookup, checkout, iteration, value enumeration, retention and
@@ -160,7 +174,7 @@ is not a claim that all coordinator work is removed.
 | --- | --- | --- |
 | Admitted file/path/FD, Unix/TCP I/O, transfers, AIO and io_uring operations | Calling worker and original shared resources; resource waits return the execution slot | Excluded descriptor/path/SQE kinds, owner controls, missing pumps/subscriptions retain explicit boundaries; production mapped-layout effects now use original backing admission |
 | Futexes, clocks/timers, admitted poll/epoll/signalfd/child waits and caught signals | Calling workers and original readiness/mailboxes | Legacy nonmember waiter adoption, excluded wait resources, tracing and capability-less lifecycle embeddings can still require the owner |
-| Guest terminals, sessions and job control | Original process/TTY/Files/namespace resources on the caller; source and solo share the ABI; only actual stops allocate readiness | Legacy terminal-ID-0 GuestOutput and capability-less/traced embeddings retain their adapter. Existing unsupported tty controls and tty io_uring remain explicit errors |
+| Guest terminals, sessions and job control | Original process/TTY/Files/namespace resources on the caller; source and solo share the ABI; only actual stops allocate readiness | Embedding terminal ID 0 uses original PTY resources and the shared ABI. Capability-less/traced embeddings and unsupported tty controls/io_uring remain explicit |
 | Scheduling attributes and CPU affinity | Calling worker and original task atomics/authority; migration waits for only the original target's running lease and releases the caller's execution slot | Tracing and capability-less embeddings keep their boundary. Existing unsupported scheduling features return their original errno locally; no compatibility owner service is needed |
 | Individual/group/default-fatal exit, STOP/CONT, parent notification and vfork release | Original source task/group resources | Returned CPU/statistics and cold task cleanup use existing source workers; only the original live mm pauses when necessary. Outside-cohort/solo and tracing/capability-less embeddings retain their boundary |
 | fork/clone/vfork and execve/execveat | Existing workers handle pure and mixed mapping scopes, nonleader replacement and original old-mm retirement; existing disk pool prepares native images without a CPU slot | Affected actors still quiesce. Tracing/capability-less embeddings, solo and host invocation remain separate |
@@ -175,8 +189,8 @@ is not a claim that all coordinator work is removed.
 | BPF and cgroup device policy | Supported program load/identity/reopen and attachment controls use original registry/Files/hierarchy resources on the caller; cgroup target directories and control files resolve/open on workers | Existing unsupported BPF commands/types remain explicit errors; tracing and capability-less embeddings keep their boundaries. Device opens/mknod/PTY peer and proc reopening consume the same live rules |
 | Seccomp and tracing | Supported seccomp/prctl installation, TSYNC and entry results use original source task/group resources; busy installation releases the slot; proc and future entries observe live policy | Explicit tracing remains joined. Capability-less embeddings retain signal/exit handling; unsupported listener/logging/notification features remain unsupported. An allowed syscall may still encounter its own excluded resource or generic fallback |
 | Cold process observation and source ownership | Original body custody and current original PID identity; queue publication orders the exit observation | Cold snapshots are lookup hints, not accepted source capabilities. Source Handles and genuinely excluded actors retain their original routes |
-| Host process and native terminal lifecycle | Original process/group/PTY resources and existing execution/disk workers | Accepted launches survive cohort replacement; loading and custody waits release the CPU slot. Legacy terminal ID 0, one-time adapter setup and genuine missing/excluded providers remain explicit |
-| Actual host/embedding administration | Joined owner handling of the accepted event | Legacy terminal-ID-0 events and unpumpable console I/O, pause/cancel, timezone/transfer, supervision/admin/deadline/pressure and actual shutdown. FileProvider staged writeback deliberately pauses as previously chosen |
+| Host process and native terminal lifecycle | Original process/group/PTY resources and existing execution/disk workers | Accepted launches survive cohort replacement; loading and custody waits release the CPU slot. One-time adapter setup and genuine missing/excluded providers remain explicit; terminal ID 0 transport no longer stops execution |
+| Actual host/embedding administration | Joined owner handling of the accepted event | Pause/cancel, timezone/transfer, supervision/admin/deadline/pressure and actual shutdown. Original embedding terminal input/output/resize/signals progress without a join. FileProvider staged writeback deliberately pauses as previously chosen |
 | Last-resort SVC/HLT/fault dispatch | Truly unimplemented numbers complete locally using generated conservative recognition and the original diagnostic log | Known handlers whose actual resource/subcommand is excluded, legacy embeddings, tracing and unhandled HLT/fault exits still retain joined fallback. An implemented number returning an errno is not classified as globally unimplemented |
 | Single-CPU/solo execution | Existing coordinated caller path | The owner may itself be the guest executor; this is not evidence of an extra cross-thread syscall RPC |
 
@@ -304,7 +318,7 @@ Tracing and security decisions with lifecycle effects retain joined boundaries. 
 | io_uring explicit capability/resource escalation | Missing typed source provider, unavailable native event subscription after source retry, actual unsupported body/pinning | Original-Files registration/import and source CQ execution stay direct. Layout and signal completion side transports are deleted: accepted dependencies remain on the request, and legacy signals publish to the original task actor. Production mapped layout uses original FileLayouts. Only the two actual maintenance failure sites still set `owner_required`. | [actor](../../crates/trames-linux/src/direct/uring/actor.rs), [source maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [subscriptions](../../crates/trames-linux/src/direct/uring/wait.rs), [file results](../../crates/trames-linux/src/direct/uring/actor_file.rs) |
 | Native guest mapping and exceptional native memory entry | Original task/mm source checkpoint before body effects; Vulkan import, live-private backing and unstable entry use original Memory | No joined execution category remains for admitted original tasks. Actual tracing and capability-less/solo embeddings retain their own route. Affected bytes still quiesce; permission/backing errors and bounded entry retries use the existing common model. | [source native scope](../../crates/trames-session/src/process_lifecycle_native.rs), [Vulkan import](../../crates/trames-vulkan/src/backend.rs), [native memory](../../crates/trames-memory/src/parallel/native.rs), [entry registry](../../crates/trames-accel/src/native.rs), [GPU waits](../../crates/trames-session/src/gpu.rs) |
 | Scheduler/cohort membership | Initial guest admission and legacy nonmember wake; ordinary scheduling metadata and live affinity no longer require the owner | Initial/legacy orchestration retains its boundary. Existing members migrate/park/wake locally; children and exec replacements enter the live queue. Original CPU slots can start directly and lazily from that queue. Periodic checks alone do not tear down the cohort: `cohort_control` tests actual events and original dependencies. | [legacy wake](../../crates/trames-session/src/futex.rs), [queue](../../crates/trames-session/src/run_queue.rs), [owner metadata](../../crates/trames-session/src/process_scheduling.rs), [control checks](../../crates/trames-session/src/process_vm.rs) |
-| Host/legacy embedding administration | Transfer/timezone command, pause/cancel, legacy terminal-ID-0 events, actual systemd supervision; Mac admin/shutdown/deadline/memory-pressure requests | These actual administration requests retain their join. Host exec construction/loading/admission, original group control and native terminal open/close/input/resize/hangup use original resources and existing workers. FileProvider writeback deliberately pauses when applying staged edits, as chosen by the owner. | [host launch lifecycle](../../crates/trames-session/src/process_lifecycle_host.rs), [original launches](../../crates/trames-session/src/process_host.rs), [shared terminals](../../crates/trames-distro/src/terminals.rs) |
+| Host/legacy embedding administration | Transfer/timezone command, pause/cancel, actual systemd supervision; Mac admin/shutdown/deadline/memory-pressure requests | These actual administration requests retain their join. Host exec construction/loading/admission, original group control and native terminal open/close/input/resize/hangup use original resources and existing workers. FileProvider writeback deliberately pauses when applying staged edits, as chosen by the owner. | [host launch lifecycle](../../crates/trames-session/src/process_lifecycle_host.rs), [original launches](../../crates/trames-session/src/process_host.rs), [shared terminals](../../crates/trames-distro/src/terminals.rs) |
 | Final teardown and faults | Actual session/backend teardown, non-notifying native stop and unhandled fault exits | Ordinary last/group/default-fatal exit is source work; CPUs and cold Rc projections return asynchronously, with actual same-mm byte custody where needed. These are not ordinary whole-cohort exit boundaries. Accepted guest faults use the original signal path; actual unhandled/backend failures and final host teardown retain their explicit boundary. A host backend error is not an automatic full-VM or software fallback. | [source completion](../../crates/trames-session/src/process_exit.rs), [fault/dispatch](../../crates/trames-session/src/workers.rs), [native lifecycle](execution-backends.md#live-native-device-authority--2026-11-03) |
 
 The final worker-dispatch catch-all remains authoritative: an exit without a
@@ -2577,3 +2591,53 @@ Only Mac Dev is deployed; stable 1.5.4, existing business environments and physi
 iPad installations stay unchanged. Actual administration, legacy terminal ID 0,
 solo dispatch, excluded/traced providers and generic joined fallback remain;
 the overall goal is active.
+
+
+## 72. Original embedding terminal transport closure — 2026-11-09
+
+The embedding terminal is reserved PTY 0, with real slave endpoints for stdio,
+aliases, /dev/tty and /dev/pts/0. The independent Kernel::terminal field,
+embedding_terminal_call, terminal signal scan, pump_terminal and byte-triggered
+cohort_control gate are deleted. Guest bytes, poll, supported controls and job
+control use original PTY/Files/task authority. No guest syscall executes in the
+transport adapter. No ordinary guest memory fence, global algorithm lock or extra
+permission policy is added.
+
+The host adapter runs within the existing nonjoining control hook. Nonblocking
+host input and bounded resize/signal events update original resources and wake
+original waiters. EOF closes input only. A resumed host session rebinds signal
+authority to its current task actors; ordinary bytes never read that binding lock.
+Runtime's public terminal field remains a stopped configuration/snapshot.
+
+Potentially blocking native output uses the same lazy bounded file/image I/O pool.
+A worker continues at most sixteen 4-KiB chunks per assignment; host input/control
+can progress during a blocked write. Partial output retains its accepted bytes
+through a guest flush; unwritten bytes precede newer output on Runtime handoff.
+Non-native mutable callbacks stay on their original caller. Worker creation failure
+cannot fall back to a blocking call on the poller. Final teardown still waits for
+accepted native work, as with the existing I/O pool; arbitrary blocking OS calls
+are not cancelled. An embedding without a transport adds no polling deadline.
+
+Regression covers partial writes with concurrent flush, handoff, EOF half-close,
+XOFF/XON, blocked native output with concurrent input, endpoint alias lifetimes
+and signal route replacement. A static ELF runs on HVF and the interpreter at
+1/4/12 CPUs, receiving input sent at 0.2 s while stdout is blocked for 3 s, then
+verifying all 8 MiB. The old HVF runner misses the 2-s input deadline at all three
+CPU counts. The new runners receive input before output is drained. Native macOS
+and ARM64 Linux run the same portable fixture as controls.
+
+Four threads query termios, PGID, SID and window size, 1,000 iterations each.
+Three alternating exact-runner pairs and final medians, including the single-CPU
+control and native reference limits, are recorded in the product validation.
+Terminal ioctl cohort returns become zero; multi-CPU acceptance stays in one
+cohort through shutdown. These are terminal subsystem measurements, not evidence
+of Firefox/Geekbench-wide improvement.
+
+Both complete local runtime workflows, 405 process tests per host and both iPad
+compile targets pass. Native terminal/host-exec whole-flow regression still requires
+one cohort at 4/12 CPUs. The source-bound
+[validation record](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/embedding-terminal-20261109.json)
+records hashes, samples and remaining limits. Only Mac Dev is updated. Stable
+1.5.4, business environments and physical iPad installs remain unchanged. Actual
+administration, solo admission, tracing/excluded providers and last-resort dispatch
+remain; the overall goal stays active.

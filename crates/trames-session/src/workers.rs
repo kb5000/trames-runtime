@@ -224,6 +224,7 @@ struct DiskWorker<C: Cpu> {
 #[allow(clippy::large_enum_variant)]
 enum DiskJob<C: Cpu> {
     File(trames_vfs::FileWork, Arc<trames_linux::FileResult>),
+    Console(crate::terminal::Write),
     Image(
         Box<crate::process::exec::Request>,
         Arc<crate::process::exec::Pending<C>>,
@@ -233,11 +234,16 @@ impl<C: Cpu> DiskJob<C> {
     fn fail(self) {
         match self {
             Self::File(_, result) => result.fail(5),
+            Self::Console(work) => {
+                work.result
+                    .complete(work.bytes, work.offset, Err(trames_vfs::Errno(5)))
+            }
             Self::Image(_, result) => result.complete(Err(trames_vfs::Errno(5))),
         }
     }
     fn run(self) {
         match self {
+            Self::Console(work) => work.run(),
             Self::File(job, result) => {
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run())) {
                     Ok(reply) => result.complete(reply),
@@ -293,7 +299,12 @@ impl<C: Cpu> DiskPool<C> {
             job
         };
         // Thread resource failure preserves one execution and one completion.
-        job.run();
+        // A host transport must not fall back to a blocking call on its poller.
+        if matches!(job, DiskJob::Console(_)) {
+            job.fail();
+        } else {
+            job.run();
+        }
     }
 
     fn shutdown(&self) {
@@ -312,6 +323,11 @@ impl<C: Cpu> trames_linux::FileExecutor for DiskPool<C> {
     fn submit_file(&self, job: trames_vfs::FileWork, result: Arc<trames_linux::FileResult>) {
         result.begin();
         self.submit(DiskJob::File(job.queued(), result));
+    }
+}
+impl<C: Cpu> crate::terminal::Executor for DiskPool<C> {
+    fn write(&self, work: crate::terminal::Write) {
+        self.submit(DiskJob::Console(work));
     }
 }
 impl<C: Cpu> crate::process::exec::Executor<C> for DiskPool<C> {
@@ -413,6 +429,9 @@ impl<C: Cpu> Pool<C> {
         epoch.activate(index).map_err(|_| ())
     }
     pub fn file_executor(&self) -> Arc<dyn trames_linux::FileExecutor> {
+        self.disk.clone()
+    }
+    pub(crate) fn terminal_executor(&self) -> Arc<dyn crate::terminal::Executor> {
         self.disk.clone()
     }
     pub(crate) fn image_executor(&self) -> Arc<dyn crate::process::exec::Executor<C>> {

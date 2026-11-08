@@ -392,17 +392,6 @@ impl<C: Cpu> Kernel<C> {
                 return Ok(true);
             }
         }
-        if let Some(tty) = &self.terminal {
-            if !tty.echo.is_empty()
-                || !tty.output_queue.is_empty()
-                || !tty.eof
-                    && io
-                        .stdin_ready()
-                        .map_err(|_| RuntimeError::Arguments("terminal master input failed"))?
-            {
-                return Ok(true);
-            }
-        }
         let now = Instant::now();
         let members: std::collections::BTreeSet<_> = members.iter().map(|(pid, _)| *pid).collect();
         Ok(self.processes.iter().any(|(pid, p)| {
@@ -448,13 +437,7 @@ impl<C: Cpu> Kernel<C> {
                                         },
                                         [0; 2],
                                     )),
-                                    FdKind::Terminal => self.terminal.as_ref().map(|tty| {
-                                        (
-                                            (events & 4)
-                                                | if tty.readable() { events & 1 } else { 0 },
-                                            [tty.input_epoch, tty.output_space_epoch],
-                                        )
-                                    }),
+                                    FdKind::Terminal => None,
                                     _ => None,
                                 })
                             })
@@ -1276,6 +1259,9 @@ mod tests {
             deadline: Instant,
         }
         impl GuestOutput for Input {
+            fn waits_for_host(&self) -> bool {
+                true
+            }
             fn source_console(&mut self) -> Arc<dyn trames_vfs::ConsoleIo> {
                 Arc::new(
                     trames_vfs::ConsoleCallbacks::new(
@@ -1321,7 +1307,6 @@ mod tests {
         k.cpu_count = 2;
         k.workers = crate::workers::Pool::new(2);
         k.per_cpu = vec![Duration::ZERO; 2];
-        k.terminal = Some(Terminal::default());
         let mut a = super::super::tests::process();
         code(&mut a, &[0xf9000120, 0x14000000]); // acknowledge the resumed read, then loop
         let [reader, writer] = a.linux.vfs.pipe(0).unwrap();

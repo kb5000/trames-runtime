@@ -196,6 +196,18 @@ pub trait GuestOutput {
     fn live_host_processes(&self) -> bool {
         false
     }
+    /// A connected embedding can supply external events when guest actors park.
+    fn waits_for_host(&self) -> bool {
+        false
+    }
+    /// Maximum interval between actual embedding transport/control polls.
+    fn control_poll_interval(&self) -> std::time::Duration {
+        std::time::Duration::MAX
+    }
+    /// Complete accepted host output before normal session teardown.
+    fn flush_output(&mut self) -> io::Result<bool> {
+        Ok(true)
+    }
 
     /// Poll host queues/original resources without touching guest bytes.
     /// True requests the stopped control hook.

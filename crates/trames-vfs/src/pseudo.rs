@@ -1631,7 +1631,7 @@ impl Vfs {
                 .ok()
                 .and_then(|s| s.parse::<u32>().ok())
             {
-                if id == 0 && self.embedding_terminal.load(Ordering::Relaxed)
+                if id == 0 && self.embedding_terminal.get().is_some()
                     || self.pty_by_id(id).is_some_and(|p| {
                         !p.private() && p.master_alive.load(std::sync::atomic::Ordering::Relaxed)
                     })
@@ -2555,7 +2555,7 @@ impl Vfs {
             );
         }
         if path == b"/dev/pts" {
-            if self.embedding_terminal.load(Ordering::Relaxed) {
+            if self.embedding_terminal.get().is_some() {
                 names.push(b"0".to_vec());
             }
             names.extend(

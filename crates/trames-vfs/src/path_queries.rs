@@ -196,10 +196,6 @@ impl Vfs {
         view.root_network = self.root_network.clone();
         view.ipc_namespace = self.ipc_namespace.clone();
         view.pid_children = self.pid_children.clone();
-        view.embedding_terminal.store(
-            self.embedding_terminal.load(Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
         view.cgroups = self.cgroups.clone();
         view.pid = self.pid;
         view.pid_ns = self.pid_ns.clone();

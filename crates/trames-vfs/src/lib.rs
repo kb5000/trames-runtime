@@ -765,7 +765,7 @@ pub struct Vfs {
     proc_refresh: Cell<ProcRefresh>,
     source_observed: Cell<Option<proc_source::Observation>>,
     ptys: Arc<std::sync::Mutex<BTreeMap<u32, std::sync::Weak<Pty>>>>,
-    embedding_terminal: Arc<std::sync::atomic::AtomicBool>,
+    embedding_terminal: Arc<std::sync::OnceLock<Arc<Pty>>>,
     controlling: std::sync::OnceLock<Arc<pty::ControllingTerminal>>,
     terminal_task: std::sync::OnceLock<Arc<dyn pty::TerminalTask>>,
     bridge: Option<trames_bridge::Broker>,
@@ -1279,7 +1279,24 @@ impl Vfs {
         ready
     }
     pub fn enable_terminal(&mut self) -> Result<()> {
-        self.embedding_terminal.store(true, Ordering::Relaxed);
+        let pair = if let Some(pair) = self.embedding_terminal.get() {
+            pair.clone()
+        } else {
+            let slave = self.pseudo.borrow_mut().cache(
+                0,
+                b"/dev/pts/0",
+                Content::Device(pseudo::Device::Pts(0, 0)),
+                0o20620,
+            )?;
+            {
+                let mut node = slave.borrow_mut();
+                node.uid = self.credentials.fsuid;
+                node.gid = 5;
+            }
+            let pair = Pty::embedding(slave);
+            self.embedding_terminal.get_or_init(|| pair).clone()
+        };
+        self.ptys.lock().unwrap().insert(0, Arc::downgrade(&pair));
         self.set_controlling_terminal(Some(0))
             .expect("embedding terminal");
         if self.node(b"/dev/tty").is_err() {
@@ -1319,7 +1336,7 @@ impl Vfs {
                             ofd_records: Default::default(),
                             node: None,
                             pipe: None,
-                            pty: None,
+                            pty: Some(pty::PtyEnd::new(pair.clone(), false)),
                             local: None,
                             bridge: None,
                             kernel_log: None,
@@ -2561,7 +2578,7 @@ impl Vfs {
         } else {
             match node.borrow().content {
                 Content::Device(pseudo::Device::Ptmx) => Some(self.allocate_pty(&p)?),
-                Content::Device(pseudo::Device::Pts(id, _)) if id != 0 => {
+                Content::Device(pseudo::Device::Pts(id, _)) => {
                     let pair = self.pty_by_id(id).ok_or(Errno(5))?;
                     if pair.locked.load(std::sync::atomic::Ordering::Relaxed)
                         || !pair.master_alive.load(std::sync::atomic::Ordering::Relaxed)
@@ -2572,7 +2589,6 @@ impl Vfs {
                 }
                 Content::Terminal => match self.controlling_terminal() {
                     None => return Err(Errno(6)),
-                    Some(0) => None,
                     Some(id) => {
                         let pair = self.pty_by_id(id).ok_or(Errno(6))?;
                         if !pair.master_alive.load(std::sync::atomic::Ordering::Relaxed) {

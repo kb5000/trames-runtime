@@ -582,7 +582,21 @@ impl<C: Cpu> Runtime<C> {
                 "exact instruction budgets are unavailable for this execution backend",
             ));
         }
-        process::run(self, output, instruction_limit)
+        let pair = self.terminal.take().map(|state| {
+            let pair = self
+                .linux
+                .vfs
+                .embedding_terminal()
+                .expect("enabled embedding terminal");
+            *pair.terminal.borrow_mut() = state;
+            pair
+        });
+        let count = self.cpu_count.clamp(1, if C::PARALLEL { 32 } else { 1 });
+        let workers = workers::Pool::<C>::with_profiling(count, self.profile_syscalls);
+        let mut adapter = terminal::Adapter::new(output, pair, workers.terminal_executor());
+        let result = process::run(self, &mut adapter, instruction_limit, workers);
+        self.terminal = adapter.finish();
+        result
     }
 }
 
