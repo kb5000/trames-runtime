@@ -384,6 +384,18 @@ pub struct DirectFd {
     pub(super) origin: Option<OfdIdentity>,
 }
 impl DirectFd {
+    /// Read-only tty probes on an actual non-terminal never need guest bytes.
+    /// Legacy console adapters and real PTYs retain their original authority.
+    pub fn terminal_query_error(&self) -> Option<Errno> {
+        if matches!(
+            self.resource,
+            ByteResource::Console(_) | ByteResource::Pty { .. }
+        ) {
+            None
+        } else {
+            Some(Errno(if self.flags & O_PATH != 0 { 9 } else { 25 }))
+        }
+    }
     pub fn check_read_access(&self) -> Result<()> {
         if self.flags & O_PATH != 0 || self.flags & 3 == 1 {
             Err(Errno(9))

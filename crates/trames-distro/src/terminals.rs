@@ -41,12 +41,6 @@ pub struct NativeTerminals {
     masters: BTreeMap<u64, Master>,
 }
 impl NativeTerminals {
-    pub fn can_pump_live(&self, channels: &BTreeMap<u64, Channel>) -> bool {
-        self.masters.keys().all(|id| channels.contains_key(id))
-            && channels
-                .iter()
-                .all(|(id, channel)| channel.phase != "starting" || self.masters.contains_key(id))
-    }
     pub fn new(root: &mut Vfs) -> Result<Self, String> {
         let [reader, writer] = root.pipe(0).map_err(|e| e.to_string())?;
         if reader != 3 {
@@ -179,13 +173,7 @@ impl NativeTerminals {
                 let bytes: Vec<_> = channel.input.iter().take(4096).copied().collect();
                 if let Ok((count, signals)) = master.pair.master_write(&bytes) {
                     channel.input.drain(..count);
-                    let mask = signals
-                        .into_iter()
-                        .fold(0, |mask, sig| mask | (1 << (sig - 1)));
-                    master
-                        .pair
-                        .host_signals
-                        .fetch_or(mask, std::sync::atomic::Ordering::Relaxed);
+                    master.pair.queue_host_signals(signals);
                 }
             }
             master.pair.flush_echo();

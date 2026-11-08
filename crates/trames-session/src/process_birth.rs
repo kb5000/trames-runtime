@@ -167,6 +167,7 @@ impl Birth {
     /// Complete the original birth transaction before making a child runnable.
     /// Host launch and guest clone use identical family/PID/cgroup admission.
     /// Resource notifications run after the family relationship guard drops.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn admit_child<C: Cpu>(
         &self,
         parent: u32,
@@ -175,9 +176,11 @@ impl Birth {
         child: &mut Process<C>,
         threaded: bool,
         inherit_job: bool,
+        host_terminal: Option<&Arc<trames_vfs::Pty>>,
     ) -> Result<(), Errno> {
         let family = child.family.clone();
         let mut cgroup_birth = None;
+        let mut hung_up = false;
         let result = self.families.birth(&family, || {
             if !parent_control.permits_birth() {
                 return Err(Errno(4));
@@ -198,6 +201,20 @@ impl Birth {
             child.bind_signals();
             child.linux.vfs.set_process_context(id);
             self.publish_task_core(id, child);
+            if let Some(pair) = host_terminal {
+                // Original membership is visible before the master can signal
+                // this session. Master close and attachment share the tty lock;
+                // notifications happen after the family/tty transaction ends.
+                let mut tty = pair.terminal.borrow_mut();
+                if pair.master_alive.load(Ordering::Relaxed) {
+                    tty.session = id;
+                    tty.foreground = id;
+                    pair.retain_job_ids(child.linux.vfs.pid_namespace(), id, id);
+                } else {
+                    child.linux.vfs.set_controlling_terminal(None)?;
+                    hung_up = true;
+                }
+            }
             let binding = (!threaded).then(|| trames_kernel::family::Binding {
                 id,
                 group: child.group(),
@@ -215,6 +232,9 @@ impl Birth {
         }
         result?;
         self.bind_task_cgroup(id, child);
+        if hung_up {
+            child.signals.io.lifecycle().request_exit(1);
+        }
         Ok(())
     }
     pub(super) fn clone_task<C: Cpu>(
@@ -358,6 +378,7 @@ impl Birth {
             &mut child,
             threaded,
             true,
+            None,
         )?;
         // Linux stores these user TIDs after task birth and ignores
         // copyout faults. CHILD_CLEARTID only records its address.
@@ -499,5 +520,123 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+}
+
+pub(super) struct HostChild<C: Cpu> {
+    pub id: u32,
+    pub process: Box<Process<C>>,
+    parent: Arc<trames_kernel::task_control::Group>,
+    terminal: Option<Arc<trames_vfs::Pty>>,
+    pub host: Arc<trames_linux::HostProcess>,
+}
+impl Birth {
+    pub(super) fn prepare_host<C: Cpu>(
+        &self,
+        root: &Process<C>,
+        request: trames_linux::HostSpawn,
+    ) -> Result<(HostChild<C>, exec::Request), Errno> {
+        if request.process.cancelled() {
+            return Err(Errno(125));
+        }
+        if request.argv.is_empty() {
+            return Err(Errno(11));
+        }
+        let slot = self.capacity.reserve().ok_or(Errno(11))?;
+        let id = self.ids.allocate().ok_or(Errno(11))?;
+        let parent = root.signals.io.lifecycle().clone();
+        let mut child = root.fork_state(
+            Memory::default(),
+            false,
+            false,
+            false,
+            Arc::new(slot.into_presence()),
+        );
+        child
+            .memory
+            .inherit_total_limit(&root.memory)
+            .map_err(|_| Errno(12))?;
+        child.linux.vfs = request.vfs;
+        child.limits.bind(&mut child.linux.vfs);
+        child.linux.vfs.prepare_child_context(id);
+        child.linux.fork_tid(0);
+        child.family.set_parent(1);
+        child.parentage.set_parent_thread(1);
+        child.tgid = id;
+        child.set_session(id);
+        child.set_group(id);
+        child.signals = Signals {
+            presence: child.signals.presence.clone(),
+            io_directory: root.signals.io_directory.clone(),
+            ..Signals::default()
+        };
+        child.linux.vfs.set_controlling_terminal(None)?;
+        let terminal = child
+            .linux
+            .vfs
+            .pty(0)?
+            .filter(|end| !end.master)
+            .map(|end| end.pair.clone());
+        if let Some(pair) = &terminal {
+            child.linux.vfs.set_controlling_terminal(Some(pair.id))?;
+        }
+        let image = exec::Request::host(
+            &child,
+            request.argv,
+            request.environment,
+            self.memory_limits.per_process,
+            self.started,
+        );
+        Ok((
+            HostChild {
+                id,
+                process: child,
+                parent,
+                terminal,
+                host: request.process,
+            },
+            image,
+        ))
+    }
+    pub(super) fn finish_host<C: Cpu>(
+        &self,
+        mut child: HostChild<C>,
+        mut image: exec::Image<C>,
+    ) -> Result<HostChild<C>, Errno> {
+        if child.host.cancelled() {
+            return Err(Errno(125));
+        }
+        image
+            .memory
+            .inherit_total_limit(&child.process.memory)
+            .map_err(|_| Errno(12))?;
+        drop(Kernel::install_exec(
+            &mut child.process,
+            image,
+            self.started,
+        ));
+        let p = &mut *child.process;
+        p.family.bind_host_status(child.host.status_cell());
+        p.vm_id = self.resource_id();
+        p.wait_event.bind_presence(&p.signals.presence);
+        self.admit_child(
+            1,
+            &child.parent,
+            child.id,
+            p,
+            false,
+            false,
+            child.terminal.as_ref(),
+        )?;
+        let directory = p.signals.io_directory.clone();
+        child.host.bind_control(Arc::new(move |group, signal| {
+            directory.host_signal_group(group, signal)
+        }));
+        if let Some(pair) = &child.terminal {
+            if let Some(task) = p.linux.vfs.terminal_task() {
+                pair.bind_signal_route(task);
+            }
+        }
+        Ok(child)
     }
 }

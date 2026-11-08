@@ -53,20 +53,37 @@ impl IoDirectory {
         }
     }
     fn terminal_signal(&self, session: u32, group: u32, signal: u32) {
-        if session == 0 || group == 0 {
+        if session == 0 {
+            return;
+        }
+        self.trusted_group(
+            group,
+            Some(session),
+            signal,
+            Info {
+                code: 128,
+                ..Default::default()
+            },
+        );
+    }
+    /// Host-authorized process-group control, over original live membership.
+    pub fn host_signal_group(&self, group: u32, signal: u32) {
+        if !(1..=64).contains(&signal) {
+            return;
+        }
+        self.trusted_group(group, None, signal, Info::default());
+    }
+    fn trusted_group(&self, group: u32, session: Option<u32>, signal: u32, info: Info) {
+        if group == 0 {
             return;
         }
         let members = self.tasks(2, group);
         let mut sent = BTreeSet::new();
         for task in members
             .iter()
-            .filter(|t| t.live() && t.session() == session)
+            .filter(|t| t.live() && session.is_none_or(|session| t.session() == session))
         {
             if sent.insert(task.tgid()) {
-                let info = Info {
-                    code: 128,
-                    ..Default::default()
-                };
                 if matches!(signal, 9 | 18..=22) {
                     let _ = task.job_signal(signal, true, info, true);
                 } else {
@@ -223,6 +240,9 @@ impl TerminalTask for TerminalRoute {
         let family = task.family().and_then(|f| f.registry()).ok_or(Errno(6))?;
         family.terminal_change(|| {
             let mut tty = terminal.terminal.borrow_mut();
+            if !terminal.master_alive.load(Ordering::Relaxed) {
+                return Err(Errno(5));
+            }
             let original = task.lifecycle().controlling().ok_or(Errno(6))?;
             let mut controlling = original.lock();
             let (group, session) = task.lifecycle().job_ids();

@@ -248,6 +248,8 @@ impl PtyIo {
             for signal in signals.drain(..) {
                 route.signal(session, group, signal);
             }
+        } else if session == 0 || group == 0 {
+            signals.clear();
         }
         Ok((count, signals))
     }

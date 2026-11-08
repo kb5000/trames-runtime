@@ -25,6 +25,7 @@ impl<C: Cpu> Kernel<C> {
         let envp = strings(&p.memory, a[2])?;
         Self::exec_strings(p, dirfd, path, argv, envp, flags, budget, clock_origin)
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn exec_strings(
         p: &mut Process<C>,
@@ -1263,10 +1264,11 @@ pub(crate) struct Request {
     flags: u32,
     options: crate::RuntimeOptions,
     clock_origin: Instant,
+    search: bool,
 }
 impl Request {
     #[allow(clippy::too_many_arguments)]
-    fn new<C: Cpu>(
+    pub(super) fn new<C: Cpu>(
         p: &Process<C>,
         dirfd: i32,
         path: Vec<u8>,
@@ -1279,6 +1281,7 @@ impl Request {
         Self {
             vfs: p.linux.vfs.clone(),
             file: None,
+            search: false,
             dirfd,
             path,
             argv,
@@ -1316,6 +1319,27 @@ impl Request {
             },
         }
     }
+    pub(super) fn host<C: Cpu>(
+        p: &Process<C>,
+        argv: Vec<Vec<u8>>,
+        environment: Vec<Vec<u8>>,
+        budget: usize,
+        clock_origin: Instant,
+    ) -> Self {
+        let path = argv[0].clone();
+        let mut request = Self::new(
+            p,
+            AT_FDCWD,
+            path,
+            argv,
+            environment,
+            0,
+            budget,
+            clock_origin,
+        );
+        request.search = !request.path.contains(&b'/');
+        request
+    }
     pub(super) fn capture<C: Cpu>(
         p: &Process<C>,
         number: u32,
@@ -1342,7 +1366,7 @@ impl Request {
     pub(crate) fn load<C: Cpu>(self) -> Result<Image<C>, Errno> {
         let Self {
             vfs,
-            file,
+            mut file,
             dirfd,
             mut path,
             mut argv,
@@ -1350,7 +1374,35 @@ impl Request {
             flags,
             options,
             clock_origin,
+            search,
         } = self;
+        if search {
+            let paths = envp
+                .iter()
+                .find_map(|e| e.strip_prefix(b"PATH="))
+                .unwrap_or(b"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+            let mut denied = false;
+            let mut found = None;
+            for directory in paths.split(|b| *b == b':') {
+                let mut candidate = directory.to_vec();
+                if !candidate.is_empty() {
+                    candidate.push(b'/');
+                }
+                candidate.extend_from_slice(&path);
+                match vfs.executable_file_at(AT_FDCWD, &candidate, 0) {
+                    Ok(open) => {
+                        found = Some((candidate, open));
+                        break;
+                    }
+                    Err(e) if e.0 == 13 => denied = true,
+                    Err(e) if matches!(e.0, 2 | 20) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            let (found, open) = found.ok_or(Errno(if denied { 13 } else { 2 }))?;
+            path = found;
+            file = Some(open);
+        }
         let budget = options.memory_limits.per_process;
         if path.is_empty() && flags & 0x1000 == 0 {
             return Err(Errno(2));
@@ -1465,7 +1517,7 @@ impl<C: Cpu> Preparation<C> {
             Self::Disk(pending) => pending.ready(),
         }
     }
-    fn take(self) -> Result<Image<C>, Errno> {
+    pub(super) fn take(self) -> Result<Image<C>, Errno> {
         match self {
             Self::Error(error) => Err(error),
             Self::Disk(pending) => pending.take().expect("ready image result"),

@@ -41,9 +41,7 @@ impl Drop for PtyEnd {
     fn drop(&mut self) {
         if self.master {
             self.pair.master_alive.store(false, Ordering::Relaxed);
-            if self.pair.hangup() {
-                self.pair.hangup_notified.store(true, Ordering::Relaxed);
-            }
+            self.pair.flush_host_events();
             self.pair.notify();
             if let Some(mount) = self.pair.mount.as_ref().filter(|m| m.devpts.is_some()) {
                 let key = format!("/{}", self.pair.number).into_bytes();
@@ -71,14 +69,53 @@ impl std::ops::Deref for Pty {
     }
 }
 impl Pty {
+    pub fn bind_signal_route(&self, route: Arc<dyn TerminalSignals>) {
+        self.io.bind_signal_route(route);
+        self.flush_host_events();
+    }
+    /// Publish/recheck closes the route-install race. Legacy embeddings keep
+    /// their pending bits; source routes consume the original terminal events.
+    pub fn flush_host_events(&self) {
+        if !self.has_signal_route() {
+            return;
+        }
+        if self.host_resize_pending.swap(false, Ordering::Relaxed) {
+            self.signal_foreground(28);
+        }
+        let mut signals = self.host_signals.swap(0, Ordering::Relaxed);
+        while signals != 0 {
+            let signal = signals.trailing_zeros() + 1;
+            signals &= signals - 1;
+            self.signal_foreground(signal);
+        }
+        if !self.master_alive.load(Ordering::Relaxed)
+            && !self.hangup_notified.swap(true, Ordering::Relaxed)
+        {
+            self.io.hangup();
+        }
+    }
+    pub fn queue_host_signals(&self, signals: Vec<u32>) {
+        if signals.is_empty() {
+            return;
+        }
+        self.host_signals.fetch_or(
+            signals
+                .into_iter()
+                .fold(0, |mask, signal| mask | (1 << (signal - 1))),
+            Ordering::Relaxed,
+        );
+        self.flush_host_events();
+    }
     pub fn resize_from_host(&self, rows: u16, columns: u16) {
         let mut tty = self.terminal.borrow_mut();
         let before = tty.window;
         tty.resize(rows, columns);
         if before != tty.window {
+            let target = tty.session != 0 && tty.foreground != 0;
             drop(tty);
-            if !self.signal_foreground(28) {
+            if target && !self.signal_foreground(28) {
                 self.host_resize_pending.store(true, Ordering::Relaxed);
+                self.flush_host_events();
             }
         }
     }
@@ -361,6 +398,72 @@ impl Devpts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[derive(Default)]
+    struct HostRoute(std::sync::Mutex<Vec<u32>>);
+    impl TerminalSignals for HostRoute {
+        fn signal(&self, _: u32, _: u32, signal: u32) {
+            self.0.lock().unwrap().push(signal);
+        }
+        fn clear_session(&self, _: u32, _: u32) {}
+        fn hangup(&self, _: u32, _: u32, _: u32) {
+            self.0.lock().unwrap().push(1);
+        }
+    }
+    #[test]
+    fn initial_host_events_do_not_escape_to_a_future_job_and_route_install_drains_pending_events() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, RuntimeInfo::default());
+        let master = v.open_at(AT_FDCWD, b"/dev/ptmx", 2, 0).unwrap();
+        let pair = v.pty(master).unwrap().unwrap().pair.clone();
+        pair.resize_from_host(30, 100);
+        pair.queue_host_signals(pair.master_write(&[3]).unwrap().1);
+        assert!(!pair.host_resize_pending.load(Ordering::Relaxed));
+        assert_eq!(pair.host_signals.load(Ordering::Relaxed), 0);
+        {
+            let mut tty = pair.terminal.borrow_mut();
+            tty.session = 1;
+            tty.foreground = 1;
+        }
+        pair.resize_from_host(40, 120);
+        pair.queue_host_signals(vec![2]);
+        v.close(master).unwrap();
+        let route = Arc::new(HostRoute::default());
+        pair.bind_signal_route(route.clone());
+        pair.flush_host_events();
+        assert_eq!(*route.0.lock().unwrap(), [28, 2, 1]);
+        assert!(!pair.host_resize_pending.load(Ordering::Relaxed));
+        assert_eq!(pair.host_signals.load(Ordering::Relaxed), 0);
+        assert!(pair.hangup_notified.load(Ordering::Relaxed));
+    }
+    #[test]
+    fn concurrent_host_close_and_route_install_deliver_hangup_once_without_pending_owner_work() {
+        for _ in 0..64 {
+            let mut v = Vfs::default();
+            v.set_runtime_info(1, RuntimeInfo::default());
+            let master = v.open_at(AT_FDCWD, b"/dev/ptmx", 2, 0).unwrap();
+            let pair = v.pty(master).unwrap().unwrap().pair.clone();
+            {
+                let mut tty = pair.terminal.borrow_mut();
+                tty.session = 1;
+                tty.foreground = 1;
+            }
+            let route = Arc::new(HostRoute::default());
+            std::thread::scope(|scope| {
+                scope.spawn(|| pair.bind_signal_route(route.clone()));
+                scope.spawn(|| {
+                    pair.resize_from_host(40, 120);
+                    pair.queue_host_signals(vec![2]);
+                });
+                scope.spawn(|| v.close(master).unwrap());
+            });
+            assert_eq!(
+                route.0.lock().unwrap().iter().filter(|&&s| s == 1).count(),
+                1
+            );
+            assert!(!pair.host_resize_pending.load(Ordering::Relaxed));
+            assert_eq!(pair.host_signals.load(Ordering::Relaxed), 0);
+        }
+    }
     fn mount(v: &mut Vfs, path: &[u8]) {
         v.mkdir_at(AT_FDCWD, path, 0o755).unwrap();
         v.mount(

@@ -80,17 +80,100 @@ pub struct HostMemoryInfo {
     pub available: usize,
 }
 
-/// A host-authorized process launch, consumed only at the existing lifecycle
-/// boundary. Stdio contains independent descriptors into shared byte resources.
+/// A host-authorized process launch over independent descriptors into the
+/// original shared byte resources. Image work can outlive its host transport.
 /// Completion is a Linux wait status (or negative errno on launch failure).
 pub struct HostSpawn {
     pub argv: Vec<Vec<u8>>,
     pub environment: Vec<Vec<u8>>,
     pub vfs: trames_vfs::Vfs,
-    pub status: std::sync::Arc<std::sync::atomic::AtomicI32>,
-    pub pid: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    pub process: std::sync::Arc<HostProcess>,
 }
 pub const HOST_RUNNING: i32 = i32::MIN;
+/// One original launch/transport lifetime. PID publication and cancellation
+/// share a single atomic modification order; neither can miss the other.
+pub struct HostProcess {
+    state: std::sync::atomic::AtomicU32,
+    status: std::sync::Arc<std::sync::atomic::AtomicI32>,
+    cancellation: std::sync::OnceLock<std::sync::Arc<trames_shared::Readiness>>,
+    control: std::sync::OnceLock<std::sync::Arc<dyn Fn(u32, u32) + Send + Sync>>,
+}
+impl Default for HostProcess {
+    fn default() -> Self {
+        Self {
+            state: Default::default(),
+            status: std::sync::Arc::new(std::sync::atomic::AtomicI32::new(HOST_RUNNING)),
+            cancellation: Default::default(),
+            control: Default::default(),
+        }
+    }
+}
+impl HostProcess {
+    const CANCELLED: u32 = 1 << 31;
+    pub fn pid(&self) -> u32 {
+        self.state.load(std::sync::atomic::Ordering::Acquire) & !Self::CANCELLED
+    }
+    pub fn status(&self) -> i32 {
+        self.status.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn status_cell(&self) -> std::sync::Arc<std::sync::atomic::AtomicI32> {
+        self.status.clone()
+    }
+    pub fn cancelled(&self) -> bool {
+        self.state.load(std::sync::atomic::Ordering::Relaxed) & Self::CANCELLED != 0
+    }
+    pub fn publish(&self, pid: u32) -> bool {
+        assert!(pid != 0 && pid < Self::CANCELLED);
+        self.state
+            .compare_exchange(
+                0,
+                pid,
+                std::sync::atomic::Ordering::Release,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+    /// Returns the already published group, if any. A concurrent publication
+    /// instead observes cancellation and retires its unissued launch.
+    pub fn cancel(&self) -> Option<u32> {
+        let old = self
+            .state
+            .fetch_or(Self::CANCELLED, std::sync::atomic::Ordering::Acquire);
+        if let Some(ready) = self.cancellation.get() {
+            ready.notify_locked();
+        }
+        let pid = old & !Self::CANCELLED;
+        if pid != 0 && old & Self::CANCELLED == 0 {
+            if let Some(route) = self.control.get() {
+                route(pid, 1);
+            }
+        }
+        (pid != 0 && old & Self::CANCELLED == 0).then_some(pid)
+    }
+    pub fn bind_control(&self, control: std::sync::Arc<dyn Fn(u32, u32) + Send + Sync>) {
+        self.control.get_or_init(|| control);
+    }
+    pub fn signal(&self, signal: u32) {
+        let pid = self.pid();
+        if pid != 0 && (1..=64).contains(&signal) {
+            if let Some(route) = self.control.get() {
+                route(pid, signal);
+            }
+        }
+    }
+    pub fn fail(&self, errno: u32) {
+        self.status
+            .store(-(errno as i32), std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn subscribe(
+        &self,
+        signal: &std::sync::Arc<trames_shared::IoSignal>,
+    ) -> trames_shared::IoSubscription {
+        self.cancellation
+            .get_or_init(Default::default)
+            .subscribe(signal)
+    }
+}
 
 pub trait GuestOutput {
     /// Original byte resource, shared with execution workers. Lifecycle hooks
@@ -108,9 +191,14 @@ pub trait GuestOutput {
     fn host_memory(&self) -> Option<HostMemoryInfo> {
         None
     }
+    /// The adapter can prepare independent stdio/terminal resources while
+    /// executors run. Accepted spawn/signal work uses original session resources.
+    fn live_host_processes(&self) -> bool {
+        false
+    }
 
-    /// Poll host queues/resource metadata without touching guest bytes or
-    /// changing namespace/FD topology. True requests the stopped control hook.
+    /// Poll host queues/original resources without touching guest bytes.
+    /// True requests the stopped control hook.
     /// Legacy adapters conservatively retain their existing joined callback.
     fn poll_control(&mut self, _vfs: &trames_vfs::Vfs) -> io::Result<bool> {
         Ok(true)
@@ -120,8 +208,8 @@ pub trait GuestOutput {
     fn control(&mut self, _vfs: &mut trames_vfs::Vfs) -> io::Result<bool> {
         Ok(true)
     }
-    /// One host-authorized Linux signal for guest PID 1, consumed only after
-    /// the stopped control hook. Terminal events still target foreground jobs.
+    /// An accepted host launch. Opted-in adapters submit while executors run;
+    /// legacy embeddings consume it after the stopped control hook.
     fn host_spawn(&mut self) -> Option<HostSpawn> {
         None
     }
@@ -342,5 +430,40 @@ mod tests {
         dispatch(&mut c, &m, &mut out);
         assert_eq!(c.x(0), errno(4));
         assert_eq!(out.calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+}
+
+#[cfg(test)]
+mod host_process_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc, Barrier,
+    };
+    #[test]
+    fn cancellation_and_publication_cannot_miss_each_other_or_deliver_twice() {
+        for _ in 0..64 {
+            let process = Arc::new(HostProcess::default());
+            let delivered = Arc::new(AtomicU32::new(0));
+            let result = delivered.clone();
+            process.bind_control(Arc::new(move |group, signal| {
+                assert_eq!((group, signal), (7, 1));
+                result.fetch_add(1, Ordering::Relaxed);
+            }));
+            let barrier = Arc::new(Barrier::new(2));
+            let peer = process.clone();
+            let ready = barrier.clone();
+            let sender = std::thread::spawn(move || {
+                ready.wait();
+                peer.publish(7)
+            });
+            barrier.wait();
+            process.cancel();
+            let published = sender.join().unwrap();
+            assert_eq!(delivered.load(Ordering::Relaxed), u32::from(published));
+            assert!(process.cancelled());
+            assert_eq!(process.cancel(), None);
+            assert_eq!(delivered.load(Ordering::Relaxed), u32::from(published));
+        }
     }
 }

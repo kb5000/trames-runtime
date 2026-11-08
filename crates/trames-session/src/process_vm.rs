@@ -334,20 +334,35 @@ impl<C: Cpu> Kernel<C> {
         result
     }
 
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn cohort_control(
         &mut self,
         members: &[(u32, usize)],
         io: &mut impl GuestOutput,
     ) -> Result<bool, RuntimeError> {
+        self.cohort_control_inner(None, members, io)
+    }
+    pub(super) fn cohort_live_control(
+        &mut self,
+        epoch: &crate::run_queue::Epoch<C>,
+        members: &[(u32, usize)],
+        io: &mut impl GuestOutput,
+    ) -> Result<bool, RuntimeError> {
+        self.cohort_control_inner(Some(epoch), members, io)
+    }
+    fn cohort_control_inner(
+        &mut self,
+        epoch: Option<&crate::run_queue::Epoch<C>>,
+        members: &[(u32, usize)],
+        io: &mut impl GuestOutput,
+    ) -> Result<bool, RuntimeError> {
         self.persistent_control_checks += 1;
         if let Some(root) = self.processes.get(&1) {
-            if io
+            let join = io
                 .poll_control(&root.linux.vfs)
-                .map_err(|_| RuntimeError::Arguments("host session control failed"))?
-            {
-                return Ok(true);
-            }
-            if root
+                .map_err(|_| RuntimeError::Arguments("host session control failed"))?;
+            let directory = root.signals.io_directory.clone();
+            let terminal = root
                 .linux
                 .vfs
                 .live_ptys()
@@ -361,8 +376,19 @@ impl<C: Cpu> Kernel<C> {
                             && !pair
                                 .hangup_notified
                                 .load(std::sync::atomic::Ordering::Relaxed)
-                })
-            {
+                });
+            drop(root);
+            if io.live_host_processes() {
+                if let Some(epoch) = epoch {
+                    while let Some(request) = io.host_spawn() {
+                        epoch.submit_host(request);
+                    }
+                    while let Some((group, signal)) = io.host_signal() {
+                        directory.host_signal_group(group, signal);
+                    }
+                }
+            }
+            if join || terminal {
                 return Ok(true);
             }
         }
@@ -383,7 +409,16 @@ impl<C: Cpu> Kernel<C> {
             if p.frozen(pid) {
                 return false;
             }
-            if members.contains(&pid) {
+            if epoch.is_some_and(|epoch| epoch.source_lifecycle())
+                && p.signals.io.tgid() != 0
+                && !p.signals.io.live()
+            {
+                // Source exit has already retired this actor. Its original
+                // task/mm cleanup may still await custody; the cold Ready
+                // projection is never a newly runnable owner-side process.
+                return false;
+            }
+            if members.contains(&pid) || epoch.is_some_and(|epoch| epoch.controls(pid)) {
                 // An excluded original resource still needs its actual owner;
                 // a stopped task cannot acknowledge before that work finishes.
                 return p.stopped() && p.stop_held() && !p.control_candidate(pid);

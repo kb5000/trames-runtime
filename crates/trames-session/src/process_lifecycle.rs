@@ -4,6 +4,8 @@
 use super::*;
 use crate::run_queue::{Checkpoint, Epoch, Job};
 use std::sync::Mutex;
+#[path = "process_lifecycle_host.rs"]
+mod host_launch;
 #[path = "process_lifecycle_exec.rs"]
 mod image;
 #[path = "process_lifecycle_layouts.rs"]
@@ -20,6 +22,8 @@ type Groups<C> = BTreeMap<usize, Vec<(u32, tasks::Handle<C>)>>;
 
 pub(crate) struct Lifecycle<C: Cpu> {
     birth: birth::Birth,
+    host_launches: Arc<host::Launches<C>>,
+    host_driver: std::sync::OnceLock<host::Driver<C>>,
     dispatch: dispatch::Dispatch,
     tasks: tasks::Directory<C>,
     registry: trames_memory::parallel::Registry,
@@ -98,6 +102,8 @@ impl<C: Cpu> Lifecycle<C> {
     pub(super) fn capture(kernel: &Kernel<C>) -> Self {
         Self {
             birth: birth::Birth::capture(kernel),
+            host_launches: kernel.host_launches.clone(),
+            host_driver: Default::default(),
             dispatch: dispatch::Dispatch::capture(kernel),
             tasks: kernel.processes.directory(),
             registry: kernel.parallel_memory.share(),
@@ -118,6 +124,11 @@ impl<C: Cpu> Lifecycle<C> {
         }
     }
     pub(crate) fn bind_memory(&self, target: std::sync::Weak<dyn trames_shared::IoWake>) {
+        let signal = trames_shared::IoSignal::new(0, target.clone());
+        assert!(self
+            .host_driver
+            .set(self.host_launches.bind(signal))
+            .is_ok());
         let signal = trames_shared::IoSignal::new(0, target.clone());
         assert!(self
             .layout_driver
@@ -148,6 +159,13 @@ impl<C: Cpu> Lifecycle<C> {
             .is_some_and(|wake| wake.signal.ready())
     }
     pub(crate) fn memory_signal(&self, signal: &Arc<trames_shared::IoSignal>) -> bool {
+        if self
+            .host_driver
+            .get()
+            .is_some_and(|driver| Arc::ptr_eq(signal, &driver.signal))
+        {
+            return true;
+        }
         self.memory_wake
             .get()
             .is_some_and(|wake| Arc::ptr_eq(signal, &wake.signal))

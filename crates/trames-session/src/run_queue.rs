@@ -427,6 +427,21 @@ impl Stats {
     }
 }
 
+/// Publish source ownership before a born host task becomes externally visible.
+/// CPU membership follows only after its original View can actually execute.
+pub(crate) struct HostAdmission<C: Cpu> {
+    epoch: Weak<Epoch<C>>,
+    id: u32,
+}
+impl<C: Cpu> Drop for HostAdmission<C> {
+    fn drop(&mut self) {
+        if let Some(epoch) = self.epoch.upgrade() {
+            let mut q = epoch.queues.lock().unwrap();
+            q.host_admissions.remove(&self.id);
+            epoch.notify(&mut q);
+        }
+    }
+}
 pub(super) struct Job<C: Cpu> {
     pub work: Work<C>,
     pub stats: Stats,
@@ -755,6 +770,7 @@ struct Queues<C: Cpu> {
     ready: VecDeque<Box<Job<C>>>,
     parked: BTreeMap<u32, Box<Job<C>>>,
     members: BTreeSet<u32>,
+    host_admissions: BTreeSet<u32>,
     running: usize,
     completing: usize,
     finished: Vec<Done<C>>,
@@ -1109,6 +1125,35 @@ impl<C: Cpu> Epoch<C> {
         }
         self.ready(&mut q, job);
     }
+    pub(crate) fn reserve_host(&self, id: u32) -> HostAdmission<C> {
+        assert!(self.queues.lock().unwrap().host_admissions.insert(id));
+        HostAdmission {
+            epoch: self.me.clone(),
+            id,
+        }
+    }
+    pub(crate) fn controls(&self, id: u32) -> bool {
+        let q = self.queues.lock().unwrap();
+        q.members.contains(&id) || q.host_admissions.contains(&id)
+    }
+    pub(crate) fn admit_live(&self, job: Box<Job<C>>) {
+        let original = self.me.upgrade().expect("live host admission");
+        original.add(job);
+        if let Some(starter) = self.starter.get() {
+            for slot in self.additional_slots(self.active_slots(), starter.capacity()) {
+                let _ = self.activate(slot);
+            }
+        }
+    }
+    pub(crate) fn submit_host(&self, request: trames_linux::HostSpawn) -> bool {
+        if let Some(lifecycle) = self.lifecycle.get() {
+            lifecycle.submit_host(request);
+            true
+        } else {
+            request.process.fail(38);
+            false
+        }
+    }
     pub fn stop(&self) {
         let mut q = self.queues.lock().unwrap();
         self.control.stop();
@@ -1326,7 +1371,9 @@ impl<C: Cpu> Epoch<C> {
             && q.ready.is_empty()
             && !q.domains.any_paused()
             && self.lifecycle.get().is_none_or(|lifecycle| {
-                !lifecycle.retirements_pending() && !lifecycle.layouts_pending()
+                !lifecycle.retirements_pending()
+                    && !lifecycle.layouts_pending()
+                    && !lifecycle.host_pending()
             })
     }
     pub fn restore_checkpoint(&self, checkpoint: Checkpoint<C>, resume: bool) {
@@ -1396,6 +1443,17 @@ impl<C: Cpu> Epoch<C> {
                     q.completing += 1;
                     drop(q);
                     lifecycle.retire_memory_domains(retired);
+                    q = self.queues.lock().unwrap();
+                    q.completing -= 1;
+                    continue;
+                }
+                if lifecycle.host_ready() {
+                    q.completing += 1;
+                    drop(q);
+                    if let Err(error) = lifecycle.pump_host(Some(self), slot) {
+                        lifecycle.host_error(error);
+                        self.stop();
+                    }
                     q = self.queues.lock().unwrap();
                     q.completing -= 1;
                     continue;
@@ -1564,7 +1622,9 @@ impl<C: Cpu> Epoch<C> {
                 && !external
                 && !q.domains.any_paused()
                 && self.lifecycle.get().is_none_or(|lifecycle| {
-                    !lifecycle.retirements_pending() && !lifecycle.layouts_pending()
+                    !lifecycle.retirements_pending()
+                        && !lifecycle.layouts_pending()
+                        && !lifecycle.host_pending()
                 })
             {
                 if self.persistent {

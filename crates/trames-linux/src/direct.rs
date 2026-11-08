@@ -734,6 +734,9 @@ impl DirectSyscalls {
         }
     }
     fn supports_fd_call(number: u32, args: [u64; 6], fd: &trames_vfs::DirectFd) -> bool {
+        if number == 29 && Self::terminal_probe(args, fd).is_some() {
+            return true;
+        }
         Self::supports_fd(number, fd)
             && (number != 29
                 || fd.is_entropy_device() && !matches!(args[1] as u32, 0x5421 | 0x5452)
@@ -773,6 +776,14 @@ impl DirectSyscalls {
         std::mem::swap(&mut *self.scratch.borrow_mut(), buffer);
     }
     pub fn supports_call(&self, number: u32, args: [u64; 6]) -> bool {
+        if number == 29
+            && self
+                .descriptors
+                .get(args[0] as u32)
+                .is_some_and(|fd| Self::terminal_probe(args, &fd).is_some())
+        {
+            return true;
+        }
         if Self::aio_call(number) {
             return self.aio.is_some();
         }
@@ -808,6 +819,11 @@ impl DirectSyscalls {
                         || matches!(args[1] as u32, 0x5401 | 0x5413)
                         || crate::pty_control_request(args[1] as u32)
                         || args[1] as u32 == 0x5441 && self.resources.is_some()))
+    }
+    fn terminal_probe(args: [u64; 6], fd: &trames_vfs::DirectFd) -> Option<Errno> {
+        (args[1] as u32 != 0x541b && crate::terminal_query_request(args[1] as u32))
+            .then(|| fd.terminal_query_error())
+            .flatten()
     }
     fn transfer(
         &self,
@@ -959,6 +975,11 @@ impl DirectSyscalls {
         self.terminal_stop.set(false);
         if !Self::supports_fd_call(number, args, fd) {
             return None;
+        }
+        if number == 29 {
+            if let Some(error) = Self::terminal_probe(args, fd) {
+                return Some(Err(error));
+            }
         }
         if let (Some(task), Some(end)) = (&self.terminal_task, fd.pty_endpoint()) {
             if !end.pair.has_signal_route() {
@@ -1991,6 +2012,40 @@ fn signals_pipe(number: u32, args: [u64; 6]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn host_stdio_terminal_probes_use_the_original_nonterminal_without_a_checkpoint() {
+        let mut linux = Linux::new(0x3000);
+        linux.vfs.set_runtime_info(1, Default::default());
+        let [reader, writer] = linux.vfs.pipe(0).unwrap();
+        let file = linux.vfs.open_at(-100, b"/file", 0x42, 0o600).unwrap();
+        let path = linux
+            .vfs
+            .open_at(-100, b"/file", trames_vfs::O_PATH, 0)
+            .unwrap();
+        let direct = DirectSyscalls::new(linux.vfs.direct_descriptors());
+        let mut memory = memory();
+        for fd in [reader, writer, file, path] {
+            for request in [0x5401, 0x540f, 0x5413, 0x5429] {
+                let args = [fd as u64, request, u64::MAX, 0, 0, 0];
+                let expected =
+                    linux.syscall(29, args, &mut memory, &mut crate::CapturedOutput::default());
+                assert_eq!(expected, Err(Errno(if fd == path { 9 } else { 25 })));
+                assert!(direct.supports_call(29, args));
+                assert_eq!(direct.invoke(29, args, &mut memory), Some(expected));
+            }
+        }
+        // A numeric slot can become a real PTY; revalidate the original OFD.
+        let old = direct.descriptors.get(reader).unwrap();
+        linux.vfs.close(reader).unwrap();
+        let master = linux.vfs.open_at(-100, b"/dev/ptmx", 2, 0).unwrap();
+        assert_eq!(master, reader);
+        let args = [reader as u64, 0x5401, 0x1000, 0, 0, 0];
+        assert_eq!(direct.invoke(29, args, &mut memory), Some(Ok(0)));
+        assert_eq!(
+            direct.transfer_fd(&old, 29, args, &mut memory),
+            Some(Err(Errno(25)))
+        );
+    }
     use super::*;
     use trames_memory::{Memory, Permissions, PAGE_SIZE};
     use trames_vfs::{Vfs, O_NONBLOCK};

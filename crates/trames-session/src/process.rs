@@ -9,6 +9,8 @@ use std::{
     time::{Duration, Instant},
 };
 use trames_engine::{Cpu, SliceOutcome};
+#[path = "process_host.rs"]
+mod host;
 /// The same guest fault classification is used by source and owner delivery.
 pub(super) fn fault_info(fault: &trames_engine::CpuFault) -> Option<trames_kernel::signal::Fault> {
     use trames_engine::CpuFault as F;
@@ -597,6 +599,7 @@ impl trames_vfs::IoWake for JoinedByteWake {
     }
 }
 pub(crate) struct Kernel<C: Cpu> {
+    host_launches: Arc<host::Launches<C>>,
     byte_target: Arc<dyn trames_vfs::IoWake>,
     exits: exit::Retirements,
     layout_work: std::sync::OnceLock<Arc<trames_linux::FileLayouts>>,
@@ -760,16 +763,6 @@ impl<C: Cpu> Kernel<C> {
         if let Some((id, p)) = current {
             self.publish_task(id, p);
         }
-    }
-    fn admit_child(
-        &self,
-        parent: u32,
-        parent_control: &trames_kernel::task_control::Group,
-        id: u32,
-        child: &mut Process<C>,
-        threaded: bool,
-    ) -> Result<(), Errno> {
-        birth::Birth::capture(self).admit_child(parent, parent_control, id, child, threaded, false)
     }
     fn native_call(
         &mut self,
@@ -1018,121 +1011,41 @@ impl<C: Cpu> Kernel<C> {
             Err(_) => return Err(RuntimeError::Arguments("host session control failed")),
         }
         drop(root);
+        if self.host_launches.pending() {
+            lifecycle::Lifecycle::capture(self).pump_host(None, 0)?;
+        }
         while let Some(request) = io.host_spawn() {
-            let status = request.status.clone();
-            let published_pid = request.pid.clone();
+            let process = request.process.clone();
             match self.spawn_host(request) {
-                Ok(pid) => published_pid.store(pid, std::sync::atomic::Ordering::Relaxed),
-                Err(e) => status.store(-(e.0 as i32), std::sync::atomic::Ordering::Relaxed),
+                Ok(pid) => {
+                    if !process.publish(pid) {
+                        self.host_signal_group(pid, 1);
+                    }
+                }
+                Err(e) => process.fail(e.0),
             }
         }
-        while let Some((group, signal @ 1..=64)) = io.host_signal() {
-            for (pid, mut task) in self.processes.iter_mut() {
-                if task.group() == group && !matches!(task.state, State::Zombie(_)) {
-                    Self::queue_one(pid, &mut task, signal, 0);
-                }
-            }
+        while let Some((group, signal)) = io.host_signal() {
+            self.host_signal_group(group, signal);
         }
         Ok(())
     }
+    fn host_signal_group(&self, group: u32, signal: u32) {
+        self.publish_io_tasks(None);
+        if let Some(root) = self.processes.get(&1) {
+            root.signals.io_directory.host_signal_group(group, signal);
+        }
+    }
     fn spawn_host(&mut self, request: trames_linux::HostSpawn) -> Result<u32, Errno> {
         self.reap_waited();
-        if request.argv.is_empty() {
-            return Err(Errno(11));
-        }
-        let slot = self.task_capacity.reserve().ok_or(Errno(11))?;
-        let id = self.task_ids.allocate().ok_or(Errno(11))?;
         let root = self.processes.get(&1).ok_or(Errno(3))?;
-        let parent_control = root.signals.io.lifecycle().clone();
         self.publish_task(1, &root);
-        let mut child = root.fork_state(
-            Memory::default(),
-            false,
-            false,
-            false,
-            Arc::new(slot.into_presence()),
-        );
-        child
-            .memory
-            .inherit_total_limit(&root.memory)
-            .map_err(|_| Errno(12))?;
-        child.linux.vfs = request.vfs;
-        child.limits.bind(&mut child.linux.vfs);
-        child.linux.vfs.prepare_child_context(id);
-        child.linux.fork_tid(0);
-        child.family.set_parent(1);
-        child.parentage.set_parent_thread(1);
-        child.tgid = id;
-        child.set_session(id);
-        child.set_group(id);
-        child.signals = Signals {
-            presence: child.signals.presence.clone(),
-            io_directory: root.signals.io_directory.clone(),
-            ..Signals::default()
-        };
-        child.linux.vfs.set_controlling_terminal(None)?;
-        let terminal = child.linux.vfs.pty(0)?.filter(|end| !end.master);
-        if let Some(end) = &terminal {
-            child
-                .linux
-                .vfs
-                .set_controlling_terminal(Some(end.pair.id))?;
-        }
-        let program = &request.argv[0];
-        let path = if program.contains(&b'/') {
-            program.clone()
-        } else {
-            let search = request
-                .environment
-                .iter()
-                .find_map(|e| e.strip_prefix(b"PATH="))
-                .unwrap_or(b"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
-            let mut denied = false;
-            let mut found = None;
-            for dir in search.split(|b| *b == b':') {
-                let mut path = dir.to_vec();
-                if !path.is_empty() {
-                    path.push(b'/');
-                }
-                path.extend_from_slice(program);
-                match child.linux.vfs.executable_file_at(AT_FDCWD, &path, 0) {
-                    Ok(_) => {
-                        found = Some(path);
-                        break;
-                    }
-                    Err(e) if e.0 == 13 => denied = true,
-                    Err(e) if e.0 == 2 || e.0 == 20 => (),
-                    Err(e) => return Err(e),
-                }
-            }
-            found.ok_or(Errno(if denied { 13 } else { 2 }))?
-        };
-        Self::exec_strings(
-            &mut child,
-            AT_FDCWD,
-            path,
-            request.argv,
-            request.environment,
-            0,
-            self.memory_limits.per_process,
-            self.started,
-        )?;
-        child.family.bind_host_status(request.status);
-        child.vm_id = self.resource_id();
-        child.wait_event.bind_presence(&child.signals.presence);
-        self.admit_child(1, &parent_control, id, &mut child, false)?;
-        if let Some(end) = terminal {
-            let mut tty = end.pair.terminal.borrow_mut();
-            tty.session = id;
-            tty.foreground = id;
-            end.pair
-                .retain_job_ids(child.linux.vfs.pid_namespace(), id, id);
-            drop(tty);
-            if let Some(task) = child.linux.vfs.terminal_task() {
-                end.pair.bind_signal_route(task);
-            }
-        }
-        self.processes.insert(id, child);
+        let (child, request) = birth::Birth::capture(self).prepare_host(&root, request)?;
+        drop(root);
+        let image = request.load()?;
+        let child = birth::Birth::capture(self).finish_host(child, image)?;
+        let id = child.id;
+        self.processes.insert(id, child.process);
         Ok(id)
     }
     fn process_maps(&self, p: &Process<C>) -> Vec<u8> {
@@ -4002,7 +3915,7 @@ impl<C: Cpu> Kernel<C> {
                 if !persistent {
                     break;
                 }
-                match self.cohort_control(&members, io) {
+                match self.cohort_live_control(&epoch, &members, io) {
                     Ok(false) => deadline = Instant::now() + self.parallel_timeout(),
                     result => {
                         checkpoint_error = result.err();
@@ -4109,7 +4022,7 @@ impl<C: Cpu> Kernel<C> {
                     }
                 }
                 Some(crate::workers::Event::<C>::Idle) => {
-                    match self.cohort_control(&members, io) {
+                    match self.cohort_live_control(&epoch, &members, io) {
                         Ok(false) => {}
                         result => {
                             checkpoint_error = result.err();
@@ -4796,7 +4709,7 @@ impl<C: Cpu> Kernel<C> {
                 }
             }
             if !progress {
-                let external = self.exit_memory_pending() || self.layout_work.get().is_some_and(|l| l.pending()) || !self.proc_owner_waits.is_empty() || self.processes.values().any(|p| {
+                let external = self.host_launches.pending() || self.exit_memory_pending() || self.layout_work.get().is_some_and(|l| l.pending()) || !self.proc_owner_waits.is_empty() || self.processes.values().any(|p| {
                     p.exec_pending.is_some() || p.retained_file.is_some() || p.file_checkpoint.is_some() || p.linux.has_pending_mmap() || p.layout_wait.is_some() ||
                     p.poll_deadline.is_some()
                         || p.byte_wait_deadline().is_some()
@@ -5101,6 +5014,7 @@ pub(super) fn run<C: Cpu>(
     root.bind_signals();
     let count = runtime.cpu_count.clamp(1, if C::PARALLEL { 32 } else { 1 });
     let mut kernel = Kernel::<C> {
+        host_launches: Default::default(),
         byte_target: Arc::new(JoinedByteWake(std::thread::current())),
         exits: Default::default(),
         layout_work: Default::default(),
@@ -5448,7 +5362,7 @@ mod tests {
 
     #[test]
     fn host_spawn_loads_literal_argv_and_reports_group_completion() {
-        use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+        use std::sync::atomic::Ordering;
         let mut k = kernel();
         let mut root = process();
         let mut image = vec![0u8; 140];
@@ -5477,16 +5391,15 @@ mod tests {
             .import_executable(b"/program", image)
             .unwrap();
         let vfs = root.linux.vfs.clone();
-        let status = Arc::new(AtomicI32::new(trames_linux::HOST_RUNNING));
-        let published = Arc::new(AtomicU32::new(0));
+        let process = Arc::new(trames_linux::HostProcess::default());
+        let status = process.status_cell();
         k.processes.insert(1, root);
         let id = k
             .spawn_host(trames_linux::HostSpawn {
                 argv: vec![b"program".to_vec(), b"a b;$(literal)".to_vec()],
                 environment: vec![b"PATH=/".to_vec(), b"X=literal value".to_vec()],
                 vfs,
-                status: status.clone(),
-                pid: published,
+                process,
             })
             .unwrap();
         let mut child = k.processes.remove(&id).unwrap();
@@ -6905,6 +6818,7 @@ mod tests {
     }
     pub(super) fn kernel() -> Kernel {
         Kernel {
+            host_launches: Default::default(),
             byte_target: Arc::new(JoinedByteWake(std::thread::current())),
             exits: Default::default(),
             layout_work: Default::default(),
@@ -9520,10 +9434,7 @@ mod boundary_tests {
                 argv: vec![b"/bad".to_vec()],
                 environment: Vec::new(),
                 vfs: k.processes.read(&1).linux.vfs.clone(),
-                status: Arc::new(std::sync::atomic::AtomicI32::new(
-                    trames_linux::HOST_RUNNING,
-                )),
-                pid: Default::default(),
+                process: Default::default(),
             };
             assert_eq!(k.spawn_host(request), Err(Errno(8)));
             assert_eq!(namespace.global(1), None);
