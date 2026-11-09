@@ -9694,3 +9694,7 @@ mod fcntl_tests;
 #[cfg(all(test, trames_interpreter_conformance))]
 #[path = "process_lock_tests.rs"]
 mod lock_tests;
+
+#[cfg(all(test, trames_interpreter_conformance))]
+#[path = "process_memfd_tests.rs"]
+mod memfd_tests;

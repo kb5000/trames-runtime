@@ -19,6 +19,135 @@ fn t() -> Arc<dyn IoWake> {
     Arc::new(Target::default())
 }
 #[test]
+fn native_memfd_creation_retains_original_name_files_credentials_and_handoff() {
+    let mut v = trames_vfs::Vfs::default();
+    v.credentials = trames_vfs::Credentials::user(1000, 1001);
+    let mut memory = Memory::default();
+    memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+    memory.write(0x1000, b"original\0").unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    let target = t();
+    let direct = DirectSyscalls::default()
+        .with_paths(v.path_queries())
+        .with_file_executor(Arc::new(Queue(send)));
+    let args = [0x1000, 3, 0, 0, 0, 0];
+    let Some(IoAttempt::Blocked(wait)) =
+        direct.start_file_call(279, args, &mut memory, 1, &Arc::downgrade(&target))
+    else {
+        panic!("native memory-file allocation must return its CPU slot")
+    };
+    let pending = wait.file_pending().unwrap();
+    assert!(!pending.interruptible());
+    drop((wait, direct, target));
+    memory.unmap(0x1000, PAGE_SIZE).unwrap();
+    v.credentials = Default::default();
+    let original_counter = v.eventfd(99, 0).unwrap();
+    let mut unrelated = trames_vfs::Vfs::default();
+    assert_eq!(
+        unrelated.memfd_create(b"unrelated", 0).unwrap(),
+        original_counter
+    );
+    let target = t();
+    let IoAttempt::Blocked(wait) = DirectSyscalls::default().start_retained_file(
+        pending,
+        279,
+        args,
+        &mut memory,
+        1,
+        &Arc::downgrade(&target),
+    ) else {
+        panic!("retain accepted native allocation")
+    };
+    let pending = wait.file_pending().unwrap();
+    let (work, result) = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+    std::thread::spawn(move || result.complete(work.run()))
+        .join()
+        .unwrap();
+    assert!(wait.signal.ready());
+    drop(wait);
+    let IoAttempt::Complete(Ok(fd)) = DirectSyscalls::default().start_retained_file(
+        pending,
+        279,
+        args,
+        &mut memory,
+        1,
+        &Arc::downgrade(&target),
+    ) else {
+        panic!("commit accepted original memory file")
+    };
+    let fd = fd as u32;
+    assert_ne!(fd, original_counter);
+    assert_eq!(
+        v.fd_kind(fd).unwrap(),
+        trames_vfs::FdKind::Node(b"/memfd:original".to_vec())
+    );
+    assert_eq!(v.flags(fd).unwrap(), 2 | trames_vfs::O_CLOEXEC);
+    assert_eq!(v.seals(fd, None), Ok(0));
+    let stat = v.stat_fd(fd).unwrap();
+    assert_eq!(u32::from_le_bytes(stat[24..28].try_into().unwrap()), 1000);
+    assert_eq!(u32::from_le_bytes(stat[28..32].try_into().unwrap()), 1001);
+    assert_eq!(v.read(original_counter, 8).unwrap(), 99u64.to_le_bytes());
+    assert!(unrelated.flags(fd).is_err());
+}
+#[test]
+fn memfd_source_solo_import_and_allocation_errors_share_original_ordering() {
+    let mut linux = Linux::new(0x100000);
+    linux.vfs.set_descriptor_limit(3);
+    let mut memory = Memory::default();
+    memory.map(0x1000, 2 * PAGE_SIZE, Permissions::RW).unwrap();
+    let target = t();
+    let (send, receive) = std::sync::mpsc::channel();
+    let direct = DirectSyscalls::default()
+        .with_paths(linux.vfs.path_queries())
+        .with_file_executor(Arc::new(Queue(send)));
+    for (address, flags, name, expected) in [
+        (0x9000, 4, Vec::new(), 14),
+        (0x1000, 4, b"valid\0".to_vec(), 22),
+        (0x1000, 0, [vec![b'x'; 250], vec![0]].concat(), 22),
+        (0x1000, 0, vec![b'x'; 4096], 36),
+        (0x1000, 0, b"valid\0".to_vec(), 24),
+    ] {
+        if !name.is_empty() {
+            memory.write(0x1000, &name).unwrap();
+        }
+        let args = [address, flags, 0, 0, 0, 0];
+        assert_eq!(
+            linux.syscall(
+                279,
+                args,
+                &mut memory,
+                &mut crate::CapturedOutput::default()
+            ),
+            Err(Errno(expected))
+        );
+        let attempt = direct
+            .start_file_call(279, args, &mut memory, 1, &Arc::downgrade(&target))
+            .unwrap();
+        let attempt = match attempt {
+            IoAttempt::Blocked(wait) => {
+                let pending = wait.file_pending().unwrap();
+                let (work, result) = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+                result.complete(work.run());
+                drop(wait);
+                DirectSyscalls::default().start_retained_file(
+                    pending,
+                    279,
+                    args,
+                    &mut memory,
+                    1,
+                    &Arc::downgrade(&target),
+                )
+            }
+            value => value,
+        };
+        assert!(matches!(attempt,IoAttempt::Complete(Err(Errno(e))) if e==expected));
+        assert!(receive.try_recv().is_err());
+    }
+    assert!(DirectSyscalls::default()
+        .start_file_call(279, [0; 6], &mut memory, 1, &Arc::downgrade(&target))
+        .is_none());
+}
+#[test]
 fn mapped_write_seal_parks_and_keeps_its_original_inode_through_close_and_fd_reuse() {
     for cancel in [false, true] {
         let mut v = trames_vfs::Vfs::default();

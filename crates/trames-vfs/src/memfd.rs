@@ -1,5 +1,28 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
+
+/// Imported name/flags for an anonymous memory file. Validation consumes no
+/// filesystem/Files resource, and the accepted name never points into guest RAM.
+pub struct MemfdParameters {
+    name: Vec<u8>,
+    flags: u32,
+}
+fn validate(name: &[u8], flags: u32) -> Result<()> {
+    if name.len() > 249 || flags & !3 != 0 {
+        Err(Errno(22))
+    } else {
+        Ok(())
+    }
+}
+impl MemfdParameters {
+    pub fn new(name: Vec<u8>, flags: u32) -> Result<Self> {
+        validate(&name, flags)?;
+        Ok(Self { name, flags })
+    }
+    pub(super) fn create(&self, vfs: &mut Vfs) -> Result<u32> {
+        vfs.memfd_publish(&self.name, self.flags)
+    }
+}
 pub const MEMFD_BYTES: u64 = 128 * 1024 * 1024;
 #[derive(Clone, Copy)]
 pub(super) enum FileResize {
@@ -158,34 +181,38 @@ impl Vfs {
         Ok(())
     }
     pub fn memfd_create(&mut self, name: &[u8], flags: u32) -> Result<u32> {
-        let (fd, open) = self.memfd_description(name, flags)?;
-        self.fds.insert(
-            fd,
+        validate(name, flags)?;
+        self.memfd_publish(name, flags)
+    }
+    fn memfd_publish(&mut self, name: &[u8], flags: u32) -> Result<u32> {
+        self.memfd_publish_with(name, flags, trames_shared::SharedFile::anonymous_in)
+    }
+    fn memfd_publish_with(
+        &mut self,
+        name: &[u8],
+        flags: u32,
+        backing: impl FnOnce(trames_shared::SharedBudget) -> std::io::Result<trames_shared::SharedFile>,
+    ) -> Result<u32> {
+        let reservation = self.shared_files().reserve()?;
+        let open = self.memfd_open_with(name, flags, backing)?;
+        reservation.publish(
             Descriptor {
                 open: OpenHandle::new(open),
                 cloexec: (flags & 1 != 0).into(),
             },
-        );
-        Ok(fd)
-    }
-    // Construct before publication: io_uring uses the same backing allocator,
-    // and publishes its complete shared queue/control graph in one operation.
-    pub(super) fn memfd_description(
-        &mut self,
-        name: &[u8],
-        flags: u32,
-    ) -> Result<(u32, OpenDescription)> {
-        if name.len() > 249 {
-            return Err(Errno(22));
-        }
-        if flags & !3 != 0 {
-            return Err(Errno(22));
-        }
-        let fd = self.available(0)?;
-        Ok((fd, self.memfd_open(name, flags)?))
+            self.query.is_none().then_some(&self.fds),
+        )
     }
     /// Caller validates the fixed creation parameters and reserves its FD first.
     pub(super) fn memfd_open(&mut self, name: &[u8], flags: u32) -> Result<OpenDescription> {
+        self.memfd_open_with(name, flags, trames_shared::SharedFile::anonymous_in)
+    }
+    fn memfd_open_with(
+        &mut self,
+        name: &[u8],
+        flags: u32,
+        backing: impl FnOnce(trames_shared::SharedBudget) -> std::io::Result<trames_shared::SharedFile>,
+    ) -> Result<OpenDescription> {
         let mut fs = self.fs.borrow_mut();
         fs.admit_inode()?;
         let inode = fs.next_inode;
@@ -197,10 +224,9 @@ impl Vfs {
             notifications: inotify::Marks::default(),
             path_hint: SharedCell::default(),
             device: 16,
-            content: Content::File(storage::FileData::Shared(
-                trames_shared::SharedFile::anonymous_in(fs.shared_budget.clone())
-                    .map_err(storage::host_errno)?,
-            )),
+            // This unpublished inode reserves its actual original quota while
+            // the native backing is created without the filesystem lock.
+            content: Content::File(storage::FileData::memory(Vec::new())),
             mode: 0o100777,
             uid: self.credentials.fsuid,
             gid: self.credentials.fsgid,
@@ -212,7 +238,10 @@ impl Vfs {
             seals: Some(if flags & 2 != 0 { 0 } else { 1 }),
         }));
         fs.track_inode(&node)?;
+        let budget = fs.shared_budget.clone();
         drop(fs);
+        let backing = backing(budget).map_err(storage::host_errno)?;
+        node.borrow_mut().content = Content::File(storage::FileData::Shared(backing));
         let mut target = b"/memfd:".to_vec();
         target.extend_from_slice(name);
         let open = OpenDescription {
@@ -343,3 +372,7 @@ mod allocation_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "memfd_source_tests.rs"]
+mod source_tests;

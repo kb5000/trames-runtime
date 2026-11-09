@@ -3,6 +3,7 @@
 use super::*;
 
 pub enum NamespaceCall {
+    Memfd(MemfdParameters),
     Mount {
         source: Option<Vec<u8>>,
         target: Vec<u8>,
@@ -99,6 +100,7 @@ pub enum NamespaceCall {
 impl NamespaceCall {
     fn paths(&self) -> Vec<(i32, Option<&[u8]>, bool)> {
         match self {
+            Self::Memfd(_) => Vec::new(),
             Self::Mount {
                 source,
                 target,
@@ -185,6 +187,9 @@ impl NamespaceCall {
     }
     pub fn execute(&self, v: &mut Vfs) -> Result<FileValue> {
         match self {
+            Self::Memfd(parameters) => {
+                return parameters.create(v).map(|fd| FileValue::Count(fd as u64))
+            }
             Self::Mount {
                 source,
                 target,
@@ -347,6 +352,11 @@ fn prepare_namespace(view: &mut Vfs, call: &NamespaceCall) -> bool {
         }
     }
     view.query.as_mut().unwrap().accepted = Some(accepted);
+    // Anonymous backing construction is real native filesystem I/O, with no
+    // pathname/mount lookup or namespace administration transaction.
+    if matches!(call, NamespaceCall::Memfd(_)) {
+        return true;
+    }
     if !view.query.as_ref().unwrap().namespace_io {
         return false;
     }

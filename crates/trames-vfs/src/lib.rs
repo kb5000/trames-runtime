@@ -96,6 +96,7 @@ mod locks;
 mod mapped;
 pub use mapped::MappingFile;
 mod memfd;
+pub use memfd::MemfdParameters;
 mod mounts;
 use mounts::{Mount, PathArg};
 pub use mounts::{MountNamespace, ResolvedPath, CLONE_NEWNS};

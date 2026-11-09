@@ -4,7 +4,7 @@ use super::*;
 use trames_vfs::NamespaceCall as Call;
 
 pub(crate) fn supported(number: u32) -> bool {
-    matches!(number, 5..=17 | 33..=41 | 43 | 44 | 49..=55 | 88 | 276 | 452)
+    matches!(number, 5..=17 | 33..=41 | 43 | 44 | 49..=55 | 88 | 276 | 279 | 452)
 }
 pub(super) fn import(
     number: u32,
@@ -13,6 +13,10 @@ pub(super) fn import(
 ) -> Result<(Call, FileOutput), Errno> {
     let output = FileOutput::None;
     let call = match number {
+        279 => Call::Memfd(trames_vfs::MemfdParameters::new(
+            Linux::path(memory, a[0])?,
+            a[1] as u32,
+        )?),
         39 => Call::Umount {
             target: Linux::path(memory, a[0])?,
             flags: a[1],

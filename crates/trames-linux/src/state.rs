@@ -1153,7 +1153,7 @@ impl Linux {
     ) -> Result<u64>;
         pub fn has_syscall;
         {
-            5..=17 | 33..=41 | 43 | 44 | 49..=55 | 88 | 276 | 452 => {
+            5..=17 | 33..=41 | 43 | 44 | 49..=55 | 88 | 276 | 279 | 452 => {
                 crate::direct::namespace::owner(number as u32, a, memory, &mut self.vfs)
             },
             92 => match a[0] as u32 {
@@ -1179,10 +1179,6 @@ impl Linux {
             },
             71 | 76 | 213 | 223 | 267 | 285 | 286 | 287 | 437 => {
                 self.file_syscall(number, a, memory, io)
-            },
-            279 => {
-                let name = Self::path(memory, a[0])?;
-                Ok(self.vfs.memfd_create(&name, a[1] as u32)? as u64)
             },
             69 | 70 => self.positioned_vector(a, memory, number == 70),
             291 => self.statx(a, memory),
