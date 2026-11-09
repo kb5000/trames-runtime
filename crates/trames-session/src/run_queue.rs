@@ -793,6 +793,7 @@ struct CustodyWait<C: Cpu> {
 }
 pub(super) struct Epoch<C: Cpu> {
     pub control: Arc<Control>,
+    host_pause: Arc<std::sync::atomic::AtomicBool>,
     queues: Mutex<Queues<C>>,
     changed: Condvar,
     slot_changed: [Condvar; 32],
@@ -843,10 +844,13 @@ impl<C: Cpu> Epoch<C> {
         events: Option<std::sync::mpsc::Sender<crate::workers::Event<C>>>,
         persistent: bool,
     ) -> Arc<Self> {
+        let domains = domains::Domains::<C>::new(events.clone());
+        let host_pause = domains.host_pause.clone();
         Arc::new_cyclic(|me: &Weak<Self>| Self {
             control,
+            host_pause,
             queues: Mutex::new(Queues::<C> {
-                domains: domains::Domains::<C>::new(events.clone()),
+                domains,
                 ..Default::default()
             }),
             changed: Condvar::new(),
@@ -875,6 +879,35 @@ impl<C: Cpu> Epoch<C> {
         persistent: bool,
     ) -> Arc<Self> {
         Self::configured(control, Some(events), persistent)
+    }
+    /// Suspend guest dispatch without returning CPUs, Views or accepted waits.
+    /// The original execution leases close both pause/pre-entry orders. Existing
+    /// workers remain available for accepted backing and lifecycle completion.
+    pub fn pause_host(&self, paused: bool) {
+        if self.host_pause.load(Ordering::Relaxed) == paused {
+            return;
+        }
+        let mut q = self.queues.lock().unwrap();
+        if self.host_pause.swap(paused, Ordering::Relaxed) == paused {
+            return;
+        }
+        if paused {
+            q.domains.interrupt_host_pause();
+        } else {
+            // An Idle event observed during host suspension is deliberately
+            // ignored. Resume must let the queue publish that state again.
+            q.idle_notified = false;
+        }
+        self.refresh_ready(&q);
+        self.notify(&mut q);
+        drop(q);
+        if !paused {
+            if let Some(starter) = self.starter.get() {
+                for slot in self.additional_slots(self.active_slots(), starter.capacity()) {
+                    let _ = self.activate(slot);
+                }
+            }
+        }
     }
     pub fn bind_lifecycle(&self, lifecycle: crate::process::lifecycle::Lifecycle<C>) {
         lifecycle.bind_memory(self.io_target.clone());
@@ -914,7 +947,7 @@ impl<C: Cpu> Epoch<C> {
         Ok(())
     }
     fn activate_for(&self, mask: u64) {
-        if self.control.stopped() {
+        if self.control.stopped() || self.host_pause.load(Ordering::Relaxed) {
             return;
         }
         let Some(starter) = self.starter.get() else {
@@ -991,12 +1024,16 @@ impl<C: Cpu> Epoch<C> {
             || self.timers.get().is_some_and(|t| t.due())
     }
     fn refresh_ready(&self, q: &Queues<C>) {
-        let slots = q.ready.iter().fold(0, |mask, job| {
-            mask | q
-                .initial_slots
-                .get(&job.work.pid)
-                .map_or(job.affinity(), |slot| 1 << slot)
-        });
+        let slots = if self.host_pause.load(Ordering::Relaxed) {
+            0
+        } else {
+            q.ready.iter().fold(0, |mask, job| {
+                mask | q
+                    .initial_slots
+                    .get(&job.work.pid)
+                    .map_or(job.affinity(), |slot| 1 << slot)
+            })
+        };
         self.ready_slots.store(slots, Ordering::Relaxed);
     }
     fn ready(&self, q: &mut Queues<C>, job: Box<Job<C>>) {
@@ -1256,6 +1293,9 @@ impl<C: Cpu> Epoch<C> {
     /// it, including a child whose affinity excludes every active executor.
     pub fn additional_slots(&self, active: u64, cpus: usize) -> Vec<usize> {
         let q = self.queues.lock().unwrap();
+        if self.host_pause.load(Ordering::Relaxed) {
+            return Vec::new();
+        }
         let valid = if cpus == 64 {
             u64::MAX
         } else {
@@ -1368,6 +1408,9 @@ impl<C: Cpu> Epoch<C> {
     }
     pub fn idle(&self) -> bool {
         let q = self.queues.lock().unwrap();
+        if self.host_pause.load(Ordering::Relaxed) {
+            return false;
+        }
         q.running == 0
             && q.completing == 0
             && q.ready.is_empty()
@@ -1548,11 +1591,16 @@ impl<C: Cpu> Epoch<C> {
                 .ready
                 .iter()
                 .position(|j| q.initial_slots.get(&j.work.pid) == Some(&slot));
-            let available = preferred.or_else(|| {
-                q.ready.iter().position(|j| {
-                    j.affinity() & (1 << slot) != 0 && !q.initial_slots.contains_key(&j.work.pid)
+            let available = (!self.host_pause.load(Ordering::Relaxed))
+                .then(|| {
+                    preferred.or_else(|| {
+                        q.ready.iter().position(|j| {
+                            j.affinity() & (1 << slot) != 0
+                                && !q.initial_slots.contains_key(&j.work.pid)
+                        })
+                    })
                 })
-            });
+                .flatten();
             let external = q.parked.values().any(|j| {
                 j.io.as_ref().is_some_and(|io| io.external_wait())
                     || j.uring.as_ref().is_some_and(|ring| ring.external())
@@ -2089,30 +2137,65 @@ mod tests {
     use trames_memory::{CpuMemory, Memory, Permissions, PAGE_SIZE};
     #[test]
     fn ready_affinity_starts_only_the_required_cold_cpu_without_an_owner_request() {
-        let mut pool = crate::workers::Pool::<Cpu>::new(4);
-        let epoch = Epoch::with_events(Arc::new(Control::new(1000)), pool.events(), true);
-        epoch.bind_starter(pool.starter());
-        let mut source = job(7, &epoch);
-        source.affinity = 8;
-        epoch.add(source);
-        assert_eq!(epoch.active_slots(), 8);
-        assert!(!epoch.activation_failed());
-        let until = Instant::now() + Duration::from_secs(3);
-        loop {
-            match pool
-                .event_timeout(until.saturating_duration_since(Instant::now()))
-                .unwrap()
-            {
-                Some(crate::workers::Event::EpochStopped(3)) => break,
-                Some(crate::workers::Event::Idle | crate::workers::Event::Retired) => epoch.stop(),
-                None => panic!("cold CPU did not finish"),
-                _ => panic!("unexpected owner request"),
+        for pause in [false, true] {
+            let mut pool = crate::workers::Pool::<Cpu>::new(4);
+            let epoch = Epoch::with_events(Arc::new(Control::new(1000)), pool.events(), true);
+            epoch.bind_starter(pool.starter());
+            epoch.pause_host(pause);
+            let mut source = job(7, &epoch);
+            source.affinity = 8;
+            epoch.add(source);
+            if pause {
+                assert_eq!(epoch.active_slots(), 0);
+                epoch.pause_host(false);
             }
+            assert_eq!(epoch.active_slots(), 8);
+            assert!(!epoch.activation_failed());
+            let until = Instant::now() + Duration::from_secs(3);
+            loop {
+                match pool
+                    .event_timeout(until.saturating_duration_since(Instant::now()))
+                    .unwrap()
+                {
+                    Some(crate::workers::Event::EpochStopped(3)) => break,
+                    Some(crate::workers::Event::Idle | crate::workers::Event::Retired) => {
+                        epoch.stop()
+                    }
+                    None => panic!("cold CPU did not finish"),
+                    _ => panic!("unexpected owner request"),
+                }
+            }
+            let returned = epoch.drain();
+            assert_eq!(returned.len(), 1);
+            assert_eq!(returned[0].worker, 3);
+            assert_eq!(returned[0].pid, 7);
         }
-        let returned = epoch.drain();
-        assert_eq!(returned.len(), 1);
-        assert_eq!(returned[0].worker, 3);
-        assert_eq!(returned[0].pid, 7);
+    }
+    #[test]
+    fn host_pause_resume_reannounces_idle_after_ignored_paused_notification() {
+        let (send, receive) = std::sync::mpsc::channel();
+        let epoch = Epoch::with_events(Arc::new(Control::new(1000)), send, true);
+        epoch.pause_host(true);
+        let worker_epoch = epoch.clone();
+        let worker = std::thread::spawn(move || assert!(worker_epoch.take(0).is_none()));
+        assert!(matches!(
+            receive.recv_timeout(Duration::from_secs(2)),
+            Ok(crate::workers::Event::Idle)
+        ));
+        assert!(!epoch.idle());
+        assert!(matches!(
+            receive.recv_timeout(Duration::from_millis(20)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        epoch.pause_host(false);
+        let resumed = receive.recv_timeout(Duration::from_millis(100));
+        epoch.stop();
+        worker.join().unwrap();
+        assert!(
+            matches!(resumed, Ok(crate::workers::Event::Idle)),
+            "resume must reannounce a previously ignored idle state"
+        );
+        assert!(epoch.idle());
     }
     #[test]
     fn initially_parked_task_can_resume_while_its_old_cpu_is_occupied() {

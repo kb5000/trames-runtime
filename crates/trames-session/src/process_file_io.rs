@@ -120,6 +120,7 @@ mod tests {
         }
         struct Host {
             work: Option<Box<Export>>,
+            ready: trames_vfs::DirectFd,
             done: Arc<AtomicBool>,
             layouts: Option<Arc<trames_linux::FileLayouts>>,
             deadline: Instant,
@@ -141,9 +142,16 @@ mod tests {
                 self.paused
             }
             fn poll_control(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<bool> {
-                if self.pause && self.work.is_some() {
-                    self.paused = true;
-                    return Ok(true);
+                if self.work.is_some() {
+                    match self.ready.read(1) {
+                        Err(trames_vfs::Errno(11)) => return Ok(Instant::now() > self.deadline),
+                        value => assert_eq!(
+                            value,
+                            Ok(vec![17]),
+                            "guest publishes its mapped write before export"
+                        ),
+                    }
+                    self.paused = self.pause;
                 }
                 if let Some(work) = self.work.take() {
                     self.layouts.as_ref().unwrap().submit_host(work);
@@ -178,6 +186,16 @@ mod tests {
                 .import_file(b"/mapped", vec![0; PAGE_SIZE as usize])
                 .unwrap();
             let export = root.linux.vfs.host_export(b"/mapped").unwrap();
+            let [reader, writer] = root.linux.vfs.pipe(trames_vfs::O_NONBLOCK).unwrap();
+            let ready = root
+                .linux
+                .vfs
+                .shared_files()
+                .lookup(reader)
+                .unwrap()
+                .unwrap()
+                .direct_byte()
+                .unwrap();
             let fd = root.linux.vfs.open_at(-100, b"/mapped", 2, 0).unwrap();
             root.memory
                 .map_backed(
@@ -200,10 +218,20 @@ mod tests {
                 p.tgid = id as u32;
                 p.vm_id = id as u64;
                 p.signals.io.scheduling.set_affinity(1 << (id - 1));
-                let words: &[u32] = if id == 1 {
-                    &[0xd2a00020, 0xd2800221, 0xf9000001, 0x14000000]
+                let words: Vec<u32> = if id == 1 {
+                    vec![
+                        0xd2a00020,
+                        0xd2800221,
+                        0xf9000001,
+                        0xd2800000 | writer << 5,
+                        0xd2a00021,
+                        0xd2800022,
+                        0xd2800808,
+                        0xd4000001,
+                        0x14000000,
+                    ]
                 } else {
-                    &[0x14000000]
+                    vec![0x14000000]
                 };
                 p.memory
                     .write(
@@ -222,6 +250,7 @@ mod tests {
             }
             let done = Arc::new(AtomicBool::new(false));
             let mut host = Host {
+                ready,
                 work: Some(Box::new(Export {
                     file: export,
                     done: done.clone(),

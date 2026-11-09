@@ -10,6 +10,7 @@ use std::sync::{atomic::AtomicBool, mpsc::Sender};
 pub(crate) struct Domain {
     pub id: u64,
     paused: AtomicBool,
+    host_pause: Arc<AtomicBool>,
     interrupts: Mutex<BTreeMap<usize, Active>>,
 }
 struct Active {
@@ -87,10 +88,13 @@ impl Domain {
         scoped: bool,
     ) -> Option<ExecutionGuard> {
         let mut active = self.interrupts.lock().unwrap();
-        if self.paused() && !scoped {
+        let host_paused = self.host_pause.load(Ordering::Relaxed);
+        if (self.paused() || host_paused) && !scoped {
             return None;
         }
-        pending.store(false, Ordering::Relaxed);
+        // Accepted scoped work may finish while paused, but its optional guest
+        // instruction batch must not start. Ordinary entry keeps one lease.
+        pending.store(host_paused, Ordering::Relaxed);
         assert!(
             active
                 .insert(
@@ -127,6 +131,12 @@ impl Domain {
     }
     fn pause(&self) {
         self.paused.store(true, Ordering::Relaxed);
+        self.interrupt();
+    }
+    pub fn interrupted(&self) -> bool {
+        self.paused() || self.host_pause.load(Ordering::Relaxed)
+    }
+    fn interrupt(&self) {
         // A CPU published before pause is kicked, including a not-yet-entered
         // CPU (the backend must latch the request). A later binder cannot enter.
         for active in self.interrupts.lock().unwrap().values() {
@@ -158,6 +168,7 @@ struct Entry<C: Cpu> {
 }
 #[derive(Default)]
 pub(super) struct Domains<C: Cpu> {
+    pub host_pause: Arc<AtomicBool>,
     entries: BTreeMap<u64, Entry<C>>,
     tasks: BTreeMap<u32, u64>,
     retired: Vec<u64>,
@@ -189,6 +200,11 @@ impl<C: Cpu> Domains<C> {
             vec![self.entries[&original].domain.clone()]
         }
     }
+    pub fn interrupt_host_pause(&self) {
+        for entry in self.entries.values() {
+            entry.domain.interrupt();
+        }
+    }
     pub fn new(events: Option<Sender<crate::workers::Event<C>>>) -> Self {
         Self {
             events,
@@ -212,6 +228,7 @@ impl<C: Cpu> Domains<C> {
             domain: Arc::new(Domain {
                 id,
                 paused: AtomicBool::new(false),
+                host_pause: self.host_pause.clone(),
                 interrupts: Mutex::new(BTreeMap::new()),
             }),
             keys,
@@ -630,6 +647,7 @@ mod tests {
         Arc::new(Domain {
             id,
             paused: AtomicBool::new(false),
+            host_pause: Arc::default(),
             interrupts: Mutex::default(),
         })
     }
@@ -792,6 +810,7 @@ mod tests {
         let domain = Arc::new(Domain {
             id: 1,
             paused: AtomicBool::new(false),
+            host_pause: Arc::default(),
             interrupts: Mutex::new(BTreeMap::new()),
         });
         let interrupt = Arc::new(Interrupt(Default::default()));
@@ -807,6 +826,106 @@ mod tests {
         drop(guard);
         domain.pause();
         assert_eq!(interrupt.0.load(Ordering::Relaxed), 1);
+    }
+    #[test]
+    fn host_pause_parks_dispatch_preserves_admission_and_cancellation() {
+        for resume in [true, false] {
+            let epoch = Epoch::new(Arc::new(Control::new(10000)));
+            let mut a = memory();
+            epoch.add(job(
+                1,
+                Box::new(a.parallel_view(&mut Default::default()).unwrap()),
+                &epoch,
+            ));
+            let (original, view) = {
+                let q = epoch.queues.lock().unwrap();
+                (
+                    (&*q.ready[0]) as *const Job as usize,
+                    q.ready[0].work.memory.as_deref().unwrap() as *const _ as usize,
+                )
+            };
+            epoch.pause_host(true);
+            let mut b = memory();
+            let second = job(
+                2,
+                Box::new(b.parallel_view(&mut Default::default()).unwrap()),
+                &epoch,
+            );
+            epoch.add(second);
+            {
+                let q = epoch.queues.lock().unwrap();
+                assert_eq!(q.ready.len(), 2);
+                assert!(q
+                    .ready
+                    .iter()
+                    .all(|j| j.domain.as_ref().unwrap().interrupted()));
+            }
+            assert!(epoch.additional_slots(1, 4).is_empty());
+            assert!(!epoch.idle());
+            let (send, receive) = std::sync::mpsc::channel();
+            let worker_epoch = epoch.clone();
+            let worker = std::thread::spawn(move || send.send(worker_epoch.take(0)).unwrap());
+            assert!(matches!(
+                receive.recv_timeout(Duration::from_millis(20)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            if resume {
+                epoch.pause_host(false);
+                let j = receive
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!((&*j) as *const Job as usize, original);
+                assert_eq!(j.work.memory.as_deref().unwrap() as *const _ as usize, view);
+                epoch.park(j, None);
+            } else {
+                epoch.stop();
+                assert!(receive
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .is_none());
+            }
+            worker.join().unwrap();
+            epoch.stop();
+            assert_eq!(epoch.drain().len(), 2);
+        }
+    }
+    #[test]
+    fn host_pause_closes_preentry_and_binding_without_changing_vm_pause() {
+        let original = domain(1);
+        let guard = original.enter(0, Arc::new(AtomicBool::new(false))).unwrap();
+        original.host_pause.store(true, Ordering::Relaxed);
+        original.interrupt();
+        assert!(guard.pending());
+        let interrupt = Arc::new(Interrupt(Default::default()));
+        assert!(!guard.bind_interrupt(interrupt.clone()));
+        assert!(original
+            .enter(1, Arc::new(AtomicBool::new(false)))
+            .is_none());
+        assert!(
+            !original.paused(),
+            "host suspension owns no mapping checkpoint"
+        );
+        let accepted_scope = original.enter_scoped(1);
+        assert!(
+            accepted_scope.pending(),
+            "accepted work cannot batch guest instructions"
+        );
+        drop((guard, accepted_scope));
+        original.host_pause.store(false, Ordering::Relaxed);
+        let resumed = original.enter(0, Arc::new(AtomicBool::new(false))).unwrap();
+        assert!(resumed.bind_interrupt(interrupt.clone()));
+        original.host_pause.store(true, Ordering::Relaxed);
+        original.interrupt();
+        assert!(resumed.pending());
+        assert_eq!(interrupt.0.load(Ordering::Relaxed), 1);
+        drop(resumed);
+        original.pause();
+        original.host_pause.store(false, Ordering::Relaxed);
+        assert!(
+            original.paused(),
+            "resume cannot clear an actual mapping pause"
+        );
     }
     #[test]
     fn pause_interrupts_aliased_backings_and_leaves_an_unrelated_cpu_running() {

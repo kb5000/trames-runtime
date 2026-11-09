@@ -365,6 +365,9 @@ impl<C: Cpu> Kernel<C> {
             let join = io
                 .poll_control(&root.linux.vfs)
                 .map_err(|_| RuntimeError::Arguments("host session control failed"))?;
+            if let Some(epoch) = epoch {
+                epoch.pause_host(io.paused());
+            }
             let directory = root.signals.io_directory.clone();
             let root_task = root.signals.io.clone();
             let terminal = root
@@ -1103,6 +1106,117 @@ mod tests {
         assert_eq!(k.instructions, limit);
     }
     #[test]
+    fn host_pause_resume_keeps_original_cpus_views_and_one_cohort() {
+        struct Pauses {
+            pages: Vec<Arc<SharedPage>>,
+            previous: Vec<u64>,
+            stable: usize,
+            since: Instant,
+            deadline: Instant,
+            paused: bool,
+            cycles: usize,
+            cancel: bool,
+        }
+        impl GuestOutput for Pauses {
+            fn source_console(&mut self) -> Arc<dyn trames_vfs::ConsoleIo> {
+                Arc::new(trames_vfs::CapturedConsole::default())
+            }
+            fn paused(&self) -> bool {
+                self.paused
+            }
+            fn control_poll_interval(&self) -> Duration {
+                Duration::from_millis(1)
+            }
+            fn poll_control(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<bool> {
+                assert!(
+                    Instant::now() < self.deadline,
+                    "pause/resume failed to progress"
+                );
+                let current: Vec<_> = self.pages.iter().map(|p| count(p)).collect();
+                if self.paused {
+                    if current == self.previous {
+                        self.stable += 1;
+                    } else {
+                        assert!(self.stable < 3, "guest executed after host pause settled");
+                        self.stable = 0;
+                        self.previous = current;
+                    }
+                    if self.stable >= 3 && self.since.elapsed() >= Duration::from_millis(20) {
+                        self.paused = false;
+                        self.stable = 0;
+                        self.cycles += 1;
+                    }
+                } else if current
+                    .iter()
+                    .zip(&self.previous)
+                    .all(|(now, before)| now > before)
+                {
+                    if self.cycles == 3 {
+                        self.cancel = true;
+                        return Ok(true);
+                    }
+                    self.previous = current;
+                    self.paused = true;
+                    self.since = Instant::now();
+                }
+                Ok(false)
+            }
+            fn control(&mut self, _: &mut trames_vfs::Vfs) -> std::io::Result<bool> {
+                Ok(!self.cancel)
+            }
+            fn write(&mut self, _: OutputFd, bytes: &[u8]) -> std::io::Result<usize> {
+                Ok(bytes.len())
+            }
+        }
+        for (cpus, slots) in [(4, 4), (12, 12), (4, 1)] {
+            let mut k = super::super::tests::kernel();
+            k.cpu_count = cpus;
+            k.workers = crate::workers::Pool::new(slots);
+            k.per_cpu = vec![Duration::ZERO; cpus];
+            let mut pages = Vec::new();
+            for id in 1..=cpus {
+                let mut p = super::super::tests::process();
+                p.tgid = id as u32;
+                p.vm_id = id as u64;
+                p.signals
+                    .io
+                    .scheduling
+                    .set_affinity(if slots == 1 { 1 } else { 1 << (id - 1) });
+                let page = Arc::new(SharedPage::new([0; PAGE_SIZE as usize]));
+                map(&mut p, 0x3000, page.clone(), None);
+                p.cpu.set_x(0, 0x3000);
+                p.cpu.set_x(1, 0);
+                code(&mut p, &[0x91000421, 0xf9000001, 0x17fffffe]);
+                k.processes.insert(id as u32, p);
+                pages.push(page);
+            }
+            let mut host = Pauses {
+                pages,
+                previous: vec![0; cpus],
+                stable: 0,
+                since: Instant::now(),
+                deadline: Instant::now() + Duration::from_secs(5),
+                paused: false,
+                cycles: 0,
+                cancel: false,
+            };
+            assert!(matches!(
+                k.drive(&mut host, u64::MAX),
+                Err(RuntimeError::Cancelled)
+            ));
+            assert_eq!(host.cycles, 3);
+            assert_eq!(k.parallel_rounds, 1);
+            assert_eq!(k.parallel_memory.metrics.full_rebuilds, cpus as u64);
+            assert!(k.cohort_return_syscalls.is_empty());
+            assert_eq!(k.service_requests, 0);
+            assert_eq!(k.serviced_syscalls, 0);
+            assert!(k
+                .processes
+                .values()
+                .all(|p| p.memory.parallel_views_quiescent()));
+        }
+    }
+    #[test]
     fn cohort_return_profile_excludes_local_calls_and_disabled_profiling() {
         for (profile, number, returned, trace) in [
             (false, 0xff00, false, false),
@@ -1362,11 +1476,19 @@ mod tests {
     fn persistent_idle_waits_survive_fd_reuse_and_wake_without_rebuilding_the_cohort() {
         struct Input {
             checks: u64,
+            pause: bool,
+            paused: bool,
             writer: trames_vfs::DirectFd,
             completed: Arc<SharedPage>,
             deadline: Instant,
         }
         impl GuestOutput for Input {
+            fn paused(&self) -> bool {
+                self.paused
+            }
+            fn control_poll_interval(&self) -> Duration {
+                Duration::from_millis(1)
+            }
             fn waits_for_host(&self) -> bool {
                 true
             }
@@ -1393,13 +1515,26 @@ mod tests {
 
             fn poll_control(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<bool> {
                 self.checks += 1;
-                if self.checks == 3 {
+                if self.pause && self.checks == 2 {
+                    self.paused = true;
+                }
+                if self.checks == 4 {
                     assert_eq!(self.writer.write(b"xy"), Ok(2));
+                }
+                if self.pause && (4..=8).contains(&self.checks) {
+                    assert!(
+                        self.completed
+                            .with_read(0, 16, |bytes| bytes.iter().all(|b| *b == 0)),
+                        "paused readers must retain their accepted results"
+                    );
+                }
+                if self.checks == 8 {
+                    self.paused = false;
                 }
                 let completed = self.completed.with_read(0, 16, |bytes| {
                     bytes[..8] == 1u64.to_le_bytes() && bytes[8..] == 1u64.to_le_bytes()
                 });
-                Ok(self.checks >= 6 && completed || Instant::now() >= self.deadline)
+                Ok(self.checks >= 12 && completed || Instant::now() >= self.deadline)
             }
             fn stdin_ready(&mut self) -> std::io::Result<bool> {
                 Ok(false)
@@ -1411,51 +1546,55 @@ mod tests {
                 Ok(bytes.len())
             }
         }
-        let mut k = super::super::tests::kernel();
-        k.cpu_count = 2;
-        k.workers = crate::workers::Pool::new(2);
-        k.per_cpu = vec![Duration::ZERO; 2];
-        let mut a = super::super::tests::process();
-        code(&mut a, &[0xf9000120, 0x14000000]); // acknowledge the resumed read, then loop
-        let [reader, writer] = a.linux.vfs.pipe(0).unwrap();
-        let writer = a.linux.vfs.direct_descriptors().get(writer).unwrap();
-        let mut b = a.fork();
-        b.tgid = 2;
-        b.vm_id = 2;
-        b.signals.io.scheduling.set_affinity(2);
-        let completed = Arc::new(SharedPage::new([0; PAGE_SIZE as usize]));
-        let mut io = Input {
-            checks: 0,
-            writer,
-            completed: completed.clone(),
-            deadline: Instant::now() + Duration::from_secs(3),
-        };
-        for (id, mut p) in [(1, a), (2, b)] {
-            map(&mut p, 0x2000, completed.clone(), None);
-            p.cpu.set_x(9, 0x2000 + (id as u64 - 1) * 8);
-            k.call(id, &mut p, 63, [reader as u64, 0x1000, 1, 0, 0, 0], &mut io);
-            assert!(p.byte_wait.is_some());
-            p.linux.vfs.close(reader).unwrap();
-            assert_eq!(p.linux.vfs.eventfd(9, O_NONBLOCK).unwrap(), reader);
-            k.processes.insert(id, p);
-        }
-        assert!(matches!(
-            k.drive(&mut io, u64::MAX),
-            Err(RuntimeError::Cancelled)
-        ));
-        let mut bytes: Vec<_> = k
-            .processes
-            .values()
-            .map(|p| p.memory.read_array::<1>(0x1000).unwrap()[0])
-            .collect();
-        bytes.sort_unstable();
-        assert_eq!(bytes, b"xy");
-        assert_eq!(k.parallel_rounds, 1);
-        assert_eq!(k.worker_direct_syscalls, 2);
-        assert_eq!(k.service_requests, 0);
-        for mut p in k.processes.values_mut() {
-            assert!(p.retained_byte.is_none());
-            assert_eq!(p.linux.vfs.read(reader, 8).unwrap(), 9u64.to_le_bytes());
+        for pause in [false, true] {
+            let mut k = super::super::tests::kernel();
+            k.cpu_count = 2;
+            k.workers = crate::workers::Pool::new(2);
+            k.per_cpu = vec![Duration::ZERO; 2];
+            let mut a = super::super::tests::process();
+            code(&mut a, &[0xf9000120, 0x14000000]); // acknowledge the resumed read, then loop
+            let [reader, writer] = a.linux.vfs.pipe(0).unwrap();
+            let writer = a.linux.vfs.direct_descriptors().get(writer).unwrap();
+            let mut b = a.fork();
+            b.tgid = 2;
+            b.vm_id = 2;
+            b.signals.io.scheduling.set_affinity(2);
+            let completed = Arc::new(SharedPage::new([0; PAGE_SIZE as usize]));
+            let mut io = Input {
+                checks: 0,
+                pause,
+                paused: false,
+                writer,
+                completed: completed.clone(),
+                deadline: Instant::now() + Duration::from_secs(3),
+            };
+            for (id, mut p) in [(1, a), (2, b)] {
+                map(&mut p, 0x2000, completed.clone(), None);
+                p.cpu.set_x(9, 0x2000 + (id as u64 - 1) * 8);
+                k.call(id, &mut p, 63, [reader as u64, 0x1000, 1, 0, 0, 0], &mut io);
+                assert!(p.byte_wait.is_some());
+                p.linux.vfs.close(reader).unwrap();
+                assert_eq!(p.linux.vfs.eventfd(9, O_NONBLOCK).unwrap(), reader);
+                k.processes.insert(id, p);
+            }
+            assert!(matches!(
+                k.drive(&mut io, u64::MAX),
+                Err(RuntimeError::Cancelled)
+            ));
+            let mut bytes: Vec<_> = k
+                .processes
+                .values()
+                .map(|p| p.memory.read_array::<1>(0x1000).unwrap()[0])
+                .collect();
+            bytes.sort_unstable();
+            assert_eq!(bytes, b"xy");
+            assert_eq!(k.parallel_rounds, 1);
+            assert_eq!(k.worker_direct_syscalls, 2);
+            assert_eq!(k.service_requests, 0);
+            for mut p in k.processes.values_mut() {
+                assert!(p.retained_byte.is_none());
+                assert_eq!(p.linux.vfs.read(reader, 8).unwrap(), 9u64.to_le_bytes());
+            }
         }
     }
 }

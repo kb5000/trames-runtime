@@ -594,7 +594,7 @@ impl<C: Cpu> Starter<C> {
                             if work.control.stop.load(Ordering::Acquire) {
                                 break SliceOutcome::Yield { instructions: 0 };
                             }
-                            if execution_guard.as_ref().map_or_else(|| domain.as_ref().is_some_and(|domain|domain.paused()), |guard|guard.pending()) {
+                            if execution_guard.as_ref().map_or_else(|| domain.as_ref().is_some_and(|domain|domain.interrupted()), |guard|guard.pending()) {
                                 yielded = true;
                                 break SliceOutcome::Yield { instructions: 0 };
                             }

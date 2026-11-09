@@ -1,11 +1,20 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 77, original native devices and Bridge resources, reviewed on 2026-11-09. The prior shared runtime
-baseline is `e3e94de96f47d74115b3084fb3d43c15ff72ed21`.
+This is the consolidated implementation audit through stage 78, original live host pause/resume, reviewed on 2026-11-09. The prior shared runtime
+baseline is `a1b09affb1be790ee1588e34fba7440d098451bf`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-09
+
+Stage 78 removes live host pause/resume from joined execution. One original
+cohort flag is shared by its domains and the existing dispatch queue. Original
+execution leases interrupt running CPUs and reject late entry; no extra
+per-instruction or ordinary memory check is added. Original jobs/Views, pending
+I/O and translations remain retained. Existing workers can finish accepted
+backing/lifecycle work, while scoped mapping batches cannot run guest
+instructions. Resume preserves actual guest/group/mapping stop policy and starts
+only required original CPU slots. Actual cancellation and final teardown remain.
 
 Stage 77 closes native special-device pathname/OFD execution and Bridge
 bytes/readiness through original shared resources. Original device availability,
@@ -377,7 +386,7 @@ Actual excluded policy effects and missing capabilities retain explicit boundari
 | io_uring explicit capability/resource escalation | Missing typed source provider, unavailable native event subscription after source retry, actual unsupported body/pinning | Original-Files registration/import and source CQ execution stay direct. Layout and signal completion side transports are deleted: accepted dependencies remain on the request, and legacy signals publish to the original task actor. Production mapped layout uses original FileLayouts. Only the two actual maintenance failure sites still set `owner_required`. | [actor](../../crates/trames-linux/src/direct/uring/actor.rs), [source maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [subscriptions](../../crates/trames-linux/src/direct/uring/wait.rs), [file results](../../crates/trames-linux/src/direct/uring/actor_file.rs) |
 | Native guest mapping and exceptional native memory entry | Original task/mm source checkpoint before body effects; Vulkan import, live-private backing and unstable entry use original Memory | No joined execution category remains for admitted original tasks. Actual capability-less/solo embeddings retain their own route. Affected bytes still quiesce; permission/backing errors and bounded entry retries use the existing common model. | [source native scope](../../crates/trames-session/src/process_lifecycle_native.rs), [Vulkan import](../../crates/trames-vulkan/src/backend.rs), [native memory](../../crates/trames-memory/src/parallel/native.rs), [entry registry](../../crates/trames-accel/src/native.rs), [GPU waits](../../crates/trames-session/src/gpu.rs) |
 | Scheduler/cohort membership | Initial guest admission and legacy nonmember wake; ordinary scheduling metadata and live affinity no longer require the owner | Initial/legacy orchestration retains its boundary. Existing members migrate/park/wake locally; children and exec replacements enter the live queue. Original CPU slots can start directly and lazily from that queue. Periodic checks alone do not tear down the cohort: `cohort_control` tests actual events and original dependencies. | [legacy wake](../../crates/trames-session/src/futex.rs), [queue](../../crates/trames-session/src/run_queue.rs), [owner metadata](../../crates/trames-session/src/process_scheduling.rs), [control checks](../../crates/trames-session/src/process_vm.rs) |
-| Host/legacy embedding administration | Pause/cancel; Mac admin/shutdown/deadline requests | These actual administration requests retain their join. Transfer/timezone/FileProvider commands use the existing disk pool and original namespace/inode resources; mapped byte consumers use original backing admission. Mac memory-pressure reclamation progresses on original mapping resources without a join. Original init notifications and authenticated graceful-stop signal delivery no longer join. Host exec construction/loading/admission, original group control and native terminal open/close/input/resize/hangup use original resources and existing workers. FileProvider admission still occurs when returning to Trames, as chosen by the owner; applying the accepted edit no longer pauses unrelated execution. | [host launch lifecycle](../../crates/trames-session/src/process_lifecycle_host.rs), [original launches](../../crates/trames-session/src/process_host.rs), [shared terminals](../../crates/trames-distro/src/terminals.rs) |
+| Host/legacy embedding administration | Actual cancel; Mac admin/shutdown/deadline requests | Live host pause/resume retains original jobs/Views/waits in the same cohort and uses existing execution leases/dispatch. Actual cancellation, deadlines/shutdown and legacy stopped-hook requests retain their join. Transfer/timezone/FileProvider commands use the existing disk pool and original namespace/inode resources; mapped byte consumers use original backing admission. Mac memory-pressure reclamation progresses on original mapping resources without a join. Original init notifications and authenticated graceful-stop signal delivery no longer join. Host exec construction/loading/admission, original group control and native terminal open/close/input/resize/hangup use original resources and existing workers. FileProvider admission still occurs when returning to Trames, as chosen by the owner; applying the accepted edit no longer pauses unrelated execution. | [host launch lifecycle](../../crates/trames-session/src/process_lifecycle_host.rs), [original launches](../../crates/trames-session/src/process_host.rs), [shared terminals](../../crates/trames-distro/src/terminals.rs) |
 | Final teardown and faults | Actual session/backend teardown, non-notifying native stop and unhandled fault exits | Ordinary last/group/default-fatal exit is source work; CPUs and cold Rc projections return asynchronously, with actual same-mm byte custody where needed. These are not ordinary whole-cohort exit boundaries. Accepted guest faults use the original signal path; actual unhandled/backend failures and final host teardown retain their explicit boundary. A host backend error is not an automatic full-VM or software fallback. | [source completion](../../crates/trames-session/src/process_exit.rs), [fault/dispatch](../../crates/trames-session/src/workers.rs), [native lifecycle](execution-backends.md#live-native-device-authority--2026-11-03) |
 
 The final worker-dispatch catch-all remains authoritative: an exit without a
@@ -2995,3 +3004,58 @@ io_uring enter, CQ polling and background pumps retain pre-pump deadlines as
 well as newly established ones. Due requests do not create a repeated past-time
 wake after the worker has observed them. Ready ordinary byte calls gain no extra
 resource scan, and ordinary guest memory access is unchanged.
+
+## 78. Original live host pause/resume — 2026-11-09
+
+A live embedding pause no longer requests a stopped control hook. The iPad FFI
+adapter continues original host queue, notification and transfer processing while
+paused. Actual cancellation still requests the original stopped hook and reports
+its existing result; pause cannot swallow cancellation or errors. Legacy adapters
+may still request their explicitly stopped callback.
+
+One original relaxed atomic pause flag is retained by the cohort and every
+original/new execution domain. The existing queue mutex publishes suspension and
+resume. On pause, existing domain interrupt registries mark their original active
+leases and kick their backend. An entry before publication is found and kicked;
+an entry after the original domain lock sees the published flag and cannot run.
+Interpreter/native loops use their existing lease pending bit; no ordinary byte
+check, native-call lock, new fence or per-instruction atomic is added. A native
+body already entered may finish before the pause settles.
+
+Guest dispatch stops without destroying jobs, CPU/translation state, Views, wait
+subscriptions or accepted I/O. New tasks can be admitted while paused and inherit
+the same original flag. Actual mapped-backing checkpoints and accepted scoped
+work can progress on existing workers; their optional guest instruction batches
+start with a pending lease and cannot execute. Host pause does not alter guest
+STOP/CONT, cgroup freezing or the mapping-pause bit. Resume cannot clear those
+independent causes. Suspended cohorts are not classified as idle completion.
+
+Resume wakes the original queue and starts only CPU slots required by its actual
+ready affinity/load. A resource wake during pause cannot start a new execution
+slot. Cancellation wakes sleeping dispatchers and uses normal teardown/drain.
+There is no resource service, new pool, polling message bus or coordinator RPC.
+
+Conformance covers three pause/resume cycles with 4/12 logical CPUs and a single
+physical execution slot, original job/View identity, pre-entry/late interrupt
+binding, new-task/cold-affinity admission, cancellation, idle pipe reads retained
+through FD close/reuse and a wake arriving while paused. Mapped host exports still
+complete on 4/12 CPUs while guest execution is suspended. The signed Mac hardware
+fixture uses native CLONE_THREAD peers and raw aligned ARM64 counter stores, so
+its pause check does not depend on guest syscalls. The baseline runtime keeps
+executing after the live pause request and fails to settle.
+
+Actual cancel/deadline/shutdown, final teardown, missing/excluded resources,
+known-resource/HLT/fault fallback and initial/legacy/solo orchestration remain.
+No overall coordinator-removal completion or browser/throughput speedup is claimed.
+
+Both complete local runtime workflows pass. macOS and ARM64 Linux each pass 412
+process tests (two intentionally ignored) and all 10 FFI tests. Strict core/FFI
+lint and iPad device/simulator SDK compiles pass. A removed unnecessary `mut` in a
+FFI test binding changes no production behavior; only affected FFI checks are
+repeated. Product hardware and installed evidence are recorded in the consumer's
+[validation record](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/host-pause-20261109.json).
+
+A focused regression reproduced an ignored paused Idle notification preventing
+idle completion after resume. Resume now clears that original notification latch
+before waking dispatchers. The full affected process suite and strict core lint
+are rerun on both hosts; unchanged CPU/Linux/VFS/runtime checks are reused.
