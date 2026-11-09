@@ -5,9 +5,12 @@ use super::*;
 #[path = "actor_file.rs"]
 mod file;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
     Mutex,
 };
+#[path = "scope.rs"]
+mod scope;
+pub(crate) use scope::Scope;
 type Key = (usize, u64);
 pub(crate) struct Execution {
     paths: Mutex<trames_vfs::PathQueries>,
@@ -20,6 +23,8 @@ pub(crate) struct Execution {
 }
 struct Accepted {
     context: Arc<Execution>,
+    owner: u64,
+    task: u32,
     retained: bool,
     socket: Option<socket_wait::RetainedSocket>,
     file: Option<file::FileIo>,
@@ -27,9 +32,7 @@ struct Accepted {
 #[derive(Default)]
 pub struct UringActor {
     rings: Mutex<BTreeMap<usize, Weak<Uring>>>,
-    active: AtomicBool,
-    owner_required: AtomicBool,
-    revision: AtomicU64,
+    scopes: scope::Scopes,
     accepted: Mutex<BTreeMap<Key, Accepted>>,
     file_size_signal: AtomicBool,
 }
@@ -203,7 +206,14 @@ impl UringActor {
     /// Accepted native jobs retain their own staging; CQ and endpoint callbacks
     /// run only after the original ring lock has been released.
     pub fn cancel_task(&self, owner: u64, task: u32) {
+        let scope = self.scope(owner, task).map(|scope| {
+            let revision = scope.revision();
+            (scope, revision)
+        });
         Self::cancel_task_rings(self.rings(), owner, task);
+        if let Some((scope, revision)) = scope {
+            self.finish_scope(&scope, revision);
+        }
     }
     pub(crate) fn cancel_task_rings(rings: Vec<Arc<Uring>>, owner: u64, task: u32) {
         for ring in rings {
@@ -230,28 +240,16 @@ impl UringActor {
         self.file_size_signal.load(Ordering::Relaxed)
             && self.file_size_signal.swap(false, Ordering::Relaxed)
     }
-    pub(crate) fn require_owner(&self) {
-        self.owner_required.store(true, Ordering::Relaxed);
-    }
-    pub(crate) fn owner_required(&self) -> bool {
-        self.owner_required.load(Ordering::Relaxed)
-    }
-    pub(crate) fn owner_progressed(&self) {
-        self.owner_required.store(false, Ordering::Relaxed);
-    }
-    pub(crate) fn reset_active(&self, active: bool) {
-        self.active.store(active, Ordering::Relaxed);
-    }
-    pub(crate) fn pending_disk(&self) -> bool {
-        self.accepted
-            .lock()
-            .unwrap()
-            .values()
-            .any(|call| call.file.as_ref().is_some_and(file::FileIo::pending_native))
+    pub(crate) fn pending_disk(&self, owner: u64, task: u32) -> bool {
+        self.accepted.lock().unwrap().values().any(|call| {
+            call.owner == owner
+                && call.task == task
+                && call.file.as_ref().is_some_and(file::FileIo::pending_native)
+        })
     }
 
     pub(crate) fn event_wait(&self, owner: u64, task: u32) -> bool {
-        if self.pending_disk() {
+        if self.pending_disk(owner, task) {
             return true;
         }
         self.rings().iter().any(|ring| {
@@ -272,19 +270,12 @@ impl UringActor {
             files.iter().any(|file| !file.native_wait_fds().is_empty())
         })
     }
-    pub(crate) fn active(&self) -> bool {
-        self.active.load(Ordering::Relaxed)
-    }
-    pub(super) fn revision(&self) -> u64 {
-        self.revision.load(Ordering::Relaxed)
-    }
-    pub(crate) fn track(&self, ring: &Arc<Uring>) {
-        self.revision.fetch_add(1, Ordering::Relaxed);
-        self.active.store(true, Ordering::Relaxed);
+    pub(crate) fn track(self: &Arc<Self>, ring: &Arc<Uring>, owner: u64, task: u32) {
         self.rings
             .lock()
             .unwrap()
             .insert(Arc::as_ptr(ring) as usize, Arc::downgrade(ring));
+        self.activate(owner, task);
     }
     pub(crate) fn accept(
         self: &Arc<Self>,
@@ -322,6 +313,8 @@ impl UringActor {
             key,
             Accepted {
                 context,
+                owner: request.owner,
+                task: request.task,
                 retained,
                 socket: None,
                 file: None,

@@ -1073,7 +1073,7 @@ impl UringSnapshot {
             .iter()
             .any(|r| r.owner == self.owner && r.task == pid)
         {
-            self.actor().track(&ring);
+            self.actor().track(&ring, self.owner, pid);
         }
         let tail = state.tail;
         let count = match ring.flush(&mut state) {
@@ -1277,7 +1277,7 @@ pub(super) struct Wait {
 }
 impl Wait {
     pub fn external(&self) -> bool {
-        self.sources.external() || self.actor.pending_disk()
+        self.sources.external() || self.actor.pending_disk(self.owner, self.task)
     }
 }
 
@@ -1870,3 +1870,7 @@ mod tests {
         assert_eq!(r.cq_ready(), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "uring/scope_tests.rs"]
+mod scope_tests;

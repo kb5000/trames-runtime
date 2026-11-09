@@ -40,8 +40,9 @@ impl Linux {
     }
     pub fn worker_uring_event(&self, memory: &Memory, task: u32) -> bool {
         self.uring_actor.get().is_some_and(|actor| {
-            actor.active()
-                && !actor.owner_required()
+            actor
+                .scope(memory.instruction_identity().0, task)
+                .is_some_and(|scope| scope.active() && !scope.owner_required())
                 && (actor.event_wait(memory.instruction_identity().0, task)
                     || self.vfs.has_native_event_sources())
         })
@@ -51,16 +52,34 @@ impl Linux {
             .get()
             .is_some_and(|actor| actor.owner_required())
     }
-    pub fn worker_uring_pending(&self) -> bool {
+    pub fn uring_requires_owner_for(&self, memory: &Memory, task: u32) -> bool {
         self.uring_actor
             .get()
-            .is_some_and(|actor| actor.active() && !actor.owner_required())
+            .and_then(|actor| actor.scope(memory.instruction_identity().0, task))
+            .is_some_and(|scope| scope.owner_required())
+    }
+    pub fn worker_uring_pending(&self, memory: &Memory, task: u32) -> bool {
+        self.uring_actor
+            .get()
+            .and_then(|actor| actor.scope(memory.instruction_identity().0, task))
+            .is_some_and(|scope| scope.active() && !scope.owner_required())
     }
     pub fn uring_actor_root(&self) -> std::sync::Arc<std::sync::OnceLock<Arc<crate::UringActor>>> {
         self.uring_actor.clone()
     }
     pub fn track_uring(&mut self, ring: &Arc<Uring>) {
-        self.uring_actor.get_or_init(Arc::default).track(ring);
+        let sources: std::collections::BTreeSet<_> = ring
+            .state
+            .lock()
+            .unwrap()
+            .pending
+            .iter()
+            .map(|request| (request.owner, request.task))
+            .collect();
+        let actor = self.uring_actor.get_or_init(Arc::default);
+        for (owner, task) in sources {
+            actor.track(ring, owner, task);
+        }
     }
 
     pub fn set_file_executor(&mut self, executor: Arc<dyn crate::FileExecutor>) {
@@ -252,7 +271,11 @@ impl Linux {
             .iter()
             .any(|r| r.owner == memory.instruction_identity().0 && r.task == task)
         {
-            self.track_uring(&ring);
+            self.uring_actor.get_or_init(Arc::default).track(
+                &ring,
+                memory.instruction_identity().0,
+                task,
+            );
         }
         Ok((
             submitted,
@@ -311,28 +334,49 @@ impl Linux {
     /// requests. No SQPOLL, new thread, timer bus or per-operation RPC is added.
     pub fn progress_uring(&mut self, memory: &mut Memory, task: u32) -> bool {
         let mut changed = false;
+        let owner = memory.instruction_identity().0;
+        let scope = self
+            .uring_actor
+            .get()
+            .and_then(|actor| actor.scope(owner, task))
+            .map(|scope| {
+                let revision = scope.revision();
+                (scope, revision)
+            });
         let rings = self.uring_rings();
         for ring in &rings {
             changed |= self.progress_ring(ring, memory, task);
         }
-        if let Some(actor) = self.uring_actor.get() {
-            if changed {
-                actor.owner_progressed();
-            }
-            actor.reset_active(rings.iter().any(|ring| {
+        if let (Some(actor), Some((scope, revision))) = (self.uring_actor.get(), scope) {
+            if !rings.iter().any(|ring| {
                 ring.state
                     .lock()
                     .unwrap()
                     .pending
                     .iter()
-                    .any(|r| r.owner == memory.instruction_identity().0 && r.task == task)
-            }));
+                    .any(|r| r.owner == owner && r.task == task)
+            }) {
+                actor.finish_scope(&scope, revision);
+            } else if changed {
+                scope.owner_progressed(revision);
+            }
         }
         changed
     }
     pub fn cancel_uring(&mut self, memory: &mut Memory, task: u32) {
         let owner = memory.instruction_identity().0;
+        let scope = self
+            .uring_actor
+            .get()
+            .and_then(|actor| actor.scope(owner, task))
+            .map(|scope| {
+                let revision = scope.revision();
+                (scope, revision)
+            });
         crate::UringActor::cancel_task_rings(self.uring_rings(), owner, task);
+        if let (Some(actor), Some((scope, revision))) = (self.uring_actor.get(), scope) {
+            actor.finish_scope(&scope, revision);
+        }
     }
     pub fn uring_deadline(&self) -> Option<Instant> {
         self.uring_rings()

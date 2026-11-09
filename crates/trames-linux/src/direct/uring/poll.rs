@@ -92,7 +92,7 @@ impl UringSnapshot {
 }
 impl PollWait {
     pub(crate) fn external(&self) -> bool {
-        self.sources.external() || self.actor.pending_disk()
+        self.sources.external() || self.actor.pending_disk(self.owner, self.task)
     }
     pub(crate) fn refresh(
         &mut self,

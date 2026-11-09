@@ -3303,7 +3303,7 @@ impl<C: Cpu> Kernel<C> {
         if self
             .processes
             .iter()
-            .any(|(id, p)| !p.frozen(id) && p.linux.worker_uring_pending())
+            .any(|(id, p)| !p.frozen(id) && p.linux.worker_uring_pending(&p.memory, id))
         {
             let runnable = self
                 .processes
@@ -3452,7 +3452,8 @@ impl<C: Cpu> Kernel<C> {
                         }
                         _ => false,
                     };
-                if p.linux.uring_requires_owner() || !local_ring && !p.linux.worker_uring_pending()
+                if p.linux.uring_requires_owner_for(&p.memory, id)
+                    || !local_ring && !p.linux.worker_uring_pending(&p.memory, id)
                 {
                     {
                         let task = &mut *p;
@@ -3510,7 +3511,7 @@ impl<C: Cpu> Kernel<C> {
                 return None;
             }
             ((p.stopped() && p.control_candidate(id))
-                || (p.linux.worker_uring_pending()
+                || (p.linux.worker_uring_pending(&p.memory, id)
                     && !matches!(p.state, State::Ready | State::Zombie(_))
                     && !p.worker_gpu_candidate())
                 || (matches!(p.state, State::Futex { .. }) && vms.contains(&p.vm_id))
@@ -3530,12 +3531,10 @@ impl<C: Cpu> Kernel<C> {
         }));
         if members.len() < 2
             && !members.iter().any(|(id, _)| {
-                self.processes.read(id).worker_gpu_candidate()
-                    || self.processes.read(id).linux.worker_uring_pending()
-                    || matches!(
-                        self.processes.read(id).state,
-                        State::Policy(_) | State::Barrier(_)
-                    )
+                let p = self.processes.read(id);
+                p.worker_gpu_candidate()
+                    || p.linux.worker_uring_pending(&p.memory, *id)
+                    || matches!(p.state, State::Policy(_) | State::Barrier(_))
             })
         {
             return Ok(false);

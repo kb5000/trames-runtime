@@ -1,11 +1,21 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 84, original io_uring submitter authority, reviewed on 2026-11-09. The prior shared runtime
-baseline is `43cdaa92f94c867e12f4a9ec0d1afd0039d7f414`.
+This is the consolidated implementation audit through stage 85, original io_uring maintenance scopes, reviewed on 2026-11-09. The prior shared runtime
+baseline is `3c8f555bd74952ce38d38edea341cada6750f8e4`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-09
+
+Stage 85 removes actor-wide io_uring active/revision/legacy-required state.
+Maintenance admission, readiness classification, completion, cancellation and
+legacy escalation now name the original (mm, task) scope. One scope cannot idle
+another or disable its source maintenance. Production Linux clones normally have
+separate actors: this closes reuse/embedding and stale-publication dependencies,
+not a measured common-workload global-actor bottleneck. The one-origin case uses
+one retained scope without a registry lock; secondary origins release their
+records after pending work and observers finish. Both real maintenance escalation
+sites remain, scoped to their original submitter. Four broad categories remain.
 
 Stage 84 binds accepted io_uring byte resources to the original submitting task,
 including solo-imported signalfd requests before their first worker capture.
@@ -426,13 +436,13 @@ Actual excluded policy effects and missing capabilities retain explicit boundari
 ### Current remaining categories
 
 The count is **four broad categories**, not the number of historical subsystem
-rows. Stages 72–84 remove concrete triggers and close request-authority dependencies inside those categories; they do not
+rows. Stages 72–85 remove concrete triggers and close request-authority dependencies inside those categories; they do not
 prove that the final generic fallback is unreachable.
 
 | Remaining category | Actual trigger | Current scope / authoritative implementation |
 | --- | --- | --- |
 | Host cancellation and final teardown | Host cancel, deadline, shutdown, legacy stopped-hook requests, final CPU/backend drain and actual native-event backend failure | Pause/resume, original init notifications/signals, pressure reclaim, host filesystem commands and terminal/process admission no longer join. Actual terminal teardown and backend failure still stop their actors. Native-event failure returns its original HostIo cause after drain/cancellation, without an owner syscall retry. See [host control](../../crates/trames-session/src/process_vm.rs), [completion](../../crates/trames-session/src/process_exit.rs) and [workers](../../crates/trames-session/src/workers.rs). |
-| Missing capabilities and excluded resources | A genuinely absent source provider, an excluded original FD/node graph, a genuinely absent native event capability or unsupported source request body | There is no filesystem-kind exclusion after stage 82. Existing node/provider admission still applies. io_uring has exactly two `require_owner()` maintenance call sites: missing-capability wait-source preparation and deferred original body progress; actual host backend errors take terminal source error handling. They remain connected to actual accepted request lifetime, subscriptions and cancellation. See [path authority](../../crates/trames-vfs/src/path_queries.rs), [maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [wait sources](../../crates/trames-linux/src/direct/uring/wait.rs) and [actor](../../crates/trames-linux/src/direct/uring/actor.rs). |
+| Missing capabilities and excluded resources | A genuinely absent source provider, an excluded original FD/node graph, a genuinely absent native event capability or unsupported source request body | There is no filesystem-kind exclusion after stage 82. Existing node/provider admission still applies. io_uring has exactly two submitter-scoped `require_owner()` maintenance call sites: missing-capability wait-source preparation and deferred original body progress; actual host backend errors take terminal source error handling. They remain connected to actual accepted request lifetime, subscriptions and cancellation. See [path authority](../../crates/trames-vfs/src/path_queries.rs), [maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [wait sources](../../crates/trames-linux/src/direct/uring/wait.rs) and [actor](../../crates/trames-linux/src/direct/uring/actor.rs). |
 | Final execution dispatch fallback | A returned SVC/HLT/fault not completed, parked or accepted by a source scope | The catch-all stops the current cohort for joined dispatch. It remains an audit target even though admitted native calls, ordinary guest faults, generated ENOSYS and migrated syscalls have source completion. A backend error is not a software or full-Linux-VM fallback. See [worker dispatch](../../crates/trames-session/src/workers.rs) and [classification](../../crates/trames-session/src/worker_syscalls.rs). |
 | Initial and legacy orchestration | Initial admission, legacy nonmember wake/wait adoption and capability-less embedding routes | Ordinary live members migrate, park and wake on the original queue; child/exec admission and lazy CPU slots no longer require a joined owner. Solo dispatch is on the caller, so its existence alone is not a cross-thread transition. See [admission](../../crates/trames-session/src/process.rs), [legacy wakes](../../crates/trames-session/src/futex.rs) and [queue](../../crates/trames-session/src/run_queue.rs). |
 
@@ -3381,3 +3391,47 @@ or teardown. The broad category count remains four. No new service/coordinator
 thread, polling bus, production unsafe block, ordinary guest memory fence/check
 or global native-function lock is introduced. Shared code remains iPad-compatible;
 only Mac Dev deployment is in scope.
+
+
+## 85. Original io_uring maintenance scopes and retirement — 2026-11-09
+
+The actor-wide active, revision and owner-required fields are removed. An original
+(mm identity, task) scope now owns pending publication and genuine legacy
+capability/body escalation. Kernel admission asks about that exact memory/task;
+foreign CQ visibility no longer creates another submitter's background actor.
+Background readiness, native-disk classification, completion and cancellation
+remain on original ring/OFD resources and cannot disable another scope.
+
+Pending publication and its generation use one relaxed atomic status word. Idling
+or acknowledging legacy progress compares the observed generation: a new accepted
+publication wins over a stale completion. Actual ring/resource locks publish
+request contents; this adds no guest-byte ordering, ordinary-memory fence or
+per-instruction check. File work stores the accepted original mm/task identity so
+another submitter's queued native work cannot make a local source "external".
+
+Linux task cloning already creates separate actors in normal production. The
+ordinary one-origin path therefore keeps one scope for the actor's lifetime and
+needs no new registry lock or tree lookup. Only reused/multi-origin embeddings use
+an object-local secondary registry. Pending work pins those scopes; inactive
+observers use the same identity until their last drop, and historical origins are
+then removed. Scopes retain no guest task, Files root, memory or strong ring.
+Native callbacks and final scope cleanup do not run under the registry lock.
+
+Three before-fix regressions fail: completing one submitter retires another source;
+foreign capture creates a background for somebody else's request; and one excluded
+body disables another submitter's ordinary maintenance. Final coverage also checks
+real TCP missing-capability escalation/retry/cancellation, independent eventfd
+progress, delayed file-job external classification, stale idle/progress versus new
+pending publication, same task numbers across different mm identities, canonical
+reactivation and retirement of over a thousand secondary origins. Existing source,
+solo, process, iPad compile and signed native product checks are recorded by the
+product validation record. Synthetic multi-origin tests do not prove a frequent
+production bottleneck or a throughput gain.
+
+This closes the connected maintenance-state ownership/lifetime dependency. It does
+not make missing native wait capabilities or excluded request bodies executable:
+the two genuine maintenance escalation calls remain and their legacy paths still
+work. Their actual worker stop/join boundary has not been relabelled as removed.
+The four broad remaining categories and overall goal remain active. No new
+coordinator/service thread, polling bus, global algorithm lock or production unsafe
+block is introduced. Only Mac Dev deployment is in scope.

@@ -4,6 +4,7 @@ use super::poll::PollRingOps;
 use super::*;
 pub struct UringBackground {
     actor: Arc<UringActor>,
+    scope: Arc<actor::Scope>,
     owner: u64,
     task: u32,
     pub signal: Arc<IoSignal>,
@@ -17,12 +18,12 @@ impl UringBackground {
         self.deadline
     }
     pub fn external(&self) -> bool {
-        self.sources.external() || self.actor.pending_disk()
+        self.sources.external() || self.actor.pending_disk(self.owner, self.task)
     }
     pub fn needs_progress(&self) -> bool {
         !self.armed
             || self.signal.ready()
-            || self.revision != self.actor.revision()
+            || self.revision != self.scope.revision()
             || self.deadline.is_some_and(|d| d <= Instant::now())
     }
     pub fn progress(&mut self, memory: &mut impl CpuMemory) -> std::io::Result<bool> {
@@ -31,7 +32,7 @@ impl UringBackground {
         }
         self.signal.reset();
         self.armed = true;
-        self.revision = self.actor.revision();
+        self.revision = self.scope.revision();
         let rings = self.actor.rings();
         // Retain a deadline that becomes due during the original body pump.
         let before = rings
@@ -49,7 +50,7 @@ impl UringBackground {
         match prepared {
             Ok(true) => {}
             Ok(false) => {
-                self.actor.require_owner();
+                self.scope.require_owner();
                 return Ok(false);
             }
             Err(error) => {
@@ -64,7 +65,7 @@ impl UringBackground {
             .min();
         for ring in &rings {
             if !ring.poll_pump(self.owner, self.task, memory, &self.actor) {
-                self.actor.require_owner();
+                self.scope.require_owner();
                 return Ok(false);
             }
             active |= ring
@@ -79,11 +80,13 @@ impl UringBackground {
                 .flatten()
                 .min();
         }
-        self.actor.reset_active(active);
+        if !active {
+            self.actor.finish_scope(&self.scope, self.revision);
+        }
         Ok(true)
     }
     pub fn active(&self) -> bool {
-        self.actor.active()
+        self.scope.active()
     }
 }
 impl DirectSyscalls {
@@ -94,7 +97,8 @@ impl DirectSyscalls {
             .as_ref()
             .map_or(&self.urings.local_actor, |actor| &**actor)
             .get()?;
-        if !actor.active() {
+        let scope = actor.scope(self.urings.owner, pid)?;
+        if !scope.active() {
             return None;
         }
         // Owner-accepted SQEs retain the same source context as caller-accepted
@@ -122,6 +126,7 @@ impl DirectSyscalls {
         }
         Some(UringBackground {
             actor: actor.clone(),
+            scope,
             owner: self.urings.owner,
             task: pid,
             signal: IoSignal::new(pid, target.clone()),
