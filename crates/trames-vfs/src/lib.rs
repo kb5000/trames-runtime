@@ -1474,13 +1474,10 @@ impl Vfs {
     fn node<P: PathArg + ?Sized>(&self, path: &P) -> Result<NodeRef> {
         let key = path.key();
         if let Some(query) = &self.query {
+            // Every implemented mount uses original shared inode/topology
+            // resources. Admission follows the actual node/provider, not a
+            // filesystem-name whitelist (which used to exclude mqueue roots).
             query.pin_mount(path.mount());
-            if path
-                .mount()
-                .is_some_and(|m| !path_queries::ordinary_mount(m))
-            {
-                return query.defer();
-            }
         }
         if path
             .mount()

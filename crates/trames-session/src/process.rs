@@ -9521,3 +9521,7 @@ mod power_tests;
 #[cfg(all(test, trames_interpreter_conformance))]
 #[path = "process_memory_query_tests.rs"]
 mod memory_query_tests;
+
+#[cfg(all(test, trames_interpreter_conformance))]
+#[path = "process_mqueue_tests.rs"]
+mod mqueue_tests;

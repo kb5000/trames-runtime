@@ -144,31 +144,6 @@ impl Authority {
         })
     }
 }
-pub(super) fn ordinary_mount(mount: &Mount) -> bool {
-    if mount.devpts.is_some() {
-        return true;
-    }
-    matches!(
-        mount.kind,
-        mounts::Kind::Root
-            | mounts::Kind::Tmpfs
-            | mounts::Kind::Overlay
-            | mounts::Kind::Cgroup
-            | mounts::Kind::Proc
-            | mounts::Kind::Sysfs
-            | mounts::Kind::Devpts
-            | mounts::Kind::Nsfs
-    ) || cfg!(all(feature = "hostfs", unix)) && host_mount(mount)
-}
-#[cfg(all(feature = "hostfs", unix))]
-fn host_mount(mount: &Mount) -> bool {
-    mount.kind == mounts::Kind::Host
-}
-#[cfg(not(all(feature = "hostfs", unix)))]
-fn host_mount(_: &Mount) -> bool {
-    false
-}
-
 /// One exclusively owned control island, movable with a retained execution job.
 /// No mutable resolver or task-local cache escapes this type's sealed API.
 pub struct PathQueries {
@@ -1060,3 +1035,5 @@ mod tests {
 
 #[cfg(test)]
 mod directory_tests;
+#[cfg(test)]
+mod mqueue_tests;

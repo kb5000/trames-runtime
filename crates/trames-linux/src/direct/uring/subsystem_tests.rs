@@ -69,6 +69,83 @@ fn scalar(op: u8, fd: u32, address: u64, length: u32, tag: u64) -> [u8; 64] {
     s
 }
 #[test]
+fn mqueue_uring_paths_and_accepted_directory_fds_do_not_require_owner_maintenance() {
+    for cancel in [false, true] {
+        let (mut l, mut m, fd, ring) = setup(16);
+        l.vfs.mkdir_at(-100, b"/mq", 0o755).unwrap();
+        let mut files = trames_vfs::FileEpoch::default();
+        let caps = files.capture(&l.vfs, true);
+        let d = direct(&l, &m, &mut UringEpoch::default(), &caps);
+        // This original mount is published after source-context capture.
+        l.vfs
+            .mount(None, b"/mq", Some(b"mqueue"), 14, None)
+            .unwrap();
+        let t = target();
+        m.write(0x2100, b"/mq\0").unwrap();
+        m.write(0x2200, b".\0").unwrap();
+        let mut open = scalar(18, (-100i32) as u32, 0x2100, 0, 1);
+        open[28..32].copy_from_slice(&trames_vfs::O_DIRECTORY.to_le_bytes());
+        let dir = submit(&d, &mut m, fd, &ring, open, &t);
+        assert!(dir >= 0, "source open returned {dir}");
+        let old = l.vfs.stat_fd(dir as u32).unwrap();
+        let [reader, writer] = l.vfs.pipe(0).unwrap();
+        add(&mut m, &ring, scalar(22, reader, 0x2300, 1, 2));
+        let mut stat = scalar(21, dir as u32, 0x2200, 0x7ff, 3);
+        stat[1] = 2; // Drain retains the accepted dirfd behind the original read.
+        stat[8..16].copy_from_slice(&0x3000u64.to_le_bytes());
+        add(&mut m, &ring, stat);
+        assert!(matches!(
+            enter(&d, fd, 2, 0, &mut m, &t),
+            IoAttempt::Complete(Ok(2))
+        ));
+        let mut background = d.uring_background(7, &Arc::downgrade(&t)).unwrap();
+        assert!(background.progress(&mut m));
+        l.vfs.close(dir as u32).unwrap();
+        // Reuse the numeric fd and replace the pathname while the original
+        // accepted operation retains its old directory and mount identity.
+        let replacement = l
+            .vfs
+            .open_at(-100, b"/", trames_vfs::O_DIRECTORY, 0)
+            .unwrap();
+        assert_eq!(replacement, dir as u32);
+        l.vfs.umount(b"/mq", 2).unwrap();
+        l.vfs.mount(None, b"/mq", Some(b"tmpfs"), 0, None).unwrap();
+        if cancel {
+            d.urings.actor().cancel_task(m.instruction_identity().0, 7);
+            let mut completions = [cq(&mut m, &ring), cq(&mut m, &ring)];
+            completions.sort_unstable();
+            assert_eq!(completions, [(2, -125), (3, -125)]);
+            assert_eq!(m.read_u64(0x3020).unwrap(), 0);
+        } else {
+            l.vfs.write(writer, b"x").unwrap();
+            assert!(background.progress(&mut m));
+            assert_eq!(cq(&mut m, &ring), (2, 1));
+            assert_eq!(cq(&mut m, &ring), (3, 0));
+            assert_eq!(
+                m.read_u64(0x3020).unwrap(),
+                u64::from_le_bytes(old[8..16].try_into().unwrap())
+            );
+        }
+        assert!(!l.uring_requires_owner());
+        stat[1] = 0;
+        stat[4..8].copy_from_slice(&((-100i32) as u32).to_le_bytes());
+        stat[16..24].copy_from_slice(&0x2100u64.to_le_bytes());
+        stat[32..40].copy_from_slice(&5u64.to_le_bytes());
+        assert_eq!(submit(&d, &mut m, fd, &ring, stat, &t), 0);
+        let current = l.vfs.stat_at(-100, b"/mq").unwrap();
+        assert_ne!(&old[..8], &current[..8]);
+        assert_eq!(
+            m.read_u64(0x3020).unwrap(),
+            u64::from_le_bytes(current[8..16].try_into().unwrap())
+        );
+        assert_eq!(
+            submit(&d, &mut m, fd, &ring, sqe(19, replacement, 6), &t),
+            0
+        );
+        assert!(!l.uring_requires_owner());
+    }
+}
+#[test]
 fn native_device_scalar_vector_and_positioned_errors_share_the_original_abi() {
     let (mut l, mut m, _, _) = setup(16);
     l.vfs.set_runtime_info(7, Default::default());
