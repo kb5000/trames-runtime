@@ -2474,7 +2474,7 @@ impl<C: Cpu> Kernel<C> {
             self.refresh_proc_observed(
                 pid,
                 p,
-                (demand.residency() && self.memory_limits.is_host_managed())
+                (demand.host_memory() && self.memory_limits.is_host_managed())
                     .then(|| io.host_memory())
                     .flatten(),
                 demand,
@@ -2491,7 +2491,7 @@ impl<C: Cpu> Kernel<C> {
                 self.refresh_proc_observed(
                     pid,
                     p,
-                    (refined.residency() && self.memory_limits.is_host_managed())
+                    (refined.host_memory() && self.memory_limits.is_host_managed())
                         .then(|| io.host_memory())
                         .flatten(),
                     demand.merge(refined),
@@ -9712,6 +9712,10 @@ mod published_proc_tests;
 #[cfg(all(test, trames_interpreter_conformance))]
 #[path = "process_uring_original_tests.rs"]
 mod uring_original_tests;
+
+#[cfg(all(test, trames_interpreter_conformance))]
+#[path = "process_proc_resources_tests.rs"]
+mod proc_resources_tests;
 
 #[cfg(all(test, trames_interpreter_conformance))]
 #[path = "process_source_fault_tests.rs"]

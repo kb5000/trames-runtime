@@ -7,6 +7,95 @@ use trames_memory::{Permissions, PAGE_SIZE};
 use trames_vfs::{ProcQuery, ProcRefresh, ProcSource};
 
 #[test]
+fn task_proc_observations_use_original_mm_without_sampling_host_global_memory() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let paths: &[&[u8]] = &[
+        b"/proc/1/status",
+        b"/proc/1/stat",
+        b"/proc/1/statm",
+        b"/proc/1/smaps",
+        b"/proc/1/smaps_rollup",
+        b"/proc/1/maps",
+        b"/proc/1/comm",
+        b"/proc/1/limits",
+        b"/proc/1/fdinfo/0",
+        b"/proc/1/mountinfo",
+    ];
+    for limits in [
+        crate::MemoryLimits::default(),
+        crate::MemoryLimits::host_managed(),
+    ] {
+        let mut k = kernel();
+        k.memory_limits = limits;
+        let mut p = process();
+        p.memory.write(0x1000, b"resident").unwrap();
+        k.install_proc_source(&p, None);
+        k.publish_task(1, &p);
+        let absent = k.proc_source.as_ref().unwrap();
+        for path in paths {
+            assert!(absent.available(ProcRefresh::for_path(path)), "{path:?}");
+        }
+        assert_eq!(
+            absent.available(ProcRefresh::for_path(b"/proc/meminfo")),
+            !limits.is_host_managed()
+        );
+        let samples = Arc::new(AtomicUsize::new(0));
+        let calls = samples.clone();
+        k.install_proc_source(
+            &p,
+            Some(Arc::new(move || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                trames_linux::HostMemoryInfo {
+                    total: 1000,
+                    free: 600,
+                    available: 800,
+                }
+            })),
+        );
+        k.publish_task(1, &p);
+        let source = k.proc_source.as_ref().unwrap();
+        for path in paths {
+            let info = ProcSource::observe(
+                &**source,
+                ProcQuery::new(
+                    path,
+                    ProcRefresh::for_path(path),
+                    p.linux.vfs.pid_namespace(),
+                    1,
+                ),
+            );
+            assert!(info.processes.iter().any(|task| task.pid == 1), "{path:?}");
+        }
+        assert_eq!(samples.load(Ordering::Relaxed), 0);
+        let global = ProcSource::observe(
+            &**source,
+            ProcQuery::new(
+                b"/proc/meminfo",
+                ProcRefresh::HostMemory,
+                p.linux.vfs.pid_namespace(),
+                1,
+            ),
+        );
+        assert_eq!(
+            samples.load(Ordering::Relaxed),
+            usize::from(limits.is_host_managed())
+        );
+        if limits.is_host_managed() {
+            assert_eq!(
+                (
+                    global.memory_limit,
+                    global.used_memory,
+                    global.available_memory
+                ),
+                (1000, 400, Some(800))
+            );
+        } else {
+            assert_eq!(global.memory_limit, limits.total);
+        }
+    }
+}
+
+#[test]
 fn system_statistics_deduplicate_original_mm_and_follow_live_task_membership() {
     let mut k = kernel();
     let mut p = process();
@@ -40,7 +129,7 @@ fn system_statistics_deduplicate_original_mm_and_follow_live_task_membership() {
         &*source,
         ProcQuery::new(
             b"/proc/meminfo",
-            ProcRefresh::Residency,
+            ProcRefresh::HostMemory,
             p.linux.vfs.pid_namespace(),
             1,
         ),
@@ -117,7 +206,7 @@ fn system_statistics_share_host_reports_and_preflight_before_host_sampling() {
         &*source,
         ProcQuery::new(
             b"/proc/meminfo",
-            ProcRefresh::Residency,
+            ProcRefresh::HostMemory,
             p.linux.vfs.pid_namespace(),
             1,
         ),

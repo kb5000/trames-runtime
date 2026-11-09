@@ -1,11 +1,27 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 99, connected io_uring maintenance resources, reviewed on 2026-11-10. The prior shared runtime
-baseline is `4169330c9e9696eafeb2919ad1f23f06eddde8a9`.
+This is the consolidated implementation audit through stage 100, original task-memory observations, reviewed on 2026-11-10. The prior shared runtime
+baseline is `796981af99a03add75eb70abd332767dd1ee9122`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-10
+
+Stage 100 separates original per-task RSS/mapping observations from global
+host/quota accounting as one resource subsystem. The typed proc demand now carries
+HostMemory only for global meminfo/full observation; per-task status/stat/statm
+and existing mapping reads use their real task/mm resources. A missing optional
+Send+Sync host-memory callback no longer rejects those available resources or
+forces their open/read/io_uring bodies through joined dispatch. Genuine absent
+host-global accounting retains its explicit provider boundary.
+
+Per-task observations no longer sample host-global memory, even when its callback
+exists. A host-managed meminfo text observation reads its original host provider
+without enumerating tasks, sampling every mm's native residency or constructing
+unconsumed CPU/load/process projections. Quota-backed global memory still sums
+unique original mm charges; sysinfo still observes its real task/load resources.
+Lookup and alias-demand union preserve these dependencies without new byte hooks,
+locks, service threads or a cached/stale memory-total publication.
 
 Stage 99 handles the connected io_uring wait/context/lifetime graph as one
 batch. Background maintenance, GETEVENTS and CQ poll/epoll use the same original
@@ -585,13 +601,13 @@ Actual excluded policy effects and missing capabilities retain explicit boundari
 ### Current remaining categories
 
 The count is **four broad categories**, not the number of historical subsystem
-rows. Stages 72–98 remove concrete triggers and close request-authority dependencies inside those categories; they do not
+rows. Stages 72–100 remove concrete triggers and close request-authority dependencies inside those categories; they do not
 prove that the final generic fallback is unreachable.
 
 | Remaining category | Actual trigger | Current scope / authoritative implementation |
 | --- | --- | --- |
 | Host cancellation and final teardown | Host cancel, deadline, shutdown, legacy stopped-hook requests, final CPU/backend drain and actual native-event backend failure | Pause/resume, original init notifications/signals, pressure reclaim, host filesystem commands and terminal/process admission no longer join. Actual terminal teardown and backend failure still stop their actors. Native-event failure returns its original HostIo cause after drain/cancellation, without an owner syscall retry. See [host control](../../crates/trames-session/src/process_vm.rs), [completion](../../crates/trames-session/src/process_exit.rs) and [workers](../../crates/trames-session/src/workers.rs). |
-| Missing capabilities and excluded resources | A genuinely absent source provider, an excluded original FD/node graph, a genuinely absent native event capability or unsupported source request body | There is no filesystem-kind exclusion after stage 82. Published global proc/sys metadata no longer lacks a source provider merely because it uses set_runtime_info. Other node/provider admission still applies. io_uring has exactly two submitter-scoped `require_owner()` maintenance call sites: an actually unavailable typed wait graph provider and deferred original body progress. An absent HostEvents hub no longer triggers this boundary: actual native interests are retained with their read/write directions. Compatibility capture carries its own original execution resources; actual host backend errors retain their host cause. They remain connected to actual accepted request lifetime, subscriptions and cancellation. See [path authority](../../crates/trames-vfs/src/path_queries.rs), [maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [wait sources](../../crates/trames-linux/src/direct/uring/wait.rs) and [actor](../../crates/trames-linux/src/direct/uring/actor.rs). |
+| Missing capabilities and excluded resources | A genuinely absent source provider, an excluded original FD/node graph, a genuinely absent native event capability or unsupported source request body | There is no filesystem-kind exclusion after stage 82. Published global proc/sys metadata no longer lacks a source provider merely because it uses set_runtime_info. Other node/provider admission still applies. io_uring has exactly two submitter-scoped `require_owner()` maintenance call sites: an actually unavailable typed wait graph provider and deferred original body progress. An absent HostEvents hub no longer triggers this boundary: actual native interests are retained with their read/write directions. Compatibility capture carries its own original execution resources; per-task memory observations do not require a host-global statistics callback. Actual missing global providers and host backend errors retain their own boundary/cause. They remain connected to actual accepted request lifetime, subscriptions and cancellation. See [path authority](../../crates/trames-vfs/src/path_queries.rs), [maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [wait sources](../../crates/trames-linux/src/direct/uring/wait.rs) and [actor](../../crates/trames-linux/src/direct/uring/actor.rs). |
 | Final execution dispatch fallback | A returned SVC or cold HLT/resource operation not completed, parked or accepted by a source scope; host faults and capability-less embeddings retain their own explicit boundaries | The catch-all stops the current cohort for joined dispatch. Ordinary shared-FD ioctl discovery, residual prctl controls/errors, implemented time observations, FD status/NOATIME, inode seals, anonymous memory-file creation, mapped-memory msync/writeback, file-cache advice, canonical FD/error admission, the complete original epoll/poll/select graph and generic socket event sources, current-offset vector transports, blocking POSIX/OFD locks, directory flock and canonical unknown fcntl commands no longer use it. It remains an audit target even though admitted native calls, ordinary guest faults, generated ENOSYS and migrated syscalls have source completion. Recognized guest faults, caught handlers and signal-frame failures now complete/terminate on source. A backend error is not a software or full-Linux-VM fallback. See [worker dispatch](../../crates/trames-session/src/workers.rs) and [classification](../../crates/trames-session/src/worker_syscalls.rs). |
 | Initial and legacy orchestration | Initial admission, standalone/capability-less nonmember scheduling and other excluded embedding routes | Ordinary live members and preexisting Kernel Futex/Sleep actors migrate, park and wake on the original queue. Cold waiters have metadata only until an event prepares their original mm; child/exec admission and lazy CPU slots no longer require a joined owner. The standalone futex legacy-publication mechanism remains. Solo dispatch is on the caller, so its existence alone is not a cross-thread transition. See [admission](../../crates/trames-session/src/process.rs), [legacy wakes](../../crates/trames-session/src/futex.rs) and [queue](../../crates/trames-session/src/run_queue.rs). |
 
@@ -4328,3 +4344,47 @@ scope. The paired Mac fixture and integration evidence belong to the product
 [batch record](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/uring-maintenance-20261110.json).
 Neither maintenance guard nor any broad remaining category is declared removed.
 No throughput or production fallback-frequency improvement is inferred here.
+
+
+## 100. Original per-task memory observations and global accounting — 2026-11-10
+
+The previous Residency demand conflated two independent original resources:
+per-task RSS/layout reports and global host/quota accounting. Under host-managed
+memory, an adapter with synchronous host_memory but no Send+Sync callback could
+supply real task/mm reports, yet source open/read/io_uring admission still ended
+the execution cohort. Even fully supplied production adapters performed an extra
+host-global Mach statistics query for each task status/stat/statm body.
+
+HostMemory is now an explicit qualifier carried through for_path, demand union,
+Full observation and legacy discovery. Metadata lookup drops it, as it already
+drops content/residency requests. Task RSS and mappings retain the original
+ProcTask/MemoryReport; only actual global meminfo/full accounting needs the host
+callback. Existing truly unavailable custom ProcSource implementations remain
+unavailable. No loaded/global publication donates guest-mm byte authority.
+
+Per-task observers never request host-global samples. The host-managed meminfo
+text body consumes only its original host report and bypasses the task directory,
+per-mm native pager and unused CPU/load/process projection. Its renderer consumes
+only the same total/free/available fields. Quota-backed meminfo still observes
+unique original mm resources; global sysinfo retains required task/load work.
+No memory cap, allocation, residency charge, fake success/error, extra ordinary
+memory check/fence, global lock, polling bus or resource-service thread is added.
+
+The connected guest fixture covers status/stat/statm/maps, metadata/statx, scalar
+read/pread, seek/vector read, close and io_uring on four/twelve CPUs and one slot.
+Self/thread-self aliases retain caller identity. Existing unimplemented smaps
+paths retain canonical ENOENT, subsequent EBADF and CQ errors rather than becoming
+capability fallbacks; this batch does not implement those files. Accepted status
+and statm bodies observe new resident pages after FD close/reuse, retain original
+PID identity through exit/reuse, and cannot keep a dead task/Files table alive.
+Existing cmdline/environment, namespace, detached reader and layout tests remain
+in the concentrated regression closure.
+
+The common baseline returns its first openat before the completion marker. The
+native four-CPU baseline completes correct guest results but takes eleven cohorts,
+returns twelve openat/twelve read/two clone calls and samples host memory 25 times.
+Final native evidence and exact cross-platform source/binary checks belong to the
+[paired validation](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/task-proc-resources-20261110.json).
+The four broad categories and two genuine io_uring missing-provider/body guards
+remain. This closes a concrete availability dependency, not universal custom
+provider coverage or the final generic dispatch catch-all.

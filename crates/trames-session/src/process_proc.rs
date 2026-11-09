@@ -833,7 +833,7 @@ mod tests {
         assert!(String::from_utf8_lossy(&task.maps).contains("000000002000-000000003000 r-xp"));
         let snapshot = source.observe(trames_vfs::ProcQuery::new(
             b"/proc/meminfo",
-            ProcRefresh::Residency,
+            ProcRefresh::HostMemory,
             &Default::default(),
             1,
         ));

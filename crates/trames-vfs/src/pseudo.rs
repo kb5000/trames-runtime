@@ -2866,6 +2866,23 @@ mod proc_probe_tests {
             ProcRefresh::for_path(b"/proc/1/statm"),
             ProcRefresh::Residency
         );
+        let global = ProcRefresh::for_path(b"/proc/meminfo");
+        assert_eq!(global, ProcRefresh::HostMemory);
+        assert!(global.residency() && global.host_memory());
+        assert!(!global.lookup().host_memory());
+        for path in [
+            b"/proc/1/status".as_slice(),
+            b"/proc/1/stat",
+            b"/proc/1/statm",
+            b"/proc/1/smaps",
+            b"/proc/1/smaps_rollup",
+        ] {
+            let task = ProcRefresh::for_path(path);
+            assert!(task.residency());
+            assert!(!task.host_memory());
+            assert!(!task.merge(ProcRefresh::Descriptors).host_memory());
+            assert!(task.merge(global).host_memory());
+        }
         assert_eq!(
             ProcRefresh::for_path(b"/proc/sys/fs/file-nr"),
             ProcRefresh::Descriptors

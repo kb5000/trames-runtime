@@ -262,7 +262,7 @@ impl trames_vfs::IoWake for Source {
 }
 impl ProcSource for Source {
     fn available(&self, demand: ProcRefresh) -> bool {
-        !demand.residency() || !self.limits.is_host_managed() || self.host.is_some()
+        !demand.host_memory() || !self.limits.is_host_managed() || self.host.is_some()
     }
     fn task(&self, pid: u32) -> Option<Arc<dyn ProcTask>> {
         self.directory.proc_identity(pid)
@@ -277,6 +277,24 @@ impl ProcSource for Source {
             retained,
             content,
         } = query;
+        // This body consumes only global memory fields. Host-managed memory
+        // already has their original provider; no task directory, per-mm pager,
+        // process projection or CPU/load sample is a dependency of meminfo.
+        // Lookup demand excludes HostMemory, so metadata does not sample it.
+        if path == b"/proc/meminfo"
+            && demand == ProcRefresh::HostMemory
+            && self.limits.is_host_managed()
+        {
+            let memory = self
+                .limits
+                .reported(0, self.host.as_ref().map(|host| host()));
+            return RuntimeInfo {
+                memory_limit: memory.total,
+                available_memory: Some(memory.available),
+                used_memory: memory.total.saturating_sub(memory.free),
+                ..Default::default()
+            };
+        }
         let target = Self::target(path, namespace);
         let aggregate = (path == b"/proc" && enumerate)
             || matches!(path, b"/proc/stat" | b"/proc/loadavg")
@@ -362,7 +380,7 @@ impl ProcSource for Source {
             }
         }
         let used = resident.values().copied().sum();
-        let host = if demand.residency() {
+        let host = if demand.host_memory() && self.limits.is_host_managed() {
             self.host.as_ref().map(|host| host())
         } else {
             None

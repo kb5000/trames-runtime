@@ -611,11 +611,13 @@ impl ProcRefresh {
     pub const Arguments: Self = Self(1 | 1 << 4);
     pub const Descriptors: Self = Self(1 | 1 << 5);
     pub const Residency: Self = Self(1 | 1 << 6);
+    /// Global host/quota accounting, distinct from an original task's RSS.
+    pub const HostMemory: Self = Self(1 | 1 << 6 | 1 << 11);
     pub const Paths: Self = Self(1 | 1 << 7);
     pub const Namespaces: Self = Self(1 | 1 << 8);
     pub const Directories: Self = Self(1 | 1 << 10);
     const Content: Self = Self(1 << 9);
-    pub const Full: Self = Self((1 << 11) - 1);
+    pub const Full: Self = Self((1 << 12) - 1);
 
     fn includes(self, fields: Self) -> bool {
         self.0 & fields.0 == fields.0
@@ -679,16 +681,18 @@ impl ProcRefresh {
         {
             return Self::Metadata;
         }
-        if path == b"/proc/meminfo"
-            || [
-                b"/stat".as_slice(),
-                b"/statm",
-                b"/status",
-                b"/smaps",
-                b"/smaps_rollup",
-            ]
-            .iter()
-            .any(|tail| path.ends_with(tail))
+        if path == b"/proc/meminfo" {
+            return Self::HostMemory;
+        }
+        if [
+            b"/stat".as_slice(),
+            b"/statm",
+            b"/status",
+            b"/smaps",
+            b"/smaps_rollup",
+        ]
+        .iter()
+        .any(|tail| path.ends_with(tail))
         {
             return Self::Residency;
         }
@@ -719,6 +723,9 @@ impl ProcRefresh {
     }
     pub fn residency(self) -> bool {
         self.includes(Self::Residency)
+    }
+    pub fn host_memory(self) -> bool {
+        self.includes(Self::HostMemory)
     }
     pub fn paths(self) -> bool {
         self.includes(Self::Paths)
