@@ -148,6 +148,7 @@ impl<C: Cpu> Lifecycle<C> {
                 Ok(None) => unreachable!("image admission waits before effects"),
                 Err(error) => {
                     p.cpu.set_x(0, super::super::error(error));
+                    job.work.trace.record(p.cpu.x(0));
                     p.signals.begin_io();
                     job.work.cpu = std::mem::take(&mut p.cpu);
                     control.finish(job.stop_hold());
@@ -179,6 +180,8 @@ impl<C: Cpu> Lifecycle<C> {
             };
             let old_ids = identity(p);
             let old_memory = Kernel::install_exec(p, image, self.birth.started);
+            job.work.trace.replaced();
+            p.trace = std::mem::take(&mut job.work.trace);
             if identity(p) != old_ids {
                 p.parentage.set_death_signal(0);
             }

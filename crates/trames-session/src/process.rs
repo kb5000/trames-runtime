@@ -155,6 +155,7 @@ pub(crate) struct Process<C: Cpu> {
     oom: Arc<trames_vfs::OomTask>,
     seccomp: seccomp::Seccomp,
     seccomp_entry: Option<seccomp::EntryDecision>,
+    trace: crate::syscall_trace::Trace,
 }
 impl<C: Cpu> Process<C> {
     fn stopped(&self) -> bool {
@@ -186,21 +187,20 @@ impl<C: Cpu> Process<C> {
                 .is_some_and(|f| !f.interruptible())
     }
     fn control_candidate(&self, id: u32) -> bool {
-        !self.linux.trace
-            && (matches!(
-                self.state,
-                State::Ready
-                    | State::Futex { .. }
-                    | State::Sleep(..)
-                    | State::Sigwait { .. }
-                    | State::Suspend(_)
-                    | State::Completion(_)
-                    | State::Namespace(_)
-                    | State::Policy(_)
-                    | State::Barrier(_)
-                    | State::Blocked(95 | 260, _)
-            ) || self.worker_io_candidate(id)
-                || self.worker_gpu_candidate())
+        matches!(
+            self.state,
+            State::Ready
+                | State::Futex { .. }
+                | State::Sleep(..)
+                | State::Sigwait { .. }
+                | State::Suspend(_)
+                | State::Completion(_)
+                | State::Namespace(_)
+                | State::Policy(_)
+                | State::Barrier(_)
+                | State::Blocked(95 | 260, _)
+        ) || self.worker_io_candidate(id)
+            || self.worker_gpu_candidate()
     }
     fn publish_stop_hold(&self, id: u32) {
         self.signals.io.lifecycle().register(&self.signals.io, id);
@@ -322,7 +322,7 @@ impl<C: Cpu> Process<C> {
             self.state,
             State::Namespace(_) | State::Policy(_) | State::Barrier(_)
         ) {
-            return !self.linux.trace;
+            return true;
         }
         if !matches!(self.state, State::Blocked(..)) {
             return false;
@@ -331,12 +331,12 @@ impl<C: Cpu> Process<C> {
             return false;
         }
         if self.retained_file.is_some() || self.retained_aio.is_some() {
-            return !self.linux.trace;
+            return true;
         }
         if let Some(poll) = &self.retained_poll {
             // This original wait has already passed its entry policy. A
             // cohort handoff must not turn an admitted wait into a new SVC.
-            return !self.linux.trace && poll.supports_worker(&self.linux.vfs);
+            return poll.supports_worker(&self.linux.vfs);
         }
         if self.retained_socket.is_some()
             || self
@@ -344,7 +344,7 @@ impl<C: Cpu> Process<C> {
                 .as_ref()
                 .is_some_and(|w| w.retained_socket.is_some())
         {
-            return !self.linux.trace;
+            return true;
         }
         if self.retained_byte.is_some() || self.byte_wait.is_some() {
             if self
@@ -357,19 +357,18 @@ impl<C: Cpu> Process<C> {
                 })
                 .is_some_and(|file| file.local_message_entry().is_some() || file.is_pty())
             {
-                return !self.linux.trace;
+                return true;
             }
-            return !self.linux.trace && self.seccomp.mode() == 0;
+            return self.seccomp.mode() == 0;
         }
         if matches!(self.state, State::Blocked(116, a) if a[0] as u32 == 2) {
-            return !self.linux.trace && self.seccomp.mode() == 0;
+            return self.seccomp.mode() == 0;
         }
         if matches!(self.state, State::Blocked(32, _)) {
-            return !self.linux.trace && self.seccomp.mode() == 0 && self.flock_wait.is_some();
+            return self.seccomp.mode() == 0 && self.flock_wait.is_some();
         }
         if let State::Blocked(426, a) = self.state {
-            return !self.linux.trace
-                && self.seccomp.mode() == 0
+            return self.seccomp.mode() == 0
                 && a[3] & !9 == 0
                 && self
                     .uring_wait
@@ -377,8 +376,7 @@ impl<C: Cpu> Process<C> {
                     .is_some_and(|(_, ring, _)| trames_linux::UringEpoch::can_adopt(ring));
         }
         if let State::Blocked(number @ (22 | 73 | 441), args) = self.state {
-            if !self.linux.trace
-                && self.seccomp.mode() == 0
+            if self.seccomp.mode() == 0
                 && trames_linux::UringEpoch::poll_rings(
                     &self.linux.vfs,
                     number,
@@ -398,7 +396,7 @@ impl<C: Cpu> Process<C> {
         else {
             return false;
         };
-        if self.linux.trace || self.seccomp.mode() != 0 {
+        if self.seccomp.mode() != 0 {
             return false;
         }
         // Most retained waits are poll/epoll, pipes or Unix sockets. Their
@@ -497,6 +495,7 @@ impl<C: Cpu> Process<C> {
         let mut signals = self.signals.fork(shared_actions);
         signals.presence = presence;
         Box::new(Self {
+            trace: Default::default(),
             cpu: self.cpu.fork_cpu(shared_vm),
             last_cpu: self.last_cpu,
             memory,
@@ -1764,10 +1763,12 @@ impl<C: Cpu> Kernel<C> {
                             | 269
                     )
                 {
+                    p.trace.restart();
                     put_args(&mut p.cpu, a);
                     p.cpu.set_pc(p.cpu.pc().wrapping_sub(4));
                 } else {
                     p.cpu.set_x(0, error(Errno(4)));
+                    p.trace.record(p.cpu.x(0));
                 }
             }
             State::Sleep(deadline, remaining) => {
@@ -1779,17 +1780,21 @@ impl<C: Cpu> Kernel<C> {
                     let _ = write_u64(&mut p.memory, remaining + 8, (ns % 1_000_000_000) as u64);
                 }
                 p.cpu.set_x(0, error(Errno(4)));
+                p.trace.record(p.cpu.x(0));
             }
             State::Suspend(old) => {
                 p.signals.wait_mask = Some(old);
                 p.cpu.set_x(0, error(Errno(4)));
+                p.trace.record(p.cpu.x(0));
             }
             State::Futex { wait, .. } => {
                 wait.cancel();
                 p.cpu.set_x(0, error(Errno(4)));
+                p.trace.record(p.cpu.x(0));
             }
             State::Sigwait { .. } => {
                 p.cpu.set_x(0, error(Errno(4)));
+                p.trace.record(p.cpu.x(0));
             }
             _ => {}
         }
@@ -2037,7 +2042,7 @@ impl<C: Cpu> Kernel<C> {
             178 => Ok(Some(p.linux.vfs.visible_pid(pid) as u64)),
             173 => Ok(Some(p.linux.vfs.visible_pid(p.family.parent()) as u64)),
             96 => {
-                p.linux.dispatch(&mut p.cpu, &mut p.memory, io);
+                p.linux.dispatch_untraced(&mut p.cpu, &mut p.memory, io);
                 Ok(Some(p.linux.vfs.visible_pid(pid) as u64))
             },
             220 => {
@@ -2278,10 +2283,7 @@ impl<C: Cpu> Kernel<C> {
                         }
                     }
                 }
-                let trace = p.linux.trace;
-                p.linux.trace = false;
-                let outcome = p.linux.dispatch(&mut p.cpu, &mut p.memory, io);
-                p.linux.trace = trace;
+                let outcome = p.linux.dispatch_untraced(&mut p.cpu, &mut p.memory, io);
                 if let SyscallOutcome::Exit(code) = outcome {
                     self.exit(pid, p, (code as i32) << 8);
                     return Ok(None);
@@ -2378,10 +2380,20 @@ impl<C: Cpu> Kernel<C> {
         }) {
             return;
         }
+        p.trace.enable(p.linux.trace);
+        p.trace.begin(pid, number, a);
         let began = self.profile_syscalls.then(Instant::now);
         self.syscalls += 1;
         if !matches!(p.state, State::Blocked(..)) && self.filter_syscall(pid, p, number, a) {
             p.tcp_liveness = None;
+            if matches!(p.state, State::Zombie(_))
+                || p.signals.io.lifecycle().termination().is_some()
+            {
+                p.trace.replaced();
+            } else {
+                p.trace.record(p.cpu.x(0));
+            }
+            p.trace.flush();
             return;
         }
         p.linux.vfs.set_process_context(pid);
@@ -2490,7 +2502,6 @@ impl<C: Cpu> Kernel<C> {
                 );
             }
         }
-        let was_blocked = matches!(p.state, State::Blocked(..));
         p.cpu.set_x(8, number as u64);
         put_args(&mut p.cpu, a);
         let ids = |c: &trames_vfs::Credentials| {
@@ -2631,7 +2642,7 @@ impl<C: Cpu> Kernel<C> {
                     None,
                 )
             }
-        } else if !p.linux.trace && matches!(number, 200 | 202 | 203 | 242) {
+        } else if matches!(number, 200 | 202 | 203 | 242) {
             trames_linux::DirectSyscalls::default()
                 .with_resources(p.linux.vfs.descriptor_factory())
                 .start_owned_socket_control(
@@ -2641,7 +2652,7 @@ impl<C: Cpu> Kernel<C> {
                     pid,
                     &Arc::downgrade(&self.byte_target),
                 )
-        } else if !p.linux.trace && matches!(number, 206 | 207 | 211 | 212) {
+        } else if matches!(number, 206 | 207 | 211 | 212) {
             trames_linux::DirectSyscalls::default()
                 .with_resources(p.linux.vfs.descriptor_factory())
                 .with_local_identity([
@@ -2856,18 +2867,14 @@ impl<C: Cpu> Kernel<C> {
                 Self::queue_one(target, &mut task, 9, 0);
             }
         }
-        if p.linux.trace && !(raw.is_none() && matches!(p.state, State::Blocked(..)) && was_blocked)
-        {
-            eprintln!(
-                "trames pid {pid} syscall {number}({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}) = {}",
-                a[0],
-                a[1],
-                a[2],
-                a[3],
-                a[4],
-                a[5],
-                raw.map_or_else(|| "suspended/replaced".into(), |v| (v as i64).to_string())
-            );
+        if let Some(value) = raw {
+            p.trace.record(value);
+            p.trace.flush();
+        } else if matches!(p.state, State::Ready | State::Zombie(_)) {
+            p.trace.replaced();
+            p.trace.flush();
+        } else {
+            p.trace.suspend();
         }
         if let Some(began) = began {
             self.syscall_total += began.elapsed();
@@ -3262,26 +3269,27 @@ impl<C: Cpu> Kernel<C> {
         }
     }
     fn parallel_candidate(&self, host_events: bool) -> bool {
-        if self.processes.iter().any(|(id, p)| {
-            !p.frozen(id)
-                && !p.linux.trace
-                && matches!(p.state, State::Policy(_) | State::Barrier(_))
-        }) {
+        if self
+            .processes
+            .iter()
+            .any(|(id, p)| !p.frozen(id) && matches!(p.state, State::Policy(_) | State::Barrier(_)))
+        {
             return true;
         }
         if self
             .processes
             .iter()
-            .any(|(id, p)| !p.frozen(id) && !p.linux.trace && p.linux.worker_uring_pending())
+            .any(|(id, p)| !p.frozen(id) && p.linux.worker_uring_pending())
         {
             let runnable = self
                 .processes
                 .iter()
                 .any(|(id, p)| !p.frozen(id) && (p.runnable() || p.worker_gpu_candidate()));
             if runnable
-                || self.processes.iter().any(|(id, p)| {
-                    !p.frozen(id) && !p.linux.trace && p.linux.worker_uring_event(&p.memory, id)
-                })
+                || self
+                    .processes
+                    .iter()
+                    .any(|(id, p)| !p.frozen(id) && p.linux.worker_uring_event(&p.memory, id))
             {
                 return true;
             }
@@ -3344,11 +3352,9 @@ impl<C: Cpu> Kernel<C> {
                     || matches!(&p.state, State::Completion(release)
                         if first.vfork.as_ref().is_some_and(|producer| Arc::ptr_eq(producer, release)))
                     || matches!(p.state, State::Blocked(95 | 260, _))
-                        && !p.linux.trace
                         && first.family.parent() == p.tgid
                     || matches!(p.state, State::Futex { .. }) && p.vm_id == first.vm_id
                     || matches!(p.state, State::Sigwait { .. } | State::Suspend(_))
-                        && !p.linux.trace
                     || p.worker_io_candidate(other)
                         && (p
                             .flock_wait
@@ -3422,15 +3428,14 @@ impl<C: Cpu> Kernel<C> {
                         }
                         _ => false,
                     };
-                if p.linux.uring_requires_owner()
-                    || !local_ring && (p.linux.trace || !p.linux.worker_uring_pending())
+                if p.linux.uring_requires_owner() || !local_ring && !p.linux.worker_uring_pending()
                 {
                     {
                         let task = &mut *p;
                         task.linux.progress_uring(&mut task.memory, id)
                     };
                 }
-                if p.linux.trace || !matches!(p.state, State::Policy(_) | State::Barrier(_)) {
+                if !matches!(p.state, State::Policy(_) | State::Barrier(_)) {
                     self.resume_event(&mut p);
                 }
                 if self.deliver(id, &mut p).is_err() {
@@ -3442,7 +3447,7 @@ impl<C: Cpu> Kernel<C> {
                     State::Blocked(..) if p.stopped() && !p.stop_held() => {}
                     State::Blocked(..)
                         if p.worker_io_candidate(id)
-                            || !p.linux.trace && matches!(p.state, State::Blocked(95 | 260, _)) =>
+                            || matches!(p.state, State::Blocked(95 | 260, _)) =>
                     {
                         // The worker owns the retry; do not perform byte I/O in
                         // the coordinator before preparing its execution View.
@@ -3451,6 +3456,7 @@ impl<C: Cpu> Kernel<C> {
                     State::Sleep(deadline, _) if Instant::now() >= deadline => {
                         p.state = State::Ready;
                         p.cpu.set_x(0, 0);
+                        p.trace.record(0);
                     }
                     _ => {}
                 }
@@ -3480,14 +3486,11 @@ impl<C: Cpu> Kernel<C> {
                 return None;
             }
             ((p.stopped() && p.control_candidate(id))
-                || (!p.linux.trace
-                    && p.linux.worker_uring_pending()
+                || (p.linux.worker_uring_pending()
                     && !matches!(p.state, State::Ready | State::Zombie(_))
                     && !p.worker_gpu_candidate())
                 || (matches!(p.state, State::Futex { .. }) && vms.contains(&p.vm_id))
-                || (matches!(p.state, State::Sleep(..))
-                    && !p.linux.trace
-                    && vms.contains(&p.vm_id))
+                || (matches!(p.state, State::Sleep(..)) && vms.contains(&p.vm_id))
                 || (matches!(
                     p.state,
                     State::Sigwait { .. }
@@ -3497,7 +3500,7 @@ impl<C: Cpu> Kernel<C> {
                         | State::Namespace(_)
                         | State::Policy(_)
                         | State::Barrier(_)
-                ) && !p.linux.trace)
+                ))
                 || p.worker_io_candidate(id))
             .then_some((id, 0))
         }));
@@ -3787,6 +3790,7 @@ impl<C: Cpu> Kernel<C> {
                             .expect("dispatched process")
                     });
                 task.cpu = done.cpu;
+                task.trace = done.trace;
             }
             return Err(RuntimeError::Arguments("CPU worker panicked"));
         }
@@ -3921,6 +3925,7 @@ impl<C: Cpu> Kernel<C> {
         }
         p.linux.vfs.sync_task_namespaces();
         p.cpu = std::mem::take(&mut done.cpu);
+        p.trace = std::mem::take(&mut done.trace);
         p.signals.finish_io();
         if let Some(entry) = done.seccomp_entry.take() {
             p.seccomp_entry = Some(entry);
@@ -4139,7 +4144,7 @@ impl<C: Cpu> Kernel<C> {
                 timeout = timeout.min(d.saturating_duration_since(now));
             }
             if let State::Sleep(d, _) = p.state {
-                let retained = !p.linux.trace && worker_vms.contains(&p.vm_id);
+                let retained = worker_vms.contains(&p.vm_id);
                 if !retained {
                     timeout = timeout.min(d.saturating_duration_since(now));
                 }
@@ -4237,6 +4242,7 @@ impl<C: Cpu> Kernel<C> {
                         State::Sleep(deadline, _) if Instant::now() >= deadline => {
                             p.state = State::Ready;
                             p.cpu.set_x(0, 0);
+                            p.trace.record(0);
                             progress = true;
                         }
                         _ => {}
@@ -4301,6 +4307,7 @@ impl<C: Cpu> Kernel<C> {
                         );
                         let outcome = {
                             let p = &mut *p;
+                            p.trace.flush();
                             p.cpu.run_coordinated(
                                 &mut self.engine,
                                 &mut p.memory,
@@ -4631,6 +4638,7 @@ pub(super) fn run<C: Cpu>(
             .into_presence(),
     );
     let mut root = Process::<C> {
+        trace: Default::default(),
         cpu: std::mem::take(&mut runtime.cpu),
         last_cpu: 0,
         memory: std::mem::take(&mut runtime.memory),
@@ -5224,7 +5232,10 @@ mod tests {
         k.processes.insert(2, receiver);
         assert!(k.parallel_candidate(false));
         k.processes.get_mut(&2).unwrap().linux.trace = true;
-        assert!(!k.parallel_candidate(false));
+        assert!(
+            k.parallel_candidate(false),
+            "logging cannot exclude the connected receiver"
+        );
         k.processes.get_mut(&2).unwrap().state = State::Ready;
         assert!(k.parallel_candidate(false));
     }
@@ -6281,6 +6292,7 @@ mod tests {
         let linux = Linux::new(0xa000);
         let limits = trames_kernel::limits::Limits::new(&linux.vfs);
         let process = Box::new(Process {
+            trace: Default::default(),
             cpu: Cpu::new(0x4000, 0x9000),
             last_cpu: 0,
             memory,
@@ -7815,6 +7827,8 @@ mod tests {
             State::Sleep(Instant::now() + Duration::from_millis(1), 0);
         assert_eq!(k.parallel_timeout(), Duration::from_millis(10));
         k.processes.get_mut(&1).unwrap().linux.trace = true;
+        assert_eq!(k.parallel_timeout(), Duration::from_millis(10));
+        k.processes.get_mut(&1).unwrap().vm_id = 999;
         assert!(k.parallel_timeout() <= Duration::from_millis(1));
     }
     #[test]
@@ -9215,7 +9229,10 @@ mod boundary_tests {
         p.uring_wait = Some((0, ring, None));
         assert!(p.worker_io_candidate(1));
         p.linux.trace = true;
-        assert!(!p.worker_io_candidate(1));
+        assert!(
+            p.worker_io_candidate(1),
+            "logging preserves the original ring admission"
+        );
         p.linux.trace = false;
         p.uring_wait.as_mut().unwrap().2 = Some(Instant::now());
         assert!(p.worker_io_candidate(1));

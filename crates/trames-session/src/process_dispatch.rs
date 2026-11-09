@@ -154,16 +154,10 @@ impl Dispatch {
         }
         let namespaces = p.linux.vfs.task_namespaces();
         let c = &p.linux.vfs.credentials;
-        let direct_files = if !p.linux.trace {
-            file_epoch.capture(&p.linux.vfs, true)
-        } else {
-            Default::default()
-        };
-        let retained_files = if !p.linux.trace {
-            file_epoch.capture_uring_rings(&p.linux.vfs, true, p.linux.uring_rings())
-        } else {
-            Default::default()
-        };
+        let direct_files = file_epoch.capture(&p.linux.vfs, true);
+        let retained_files =
+            file_epoch.capture_uring_rings(&p.linux.vfs, true, p.linux.uring_rings());
+        p.trace.enable(p.linux.trace);
         let work = crate::workers::Work::<C> {
             task: Some(task),
             gpu,
@@ -172,8 +166,8 @@ impl Dispatch {
             cpu: std::mem::take(&mut p.cpu),
             memory: view.into(),
             control: control.clone(),
+            trace: std::mem::take(&mut p.trace),
             syscalls: Some(crate::worker_syscalls::Snapshot {
-                owner_syscalls: p.linux.trace,
                 diagnostics: Some(p.linux.syscall_diagnostics(id)),
                 membarrier_registered: Some(p.membarrier_registered.clone()),
                 vfork_release: p.vfork.clone(),

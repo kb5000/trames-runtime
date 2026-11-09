@@ -134,7 +134,7 @@ impl<C: Cpu> Kernel<C> {
                 let pid = job.work.pid;
                 let mut p = self.processes.checkout(&pid).expect("paused task");
                 p.linux.vfs.sync_task_namespaces();
-                assert!(!p.linux.trace);
+
                 p.cpu = std::mem::take(&mut job.work.cpu);
                 let control = p.signals.io.lifecycle().enter(&p.signals.io, pid);
                 p.state = State::Ready;
@@ -161,7 +161,9 @@ impl<C: Cpu> Kernel<C> {
                     p.signals.finish_io();
                     let a = args(&p.cpu);
                     let call_began = Instant::now();
+                    p.trace = std::mem::take(&mut job.work.trace);
                     self.call(pid, &mut p, 220, a, io);
+                    job.work.trace = std::mem::take(&mut p.trace);
                     self.vm_checkpoint_time[3] += call_began.elapsed();
                     let value = p.cpu.x(0);
                     if value != 0 && value <= i32::MAX as u64 {
@@ -211,7 +213,9 @@ impl<C: Cpu> Kernel<C> {
                     };
                     self.vm_checkpoint_calls[kind] += 1;
                     let call_began = Instant::now();
+                    p.trace = std::mem::take(&mut job.work.trace);
                     self.call(pid, &mut p, number, args, io);
+                    job.work.trace = std::mem::take(&mut p.trace);
                     self.vm_checkpoint_time[3] += call_began.elapsed();
                     assert!(matches!(p.state, State::Ready), "mapping call cannot park");
                     self.vm_local_syscalls += 1;
@@ -672,7 +676,7 @@ mod tests {
             .unwrap();
         let mut peer = k.processes.get_mut(&3).unwrap();
         peer.state = State::Suspend(0);
-        peer.linux.trace = true; // real owner outside the admitted cohort
+        peer.linux.trace = true; // manually excluded original task, with diagnostics enabled
         drop(peer);
         k.processes.insert(2, child);
         assert!(k.parallel_epoch(&mut output, 100000000, false).unwrap());
@@ -1100,9 +1104,10 @@ mod tests {
             (true, 0xff00, false, false),
             (true, 283, false, false),
             (true, 278, false, false),
-            (true, 278, true, true),
+            (true, 278, false, true),
             (true, 179, true, false),
-            (true, 0xff00, true, true),
+            (true, 179, true, true),
+            (true, 0xff00, false, true),
         ] {
             let mut k = super::super::tests::kernel();
             k.cpu_count = 2;

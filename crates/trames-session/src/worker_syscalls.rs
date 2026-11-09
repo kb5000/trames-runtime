@@ -81,7 +81,6 @@ impl ExitResources<'_> {
 }
 
 pub(super) struct Snapshot {
-    pub owner_syscalls: bool,
     pub diagnostics: Option<trames_linux::SyscallDiagnostics>,
     pub membarrier_registered: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub vfork_release: Option<Arc<trames_kernel::vfork::Release>>,
@@ -1141,7 +1140,6 @@ mod tests {
             .wait((0, 8, 0x1000), 3, 2, || Ok::<_, ()>(()))
             .unwrap();
         let snapshot = Snapshot {
-            owner_syscalls: false,
             diagnostics: None,
             membarrier_registered: None,
             vfork_release: None,
@@ -1281,7 +1279,6 @@ mod tests {
         let mut memory = Memory::default();
         memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         let snapshot = Snapshot {
-            owner_syscalls: false,
             diagnostics: None,
             membarrier_registered: None,
             vfork_release: None,
@@ -1348,7 +1345,6 @@ mod tests {
             .pipe(trames_vfs::O_CLOEXEC | trames_vfs::O_NONBLOCK)
             .unwrap();
         let mut snapshot = Snapshot {
-            owner_syscalls: false,
             diagnostics: None,
             membarrier_registered: None,
             vfork_release: None,
@@ -1458,7 +1454,6 @@ mod tests {
             .open_at(trames_vfs::AT_FDCWD, b"/", trames_vfs::O_PATH, 0)
             .unwrap();
         let snapshot = Snapshot {
-            owner_syscalls: false,
             diagnostics: None,
             membarrier_registered: None,
             vfork_release: None,
@@ -1533,7 +1528,6 @@ mod tests {
         memory.write_array(0x1ff8, [0x5a; 8]).unwrap();
         memory.protect(0x2000, PAGE_SIZE, Permissions::R).unwrap();
         let snapshot = Snapshot {
-            owner_syscalls: false,
             diagnostics: None,
             membarrier_registered: None,
             vfork_release: None,

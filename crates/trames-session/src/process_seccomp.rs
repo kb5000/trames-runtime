@@ -2188,7 +2188,6 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5000d })]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
-                owner_syscalls: false,
                 diagnostics: None,
                 membarrier_registered: None,
                 vfork_release: None,
@@ -2238,117 +2237,124 @@ mod tests {
 
     #[test]
     fn complete_socket_controls_use_workers_and_one_filter_decision() {
-        for virtual_socket in [false, true] {
-            for number in [200u32, 201, 202, 203, 204, 205, 208, 209, 210, 242] {
-                for decision in [None, Some(ALLOW), Some(0x5007b)] {
-                    let mut p = super::super::tests::process();
-                    if virtual_socket {
-                        p.linux
-                            .vfs
-                            .configure_local_fabric(trames_vfs::NetworkMode::Loopback)
-                            .unwrap();
-                    } else {
-                        p.linux
-                            .vfs
-                            .configure_network(trames_vfs::NetworkMode::Loopback)
-                            .unwrap();
-                    }
-                    let fd = p
-                        .linux
-                        .vfs
-                        .socket(2, 1 | trames_vfs::O_NONBLOCK, 0)
-                        .unwrap();
-                    let socket = p.linux.vfs.socket_fd(fd).unwrap();
-                    let mut endpoint = "127.0.0.1:0".parse().unwrap();
-                    if matches!(number, 201 | 202 | 242) {
-                        socket.bind(endpoint).unwrap();
-                        if number != 201 {
-                            socket.listen(4).unwrap();
+        for traced in [false, true] {
+            for virtual_socket in [false, true] {
+                for number in [200u32, 201, 202, 203, 204, 205, 208, 209, 210, 242] {
+                    for decision in [None, Some(ALLOW), Some(0x5007b)] {
+                        let mut p = super::super::tests::process();
+                        p.linux.trace = traced;
+                        if virtual_socket {
+                            p.linux
+                                .vfs
+                                .configure_local_fabric(trames_vfs::NetworkMode::Loopback)
+                                .unwrap();
+                        } else {
+                            p.linux
+                                .vfs
+                                .configure_network(trames_vfs::NetworkMode::Loopback)
+                                .unwrap();
                         }
-                    }
-                    let _listener = if number == 203 {
-                        let listener = p
+                        let fd = p
                             .linux
                             .vfs
                             .socket(2, 1 | trames_vfs::O_NONBLOCK, 0)
                             .unwrap();
-                        let socket = p.linux.vfs.socket_fd(listener).unwrap();
-                        socket.bind(endpoint).unwrap();
-                        socket.listen(4).unwrap();
-                        endpoint = socket.local_addr().unwrap();
-                        Some(socket)
-                    } else {
-                        None
-                    };
-                    p.memory
-                        .write(0x1000, &trames_net::encode_address(endpoint))
-                        .unwrap();
-                    p.memory.write(0x1100, &1u32.to_le_bytes()).unwrap();
-                    p.memory.write(0x1200, &16u32.to_le_bytes()).unwrap();
-                    let args = match number {
-                        200 | 203 => [fd, 0x1000, 16, 0, 0, 0],
-                        201 => [fd, 4, 0, 0, 0, 0],
-                        202 | 242 => [fd, 0, 0, 0, 0, 0],
-                        204 | 205 => [fd, 0x1300, 0x1200, 0, 0, 0],
-                        208 => [fd, 6, 1, 0x1100, 4, 0],
-                        209 => [fd, 6, 1, 0x1100, 0x1200, 0],
-                        _ => [fd, 2, 0, 0, 0, 0],
-                    };
-                    let mov = |rd: u32, value: u32| 0xd2800000u32 | (value << 5) | rd;
-                    let mut code: Vec<_> = args
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, a)| mov(i as u32, a))
-                        .collect();
-                    code.extend([mov(8, number), 0xd4000001]);
-                    code.push(0x14000000 | ((-(code.len() as i32) as u32) & 0x03ffffff));
-                    for (i, word) in code.into_iter().enumerate() {
+                        let socket = p.linux.vfs.socket_fd(fd).unwrap();
+                        let mut endpoint = "127.0.0.1:0".parse().unwrap();
+                        if matches!(number, 201 | 202 | 242) {
+                            socket.bind(endpoint).unwrap();
+                            if number != 201 {
+                                socket.listen(4).unwrap();
+                            }
+                        }
+                        let _listener = if number == 203 {
+                            let listener = p
+                                .linux
+                                .vfs
+                                .socket(2, 1 | trames_vfs::O_NONBLOCK, 0)
+                                .unwrap();
+                            let socket = p.linux.vfs.socket_fd(listener).unwrap();
+                            socket.bind(endpoint).unwrap();
+                            socket.listen(4).unwrap();
+                            endpoint = socket.local_addr().unwrap();
+                            Some(socket)
+                        } else {
+                            None
+                        };
                         p.memory
-                            .write_array(0x4000 + i as u64 * 4, word.to_le_bytes())
+                            .write(0x1000, &trames_net::encode_address(endpoint))
                             .unwrap();
-                    }
-                    p.memory
-                        .protect(
-                            0x4000,
-                            trames_memory::PAGE_SIZE,
-                            trames_memory::Permissions::RX,
-                        )
-                        .unwrap();
-                    p.cpu = Cpu::new(0x4000, 0);
-                    p.signals.io.scheduling.set_affinity(3);
-                    if let Some(decision) = decision {
-                        p.seccomp.push(Arc::new(
-                            Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
-                        ));
-                    }
-                    let peer = p.fork();
-                    peer.family.set_parent(1);
-                    let mut k = super::super::tests::kernel();
-                    k.cpu_count = 2;
-                    k.workers = crate::workers::Pool::new(2);
-                    k.per_cpu = vec![Duration::ZERO; 2];
-                    k.processes.insert(1, p);
-                    k.processes.insert(2, peer);
-                    assert!(k
-                        .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
-                        .unwrap());
-                    if decision.is_some() {
-                        assert_eq!(
-                            k.processes.read(&1).seccomp.evaluations(),
-                            k.syscalls,
-                            "{virtual_socket} {number}"
-                        );
-                    }
-                    if decision != Some(0x5007b) {
-                        assert!(
-                            k.worker_socket_syscalls > 100,
-                            "{virtual_socket} {number}: {}",
-                            k.worker_socket_syscalls
-                        );
-                        assert_eq!(k.service_requests, 0, "{virtual_socket} {number}");
-                        assert!(k.parallel_rounds <= 4, "{virtual_socket} {number}");
-                    } else {
-                        assert_eq!(k.worker_socket_syscalls, 0);
+                        p.memory.write(0x1100, &1u32.to_le_bytes()).unwrap();
+                        p.memory.write(0x1200, &16u32.to_le_bytes()).unwrap();
+                        let args = match number {
+                            200 | 203 => [fd, 0x1000, 16, 0, 0, 0],
+                            201 => [fd, 4, 0, 0, 0, 0],
+                            202 | 242 => [fd, 0, 0, 0, 0, 0],
+                            204 | 205 => [fd, 0x1300, 0x1200, 0, 0, 0],
+                            208 => [fd, 6, 1, 0x1100, 4, 0],
+                            209 => [fd, 6, 1, 0x1100, 0x1200, 0],
+                            _ => [fd, 2, 0, 0, 0, 0],
+                        };
+                        let mov = |rd: u32, value: u32| 0xd2800000u32 | (value << 5) | rd;
+                        let mut code: Vec<_> = args
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, a)| mov(i as u32, a))
+                            .collect();
+                        code.extend([mov(8, number), 0xd4000001]);
+                        code.push(0x14000000 | ((-(code.len() as i32) as u32) & 0x03ffffff));
+                        for (i, word) in code.into_iter().enumerate() {
+                            p.memory
+                                .write_array(0x4000 + i as u64 * 4, word.to_le_bytes())
+                                .unwrap();
+                        }
+                        p.memory
+                            .protect(
+                                0x4000,
+                                trames_memory::PAGE_SIZE,
+                                trames_memory::Permissions::RX,
+                            )
+                            .unwrap();
+                        p.cpu = Cpu::new(0x4000, 0);
+                        p.signals.io.scheduling.set_affinity(3);
+                        if let Some(decision) = decision {
+                            p.seccomp.push(Arc::new(
+                                Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
+                            ));
+                        }
+                        let peer = p.fork();
+                        peer.family.set_parent(1);
+                        let mut k = super::super::tests::kernel();
+                        k.cpu_count = 2;
+                        k.workers = crate::workers::Pool::new(2);
+                        k.per_cpu = vec![Duration::ZERO; 2];
+                        k.processes.insert(1, p);
+                        k.processes.insert(2, peer);
+                        assert!(k
+                            .parallel_epoch(
+                                &mut trames_linux::CapturedOutput::default(),
+                                100_000,
+                                true
+                            )
+                            .unwrap());
+                        if decision.is_some() {
+                            assert_eq!(
+                                k.processes.read(&1).seccomp.evaluations(),
+                                k.syscalls,
+                                "{virtual_socket} {number}"
+                            );
+                        }
+                        if decision != Some(0x5007b) {
+                            assert!(
+                                k.worker_socket_syscalls > 100,
+                                "{virtual_socket} {number}: {}",
+                                k.worker_socket_syscalls
+                            );
+                            assert_eq!(k.service_requests, 0, "{virtual_socket} {number}");
+                            assert!(k.parallel_rounds <= 4, "{virtual_socket} {number}");
+                        } else {
+                            assert_eq!(k.worker_socket_syscalls, 0);
+                        }
                     }
                 }
             }
@@ -2420,7 +2426,6 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
-                owner_syscalls: false,
                 diagnostics: None,
                 membarrier_registered: None,
                 vfork_release: None,
@@ -2529,7 +2534,6 @@ mod tests {
                     Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
                 ));
                 let snapshot = crate::worker_syscalls::Snapshot {
-                    owner_syscalls: false,
                     diagnostics: None,
                     membarrier_registered: None,
                     vfork_release: None,
@@ -2575,6 +2579,7 @@ mod tests {
                             p.memory.parallel_view(&mut Default::default()).unwrap(),
                         )),
                         control,
+                        trace: Default::default(),
                         syscalls: Some(snapshot),
                         gpu: None,
                         audio: None,
@@ -2664,7 +2669,6 @@ mod tests {
                     Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
                 ));
                 let snapshot = crate::worker_syscalls::Snapshot {
-                    owner_syscalls: false,
                     diagnostics: None,
                     membarrier_registered: None,
                     vfork_release: None,
@@ -2707,6 +2711,7 @@ mod tests {
                             p.memory.parallel_view(&mut Default::default()).unwrap(),
                         )),
                         control,
+                        trace: Default::default(),
                         syscalls: Some(snapshot),
                         gpu: None,
                         audio: None,
@@ -2785,7 +2790,6 @@ mod tests {
                     Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
                 ));
                 let snapshot = crate::worker_syscalls::Snapshot {
-                    owner_syscalls: false,
                     diagnostics: None,
                     membarrier_registered: None,
                     vfork_release: None,
@@ -2829,6 +2833,7 @@ mod tests {
                             p.memory.parallel_view(&mut Default::default()).unwrap(),
                         )),
                         control,
+                        trace: Default::default(),
                         syscalls: Some(snapshot),
                     },
                     1,
@@ -2914,7 +2919,6 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
-                owner_syscalls: false,
                 diagnostics: None,
                 membarrier_registered: None,
                 vfork_release: None,
@@ -2956,6 +2960,7 @@ mod tests {
                     p.memory.parallel_view(&mut Default::default()).unwrap(),
                 )),
                 control: Arc::new(crate::workers::Control::new(1000)),
+                trace: Default::default(),
                 syscalls: Some(snapshot),
                 gpu: None,
             };
@@ -3906,7 +3911,6 @@ mod tests {
             .wait((0, 7, 0x1000), 3, 1, || Ok::<_, ()>(()))
             .unwrap();
         let mut snapshot = crate::worker_syscalls::Snapshot {
-            owner_syscalls: false,
             diagnostics: None,
             membarrier_registered: None,
             vfork_release: None,
@@ -4211,7 +4215,6 @@ mod tests {
                         .unwrap(),
                 ));
                 let snapshot = crate::worker_syscalls::Snapshot {
-                    owner_syscalls: false,
                     diagnostics: None,
                     membarrier_registered: None,
                     vfork_release: None,
@@ -4263,7 +4266,6 @@ mod tests {
             ));
             let mut epoch = trames_vfs::FileEpoch::default();
             let snapshot = crate::worker_syscalls::Snapshot {
-                owner_syscalls: false,
                 diagnostics: None,
                 membarrier_registered: None,
                 vfork_release: None,
@@ -4324,7 +4326,6 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5007b })]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
-                owner_syscalls: false,
                 diagnostics: None,
                 membarrier_registered: None,
                 vfork_release: None,
@@ -4378,7 +4379,6 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5007b })]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
-                owner_syscalls: false,
                 diagnostics: None,
                 membarrier_registered: None,
                 vfork_release: None,
@@ -4442,7 +4442,6 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5007b })]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
-                owner_syscalls: false,
                 diagnostics: None,
                 membarrier_registered: None,
                 vfork_release: None,
@@ -4506,7 +4505,6 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5007b })]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
-                owner_syscalls: false,
                 diagnostics: None,
                 membarrier_registered: None,
                 vfork_release: None,
@@ -4572,7 +4570,6 @@ mod tests {
                 Filter::validate(vec![i(6, 0, 0, if allowed { ALLOW } else { 0x5007b })]).unwrap(),
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
-                owner_syscalls: false,
                 diagnostics: None,
                 membarrier_registered: None,
                 vfork_release: None,
@@ -4633,7 +4630,6 @@ mod tests {
                 ));
                 let mut epoch = trames_vfs::FileEpoch::default();
                 let snapshot = crate::worker_syscalls::Snapshot {
-                    owner_syscalls: false,
                     diagnostics: None,
                     membarrier_registered: None,
                     vfork_release: None,

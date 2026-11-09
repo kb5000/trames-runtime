@@ -6,7 +6,6 @@ use trames_cpu::Cpu;
 use trames_memory::{Memory, Permissions, PAGE_SIZE};
 fn snapshot(direct: trames_linux::DirectSyscalls) -> crate::worker_syscalls::Snapshot {
     crate::worker_syscalls::Snapshot {
-        owner_syscalls: false,
         diagnostics: None,
         membarrier_registered: None,
         vfork_release: None,
@@ -145,6 +144,7 @@ fn uring_background_does_not_retire_sleep_futex_or_lifecycle_waits_on_one_cpu_sl
                 cpu,
                 memory: Some(Box::new(source)),
                 control: control.clone(),
+                trace: Default::default(),
                 syscalls: Some(source_snapshot),
             },
             1,
@@ -166,6 +166,7 @@ fn uring_background_does_not_retire_sleep_futex_or_lifecycle_waits_on_one_cpu_sl
                 cpu,
                 memory: Some(Box::new(peer)),
                 control,
+                trace: Default::default(),
                 syscalls: Some(snapshot(direct)),
             },
             1,

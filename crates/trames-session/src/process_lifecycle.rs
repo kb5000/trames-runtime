@@ -81,7 +81,7 @@ pub(crate) fn eligible<'a, C: Cpu>(
         }
         if let Some(outcome) = &job.checkpoint {
             requested = true;
-            if job.work.syscalls.as_ref().is_none_or(|s| s.owner_syscalls) {
+            if job.work.syscalls.is_none() {
                 return false;
             }
             match outcome {
@@ -490,6 +490,9 @@ impl<C: Cpu> Lifecycle<C> {
                     }
                 }
                 Err(error) => p.cpu.set_x(0, super::error(error)),
+            }
+            if !matches!(p.state, State::Completion(_)) {
+                job.work.trace.record(p.cpu.x(0));
             }
             if let State::Completion(release) = &p.state {
                 let wait = crate::run_queue::CompletionWait::new(release.clone());

@@ -131,6 +131,7 @@ impl<C: Cpu> Kernel<C> {
             {
                 p.state = State::Ready;
                 p.cpu.set_x(0, 0);
+                p.trace.record(0);
                 progress = true;
             }
         }
@@ -141,6 +142,7 @@ impl<C: Cpu> Kernel<C> {
         if let State::Barrier(wait) = &p.state {
             if let Some(value) = wait.finish() {
                 p.cpu.set_x(0, value);
+                p.trace.record(p.cpu.x(0));
                 p.state = State::Ready;
                 return true;
             }
@@ -150,6 +152,7 @@ impl<C: Cpu> Kernel<C> {
             if wait.ready() {
                 if let Some(result) = wait.run() {
                     p.cpu.set_x(0, result.unwrap_or_else(error));
+                    p.trace.record(p.cpu.x(0));
                     p.state = State::Ready;
                     return true;
                 }
@@ -165,6 +168,7 @@ impl<C: Cpu> Kernel<C> {
                         .proc_view
                         .replace_resources(p.linux.vfs.proc_resources());
                     p.cpu.set_x(0, result.unwrap_or_else(error));
+                    p.trace.record(p.cpu.x(0));
                     p.state = State::Ready;
                     return true;
                 }
@@ -174,6 +178,7 @@ impl<C: Cpu> Kernel<C> {
 
         if matches!(&p.state, State::Completion(release) if release.finished()) {
             p.state = State::Ready;
+            p.trace.record(p.cpu.x(0));
             return true;
         }
         if p.stopped() {
@@ -183,6 +188,7 @@ impl<C: Cpu> Kernel<C> {
             State::Futex { ref wait, .. } if wait.woken() => {
                 p.state = State::Ready;
                 p.cpu.set_x(0, 0);
+                p.trace.record(p.cpu.x(0));
                 true
             }
             State::Futex {
@@ -191,6 +197,7 @@ impl<C: Cpu> Kernel<C> {
             } if Instant::now() >= d && wait.timeout() => {
                 p.state = State::Ready;
                 p.cpu.set_x(0, error(Errno(110)));
+                p.trace.record(p.cpu.x(0));
                 true
             }
             State::Sigwait {
@@ -207,6 +214,7 @@ impl<C: Cpu> Kernel<C> {
                     wait.check(&p.signals.io, &mut p.memory, p.linux.vfs.pid_namespace())
                 {
                     p.cpu.set_x(0, value.unwrap_or_else(error));
+                    p.trace.record(p.cpu.x(0));
                     p.state = State::Ready;
                     true
                 } else {

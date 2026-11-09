@@ -69,6 +69,7 @@ pub(super) struct Work<C: Cpu> {
     pub memory: Option<Box<View>>,
     pub control: Arc<Control>,
     pub syscalls: Option<crate::worker_syscalls::Snapshot>,
+    pub trace: crate::syscall_trace::Trace,
     pub gpu: Option<crate::gpu::Authority>,
     pub audio: Option<crate::devices::Audio>,
 }
@@ -117,6 +118,7 @@ impl GpuStats {
 pub(super) struct Done<C: Cpu> {
     pub task: Option<crate::process::tasks::Handle<C>>,
     pub thread_exit: Option<i32>,
+    pub trace: crate::syscall_trace::Trace,
     pub fatal_fault: Option<trames_engine::CpuFault>,
     pub exit_groups: Vec<Arc<trames_kernel::task_control::Group>>,
     pub seccomp_entry: Option<crate::process::seccomp::EntryDecision>,
@@ -192,9 +194,7 @@ pub(super) fn native_fault(
     SliceOutcome::Fault(fault)
 }
 fn source_native<C: Cpu>(work: &Work<C>, epoch: Option<&crate::run_queue::Epoch<C>>) -> bool {
-    epoch.is_some_and(|epoch| epoch.local_vm)
-        && work.task.is_some()
-        && work.syscalls.as_ref().is_some_and(|s| !s.owner_syscalls)
+    epoch.is_some_and(|epoch| epoch.local_vm) && work.task.is_some() && work.syscalls.is_some()
 }
 /// Native scopes begin after stub validation; even unwinding releases the count.
 struct NativeScope<'a>(Option<&'a AtomicUsize>);
@@ -544,6 +544,7 @@ impl<C: Cpu> Starter<C> {
                     let Some(mut job) = (if let Some(epoch) = &epoch { epoch.take_with_engine(index, &mut engine) } else { single.take() }) else { break };
                     let domain = job.domain.clone();
                     let work = &mut job.work;
+                    work.trace.flush();
                     let mut parked = None;
                     let mut parked_hardware = None;
                     let mut parked_io = None;
@@ -604,7 +605,7 @@ impl<C: Cpu> Starter<C> {
                                 if let Some(crate::run_queue::WaitState::Signal(wait)) = &job.waiting {
                                     if !snapshot.quiesced() {
                                     if let Some(value) = wait.request.check(&snapshot.io_signals, work.memory.as_deref_mut().expect("signal wait View"), &snapshot.io_routes.namespace) {
-                                        work.cpu.set_x(0, value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
+                                        work.trace.finish(&mut work.cpu, value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
                                         job.waiting = None;
                                         continue;
                                     }
@@ -613,7 +614,7 @@ impl<C: Cpu> Starter<C> {
                                 if let Some(crate::run_queue::WaitState::Child(wait)) = &job.waiting {
                                     if !snapshot.quiesced() {
                                     if let Some(value) = snapshot.children.wait(wait.request, &snapshot.io_routes.namespace, snapshot.io_signals.group(), work.memory.as_deref_mut().expect("child wait View")).transpose() {
-                                        work.cpu.set_x(0, value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
+                                        work.trace.finish(&mut work.cpu, value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
                                         job.waiting = None;
                                         continue;
                                     }
@@ -662,10 +663,11 @@ impl<C: Cpu> Starter<C> {
                                                 }
                                                 if let crate::run_queue::WaitState::Child(wait) = &waiting {
                                                     if action.flags & 0x10000000 != 0 {
+                                                        work.trace.restart();
                                                         for (i, value) in wait.request.args.iter().enumerate() { work.cpu.set_x(i, *value); }
                                                         work.cpu.set_pc(work.cpu.pc().wrapping_sub(4));
-                                                    } else { work.cpu.set_x(0, 0u64.wrapping_sub(4)); }
-                                                } else { work.cpu.set_x(0, 0u64.wrapping_sub(4)); }
+                                                    } else { work.trace.finish(&mut work.cpu, 0u64.wrapping_sub(4)); }
+                                                } else { work.trace.finish(&mut work.cpu, 0u64.wrapping_sub(4)); }
                                             }
                                             let pending = job.io.take().as_ref().map(crate::run_queue::IoCall::from).or_else(|| job.retry.take());
                                             if let Some(pending) = pending {
@@ -674,9 +676,10 @@ impl<C: Cpu> Starter<C> {
                                                     wait.finish(work.memory.as_deref_mut().expect("signal View"),Err(trames_vfs::Errno(4)))
                                                 }else{Err(trames_vfs::Errno(4))};
                                                 if action.flags & 0x10000000 != 0 && matches!(pending.number, 25 | 29 | 32 | 63..=66 | 71 | 76 | 206 | 207 | 211 | 212 | 269) && pending.deadline.is_none() {
+                                                    work.trace.restart();
                                                     for (i, value) in pending.args.iter().enumerate() { work.cpu.set_x(i, *value); }
                                                     work.cpu.set_pc(work.cpu.pc().wrapping_sub(4));
-                                                } else { work.cpu.set_x(0, 0u64.wrapping_sub(interrupted.err().unwrap().0 as u64)); }
+                                                } else { work.trace.finish(&mut work.cpu, 0u64.wrapping_sub(interrupted.err().unwrap().0 as u64)); }
                                             }
                                             if snapshot.enter_io_signal(&mut work.cpu, work.memory.as_deref_mut().expect("signal View"), sig, *info, action).is_err() {
                                                 let _ = snapshot.io_signals.inbox.enqueue(11, trames_kernel::signal::Info::default());
@@ -687,14 +690,15 @@ impl<C: Cpu> Starter<C> {
                                     }
                                 }
                             }
+                            work.trace.flush();
                             if let Some(crate::run_queue::WaitState::Barrier(wait)) = &job.waiting {
-                                if let Some(value) = wait.finish() { work.cpu.set_x(0,value); job.waiting=None; continue; }
+                                if let Some(value) = wait.finish() { work.trace.finish(&mut work.cpu, value); job.waiting=None; continue; }
                                 maintenance=true; break SliceOutcome::Yield { instructions:0 };
                             }
                             if let Some(crate::run_queue::WaitState::Policy(wait)) = &job.waiting {
                                 if wait.ready() {
                                     if let Some(result)=wait.run() {
-                                        work.cpu.set_x(0,result.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));
+                                        work.trace.finish(&mut work.cpu, result.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));
                                         job.waiting=None;continue;
                                     }
                                 }
@@ -704,6 +708,7 @@ impl<C: Cpu> Starter<C> {
                                 if wait.ready() {
                                     if let Some((state, result)) = wait.run() {
                                         work.finish_namespaces(state, result);
+                                        work.trace.record(work.cpu.x(0));
                                         job.waiting = None;
                                         continue;
                                     }
@@ -805,7 +810,7 @@ impl<C: Cpu> Starter<C> {
                                 match result {
                                     trames_linux::IoAttempt::Complete(result) => {
                                         if saved_call.as_ref().is_some_and(|c|trames_linux::event_wait(c.number)) { snapshot.finish_wait_mask(); }
-                                        work.cpu.set_x(0, result.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
+                                        work.trace.finish(&mut work.cpu, result.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
                                         syscalls += 1;
                                         continue;
                                     }
@@ -931,8 +936,9 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                 }
                             }
                             if matches!(result, SliceOutcome::Syscall { .. }) {
+                                work.trace.begin_cpu(work.pid, &work.cpu);
                                 work.cpu.clear_exclusive();
-                                if work.syscalls.as_ref().is_some_and(|s| s.owner_syscalls) { break result; }
+
                                 if let Some(snapshot) = &mut work.syscalls {
                                     let number=work.cpu.x(8) as u32;
                                     let args=std::array::from_fn(|i|work.cpu.x(i));
@@ -943,7 +949,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                     }
                                     if let Some(began)=began {syscall_time+=began.elapsed();}
                                     if let Some(entry)=snapshot.seccomp.denied_entry(number,work.cpu.pc(),args) {
-                                        if let Some(value)=entry.completed() {work.cpu.set_x(0,value);syscalls+=1;continue;}
+                                        if let Some(value)=entry.completed() {work.trace.finish(&mut work.cpu, value);syscalls+=1;continue;}
                                         if epoch.is_none() || snapshot.exit_files.is_none() {job.seccomp_entry=Some(entry);break result;}
                                         syscalls+=1;
                                         if entry.action()==0 {
@@ -969,11 +975,11 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                             let result=crate::barrier::prepare(registered,work.cpu.x(0),work.cpu.x(1));
                                             syscalls+=1;
                                             match result {
-                                                Ok(crate::barrier::Action::Complete(value)) => work.cpu.set_x(0,value),
-                                                Err(error) => work.cpu.set_x(0,0u64.wrapping_sub(error.0 as u64)),
+                                                Ok(crate::barrier::Action::Complete(value)) => work.trace.finish(&mut work.cpu, value),
+                                                Err(error) => work.trace.finish(&mut work.cpu, 0u64.wrapping_sub(error.0 as u64)),
                                                 Ok(crate::barrier::Action::Fence(scope)) => {
                                                     let request=epoch.memory_barrier(domain.id,matches!(scope,crate::barrier::Scope::Global),index);
-                                                    if let Some(value)=request.finish() {work.cpu.set_x(0,value);}
+                                                    if let Some(value)=request.finish() {work.trace.finish(&mut work.cpu, value);}
                                                     else {
                                                         let wait=crate::barrier::Wait::new(request);
                                                         if let Some(signal)=&snapshot.io_wake {wait.bind(signal);}
@@ -995,7 +1001,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                     let snapshot=work.syscalls.as_ref().unwrap();
                                     let entry=snapshot.seccomp.entry_decision(number, work.cpu.pc(), args);
                                     if !entry.allowed() {
-                                        if let Some(value)=entry.completed() {work.cpu.set_x(0,value);syscalls+=1;continue;}
+                                        if let Some(value)=entry.completed() {work.trace.finish(&mut work.cpu, value);syscalls+=1;continue;}
                                         job.seccomp_entry=Some(entry);break result;
                                     }
                                     let began=snapshot.profile.then(Instant::now);
@@ -1003,7 +1009,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                     if let Some(began)=began {syscall_time+=began.elapsed();}
                                     syscalls+=1;
                                     match attempt {
-                                        crate::process::seccomp::Attempt::Complete(value)=>work.cpu.set_x(0,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64))),
+                                        crate::process::seccomp::Attempt::Complete(value)=>work.trace.finish(&mut work.cpu, value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64))),
                                         crate::process::seccomp::Attempt::Waiting(pending)=>{
                                             let wait=crate::run_queue::PolicyWait::new(*pending);
                                             if let Some(wake)=work.syscalls.as_ref().and_then(|s|s.io_wake.as_ref()) {wait.bind(wake);}
@@ -1038,7 +1044,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                     }
                                 }
                                 if !matches!(work.cpu.x(8) as u32, 174..=177)
-                                    && work.syscalls.as_ref().is_some_and(|s| !s.owner_syscalls && s.namespaces.is_some())
+                                    && work.syscalls.as_ref().is_some_and(|s| s.namespaces.is_some())
                                     && trames_linux::credential_entry(work.cpu.x(8) as u32, std::array::from_fn(|i| work.cpu.x(i))) {
                                     let number = work.cpu.x(8) as u32;
                                     let args = std::array::from_fn(|i| work.cpu.x(i));
@@ -1082,7 +1088,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                             match attempt {
                                                 trames_linux::IoAttempt::Complete(result) => {
                                                     if trames_linux::event_wait(number) { snapshot.finish_wait_mask(); }
-                                                    work.cpu.set_x(0, result.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
+                                                    work.trace.finish(&mut work.cpu, result.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
                                                     syscalls += 1;
                                                     continue;
                                                 }
@@ -1122,7 +1128,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                                             if let Some(began) = began { syscall_time += began.elapsed(); }
                                             match attempt {
                                                 trames_linux::IoAttempt::Complete(value) => {
-                                                    work.cpu.set_x(0, value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
+                                                    work.trace.finish(&mut work.cpu, value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
                                                     syscalls += 1; continue;
                                                 }
                                                 trames_linux::IoAttempt::Blocked(pending) => {
@@ -1139,14 +1145,14 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                                         }
                                         if let Some(value)=snapshot.direct.invoke_epoll_control(number,args,work.memory.as_deref().expect("worker view")) {
                                             if let Some(began)=began {syscall_time+=began.elapsed();}
-                                            work.cpu.set_x(0,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));
+                                            work.trace.finish(&mut work.cpu, value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));
                                             syscalls+=1;continue;
                                         }
                                         if let Some(epoch)=&epoch {
                                             if let Some(attempt)=snapshot.direct.start_socket_control(number,args,work.memory.as_deref_mut().expect("worker view"),work.pid,&epoch.io_target) {
                                                 if let Some(began)=began {syscall_time+=began.elapsed();}
                                                 match attempt {
-                                                    trames_linux::IoAttempt::Complete(value)=>{work.cpu.set_x(0,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));syscalls+=1;continue;}
+                                                    trames_linux::IoAttempt::Complete(value)=>{work.trace.finish(&mut work.cpu, value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));syscalls+=1;continue;}
                                                     trames_linux::IoAttempt::Blocked(pending)=>{
  if let Some(wait)=&pending.retained_poll {snapshot.begin_wait_mask(wait);}parked_io=Some(pending);break SliceOutcome::Yield {instructions:0};}
                                                     trames_linux::IoAttempt::FileCheckpoint(file) => {
@@ -1181,7 +1187,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket)=>{for (i,value) in socket.args
                                                 if let Some(attempt) = snapshot.direct.start(number, args, work.memory.as_deref_mut().expect("worker view"), work.pid, &epoch.io_target, None) {
                                                     if let Some(began) = began { syscall_time += began.elapsed(); }
                                                     match attempt {
-                                                        trames_linux::IoAttempt::Complete(value) => { work.cpu.set_x(0,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64))); syscalls+=1; continue; }
+                                                        trames_linux::IoAttempt::Complete(value) => { work.trace.finish(&mut work.cpu, value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64))); syscalls+=1; continue; }
                                                         trames_linux::IoAttempt::Blocked(pending) => {
  if let Some(wait)=&pending.retained_poll {snapshot.begin_wait_mask(wait);} parked_io=Some(pending); break SliceOutcome::Yield { instructions:0 }; }
                                                         trames_linux::IoAttempt::FileCheckpoint(file) => {
@@ -1209,12 +1215,12 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                         }
                                         if let Some(value)=snapshot.direct.invoke_socket_control(number,args,work.memory.as_deref_mut().expect("worker view")) {
                                             if let Some(began)=began {syscall_time+=began.elapsed();}
-                                            work.cpu.set_x(0,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));
+                                            work.trace.finish(&mut work.cpu, value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));
                                             syscalls+=1;continue;
                                         }
                                         if let Some(value)=snapshot.direct.invoke_creation(number,args,work.memory.as_deref_mut().expect("worker view")) {
                                             if let Some(began)=began {syscall_time+=began.elapsed();}
-                                            work.cpu.set_x(0,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));
+                                            work.trace.finish(&mut work.cpu, value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));
                                             syscalls+=1;continue;
                                         }
                                         if snapshot.direct.supports_path_query(number) {
@@ -1222,7 +1228,7 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                                 .or_else(||snapshot.direct.invoke_path(number,args,work.memory.as_deref_mut().expect("worker view")));
                                             if let Some(value)=value {
                                                 if let Some(began)=began {syscall_time+=began.elapsed();}
-                                                work.cpu.set_x(0,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));
+                                                work.trace.finish(&mut work.cpu, value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));
                                                 syscalls+=1;continue;
                                             }
                                             job.seccomp_entry=Some(entry);break result;
@@ -1239,12 +1245,12 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                                     parked = Some(crate::run_queue::WaitState::Sleep { deadline, remaining });
                                                     break SliceOutcome::Yield { instructions: 0 };
                                                 }
-                                                Err(error) => { work.cpu.set_x(0, 0u64.wrapping_sub(error.0 as u64)); continue; }
+                                                Err(error) => { work.trace.finish(&mut work.cpu, 0u64.wrapping_sub(error.0 as u64)); continue; }
                                             }
                                         }
                                         if let Some(value) = snapshot.direct.invoke_membership(number, args) {
                                             if let Some(began) = began { syscall_time += began.elapsed(); }
-                                            work.cpu.set_x(0, value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
+                                            work.trace.finish(&mut work.cpu, value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
                                             syscalls += 1;
                                             continue;
                                         }
@@ -1266,7 +1272,7 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                     let snapshot=work.syscalls.as_ref().expect("custody task");
                                     if snapshot.seccomp.mode()!=0 {
                                         let entry=snapshot.seccomp.entry_decision(work.cpu.x(8) as u32,work.cpu.pc(),std::array::from_fn(|i|work.cpu.x(i)));
-                                        if let Some(value)=entry.completed() {work.cpu.set_x(0,value);syscalls+=1;continue;}
+                                        if let Some(value)=entry.completed() {work.trace.finish(&mut work.cpu, value);syscalls+=1;continue;}
                                         job.seccomp_entry=Some(entry);
                                     }
                                     vm_checkpoint = true;
@@ -1277,7 +1283,7 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                         let mut entry = snapshot.task_entry(&work.cpu);
                                         if let Some(decision)=entry.as_ref() {
                                             if !decision.allowed() {
-                                                if let Some(value)=decision.completed() {work.cpu.set_x(0,value);syscalls+=1;continue;}
+                                                if let Some(value)=decision.completed() {work.trace.finish(&mut work.cpu, value);syscalls+=1;continue;}
                                                 job.seccomp_entry=entry.take();break result;
                                             }
                                         }
@@ -1296,14 +1302,14 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                         let number=work.cpu.x(8) as u32;
                                         if matches!(number,95|260) {
                                             let request=match trames_kernel::children::Wait::prepare(number,std::array::from_fn(|i|work.cpu.x(i))) {
-                                                Ok(request)=>request, Err(e)=>{work.cpu.set_x(0,0u64.wrapping_sub(e.0 as u64));syscalls+=1;continue;}
+                                                Ok(request)=>request, Err(e)=>{work.trace.finish(&mut work.cpu, 0u64.wrapping_sub(e.0 as u64));syscalls+=1;continue;}
                                             };
                                             // Subscribe before checking: an exit between checking and
                                             // parking cannot strand the accepted source wait.
                                             let waiting=snapshot.begin_child_wait(request);
                                             let attempt=snapshot.children.wait(request,&snapshot.io_routes.namespace,snapshot.io_signals.group(),work.memory.as_deref_mut().expect("child wait View"));
                                             if let Some(value)=attempt.transpose() {
-                                                work.cpu.set_x(0,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));syscalls+=1;continue;
+                                                work.trace.finish(&mut work.cpu, value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));syscalls+=1;continue;
                                             }
                                             parked=Some(waiting);
                                             if let Some(began)=began{syscall_time+=began.elapsed();}
@@ -1311,9 +1317,9 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                         }
                                         if matches!(number,133|137) {
                                             let attempt=trames_kernel::signal::SignalWait::prepare(number,std::array::from_fn(|i|work.cpu.x(i)),work.memory.as_deref().expect("signal wait View"));
-                                            let request=match attempt {Ok(r)=>r,Err(e)=>{work.cpu.set_x(0,0u64.wrapping_sub(e.0 as u64));syscalls+=1;continue;}};
+                                            let request=match attempt {Ok(r)=>r,Err(e)=>{work.trace.finish(&mut work.cpu, 0u64.wrapping_sub(e.0 as u64));syscalls+=1;continue;}};
                                             if let Some(value)=request.check(&snapshot.io_signals,work.memory.as_deref_mut().expect("signal wait View"),&snapshot.io_routes.namespace) {
-                                                work.cpu.set_x(0,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));syscalls+=1;continue;
+                                                work.trace.finish(&mut work.cpu, value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));syscalls+=1;continue;
                                             }
                                             parked=Some(snapshot.begin_signal_wait(request));
                                             if let Some(began)=began{syscall_time+=began.elapsed();}
@@ -1324,9 +1330,9 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                             if let Some(began)=began {syscall_time+=began.elapsed();}
                                             syscalls+=1;
                                             match reply {
-                                                Err(e) => {work.cpu.set_x(0,0u64.wrapping_sub(e.0 as u64));continue;}
+                                                Err(e) => {work.trace.finish(&mut work.cpu, 0u64.wrapping_sub(e.0 as u64));continue;}
                                                 Ok((value, wait)) => {
-                                                    work.cpu.set_x(0,value);
+                                                    work.trace.finish(&mut work.cpu, value);
                                                     if let (Some(_),Some(wait)) = (&epoch, wait.filter(|w| !w.finished())) {
                                                         let waiting = crate::run_queue::CompletionWait::new(wait);
                                                         if let Some(signal)=&snapshot.io_wake {waiting.bind(&snapshot.io_signals,signal);}
@@ -1339,14 +1345,14 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                         }
                                         let value=snapshot.invoke(&work.cpu,work.memory.as_deref_mut().expect("task control View")).expect("shared task control");
                                         if let Some(began)=began{syscall_time+=began.elapsed();}
-                                        work.cpu.set_x(0,value);syscalls+=1;continue;
+                                        work.trace.finish(&mut work.cpu, value);syscalls+=1;continue;
                                     }
                                     if let Some(entry)=snapshot.timer_entry(&work.cpu) {
                                         if !entry.allowed() {job.seccomp_entry=Some(entry);break result;}
                                         let began=snapshot.profile.then(Instant::now);
                                         let value=snapshot.invoke(&work.cpu,work.memory.as_deref_mut().expect("timer View")).expect("shared timer authority");
                                         if let Some(began)=began{syscall_time+=began.elapsed();}
-                                        work.cpu.set_x(0,value);syscalls+=1;continue;
+                                        work.trace.finish(&mut work.cpu, value);syscalls+=1;continue;
                                     }
                                     if let Some(entry)=snapshot.event_entry(&work.cpu) {
                                         if !entry.allowed() {job.seccomp_entry=Some(entry);break result;}
@@ -1357,7 +1363,7 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                             if let Some(attempt)=snapshot.direct.start(number,args,work.memory.as_deref_mut().expect("wait View"),work.pid,&epoch.io_target,None) {
                                                 if let Some(began)=began{syscall_time+=began.elapsed();}
                                                 match attempt {
-                                                    trames_linux::IoAttempt::Complete(value)=>{snapshot.finish_wait_mask();work.cpu.set_x(0,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));syscalls+=1;continue;}
+                                                    trames_linux::IoAttempt::Complete(value)=>{snapshot.finish_wait_mask();work.trace.finish(&mut work.cpu, value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));syscalls+=1;continue;}
                                                     trames_linux::IoAttempt::Blocked(pending)=>{
                                                         if let Some(wait)=&pending.retained_poll {snapshot.begin_wait_mask(wait);}
                                                         parked_io=Some(pending);break SliceOutcome::Yield{instructions:0};
@@ -1379,7 +1385,7 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                     let began = snapshot.profile.then(Instant::now);
                                     if let Some(epoch) = &epoch {
                                         if work.cpu.x(8) as u32 == 124 {
-                                            work.cpu.set_x(0, 0);
+                                            work.trace.finish(&mut work.cpu, 0);
                                             syscalls += 1;
                                             yielded = true;
                                             break SliceOutcome::Yield { instructions: 0 };
@@ -1389,7 +1395,7 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                             syscalls += 1;
                                             match result {
                                                 Ok(waiting) => { parked = Some(waiting); break SliceOutcome::Yield { instructions: 0 }; }
-                                                Err(error) => { work.cpu.set_x(0, 0u64.wrapping_sub(error.0 as u64)); continue; }
+                                                Err(error) => { work.trace.finish(&mut work.cpu, 0u64.wrapping_sub(error.0 as u64)); continue; }
                                             }
                                         }
                                     }
@@ -1400,7 +1406,7 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                         if let Some(attempt)=snapshot.direct.start_socket_control(number,args,work.memory.as_deref_mut().expect("worker view"),work.pid,&epoch.io_target) {
                                             if let Some(began)=began {syscall_time+=began.elapsed();}
                                             match attempt {
-                                                trames_linux::IoAttempt::Complete(value)=>{work.cpu.set_x(0,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));syscalls+=1;continue;}
+                                                trames_linux::IoAttempt::Complete(value)=>{work.trace.finish(&mut work.cpu, value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));syscalls+=1;continue;}
                                                 trames_linux::IoAttempt::Blocked(pending)=>{
  if let Some(wait)=&pending.retained_poll {snapshot.begin_wait_mask(wait);}parked_io=Some(pending);break SliceOutcome::Yield {instructions:0};}
                                                 trames_linux::IoAttempt::FileCheckpoint(file) => {
@@ -1436,7 +1442,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket)=>{for (i,value) in socket.args
                                             if let Some(began) = began { syscall_time += began.elapsed(); }
                                             match attempt {
                                                 trames_linux::IoAttempt::Complete(result) => {
-                                                    work.cpu.set_x(0, result.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
+                                                    work.trace.finish(&mut work.cpu, result.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
                                                     syscalls += 1;
                                                     continue;
                                                 }
@@ -1476,7 +1482,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                                             if let Some(began) = began { syscall_time += began.elapsed(); }
                                             match attempt {
                                                 trames_linux::IoAttempt::Complete(value) => {
-                                                    work.cpu.set_x(0, value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
+                                                    work.trace.finish(&mut work.cpu, value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
                                                     syscalls += 1; continue;
                                                 }
                                                 trames_linux::IoAttempt::Blocked(pending) => {
@@ -1498,7 +1504,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                                         if let Some(began) = began {
                                             syscall_time += began.elapsed();
                                         }
-                                        work.cpu.set_x(0, value);
+                                        work.trace.finish(&mut work.cpu, value);
                                         syscalls += 1;
                                         if work.cpu.x(8) as u32 == 98
                                             && snapshot.futex.take_readied()
@@ -1524,7 +1530,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                                                     job.stats.additive_mmaps+=1;
                                                     job.stats.additive_time+=elapsed;
                                                     if snapshot.profile {syscall_time+=elapsed;}
-                                                    work.cpu.set_x(0,value);syscalls+=1;continue;
+                                                    work.trace.finish(&mut work.cpu, value);syscalls+=1;continue;
                                                 },
                                                 Err(wait)=>{
                                                     job.seccomp_entry=Some(snapshot.seccomp.entry_decision(work.cpu.x(8) as u32,work.cpu.pc(),std::array::from_fn(|i|work.cpu.x(i))));
@@ -1675,7 +1681,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                         }
                     }
                     if matches!(outcome, Some(SliceOutcome::Syscall { .. })) && job.seccomp_entry.is_none() && job.retry.is_none() && thread_exit.is_none() {
-                        if let Some(snapshot)=work.syscalls.as_ref().filter(|s| !s.owner_syscalls) {
+                        if let Some(snapshot)=work.syscalls.as_ref() {
                             job.seccomp_entry=Some(snapshot.seccomp.entry_decision(work.cpu.x(8) as u32,work.cpu.pc(),std::array::from_fn(|i|work.cpu.x(i))));
                         }
                     }
@@ -1731,6 +1737,8 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                         lease.finish(held);
                     }
                     if let Some(task)=job.work.syscalls.as_ref().and_then(|s|s.io_signals.cgroup()) {task.acknowledge();}
+                    if thread_exit.is_some() { job.work.trace.replaced(); }
+                    job.work.trace.suspend();
                     // The same allocation retains CPU, translations and View;
                     // only its Box pointer enters the shared queues.
                     if let Some(epoch) = &epoch {
@@ -1950,6 +1958,7 @@ mod tests {
                 cpu,
                 memory: Some(Box::new(view)),
                 control: control.clone(),
+                trace: Default::default(),
                 syscalls: Some(snapshot),
             },
             1,
@@ -2062,13 +2071,13 @@ mod tests {
                 memory.parallel_view(&mut Default::default()).unwrap(),
             )),
             control,
+            trace: Default::default(),
             syscalls: None,
         }
     }
 
     fn syscall_snapshot() -> crate::worker_syscalls::Snapshot {
         crate::worker_syscalls::Snapshot {
-            owner_syscalls: false,
             diagnostics: None,
             membarrier_registered: None,
             vfork_release: None,
@@ -2130,6 +2139,7 @@ mod tests {
                     memory.parallel_view(&mut Default::default()).unwrap(),
                 )),
                 control: Arc::new(Control::new(100)),
+                trace: Default::default(),
                 syscalls: Some(snapshot),
             },
             memory,
@@ -2204,6 +2214,7 @@ mod tests {
                         memory.parallel_view(&mut Default::default()).unwrap(),
                     )),
                     control: control.clone(),
+                    trace: Default::default(),
                     syscalls: Some(snapshot),
                     gpu: None,
                     audio: None,
@@ -2321,6 +2332,7 @@ mod tests {
                 memory.parallel_view(&mut Default::default()).unwrap(),
             )),
             control,
+            trace: Default::default(),
             syscalls: Some(snapshot),
             gpu: None,
             audio: None,
@@ -2630,6 +2642,7 @@ mod tests {
                             memory.parallel_view(&mut Default::default()).unwrap(),
                         )),
                         control: control.clone(),
+                        trace: Default::default(),
                         syscalls: Some(snapshot),
                         gpu: None,
                         audio: None,
@@ -2766,6 +2779,7 @@ mod tests {
                             memory.parallel_view(&mut Default::default()).unwrap(),
                         )),
                         control: control.clone(),
+                        trace: Default::default(),
                         syscalls: Some(snapshot),
                         gpu: None,
                         audio: None,
@@ -2919,6 +2933,7 @@ mod tests {
                             memory.parallel_view(&mut Default::default()).unwrap(),
                         )),
                         control: control.clone(),
+                        trace: Default::default(),
                         syscalls: Some(snapshot),
                         gpu: None,
                         audio: None,
@@ -3048,6 +3063,7 @@ mod tests {
                     memory.parallel_view(&mut Default::default()).unwrap(),
                 )),
                 control,
+                trace: Default::default(),
                 syscalls: Some(snapshot),
                 gpu: None,
                 audio: None,
@@ -3150,6 +3166,7 @@ mod tests {
                         memory.parallel_view(&mut Default::default()).unwrap(),
                     )),
                     control,
+                    trace: Default::default(),
                     syscalls: Some(snapshot),
                     gpu: None,
                     audio: None,
@@ -3371,6 +3388,7 @@ mod tests {
                 memory.parallel_view(&mut Default::default()).unwrap(),
             )),
             control: control.clone(),
+            trace: Default::default(),
             syscalls: Some(snapshot),
             gpu: None,
             audio: None,
@@ -3414,6 +3432,7 @@ mod tests {
                 memory.parallel_view(&mut Default::default()).unwrap(),
             )),
             control,
+            trace: Default::default(),
             syscalls: Some(snapshot),
             gpu: None,
             audio: None,
@@ -3592,6 +3611,7 @@ mod tests {
                     cpu,
                     memory: Some(Box::new(view)),
                     control: control.clone(),
+                    trace: Default::default(),
                     syscalls: Some(snapshot),
                 },
                 1,
@@ -3683,6 +3703,7 @@ mod tests {
                     cpu,
                     memory: Some(Box::new(view)),
                     control: control.clone(),
+                    trace: Default::default(),
                     syscalls: Some(snapshot),
                 },
                 1,
@@ -3810,6 +3831,7 @@ mod tests {
                         cpu,
                         memory: Some(Box::new(view)),
                         control: control.clone(),
+                        trace: Default::default(),
                         syscalls: Some(snapshot),
                     },
                     1,
@@ -3958,6 +3980,7 @@ mod tests {
                         cpu,
                         memory: Some(Box::new(view)),
                         control: control.clone(),
+                        trace: Default::default(),
                         syscalls: Some(snapshot),
                     },
                     1,
@@ -4040,6 +4063,7 @@ mod tests {
                     cpu,
                     memory: Some(Box::new(view)),
                     control: control.clone(),
+                    trace: Default::default(),
                     syscalls: Some(snapshot),
                 },
                 1,
@@ -4110,6 +4134,7 @@ mod tests {
                     cpu,
                     memory: Some(Box::new(view)),
                     control: control.clone(),
+                    trace: Default::default(),
                     syscalls: Some(syscall_snapshot()),
                 },
                 1,
@@ -4226,6 +4251,7 @@ mod tests {
                         cpu,
                         memory: Some(Box::new(view)),
                         control: control.clone(),
+                        trace: Default::default(),
                         syscalls: Some(snapshot),
                     },
                     1,
@@ -4643,6 +4669,7 @@ mod tests {
                 cpu,
                 memory: Some(Box::new(memory_view)),
                 control,
+                trace: Default::default(),
                 syscalls: None,
             },
             memory,
@@ -4694,6 +4721,7 @@ mod tests {
                         memory.parallel_view(&mut Default::default()).unwrap(),
                     )),
                     control: control.clone(),
+                    trace: Default::default(),
                     syscalls: None,
                 },
             )
@@ -4762,6 +4790,7 @@ mod tests {
                     memory.parallel_view(&mut Default::default()).unwrap(),
                 )),
                 control,
+                trace: Default::default(),
                 syscalls: None,
             },
             memory,
@@ -4950,6 +4979,7 @@ mod tests {
                 memory.parallel_view(&mut Default::default()).unwrap(),
             )),
             control: control.clone(),
+            trace: Default::default(),
             syscalls: None,
         };
         pool.dispatch(0, work).unwrap();
@@ -5042,6 +5072,7 @@ mod tests {
                 cpu: peer_cpu,
                 memory: first.memory.clone(),
                 control: control.clone(),
+                trace: Default::default(),
                 syscalls: None,
             };
             let (held_tx, held_rx) = mpsc::channel();

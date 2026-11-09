@@ -983,6 +983,7 @@ mod tests {
     fn job(pid: u32, view: Box<trames_memory::parallel::View>, epoch: &Arc<Epoch>) -> Box<Job> {
         Job::new(
             Work {
+                trace: Default::default(),
                 task: None,
                 audio: None,
                 pid,

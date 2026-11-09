@@ -1098,11 +1098,29 @@ impl Linux {
         memory: &mut Memory,
         io: &mut impl GuestOutput,
     ) -> SyscallOutcome {
+        self.dispatch_with_trace(cpu, memory, io, self.trace)
+    }
+    /// A session's accepted-call diagnostic state owns its completion record.
+    pub fn dispatch_untraced(
+        &mut self,
+        cpu: &mut impl Registers,
+        memory: &mut Memory,
+        io: &mut impl GuestOutput,
+    ) -> SyscallOutcome {
+        self.dispatch_with_trace(cpu, memory, io, false)
+    }
+    fn dispatch_with_trace(
+        &mut self,
+        cpu: &mut impl Registers,
+        memory: &mut Memory,
+        io: &mut impl GuestOutput,
+        trace: bool,
+    ) -> SyscallOutcome {
         let number = cpu.x(8) as u32 as u64;
         let a = std::array::from_fn(|index| cpu.x(index));
         if number == 93 || number == 94 {
             self.exit_tid(memory);
-            if self.trace {
+            if trace {
                 eprintln!("trames syscall {number}: exit {}", a[0] as u8);
             }
             return SyscallOutcome::Exit(a[0] as u8);
@@ -1125,7 +1143,7 @@ impl Linux {
                 &self.command_name,
             );
         }
-        if self.trace {
+        if trace {
             eprintln!(
                 "trames syscall {number}({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}) = {}",
                 a[0], a[1], a[2], a[3], a[4], a[5], raw as i64

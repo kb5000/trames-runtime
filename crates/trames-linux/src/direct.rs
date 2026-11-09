@@ -2016,6 +2016,9 @@ mod tests {
     fn host_stdio_terminal_probes_use_the_original_nonterminal_without_a_checkpoint() {
         let mut linux = Linux::new(0x3000);
         linux.vfs.set_runtime_info(1, Default::default());
+        linux
+            .vfs
+            .bind_console(Arc::new(trames_vfs::CapturedConsole::default()));
         let [reader, writer] = linux.vfs.pipe(0).unwrap();
         let file = linux.vfs.open_at(-100, b"/file", 0x42, 0o600).unwrap();
         let path = linux
@@ -2024,7 +2027,7 @@ mod tests {
             .unwrap();
         let direct = DirectSyscalls::new(linux.vfs.direct_descriptors());
         let mut memory = memory();
-        for fd in [reader, writer, file, path] {
+        for fd in [0, 1, 2, reader, writer, file, path] {
             for request in [0x5401, 0x540f, 0x5413, 0x5429] {
                 let args = [fd as u64, request, u64::MAX, 0, 0, 0];
                 let expected =

@@ -679,6 +679,7 @@ impl<C: Cpu> Job<C> {
             self.stats
                 .finish(work.pid, work.cpu, outcome, self.waiting, io, gpu_pending);
         done.task = work.task;
+        done.trace = work.trace;
         done.seccomp_entry = self.seccomp_entry;
         done
     }
@@ -720,6 +721,7 @@ impl Stats {
         Done::<C> {
             task: None,
             thread_exit: None,
+            trace: Default::default(),
             fatal_fault: None,
             exit_groups: Vec::new(),
             pid,
@@ -1115,7 +1117,7 @@ impl<C: Cpu> Epoch<C> {
         if let Some(waiting) = &job.waiting {
             waiting.bind(self);
             if waiting.woken() {
-                job.work.cpu.set_x(0, 0);
+                job.work.trace.finish(&mut job.work.cpu, 0);
                 job.waiting = None;
             } else if job.uring.is_none() && !job.ring_ready() {
                 self.publish_deadline(waiting.deadline());
@@ -1383,7 +1385,7 @@ impl<C: Cpu> Epoch<C> {
             job.rearm_signals();
             if job.waiting.as_ref().is_some_and(|w| w.woken()) {
                 job.waiting = None;
-                job.work.cpu.set_x(0, 0);
+                job.work.trace.finish(&mut job.work.cpu, 0);
                 job.stats.resumes += 1;
             }
             let pending = job.hardware_wait.as_ref().is_some_and(|w| !w.ready())
@@ -1417,7 +1419,7 @@ impl<C: Cpu> Epoch<C> {
                 .is_some_and(|w| w.matches_ticket(ticket))
         }) {
             let mut job = q.parked.remove(&ticket.pid).unwrap();
-            job.work.cpu.set_x(0, 0);
+            job.work.trace.finish(&mut job.work.cpu, 0);
             job.waiting = None;
             job.stats.resumes += 1;
             self.ready(&mut q, job);
@@ -1525,7 +1527,7 @@ impl<C: Cpu> Epoch<C> {
                     && !matches!(job.waiting, Some(WaitState::Signal(_)))
                 {
                     let waiting = job.waiting.take().unwrap();
-                    job.work.cpu.set_x(0, waiting.expire());
+                    job.work.trace.finish(&mut job.work.cpu, waiting.expire());
                 }
                 // I/O must perform a final resource check and scatter, even on
                 // timeout. Keep its pending call and do not execute SVC twice.
@@ -1676,7 +1678,7 @@ impl<C: Cpu> Epoch<C> {
         if let Some(waiting) = waiting {
             job.stats.waits += 1;
             if waiting.woken() {
-                job.work.cpu.set_x(0, 0);
+                job.work.trace.finish(&mut job.work.cpu, 0);
                 job.stats.resumes += 1;
                 self.ready(&mut q, job);
             } else {
@@ -1710,7 +1712,7 @@ impl<C: Cpu> Epoch<C> {
         } else {
             if job.waiting.as_ref().is_some_and(WaitState::woken) {
                 job.waiting = None;
-                job.work.cpu.set_x(0, 0);
+                job.work.trace.finish(&mut job.work.cpu, 0);
             } else if job
                 .waiting
                 .as_ref()
@@ -1719,7 +1721,7 @@ impl<C: Cpu> Epoch<C> {
                 && !matches!(job.waiting, Some(WaitState::Signal(_)))
             {
                 let waiting = job.waiting.take().unwrap();
-                job.work.cpu.set_x(0, waiting.expire());
+                job.work.trace.finish(&mut job.work.cpu, waiting.expire());
             }
             if job.ring_ready() || !job.guest_waiting() {
                 self.ready(&mut q, job);
@@ -2247,6 +2249,7 @@ mod tests {
                     memory.parallel_view(&mut Default::default()).unwrap(),
                 )),
                 control: epoch.control.clone(),
+                trace: Default::default(),
                 syscalls: None,
             },
             1,

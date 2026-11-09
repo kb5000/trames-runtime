@@ -138,7 +138,8 @@ impl<C: Cpu> Lifecycle<C> {
                 let began = Instant::now();
                 // The selected mapping ABI has no host terminal/output effects.
                 // Use the same Linux implementation as the joined caller.
-                p.linux.dispatch(
+                job.work.trace.begin(pid, number, args(&p.cpu));
+                p.linux.dispatch_untraced(
                     &mut p.cpu,
                     &mut p.memory,
                     &mut trames_linux::CapturedOutput::default(),
@@ -148,6 +149,8 @@ impl<C: Cpu> Lifecycle<C> {
                 if job.work.syscalls.as_ref().is_some_and(|s| s.profile) {
                     job.stats.syscall_time += elapsed;
                 }
+                job.work.trace.record(p.cpu.x(0));
+                job.work.trace.flush();
                 job.stats.syscalls += 1;
                 report.mapping_calls[kind] += 1;
                 report.mapping_syscalls += 1;
