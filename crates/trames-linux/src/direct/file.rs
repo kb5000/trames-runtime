@@ -252,6 +252,7 @@ enum PreparedAction {
 impl DirectSyscalls {
     pub fn file_call(number: u32) -> bool {
         namespace::supported(number)
+            || crate::file_advice::entry(number)
             || matches!(number, 45..=47 | 56 | 62..=71 | 76 | 80..=83 | 227 | 267 | 285..=287 | 437)
     }
     pub fn file_entry(number: u32, args: [u64; 6]) -> bool {
@@ -512,6 +513,13 @@ impl DirectSyscalls {
         pid: u32,
         target: &Weak<dyn IoWake>,
     ) -> Option<IoAttempt> {
+        if crate::file_advice::entry(number) {
+            return Some(self.complete(
+                number,
+                args,
+                crate::file_advice::call(number, args, vfs.stat_fd(args[0] as u32)),
+            ));
+        }
         if number == 227 {
             return self.start_memory_sync(args, memory, pid, target);
         }
@@ -943,6 +951,12 @@ impl DirectSyscalls {
         a: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
+        if crate::file_advice::entry(number) {
+            let stat = self.paths.as_ref()?.stat_fd(a[0] as u32)?;
+            self.completed.set(self.completed.get() + 1);
+            self.file_completed.set(self.file_completed.get() + 1);
+            return Some(crate::file_advice::call(number, a, stat));
+        }
         if number == 25 && matches!(a[1], 1033 | 1034) {
             if self.file_prepared(number, a) {
                 return None;

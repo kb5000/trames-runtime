@@ -1,11 +1,20 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 96, original mapped-memory writeback, reviewed on 2026-11-10. The prior shared runtime
-baseline is `3a5a0e2b27a724e73258c4c39083cceb48de9b7e`.
+This is the consolidated implementation audit through stage 97, original file-cache advice, reviewed on 2026-11-10. The prior shared runtime
+baseline is `fc59b7b38f3de0428798cf942efd7a6d52fce8d5`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-10
+
+Stage 97 closes the implemented file-cache advice family, readahead and
+fadvise64. Source and solo use one original-stat/type/range/flags body. The caller
+queries live original Files once, preserving close/reuse and detached-membership
+behavior rather than using a captured FD/type mask. The existing optional hint
+policy remains: no speculative disk reads, eviction, data/position update or
+resident charge is added. These short calls need no disk task, mapping checkpoint,
+service thread or guest-memory access. Missing actual original metadata bindings
+retain their before-effects capability boundary.
 
 Stage 96 closes supported msync and its connected mapped-writeback resources.
 Source/solo share range/flag import and capture actual original shared backings.
@@ -414,6 +423,7 @@ is not a claim that all coordinator work is removed.
 | Descriptor ioctl discovery and control | Shared namespace type, virtual render discovery, implemented interface queries/link control and ordinary unsupported commands execute on the caller with one retained original OFD and the common solo ABI | Existing PTY/flag/async routes stay source-owned. Actual legacy OFDs or absent providers retain before-effects fallback; unsupported commands preserve their existing errno |
 | FD status, descriptor flags and memfd seals | Live NOATIME authority, original OFD status/async subscription, descriptor-local CLOEXEC, canonical unknown-command errors and original inode seals run on source; native seal flushes park on existing FileWork | Existing duplication, record locks and async-owner operations retain their source routes and actual resource requirements. A genuinely absent source capability still defers before effects; no unsupported fcntl feature is advertised |
 | Mapped-memory writeback | msync imports the original shared backing graph on its calling worker; existing FileLayouts admission and disk pool perform native sync without holding a CPU slot. Original range/key/error behavior is common with solo | Actual affected backing readers still quiesce. Anonymous/private/no-op mappings finish inline. Custom providers missing real original layout admission defer before effects; no msync-only supported-file join remains |
+| File-cache advice | readahead/fadvise64 use live original Files/stat metadata and common type/argument validation on the calling worker | No advice-only join or mapping checkpoint remains. Optional hints retain their existing policy without forced prefetch/eviction. Missing actual metadata bindings defer before effects |
 | Anonymous memory files | Validated owned memfd name/flags, original Files publication/inode allocation, native backing, sparse data, mapping, seals and aliases use original resources. Native creation returns the CPU slot; no pathname or mount-administration probe is required | No supported memfd_create-only join remains. Actual missing path/executor bindings keep their boundary; mapped writes/unmap retain necessary original-mm/backing scopes |
 | POSIX/OFD range locks and whole-file flock | Original shared OFD/inode arbitration and common source/solo ABI; contended range/flock requests park and subscribe before retry. Deadlocks use original shared wait relations; directory flock uses the actual full OFD | No supported blocking-lock-only join or process-map retry/scan remains. Genuine missing original lock/Files capabilities retain a before-effects boundary; solo dispatch runs on its existing caller |
 | Native libc/GPU/video/audio bodies, waits and before-effects mapping/entry checkpoints | Calling/shared-resource execution; exceptional access uses original task/mm custody on an existing executor, then retains resource waits | Capability-less embeddings and actual platform/host lifecycle retain their boundary. Single-CPU/solo calls use their existing caller. Local libc/DirectFile/HVF fallback alone is not an owner transition |
@@ -550,14 +560,14 @@ Actual excluded policy effects and missing capabilities retain explicit boundari
 ### Current remaining categories
 
 The count is **four broad categories**, not the number of historical subsystem
-rows. Stages 72–96 remove concrete triggers and close request-authority dependencies inside those categories; they do not
+rows. Stages 72–97 remove concrete triggers and close request-authority dependencies inside those categories; they do not
 prove that the final generic fallback is unreachable.
 
 | Remaining category | Actual trigger | Current scope / authoritative implementation |
 | --- | --- | --- |
 | Host cancellation and final teardown | Host cancel, deadline, shutdown, legacy stopped-hook requests, final CPU/backend drain and actual native-event backend failure | Pause/resume, original init notifications/signals, pressure reclaim, host filesystem commands and terminal/process admission no longer join. Actual terminal teardown and backend failure still stop their actors. Native-event failure returns its original HostIo cause after drain/cancellation, without an owner syscall retry. See [host control](../../crates/trames-session/src/process_vm.rs), [completion](../../crates/trames-session/src/process_exit.rs) and [workers](../../crates/trames-session/src/workers.rs). |
 | Missing capabilities and excluded resources | A genuinely absent source provider, an excluded original FD/node graph, a genuinely absent native event capability or unsupported source request body | There is no filesystem-kind exclusion after stage 82. Published global proc/sys metadata no longer lacks a source provider merely because it uses set_runtime_info. Other node/provider admission still applies. io_uring has exactly two submitter-scoped `require_owner()` maintenance call sites: missing-capability wait-source preparation and deferred original body progress; actual host backend errors take terminal source error handling. They remain connected to actual accepted request lifetime, subscriptions and cancellation. See [path authority](../../crates/trames-vfs/src/path_queries.rs), [maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [wait sources](../../crates/trames-linux/src/direct/uring/wait.rs) and [actor](../../crates/trames-linux/src/direct/uring/actor.rs). |
-| Final execution dispatch fallback | A returned SVC or cold HLT/resource operation not completed, parked or accepted by a source scope; host faults and capability-less embeddings retain their own explicit boundaries | The catch-all stops the current cohort for joined dispatch. Ordinary shared-FD ioctl discovery, residual prctl controls/errors, implemented time observations, FD status/NOATIME, inode seals, anonymous memory-file creation, mapped-memory msync/writeback, blocking POSIX/OFD locks, directory flock and canonical unknown fcntl commands no longer use it. It remains an audit target even though admitted native calls, ordinary guest faults, generated ENOSYS and migrated syscalls have source completion. Recognized guest faults, caught handlers and signal-frame failures now complete/terminate on source. A backend error is not a software or full-Linux-VM fallback. See [worker dispatch](../../crates/trames-session/src/workers.rs) and [classification](../../crates/trames-session/src/worker_syscalls.rs). |
+| Final execution dispatch fallback | A returned SVC or cold HLT/resource operation not completed, parked or accepted by a source scope; host faults and capability-less embeddings retain their own explicit boundaries | The catch-all stops the current cohort for joined dispatch. Ordinary shared-FD ioctl discovery, residual prctl controls/errors, implemented time observations, FD status/NOATIME, inode seals, anonymous memory-file creation, mapped-memory msync/writeback, file-cache advice, blocking POSIX/OFD locks, directory flock and canonical unknown fcntl commands no longer use it. It remains an audit target even though admitted native calls, ordinary guest faults, generated ENOSYS and migrated syscalls have source completion. Recognized guest faults, caught handlers and signal-frame failures now complete/terminate on source. A backend error is not a software or full-Linux-VM fallback. See [worker dispatch](../../crates/trames-session/src/workers.rs) and [classification](../../crates/trames-session/src/worker_syscalls.rs). |
 | Initial and legacy orchestration | Initial admission, standalone/capability-less nonmember scheduling and other excluded embedding routes | Ordinary live members and preexisting Kernel Futex/Sleep actors migrate, park and wake on the original queue. Cold waiters have metadata only until an event prepares their original mm; child/exec admission and lazy CPU slots no longer require a joined owner. The standalone futex legacy-publication mechanism remains. Solo dispatch is on the caller, so its existence alone is not a cross-thread transition. See [admission](../../crates/trames-session/src/process.rs), [legacy wakes](../../crates/trames-session/src/futex.rs) and [queue](../../crates/trames-session/src/run_queue.rs). |
 
 Supported process/family lifecycle, signals and security policy, mount and task
@@ -4136,3 +4146,42 @@ scopes. Both local runtime workflows, process/FFI checks, strict lint and both
 iPad SDK targets pass; signed native before/after and installed Dev evidence
 belongs to the paired product validation. Four broad categories and both actual
 io_uring maintenance escalation sites remain; the overall objective stays active.
+
+
+## 97. Original file-cache advice and live descriptor metadata — 2026-11-10
+
+The existing readahead (213) and fadvise64 (223) family still returned to joined
+Linux dispatch to perform a regular-file stat and validate arguments. Source and
+solo now use one original-stat/type/range/advice body. Calling-worker dispatch
+uses original PathQueries metadata with one live Files lookup for the complete
+query. The same original stat implementation retains actual native metadata and
+errors; it does not guess eligibility from a cached regular-file/FD flag mask.
+Owned session calls use the same body without requiring a new worker binding.
+
+Descriptor errors and file type precede offset/length/advice errors. Existing
+O_PATH behavior, low-32-bit descriptor interpretation, signed-range checks, all
+six supported advice values, zero lengths and unused readahead count/operands
+remain unchanged. No guest memory is read, no native syscall blindly forwarded,
+and no policy is added to CPU/native byte access. The supported advice remains
+optional: success does not promise speculative prefetch, eviction or cache
+retention. It performs no data transfer, file-position/metadata update, page-in
+or resident charge.
+
+Future calls observe original shared membership through close/reuse; an unrelated
+or detached Files table cannot donate a descriptor. The short operation completes
+on its caller before any parking/handoff is needed. No new disk task, native-call
+lock, service/resource thread, polling bus, unsafe block or mapping checkpoint is
+introduced. An embedding without actual original stat resources still defers
+before effects rather than manufacturing a guest error or success.
+
+Common tests exercise source/solo/owned/direct entry, all hints and range/flag/FD
+error ordering, unused unmapped operands, original shared and detached Files,
+numeric reuse, O_PATH and nonregular descriptors, unchanged file bytes/position/
+metadata and zero resident charge. The connected guest fixture tests these calls
+plus close/dup3 replacement from a regular file to a directory and back, preserving
+an alias to the original OFD. Prior production returns its first fadvise64 before
+the completion marker. Final four/twelve-CPU, one-slot and seccomp ALLOW runs finish
+one cohort with no returned syscall/service and no mapping checkpoint. Signed
+native before/after and installed Dev evidence belongs to the paired product
+validation. The four broad categories, both io_uring maintenance escalation sites
+and full coordinator-removal objective remain open.

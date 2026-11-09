@@ -23,6 +23,7 @@ pub use direct::{
     RetainedByte, RetainedSocket, UringActor, UringBackground, UringEnter, UringEpoch,
     UringSnapshot,
 };
+mod file_advice;
 mod file_calls;
 mod file_layouts;
 mod ioctl;

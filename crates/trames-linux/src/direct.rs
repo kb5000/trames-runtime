@@ -842,6 +842,9 @@ impl DirectSyscalls {
         std::mem::swap(&mut *self.scratch.borrow_mut(), buffer);
     }
     pub fn supports_call(&self, number: u32, args: [u64; 6]) -> bool {
+        if crate::file_advice::entry(number) {
+            return self.paths.is_some();
+        }
         if number == 227 {
             return self.file_layouts.is_some();
         }
@@ -1323,6 +1326,11 @@ impl DirectSyscalls {
         target: &Weak<dyn IoWake>,
         saved_deadline: Option<Instant>,
     ) -> Option<IoAttempt> {
+        if crate::file_advice::entry(number) {
+            return self
+                .invoke_file_io(number, args, memory)
+                .map(IoAttempt::Complete);
+        }
         if number == 227 {
             return self.start_memory_sync(args, memory, pid, target);
         }

@@ -75,13 +75,7 @@ impl Linux {
         io: &mut impl GuestOutput,
     ) -> Result<u64> {
         match number {
-            213 | 223 => {
-                self.regular_file(a[0] as u32)?;
-                if a[1] > i64::MAX as u64 || number == 223 && (a[2] > i64::MAX as u64 || a[3] > 5) {
-                    return Err(Errno(22));
-                }
-                Ok(0) // Kernel prefetch/eviction advice is optional, not a data operation.
-            }
+            213 | 223 => crate::file_advice::call(number as u32, a, self.vfs.stat_fd(a[0] as u32)),
             267 => {
                 self.vfs.sync_filesystem_fd(a[0] as u32)?;
                 Ok(0)
