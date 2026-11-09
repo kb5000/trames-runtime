@@ -229,6 +229,8 @@ pub trait GuestOutput {
     fn host_signal(&mut self) -> Option<(u32, u32)> {
         None
     }
+    /// An authorized signal to the original guest PID 1 task. Live adapters may
+    /// publish it from poll_control; delivery does not require a cohort join.
     fn root_signal(&mut self) -> Option<u32> {
         None
     }

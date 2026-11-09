@@ -17,6 +17,38 @@ impl Signals {
     }
 }
 impl IoTask {
+    /// Host-authorized control of this original task, not its process group.
+    /// Policy and the private inbox are shared with its running executor.
+    pub fn host_signal(&self, signal: u32) {
+        if !(1..=64).contains(&signal) || !self.live() {
+            return;
+        }
+        let info = Info::default();
+        if matches!(signal, 9 | 18..=22) {
+            let _ = self.job_signal(signal, false, info, true);
+            return;
+        }
+        let queued = {
+            let policy = self.policy.read().unwrap();
+            let enqueue = || self.inbox.enqueue_quiet(signal, info);
+            policy.as_ref().map_or_else(enqueue, |policy| {
+                policy.actions.with_action(signal, |action| {
+                    let masked = self.mask() & (1 << (signal - 1)) != 0;
+                    let init =
+                        policy.namespace.is_nested() && policy.namespace.local(self.tgid()) == 1;
+                    if !masked && (action.handler == 1 || init && action.handler <= 1) {
+                        Ok(false)
+                    } else {
+                        enqueue()
+                    }
+                })
+            })
+        };
+        if matches!(queued, Ok(true)) {
+            self.inbox.changed();
+        }
+    }
+
     /// A trusted lifecycle producer, using the child's original policy/queues.
     /// No guest sender permission or owner Process projection is involved.
     pub(crate) fn parent_death(&self, signal: u32, info: Info) {
@@ -218,6 +250,51 @@ mod tests {
         signals.publish_policy(&PidNamespace::default(), false);
         directory.publish(&signals.io, id, id, group, uid, suid);
         signals
+    }
+    #[test]
+    fn host_signal_uses_original_private_inbox_and_live_init_policy() {
+        let mut vfs = trames_vfs::Vfs::default();
+        vfs.unshare_pid().unwrap();
+        vfs.activate_child_pid(100).unwrap();
+        for nested in [false, true] {
+            let namespace = if nested {
+                vfs.pid_namespace().clone()
+            } else {
+                PidNamespace::default()
+            };
+            for handler in [0, 1, 0x4000] {
+                for masked in [false, true] {
+                    let directory = Arc::new(IoDirectory::default());
+                    let mut root = publish(&directory, 100, 100, 1000, 1000);
+                    let peer = publish(&directory, 200, 100, 1000, 1000);
+                    root.publish_policy(&namespace, false);
+                    root.actions.set(
+                        37,
+                        Action {
+                            handler,
+                            ..Default::default()
+                        },
+                    );
+                    root.set_mask(if masked { 1 << 36 } else { 0 });
+                    root.io.host_signal(0);
+                    root.io.host_signal(65);
+                    root.io.host_signal(37);
+                    let queued = masked || handler > 1 || handler == 0 && !nested;
+                    assert_eq!(root.io.inbox.bits(), if queued { 1 << 36 } else { 0 });
+                    assert_eq!(root.io.process().bits(), 0);
+                    assert_eq!(peer.pending_bits(), 0);
+                    if queued {
+                        assert_eq!(root.take_signal(37, false).sender, 0);
+                    }
+                    let old = root.io.clone();
+                    old.exit();
+                    let replacement = publish(&directory, 100, 100, 0, 0);
+                    old.host_signal(37);
+                    assert_eq!(old.inbox.bits(), 0);
+                    assert_eq!(replacement.pending_bits(), 0);
+                }
+            }
+        }
     }
     #[test]
     fn continued_signal_uses_the_session_permission_exception_for_all_send_apis() {

@@ -1,11 +1,21 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 73, source-owned syscall diagnostics, reviewed on 2026-11-09. The prior shared runtime
-baseline is `b6b336e9e685b309fca9c84aaa4c3e432f5e2776`.
+This is the consolidated implementation audit through stage 74, original init supervision, reviewed on 2026-11-09. The prior shared runtime
+baseline is `38590a849a2b559e23eae81d9640b9579faff7ff`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-09
+
+Stage 74 removes systemd notification and graceful-stop supervision from joined
+control on both products. The existing host adapter drains the original retained
+nonblocking notification socket; PID 1 credentials still authenticate readiness
+and its shutdown signal level. A host-authorized signal addresses the original
+PID 1 task's policy and private inbox, without borrowing its executing CPU or
+signalling unrelated jobs. Notifications and root-signal delivery no longer stop
+the cohort. No new thread, polling bus or guest hot-path check is introduced.
+Mac preserves its existing 100 ms host-control interval. Actual non-systemd
+cancellation, pause, transfer/writeback, pressure and teardown remain explicit.
 
 Stage 73 closes the diagnostic-tracing execution category. Linux.trace / Mac
 --trace / interpreter --trace-syscalls no longer disable original resource
@@ -205,7 +215,8 @@ is not a claim that all coordinator work is removed.
 | Seccomp policy | Supported seccomp/prctl installation, TSYNC and entry results use original source task/group resources; busy installation releases the slot; proc and future entries observe live policy | Capability-less embeddings retain signal/exit handling; unsupported listener/logging/notification features remain unsupported. An allowed syscall may still encounter its own excluded resource or generic fallback |
 | Cold process observation and source ownership | Original body custody and current original PID identity; queue publication orders the exit observation | Cold snapshots are lookup hints, not accepted source capabilities. Source Handles and genuinely excluded actors retain their original routes |
 | Host process and native terminal lifecycle | Original process/group/PTY resources and existing execution/disk workers | Accepted launches survive cohort replacement; loading and custody waits release the CPU slot. One-time adapter setup and genuine missing/excluded providers remain explicit; terminal ID 0 transport no longer stops execution |
-| Actual host/embedding administration | Joined owner handling of the accepted event | Pause/cancel, timezone/transfer, supervision/admin/deadline/pressure and actual shutdown. Original embedding terminal input/output/resize/signals progress without a join. FileProvider staged writeback deliberately pauses as previously chosen |
+| Init notification and graceful-stop supervision | Existing host adapter and original notification endpoint; original PID 1 policy/private inbox | No notification/handshake/root-signal join remains; initial VFS preparation and actual final teardown retain their own lifetime |
+| Actual host/embedding administration | Joined owner handling of the accepted event | Pause/cancel, timezone/transfer, admin/deadline/pressure and actual shutdown. Original embedding terminal input/output/resize/signals progress without a join. FileProvider staged writeback deliberately pauses as previously chosen |
 | Last-resort SVC/HLT/fault dispatch | Truly unimplemented numbers complete locally using generated conservative recognition and the original diagnostic log | Known handlers whose actual resource/subcommand is excluded, legacy embeddings and unhandled HLT/fault exits still retain joined fallback. An implemented number returning an errno is not classified as globally unimplemented |
 | Single-CPU/solo execution | Existing coordinated caller path | The owner may itself be the guest executor; this is not evidence of an extra cross-thread syscall RPC |
 
@@ -333,7 +344,7 @@ Actual excluded policy effects and missing capabilities retain explicit boundari
 | io_uring explicit capability/resource escalation | Missing typed source provider, unavailable native event subscription after source retry, actual unsupported body/pinning | Original-Files registration/import and source CQ execution stay direct. Layout and signal completion side transports are deleted: accepted dependencies remain on the request, and legacy signals publish to the original task actor. Production mapped layout uses original FileLayouts. Only the two actual maintenance failure sites still set `owner_required`. | [actor](../../crates/trames-linux/src/direct/uring/actor.rs), [source maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [subscriptions](../../crates/trames-linux/src/direct/uring/wait.rs), [file results](../../crates/trames-linux/src/direct/uring/actor_file.rs) |
 | Native guest mapping and exceptional native memory entry | Original task/mm source checkpoint before body effects; Vulkan import, live-private backing and unstable entry use original Memory | No joined execution category remains for admitted original tasks. Actual capability-less/solo embeddings retain their own route. Affected bytes still quiesce; permission/backing errors and bounded entry retries use the existing common model. | [source native scope](../../crates/trames-session/src/process_lifecycle_native.rs), [Vulkan import](../../crates/trames-vulkan/src/backend.rs), [native memory](../../crates/trames-memory/src/parallel/native.rs), [entry registry](../../crates/trames-accel/src/native.rs), [GPU waits](../../crates/trames-session/src/gpu.rs) |
 | Scheduler/cohort membership | Initial guest admission and legacy nonmember wake; ordinary scheduling metadata and live affinity no longer require the owner | Initial/legacy orchestration retains its boundary. Existing members migrate/park/wake locally; children and exec replacements enter the live queue. Original CPU slots can start directly and lazily from that queue. Periodic checks alone do not tear down the cohort: `cohort_control` tests actual events and original dependencies. | [legacy wake](../../crates/trames-session/src/futex.rs), [queue](../../crates/trames-session/src/run_queue.rs), [owner metadata](../../crates/trames-session/src/process_scheduling.rs), [control checks](../../crates/trames-session/src/process_vm.rs) |
-| Host/legacy embedding administration | Transfer/timezone command, pause/cancel, actual systemd supervision; Mac admin/shutdown/deadline/memory-pressure requests | These actual administration requests retain their join. Host exec construction/loading/admission, original group control and native terminal open/close/input/resize/hangup use original resources and existing workers. FileProvider writeback deliberately pauses when applying staged edits, as chosen by the owner. | [host launch lifecycle](../../crates/trames-session/src/process_lifecycle_host.rs), [original launches](../../crates/trames-session/src/process_host.rs), [shared terminals](../../crates/trames-distro/src/terminals.rs) |
+| Host/legacy embedding administration | Transfer/timezone command, pause/cancel; Mac admin/shutdown/deadline/memory-pressure requests | These actual administration requests retain their join. Original init notifications and authenticated graceful-stop signal delivery no longer join. Host exec construction/loading/admission, original group control and native terminal open/close/input/resize/hangup use original resources and existing workers. FileProvider writeback deliberately pauses when applying staged edits, as chosen by the owner. | [host launch lifecycle](../../crates/trames-session/src/process_lifecycle_host.rs), [original launches](../../crates/trames-session/src/process_host.rs), [shared terminals](../../crates/trames-distro/src/terminals.rs) |
 | Final teardown and faults | Actual session/backend teardown, non-notifying native stop and unhandled fault exits | Ordinary last/group/default-fatal exit is source work; CPUs and cold Rc projections return asynchronously, with actual same-mm byte custody where needed. These are not ordinary whole-cohort exit boundaries. Accepted guest faults use the original signal path; actual unhandled/backend failures and final host teardown retain their explicit boundary. A host backend error is not an automatic full-VM or software fallback. | [source completion](../../crates/trames-session/src/process_exit.rs), [fault/dispatch](../../crates/trames-session/src/workers.rs), [native lifecycle](execution-backends.md#live-native-device-authority--2026-11-03) |
 
 The final worker-dispatch catch-all remains authoritative: an exit without a
@@ -2745,3 +2756,51 @@ Dev is deployed; stable 1.5.4, business environments and physical iPad installs
 remain unchanged. Actual host administration, missing/excluded resources,
 unadmitted/solo orchestration and generic last-resort dispatch still remain.
 The overall coordinator-removal goal stays active.
+
+## 74. Original init notification and supervision closure — 2026-11-09
+
+Both product adapters previously converted a pending systemd host-notify datagram
+into a stopped control callback. Mac also latched that administrative boundary
+before generating the guest shutdown signal. Monitor::pending, the Mac
+admin_pending flag and the iPad notification-only join are deleted. The original
+nonblocking endpoint is drained in the existing adapter poll. Mac retains its
+100 ms host-control cadence; there is no new resource/logging thread or timer bus.
+Only [1, 0, 0] notification credentials can publish READY=1 or
+X_SYSTEMD_SIGNALS_LEVEL=2. Closing inherited numeric FDs does not close the retained
+endpoint. The existing level handshake still permits exactly one SIGRTMIN+3 (37)
+when stopping. A queued root signal is retained until consumed, rather than being
+overwritten by a later empty poll.
+
+Live root-signal delivery retains the original PID 1 IoTask. Its existing policy,
+sighand, private inbox and job-control objects implement the same masked/ignored
+and nested-init semantics as stopped delivery. It cannot target a different job,
+process group or a future task reusing that PID. Queue notification happens after
+policy/queue locks are released; neither a Process/CPU borrow nor a cohort join is
+required. Solo/stopped adapters retain their existing caller path. This is an
+explicitly authorized host signal, with no added guest sender permission policy.
+
+The real four-thread init fixture sends a non-init forged handshake and repeated
+PID 1 readiness datagrams while peers compute. Host stop arrives before the real
+signal-level handshake: no signal may arrive early. The authenticated handshake
+then delivers 37 once and all threads join. The exact previous Dev runner uses
+four cohorts on both 4 and 12 CPUs; the new runner uses one with zero returned
+SVCs and zero service requests. Both pass functional checks on 1/4/12 CPUs.
+Native macOS/Linux controls verify the fixture's threads and signal completion;
+they do not implement the host monitor and are not native systemd performance
+comparisons. Deliberate delays make these functional/cohort controls, not a CPU
+throughput benchmark.
+
+The actual iPad FFI adapter test verifies notification progress without a stopped
+callback and retains explicit pause behavior. Shared tests cover credentials,
+closed inherited FDs, repeated notification, one-shot shutdown, masked/ignored
+policy, nested init and stale original task identity. Both complete local runtime
+workflows pass, together with 406 process tests per host, strict lint, FFI tests
+and both iPad compile targets. Disposable unmodified Debian systemd acceptance
+passes services, D-Bus, journal, notify, persisted deployment, graceful stop,
+mode switching, backup/restore and renewed identity on one and four CPUs.
+
+See the product [validation record](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/init-supervision-20261109.json)
+for exact source/runner/fixture hashes and gates. Only Mac Dev is updated; stable,
+business environments and physical iPad installs remain unchanged. Actual host
+administration, missing/excluded resources, initial/legacy/solo orchestration and
+last-resort dispatch remain. The overall goal stays active.

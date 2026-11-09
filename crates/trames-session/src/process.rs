@@ -5023,23 +5023,41 @@ mod tests {
             fn root_signal(&mut self) -> Option<u32> {
                 self.0.take()
             }
+            fn poll_control(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<bool> {
+                Ok(false)
+            }
             fn write(&mut self, _: OutputFd, b: &[u8]) -> std::io::Result<usize> {
                 Ok(b.len())
             }
         }
-        let mut k = kernel();
-        let mut root = process();
-        root.signals.mask |= 1 << 36;
-        k.processes
-            .insert(2, root.fork_with_memory(root.memory.clone()));
-        k.processes.insert(1, root);
-        k.control(&mut Control(Some(37))).unwrap();
-        assert_eq!(
-            k.processes.read(&1).next_signal(u64::MAX).map(|s| s.0),
-            Some(37)
-        );
-        assert!(k.processes.read(&2).next_signal(u64::MAX).is_none());
-        k.control(&mut Control(Some(65))).unwrap();
+        for live in [false, true] {
+            let mut k = kernel();
+            let mut root = process();
+            root.signals.set_mask(1 << 36);
+            k.processes
+                .insert(2, root.fork_with_memory(root.memory.clone()));
+            k.processes.insert(1, root);
+            k.publish_io_tasks(None);
+            if live {
+                assert!(!k
+                    .cohort_control(&[(1, 0), (2, 1)], &mut Control(Some(37)))
+                    .unwrap());
+            } else {
+                k.control(&mut Control(Some(37))).unwrap();
+            }
+            assert_eq!(
+                k.processes.read(&1).next_signal(u64::MAX).map(|s| s.0),
+                Some(37)
+            );
+            assert!(k.processes.read(&2).next_signal(u64::MAX).is_none());
+            if live {
+                assert!(!k
+                    .cohort_control(&[(1, 0), (2, 1)], &mut Control(Some(65)))
+                    .unwrap());
+            } else {
+                k.control(&mut Control(Some(65))).unwrap();
+            }
+        }
     }
 
     #[test]

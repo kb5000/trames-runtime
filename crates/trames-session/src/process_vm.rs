@@ -366,6 +366,7 @@ impl<C: Cpu> Kernel<C> {
                 .poll_control(&root.linux.vfs)
                 .map_err(|_| RuntimeError::Arguments("host session control failed"))?;
             let directory = root.signals.io_directory.clone();
+            let root_task = root.signals.io.clone();
             let terminal = root
                 .linux
                 .vfs
@@ -382,6 +383,11 @@ impl<C: Cpu> Kernel<C> {
                                 .load(std::sync::atomic::Ordering::Relaxed)
                 });
             drop(root);
+            // The accepted host event targets this original PID 1 task. It
+            // neither borrows its executing CPU nor signals unrelated jobs.
+            if let Some(signal) = io.root_signal() {
+                root_task.host_signal(signal);
+            }
             if io.live_host_processes() {
                 if let Some(epoch) = epoch {
                     while let Some(request) = io.host_spawn() {

@@ -137,9 +137,8 @@ pub struct Monitor {
     shutdown_sent: bool,
 }
 impl Monitor {
-    pub fn pending(&self, stopping: bool) -> bool {
-        self.socket.poll(1) != 0 || (stopping && self.signals_ready && !self.shutdown_sent)
-    }
+    /// Drain the original nonblocking endpoint while guest executors continue.
+    /// Returning a guest signal does not request a stopped scheduler callback.
     pub fn control(&mut self, stopping: bool) -> Result<Option<u32>> {
         while self.socket.poll(1) != 0 {
             let message = self.socket.recv(65536, 0x40)?;
@@ -201,6 +200,51 @@ pub fn renew_identity(vfs: &mut Vfs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn original_notify_endpoint_authenticates_init_and_latches_one_shutdown() {
+        let mut vfs = Vfs::default();
+        let address = b"\x01\x00\x00trames-init-monitor";
+        let receiver = vfs.local_create(2 | trames_vfs::O_NONBLOCK, 0).unwrap();
+        let socket = vfs.local_socket(receiver).unwrap().unwrap();
+        socket.set_reuse(16, 1).unwrap();
+        vfs.local_bind(&socket, address).unwrap();
+        vfs.close(receiver).unwrap(); // PID 1 may close all inherited FDs.
+        let sender = vfs.local_create(2, 0).unwrap();
+        let sender = vfs.local_socket(sender).unwrap().unwrap();
+        let mut monitor = Monitor {
+            socket,
+            signals_ready: false,
+            ready: false,
+            shutdown_sent: false,
+        };
+        let send = |bytes: &[u8], credentials| {
+            vfs.local_send_credentials(
+                &sender,
+                bytes,
+                0,
+                Some(address),
+                Default::default(),
+                credentials,
+            )
+            .unwrap();
+        };
+        assert_eq!(monitor.control(true).unwrap(), None);
+        for credentials in [[2, 0, 0], [1, 1000, 0], [1, 0, 1000]] {
+            send(b"READY=1\nX_SYSTEMD_SIGNALS_LEVEL=2", credentials);
+        }
+        assert_eq!(monitor.control(true).unwrap(), None);
+        assert!(!monitor.ready && !monitor.signals_ready && !monitor.shutdown_sent);
+        send(b"READY=1", [1, 0, 0]);
+        assert_eq!(monitor.control(true).unwrap(), None);
+        assert!(monitor.ready && !monitor.signals_ready);
+        send(b"X_SYSTEMD_SIGNALS_LEVEL=2\nREADY=1", [1, 0, 0]);
+        assert_eq!(monitor.control(true).unwrap(), Some(37));
+        assert!(monitor.shutdown_sent);
+        send(b"X_SYSTEMD_SIGNALS_LEVEL=2\nREADY=1", [1, 0, 0]);
+        assert_eq!(monitor.control(true).unwrap(), None);
+        assert_eq!(monitor.control(false).unwrap(), None);
+    }
+
     #[test]
     fn imported_machine_identity_is_renewed_consistently() {
         let mut vfs = Vfs::default();
