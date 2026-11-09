@@ -28,6 +28,8 @@ pub use file_layouts::{FileLayoutDriver, FileLayoutRequest, FileLayouts};
 mod host_files;
 pub use host_files::{HostFileAdmission, HostFileLayout, HostFileTask};
 mod heap;
+mod memory_queries;
+pub use memory_queries::{memory_query, memory_query_entry};
 mod path_queries;
 mod render;
 pub use heap::ProgramBreak;

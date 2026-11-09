@@ -1279,6 +1279,20 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                     job.seccomp_entry = Some(entry);
                                     break result;
                                 }
+                                if let Some(snapshot)=work.syscalls.as_ref().filter(|_|trames_linux::memory_query_entry(work.cpu.x(8) as u32,std::array::from_fn(|i|work.cpu.x(i)))) {
+                                    let number=work.cpu.x(8) as u32;
+                                    let args=std::array::from_fn(|i|work.cpu.x(i));
+                                    let entry=snapshot.seccomp.entry_decision(number,work.cpu.pc(),args);
+                                    if !entry.allowed() {job.seccomp_entry=Some(entry);break result;}
+                                    let began=snapshot.profile.then(Instant::now);
+                                    let attempt=trames_linux::memory_query(work.memory.as_deref_mut().expect("memory observation View"),number,args);
+                                    if let Some(began)=began {syscall_time+=began.elapsed();}
+                                    if let Some(value)=attempt {
+                                        work.trace.finish(&mut work.cpu,value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));
+                                        syscalls+=1;continue;
+                                    }
+                                    job.seccomp_entry=Some(entry);
+                                }
                                 // Decide before custody: pure policy errors need
                                 // neither mm quiescence nor an owner callback.
                                 // Carry an allowed/deferred decision exactly once.

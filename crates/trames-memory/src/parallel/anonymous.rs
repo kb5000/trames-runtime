@@ -266,6 +266,14 @@ impl Anonymous {
         self.base_range(address)
             .or_else(|| self.live.range(address))
     }
+    pub(super) fn mapped_end(&self, address: u64) -> Option<u64> {
+        Some(self.range(address)?.end)
+    }
+    pub(super) fn resident(&self, address: u64) -> u8 {
+        self.range(address)
+            .and_then(|range| range.store.lookup(address))
+            .map_or(0, |page| u8::from(page.charge.resident()))
+    }
     pub(super) fn overlaps(&self, start: u64, end: u64) -> bool {
         self.base_range(start).is_some()
             || self.ranges.range(start..end).next().is_some()

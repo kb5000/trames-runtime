@@ -4055,6 +4055,119 @@ mod tests {
         }
     }
     #[test]
+    fn memory_observations_filter_once_before_queries_or_checkpoint_selection() {
+        for (number, args) in [
+            (236u32, [0x1000, 0x1010, 65, 0, 4, 0]),
+            (
+                232,
+                [0x10000, 3 * trames_memory::PAGE_SIZE, 0x1000, 0, 0, 0],
+            ),
+            (233, [0x20000, 2 * trames_memory::PAGE_SIZE, 3, 0, 0, 0]),
+        ] {
+            for decision in [ALLOW, 0x5007b] {
+                for slots in [1, 4] {
+                    let mut k = super::super::tests::kernel();
+                    k.cpu_count = 4;
+                    k.workers = crate::workers::Pool::new(slots);
+                    k.per_cpu = vec![Duration::ZERO; 4];
+                    k.profile_syscalls = true;
+                    let mut p = super::super::tests::process();
+                    p.memory
+                        .map(
+                            0x10000,
+                            3 * trames_memory::PAGE_SIZE,
+                            trames_memory::Permissions::RW,
+                        )
+                        .unwrap();
+                    p.memory
+                        .reserve(0x20000, 2 * trames_memory::PAGE_SIZE, false)
+                        .unwrap();
+                    p.memory.write(0x1000, &[0xa5; 32]).unwrap();
+                    let words = [
+                        0xaa1403e0u32,
+                        0xaa1503e1,
+                        0xaa1603e2,
+                        0xaa1703e3,
+                        0xaa1803e4,
+                        0xaa1903e5,
+                        0xd4000001,
+                        0xaa0003f3,
+                        0x17fffff8,
+                    ];
+                    p.memory
+                        .write(
+                            0x4000,
+                            &words
+                                .into_iter()
+                                .flat_map(u32::to_le_bytes)
+                                .collect::<Vec<_>>(),
+                        )
+                        .unwrap();
+                    p.memory
+                        .protect(
+                            0x4000,
+                            trames_memory::PAGE_SIZE,
+                            trames_memory::Permissions::RX,
+                        )
+                        .unwrap();
+                    for (i, value) in args.into_iter().enumerate() {
+                        p.cpu.set_x(20 + i, value);
+                    }
+                    p.cpu.set_x(8, number as u64);
+                    p.seccomp.push(Arc::new(
+                        Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
+                    ));
+                    p.signals.io.scheduling.set_affinity((1 << slots) - 1);
+                    let mut peer = super::super::tests::process();
+                    peer.tgid = 2;
+                    peer.signals.io.scheduling.set_affinity((1 << slots) - 1);
+                    peer.memory
+                        .write(0x4000, &0x14000000u32.to_le_bytes())
+                        .unwrap();
+                    peer.memory
+                        .protect(
+                            0x4000,
+                            trames_memory::PAGE_SIZE,
+                            trames_memory::Permissions::RX,
+                        )
+                        .unwrap();
+                    k.processes.insert(1, p);
+                    k.processes.insert(2, peer);
+                    assert!(k
+                        .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
+                        .unwrap());
+                    assert!(k.worker_syscalls > 0);
+                    assert_eq!(k.syscalls, k.worker_syscalls);
+                    assert_eq!(
+                        k.processes.read(&1).seccomp.evaluations(),
+                        k.worker_syscalls
+                    );
+                    assert_eq!(
+                        k.processes.read(&1).cpu.x(19),
+                        if decision == ALLOW {
+                            0
+                        } else {
+                            0u64.wrapping_sub(123)
+                        }
+                    );
+                    if decision != ALLOW {
+                        assert_eq!(
+                            k.processes
+                                .read(&1)
+                                .memory
+                                .read_array::<32>(0x1000)
+                                .unwrap(),
+                            [0xa5; 32]
+                        );
+                    }
+                    assert_eq!(k.vm_checkpoint_groups, 0);
+                    assert!(k.cohort_return_syscalls.is_empty());
+                    assert_eq!(k.service_requests, 0);
+                }
+            }
+        }
+    }
+    #[test]
     fn source_poweroff_filters_once_before_original_group_effects() {
         for decision in [ALLOW, 0x5007b] {
             for slots in [1, 4] {

@@ -787,7 +787,7 @@ impl Linux {
         memory.write(a[4], &out).map_err(|_| Errno(14))?;
         Ok(0)
     }
-    fn page_length(len: u64) -> Result<u64> {
+    pub(crate) fn page_length(len: u64) -> Result<u64> {
         if len == 0 {
             return Err(Errno(22));
         }
@@ -820,7 +820,7 @@ impl Linux {
         self.heap.set_current(address);
         address
     }
-    fn memory_errno(e: MemoryError) -> Errno {
+    pub(crate) fn memory_errno(e: MemoryError) -> Errno {
         Errno(match e {
             MemoryError::UnalignedMapping
             | MemoryError::InvalidRange
@@ -1533,24 +1533,9 @@ impl Linux {
                 memory.sync_range(a[0], len).map_err(Self::memory_errno)?;
                 Ok(0)
             },
-            232 => {
-                if a[1] == 0 {
-                    return if a[0].is_multiple_of(PAGE_SIZE) {
-                        Ok(0)
-                    } else {
-                        Err(Errno(22))
-                    };
-                }
-                let len = Self::page_length(a[1])?;
-                if len > trames_memory::MAX_DESCRIBED_BYTES as u64 {
-                    return Err(Errno(12));
-                }
-                let resident = memory.resident(a[0], len).map_err(Self::memory_errno)?;
-                Self::check(memory, a[2], resident.len(), Access::Write)?;
-                memory.write(a[2], &resident).map_err(|_| Errno(14))?;
-                Ok(0)
-            },
+            232 => crate::memory_query(memory,232,a).expect("original residency capability"),
             233 => {
+                if a[2] as u32 != 4 { return crate::memory_query(memory,233,a).expect("original mapping capability"); }
                 if !a[0].is_multiple_of(PAGE_SIZE) {
                     return Err(Errno(22));
                 }
@@ -1561,13 +1546,7 @@ impl Linux {
                     return Ok(0);
                 }
                 let len = Self::page_length(a[1])?;
-                if a[2] as u32 == 4 {
-                    memory.discard(a[0], len).map_err(Self::memory_errno)?;
-                } else {
-                    memory
-                        .validate_mapped(a[0], len)
-                        .map_err(Self::memory_errno)?;
-                }
+                memory.discard(a[0], len).map_err(Self::memory_errno)?;
                 Ok(0)
             },
             214 => Ok(self.brk(a[0], memory)),

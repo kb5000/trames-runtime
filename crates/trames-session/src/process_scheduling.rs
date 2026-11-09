@@ -19,47 +19,9 @@ impl<C: Cpu> Kernel<C> {
         .scheduling(&p.signals.io, self.cpu_count, number, a, &mut p.memory)
     }
     pub(super) fn mempolicy(p: &mut Process<C>, a: [u64; 6]) -> Result<Option<u64>, Errno> {
-        let flags = a[4];
-        if flags & !7 != 0
-            || flags & 4 != 0 && flags & 3 != 0
-            || flags == 1
-            || a[3] != 0 && flags & 2 == 0
-        {
-            return Err(Errno(22));
-        }
-        if flags & 2 != 0
-            && !p
-                .memory
-                .regions()
-                .iter()
-                .any(|(start, end, _)| a[3] >= *start && a[3] < *end)
-        {
-            return Err(Errno(14));
-        }
-        if a[0] != 0 {
-            Linux::check(&p.memory, a[0], 4, Access::Write)?;
-        }
-        let length = if a[1] != 0 {
-            if a[2] == 0 || a[2] > 65536 {
-                return Err(Errno(22));
-            }
-            let length = a[2].div_ceil(64) as usize * 8;
-            Linux::check(&p.memory, a[1], length, Access::Write)?;
-            length
-        } else {
-            0
-        };
-        if a[0] != 0 {
-            write_u32(&mut p.memory, a[0], 0)?;
-        } // MPOL_DEFAULT, or node 0 with F_NODE
-        if length != 0 {
-            let mut mask = vec![0; length];
-            if flags & 4 != 0 {
-                mask[0] = 1;
-            } // allowed node mask; default policy mask is empty
-            p.memory.write(a[1], &mask).map_err(|_| Errno(14))?;
-        }
-        Ok(Some(0))
+        trames_linux::memory_query(&mut p.memory, 236, a)
+            .expect("memory policy ABI")
+            .map(Some)
     }
 }
 #[cfg(all(test, trames_interpreter_conformance))]

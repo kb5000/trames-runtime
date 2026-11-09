@@ -1,11 +1,17 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 80, original guest power control, reviewed on 2026-11-09. The prior shared runtime
-baseline is `30546645a3a2170200162a4b5b06383590f49055`.
+This is the consolidated implementation audit through stage 81, original read-only memory observations, reviewed on 2026-11-09. The prior shared runtime
+baseline is `75b9edadad2bf34884d8475765b7e3ab842f5044`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-09
+
+Stage 81 removes read-only memory observation from joined or mapping-checkpoint
+execution. get_mempolicy, mincore and implemented non-discard madvise share one
+source/solo ABI. Admitted Views observe original mapping extents, reservation
+intervals and shared resident charges without loading pages or constructing byte
+actors. Only actual discard/mapping changes keep their original mutation scope.
 
 Stage 80 removes supported guest halt/poweroff from joined syscall execution.
 Source and solo use one authority/magic/command/namespace policy. The original
@@ -260,6 +266,7 @@ is not a claim that all coordinator work is removed.
 | fork/clone/vfork and execve/execveat | Existing workers handle pure and mixed mapping scopes, nonleader replacement and original old-mm retirement; existing disk pool prepares native images without a CPU slot | Affected actors still quiesce. Capability-less embeddings, solo and host invocation remain separate |
 | Structural VM edits, pins and mapped-file layout changes | Supported mapping/buffer-registration checkpoints publish on existing workers with original task/mm custody; additive anonymous mmap runs directly while peers continue | Proc/cold-mm checkpoints and supported mapped-file transactions now run on existing workers. Unsupported backing/lifetime/policy and capability-less embeddings retain explicit boundaries |
 | Native libc/GPU/video/audio bodies, waits and before-effects mapping/entry checkpoints | Calling/shared-resource execution; exceptional access uses original task/mm custody on an existing executor, then retains resource waits | Capability-less embeddings and actual platform/host lifecycle retain their boundary. Single-CPU/solo calls use their existing caller. Local libc/DirectFile/HVF fallback alone is not an owner transition |
+| Read-only VM observations and implemented non-discard advice | Calling executor, original admitted mappings/reservations and per-page resident metadata; common source/solo ABI | No observation-only join or mm checkpoint. Genuine absent custom observation capabilities retain explicit before-effects fallback; actual discard/mapping mutation remains scoped |
 | Guest halt/poweroff | Calling executor and original root/caller group exit controls; common policy for source/solo | No supported power-control-only join. Missing original shutdown/exit capabilities keep explicit legacy execution. Unsupported restart/kexec and nested PID namespace power behavior retain their existing errno |
 | System statistics and live CPU accounting | sysinfo and proc consume original task/mm/host resources; original execution assignments publish live time | No supported-statistics-only join remains. Genuine absent statistics/host capabilities retain legacy execution; load remains a five-second observer-sampled approximation |
 | Dynamic proc/sys views and proc pathname/FD consumers | Original PID/mm/Files/fs/namespace resources on the calling worker; owner/solo queries use the same provider | First cross-mm byte export and invalidation now activate on an existing worker using only original task/mm custody. Legacy embeddings without a provider and actual policy remain separate |
@@ -3162,3 +3169,51 @@ installed evidence are in the [validation record](https://github.com/kb5000/tram
 Host cancel/deadline/shutdown/final teardown, other missing/excluded resources,
 other known-resource/HLT/fault fallback and initial/legacy/solo orchestration
 remain. The overall coordinator-removal goal is still active.
+
+## 81. Original read-only memory observations — 2026-11-09
+
+get_mempolicy(236) no longer constructs an owner regions vector. Its address
+query uses the executor's existing translation-presence contract, including
+PROT_NONE reservations. Raw target addresses retain the previous untagged ABI;
+ordinary byte destinations retain existing TBI and permission behavior. Flags,
+node-mask bounds, output preflight/order and the single-node policy are shared
+with solo/legacy execution. No new NUMA placement API is implemented.
+
+mincore(232) and currently implemented non-discard madvise(233) use two optional
+CpuMemory observation capabilities. Original Memory and View expose the same
+ABI. A View validates complete mapped coverage by original anonymous/reservation
+extent ends and existing described pages. Huge untouched ranges are skipped as
+intervals, rather than materialized or walked one virtual page at a time.
+Residency reads original shared Charge state and admitted backing validity.
+Sparse lookup does not construct Frame metadata, allocate a resident page, call
+PageSource::load or retain guest bytes. Insert-only live mappings and another
+actor's actual writes remain visible through the original store.
+
+This preserves the existing per-page charged/backing-validity reporting model;
+it does not add a host-pager residency bitmap or change native residency policy.
+Observation output still uses the existing guest-memory checks/byte protocol.
+An overlapping mincore vector is observed before output preflight/writes can
+make that destination resident. Original length limits, holes, pointer/error
+ordering, reservations and ABI argument widths remain. Non-discard advice keeps
+its existing no-op semantics; actual MADV_DONTNEED continues through original
+mapping/byte mutation admission. No extra service thread, polling bus, ordinary
+memory fence/check or per-instruction hook is introduced.
+
+Accepted source query entries retain one seccomp decision before observation or
+mapping-scope selection. Genuine custom CpuMemory implementations without a
+required observation capability defer before output effects. Supported original
+Memory/View callers do not take that boundary. Structural VM editing, backing
+layout changes and actual discard are not reclassified as observations.
+
+Conformance covers owner/View ABI parity, complete preflight/error ordering,
+inaccessible and huge untouched ranges, shared live additions/writes, deferred
+file page-in, an overlapping mincore output, absent capabilities and source
+ALLOW/ERRNO decisions. Each shared-mm actor observes once and parks on an
+original infinite futex wait, so all 4/12 logical actors and the one-slot case
+finish without a host-time/global-budget fairness assumption. No observation
+returns or mapping checkpoints occur. Consumer hardware and installed evidence
+are in the [validation record](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/memory-observation-20261109.json).
+
+Host cancellation/deadline/shutdown/final teardown, other missing/excluded
+resources, other final SVC/HLT/fault dispatch and initial/legacy/solo orchestration
+remain. The overall coordinator-removal goal stays active.

@@ -9,6 +9,7 @@ mod hardware;
 #[cfg(test)]
 mod layout_tests;
 mod native;
+mod observation;
 pub(super) mod page;
 #[cfg(test)]
 mod readonly;
@@ -1047,6 +1048,12 @@ impl View {
     }
 }
 impl CpuMemory for View {
+    fn validate_mapped(&self, address: u64, len: u64) -> Option<Result<(), MemoryError>> {
+        Some(self.observe_mapped(address, len))
+    }
+    fn resident(&self, address: u64, len: u64) -> Option<Result<Vec<u8>, MemoryError>> {
+        Some(self.observe_resident(address, len))
+    }
     fn proc_address_space(&self) -> Option<u64> {
         Some(self.snapshot.original_identity)
     }

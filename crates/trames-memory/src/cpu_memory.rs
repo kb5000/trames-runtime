@@ -26,6 +26,14 @@ impl<M> std::ops::DerefMut for CpuSlice<'_, M> {
 }
 
 pub trait CpuMemory {
+    /// Read-only VMA/residency observations. Missing embedding capabilities defer
+    /// before effects; neither hook may fault in bytes or allocate observed pages.
+    fn validate_mapped(&self, _address: u64, _len: u64) -> Option<Result<(), MemoryError>> {
+        None
+    }
+    fn resident(&self, _address: u64, _len: u64) -> Option<Result<Vec<u8>, MemoryError>> {
+        None
+    }
     /// Immutable original mm identity, independent of decoder revision wraps.
     /// This is only consulted by accepted proc reads, never ordinary accesses.
     fn proc_address_space(&self) -> Option<u64> {
@@ -154,6 +162,12 @@ pub trait CpuMemory {
 }
 
 impl CpuMemory for Memory {
+    fn validate_mapped(&self, address: u64, len: u64) -> Option<Result<(), MemoryError>> {
+        Some(Memory::validate_mapped(self, address, len))
+    }
+    fn resident(&self, address: u64, len: u64) -> Option<Result<Vec<u8>, MemoryError>> {
+        Some(Memory::resident(self, address, len))
+    }
     fn proc_address_space(&self) -> Option<u64> {
         self.shared.as_ref().map_or_else(
             || Some(self.original_identity),
