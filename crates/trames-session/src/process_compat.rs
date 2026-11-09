@@ -12,29 +12,7 @@ impl<C: Cpu> Kernel<C> {
         p: &mut Process<C>,
         a: [u64; 6],
     ) -> Result<Option<u64>, Errno> {
-        if !p.linux.vfs.credentials.has_cap(capabilities::SYS_BOOT) {
-            return Err(Errno(1));
-        }
-        if a[0] as u32 != 0xfee1_dead
-            || !matches!(
-                a[1] as u32,
-                0x2812_1969 | 0x0512_1996 | 0x1604_1998 | 0x2011_2000
-            )
-        {
-            return Err(Errno(22));
-        }
-        match a[2] as u32 {
-            0xcdef_0123 | 0x4321_fedc => {}
-            0x0123_4567 | 0xa1b2_c3d4 | 0x4558_4543 | 0xd000_fce2 | 0x89ab_cdef | 0 => {
-                return Err(Errno(95))
-            }
-            _ => return Err(Errno(22)),
-        }
-        // Nested PID namespace restart/status translation is not implemented.
-        // Never let its init stop the containing guest environment.
-        if p.linux.vfs.pid_namespace().is_nested() {
-            return Err(Errno(95));
-        }
+        trames_kernel::power::prepare(&p.linux.vfs.credentials, p.linux.vfs.pid_namespace(), a)?;
         // A guest halt/poweroff ends this userspace kernel using the existing
         // root-exit teardown. No host reboot, signal or device API is invoked.
         if p.tgid != 1 {

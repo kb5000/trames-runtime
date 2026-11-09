@@ -4055,6 +4055,88 @@ mod tests {
         }
     }
     #[test]
+    fn source_poweroff_filters_once_before_original_group_effects() {
+        for decision in [ALLOW, 0x5007b] {
+            for slots in [1, 4] {
+                let mut k = super::super::tests::kernel();
+                k.cpu_count = 4;
+                k.workers = crate::workers::Pool::new(slots);
+                k.per_cpu = vec![Duration::ZERO; 4];
+                k.profile_syscalls = true;
+                let mut p = super::super::tests::process();
+                k.install_proc_source(&p, None);
+                p.seccomp.push(Arc::new(
+                    Filter::validate(vec![
+                        i(0x20, 0, 0, 0),
+                        i(0x15, 0, 1, 142),
+                        i(6, 0, 0, decision),
+                        i(6, 0, 0, ALLOW),
+                    ])
+                    .unwrap(),
+                ));
+                let policy = p.seccomp.clone();
+                let words = [
+                    0xd4000001u32,
+                    0xaa0003f3,
+                    0xd28000e0,
+                    0xd2800bc8,
+                    0xd4000001,
+                ];
+                p.memory
+                    .write(
+                        0x4000,
+                        &words
+                            .into_iter()
+                            .flat_map(u32::to_le_bytes)
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap();
+                p.memory
+                    .protect(
+                        0x4000,
+                        trames_memory::PAGE_SIZE,
+                        trames_memory::Permissions::RX,
+                    )
+                    .unwrap();
+                p.cpu.set_x(8, 142);
+                p.cpu.set_x(0, 0xfee1_dead);
+                p.cpu.set_x(1, 0x2812_1969);
+                p.cpu.set_x(2, 0xcdef_0123);
+                p.signals.io.scheduling.set_affinity((1 << slots) - 1);
+                let mut peer = p.fork();
+                peer.tgid = 2;
+                peer.family.set_parent(1);
+                peer.memory
+                    .write(0x5000, &0x14000000u32.to_le_bytes())
+                    .unwrap();
+                peer.memory
+                    .protect(
+                        0x5000,
+                        trames_memory::PAGE_SIZE,
+                        trames_memory::Permissions::RX,
+                    )
+                    .unwrap();
+                peer.cpu.pc = 0x5000;
+                k.processes.insert(1, p);
+                k.processes.insert(2, peer);
+                let exit = k
+                    .drive(&mut trames_linux::CapturedOutput::default(), 1_000_000)
+                    .unwrap();
+                let expected = if decision == ALLOW { 0 } else { 7 };
+                assert_eq!(exit.code, expected);
+                assert_eq!(k.parallel_rounds, 1);
+                assert!(
+                    k.cohort_return_syscalls.is_empty(),
+                    "{:?}",
+                    k.cohort_return_syscalls
+                );
+                assert_eq!(k.service_requests, 0);
+                assert_eq!(policy.evaluations(), if decision == ALLOW { 1 } else { 2 });
+                assert_eq!(k.worker_syscalls, if decision == ALLOW { 1 } else { 2 });
+            }
+        }
+    }
+    #[test]
     fn sysinfo_observes_source_resources_after_exactly_one_filter_decision() {
         for (decision, address) in [(ALLOW, 0x1000u64), (ALLOW, 0), (0x5007b, 0x1000)] {
             for slots in [1, 4] {

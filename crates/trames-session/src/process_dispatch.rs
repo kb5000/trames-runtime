@@ -36,6 +36,7 @@ pub(super) struct Dispatch {
     futexes: crate::futex::Futexes,
     files: Arc<dyn trames_linux::FileExecutor>,
     statistics: Option<Arc<dyn trames_linux::SystemStatistics>>,
+    shutdown: Option<Arc<dyn Fn() + Send + Sync>>,
     layouts: Arc<trames_linux::FileLayouts>,
     gpu_budget: trames_vulkan::Budget,
     gpu_display: trames_vulkan::Display,
@@ -52,6 +53,7 @@ impl Dispatch {
             timers: k.timers.clone(),
             futexes: k.futexes.clone(),
             files: k.workers.file_executor(),
+            shutdown: k.guest_shutdown.get().cloned(),
             statistics: k
                 .proc_source
                 .as_ref()
@@ -213,6 +215,7 @@ impl Dispatch {
                 program_break: p.linux.program_break(),
                 uts: Some(p.linux.vfs.uts_capability()),
                 direct: trames_linux::DirectSyscalls::new(p.linux.vfs.direct_descriptors())
+                    .with_guest_shutdown(self.shutdown.clone())
                     .with_statistics(self.statistics.clone())
                     .with_aio(p.linux.aio.clone(), p.linux.vfs.native_events())
                     .with_task_signal(p.signals.io.clone())

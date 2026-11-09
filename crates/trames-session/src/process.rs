@@ -675,6 +675,7 @@ pub(crate) struct Kernel<C: Cpu> {
     proc_refreshes: u64,
     proc_maps: RefCell<BTreeMap<u64, ProcMaps>>,
     proc_source: Option<Arc<crate::proc_views::Source>>,
+    guest_shutdown: std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>,
     proc_owner_waits: Vec<proc::ProcReadWait<C>>,
     profile_syscalls: bool,
     idle: Duration,
@@ -744,6 +745,14 @@ fn strings(m: &Memory, address: u64) -> Result<Vec<Vec<u8>>, Errno> {
 impl<C: Cpu> Kernel<C> {
     fn publish_task(&self, id: u32, p: &Process<C>) {
         self.publish_task_core(id, p);
+        if id == 1 {
+            self.guest_shutdown.get_or_init(|| {
+                let group = p.signals.io.lifecycle().clone();
+                Arc::new(move || {
+                    group.request_exit(0);
+                })
+            });
+        }
         birth::Birth::capture(self).publish_family(id, p);
         self.bind_task_cgroup(id, p);
     }
@@ -4766,6 +4775,7 @@ pub(super) fn run<C: Cpu>(
         proc_refreshes: 0,
         proc_maps: RefCell::new(BTreeMap::new()),
         proc_source: None,
+        guest_shutdown: Default::default(),
         proc_owner_waits: Vec::new(),
         profile_syscalls: runtime.profile_syscalls,
         idle: Duration::ZERO,
@@ -6599,6 +6609,7 @@ mod tests {
             proc_refreshes: 0,
             proc_maps: RefCell::new(BTreeMap::new()),
             proc_source: None,
+            guest_shutdown: Default::default(),
             proc_owner_waits: Vec::new(),
             profile_syscalls: false,
             idle: Duration::ZERO,
@@ -9502,3 +9513,7 @@ mod job_tests;
 #[cfg(all(test, trames_interpreter_conformance))]
 #[path = "process_statistics_tests.rs"]
 mod statistics_tests;
+
+#[cfg(all(test, trames_interpreter_conformance))]
+#[path = "process_power_tests.rs"]
+mod power_tests;

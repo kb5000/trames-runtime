@@ -1,11 +1,18 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 79, original system statistics, reviewed on 2026-11-09. The prior shared runtime
-baseline is `04ec423f35a222642a2bcbde3b93a568d7f9968a`.
+This is the consolidated implementation audit through stage 80, original guest power control, reviewed on 2026-11-09. The prior shared runtime
+baseline is `30546645a3a2170200162a4b5b06383590f49055`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-09
+
+Stage 80 removes supported guest halt/poweroff from joined syscall execution.
+Source and solo use one authority/magic/command/namespace policy. The original
+root publication retains its actual thread-group control; later dispatch and
+child/image admission cannot resolve a different numeric PID 1. Source requests
+root/caller group exit through existing original lifecycle resources. Actual
+CPU return, cancellation and backend/session teardown keep their necessary scope.
 
 Stage 79 removes supported `sysinfo` execution and live system-accounting
 refresh from joined control. Source/solo share one AArch64 ABI. The original
@@ -253,6 +260,7 @@ is not a claim that all coordinator work is removed.
 | fork/clone/vfork and execve/execveat | Existing workers handle pure and mixed mapping scopes, nonleader replacement and original old-mm retirement; existing disk pool prepares native images without a CPU slot | Affected actors still quiesce. Capability-less embeddings, solo and host invocation remain separate |
 | Structural VM edits, pins and mapped-file layout changes | Supported mapping/buffer-registration checkpoints publish on existing workers with original task/mm custody; additive anonymous mmap runs directly while peers continue | Proc/cold-mm checkpoints and supported mapped-file transactions now run on existing workers. Unsupported backing/lifetime/policy and capability-less embeddings retain explicit boundaries |
 | Native libc/GPU/video/audio bodies, waits and before-effects mapping/entry checkpoints | Calling/shared-resource execution; exceptional access uses original task/mm custody on an existing executor, then retains resource waits | Capability-less embeddings and actual platform/host lifecycle retain their boundary. Single-CPU/solo calls use their existing caller. Local libc/DirectFile/HVF fallback alone is not an owner transition |
+| Guest halt/poweroff | Calling executor and original root/caller group exit controls; common policy for source/solo | No supported power-control-only join. Missing original shutdown/exit capabilities keep explicit legacy execution. Unsupported restart/kexec and nested PID namespace power behavior retain their existing errno |
 | System statistics and live CPU accounting | sysinfo and proc consume original task/mm/host resources; original execution assignments publish live time | No supported-statistics-only join remains. Genuine absent statistics/host capabilities retain legacy execution; load remains a five-second observer-sampled approximation |
 | Dynamic proc/sys views and proc pathname/FD consumers | Original PID/mm/Files/fs/namespace resources on the calling worker; owner/solo queries use the same provider | First cross-mm byte export and invalidation now activate on an existing worker using only original task/mm custody. Legacy embeddings without a provider and actual policy remain separate |
 | Mount topology administration | Calling worker and original namespace/fs_struct resources, with existing disk workers only for host-backed path work | Busy transactions park the caller on original readiness. Genuinely excluded path controls keep separate boundaries |
@@ -3115,3 +3123,42 @@ Actual cancellation/deadline/shutdown/final teardown, missing/excluded resources
 other known-resource/HLT/fault fallback and initial/legacy/solo orchestration
 remain. This closes one connected supported statistics subsystem, not the full
 coordinator-removal goal. Only Mac Dev deployment is included.
+
+## 80. Original guest power control and group completion — 2026-11-09
+
+Supported Linux halt/poweroff validates live original credentials, int-width
+magic/command arguments and the caller's PID namespace with the same policy as
+solo/legacy execution. EPERM precedes malformed magic; unsupported commands and
+nested namespace behavior keep their original results. No reboot, signal or
+power-management API is called on the host. Unused guest pointer arguments are
+not dereferenced.
+
+The first root publication retains its original group in one existing-session
+OnceLock. Dispatch and future child/exec capture retain that same authority,
+without a task-body borrow, PID lookup or copied signal owner. Root rekey/retire
+or a legacy numeric replacement cannot redirect an accepted control. A source
+caller requests the original root group and its own group to exit with status
+zero. Original members, active execution leases, dormant waiters and resource
+cleanup use the existing group lifecycle. First terminal status still wins;
+accepted native/disk work and actual byte/task custody keep their existing drain
+requirements. A successful call never executes the following guest instruction.
+
+Seccomp is evaluated once before effects; errors complete on the caller even
+when shutdown capabilities are absent. A valid genuinely capability-less caller
+defers before changing either group. No new service/coordinator thread, polling
+bus, ordinary guest memory check/fence or per-instruction check is introduced.
+Actual final session/backend teardown still stops and drains its real CPU actors;
+this change removes the syscall handoff preceding that teardown.
+
+Shared conformance covers both commands from root, its nonleader, an independent
+child and that child's nonleader on 4/12 logical CPUs and one execution slot.
+It also covers original route lifetime, numeric replacement, changing live
+credentials, error ordering, nested namespace rejection, missing capabilities
+and seccomp ALLOW/ERRNO. The native hardware fixture creates CLONE_THREAD peers
+running raw AArch64 instructions and checks original group completion. The
+baseline returns reboot(142) to joined dispatch. Consumer final hardware and
+installed evidence are in the [validation record](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/guest-power-20261109.json).
+
+Host cancel/deadline/shutdown/final teardown, other missing/excluded resources,
+other known-resource/HLT/fault fallback and initial/legacy/solo orchestration
+remain. The overall coordinator-removal goal is still active.

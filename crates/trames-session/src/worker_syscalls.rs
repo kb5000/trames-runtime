@@ -699,6 +699,7 @@ impl Snapshot {
         match cpu.x(8) as u32 {
             number if trames_kernel::scheduling::call(number) => true,
             93 | 94 => self.exit_files.is_some(),
+            142 => true,
             96 => self.io_signals.thread_addresses().is_some(),
             167 => match cpu.x(0) as u32 {
                 1 | 2 => self.io_signals.parentage().is_some(),
@@ -707,6 +708,21 @@ impl Snapshot {
             },
             _ => false,
         }
+    }
+    pub fn shutdown_guest(&self, args: [u64; 6], source: bool) -> Option<Result<(), Errno>> {
+        if let Err(error) = trames_kernel::power::prepare(
+            &self.io_signals.credentials().read(),
+            &self.io_routes.namespace,
+            args,
+        ) {
+            return Some(Err(error));
+        }
+        if !source || self.exit_files.is_none() {
+            return None;
+        }
+        self.direct.request_guest_shutdown()?;
+        self.io_signals.lifecycle().request_exit(0);
+        Some(Ok(()))
     }
     pub fn exit_thread(&self, pid: u32, status: i32, memory: &mut impl CpuMemory) -> Option<Exit> {
         let files = self.exit_files.as_ref()?;

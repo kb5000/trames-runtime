@@ -6,6 +6,7 @@ pub mod children;
 pub mod completion;
 pub mod family;
 pub mod limits;
+pub mod power;
 pub mod scheduling;
 pub mod signal;
 pub mod task;

@@ -1305,6 +1305,16 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                                 job.seccomp_entry=entry.take();break result;
                                             }
                                         }
+                                        if work.cpu.x(8) as u32 == 142 {
+                                            let began=snapshot.profile.then(Instant::now);
+                                            let attempt=snapshot.shutdown_guest(std::array::from_fn(|i|work.cpu.x(i)),epoch.is_some());
+                                            if let Some(began)=began {syscall_time+=began.elapsed();}
+                                            match attempt {
+                                                Some(Err(error))=>{work.trace.finish(&mut work.cpu,0u64.wrapping_sub(error.0 as u64));syscalls+=1;continue;}
+                                                Some(Ok(()))=>{syscalls+=1;continue;}
+                                                None=>{job.seccomp_entry=entry;break result;}
+                                            }
+                                        }
                                         if matches!(work.cpu.x(8) as u32, 93 | 94) {
                                             let status=(work.cpu.x(0) as u8 as i32)<<8;
                                             if work.cpu.x(8) as u32 == 94 { snapshot.io_signals.lifecycle().request_exit(status); }

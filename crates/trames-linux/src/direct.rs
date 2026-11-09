@@ -217,6 +217,7 @@ pub fn epoll_scatter(
 
 #[derive(Default)]
 pub struct DirectSyscalls {
+    shutdown: Option<Arc<dyn Fn() + Send + Sync>>,
     statistics: Option<Arc<dyn crate::SystemStatistics>>,
     signal_reader: Option<Arc<dyn trames_vfs::SignalReader>>,
     task_signal: Option<Arc<dyn trames_vfs::TaskSignal>>,
@@ -250,6 +251,15 @@ pub struct DirectSyscalls {
     completed: Cell<u64>,
 }
 impl DirectSyscalls {
+    /// Retain the original guest root group, never a numeric PID/host callback.
+    pub fn with_guest_shutdown(mut self, shutdown: Option<Arc<dyn Fn() + Send + Sync>>) -> Self {
+        self.shutdown = shutdown;
+        self
+    }
+    pub fn request_guest_shutdown(&self) -> Option<()> {
+        self.shutdown.as_ref()?();
+        Some(())
+    }
     /// Change only future syscall/SQE acceptance. Accepted async work owns its
     /// old paths, descriptors and execution context until it completes.
     pub fn refresh_namespaces(&mut self, resources: trames_vfs::TaskNamespaceResources) {
@@ -322,6 +332,7 @@ impl DirectSyscalls {
     pub fn new(descriptors: DirectFds) -> Self {
         let membership = descriptors.shared_files();
         Self {
+            shutdown: None,
             statistics: None,
             signal_reader: None,
             task_signal: None,
