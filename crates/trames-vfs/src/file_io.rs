@@ -375,13 +375,9 @@ impl DirectFile {
         }
         let base = match whence {
             0 => 0,
-            1 => {
-                let position = self.try_position()?;
-                if position.pending != 0 {
-                    return None;
-                }
-                position.value
-            }
+            // Same committed original offset as the solo fcntl ABI. A lock
+            // observation neither owns nor waits for another byte operation.
+            1 => self.position.snapshot(),
             2 => self.data.len(),
             _ => return Some(Err(Errno(22))),
         };

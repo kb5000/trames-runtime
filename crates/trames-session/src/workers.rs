@@ -818,6 +818,8 @@ impl<C: Cpu> Starter<C> {
                                     } else if let Some(request) = call.flock {
                                         snapshot.direct.start_flock(request, call.args, work.memory.as_deref_mut().expect("worker view"),
                                             work.pid, &epoch.as_ref().unwrap().io_target)
+                                    } else if let Some(request) = call.record {
+                                        snapshot.direct.start_record_wait(request,call.args,work.memory.as_deref_mut().expect("worker view"),work.pid,&epoch.as_ref().unwrap().io_target)
                                     } else if let Some(file) = call.retained_byte {
                                         snapshot.direct.start_retained_byte(file, call.number, call.args,
                                             work.memory.as_deref_mut().expect("worker view"), work.pid,
@@ -1101,9 +1103,9 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                             || snapshot.direct.supports_path_query(work.cpu.x(8) as u32)
                                             || snapshot.direct.supports_epoll_control(work.cpu.x(8) as u32)
                                             || snapshot.direct.supports_ioctl(work.cpu.x(8) as u32, std::array::from_fn(|i|work.cpu.x(i)))
-                                            || matches!(work.cpu.x(8) as u32, 23 | 24 | 57 | 101 | 115 | 436)
+                                            || matches!(work.cpu.x(8) as u32, 23 | 24 | 32 | 57 | 101 | 115 | 436)
                                             || work.cpu.x(8) as u32 == 25
-                                                && matches!(work.cpu.x(1), 0 | 1030))
+                                                && matches!(work.cpu.x(1), 0 | 7 | 38 | 1030))
                                 }) {
                                     let began = snapshot.profile.then(Instant::now);
                                     let number = work.cpu.x(8) as u32;
@@ -2049,6 +2051,7 @@ mod tests {
             args,
             deadline: None,
             flock: None,
+            record: None,
             retained_socket: None,
             retained_byte: None,
             tcp_liveness: None,

@@ -17,6 +17,7 @@ pub use aio::{Aio, RetainedAio};
 mod console_tests;
 mod ip_message;
 mod local_message;
+mod locks;
 pub(crate) mod namespace;
 #[cfg(test)]
 mod netlink;
@@ -41,6 +42,7 @@ pub struct PendingIo {
     pub deadline: Option<Instant>,
     pub signal: Arc<IoSignal>,
     pub flock: Option<trames_vfs::FlockRequest>,
+    pub record: Option<trames_vfs::RecordWait>,
     pub retained_byte: Option<RetainedByte>,
     pub retained_socket: Option<RetainedSocket>,
     // Cohort-local accepted TCP authority. Joined policy/signal transitions
@@ -748,34 +750,15 @@ impl DirectSyscalls {
         // a failed conversion may already have released the old lock: it must
         // not be attempted speculatively and then replayed on fallback.
         if number == 32 && (a[1] as u32 & 4 != 0 || a[1] as u32 == 8) {
-            let result = self.files.get(a[0] as u32)?.flock(a[1] as u32).map(|()| 0);
+            let result = self
+                .flock_request(a[0] as u32, a[1] as u32)?
+                .and_then(|r| r.try_lock())
+                .map(|()| 0);
             self.record_fd_control();
             return Some(result);
         }
         if number == 25 && matches!(a[1], 5 | 6 | 36 | 37) {
-            let context = self.lock_context.as_ref()?;
-            let file = self.files.get(a[0] as u32)?;
-            let result = if !file.allows_record_locks() {
-                Err(Errno(9))
-            } else {
-                crate::record_locks::call(
-                    memory,
-                    a[1],
-                    a[2],
-                    |kind, whence, start, length| {
-                        if a[1] >= 36 {
-                            file.normalize_ofd_lock(kind, whence, start, length)
-                        } else {
-                            file.normalize_lock(kind, whence, start, length, context.owner)
-                        }
-                    },
-                    |requested| Ok(file.record_lock_conflict(requested)),
-                    |requested| file.record_lock_set(requested),
-                    |owner| context.visible_pid(owner),
-                )?
-            };
-            self.record_fd_control();
-            return Some(result);
+            return self.invoke_record_lock(a, memory);
         }
         self.invoke_file_io(number, a, memory)
     }
@@ -876,7 +859,18 @@ impl DirectSyscalls {
             return self.kernel_log.is_some();
         }
         if number == 32 {
-            return self.files.get(args[0] as u32).is_some();
+            return self.resources.is_some() || self.files.get(args[0] as u32).is_some();
+        }
+        if number == 25 && matches!(args[1], 7 | 38) {
+            return self
+                .lock_context
+                .as_ref()
+                .is_some_and(trames_vfs::RecordLockContext::supports_waits)
+                && (self.resources.is_some()
+                    || self
+                        .files
+                        .get(args[0] as u32)
+                        .is_some_and(|file| file.shared_file().is_some()));
         }
         if number == 426 {
             return self.urings.available();
@@ -1029,6 +1023,7 @@ impl DirectSyscalls {
                 retained_socket: None,
                 retained_byte: None,
                 flock: None,
+                record: None,
                 resource_deadline: None,
                 epoll_revision: None,
                 retained_poll: None,
@@ -1262,10 +1257,10 @@ impl DirectSyscalls {
     }
     fn complete(&self, number: u32, args: [u64; 6], result: Result<u64, Errno>) -> IoAttempt {
         self.completed.set(self.completed.get() + 1);
-        if matches!(number, 28 | 32) {
+        if matches!(number, 25 | 28 | 32) {
             self.record_fd_control();
         }
-        if matches!(number, 32 | 116) {
+        if matches!(number, 25 | 32 | 116) {
             return IoAttempt::Complete(result);
         }
         if crate::event_wait(number) {
@@ -1365,15 +1360,14 @@ impl DirectSyscalls {
                 .map(IoAttempt::Complete);
         }
         if number == 32 {
-            let request = match self
-                .files
-                .get(args[0] as u32)?
-                .flock_request(args[1] as u32)
-            {
+            let request = match self.flock_request(args[0] as u32, args[1] as u32)? {
                 Ok(request) => request,
                 Err(error) => return Some(self.complete(number, args, Err(error))),
             };
             return Some(self.start_flock(request, args, memory, pid, target));
+        }
+        if number == 25 && matches!(args[1], 7 | 38) {
+            return self.start_record_lock(args, memory, pid, target);
         }
         if number == 427 {
             return self.urings.register(args, memory, pid);
@@ -1472,6 +1466,7 @@ impl DirectSyscalls {
                 retained_poll: None,
                 resource_deadline: None,
                 flock: None,
+                record: None,
                 retained_socket: None,
                 retained_byte: None,
                 native_tcp: None,
@@ -1567,6 +1562,7 @@ impl DirectSyscalls {
                 retained_byte: None,
                 native_tcp: None,
                 flock: None,
+                record: None,
                 resource_deadline: None,
                 terminal_job: false,
                 _subscriptions: subscriptions,
@@ -1717,6 +1713,7 @@ impl DirectSyscalls {
                 deadline: None,
                 signal,
                 flock: None,
+                record: None,
                 retained_socket: None,
                 retained_byte: Some(file),
                 native_tcp: None,
@@ -1761,6 +1758,7 @@ impl DirectSyscalls {
                 deadline: None,
                 signal,
                 flock: Some(request),
+                record: None,
                 retained_socket: None,
                 retained_byte: None,
                 native_tcp: None,
@@ -1863,6 +1861,12 @@ impl DirectSyscalls {
             return match request.try_lock() {
                 Err(Errno(11)) => IoAttempt::Blocked(pending),
                 result => self.complete(32, pending.args, result.map(|()| 0)),
+            };
+        }
+        if let Some(request) = &pending.record {
+            return match request.try_lock() {
+                Err(Errno(11)) => IoAttempt::Blocked(pending),
+                result => self.complete(25, pending.args, result.map(|()| 0)),
             };
         }
         if pending.poll_uring.is_none() {

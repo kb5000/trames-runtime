@@ -199,33 +199,9 @@ impl Linux {
         memory: &mut impl CpuMemory,
         a: [u64; 6],
     ) -> Result<trames_vfs::RecordLockRequest> {
-        if self.vfs.flags(a[0] as u32)? & trames_vfs::O_PATH != 0 {
-            return Err(Errno(9));
-        }
-        let mut request = None;
-        crate::record_locks::call(
-            memory,
-            a[1],
-            a[2],
-            |kind, whence, start, length| {
-                Some(if a[1] >= 36 {
-                    self.vfs
-                        .normalize_ofd_lock(a[0] as u32, kind, whence, start, length)
-                } else {
-                    self.vfs
-                        .normalize_lock(a[0] as u32, kind, whence, start, length)
-                })
-            },
-            |r| self.vfs.record_lock_conflict(a[0] as u32, r),
-            |r| {
-                request = Some(self.vfs.retain_record_lock(a[0] as u32, r)?);
-                Ok(())
-            },
-            |owner| self.vfs.visible_pid(owner),
-        )
-        .expect("owner lock cannot defer")?;
-        request.ok_or(Errno(22))
+        crate::record_locks::prepare(&self.vfs.record_file(a[0] as u32)?, a[1], a[2], memory)
     }
+
     pub fn record_lock_holder(&self, memory: &Memory, a: [u64; 6]) -> Result<Option<u32>> {
         Self::check(memory, a[2], 32, Access::Read)?;
         let mut bytes = [0; 32];
@@ -1304,6 +1280,9 @@ impl Linux {
                 if let Some(value) = crate::fcntl::short(&self.vfs.descriptor_factory(),a) {
                     return value;
                 }
+                if matches!(a[1],5..=7|36..=38) {
+                    return crate::record_locks::control(&self.vfs.record_file(a[0] as u32)?,a[1],a[2],memory);
+                }
                 let flags = self.vfs.flags(a[0] as u32)?;
                 if flags & trames_vfs::O_PATH != 0 && !matches!(a[1], 0..=3 | 1030) {
                     return Err(Errno(9));
@@ -1325,29 +1304,6 @@ impl Linux {
                         self.vfs.set_status_flags(a[0] as u32, a[2] as u32)?;
                         Ok(0)
                     }
-                    5..=7 | 36..=38 => crate::record_locks::call(
-                        memory,
-                        a[1],
-                        a[2],
-                        |kind, whence, start, length| {
-                            Some(if a[1] >= 36 {
-                                self.vfs.normalize_ofd_lock(
-                                    a[0] as u32,
-                                    kind,
-                                    whence,
-                                    start,
-                                    length,
-                                )
-                            } else {
-                                self.vfs
-                                    .normalize_lock(a[0] as u32, kind, whence, start, length)
-                            })
-                        },
-                        |requested| self.vfs.record_lock_conflict(a[0] as u32, requested),
-                        |requested| self.vfs.record_lock_set(a[0] as u32, requested),
-                        |owner| self.vfs.visible_pid(owner),
-                    )
-                    .expect("owner lock normalization cannot defer"),
                     _ => Err(Errno(22)),
                 }
             },

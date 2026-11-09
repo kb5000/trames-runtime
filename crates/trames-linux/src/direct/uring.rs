@@ -1118,6 +1118,7 @@ impl UringSnapshot {
                 signal,
                 resource_deadline: None,
                 flock: None,
+                record: None,
                 retained_byte: None,
                 retained_socket: None,
                 native_tcp: None,

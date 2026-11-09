@@ -496,6 +496,7 @@ impl DirectSyscalls {
                 deadline,
                 signal,
                 flock: None,
+                record: None,
                 retained_byte: None,
                 retained_socket: None,
                 native_tcp: None,

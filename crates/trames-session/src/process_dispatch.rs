@@ -332,6 +332,7 @@ impl Dispatch {
                 } else {
                     p.flock_wait.as_ref().map(|(request, _)| request.clone())
                 },
+                record: p.record_wait.take(),
                 retained_byte,
                 retained_socket,
                 tcp_liveness,

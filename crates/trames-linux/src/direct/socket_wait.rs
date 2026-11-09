@@ -423,6 +423,7 @@ impl DirectSyscalls {
             retained_byte: None,
             native_tcp: None,
             flock: None,
+            record: None,
             retained_poll: None,
             resource_deadline: None,
             epoll_revision: None,

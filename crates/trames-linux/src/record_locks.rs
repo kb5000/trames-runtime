@@ -5,6 +5,56 @@ use trames_memory::{Access, CpuMemory};
 use trames_vfs::{Errno, RecordLock};
 type Result<T> = std::result::Result<T, Errno>;
 
+pub(crate) fn control(
+    file: &trames_vfs::RecordFile,
+    command: u64,
+    address: u64,
+    memory: &mut impl CpuMemory,
+) -> Result<u64> {
+    if file.flags() & trames_vfs::O_PATH != 0 {
+        return Err(Errno(9));
+    }
+    call(
+        memory,
+        command,
+        address,
+        |kind, whence, start, length| {
+            Some(file.normalize(kind, whence, start, length, command >= 36))
+        },
+        |requested| file.conflict(requested),
+        |requested| file.set(requested),
+        |owner| file.visible_pid(owner),
+    )
+    .expect("original file lock body cannot defer")
+}
+pub(crate) fn prepare(
+    file: &trames_vfs::RecordFile,
+    command: u64,
+    address: u64,
+    memory: &mut impl CpuMemory,
+) -> Result<trames_vfs::RecordLockRequest> {
+    if file.flags() & trames_vfs::O_PATH != 0 {
+        return Err(Errno(9));
+    }
+    let mut request = None;
+    call(
+        memory,
+        command,
+        address,
+        |kind, whence, start, length| {
+            Some(file.normalize(kind, whence, start, length, command >= 36))
+        },
+        |requested| file.conflict(requested),
+        |requested| {
+            request = Some(file.request(requested)?);
+            Ok(())
+        },
+        |owner| file.visible_pid(owner),
+    )
+    .expect("original file lock body cannot defer")?;
+    request.ok_or(Errno(22))
+}
+
 pub(crate) fn call(
     memory: &mut impl CpuMemory,
     command: u64,
@@ -201,7 +251,49 @@ mod tests {
             direct.invoke_file(25, [fd as u64, 7, 0x1000, 0, 0, 0], &mut m),
             None
         );
-        assert!(!direct.supports_call(25, [fd as u64, 7, 0, 0, 0, 0]));
+        assert!(direct.supports_call(25, [fd as u64, 7, 0, 0, 0, 0]));
+        struct Wake;
+        impl trames_vfs::IoWake for Wake {
+            fn wake_io(&self, _: &std::sync::Arc<trames_vfs::IoSignal>) {}
+        }
+        let target: std::sync::Arc<dyn trames_vfs::IoWake> = std::sync::Arc::new(Wake);
+        assert!(matches!(
+            direct.start(
+                25,
+                [fd as u64, 7, 0, 0, 0, 0],
+                &mut m,
+                2,
+                &std::sync::Arc::downgrade(&target),
+                None
+            ),
+            Some(crate::IoAttempt::Complete(Err(Errno(14))))
+        ));
+        let Some(crate::IoAttempt::Blocked(wait)) = direct.start(
+            25,
+            [fd as u64, 7, 0x1000, 0, 0, 0],
+            &mut m,
+            2,
+            &std::sync::Arc::downgrade(&target),
+            None,
+        ) else {
+            panic!("the original conflicting lock must park")
+        };
+        assert!(wait.record.is_some());
+        drop(wait);
+        let missing = crate::DirectSyscalls::default()
+            .with_resources(linux.vfs.descriptor_factory())
+            .with_lock_context(Default::default());
+        assert!(!missing.supports_call(25, [fd as u64, 7, 0x1000, 0, 0, 0]));
+        assert!(missing
+            .start(
+                25,
+                [fd as u64, 7, 0x1000, 0, 0, 0],
+                &mut m,
+                2,
+                &std::sync::Arc::downgrade(&target),
+                None
+            )
+            .is_none());
         assert_eq!(
             linux
                 .vfs

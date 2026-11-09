@@ -1,11 +1,21 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 93, original FD status and memfd seals, reviewed on 2026-11-09. The prior shared runtime
-baseline is `0c736ffe1efb13c2bd504eb9b2f9391b931d0c18`.
+This is the consolidated implementation audit through stage 94, original file locks and blocking range waits, reviewed on 2026-11-10. The prior shared runtime
+baseline is `76f91c36976fbdc95cf1f5790427d311be629898`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
-## Current status at a glance — 2026-11-09
+## Current status at a glance — 2026-11-10
+
+Stage 94 closes the file-lock execution subsystem: POSIX/OFD range controls,
+blocking F_SETLKW/F_OFD_SETLKW, whole-file flock including directory/opaque OFDs,
+original accepted ranges, inode notifications and common source/solo deadlock
+detection. This corrects stage 93's broad wording about record-lock waits: only
+the nonblocking range path was source-owned then; blocking requests and their
+process-map deadlock scan still used joined dispatch. Waits now return CPU slots
+and use their original inode readiness. The wait graph has weak original edges
+and is touched only for contended POSIX waits, not ordinary lock operations.
+No new coordinator/resource thread, polling bus or ordinary memory fence is added.
 
 Stage 93 closes residual FD status authority, memfd seal operations and unknown
 fcntl command completion on original source resources. F_SETFL checks live inode
@@ -383,6 +393,7 @@ is not a claim that all coordinator work is removed.
 | Structural VM edits, pins and mapped-file layout changes | Supported mapping/buffer-registration checkpoints publish on existing workers with original task/mm custody; additive anonymous mmap runs directly while peers continue | Proc/cold-mm checkpoints and supported mapped-file transactions now run on existing workers. Unsupported backing/lifetime/policy and capability-less embeddings retain explicit boundaries |
 | Descriptor ioctl discovery and control | Shared namespace type, virtual render discovery, implemented interface queries/link control and ordinary unsupported commands execute on the caller with one retained original OFD and the common solo ABI | Existing PTY/flag/async routes stay source-owned. Actual legacy OFDs or absent providers retain before-effects fallback; unsupported commands preserve their existing errno |
 | FD status, descriptor flags and memfd seals | Live NOATIME authority, original OFD status/async subscription, descriptor-local CLOEXEC, canonical unknown-command errors and original inode seals run on source; native seal flushes park on existing FileWork | Existing duplication, record locks and async-owner operations retain their source routes and actual resource requirements. A genuinely absent source capability still defers before effects; no unsupported fcntl feature is advertised |
+| POSIX/OFD range locks and whole-file flock | Original shared OFD/inode arbitration and common source/solo ABI; contended range/flock requests park and subscribe before retry. Deadlocks use original shared wait relations; directory flock uses the actual full OFD | No supported blocking-lock-only join or process-map retry/scan remains. Genuine missing original lock/Files capabilities retain a before-effects boundary; solo dispatch runs on its existing caller |
 | Native libc/GPU/video/audio bodies, waits and before-effects mapping/entry checkpoints | Calling/shared-resource execution; exceptional access uses original task/mm custody on an existing executor, then retains resource waits | Capability-less embeddings and actual platform/host lifecycle retain their boundary. Single-CPU/solo calls use their existing caller. Local libc/DirectFile/HVF fallback alone is not an owner transition |
 | Read-only VM observations and implemented non-discard advice | Calling executor, original admitted mappings/reservations and per-page resident metadata; common source/solo ABI | No observation-only join or mm checkpoint. Genuine absent custom observation capabilities retain explicit before-effects fallback; actual discard/mapping mutation remains scoped |
 | Guest halt/poweroff | Calling executor and original root/caller group exit controls; common policy for source/solo | No supported power-control-only join. Missing original shutdown/exit capabilities keep explicit legacy execution. Unsupported restart/kexec and nested PID namespace power behavior retain their existing errno |
@@ -517,14 +528,14 @@ Actual excluded policy effects and missing capabilities retain explicit boundari
 ### Current remaining categories
 
 The count is **four broad categories**, not the number of historical subsystem
-rows. Stages 72–93 remove concrete triggers and close request-authority dependencies inside those categories; they do not
+rows. Stages 72–94 remove concrete triggers and close request-authority dependencies inside those categories; they do not
 prove that the final generic fallback is unreachable.
 
 | Remaining category | Actual trigger | Current scope / authoritative implementation |
 | --- | --- | --- |
 | Host cancellation and final teardown | Host cancel, deadline, shutdown, legacy stopped-hook requests, final CPU/backend drain and actual native-event backend failure | Pause/resume, original init notifications/signals, pressure reclaim, host filesystem commands and terminal/process admission no longer join. Actual terminal teardown and backend failure still stop their actors. Native-event failure returns its original HostIo cause after drain/cancellation, without an owner syscall retry. See [host control](../../crates/trames-session/src/process_vm.rs), [completion](../../crates/trames-session/src/process_exit.rs) and [workers](../../crates/trames-session/src/workers.rs). |
 | Missing capabilities and excluded resources | A genuinely absent source provider, an excluded original FD/node graph, a genuinely absent native event capability or unsupported source request body | There is no filesystem-kind exclusion after stage 82. Published global proc/sys metadata no longer lacks a source provider merely because it uses set_runtime_info. Other node/provider admission still applies. io_uring has exactly two submitter-scoped `require_owner()` maintenance call sites: missing-capability wait-source preparation and deferred original body progress; actual host backend errors take terminal source error handling. They remain connected to actual accepted request lifetime, subscriptions and cancellation. See [path authority](../../crates/trames-vfs/src/path_queries.rs), [maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [wait sources](../../crates/trames-linux/src/direct/uring/wait.rs) and [actor](../../crates/trames-linux/src/direct/uring/actor.rs). |
-| Final execution dispatch fallback | A returned SVC or cold HLT/resource operation not completed, parked or accepted by a source scope; host faults and capability-less embeddings retain their own explicit boundaries | The catch-all stops the current cohort for joined dispatch. Ordinary shared-FD ioctl discovery, residual prctl controls/errors, implemented time observations, FD status/NOATIME, inode seals and canonical unknown fcntl commands no longer use it. It remains an audit target even though admitted native calls, ordinary guest faults, generated ENOSYS and migrated syscalls have source completion. Recognized guest faults, caught handlers and signal-frame failures now complete/terminate on source. A backend error is not a software or full-Linux-VM fallback. See [worker dispatch](../../crates/trames-session/src/workers.rs) and [classification](../../crates/trames-session/src/worker_syscalls.rs). |
+| Final execution dispatch fallback | A returned SVC or cold HLT/resource operation not completed, parked or accepted by a source scope; host faults and capability-less embeddings retain their own explicit boundaries | The catch-all stops the current cohort for joined dispatch. Ordinary shared-FD ioctl discovery, residual prctl controls/errors, implemented time observations, FD status/NOATIME, inode seals, blocking POSIX/OFD locks, directory flock and canonical unknown fcntl commands no longer use it. It remains an audit target even though admitted native calls, ordinary guest faults, generated ENOSYS and migrated syscalls have source completion. Recognized guest faults, caught handlers and signal-frame failures now complete/terminate on source. A backend error is not a software or full-Linux-VM fallback. See [worker dispatch](../../crates/trames-session/src/workers.rs) and [classification](../../crates/trames-session/src/worker_syscalls.rs). |
 | Initial and legacy orchestration | Initial admission, standalone/capability-less nonmember scheduling and other excluded embedding routes | Ordinary live members and preexisting Kernel Futex/Sleep actors migrate, park and wake on the original queue. Cold waiters have metadata only until an event prepares their original mm; child/exec admission and lazy CPU slots no longer require a joined owner. The standalone futex legacy-publication mechanism remains. Solo dispatch is on the caller, so its existence alone is not a cross-thread transition. See [admission](../../crates/trames-session/src/process.rs), [legacy wakes](../../crates/trames-session/src/futex.rs) and [queue](../../crates/trames-session/src/run_queue.rs). |
 
 Supported process/family lifecycle, signals and security policy, mount and task
@@ -3927,3 +3938,65 @@ from final dispatch, but retains genuinely absent Files/lock/path/wait providers
 both actual io_uring maintenance escalation sites, host cancel/final teardown
 and initial/legacy orchestration. Neither category count nor a workload speedup
 is inferred from a passing path regression.
+
+
+## 94. Original file locks, blocking range waits and deadlock relations — 2026-11-10
+
+An audit of the remaining FD-control dependency found that F_SETLKW and
+F_OFD_SETLKW still returned to Kernel, retained their request in Process and
+retried through joined dispatch. POSIX deadlock detection scanned that owner's
+process map. The previous stage's wording about record-lock waits was too broad:
+its existing source route covered nonblocking range controls, not this waiting
+unit. This stage migrates the connected locking subsystem and its dependencies.
+
+RecordFile retains one original shared OFD plus the original lock registry and
+PID visibility. Source/solo range control and preparation use the same ABI,
+including flags, guest pointer validation, lock kind/range rules, access modes,
+PID translation, OFD owner and errno precedence. Normal prepared regular-file
+queries and updates keep their existing direct data path. SEEK_CUR observes the
+same original committed offset as solo; an unrelated pending byte operation no
+longer forces a lock query to join. No ordinary data permission/borrow policy or
+memory fence is added.
+
+Contended requests retain the imported normalized range, original file/owner and
+inode arbitration object. Unlock, writer-to-reader downgrade, process-lock
+release and final OFD release notify original readiness after releasing resource
+locks. Readiness is allocated lazily on an inode's first actual waiter. Waiting
+subscribes then retries the original request, returning the CPU slot rather than
+polling or asking a service. Closing/reusing the numeric FD or editing the guest
+flock structure cannot retarget an accepted wait. Cohort handoff rebinds its wake
+target while keeping the same operation and cancellation lifetime. A previously
+blocked record waiter can be admitted alongside its related runnable actor.
+
+Only contended POSIX waits register a deadlock relation. Their original registry
+holds weak edges naming the actual requested range and inode, not a copied
+holder PID or Process projection. Registration checks the live conflict graph
+and publishes the new relation under its graph mutex, so simultaneous opposing
+requests cannot both miss a cycle. It handles multiple waiting threads of one
+process. Edge destruction/cancellation removes only that accepted registration;
+temporary edge references have no graph-reentrant destructor. OFD waits do not
+participate in POSIX deadlock detection. Normal lock queries, uncontended changes
+and release never acquire the wait-graph mutex. There is no new global native
+execution lock, service/resource thread or polling bus.
+
+Whole-file flock now takes the full original OFD independently of regular-file
+data eligibility. Directory controls, invalid operations/FDs and already accepted
+owner-style descriptions use the same original flock object, preserving native
+host lock subscriptions. Original shared descriptions retain their own lock
+lifetime, so preexisting accepted requests need no separate owner lease merely
+because their description had an ancillary control projection. Capability-less
+legacy direct-file embeddings retain their actual explicit boundary.
+
+Connected process tests cover POSIX/OFD contention, directory flock and a true
+cross-process deadlock cycle at four/twelve CPUs, one slot and seccomp ALLOW.
+Both connected tests fail against prior production. Original cold-wait admission,
+source/solo mixed deadlock detection, concurrent opposing registration, multiple
+waits per process, close/reuse, range/offset mutation, cancellation, downgrade and
+last-close release have additional regression coverage. The same original ABI
+covers every range-lock command's source/solo access and error ordering.
+
+The paired product records complete local macOS/ARM64 Linux runtime validation,
+both iPad SDKs, signed native before/after path checks and Dev acceptance. Four
+broad categories remain; both io_uring maintenance escalation sites still refer
+to actual missing wait/body capabilities. This closes the lock subsystem's joined
+execution path, not all cold dispatch, host teardown or legacy orchestration.

@@ -136,7 +136,7 @@ pub(crate) struct Process<C: Cpu> {
     file_entry: Option<(u64, u32, [u64; 6])>,
     layout_wait: Option<tasks::AdmissionWait>,
     flock_wait: Option<(trames_vfs::FlockRequest, Option<trames_vfs::RetainedFd>)>,
-    record_wait: Option<trames_vfs::RecordLockRequest>,
+    record_wait: Option<trames_vfs::RecordWait>,
     byte_wait: Option<trames_linux::PendingIo>,
     retained_byte: Option<trames_linux::RetainedByte>,
     retained_socket: Option<trames_linux::RetainedSocket>,
@@ -369,6 +369,9 @@ impl<C: Cpu> Process<C> {
         if matches!(self.state, State::Blocked(32, _)) {
             return self.seccomp.mode() == 0 && self.flock_wait.is_some();
         }
+        if matches!(self.state, State::Blocked(25,args) if matches!(args[1],7|38)) {
+            return self.record_wait.is_some();
+        }
         if let State::Blocked(426, a) = self.state {
             return self.seccomp.mode() == 0
                 && a[3] & !9 == 0
@@ -420,6 +423,7 @@ impl<C: Cpu> Process<C> {
 
     /// Preserve the complete OFD before owner-side close/dup can resume.
     fn retain_worker_flock(&mut self, call: Option<&crate::run_queue::IoCall>) {
+        self.record_wait = call.and_then(|call| call.record.clone());
         if let Some(request) = call.and_then(|call| call.flock.as_ref()) {
             if request.retains_file() {
                 // Already accepted on the executing worker. Numeric membership
@@ -2210,27 +2214,18 @@ impl<C: Cpu> Kernel<C> {
             25 if matches!(a[1], 7 | 38) => {
                 let request = match p.record_wait.take() {
                     Some(r) => r,
-                    None => p.linux.prepare_record_lock(&mut p.memory, a)?,
+                    None => {
+                        let request=p.linux.prepare_record_lock(&mut p.memory,a)?;
+                        match request.try_lock() {
+                            Ok(())=>return Ok(Some(0)),
+                            Err(Errno(11))=>request.wait()?,
+                            Err(error)=>return Err(error),
+                        }
+                    },
                 };
                 match request.try_lock() {
                     Ok(()) => Ok(Some(0)),
                     Err(Errno(11)) => {
-                        if a[1] == 7 {
-                            let mut holder = request.holder();
-                            let mut seen = Vec::new();
-                            while let Some(id) = holder {
-                                if id == p.tgid {
-                                    return Err(Errno(35));
-                                }
-                                if seen.contains(&id) {
-                                    break;
-                                }
-                                seen.push(id);
-                                holder = self.processes.values()
-                                    .find(|other|other.tgid == id && matches!(other.state, State::Blocked(25,args) if args[1] == 7))
-                                    .and_then(|other|other.record_wait.as_ref().and_then(trames_vfs::RecordLockRequest::holder));
-                            }
-                        }
                         p.record_wait = Some(request);
                         Ok(None)
                     }
@@ -3357,6 +3352,7 @@ impl<C: Cpu> Kernel<C> {
                             .flock_wait
                             .as_ref()
                             .is_some_and(|(r, _)| first.linux.vfs.shares_flock(r))
+                            || p.record_wait.as_ref().is_some_and(|wait|first.linux.vfs.shares_record_wait(wait))
                             || matches!(p.state, State::Blocked(116, _))
                                 && first.linux.vfs.can_write_kernel_log_for(&p.linux.vfs)
                             || fds.shares_resources(&p.linux.vfs.direct_descriptors())
@@ -5403,6 +5399,7 @@ mod tests {
             args: [a as u64, 2, 0, 0, 0, 0],
             deadline: None,
             flock: Some(request),
+            record: None,
             retained_socket: None,
             retained_byte: None,
             tcp_liveness: None,
@@ -5999,6 +5996,7 @@ mod tests {
             args: [a as u64, 1, 0, 0, 0, 0],
             deadline: None,
             flock: Some(shared.clone()),
+            record: None,
             retained_socket: None,
             retained_byte: None,
             tcp_liveness: None,
@@ -6349,6 +6347,91 @@ mod tests {
     }
     pub(super) fn process() -> Box<Process> {
         process_with_presence(Default::default())
+    }
+    #[test]
+    fn one_runnable_actor_admits_an_original_record_wait_and_releases_it_on_source() {
+        use trames_engine::Cpu as _;
+        let mut k = kernel();
+        k.cpu_count = 4;
+        k.workers = crate::workers::Pool::new(1);
+        k.per_cpu = vec![Duration::ZERO; 4];
+        k.profile_syscalls = true;
+        let mut root = process();
+        root.linux.vfs.set_lock_owner(1);
+        let fd = root
+            .linux
+            .vfs
+            .open_at(-100, b"/cold-record", 0x42, 0o600)
+            .unwrap();
+        let locked = root.linux.vfs.normalize_lock(fd, 1, 0, 0, 8).unwrap();
+        root.linux.vfs.record_lock_set(fd, locked).unwrap();
+        let wait = [
+            0xd2860000, 0xd2801001, 0xd2800002, 0xd2800003, 0xd2800c48, 0xd4000001, 0x14000000,
+        ];
+        let mut release = vec![
+            0xd2800000 | (fd << 5),
+            0xd28000c1,
+            0xd2830002,
+            0xd2800328,
+            0xd4000001,
+        ];
+        release.extend([0xd2850000, 0xd2800021, 0xb9000001]);
+        release.extend(wait);
+        let mut acquired = vec![0xaa0003f4, 0xd2850000, 0xd2800021, 0xb9000001];
+        acquired.extend(wait);
+        for (at, code) in [(0x4000, release), (0x5000, acquired)] {
+            root.memory
+                .write(
+                    at,
+                    &code
+                        .iter()
+                        .flat_map(|w| w.to_le_bytes())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+            root.memory.protect(at, PAGE_SIZE, Permissions::RX).unwrap();
+        }
+        let mut unlock = [0; 32];
+        unlock[..2].copy_from_slice(&2u16.to_le_bytes());
+        unlock[16..24].copy_from_slice(&8u64.to_le_bytes());
+        root.memory.write_array(0x1800, unlock).unwrap();
+        let mut peer = root.fork();
+        peer.vm_id = 2;
+        peer.tgid = 2;
+        peer.cpu.set_pc(0x5000);
+        peer.linux.vfs.set_lock_owner(2);
+        let mut requested = unlock;
+        requested[..2].copy_from_slice(&1u16.to_le_bytes());
+        peer.memory.write_array(0x1800, requested).unwrap();
+        let args = [fd as u64, 7, 0x1800, 0, 0, 0];
+        let request = peer
+            .linux
+            .prepare_record_lock(&mut peer.memory, args)
+            .unwrap();
+        assert_eq!(request.try_lock(), Err(Errno(11)));
+        peer.record_wait = Some(request.wait().unwrap());
+        peer.state = State::Blocked(25, args);
+        k.processes.insert(1, root);
+        k.processes.insert(2, peer);
+        assert!(k.parallel_candidate(false));
+        assert!(k
+            .parallel_round(&mut trames_linux::CapturedOutput::default(), 1_000_000)
+            .unwrap());
+        for id in [1, 2] {
+            assert_eq!(
+                k.processes
+                    .get_mut(&id)
+                    .unwrap()
+                    .memory
+                    .read_array::<4>(0x2800)
+                    .unwrap(),
+                1u32.to_le_bytes()
+            );
+        }
+        assert_eq!(k.processes.get(&2).unwrap().cpu.x(20), 0);
+        assert_eq!(k.parallel_rounds, 1);
+        assert!(k.cohort_return_syscalls.is_empty());
+        assert_eq!(k.service_requests, 0);
     }
     pub(super) fn admitted_process(k: &Kernel) -> Box<Process> {
         process_with_presence(Arc::new(k.task_capacity.reserve().unwrap().into_presence()))
@@ -9607,3 +9690,7 @@ mod source_fault_tests;
 #[cfg(all(test, trames_interpreter_conformance))]
 #[path = "process_fcntl_tests.rs"]
 mod fcntl_tests;
+
+#[cfg(all(test, trames_interpreter_conformance))]
+#[path = "process_lock_tests.rs"]
+mod lock_tests;

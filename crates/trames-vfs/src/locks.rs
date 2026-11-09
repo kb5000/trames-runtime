@@ -14,7 +14,33 @@ pub struct RecordLock {
 /// Only inode registration and process exit visit the registry. Ordinary lock
 /// queries/changes/close use the individual inode object, never this mutex.
 #[derive(Default)]
-pub(super) struct Registry(Mutex<RegistryEntries>);
+pub(super) struct Registry(Mutex<RegistryEntries>, Mutex<WaitGraph>);
+type WaitGraph = BTreeMap<u32, Vec<std::sync::Weak<Waiting>>>;
+struct Waiting {
+    records: Arc<Records>,
+    requested: RecordLock,
+}
+struct WaitRegistration {
+    registry: std::sync::Weak<Registry>,
+    edge: Arc<Waiting>,
+}
+impl Drop for WaitRegistration {
+    fn drop(&mut self) {
+        if let Some(registry) = self.registry.upgrade() {
+            let mut graph = registry.1.lock().unwrap();
+            let owner = self.edge.requested.owner as u32;
+            if let Some(edges) = graph.get_mut(&owner) {
+                edges.retain(|edge| {
+                    edge.strong_count() != 0
+                        && !std::ptr::eq(edge.as_ptr(), Arc::as_ptr(&self.edge))
+                });
+                if edges.is_empty() {
+                    graph.remove(&owner);
+                }
+            }
+        }
+    }
+}
 struct RegistryEntries {
     live: Vec<std::sync::Weak<Records>>,
     next_gc: usize,
@@ -28,6 +54,35 @@ impl Default for RegistryEntries {
     }
 }
 impl Registry {
+    fn wait(
+        self: &Arc<Self>,
+        records: Arc<Records>,
+        requested: RecordLock,
+    ) -> Result<Arc<WaitRegistration>> {
+        let mut graph = self.1.lock().unwrap();
+        let origin = requested.owner as u32;
+        let mut pending = records.holders(requested);
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(owner) = pending.pop() {
+            if owner == origin {
+                return Err(Errno(35));
+            }
+            if !seen.insert(owner) {
+                continue;
+            }
+            if let Some(edges) = graph.get(&owner) {
+                for edge in edges.iter().filter_map(std::sync::Weak::upgrade) {
+                    pending.extend(edge.records.holders(edge.requested));
+                }
+            }
+        }
+        let edge = Arc::new(Waiting { records, requested });
+        graph.entry(origin).or_default().push(Arc::downgrade(&edge));
+        Ok(Arc::new(WaitRegistration {
+            registry: Arc::downgrade(self),
+            edge,
+        }))
+    }
     fn create(&self) -> Arc<Records> {
         let records = Arc::new(Records::default());
         let mut all = self.0.lock().unwrap();
@@ -56,10 +111,34 @@ impl Registry {
     }
 }
 #[derive(Default)]
-pub(super) struct Records(Mutex<Vec<RecordLock>>);
+pub(super) struct Records(
+    Mutex<Vec<RecordLock>>,
+    std::sync::OnceLock<Arc<readiness::Readiness>>,
+);
 impl Records {
+    fn notify(&self) {
+        if let Some(readiness) = self.1.get() {
+            readiness.notify_locked();
+        }
+    }
     fn release(&self, owner: u64) {
-        self.0.lock().unwrap().retain(|lock| lock.owner != owner);
+        let mut locks = self.0.lock().unwrap();
+        let before = locks.len();
+        locks.retain(|lock| lock.owner != owner);
+        let changed = before != locks.len();
+        drop(locks);
+        if changed {
+            self.notify();
+        }
+    }
+    fn holders(&self, requested: RecordLock) -> Vec<u32> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|lock| conflicts(**lock, requested))
+            .filter_map(|lock| u32::try_from(lock.owner).ok())
+            .collect()
     }
     pub(super) fn conflict(&self, requested: RecordLock) -> Option<RecordLock> {
         conflict(&self.0.lock().unwrap(), requested)
@@ -71,6 +150,12 @@ impl Records {
         if conflict(&locks, requested).is_some() {
             return Err(Errno(11));
         }
+        let releases = locks.iter().any(|old| {
+            old.owner == requested.owner
+                && old.start < requested.end
+                && requested.start < old.end
+                && (requested.kind == 2 || requested.kind == 0 && old.kind == 1)
+        });
         let mut next = Vec::new();
         for &lock in locks.iter() {
             if lock.owner != requested.owner
@@ -112,21 +197,26 @@ impl Records {
             return Err(Errno(37));
         }
         *locks = merged;
+        drop(locks);
+        if releases {
+            self.notify();
+        }
         Ok(())
     }
 }
 fn conflict(locks: &[RecordLock], requested: RecordLock) -> Option<RecordLock> {
     locks
         .iter()
-        .filter(|lock| {
-            lock.owner != requested.owner
-                && requested.kind != 2
-                && (requested.kind == 1 || lock.kind == 1)
-                && requested.start < lock.end
-                && lock.start < requested.end
-        })
+        .filter(|lock| conflicts(**lock, requested))
         .min_by_key(|lock| lock.start)
         .copied()
+}
+fn conflicts(lock: RecordLock, requested: RecordLock) -> bool {
+    lock.owner != requested.owner
+        && requested.kind != 2
+        && (requested.kind == 1 || lock.kind == 1)
+        && requested.start < lock.end
+        && lock.start < requested.end
 }
 
 pub(super) fn normalize(
@@ -194,7 +284,8 @@ impl SharedOpenDescription {
 pub struct RecordLockRequest {
     records: Arc<Records>,
     requested: RecordLock,
-    _file: RetainedFd,
+    _file: SharedFd,
+    registry: Arc<Registry>,
 }
 impl RecordLockRequest {
     pub fn try_lock(&self) -> Result<()> {
@@ -205,8 +296,142 @@ impl RecordLockRequest {
             .conflict(self.requested)
             .and_then(|r| u32::try_from(r.owner).ok())
     }
+    pub fn wait(self) -> Result<RecordWait> {
+        let registration = (self.requested.owner & OFD_LOCK_OWNER == 0)
+            .then(|| self.registry.wait(self.records.clone(), self.requested))
+            .transpose()?;
+        Ok(RecordWait {
+            request: self,
+            _registration: registration,
+        })
+    }
+}
+/// The accepted range, original OFD and optional POSIX deadlock edge. Waiting
+/// never reimports a guest flock structure or resolves its numeric FD again.
+#[derive(Clone)]
+pub struct RecordWait {
+    request: RecordLockRequest,
+    _registration: Option<Arc<WaitRegistration>>,
+}
+impl RecordWait {
+    pub fn try_lock(&self) -> Result<()> {
+        self.request.try_lock()
+    }
+    pub fn holder(&self) -> Option<u32> {
+        self.request.holder()
+    }
+    pub fn subscribe(&self, signal: &Arc<IoSignal>) -> IoSubscription {
+        self.request
+            .records
+            .1
+            .get_or_init(Arc::default)
+            .subscribe(signal)
+    }
+}
+
+/// One original lock file. It owns no Files/namespace/task projection.
+#[derive(Clone)]
+pub struct RecordFile {
+    file: SharedFd,
+    context: RecordLockContext,
+}
+impl RecordFile {
+    pub fn visible_pid(&self, owner: u32) -> u32 {
+        self.context.visible_pid(owner)
+    }
+    pub fn flags(&self) -> u32 {
+        self.file.open.flags.get()
+    }
+    fn records(&self) -> Result<Arc<Records>> {
+        let node = self.file.open.node.as_ref().ok_or(Errno(9))?.borrow();
+        Ok(node
+            .record_locks
+            .get_or_init(|| {
+                self.context
+                    .registry
+                    .as_ref()
+                    .expect("original lock registry")
+                    .create()
+            })
+            .clone())
+    }
+    pub fn normalize(
+        &self,
+        kind: u16,
+        whence: u16,
+        start: i64,
+        length: i64,
+        ofd: bool,
+    ) -> Result<RecordLock> {
+        if kind > 2 {
+            return Err(Errno(22));
+        }
+        let open = &self.file.open;
+        let node = open.node.as_ref().ok_or(Errno(9))?.borrow();
+        let Content::File(data) = &node.content else {
+            return Err(Errno(9));
+        };
+        let base = match whence {
+            0 => 0,
+            1 => open.file_position.snapshot(),
+            2 => data.len(),
+            _ => return Err(Errno(22)),
+        };
+        let mut requested = normalize(kind, start, length, base, self.context.owner)?;
+        if ofd {
+            let records = node.record_locks.get_or_init(|| {
+                self.context
+                    .registry
+                    .as_ref()
+                    .expect("original lock registry")
+                    .create()
+            });
+            requested.owner = open.ofd_record_owner(records);
+        }
+        Ok(requested)
+    }
+    pub fn conflict(&self, requested: RecordLock) -> Result<Option<RecordLock>> {
+        Ok(self.records()?.conflict(requested))
+    }
+    fn writable(&self, requested: RecordLock) -> Result<()> {
+        let flags = self.flags();
+        if requested.kind == 0 && flags & 3 == 1 || requested.kind == 1 && flags & 3 == 0 {
+            Err(Errno(9))
+        } else {
+            Ok(())
+        }
+    }
+    pub fn set(&self, requested: RecordLock) -> Result<()> {
+        self.writable(requested)?;
+        self.records()?.set(requested)
+    }
+    pub fn request(&self, requested: RecordLock) -> Result<RecordLockRequest> {
+        self.writable(requested)?;
+        Ok(RecordLockRequest {
+            records: self.records()?,
+            requested,
+            _file: self.file.clone(),
+            registry: self
+                .context
+                .registry
+                .as_ref()
+                .expect("original lock registry")
+                .clone(),
+        })
+    }
 }
 impl Vfs {
+    /// Cold admission only, without allocating an inode lock object.
+    pub fn shares_record_wait(&self, wait: &RecordWait) -> bool {
+        self.fds.entries().values().any(|descriptor| {
+            descriptor.open.borrow().node.as_ref().is_some_and(|node| {
+                node.borrow()
+                    .record_locks
+                    .get()
+                    .is_some_and(|records| Arc::ptr_eq(records, &wait.request.records))
+            })
+        })
+    }
     pub fn normalize_ofd_lock(
         &self,
         fd: u32,
@@ -215,32 +440,11 @@ impl Vfs {
         start: i64,
         length: i64,
     ) -> Result<RecordLock> {
-        let mut lock = self.normalize_lock(fd, kind, whence, start, length)?;
-        let descriptor = self.descriptor(fd)?;
-        let open = descriptor.open.borrow();
-        let node = open.node.as_ref().ok_or(Errno(9))?.borrow();
-        lock.owner = open
-            .shared
-            .ofd_record_owner(&self.inode_record_locks(&node));
-        Ok(lock)
+        self.record_file(fd)?
+            .normalize(kind, whence, start, length, true)
     }
     pub fn retain_record_lock(&self, fd: u32, requested: RecordLock) -> Result<RecordLockRequest> {
-        let file = RetainedFd(self.descriptor(fd)?);
-        let open = file.0.open.borrow();
-        if (requested.kind == 0 && open.flags.get() & 3 == 1)
-            || (requested.kind == 1 && open.flags.get() & 3 == 0)
-        {
-            return Err(Errno(9));
-        }
-        let node = open.node.as_ref().ok_or(Errno(9))?.borrow();
-        let records = self.inode_record_locks(&node);
-        drop(node);
-        drop(open);
-        Ok(RecordLockRequest {
-            records,
-            requested,
-            _file: file,
-        })
+        self.record_file(fd)?.request(requested)
     }
 }
 /// Live original PID visibility across in-epoch task birth. This
@@ -264,6 +468,16 @@ impl ProcessRecordLocks {
     }
 }
 impl RecordLockContext {
+    pub fn supports_waits(&self) -> bool {
+        self.registry.is_some()
+    }
+    pub fn file(&self, file: SharedFd) -> Option<RecordFile> {
+        self.registry.as_ref()?;
+        Some(RecordFile {
+            file,
+            context: self.clone(),
+        })
+    }
     pub fn release(&self) {
         if let Some(registry) = &self.registry {
             registry.release(self.owner);
@@ -276,6 +490,14 @@ impl RecordLockContext {
     }
 }
 impl Vfs {
+    pub fn record_file(&self, fd: u32) -> Result<RecordFile> {
+        let descriptor = self.descriptor(fd)?;
+        let file = SharedFd::new(descriptor.open.borrow().shared.clone());
+        Ok(self
+            .record_lock_context(self.lock_owner)
+            .file(file)
+            .expect("original VFS lock registry"))
+    }
     pub fn process_record_locks(&self, owner: u32) -> ProcessRecordLocks {
         ProcessRecordLocks {
             registry: self.record_locks.clone(),
@@ -301,11 +523,8 @@ impl Vfs {
         self.process_record_locks(self.lock_owner).release();
     }
     pub(super) fn release_record_locks(&self, descriptor: &Descriptor) {
-        descriptor
-            .open
-            .borrow()
-            .shared
-            .release_record_locks(self.lock_owner);
+        let open = descriptor.open.borrow().shared.clone();
+        open.release_record_locks(self.lock_owner);
     }
 }
 impl SharedOpenDescription {
@@ -314,7 +533,8 @@ impl SharedOpenDescription {
             // Do not allocate or lock a registry for an inode that has never
             // acquired a lock object. Close releases this process's locks even
             // when dup/another process retains the open description.
-            if let Some(records) = node.borrow().record_locks.get() {
+            let records = node.borrow().record_locks.get().cloned();
+            if let Some(records) = records {
                 records.release(owner as u64);
             }
         }
@@ -332,40 +552,18 @@ impl Vfs {
         if kind > 2 {
             return Err(Errno(22));
         }
-        let d = self.descriptor(fd)?;
-        let o = d.open.borrow();
-        let n = o.node.as_ref().ok_or(Errno(9))?.borrow();
-        let Content::File(data) = &n.content else {
-            return Err(Errno(9));
-        };
-        let base = match whence {
-            0 => 0,
-            1 => o.current_position(),
-            2 => data.len(),
-            _ => return Err(Errno(22)),
-        };
-        normalize(kind, start, length, base, self.lock_owner)
+        self.record_file(fd)?
+            .normalize(kind, whence, start, length, false)
     }
     pub fn record_lock_conflict(
         &self,
         fd: u32,
         requested: RecordLock,
     ) -> Result<Option<RecordLock>> {
-        let d = self.descriptor(fd)?;
-        let o = d.open.borrow();
-        let n = o.node.as_ref().ok_or(Errno(9))?.borrow();
-        Ok(self.inode_record_locks(&n).conflict(requested))
+        self.record_file(fd)?.conflict(requested)
     }
     pub fn record_lock_set(&self, fd: u32, requested: RecordLock) -> Result<()> {
-        let d = self.descriptor(fd)?;
-        let o = d.open.borrow();
-        if (requested.kind == 0 && o.flags.get() & 3 == 1)
-            || (requested.kind == 1 && o.flags.get() & 3 == 0)
-        {
-            return Err(Errno(9));
-        }
-        let n = o.node.as_ref().ok_or(Errno(9))?.borrow();
-        self.inode_record_locks(&n).set(requested)
+        self.record_file(fd)?.set(requested)
     }
 }
 
@@ -658,6 +856,8 @@ mod tests {
         let a = registry.create();
         let b = registry.create();
         let held = a.0.lock().unwrap();
+        let _registry = registry.0.lock().unwrap();
+        let _wait_graph = registry.1.lock().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
             scope.spawn(|| {
@@ -709,3 +909,7 @@ mod tests {
         assert_eq!(context.visible_pid(11), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "lock_wait_tests.rs"]
+mod wait_tests;

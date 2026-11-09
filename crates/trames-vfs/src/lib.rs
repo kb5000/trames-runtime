@@ -105,7 +105,8 @@ pub use ipc::{
     LocalSocket, SharedRights, WaylandAuth, WaylandGrant,
 };
 pub use locks::{
-    ProcessRecordLocks, RecordLock, RecordLockContext, RecordLockRequest, OFD_LOCK_OWNER,
+    ProcessRecordLocks, RecordFile, RecordLock, RecordLockContext, RecordLockRequest, RecordWait,
+    OFD_LOCK_OWNER,
 };
 mod host_files;
 mod linux_namespace;

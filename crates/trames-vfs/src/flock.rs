@@ -72,10 +72,7 @@ impl FlockRequest {
 impl RetainedFd {
     pub fn flock_request(&self, operation: u32) -> Result<FlockRequest> {
         validate(operation)?;
-        let shared = match &self.0.open {
-            OpenHandle::Shared(open) => Some(SharedFd::new(open.clone())),
-            OpenHandle::Owner(_) => None,
-        };
+        let shared = Some(SharedFd::new(self.0.open.borrow().shared.clone()));
         Ok(
             FlockRequest::new(self.0.open.borrow().flock_owner()?.clone(), operation)
                 .with_file(shared),
@@ -130,7 +127,7 @@ impl Drop for Owner {
         }
     }
 }
-impl OpenDescription {
+impl SharedOpenDescription {
     fn flock_owner(&self) -> Result<&Arc<Owner>> {
         if self.flags.get() & O_PATH != 0 {
             return Err(Errno(9));
@@ -147,6 +144,14 @@ impl OpenDescription {
     }
     pub(super) fn flock_capability(&self) -> std::sync::Weak<Owner> {
         self.flock_owner().map(Arc::downgrade).unwrap_or_default()
+    }
+}
+impl DescriptorFactory {
+    pub fn flock_request(&self, fd: u32, operation: u32) -> Result<FlockRequest> {
+        validate(operation)?;
+        let control = self.descriptor_control(fd)?;
+        let file = control.filesystem_target().shared_file();
+        Ok(FlockRequest::new(file.open.flock_owner()?.clone(), operation).with_file(Some(file)))
     }
 }
 impl Vfs {
