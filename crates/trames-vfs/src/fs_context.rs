@@ -345,6 +345,19 @@ pub(super) struct ContextPublication {
     owner: Option<FsOwner>,
 }
 impl ContextPublication {
+    pub(super) fn observe(&self, registry: mounts::Registry) -> FsContext {
+        FsContext {
+            paths: PathStore {
+                shared: self.shared.clone(),
+                users: self.users.clone(),
+                contexts: self.contexts.clone(),
+                projections: RefCell::default(),
+                registry,
+            },
+            mask: self.mask.clone(),
+            owner: None,
+        }
+    }
     pub(super) fn same_owner(&self, context: &FsContext) -> bool {
         match (&self.owner, &context.owner) {
             (Some(a), Some(b)) => a.same(b),

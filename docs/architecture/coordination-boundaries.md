@@ -360,7 +360,7 @@ Actual excluded policy effects and missing capabilities retain explicit boundari
 | io_uring explicit capability/resource escalation | Missing typed source provider, unavailable native event subscription after source retry, actual unsupported body/pinning | Original-Files registration/import and source CQ execution stay direct. Layout and signal completion side transports are deleted: accepted dependencies remain on the request, and legacy signals publish to the original task actor. Production mapped layout uses original FileLayouts. Only the two actual maintenance failure sites still set `owner_required`. | [actor](../../crates/trames-linux/src/direct/uring/actor.rs), [source maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [subscriptions](../../crates/trames-linux/src/direct/uring/wait.rs), [file results](../../crates/trames-linux/src/direct/uring/actor_file.rs) |
 | Native guest mapping and exceptional native memory entry | Original task/mm source checkpoint before body effects; Vulkan import, live-private backing and unstable entry use original Memory | No joined execution category remains for admitted original tasks. Actual capability-less/solo embeddings retain their own route. Affected bytes still quiesce; permission/backing errors and bounded entry retries use the existing common model. | [source native scope](../../crates/trames-session/src/process_lifecycle_native.rs), [Vulkan import](../../crates/trames-vulkan/src/backend.rs), [native memory](../../crates/trames-memory/src/parallel/native.rs), [entry registry](../../crates/trames-accel/src/native.rs), [GPU waits](../../crates/trames-session/src/gpu.rs) |
 | Scheduler/cohort membership | Initial guest admission and legacy nonmember wake; ordinary scheduling metadata and live affinity no longer require the owner | Initial/legacy orchestration retains its boundary. Existing members migrate/park/wake locally; children and exec replacements enter the live queue. Original CPU slots can start directly and lazily from that queue. Periodic checks alone do not tear down the cohort: `cohort_control` tests actual events and original dependencies. | [legacy wake](../../crates/trames-session/src/futex.rs), [queue](../../crates/trames-session/src/run_queue.rs), [owner metadata](../../crates/trames-session/src/process_scheduling.rs), [control checks](../../crates/trames-session/src/process_vm.rs) |
-| Host/legacy embedding administration | Transfer/timezone command, pause/cancel; Mac admin/shutdown/deadline requests | These actual administration requests retain their join. Mac memory-pressure reclamation progresses on original mapping resources without a join. Original init notifications and authenticated graceful-stop signal delivery no longer join. Host exec construction/loading/admission, original group control and native terminal open/close/input/resize/hangup use original resources and existing workers. FileProvider writeback deliberately pauses when applying staged edits, as chosen by the owner. | [host launch lifecycle](../../crates/trames-session/src/process_lifecycle_host.rs), [original launches](../../crates/trames-session/src/process_host.rs), [shared terminals](../../crates/trames-distro/src/terminals.rs) |
+| Host/legacy embedding administration | Pause/cancel; Mac admin/shutdown/deadline requests | These actual administration requests retain their join. Transfer/timezone/FileProvider commands use the existing disk pool and original namespace/inode resources; mapped byte consumers use original backing admission. Mac memory-pressure reclamation progresses on original mapping resources without a join. Original init notifications and authenticated graceful-stop signal delivery no longer join. Host exec construction/loading/admission, original group control and native terminal open/close/input/resize/hangup use original resources and existing workers. FileProvider admission still occurs when returning to Trames, as chosen by the owner; applying the accepted edit no longer pauses unrelated execution. | [host launch lifecycle](../../crates/trames-session/src/process_lifecycle_host.rs), [original launches](../../crates/trames-session/src/process_host.rs), [shared terminals](../../crates/trames-distro/src/terminals.rs) |
 | Final teardown and faults | Actual session/backend teardown, non-notifying native stop and unhandled fault exits | Ordinary last/group/default-fatal exit is source work; CPUs and cold Rc projections return asynchronously, with actual same-mm byte custody where needed. These are not ordinary whole-cohort exit boundaries. Accepted guest faults use the original signal path; actual unhandled/backend failures and final host teardown retain their explicit boundary. A host backend error is not an automatic full-VM or software fallback. | [source completion](../../crates/trames-session/src/process_exit.rs), [fault/dispatch](../../crates/trames-session/src/workers.rs), [native lifecycle](execution-backends.md#live-native-device-authority--2026-11-03) |
 
 The final worker-dispatch catch-all remains authoritative: an exit without a
@@ -2873,3 +2873,47 @@ Only Mac Dev is updated; stable, business environments and physical iPad install
 remain unchanged. Actual pause/cancel, transfer/writeback, shutdown, excluded
 resources, initial/legacy/solo orchestration and last-resort dispatch remain.
 The overall coordinator-removal goal stays active.
+
+
+## 76. Original host filesystem operations and conditional editor commits — 2026-11-09
+
+Authorized embedding imports, exports, timezone updates and conditional
+FileProvider saves use the existing disk pool. The host adapter retains one
+accepted command at a time, preserving its existing FIFO and queue limits while
+guest CPUs continue. Spawn failure/closed pools fail the original response;
+blocking I/O never falls back to the control poller. Completion wakes the existing
+session driver. No new thread, guest per-write lock/check, or coordinator service
+is introduced.
+
+A host context observes current original task namespace/credential publications
+without consuming them or adopting/retiring another task's Files/fs ownership.
+Accepted operations retain their original resources across later unshare and
+credential changes. Export retains its original inode across rename/unlink.
+Mapped byte consumers use the existing FileLayouts driver and backing ticket;
+only actual mapped-byte dependants quiesce, without ending the cohort.
+
+Imports stage unpublished objects with bounded streaming buffers and original
+storage accounting. An incomplete/cancelled transfer never publishes its stage.
+Explicit replacements preserve metadata, hardlinks and old OFD/mapping identity.
+Conditional saves validate their host checksum, then use the original filesystem,
+inode and plain byte locks through content validation and namespace replacement.
+FS -> inode -> bytes is the existing checkpoint order. This cold transaction can
+block filesystem observers during hashing; it never waits for unrelated CPUs to
+return and adds no fast-path synchronization. Mapped writers use original backing
+admission. Failed manifests restore the old namespace and release anonymous
+staging; already-applied retries need no extra staging quota.
+
+Explicit host pause still suspends guest execution. Its callback now returns to
+the existing driver so accepted disk/backing work can complete while paused.
+Normal root teardown drains accepted embedding work and backing requests before
+returning. Actual cancellation/final backend teardown retain their own boundary.
+The owner-selected policy of applying FileProvider saves when returning to the
+app is unchanged.
+
+Focused tests cover original namespace publication/ownership, inode retention,
+concurrent plain writes, metadata/hardlinks, cancellation, idempotence at full
+quota, failed manifests, and embedding command FIFO/pause completion. Original
+mapped exports complete on 4/12 execution CPUs within one cohort, including the
+explicit pause route. These are scoped conformance results, not browser or
+throughput performance claims. Capability-less legacy embeddings retain their
+explicit boundary. The overall coordinator-removal goal remains active.

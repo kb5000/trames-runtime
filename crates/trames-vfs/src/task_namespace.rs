@@ -57,6 +57,16 @@ impl Bindings {
         target.pid_children = self.pid_children;
         target.mounts = self.mounts;
     }
+    fn install_shared(&self, target: &mut Vfs) {
+        target.credentials = self.credentials.clone();
+        target.uts = self.uts.clone();
+        target.network = self.network.clone();
+        target.root_network = self.root_network.clone();
+        target.ipc_namespace = self.ipc.clone();
+        target.cgroup_namespace = self.cgroup.clone();
+        target.pid_children = self.pid_children.clone();
+        target.mounts = self.mounts.clone();
+    }
 }
 impl Publication {
     fn publish(&self, bindings: Bindings) {
@@ -131,6 +141,27 @@ pub enum TaskNamespaceAttempt {
     Waiting(TaskNamespaceWork),
 }
 impl Vfs {
+    /// An accepted host filesystem operation retains the original Files/fs and
+    /// namespace resources. Read pending source bindings without consuming the
+    /// cold owner's publication; later unshare cannot retarget accepted work.
+    pub fn host_files_context(&self) -> Self {
+        let mut view = self.clone_with_resources(true, true);
+        if let Some(publication) = self.task_namespace_publication.get() {
+            if let Some(bindings) = publication.pending.lock().unwrap().as_ref() {
+                bindings.install_shared(&mut view);
+                view.fds = DescriptorTable::observe(bindings.files.clone());
+                view.context = bindings.context.observe(view.mount_registry.clone());
+            }
+        }
+        // Observing Files is not another Linux task's ownership reference.
+        view.fds = DescriptorTable::observe(view.shared_files());
+        view.context = view
+            .context
+            .publication(None)
+            .observe(view.mount_registry.clone());
+        view
+    }
+
     /// A non-mount namespace replaces only a task-local handle after validation.
     /// There is no multi-resource rollback state to copy on a serial executor.
     pub fn setns_task(&mut self, fd: u32, kind: u64) -> TaskNamespaceOwnerAttempt {

@@ -97,6 +97,154 @@ mod tests {
     use trames_execution::Registers;
     use trames_memory::{Permissions, PAGE_SIZE};
     #[test]
+    fn host_export_uses_original_backing_on_four_and_twelve_cpu_sources() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Export {
+            file: trames_vfs::HostExport,
+            done: Arc<AtomicBool>,
+        }
+        impl trames_linux::HostFileTask for Export {
+            fn layout(&self) -> Option<Arc<trames_linux::HostFileLayout>> {
+                Some(self.file.layout())
+            }
+            fn run(self: Box<Self>, admission: Option<trames_linux::HostFileAdmission>) {
+                assert!(admission.is_some());
+                let mut bytes = Vec::new();
+                self.file.write_to(&mut bytes).unwrap();
+                assert_eq!(&bytes[..8], &17u64.to_le_bytes());
+                self.done.store(true, Ordering::Release);
+            }
+            fn fail(self: Box<Self>) {
+                panic!("host export failed")
+            }
+        }
+        struct Host {
+            work: Option<Box<Export>>,
+            done: Arc<AtomicBool>,
+            layouts: Option<Arc<trames_linux::FileLayouts>>,
+            deadline: Instant,
+            pause: bool,
+            paused: bool,
+        }
+        impl GuestOutput for Host {
+            fn bind_host_files(
+                &mut self,
+                _: Arc<dyn trames_linux::FileExecutor>,
+                layouts: Arc<trames_linux::FileLayouts>,
+            ) {
+                self.layouts = Some(layouts);
+            }
+            fn source_console(&mut self) -> Arc<dyn trames_vfs::ConsoleIo> {
+                Arc::new(trames_vfs::CapturedConsole::default())
+            }
+            fn paused(&self) -> bool {
+                self.paused
+            }
+            fn poll_control(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<bool> {
+                if self.pause && self.work.is_some() {
+                    self.paused = true;
+                    return Ok(true);
+                }
+                if let Some(work) = self.work.take() {
+                    self.layouts.as_ref().unwrap().submit_host(work);
+                }
+                Ok(self.done.load(Ordering::Acquire) || Instant::now() > self.deadline)
+            }
+            fn control(&mut self, _: &mut trames_vfs::Vfs) -> std::io::Result<bool> {
+                if self.paused {
+                    if let Some(work) = self.work.take() {
+                        self.layouts.as_ref().unwrap().submit_host(work);
+                    }
+                }
+                Ok(!self.done.load(Ordering::Acquire) && Instant::now() <= self.deadline)
+            }
+            fn control_poll_interval(&self) -> Duration {
+                Duration::from_millis(1)
+            }
+            fn write(&mut self, _: OutputFd, bytes: &[u8]) -> std::io::Result<usize> {
+                Ok(bytes.len())
+            }
+        }
+        // Multi-CPU source admission; solo uses the same backing driver and is
+        // separately covered by its existing file-layout conformance fixtures.
+        for (cpus, pause) in [(4, false), (12, false), (4, true), (12, true)] {
+            let mut k = super::super::tests::kernel();
+            k.cpu_count = cpus;
+            k.workers = crate::workers::Pool::new(cpus);
+            k.per_cpu = vec![Duration::ZERO; cpus];
+            let mut root = super::super::tests::process();
+            root.linux
+                .vfs
+                .import_file(b"/mapped", vec![0; PAGE_SIZE as usize])
+                .unwrap();
+            let export = root.linux.vfs.host_export(b"/mapped").unwrap();
+            let fd = root.linux.vfs.open_at(-100, b"/mapped", 2, 0).unwrap();
+            root.memory
+                .map_backed(
+                    0x10000,
+                    root.linux
+                        .vfs
+                        .mapping_pages(fd, 0, PAGE_SIZE, true, true)
+                        .unwrap(),
+                    true,
+                    Permissions::RW,
+                    false,
+                )
+                .unwrap();
+            for id in 1..=cpus {
+                let mut p = if id == 1 {
+                    root
+                } else {
+                    super::super::tests::process()
+                };
+                p.tgid = id as u32;
+                p.vm_id = id as u64;
+                p.signals.io.scheduling.set_affinity(1 << (id - 1));
+                let words: &[u32] = if id == 1 {
+                    &[0xd2a00020, 0xd2800221, 0xf9000001, 0x14000000]
+                } else {
+                    &[0x14000000]
+                };
+                p.memory
+                    .write(
+                        0x4000,
+                        &words
+                            .iter()
+                            .flat_map(|v| v.to_le_bytes())
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap();
+                p.memory
+                    .protect(0x4000, PAGE_SIZE, Permissions::RX)
+                    .unwrap();
+                k.processes.insert(id as u32, p);
+                root = super::super::tests::process();
+            }
+            let done = Arc::new(AtomicBool::new(false));
+            let mut host = Host {
+                work: Some(Box::new(Export {
+                    file: export,
+                    done: done.clone(),
+                })),
+                done: done.clone(),
+                layouts: None,
+                deadline: Instant::now() + Duration::from_secs(5),
+                pause,
+                paused: false,
+            };
+            assert!(matches!(
+                k.drive(&mut host, u64::MAX),
+                Err(RuntimeError::Cancelled)
+            ));
+            assert!(
+                done.load(Ordering::Acquire),
+                "host export must complete before its timeout"
+            );
+            assert_eq!(k.parallel_rounds, 1, "host I/O must not split the cohort");
+            assert!(k.cohort_return_syscalls.is_empty());
+        }
+    }
+    #[test]
     fn file_layout_waits_for_original_views_and_retires_once_without_global_pauses() {
         let mut k = super::super::tests::kernel();
         let mut p = super::super::tests::process();

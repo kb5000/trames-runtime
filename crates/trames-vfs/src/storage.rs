@@ -1391,6 +1391,12 @@ impl Vfs {
         executable: bool,
     ) -> Result<u64> {
         self.import_plan(path)?;
+        let (data, total) = self.stage_import(reader)?;
+        self.import_data(path, data, executable)?;
+        Ok(total)
+    }
+    /// An unpublished object owns its quota and cleanup through cancellation.
+    pub(super) fn stage_import(&self, reader: &mut impl Read) -> Result<(FileData, u64)> {
         let mut data = self.empty_data()?;
         let mut total = 0u64;
         let mut buffer = [0; 65536];
@@ -1411,8 +1417,7 @@ impl Vfs {
             total = end;
         }
         data.sync(false)?;
-        self.import_data(path, data, executable)?;
-        Ok(total)
+        Ok((data, total))
     }
     /// Explicit host import replacement. Stage a complete inode before one
     /// namespace rename; cancellation/short reads never truncate the old file.
@@ -1422,45 +1427,7 @@ impl Vfs {
             Err(Errno(17)) => {}
             Err(error) => return Err(error),
         }
-        let old = self.node(path)?;
-        if !matches!(old.borrow().content, Content::File(_)) {
-            return Err(Errno(21));
-        }
-        let parent = &path[..path.iter().rposition(|b| *b == b'/').ok_or(Errno(22))?];
-        let mut temporary = parent.to_vec();
-        for attempt in 0..32 {
-            temporary.truncate(parent.len());
-            temporary.extend(
-                format!(
-                    "/.trames-import-{:x}-{attempt}",
-                    self.fs.borrow().next_inode
-                )
-                .as_bytes(),
-            );
-            if self.node(&temporary).is_err() {
-                break;
-            }
-            if attempt == 31 {
-                return Err(Errno(17));
-            }
-        }
-        let count = self.import_reader(&temporary, reader, false)?;
-        let result = (|| {
-            let staged = self.node(&temporary)?;
-            {
-                let mut staged = staged.borrow_mut();
-                let old = old.borrow();
-                staged.mode = old.file_metadata().mode;
-                staged.uid = old.uid;
-                staged.gid = old.gid;
-                staged.xattrs = old.xattrs.clone();
-            }
-            self.rename_at(AT_FDCWD, &temporary, AT_FDCWD, path, 0)
-        })();
-        if result.is_err() {
-            let _ = self.unlink_at(AT_FDCWD, &temporary, false);
-        }
-        result.map(|_| count)
+        self.host_edit(path)?.replace_unchecked(self, reader)
     }
     /// Export through an authorized platform writer; no guest-to-host path mapping.
     pub fn export_writer(&self, path: &[u8], writer: &mut impl Write) -> Result<u64> {

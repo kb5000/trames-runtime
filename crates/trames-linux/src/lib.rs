@@ -25,6 +25,8 @@ pub use direct::{
 mod file_calls;
 mod file_layouts;
 pub use file_layouts::{FileLayoutDriver, FileLayoutRequest, FileLayouts};
+mod host_files;
+pub use host_files::{HostFileAdmission, HostFileLayout, HostFileTask};
 mod heap;
 mod path_queries;
 mod render;
@@ -176,6 +178,14 @@ impl HostProcess {
 }
 
 pub trait GuestOutput {
+    /// Bind the session's existing I/O pool and original backing driver before
+    /// execution. Embedding jobs never create a resource-service thread.
+    fn bind_host_files(
+        &mut self,
+        _executor: std::sync::Arc<dyn FileExecutor>,
+        _layouts: std::sync::Arc<FileLayouts>,
+    ) {
+    }
     /// Original byte resource, shared with execution workers. Lifecycle hooks
     /// remain on the host; console bytes never call those hooks through RPC.
     fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo>;
@@ -219,6 +229,11 @@ pub trait GuestOutput {
     /// entire session. Host adapters may perform queued, authorized VFS work here.
     fn control(&mut self, _vfs: &mut trames_vfs::Vfs) -> io::Result<bool> {
         Ok(true)
+    }
+    /// Explicit embedding pause stops guest execution, while original I/O and
+    /// mapped-backing completion continue on the existing driver/workers.
+    fn paused(&self) -> bool {
+        false
     }
     /// An accepted host launch. Opted-in adapters submit while executors run;
     /// legacy embeddings consume it after the stopped control hook.

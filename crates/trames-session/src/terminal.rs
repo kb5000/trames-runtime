@@ -191,6 +191,16 @@ fn io_error(error: Errno) -> io::Error {
     io::Error::other(error.to_string())
 }
 impl<T: GuestOutput> GuestOutput for Adapter<'_, T> {
+    fn paused(&self) -> bool {
+        self.inner.paused()
+    }
+    fn bind_host_files(
+        &mut self,
+        executor: Arc<dyn trames_linux::FileExecutor>,
+        layouts: Arc<trames_linux::FileLayouts>,
+    ) {
+        self.inner.bind_host_files(executor, layouts);
+    }
     fn source_console(&mut self) -> Arc<dyn trames_vfs::ConsoleIo> {
         self.console
             .clone()

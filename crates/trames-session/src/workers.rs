@@ -225,6 +225,10 @@ struct DiskWorker<C: Cpu> {
 enum DiskJob<C: Cpu> {
     File(trames_vfs::FileWork, Arc<trames_linux::FileResult>),
     Console(crate::terminal::Write),
+    Host(
+        Box<dyn trames_linux::HostFileTask>,
+        Option<trames_memory::layout::LayoutExclusive>,
+    ),
     Image(
         Box<crate::process::exec::Request>,
         Arc<crate::process::exec::Pending<C>>,
@@ -239,10 +243,17 @@ impl<C: Cpu> DiskJob<C> {
                     .complete(work.bytes, work.offset, Err(trames_vfs::Errno(5)))
             }
             Self::Image(_, result) => result.complete(Err(trames_vfs::Errno(5))),
+            Self::Host(work, _) => work.fail(),
         }
     }
     fn run(self) {
         match self {
+            Self::Host(work, exclusive) => {
+                // A panic drops the original response and admission. Preserve
+                // the disk worker for other accepted operations.
+                let _ =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work.run(exclusive)));
+            }
             Self::Console(work) => work.run(),
             Self::File(job, result) => {
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run())) {
@@ -300,7 +311,7 @@ impl<C: Cpu> DiskPool<C> {
         };
         // Thread resource failure preserves one execution and one completion.
         // A host transport must not fall back to a blocking call on its poller.
-        if matches!(job, DiskJob::Console(_)) {
+        if matches!(job, DiskJob::Console(_) | DiskJob::Host(..)) {
             job.fail();
         } else {
             job.run();
@@ -320,6 +331,13 @@ impl<C: Cpu> DiskPool<C> {
     }
 }
 impl<C: Cpu> trames_linux::FileExecutor for DiskPool<C> {
+    fn submit_host(
+        &self,
+        work: Box<dyn trames_linux::HostFileTask>,
+        exclusive: Option<trames_memory::layout::LayoutExclusive>,
+    ) {
+        self.submit(DiskJob::Host(work, exclusive));
+    }
     fn submit_file(&self, job: trames_vfs::FileWork, result: Arc<trames_linux::FileResult>) {
         result.begin();
         self.submit(DiskJob::File(job.queued(), result));

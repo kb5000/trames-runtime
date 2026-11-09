@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Original mapped-file mutations, driven by existing execution slots. This
 //! resource owns accepted work across executor changes; it runs no thread.
-use crate::{FileExecutor, FileResult};
+use crate::{FileExecutor, FileResult, HostFileTask};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, Weak};
 use trames_memory::layout::{Layout, LayoutWrite};
@@ -40,13 +40,25 @@ impl IoWake for Wake {
 }
 pub struct FileLayoutRequest {
     id: u64,
-    work: FileWork,
-    result: Arc<FileResult>,
+    work: LayoutWork,
     ticket: Option<LayoutWrite>,
     pub signal: Arc<IoSignal>,
     _wake: Arc<Wake>,
     _layout: IoSubscription,
     waits: Vec<IoSubscription>,
+}
+#[allow(clippy::large_enum_variant)] // Preserve inline ordinary file jobs; only cold host work allocates.
+enum LayoutWork {
+    File(FileWork, Arc<FileResult>),
+    Host(Box<dyn HostFileTask>),
+}
+impl LayoutWork {
+    fn fail(self, errno: u32) {
+        match self {
+            Self::File(_, result) => result.fail(errno),
+            Self::Host(work) => work.fail(),
+        }
+    }
 }
 impl FileLayoutRequest {
     pub fn layout(&self) -> &Arc<Layout> {
@@ -138,6 +150,20 @@ impl FileLayouts {
             return Err(work);
         };
         result.begin();
+        self.enqueue(ticket, LayoutWork::File(work, result));
+        Ok(())
+    }
+    /// Host byte consumers share original mapped-backing admission. Ordinary
+    /// imports/timezone updates have no layout dependency and use the pool
+    /// directly. No execution slot is retained by either kind of host job.
+    pub fn submit_host(self: &Arc<Self>, work: Box<dyn HostFileTask>) {
+        if let Some(layout) = work.layout() {
+            self.enqueue(layout.write(), LayoutWork::Host(work));
+        } else {
+            self.executor.submit_host(work, None);
+        }
+    }
+    fn enqueue(self: &Arc<Self>, ticket: LayoutWrite, work: LayoutWork) {
         let id = {
             let mut state = self.state.lock().unwrap();
             let id = state.next;
@@ -155,7 +181,6 @@ impl FileLayouts {
         let request = FileLayoutRequest {
             id,
             work,
-            result,
             ticket: Some(ticket),
             signal,
             _wake: wake,
@@ -167,7 +192,6 @@ impl FileLayouts {
         state.ready.insert(id);
         drop(state);
         self.notify();
-        Ok(())
     }
     pub fn take_owner(&self) -> Vec<FileLayoutRequest> {
         let driver = self.driver.lock().unwrap();
@@ -223,14 +247,19 @@ impl FileLayouts {
             }
         };
         self.finish(request.id);
-        request.result.begin();
-        self.executor
-            .submit_file(request.work.enter_layout(exclusive), request.result);
+        match request.work {
+            LayoutWork::File(work, result) => {
+                result.begin();
+                self.executor
+                    .submit_file(work.enter_layout(exclusive), result);
+            }
+            LayoutWork::Host(work) => self.executor.submit_host(work, Some(exclusive)),
+        }
         Ok(())
     }
     pub fn fail(&self, request: FileLayoutRequest, errno: u32) {
         self.finish(request.id);
-        request.result.fail(errno);
+        request.work.fail(errno);
     }
     fn finish(&self, id: u64) {
         let mut state = self.state.lock().unwrap();

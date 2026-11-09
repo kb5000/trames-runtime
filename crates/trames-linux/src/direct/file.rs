@@ -5,6 +5,13 @@ use std::sync::Mutex;
 
 pub trait FileExecutor: Send + Sync {
     fn submit_file(&self, job: trames_vfs::FileWork, result: Arc<FileResult>);
+    fn submit_host(
+        &self,
+        job: Box<dyn crate::HostFileTask>,
+        _exclusive: Option<trames_memory::layout::LayoutExclusive>,
+    ) {
+        job.fail();
+    }
 }
 pub struct FileResult {
     result: Mutex<Option<trames_vfs::FileOutcome>>,

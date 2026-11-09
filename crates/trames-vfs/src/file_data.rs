@@ -102,6 +102,31 @@ impl Drop for ReadLease {
     }
 }
 impl PlainFile {
+    /// Cold conditional host replacement uses the existing byte lock through
+    /// its namespace commit. Ordinary writes gain no additional gate/check.
+    pub(super) fn with_reader<T>(&self, call: impl FnOnce(&mut dyn std::io::Read) -> T) -> T {
+        let bytes = self.bytes.read().unwrap();
+        struct Reader<'a> {
+            bytes: &'a Bytes,
+            offset: u64,
+        }
+        impl std::io::Read for Reader<'_> {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                let data = self
+                    .bytes
+                    .read_at(self.offset, out.len(), None)
+                    .map_err(|e| std::io::Error::from_raw_os_error(e.0 as i32))?;
+                out[..data.len()].copy_from_slice(&data);
+                self.offset += data.len() as u64;
+                Ok(data.len())
+            }
+        }
+        let mut reader = Reader {
+            bytes: &bytes,
+            offset: 0,
+        };
+        call(&mut reader)
+    }
     pub(super) fn private_lease(&self, write: bool) -> Result<Option<Arc<std::fs::File>>> {
         match &self.backing {
             Some(backing) => backing.private_lease(write),

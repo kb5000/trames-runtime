@@ -4173,6 +4173,7 @@ impl<C: Cpu> Kernel<C> {
         }
     }
     fn drive(&mut self, io: &mut impl GuestOutput, limit: u64) -> Result<Exit, RuntimeError> {
+        io.bind_host_files(self.workers.file_executor(), self.file_layout_work());
         'drive: loop {
             self.process_exits(None)?;
             self.progress_proc_reads()?;
@@ -4201,6 +4202,10 @@ impl<C: Cpu> Kernel<C> {
             }
             self.control(io)?;
             self.poll_file_layouts();
+            if io.paused() {
+                std::thread::park_timeout(Duration::from_millis(10));
+                continue;
+            }
             let mut progress = false;
             if let Some(root) = self.processes.get(&1) {
                 root.linux.vfs.dispatch_native_events();
@@ -4373,6 +4378,7 @@ impl<C: Cpu> Kernel<C> {
                             .map_err(|_| RuntimeError::Arguments("terminal master output failed"))?
                         {
                             self.control(io)?;
+                            self.poll_file_layouts();
                             self.wait_external(io.control_poll_interval());
                         }
                         return Ok(Exit {

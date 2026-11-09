@@ -102,8 +102,10 @@ pub use ipc::{
 pub use locks::{
     ProcessRecordLocks, RecordLock, RecordLockContext, RecordLockRequest, OFD_LOCK_OWNER,
 };
+mod host_files;
 mod linux_namespace;
 mod task_namespace;
+pub use host_files::{HostEdit, HostExport};
 pub use task_namespace::{
     TaskNamespaceAttempt, TaskNamespaceOwnerAttempt, TaskNamespaceResources, TaskNamespaceWork,
     TaskNamespaces,
