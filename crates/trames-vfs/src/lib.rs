@@ -127,6 +127,7 @@ mod proc_file;
 mod proc_image;
 pub use proc_image::ProcImage;
 mod proc_source;
+mod proc_time;
 mod pseudo;
 pub use oom::OomTask;
 pub use proc_source::{

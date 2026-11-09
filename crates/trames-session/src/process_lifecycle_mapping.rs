@@ -184,15 +184,19 @@ impl<C: Cpu> Lifecycle<C> {
                     }
                 }
                 let began = Instant::now();
-                let Some(outcome) = p
+                p.signals.io.proc_view.begin_accounting(began, slot);
+                let outcome = p
                     .cpu
-                    .run_quiesced(engine, &mut p.memory, registry, remaining)
-                else {
+                    .run_quiesced(engine, &mut p.memory, registry, remaining);
+                let elapsed = outcome.as_ref().map_or(Duration::ZERO, |_| began.elapsed());
+                p.signals
+                    .io
+                    .proc_view
+                    .finish_accounting(began, elapsed, slot);
+                let Some(outcome) = outcome else {
                     break;
                 };
-                let elapsed = began.elapsed();
                 p.cpu_time += elapsed;
-                p.signals.io.proc_view.account(elapsed, slot);
                 report.batch_cpu[slot] += elapsed;
                 report.time[6] += elapsed;
                 report.mapping_batch[0] += u64::from(!used_window);

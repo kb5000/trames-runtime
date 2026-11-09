@@ -678,8 +678,7 @@ pub(crate) struct Kernel<C: Cpu> {
     proc_owner_waits: Vec<proc::ProcReadWait<C>>,
     profile_syscalls: bool,
     idle: Duration,
-    load: [f64; 3],
-    load_sample: Instant,
+    load: Arc<std::sync::Mutex<crate::proc_views::Load>>,
     next_resource: Arc<std::sync::atomic::AtomicU64>,
     timers: Arc<trames_kernel::timers::Timers>,
     native: trames_accel::native::Registry,
@@ -1194,7 +1193,14 @@ impl<C: Cpu> Kernel<C> {
                 idle: self.idle,
                 memory_limit: memory.total,
                 available_memory: Some(memory.available),
-                load: self.load,
+                load: self.load.lock().unwrap().sample(
+                    Instant::now(),
+                    self.processes
+                        .values()
+                        .filter(|task| task.runnable())
+                        .count()
+                        + usize::from(p.runnable()),
+                ),
                 processes_created: self.task_ids.created(),
                 used_memory: memory.total.saturating_sub(memory.free),
             },
@@ -2179,31 +2185,26 @@ impl<C: Cpu> Kernel<C> {
             )
             .map(Some),
             179 => {
-                Linux::check(&p.memory, a[0], 112, Access::Write)?;
-                let used = self.other_memory(p.vm_id) + p.memory.resident_bytes();
-                let memory = self.memory_limits.reported(
-                    used,
-                    self.memory_limits
-                        .is_host_managed()
-                        .then(|| io.host_memory())
-                        .flatten(),
-                );
-                let mut out = [0; 112];
-                for (offset, value) in [
-                    (0, self.started.elapsed().as_secs()),
-                    (32, memory.total as u64),
-                    (40, memory.free as u64),
-                ] {
-                    out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-                }
-                for (i, load) in self.load.iter().enumerate() {
-                    out[8 + i * 8..16 + i * 8]
-                        .copy_from_slice(&((load * 65536.0) as u64).to_le_bytes());
-                }
-                out[80..82].copy_from_slice(&((self.processes.len() + 1) as u16).to_le_bytes());
-                out[104..108].copy_from_slice(&1u32.to_le_bytes());
-                p.memory.write(a[0], &out).map_err(|_| Errno(14))?;
-                Ok(Some(0))
+                let vm_id = p.vm_id;
+                let runnable = p.runnable();
+                trames_linux::sysinfo(&mut p.memory, a[0], |caller| {
+                    if let Some(info) = self.proc_source.as_ref().and_then(|source|
+                        trames_linux::SystemStatistics::observe(&**source)) {
+                        return Some(info);
+                    }
+                    // Genuine legacy embeddings use the same preflight/ABI and
+                    // their existing original caller/host accounting resources.
+                    let used = self.other_memory(vm_id) + caller.resident_bytes();
+                    let memory = self.memory_limits.reported(used,
+                        self.memory_limits.is_host_managed().then(|| io.host_memory()).flatten());
+                    Some(trames_linux::SystemInfo {
+                        uptime: self.started.elapsed(),
+                        load: self.load.lock().unwrap().sample(Instant::now(), self.processes.values().filter(|task| task.runnable()).count() + usize::from(runnable)),
+                        total: memory.total,
+                        free: memory.free,
+                        tasks: self.processes.len() + 1,
+                    })
+                }).expect("legacy statistics available").map(Some)
             },
             31 => self.ioprio_get(pid, p, a[0], a[1]).map(Some),
             132 => Self::sigaltstack(p, a[0], a[1]).map(Some),
@@ -3139,6 +3140,7 @@ impl<C: Cpu> Kernel<C> {
                     self.instructions += instructions
                 };
                 let began = Instant::now();
+                p.signals.io.proc_view.begin_accounting(began, p.last_cpu);
                 let a = [p.cpu.x(0), p.cpu.x(1), p.cpu.x(2)];
                 // Views can defer before effects when code changes during
                 // validation or backing writes need coordinator authority. A
@@ -3180,7 +3182,10 @@ impl<C: Cpu> Kernel<C> {
                 p.cpu_time += elapsed;
                 self.cpu_total += elapsed;
                 self.per_cpu[p.last_cpu] += elapsed;
-                p.signals.io.proc_view.account(elapsed, p.last_cpu);
+                p.signals
+                    .io
+                    .proc_view
+                    .finish_accounting(began, elapsed, p.last_cpu);
             }
             SliceOutcome::Syscall { instructions } => {
                 p.cpu.clear_exclusive();
@@ -4182,24 +4187,6 @@ impl<C: Cpu> Kernel<C> {
             }
             self.pump_guest_ptys();
             self.tick_timers();
-            let elapsed = self.load_sample.elapsed().as_secs_f64();
-            if elapsed >= 5.0 {
-                let running = self.processes.values().filter(|p| p.runnable()).count() as f64;
-                for (load, seconds) in self.load.iter_mut().zip([60.0, 300.0, 900.0]) {
-                    let decay = (-elapsed / seconds).exp();
-                    *load = *load * decay + running * (1.0 - decay);
-                }
-                self.load_sample = Instant::now();
-                if let Some(source) = &self.proc_source {
-                    *source.load.lock().unwrap() = self.load;
-                }
-            }
-            if let Some(source) = &self.proc_source {
-                source.idle.store(
-                    self.idle.as_nanos().min(u64::MAX as u128) as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-            }
             self.control(io)?;
             self.poll_file_layouts();
             if io.paused() {
@@ -4310,6 +4297,8 @@ impl<C: Cpu> Kernel<C> {
                         p.signals.io.proc_view.dispatched(
                             p.signals.io.scheduling.affinity().trailing_zeros() as usize,
                         );
+                        let cpu = p.signals.io.scheduling.affinity().trailing_zeros() as usize;
+                        p.signals.io.proc_view.begin_accounting(began, cpu);
                         let outcome = {
                             let p = &mut *p;
                             p.trace.flush();
@@ -4330,7 +4319,10 @@ impl<C: Cpu> Kernel<C> {
                         self.cpu_total += elapsed;
                         p.last_cpu = p.signals.io.scheduling.affinity().trailing_zeros() as usize;
                         self.per_cpu[p.last_cpu] += elapsed;
-                        p.signals.io.proc_view.account(elapsed, p.last_cpu);
+                        p.signals
+                            .io
+                            .proc_view
+                            .finish_accounting(began, elapsed, cpu);
                         self.context_switches += 1;
                         let immediate_return = self.finish_slice(id, &mut p, outcome, io, true);
                         if let Some(error) = self.backend_error.take() {
@@ -4777,8 +4769,7 @@ pub(super) fn run<C: Cpu>(
         proc_owner_waits: Vec::new(),
         profile_syscalls: runtime.profile_syscalls,
         idle: Duration::ZERO,
-        load: [0.0; 3],
-        load_sample: Instant::now(),
+        load: Arc::default(),
         next_resource: Arc::new(std::sync::atomic::AtomicU64::new(2)),
         timers: Default::default(),
         native: trames_accel::native::Registry::default(),
@@ -6611,8 +6602,7 @@ mod tests {
             proc_owner_waits: Vec::new(),
             profile_syscalls: false,
             idle: Duration::ZERO,
-            load: [0.0; 3],
-            load_sample: Instant::now(),
+            load: Arc::default(),
             next_resource: Arc::new(std::sync::atomic::AtomicU64::new(2)),
             timers: Default::default(),
             native: trames_accel::native::Registry::default(),
@@ -9508,3 +9498,7 @@ mod socket_wait_tests;
 #[cfg(all(test, trames_interpreter_conformance))]
 #[path = "process_job.rs"]
 mod job_tests;
+
+#[cfg(all(test, trames_interpreter_conformance))]
+#[path = "process_statistics_tests.rs"]
+mod statistics_tests;

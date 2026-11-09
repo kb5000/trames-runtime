@@ -217,6 +217,7 @@ pub fn epoll_scatter(
 
 #[derive(Default)]
 pub struct DirectSyscalls {
+    statistics: Option<Arc<dyn crate::SystemStatistics>>,
     signal_reader: Option<Arc<dyn trames_vfs::SignalReader>>,
     task_signal: Option<Arc<dyn trames_vfs::TaskSignal>>,
     aio: Option<(Aio, trames_vfs::NativeEvents)>,
@@ -288,6 +289,21 @@ impl DirectSyscalls {
             context.release();
         }
     }
+    pub fn with_statistics(mut self, statistics: Option<Arc<dyn crate::SystemStatistics>>) -> Self {
+        self.statistics = statistics;
+        self
+    }
+    pub fn invoke_system(
+        &self,
+        number: u32,
+        args: [u64; 6],
+        memory: &mut impl CpuMemory,
+    ) -> Option<Result<u64, Errno>> {
+        if number != 179 {
+            return None;
+        }
+        crate::sysinfo(memory, args[0], |_| self.statistics.as_ref()?.observe())
+    }
     pub fn with_signal_reader(mut self, reader: Arc<dyn trames_vfs::SignalReader>) -> Self {
         self.signal_reader = Some(reader.clone());
         self.descriptors = self.descriptors.with_signal_reader(Some(reader.clone()));
@@ -306,6 +322,7 @@ impl DirectSyscalls {
     pub fn new(descriptors: DirectFds) -> Self {
         let membership = descriptors.shared_files();
         Self {
+            statistics: None,
             signal_reader: None,
             task_signal: None,
             aio: None,

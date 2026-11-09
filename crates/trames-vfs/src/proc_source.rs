@@ -2,8 +2,9 @@
 //! Original filesystem/Files resources for dynamic process observations.
 //! No owner VFS, namespace Rc, or accepted descriptor number is transferred.
 use super::*;
+use crate::proc_time::Time;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 static NEXT_VIEW: AtomicU64 = AtomicU64::new(1);
 
@@ -89,25 +90,47 @@ pub trait ProcTask: Send + Sync {
     }
 }
 
-#[derive(Default)]
 pub struct ProcCounters {
-    per_cpu: [AtomicU64; 32],
+    per_cpu: [Time; 32],
     last_task: [AtomicU64; 32],
     pub switches: AtomicU64,
 }
+impl Default for ProcCounters {
+    fn default() -> Self {
+        let origin = Instant::now();
+        Self {
+            per_cpu: std::array::from_fn(|_| Time::new(origin)),
+            last_task: std::array::from_fn(|_| AtomicU64::new(0)),
+            switches: AtomicU64::new(0),
+        }
+    }
+}
 impl ProcCounters {
-    pub fn ticks(&self, cpus: usize) -> Vec<u64> {
+    pub fn times(&self, cpus: usize, at: Instant) -> Vec<Duration> {
         self.per_cpu[..cpus.min(32)]
             .iter()
-            .map(|time| time.load(Ordering::Relaxed) / 10_000_000)
+            .map(|time| time.read_at(at))
             .collect()
+    }
+    pub fn ticks(&self, cpus: usize) -> Vec<u64> {
+        self.times(cpus, Instant::now())
+            .iter()
+            .map(|time| (time.as_nanos() / 10_000_000) as u64)
+            .collect()
+    }
+    fn begin(&self, at: Instant, cpu: usize) {
+        if let Some(time) = self.per_cpu.get(cpu) {
+            time.begin(at);
+        }
+    }
+    fn finish(&self, began: Instant, elapsed: Duration, cpu: usize) {
+        if let Some(time) = self.per_cpu.get(cpu) {
+            time.finish(began, elapsed);
+        }
     }
     fn account(&self, elapsed: Duration, cpu: usize) {
         if let Some(time) = self.per_cpu.get(cpu) {
-            time.fetch_add(
-                elapsed.as_nanos().min(u64::MAX as u128) as u64,
-                Ordering::Relaxed,
-            );
+            time.add(elapsed);
         }
     }
 }
@@ -593,7 +616,7 @@ pub struct ProcessView {
     image: std::sync::RwLock<Option<Arc<ProcessImage>>>,
     identity: u64,
     cpu: AtomicU32,
-    time: AtomicU64,
+    time: Time,
     state: AtomicU32,
     counters: std::sync::OnceLock<Arc<ProcCounters>>,
 }
@@ -617,14 +640,37 @@ impl ProcessView {
     pub fn bind_counters(&self, counters: &Arc<ProcCounters>) {
         self.counters.get_or_init(|| counters.clone());
     }
+    /// Begin/finish one original execution assignment. The timestamp already
+    /// belongs to that assignment; normal syscalls/native calls add no clocks.
+    pub fn begin_accounting(&self, at: Instant, cpu: usize) {
+        self.cpu.store(cpu as u32, Ordering::Relaxed);
+        self.time.begin(at);
+        if let Some(counters) = self.counters.get() {
+            counters.begin(at, cpu);
+        }
+    }
+    pub fn finish_accounting(&self, began: Instant, elapsed: Duration, cpu: usize) {
+        self.time.finish(began, elapsed);
+        if let Some(counters) = self.counters.get() {
+            counters.finish(began, elapsed, cpu);
+        }
+    }
     pub fn account(&self, elapsed: Duration, cpu: usize) {
         self.cpu.store(cpu as u32, Ordering::Relaxed);
-        self.time.fetch_add(
-            elapsed.as_nanos().min(u64::MAX as u128) as u64,
-            Ordering::Relaxed,
-        );
+        self.time.add(elapsed);
         if let Some(counters) = self.counters.get() {
             counters.account(elapsed, cpu);
+        }
+    }
+    pub fn runnable(&self) -> bool {
+        match self.state.load(Ordering::Relaxed) {
+            0 => self
+                .image
+                .read()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|image| image.metadata.state == 'R'),
+            state => state == b'R' as u32,
         }
     }
     pub fn dispatched(&self, cpu: usize) {
@@ -639,13 +685,10 @@ impl ProcessView {
         }
     }
     pub fn elapsed(&self) -> Duration {
-        Duration::from_nanos(self.time.load(Ordering::Relaxed))
+        self.time.read()
     }
     pub fn publish_time(&self, elapsed: Duration) {
-        self.time.fetch_max(
-            elapsed.as_nanos().min(u64::MAX as u128) as u64,
-            Ordering::Relaxed,
-        );
+        self.time.publish(elapsed);
     }
     pub fn waiting(&self, waiting: bool) {
         self.state
@@ -699,7 +742,7 @@ impl ProcessView {
             (info.seccomp, info.seccomp_filters) = policy.seccomp();
         }
         info.identity = self.identity;
-        let time = self.time.load(Ordering::Relaxed);
+        let time = self.time.read().as_nanos() as u64;
         if time != 0 {
             info.user_ticks = time / 10_000_000;
             info.processor = self.cpu.load(Ordering::Relaxed);
@@ -737,6 +780,46 @@ impl ProcessView {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn live_original_cpu_accounting_survives_migration_and_cold_publication() {
+        use super::*;
+        let counters = Arc::new(ProcCounters::default());
+        let task = ProcessView::default();
+        task.bind_counters(&counters);
+        let origin = Instant::now();
+        task.begin_accounting(origin, 1);
+        task.publish_time(Duration::from_secs(100));
+        assert_eq!(
+            counters.times(4, origin + Duration::from_secs(2)),
+            vec![
+                Duration::ZERO,
+                Duration::from_secs(2),
+                Duration::ZERO,
+                Duration::ZERO
+            ]
+        );
+        task.finish_accounting(origin, Duration::from_secs(3), 1);
+        task.begin_accounting(origin + Duration::from_secs(4), 2);
+        assert_eq!(
+            counters.times(4, origin + Duration::from_secs(6)),
+            vec![
+                Duration::ZERO,
+                Duration::from_secs(3),
+                Duration::from_secs(2),
+                Duration::ZERO
+            ]
+        );
+        task.finish_accounting(origin + Duration::from_secs(4), Duration::from_secs(2), 2);
+        assert_eq!(task.elapsed(), Duration::from_secs(5));
+        assert_eq!(
+            counters
+                .times(4, origin + Duration::from_secs(100))
+                .iter()
+                .copied()
+                .sum::<Duration>(),
+            Duration::from_secs(5)
+        );
+    }
     use super::*;
     use trames_memory::PAGE_SIZE;
     #[test]

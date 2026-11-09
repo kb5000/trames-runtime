@@ -767,7 +767,7 @@ impl Snapshot {
         // futex/epoll checkpoint. Ordinary unfiltered calls keep the old path.
         if !matches!(
             cpu.x(8) as u32,
-            25 | 101 | 113..=115 | 124 | 139 | 154..=157 | 163 | 164 | 261 | 166 | 168 | 172..=178 | 278
+            25 | 101 | 113..=115 | 124 | 139 | 154..=157 | 163 | 164 | 261 | 166 | 168 | 172..=179 | 278
         ) && !(cpu.x(8) as u32 == 29 && matches!(cpu.x(1) as u32, 0x5421 | 0x5452))
             && !(matches!(cpu.x(8) as u32, 160..=162) && self.uts.is_some())
             && !(cpu.x(8) as u32 == 32 && (cpu.x(1) as u32 & 4 != 0 || cpu.x(1) as u32 == 8))
@@ -787,6 +787,12 @@ impl Snapshot {
             .allows(cpu.x(8) as u32, cpu.pc(), std::array::from_fn(|i| cpu.x(i)))
     }
     pub fn invoke<C: Cpu>(&self, cpu: &C, memory: &mut impl CpuMemory) -> Option<u64> {
+        if let Some(result) =
+            self.direct
+                .invoke_system(cpu.x(8) as u32, std::array::from_fn(|i| cpu.x(i)), memory)
+        {
+            return Some(result.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
+        }
         if let Some(result) = self
             .direct
             .invoke_membership(cpu.x(8) as u32, std::array::from_fn(|i| cpu.x(i)))

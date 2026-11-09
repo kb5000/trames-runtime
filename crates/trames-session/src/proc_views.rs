@@ -3,10 +3,10 @@
 use std::{
     collections::BTreeMap,
     sync::{
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicU32, Ordering},
         Arc, Mutex, Weak,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 use trames_vfs::{PidNamespace, ProcQuery, ProcRefresh, ProcSource, ProcTask, RuntimeInfo};
 
@@ -14,8 +14,7 @@ pub(super) struct Source {
     pub directory: Arc<trames_kernel::signal::IoDirectory>,
     pub counters: Arc<trames_vfs::ProcCounters>,
     pub created: AtomicU32,
-    pub idle: AtomicU64,
-    pub load: Mutex<[f64; 3]>,
+    pub load: Arc<Mutex<Load>>,
     pub started: Instant,
     pub boot_time: u64,
     pub cpus: usize,
@@ -25,6 +24,33 @@ pub(super) struct Source {
     pub host: Option<Arc<dyn Fn() -> trames_linux::HostMemoryInfo + Send + Sync>>,
     pub reads: Mutex<Reads>,
     pub wake: Arc<dyn Fn() + Send + Sync>,
+}
+/// The existing five-second exponential sample, advanced by actual observers.
+/// It is shared by source and legacy callers, never copied by the drive loop.
+pub(super) struct Load {
+    values: [f64; 3],
+    sampled: Instant,
+}
+impl Default for Load {
+    fn default() -> Self {
+        Self {
+            values: [0.0; 3],
+            sampled: Instant::now(),
+        }
+    }
+}
+impl Load {
+    pub fn sample(&mut self, at: Instant, running: usize) -> [f64; 3] {
+        let elapsed = at.saturating_duration_since(self.sampled).as_secs_f64();
+        if elapsed >= 5.0 {
+            for (load, seconds) in self.values.iter_mut().zip([60.0, 300.0, 900.0]) {
+                let decay = (-elapsed / seconds).exp();
+                *load = *load * decay + running as f64 * (1.0 - decay);
+            }
+            self.sampled = at;
+        }
+        self.values
+    }
 }
 #[derive(Default)]
 pub(super) struct Reads {
@@ -60,6 +86,30 @@ impl Drop for ReadDriver {
     }
 }
 impl Source {
+    fn running(tasks: &[Arc<trames_kernel::signal::IoTask>]) -> usize {
+        tasks
+            .iter()
+            .filter(|task| {
+                task.live()
+                    && task.proc_view.runnable()
+                    && !task.lifecycle().stopped()
+                    && !task.cgroup().is_some_and(|group| group.frozen())
+            })
+            .count()
+    }
+    fn load(&self, at: Instant, sample: bool) -> [f64; 3] {
+        if sample {
+            let running = Self::running(&self.directory.proc_tasks());
+            self.load.lock().unwrap().sample(at, running)
+        } else {
+            self.load.lock().unwrap().values
+        }
+    }
+    fn idle(&self, at: Instant, times: &[Duration]) -> Duration {
+        at.saturating_duration_since(self.started)
+            .saturating_mul(self.cpus as u32)
+            .saturating_sub(times.iter().copied().sum())
+    }
     pub fn request_read(&self, report: trames_memory::MemoryReport) {
         let mut reads = self.reads.lock().unwrap();
         if reads.pending.iter().any(|old| old.same_resource(&report))
@@ -170,6 +220,39 @@ impl Source {
             parts.first()?
         };
         namespace.global(std::str::from_utf8(id).ok()?.parse().ok()?)
+    }
+}
+impl trames_linux::SystemStatistics for Source {
+    fn observe(&self) -> Option<trames_linux::SystemInfo> {
+        if self.limits.is_host_managed() && self.host.is_none() {
+            return None;
+        }
+        let tasks = self.directory.proc_tasks();
+        let mut resident = BTreeMap::new();
+        if !self.limits.is_host_managed() {
+            for task in &tasks {
+                if let Some(report) = task.memory_report() {
+                    resident
+                        .entry(report.identity())
+                        .or_insert_with(|| report.resident_bytes());
+                }
+            }
+        }
+        let host = self
+            .limits
+            .is_host_managed()
+            .then(|| self.host.as_ref().map(|host| host()))
+            .flatten();
+        let memory = self.limits.reported(resident.values().copied().sum(), host);
+        let at = Instant::now();
+        let running = Self::running(&tasks);
+        Some(trames_linux::SystemInfo {
+            uptime: at.saturating_duration_since(self.started),
+            load: self.load.lock().unwrap().sample(at, running),
+            total: memory.total,
+            free: memory.free,
+            tasks: tasks.len(),
+        })
     }
 }
 impl trames_vfs::IoWake for Source {
@@ -285,7 +368,12 @@ impl ProcSource for Source {
             None
         };
         let memory = self.limits.reported(used, host);
-        let per_cpu_ticks = self.counters.ticks(self.cpus);
+        let at = Instant::now();
+        let times = self.counters.times(self.cpus, at);
+        let per_cpu_ticks: Vec<_> = times
+            .iter()
+            .map(|time| (time.as_nanos() / 10_000_000) as u64)
+            .collect();
         RuntimeInfo {
             cpu_count: self.cpus,
             task_limit: self.task_limit,
@@ -293,15 +381,38 @@ impl ProcSource for Source {
             cpu_user_ticks: per_cpu_ticks.iter().sum(),
             per_cpu_ticks,
             processes,
-            uptime: self.started.elapsed(),
+            uptime: at.saturating_duration_since(self.started),
             boot_time: self.boot_time,
             context_switches: self.counters.switches.load(Ordering::Relaxed),
-            idle: std::time::Duration::from_nanos(self.idle.load(Ordering::Relaxed)),
+            idle: self.idle(at, &times),
             memory_limit: memory.total,
             available_memory: Some(memory.available),
-            load: *self.load.lock().unwrap(),
+            load: self.load(at, aggregate),
             processes_created: self.created.load(Ordering::Relaxed),
             used_memory: memory.total.saturating_sub(memory.free),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn load_sampling_advances_without_drive_loop_and_preserves_decay() {
+        let origin = Instant::now();
+        let mut load = Load {
+            values: [0.0; 3],
+            sampled: origin,
+        };
+        assert_eq!(load.sample(origin + Duration::from_secs(4), 12), [0.0; 3]);
+        let active = load.sample(origin + Duration::from_secs(5), 4);
+        for (value, seconds) in active.into_iter().zip([60.0_f64, 300.0, 900.0]) {
+            assert!((value - 4.0 * (1.0 - (-5.0 / seconds).exp())).abs() < 1e-12);
+        }
+        let idle = load.sample(origin + Duration::from_secs(20), 0);
+        for ((value, old), seconds) in idle.into_iter().zip(active).zip([60.0_f64, 300.0, 900.0]) {
+            assert!((value - old * (-15.0 / seconds).exp()).abs() < 1e-12);
+        }
+        assert_eq!(load.sample(origin + Duration::from_secs(19), 100), idle);
     }
 }

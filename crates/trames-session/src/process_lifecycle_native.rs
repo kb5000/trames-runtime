@@ -44,6 +44,7 @@ impl<C: Cpu> Lifecycle<C> {
                 continue;
             }
             let began = Instant::now();
+            p.signals.io.proc_view.begin_accounting(began, slot);
             let _execution = job.domain.as_ref().expect("native mm").enter_scoped(slot);
             let control = p.signals.io.lifecycle().enter(&p.signals.io, job.work.pid);
             let a = [job.work.cpu.x(0), job.work.cpu.x(1), job.work.cpu.x(2)];
@@ -118,7 +119,10 @@ impl<C: Cpu> Lifecycle<C> {
                 cgroup.acknowledge();
             }
             let elapsed = began.elapsed();
-            p.signals.io.proc_view.account(elapsed, slot);
+            p.signals
+                .io
+                .proc_view
+                .finish_accounting(began, elapsed, slot);
             job.stats.cpu_times[slot] += elapsed;
             job.stats.elapsed += elapsed;
             report.time[3] += elapsed;

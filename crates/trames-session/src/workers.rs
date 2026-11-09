@@ -581,6 +581,7 @@ impl<C: Cpu> Starter<C> {
                         snapshot.direct.swap_disk_cache(&mut file_cache);
                     }
                     let began = Instant::now();
+                    if let Some(snapshot)=&work.syscalls {snapshot.io_signals.proc_view.begin_accounting(began,index);}
                     let mut instructions = 0;
                     let mut chunks = 0;
                     let mut running = false;
@@ -1722,7 +1723,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                     }
                     let stats = &mut job.stats;
                     if let Some(snapshot) = &work.syscalls {
-                        snapshot.io_signals.proc_view.account(elapsed, index);
+                        snapshot.io_signals.proc_view.finish_accounting(began,elapsed,index);
                     }
                     stats.elapsed += elapsed;
                     stats.after = after;

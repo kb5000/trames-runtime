@@ -44,6 +44,8 @@ pub use pty::{
 mod record_locks;
 mod state;
 mod syslog;
+mod system_info;
+pub use system_info::{sysinfo, SystemInfo, SystemStatistics};
 mod uts;
 pub use uts::uts_call;
 mod timer;

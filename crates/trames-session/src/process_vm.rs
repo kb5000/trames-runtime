@@ -231,7 +231,11 @@ impl<C: Cpu> Kernel<C> {
                         break;
                     }
                     let cpu_began = Instant::now();
-                    let Some(outcome) = ({
+                    p.signals
+                        .io
+                        .proc_view
+                        .begin_accounting(cpu_began, job.stats.worker);
+                    let outcome = {
                         let p = &mut *p;
                         p.cpu.run_quiesced(
                             &mut self.engine,
@@ -241,14 +245,20 @@ impl<C: Cpu> Kernel<C> {
                             // computation cannot extend the exclusive window.
                             remaining,
                         )
-                    }) else {
+                    };
+                    let elapsed = outcome
+                        .as_ref()
+                        .map_or(Duration::ZERO, |_| cpu_began.elapsed());
+                    p.signals
+                        .io
+                        .proc_view
+                        .finish_accounting(cpu_began, elapsed, job.stats.worker);
+                    let Some(outcome) = outcome else {
                         break;
                     };
-                    let elapsed = cpu_began.elapsed();
                     p.cpu_time += elapsed;
                     self.cpu_total += elapsed;
                     self.per_cpu[job.stats.worker] += elapsed;
-                    p.signals.io.proc_view.account(elapsed, job.stats.worker);
                     self.vm_checkpoint_time[6] += elapsed;
                     self.context_switches += 1;
                     self.vm_checkpoint_batch[0] += u64::from(!used_window);
@@ -1225,8 +1235,8 @@ mod tests {
             (true, 283, false, false),
             (true, 278, false, false),
             (true, 278, false, true),
-            (true, 179, true, false),
-            (true, 179, true, true),
+            (true, 179, false, false),
+            (true, 179, false, true),
             (true, 0xff00, false, true),
         ] {
             let mut k = super::super::tests::kernel();

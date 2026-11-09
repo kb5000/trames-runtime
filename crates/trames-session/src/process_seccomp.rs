@@ -4055,6 +4055,82 @@ mod tests {
         }
     }
     #[test]
+    fn sysinfo_observes_source_resources_after_exactly_one_filter_decision() {
+        for (decision, address) in [(ALLOW, 0x1000u64), (ALLOW, 0), (0x5007b, 0x1000)] {
+            for slots in [1, 4] {
+                let mut k = super::super::tests::kernel();
+                k.cpu_count = 4;
+                k.workers = crate::workers::Pool::new(slots);
+                k.per_cpu = vec![Duration::ZERO; 4];
+                k.profile_syscalls = true;
+                let mut p = super::super::tests::process();
+                k.install_proc_source(&p, None);
+                p.seccomp.push(Arc::new(
+                    Filter::validate(vec![i(6, 0, 0, decision)]).unwrap(),
+                ));
+                let words = [
+                    0xd2800000u32 | ((address as u32) << 5),
+                    0xd2801668,
+                    0xd4000001,
+                    0x17fffffd,
+                ];
+                p.memory
+                    .write(
+                        0x4000,
+                        &words
+                            .into_iter()
+                            .flat_map(u32::to_le_bytes)
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap();
+                p.memory
+                    .protect(
+                        0x4000,
+                        trames_memory::PAGE_SIZE,
+                        trames_memory::Permissions::RX,
+                    )
+                    .unwrap();
+                p.signals.io.scheduling.set_affinity((1 << slots) - 1);
+                for id in 2..=4 {
+                    let mut peer = super::super::tests::process();
+                    peer.tgid = id;
+                    peer.vm_id = id as u64;
+                    peer.signals.io_directory = p.signals.io_directory.clone();
+                    peer.signals.io.scheduling.set_affinity((1 << slots) - 1);
+                    peer.memory
+                        .write(0x4000, &0x14000000u32.to_le_bytes())
+                        .unwrap();
+                    peer.memory
+                        .protect(
+                            0x4000,
+                            trames_memory::PAGE_SIZE,
+                            trames_memory::Permissions::RX,
+                        )
+                        .unwrap();
+                    k.processes.insert(id, peer);
+                }
+                k.processes.insert(1, p);
+                assert!(k
+                    .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
+                    .unwrap());
+                assert!(k.worker_syscalls > 0);
+                assert_eq!(k.syscalls, k.worker_syscalls);
+                assert!(k.cohort_return_syscalls.is_empty());
+                assert_eq!(k.service_requests, 0);
+                assert_eq!(
+                    k.processes.read(&1).seccomp.evaluations(),
+                    k.worker_syscalls
+                );
+                if decision == ALLOW && address != 0 {
+                    assert_eq!(
+                        k.processes.read(&1).memory.read_u64(0x1020).unwrap(),
+                        k.memory_limits.total as u64
+                    );
+                }
+            }
+        }
+    }
+    #[test]
     fn worker_filter_snapshots_keep_pc_arguments_and_immutable_installation_order() {
         let mut current = Seccomp::default();
         current.push(Arc::new(

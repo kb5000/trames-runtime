@@ -1,11 +1,19 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 78, original live host pause/resume, reviewed on 2026-11-09. The prior shared runtime
-baseline is `a1b09affb1be790ee1588e34fba7440d098451bf`.
+This is the consolidated implementation audit through stage 79, original system statistics, reviewed on 2026-11-09. The prior shared runtime
+baseline is `04ec423f35a222642a2bcbde3b93a568d7f9968a`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-09
+
+Stage 79 removes supported `sysinfo` execution and live system-accounting
+refresh from joined control. Source/solo share one AArch64 ABI. The original
+proc directory, unique mm residency reports, original host-memory callback and
+shared load sample provide the data; no copied task-table provider is introduced.
+Active CPU/task time is observable before its assignment returns. Load and idle
+no longer depend on the drive loop refreshing a projection. Missing real
+statistics/host capabilities retain their explicit legacy boundary.
 
 Stage 78 removes live host pause/resume from joined execution. One original
 cohort flag is shared by its domains and the existing dispatch queue. Original
@@ -245,6 +253,7 @@ is not a claim that all coordinator work is removed.
 | fork/clone/vfork and execve/execveat | Existing workers handle pure and mixed mapping scopes, nonleader replacement and original old-mm retirement; existing disk pool prepares native images without a CPU slot | Affected actors still quiesce. Capability-less embeddings, solo and host invocation remain separate |
 | Structural VM edits, pins and mapped-file layout changes | Supported mapping/buffer-registration checkpoints publish on existing workers with original task/mm custody; additive anonymous mmap runs directly while peers continue | Proc/cold-mm checkpoints and supported mapped-file transactions now run on existing workers. Unsupported backing/lifetime/policy and capability-less embeddings retain explicit boundaries |
 | Native libc/GPU/video/audio bodies, waits and before-effects mapping/entry checkpoints | Calling/shared-resource execution; exceptional access uses original task/mm custody on an existing executor, then retains resource waits | Capability-less embeddings and actual platform/host lifecycle retain their boundary. Single-CPU/solo calls use their existing caller. Local libc/DirectFile/HVF fallback alone is not an owner transition |
+| System statistics and live CPU accounting | sysinfo and proc consume original task/mm/host resources; original execution assignments publish live time | No supported-statistics-only join remains. Genuine absent statistics/host capabilities retain legacy execution; load remains a five-second observer-sampled approximation |
 | Dynamic proc/sys views and proc pathname/FD consumers | Original PID/mm/Files/fs/namespace resources on the calling worker; owner/solo queries use the same provider | First cross-mm byte export and invalidation now activate on an existing worker using only original task/mm custody. Legacy embeddings without a provider and actual policy remain separate |
 | Mount topology administration | Calling worker and original namespace/fs_struct resources, with existing disk workers only for host-backed path work | Busy transactions park the caller on original readiness. Genuinely excluded path controls keep separate boundaries |
 | Task namespace membership and Files/fs detachment | Calling worker; supported unshare/setns and close_range update original per-task bindings and all future-call consumers; busy namespace transactions return the execution slot | Capability-less embeddings remain. Clone namespace creation retains creator-mm custody; unsupported user/time namespace semantics remain separate |
@@ -3061,3 +3070,48 @@ A focused regression reproduced an ignored paused Idle notification preventing
 idle completion after resume. Resume now clears that original notification latch
 before waking dispatchers. The full affected process suite and strict core lint
 are rerun on both hosts; unchanged CPU/Linux/VFS/runtime checks are reused.
+
+## 79. Original system statistics and live execution accounting — 2026-11-09
+
+The original proc Source also supplies the typed sysinfo capability. Both source
+and legacy calls use the same 112-byte AArch64 layout and full destination
+preflight, before host sampling or provider deferral. Finite budgets sum resident
+bytes once per original live mm, including CLONE_VM; untouched VA reservations
+consume no residency. Host-managed sysinfo uses the original host report directly
+without a redundant all-mm residency scan. Original task membership supplies the
+process count. Numeric PID reuse does not redirect an accepted statistics object.
+Statistics are approximate observations of concurrently changing resources, not a
+transaction over all processes or an invented guest race error.
+
+Task and original execution-slot time include the current assignment. One relaxed
+word encodes completed time or a signed running-clock offset; only the original
+execution actor begins/finishes an interval. Cold publications can raise an idle
+total but cannot overwrite a running one. A native body, scoped execution and solo
+execution use their existing timestamps and original accounting boundary. Queries
+sample live time without borrowing a CPU/View. No clock/atomic is added to each
+ordinary instruction, syscall or native fast call. The packed nanosecond range is
+approximately 73 years. Accounting retains the existing wall-assignment model;
+it is not new precise host thread-CPU accounting.
+
+One original load object serves source and legacy observations. Actual aggregate
+observers advance its existing five-second exponential sample from current
+runnable task state; partial per-process reads do not advance it. Without
+observations, no periodic history is collected. Consequently this remains an
+observer-sampled load approximation, rather than Linux's periodic historical
+sampler. Idle is computed from elapsed configured CPU capacity minus original
+live execution-slot time. The drive-loop load/idle copies are deleted. There is
+no statistics service, worker message bus, whole-cohort refresh or extra guest
+memory fence/check.
+
+Conformance covers destination/error ordering, zero padding, fixed-point loads,
+missing providers, changing host reports, untouched reservations, shared-mm
+deduplication, original task exit/lifetime, live time and migration, load decay,
+and one seccomp decision. The live fixture exercises 4/12 logical CPUs and one
+physical execution slot with one cohort and zero returned sysinfo/service work.
+Shared code compiles for both iPad SDK targets. Consumer hardware/deployment
+results are kept in the [validation record](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/system-statistics-20261109.json).
+
+Actual cancellation/deadline/shutdown/final teardown, missing/excluded resources,
+other known-resource/HLT/fault fallback and initial/legacy/solo orchestration
+remain. This closes one connected supported statistics subsystem, not the full
+coordinator-removal goal. Only Mac Dev deployment is included.
