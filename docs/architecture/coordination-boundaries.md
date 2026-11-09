@@ -1,7 +1,7 @@
 # Coordination and fallback boundaries
 
 This is the consolidated implementation audit through stage 75, source-owned Mac pressure reclamation, reviewed on 2026-11-09. The prior shared runtime
-baseline is `38590a849a2b559e23eae81d9640b9579faff7ff`.
+baseline is `effa704003797f610f0608cd8b3ff73fd787d621`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
@@ -29,7 +29,8 @@ PID 1 task's policy and private inbox, without borrowing its executing CPU or
 signalling unrelated jobs. Notifications and root-signal delivery no longer stop
 the cohort. No new thread, polling bus or guest hot-path check is introduced.
 Mac preserves its existing 100 ms host-control interval. Actual non-systemd
-cancellation, pause, transfer/writeback, pressure and teardown remain explicit.
+cancellation, pause, transfer/writeback and teardown remain explicit; the
+then-current pressure boundary is closed by stage 75.
 
 Stage 73 closes the diagnostic-tracing execution category. Linux.trace / Mac
 --trace / interpreter --trace-syscalls no longer disable original resource
