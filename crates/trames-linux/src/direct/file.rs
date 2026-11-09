@@ -254,6 +254,9 @@ impl DirectSyscalls {
         namespace::supported(number)
             || matches!(number, 45..=47 | 56 | 62..=71 | 76 | 80..=83 | 267 | 285..=287 | 437)
     }
+    pub fn file_entry(number: u32, args: [u64; 6]) -> bool {
+        Self::file_call(number) || number == 25 && matches!(args[1], 1033 | 1034)
+    }
     pub fn start_file_call(
         &self,
         number: u32,
@@ -262,7 +265,7 @@ impl DirectSyscalls {
         pid: u32,
         target: &Weak<dyn IoWake>,
     ) -> Option<IoAttempt> {
-        if !Self::file_call(number) {
+        if !Self::file_entry(number, args) {
             return None;
         }
         if namespace::supported(number) {
@@ -506,6 +509,27 @@ impl DirectSyscalls {
         pid: u32,
         target: &Weak<dyn IoWake>,
     ) -> Option<IoAttempt> {
+        if number == 25 && matches!(args[1], 1033 | 1034) {
+            let control = match vfs.descriptor_control(args[0] as u32) {
+                Ok(control) => control,
+                Err(error) => return Some(IoAttempt::Complete(Err(error))),
+            };
+            if control.flags() & trames_vfs::O_PATH != 0 {
+                return Some(IoAttempt::Complete(Err(Errno(9))));
+            }
+            let command =
+                trames_vfs::FileCommand::Seals((args[1] == 1033).then_some(args[2] as u32));
+            let work = trames_vfs::FileWork::from_vfs(vfs, control.filesystem_target(), command);
+            return Some(self.submit_file_work(
+                work,
+                FileOutput::None,
+                number,
+                args,
+                memory,
+                pid,
+                target,
+            ));
+        }
         if namespace::supported(number) {
             let (call, output) = match namespace::import(number, args, memory) {
                 Ok(call) => call,
@@ -911,6 +935,26 @@ impl DirectSyscalls {
         a: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
+        if number == 25 && matches!(a[1], 1033 | 1034) {
+            if self.file_prepared(number, a) {
+                return None;
+            }
+            let control = match self.resources.as_ref()?.descriptor_control(a[0] as u32) {
+                Ok(control) => control,
+                Err(error) => return Some(Err(error)),
+            };
+            if control.flags() & trames_vfs::O_PATH != 0 {
+                return Some(Err(Errno(9)));
+            }
+            return self.prepare_file_fallback(
+                number,
+                a,
+                control.filesystem_target(),
+                trames_vfs::FileCommand::Seals((a[1] == 1033).then_some(a[2] as u32)),
+                FileOutput::None,
+                memory,
+            );
+        }
         if matches!(number, 71 | 76 | 285) {
             if self.file_prepared(number, a) {
                 return None;

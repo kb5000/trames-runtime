@@ -1905,8 +1905,7 @@ impl<C: Cpu> Kernel<C> {
                     let b = p.memory.read_array::<4>(a[2]).map_err(|_| Errno(14))?;
                     flags.set_async(&fds, a[0] as u32, u32::from_le_bytes(b) != 0)
                 } else if a[1] == 4 {
-                    p.linux.vfs.check_status_flags(a[0] as u32, a[2] as u32)?;
-                    flags.set_status(&fds, a[0] as u32, a[2] as u32)
+                    p.linux.vfs.descriptor_control(a[0] as u32)?.short(a[0] as u32,4,a[2],&p.linux.vfs.credentials)
                 } else {
                     flags.async_control(a[0] as u32, a[1] as u32, a[2], &mut p.memory, &routes)
                 };
@@ -9604,3 +9603,7 @@ mod uring_original_tests;
 #[cfg(all(test, trames_interpreter_conformance))]
 #[path = "process_source_fault_tests.rs"]
 mod source_fault_tests;
+
+#[cfg(all(test, trames_interpreter_conformance))]
+#[path = "process_fcntl_tests.rs"]
+mod fcntl_tests;

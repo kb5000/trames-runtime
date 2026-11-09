@@ -719,6 +719,11 @@ impl DirectSyscalls {
         self.fd_control_completed
             .set(self.fd_control_completed.get() + 1);
     }
+    pub fn invoke_fcntl(&self, args: [u64; 6]) -> Option<Result<u64, Errno>> {
+        let value = crate::fcntl::short(self.resources.as_ref()?, args)?;
+        self.record_fd_control();
+        Some(value)
+    }
     pub fn with_boot_clock(mut self, clock: trames_shared::boottime::Boottime) -> Self {
         self.boot_clock = Some(clock);
         self

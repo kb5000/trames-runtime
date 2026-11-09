@@ -50,6 +50,81 @@ struct MutableStatus {
     asynchronous: std::sync::OnceLock<Arc<async_io::AsyncState>>,
 }
 const CHANGEABLE: u32 = 0x400 | O_NONBLOCK | O_NOATIME | 0x2000;
+/// One accepted original descriptor for controls needing inode/credential data.
+/// This has no Files root and never resolves a numeric FD after acceptance.
+pub struct DescriptorControl(Descriptor);
+impl DescriptorControl {
+    pub fn flags(&self) -> u32 {
+        self.0.open.borrow().flags.get() | if self.0.cloexec.get() { O_CLOEXEC } else { 0 }
+    }
+    pub fn filesystem_target(&self) -> FileTarget {
+        SharedFd::new(self.0.open.borrow().shared.clone()).filesystem_target()
+    }
+    pub fn short(
+        &self,
+        fd: u32,
+        command: u64,
+        argument: u64,
+        credentials: &Credentials,
+    ) -> Result<u64> {
+        let open = self.0.open.borrow();
+        let flags = open.flags.clone();
+        if flags.get() & O_PATH != 0 && !matches!(command, 0..=3 | 1030) {
+            return Err(Errno(9));
+        }
+        match command {
+            1 | 3 => query_fd_flags(
+                flags.get() | if self.0.cloexec.get() { O_CLOEXEC } else { 0 },
+                command,
+            ),
+            2 => {
+                self.0.cloexec.set(argument & 1 != 0);
+                Ok(0)
+            }
+            4 => {
+                let _update = flags.lock_update();
+                check_status(&open, credentials, argument as u32)?;
+                let current = flags.get();
+                let shared = open.shared.clone();
+                drop(open);
+                if (current | argument as u32) & 0x2000 != 0 {
+                    let target = SharedFd::new(shared).direct_byte().ok_or(Errno(95))?;
+                    flags
+                        .async_state()
+                        .enable(&target, fd, argument as u32 & 0x2000 != 0)?;
+                }
+                flags.store_locked(argument as u32)?;
+                Ok(0)
+            }
+            _ => Err(Errno(22)),
+        }
+    }
+}
+pub(super) fn check_status(
+    open: &OpenDescription,
+    credentials: &Credentials,
+    flags: u32,
+) -> Result<()> {
+    if flags & O_NOATIME != 0 && open.flags.get() & O_NOATIME == 0 {
+        let uid = open
+            .metadata_node()
+            .map_or(open.owner.0, |node| node.borrow().uid);
+        if credentials.fsuid != uid && !credentials.has_cap(capabilities::FOWNER) {
+            return Err(Errno(1));
+        }
+    }
+    StatusFlags::validate(flags)
+}
+impl DescriptorFactory {
+    pub fn descriptor_control(&self, fd: u32) -> Result<DescriptorControl> {
+        self.files.observation_descriptor(fd).map(DescriptorControl)
+    }
+}
+impl Vfs {
+    pub fn descriptor_control(&self, fd: u32) -> Result<DescriptorControl> {
+        self.descriptor(fd).map(DescriptorControl)
+    }
+}
 impl From<u32> for StatusFlags {
     fn from(flags: u32) -> Self {
         Self {
@@ -183,6 +258,67 @@ impl FdFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn accepted_status_control_uses_live_inode_permission_and_survives_fd_reuse() {
+        let mut v = Vfs::default();
+        v.import_file(b"/owned", b"original".to_vec()).unwrap();
+        let fd = v.open_at(AT_FDCWD, b"/owned", 2, 0).unwrap();
+        let alias = v.dup(fd, 0, false).unwrap();
+        let control = v.descriptor_control(fd).unwrap();
+        let owner = Credentials::user(1000, 1000);
+        assert_eq!(
+            control.short(fd, 4, O_NOATIME as u64, &owner),
+            Err(Errno(1))
+        );
+        assert_eq!(v.flags(fd).unwrap(), 2);
+        // The accepted OFD observes a subsequent owner change on its original
+        // inode; it never substitutes a cached opener identity.
+        v.chown_fd(fd, 1000, u32::MAX).unwrap();
+        assert_eq!(control.short(fd, 4, O_NOATIME as u64, &owner), Ok(0));
+        let stranger = Credentials::user(2000, 2000);
+        assert_eq!(control.short(fd, 4, O_NOATIME as u64, &stranger), Ok(0));
+        assert_eq!(control.short(fd, 4, 0, &stranger), Ok(0));
+        assert_eq!(
+            control.short(fd, 4, O_NOATIME as u64, &stranger),
+            Err(Errno(1))
+        );
+        v.close(fd).unwrap();
+        assert_eq!(v.eventfd(99, 0).unwrap(), fd);
+        assert_eq!(
+            control.short(fd, 4, (O_NOATIME | O_NONBLOCK) as u64, &owner),
+            Ok(0)
+        );
+        assert_eq!(v.flags(alias).unwrap(), 2 | O_NOATIME | O_NONBLOCK);
+        assert_eq!(v.flags(fd).unwrap(), 2);
+        assert_eq!(control.short(fd, 2, 1, &owner), Ok(0));
+        assert_eq!(v.flags(fd).unwrap() & O_CLOEXEC, 0);
+        assert_eq!(v.flags(alias).unwrap() & O_CLOEXEC, 0);
+    }
+    #[test]
+    fn short_control_preserves_path_invalid_command_and_validation_precedence() {
+        let mut v = Vfs::default();
+        let fd = v.open_at(AT_FDCWD, b"/", O_PATH, 0).unwrap();
+        let path = v.descriptor_control(fd).unwrap();
+        let user = Credentials::user(1000, 1000);
+        for command in [4, 12, 1033, 1034, u64::MAX] {
+            assert_eq!(path.short(fd, command, 0x80040000, &user), Err(Errno(9)));
+        }
+        assert_eq!(path.short(fd, 1, 0, &user), Ok(0));
+        assert_eq!(path.short(fd, 2, 1, &user), Ok(0));
+        assert_eq!(path.short(fd, 1, 0, &user), Ok(1));
+        let file = v.open_at(AT_FDCWD, b"/regular", 0x42, 0o600).unwrap();
+        let control = v.descriptor_control(file).unwrap();
+        assert_eq!(control.short(file, 4, 0x80040000, &user), Err(Errno(1)));
+        assert_eq!(control.short(file, 4, 0x80000000, &user), Err(Errno(22)));
+        assert_eq!(
+            control.short(file, u64::MAX, u64::MAX, &user),
+            Err(Errno(22))
+        );
+        assert_eq!(
+            control.short(file, 4, O_NOATIME as u64, &Credentials::default()),
+            Ok(0)
+        );
+    }
     #[test]
     fn existing_flag_capture_resolves_new_socket_aliases_and_reuse() {
         let mut v = Vfs::default();

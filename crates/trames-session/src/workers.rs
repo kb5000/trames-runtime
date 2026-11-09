@@ -1094,7 +1094,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                 }
                                 if let Some(snapshot) = work.syscalls.as_ref().filter(|snapshot| {
                                     snapshot.seccomp.mode() != 0
-                                        && (trames_linux::DirectSyscalls::file_call(work.cpu.x(8) as u32)
+                                        && (trames_linux::DirectSyscalls::file_entry(work.cpu.x(8) as u32,std::array::from_fn(|i|work.cpu.x(i)))
                                             || snapshot.direct.supports_creation(work.cpu.x(8) as u32)
                                             || snapshot.direct.supports_socket_control(work.cpu.x(8) as u32)
                                             || snapshot.direct.supports_local_message(work.cpu.x(8) as u32, work.cpu.x(0) as u32)

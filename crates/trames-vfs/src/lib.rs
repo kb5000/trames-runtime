@@ -24,6 +24,7 @@ mod async_io;
 mod credentials;
 mod fd_status;
 pub use async_io::{AsyncOwner, AsyncOwners, TaskSignal};
+pub use fd_status::DescriptorControl;
 use fd_status::{CloseOnExec, DescriptorFlags, StatusFlags};
 mod pipe;
 mod stream_transfer;
@@ -2834,15 +2835,7 @@ impl Vfs {
     pub fn check_status_flags(&self, fd: u32, flags: u32) -> Result<()> {
         let descriptor = self.descriptor(fd)?;
         let open = descriptor.open.borrow();
-        if flags & O_NOATIME != 0 && open.flags.get() & O_NOATIME == 0 {
-            let uid = open
-                .metadata_node()
-                .map_or(open.owner.0, |node| node.borrow().uid);
-            if self.credentials.fsuid != uid && !self.credentials.has_cap(capabilities::FOWNER) {
-                return Err(Errno(1));
-            }
-        }
-        fd_status::StatusFlags::validate(flags)
+        fd_status::check_status(&open, &self.credentials, flags)
     }
     pub fn set_nonblocking(&self, fd: u32, enabled: bool) -> Result<()> {
         self.descriptor(fd)?

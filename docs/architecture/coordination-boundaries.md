@@ -1,11 +1,22 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 90, original published global proc/sys resources, reviewed on 2026-11-09. The prior shared runtime
+This is the consolidated implementation audit through stage 93, original FD status and memfd seals, reviewed on 2026-11-09. The prior shared runtime
 baseline is `0c736ffe1efb13c2bd504eb9b2f9391b931d0c18`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-09
+
+Stage 93 closes residual FD status authority, memfd seal operations and unknown
+fcntl command completion on original source resources. F_SETFL checks live inode
+ownership and current original fsuid/capabilities, then updates the accepted OFD;
+it never re-resolves a reused numeric FD for its asynchronous subscription.
+Source and solo share the short-control ABI. GET/ADD_SEALS use the same original
+inode body; mapped WRITE-seal flushing uses existing FileWork/disk execution and
+returns the CPU slot. Existing dup, lock and async-owner routes remain in place.
+Actual absent resource/Files/lock/wait capabilities retain their boundaries;
+neither io_uring maintenance escalation site nor the four broad categories is
+declared removed.
 
 Stage 92 closes recognized guest-fault delivery on source executors: caught CPU
 memory/instruction/trap faults, rejected native entries, precise forced signal
@@ -371,6 +382,7 @@ is not a claim that all coordinator work is removed.
 | fork/clone/vfork and execve/execveat | Existing workers handle pure and mixed mapping scopes, nonleader replacement and original old-mm retirement; existing disk pool prepares native images without a CPU slot | Affected actors still quiesce. Capability-less embeddings, solo and host invocation remain separate |
 | Structural VM edits, pins and mapped-file layout changes | Supported mapping/buffer-registration checkpoints publish on existing workers with original task/mm custody; additive anonymous mmap runs directly while peers continue | Proc/cold-mm checkpoints and supported mapped-file transactions now run on existing workers. Unsupported backing/lifetime/policy and capability-less embeddings retain explicit boundaries |
 | Descriptor ioctl discovery and control | Shared namespace type, virtual render discovery, implemented interface queries/link control and ordinary unsupported commands execute on the caller with one retained original OFD and the common solo ABI | Existing PTY/flag/async routes stay source-owned. Actual legacy OFDs or absent providers retain before-effects fallback; unsupported commands preserve their existing errno |
+| FD status, descriptor flags and memfd seals | Live NOATIME authority, original OFD status/async subscription, descriptor-local CLOEXEC, canonical unknown-command errors and original inode seals run on source; native seal flushes park on existing FileWork | Existing duplication, record locks and async-owner operations retain their source routes and actual resource requirements. A genuinely absent source capability still defers before effects; no unsupported fcntl feature is advertised |
 | Native libc/GPU/video/audio bodies, waits and before-effects mapping/entry checkpoints | Calling/shared-resource execution; exceptional access uses original task/mm custody on an existing executor, then retains resource waits | Capability-less embeddings and actual platform/host lifecycle retain their boundary. Single-CPU/solo calls use their existing caller. Local libc/DirectFile/HVF fallback alone is not an owner transition |
 | Read-only VM observations and implemented non-discard advice | Calling executor, original admitted mappings/reservations and per-page resident metadata; common source/solo ABI | No observation-only join or mm checkpoint. Genuine absent custom observation capabilities retain explicit before-effects fallback; actual discard/mapping mutation remains scoped |
 | Guest halt/poweroff | Calling executor and original root/caller group exit controls; common policy for source/solo | No supported power-control-only join. Missing original shutdown/exit capabilities keep explicit legacy execution. Unsupported restart/kexec and nested PID namespace power behavior retain their existing errno |
@@ -505,14 +517,14 @@ Actual excluded policy effects and missing capabilities retain explicit boundari
 ### Current remaining categories
 
 The count is **four broad categories**, not the number of historical subsystem
-rows. Stages 72–92 remove concrete triggers and close request-authority dependencies inside those categories; they do not
+rows. Stages 72–93 remove concrete triggers and close request-authority dependencies inside those categories; they do not
 prove that the final generic fallback is unreachable.
 
 | Remaining category | Actual trigger | Current scope / authoritative implementation |
 | --- | --- | --- |
 | Host cancellation and final teardown | Host cancel, deadline, shutdown, legacy stopped-hook requests, final CPU/backend drain and actual native-event backend failure | Pause/resume, original init notifications/signals, pressure reclaim, host filesystem commands and terminal/process admission no longer join. Actual terminal teardown and backend failure still stop their actors. Native-event failure returns its original HostIo cause after drain/cancellation, without an owner syscall retry. See [host control](../../crates/trames-session/src/process_vm.rs), [completion](../../crates/trames-session/src/process_exit.rs) and [workers](../../crates/trames-session/src/workers.rs). |
 | Missing capabilities and excluded resources | A genuinely absent source provider, an excluded original FD/node graph, a genuinely absent native event capability or unsupported source request body | There is no filesystem-kind exclusion after stage 82. Published global proc/sys metadata no longer lacks a source provider merely because it uses set_runtime_info. Other node/provider admission still applies. io_uring has exactly two submitter-scoped `require_owner()` maintenance call sites: missing-capability wait-source preparation and deferred original body progress; actual host backend errors take terminal source error handling. They remain connected to actual accepted request lifetime, subscriptions and cancellation. See [path authority](../../crates/trames-vfs/src/path_queries.rs), [maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [wait sources](../../crates/trames-linux/src/direct/uring/wait.rs) and [actor](../../crates/trames-linux/src/direct/uring/actor.rs). |
-| Final execution dispatch fallback | A returned SVC or cold HLT/resource operation not completed, parked or accepted by a source scope; host faults and capability-less embeddings retain their own explicit boundaries | The catch-all stops the current cohort for joined dispatch. Ordinary shared-FD ioctl discovery and residual prctl controls/errors and implemented time observations no longer use it. It remains an audit target even though admitted native calls, ordinary guest faults, generated ENOSYS and migrated syscalls have source completion. Recognized guest faults, caught handlers and signal-frame failures now complete/terminate on source. A backend error is not a software or full-Linux-VM fallback. See [worker dispatch](../../crates/trames-session/src/workers.rs) and [classification](../../crates/trames-session/src/worker_syscalls.rs). |
+| Final execution dispatch fallback | A returned SVC or cold HLT/resource operation not completed, parked or accepted by a source scope; host faults and capability-less embeddings retain their own explicit boundaries | The catch-all stops the current cohort for joined dispatch. Ordinary shared-FD ioctl discovery, residual prctl controls/errors, implemented time observations, FD status/NOATIME, inode seals and canonical unknown fcntl commands no longer use it. It remains an audit target even though admitted native calls, ordinary guest faults, generated ENOSYS and migrated syscalls have source completion. Recognized guest faults, caught handlers and signal-frame failures now complete/terminate on source. A backend error is not a software or full-Linux-VM fallback. See [worker dispatch](../../crates/trames-session/src/workers.rs) and [classification](../../crates/trames-session/src/worker_syscalls.rs). |
 | Initial and legacy orchestration | Initial admission, standalone/capability-less nonmember scheduling and other excluded embedding routes | Ordinary live members and preexisting Kernel Futex/Sleep actors migrate, park and wake on the original queue. Cold waiters have metadata only until an event prepares their original mm; child/exec admission and lazy CPU slots no longer require a joined owner. The standalone futex legacy-publication mechanism remains. Solo dispatch is on the caller, so its existence alone is not a cross-thread transition. See [admission](../../crates/trames-session/src/process.rs), [legacy wakes](../../crates/trames-session/src/futex.rs) and [queue](../../crates/trames-session/src/run_queue.rs). |
 
 Supported process/family lifecycle, signals and security policy, mount and task
@@ -3862,3 +3874,56 @@ The native ARM64 Linux workflow passes all seven steps. Signed native and instal
 Dev evidence is recorded in the paired product validation. This closes a concrete
 final-dispatch subsystem, not the remaining syscall/native resource fallback,
 actual host cancel/final teardown or initial/capability-less orchestration.
+
+
+## 93. Original FD status authority and memfd seals — 2026-11-09
+
+The residual fcntl control family runs on original source resources: F_SETFL
+including O_NOATIME, canonical unknown-command errors, and GET/ADD_SEALS. The
+short ABI is common to source and solo. Existing duplication, flag queries,
+record-lock waits and async owner/signal controls retain their existing routes;
+this does not invent unsupported commands or remove their real resource needs.
+
+One accepted full OFD supplies its status cell, descriptor-local CLOEXEC and live
+inode ownership. NOATIME is checked only when first enabled, against the original
+caller's current fsuid/FOWNER. Retaining an already enabled flag or clearing it
+keeps existing semantics. Credential changes refresh future source authority.
+Status validation and asynchronous observer updates use the existing per-OFD
+update lock. Async enable/disable captures the original endpoint, so close/reuse
+cannot change the target between permission checking and status publication.
+Ordinary flag reads, byte I/O and guest memory gain no lock, check or fence.
+
+Source and solo now agree that O_PATH rejects nonpermitted fcntl commands before
+examining unused arguments, including a multiply-invalid F_SETFL. The old joined
+session interception checked NOATIME authority before O_PATH while Linux's ABI
+body did the reverse; the common control consistently uses the latter ordering.
+Valid/invalid FDs, unknown raw command values and ignored pointer arguments retain
+canonical errno. A flag-only embedding still handles ordinary status locally;
+NOATIME without its actual original authority retains an explicit boundary.
+
+Seals execute directly against the original inode using one shared VFS body,
+without importing a numeric FD into another task's Files. Queries and ordinary
+changes complete inline. A WRITE-seal flush of live mapped backing goes through
+existing FileWork and the disk pool, parks the task and resumes the accepted
+result; it neither blocks an execution slot on native I/O nor starts a service
+thread. Existing writable mapping leases still produce EBUSY, including shared
+mappings of O_RDWR whose current permissions happen to be read-only. A private
+read-only mapping can retain backing without such a writer. No new layout edit
+or whole-cohort mapping checkpoint is required for a seal.
+
+The connected process fixture covers live credential changes, owner/foreign
+NOATIME, aliases, validation order, O_PATH, unknown commands, seals and real
+mapped-backing waits at four/twelve CPUs, one slot and seccomp ALLOW. Prior
+production stops before its completion marker. Final execution finishes one
+cohort without returned syscalls, services or mapping checkpoints. Original-OFD
+unit tests cover live chown, close/reuse, CLOEXEC locality, async subscriptions,
+last-close release, seal completion and cancellation after native acceptance.
+The native fixture checks real per-thread results, sealed original bytes and
+writable-map rejection. Signed hardware, full local runtime/product validation,
+both iPad SDKs and Dev deployment are recorded by the paired product.
+
+Four broad categories remain. This removes concrete status/seal/error triggers
+from final dispatch, but retains genuinely absent Files/lock/path/wait providers,
+both actual io_uring maintenance escalation sites, host cancel/final teardown
+and initial/legacy orchestration. Neither category count nor a workload speedup
+is inferred from a passing path regression.

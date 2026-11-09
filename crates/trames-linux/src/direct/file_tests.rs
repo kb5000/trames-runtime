@@ -19,6 +19,68 @@ fn t() -> Arc<dyn IoWake> {
     Arc::new(Target::default())
 }
 #[test]
+fn mapped_write_seal_parks_and_keeps_its_original_inode_through_close_and_fd_reuse() {
+    for cancel in [false, true] {
+        let mut v = trames_vfs::Vfs::default();
+        let fd = v.memfd_create(b"original", 2).unwrap();
+        v.write(fd, b"original bytes").unwrap();
+        let alias = v.dup(fd, 0, false).unwrap();
+        // A private read-only mapping keeps backing without VM_MAYWRITE.
+        // Shared mappings of O_RDWR prevent WRITE seals even while read-only.
+        let pages = v.mapping_pages(fd, 0, PAGE_SIZE, false, false).unwrap();
+        let mut memory = Memory::default();
+        memory
+            .map_backed(0x10000, pages, false, Permissions::R, false)
+            .unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let target = t();
+        let direct = DirectSyscalls::default()
+            .with_resources(v.descriptor_factory())
+            .with_paths(v.path_queries())
+            .with_file_executor(Arc::new(Queue(send)));
+        let args = [fd as u64, 1033, 8, 0, 0, 0];
+        let Some(IoAttempt::Blocked(wait)) =
+            direct.start_file_call(25, args, &mut memory, 1, &Arc::downgrade(&target))
+        else {
+            panic!("native seal sync must release its execution slot")
+        };
+        let pending = wait.file_pending().unwrap();
+        drop(wait);
+        v.close(fd).unwrap();
+        assert_eq!(v.memfd_create(b"replacement", 2).unwrap(), fd);
+        drop(direct);
+        let (work, result) = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        if cancel {
+            drop(pending);
+        } else {
+            std::thread::spawn(move || result.complete(work.run()))
+                .join()
+                .unwrap();
+            assert!(matches!(
+                DirectSyscalls::default().start_retained_file(
+                    pending,
+                    25,
+                    args,
+                    &mut memory,
+                    1,
+                    &Arc::downgrade(&target)
+                ),
+                IoAttempt::Complete(Ok(0))
+            ));
+            assert_eq!(v.seals(alias, None), Ok(8));
+            assert_eq!(v.pwrite(alias, b"changed", 0), Err(Errno(1)));
+            assert_eq!(v.pread(alias, 32, 0).unwrap(), b"original bytes");
+            assert_eq!(v.seals(fd, None), Ok(0));
+            continue;
+        }
+        // Once accepted by the existing disk pool, cancellation may leave
+        // the real inode effect, but must never redirect it to a reused FD.
+        result.complete(work.run());
+        assert_eq!(v.seals(alias, None), Ok(8));
+        assert_eq!(v.seals(fd, None), Ok(0));
+    }
+}
+#[test]
 fn mmap_plan_waits_before_page_preparation_and_retains_original_fd() {
     let mut linux = Linux::new(0x100000);
     linux

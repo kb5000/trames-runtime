@@ -175,6 +175,7 @@ impl FileTarget {
             FileCommand::Transfer(transfer) => transfer.borrow().host_work(),
             FileCommand::Seek { .. } => persistent,
             FileCommand::Stat => false,
+            FileCommand::Seals(add) => add.is_some_and(|add| add & 8 != 0) && data.mapped_work(),
             FileCommand::Read { .. } => persistent,
             FileCommand::Write { .. } | FileCommand::WriteSync { .. } => persistent,
             FileCommand::Sync { .. } | FileCommand::SyncFilesystem | FileCommand::SyncAll => {
@@ -209,6 +210,7 @@ impl SharedFd {
 }
 
 pub enum FileCommand {
+    Seals(Option<u32>),
     Read {
         count: usize,
         offset: Option<u64>,
@@ -804,6 +806,8 @@ impl FileCommand {
             cloexec: false.into(),
         };
         match self {
+            Self::Seals(add) => Vfs::seals_description(&descriptor, *add)
+                .map(|value| FileValue::Count(value as u64)),
             Self::Transfer(transfer) => transfer.borrow_mut().execute(v),
             Self::Read {
                 count,
@@ -897,6 +901,9 @@ impl FileCommand {
             FileCommand::Sync { data_only } => {
                 v.sync_fd(fd, *data_only).map(|()| FileValue::Count(0))
             }
+            FileCommand::Seals(add) => v
+                .seals(fd, *add)
+                .map(|value| FileValue::Count(value as u64)),
             FileCommand::SyncAll => v.sync().map(|()| FileValue::Count(0)),
             FileCommand::SyncFilesystem => v.sync_filesystem_fd(fd).map(|()| FileValue::Count(0)),
         }

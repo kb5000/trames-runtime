@@ -232,6 +232,38 @@ mod tests {
         }
     }
     #[test]
+    fn accepted_status_control_keeps_the_original_async_endpoint_after_fd_reuse() {
+        let mut v = Vfs::default();
+        let [reader, writer] = v.pipe(0).unwrap();
+        let alias = v.dup(reader, 0, false).unwrap();
+        let flags = v.fd_flags_snapshot();
+        let owner = Arc::new(Owner(Mutex::default()));
+        flags
+            .async_control(
+                reader,
+                8,
+                42,
+                &mut trames_memory::Memory::default(),
+                &Routes(owner.clone()),
+            )
+            .unwrap();
+        let original = v.descriptor_control(reader).unwrap();
+        v.close(reader).unwrap();
+        assert_eq!(v.eventfd(0, 0).unwrap(), reader);
+        original.short(reader, 4, 0x2000, &v.credentials).unwrap();
+        v.write(writer, b"x").unwrap();
+        assert_eq!(*owner.0.lock().unwrap(), vec![(0, reader, 1)]);
+        assert_eq!(v.flags(reader).unwrap() & 0x2000, 0);
+        assert_eq!(v.flags(alias).unwrap() & 0x2000, 0x2000);
+        assert_eq!(v.read(alias, 1).unwrap(), b"x");
+        original.short(reader, 4, 0, &v.credentials).unwrap();
+        v.write(writer, b"y").unwrap();
+        assert_eq!(owner.0.lock().unwrap().len(), 1);
+        v.close(alias).unwrap();
+        drop(original);
+        assert_eq!(v.write(writer, b"z"), Err(Errno(32)));
+    }
+    #[test]
     fn async_pipe_observes_repeated_events_shares_ofd_state_and_stops_on_disable() {
         let mut v = Vfs::default();
         let [reader, writer] = v.pipe(0).unwrap();

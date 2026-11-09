@@ -275,8 +275,13 @@ impl Vfs {
         data.shared_file().ok_or(Errno(95))
     }
     pub fn seals(&self, fd: u32, add: Option<u32>) -> Result<u32> {
-        let o_descriptor = self.descriptor(fd)?;
-        let o = o_descriptor.open.borrow();
+        Self::seals_description(&self.descriptor(fd)?, add)
+    }
+    pub(super) fn seals_description(descriptor: &Descriptor, add: Option<u32>) -> Result<u32> {
+        let o = descriptor.open.borrow();
+        if o.flags.get() & O_PATH != 0 {
+            return Err(Errno(9));
+        }
         let node = o.node.as_ref().ok_or(Errno(22))?;
         let mut n = node.borrow_mut();
         let current = n.seals.ok_or(Errno(22))?;

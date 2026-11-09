@@ -725,9 +725,6 @@ impl Snapshot {
         matches!(cpu.x(8) as u32, 129..=131)
     }
     pub fn admit<C: Cpu>(&self, cpu: &C) -> bool {
-        if cpu.x(8) as u32 == 25 && cpu.x(1) == 4 && cpu.x(2) as u32 & trames_vfs::O_NOATIME != 0 {
-            return false;
-        }
         if self.seccomp.mode() == 0 {
             return true;
         }
@@ -889,10 +886,16 @@ impl Snapshot {
                 effect.total()
             }),
             25 if matches!(cpu.x(1), 1..=4) => {
-                if cpu.x(1) == 4 && cpu.x(2) as u32 & trames_vfs::O_NOATIME != 0 {
-                    return None;
-                }
                 let result = if cpu.x(1) == 4 {
+                    if let Some(value) = self.direct.invoke_fcntl(std::array::from_fn(|i| cpu.x(i)))
+                    {
+                        return Some(value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
+                    }
+                    // Existing flag-only embeddings need no inode authority
+                    // when the requested status does not add NOATIME.
+                    if cpu.x(2) as u32 & trames_vfs::O_NOATIME != 0 {
+                        return None;
+                    }
                     self.fd_flags.set_status(
                         &self.direct.descriptors(),
                         cpu.x(0) as u32,
@@ -903,6 +906,12 @@ impl Snapshot {
                 };
                 self.direct.record_fd_control();
                 result
+            }
+            25 => {
+                return self
+                    .direct
+                    .invoke_fcntl(std::array::from_fn(|i| cpu.x(i)))
+                    .map(|r| r.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
             }
             436 if cpu.x(2) as u32 == 4 => {
                 let result = self

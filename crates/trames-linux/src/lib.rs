@@ -14,6 +14,7 @@ mod credentials;
 pub use credentials::{credential_call, credential_entry, credential_mutation, CredentialResult};
 mod descriptor_create;
 mod entropy;
+mod fcntl;
 pub use entropy::getrandom;
 mod direct;
 pub use direct::{

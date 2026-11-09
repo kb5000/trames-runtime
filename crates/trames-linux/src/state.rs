@@ -1301,6 +1301,9 @@ impl Linux {
             80 => self.fd_query(80, a, memory),
             25 if matches!(a[1], 1 | 3) => self.fd_query(25, a, memory),
             25 => {
+                if let Some(value) = crate::fcntl::short(&self.vfs.descriptor_factory(),a) {
+                    return value;
+                }
                 let flags = self.vfs.flags(a[0] as u32)?;
                 if flags & trames_vfs::O_PATH != 0 && !matches!(a[1], 0..=3 | 1030) {
                     return Err(Errno(9));
