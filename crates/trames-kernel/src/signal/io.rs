@@ -558,6 +558,24 @@ impl IoTask {
             .map(|s| (s, false))
             .or_else(|| self.process().next(mask).map(|s| (s, true)))
     }
+    /// Delivery gives KILL, then a precise thread fault, priority over ordinary
+    /// pending signals. The idle path reads only the same two pending bitsets.
+    pub fn next_delivery(&self, mask: u64) -> Option<(u32, bool)> {
+        let thread = self.inbox.bits();
+        let process = self.process().bits();
+        if thread | process == 0 {
+            return None;
+        }
+        if (thread | process) & (1 << 8) != 0 {
+            return self.next(1 << 8);
+        }
+        if thread != 0 && !self.lifecycle().stopped() {
+            if let Some(signal) = self.inbox.first_fault() {
+                return Some((signal, false));
+            }
+        }
+        self.next(mask)
+    }
     pub fn take(&self, sig: u32, shared: bool) -> Option<RetainedInfo> {
         if shared {
             self.process().take(sig)

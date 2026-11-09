@@ -6,6 +6,7 @@ pub struct SyscallDiagnostics {
     log: trames_vfs::KernelLogAccess,
     pid: u32,
     name: trames_vfs::TaskName,
+    trace: bool,
 }
 impl Linux {
     pub fn syscall_diagnostics(&self, pid: u32) -> SyscallDiagnostics {
@@ -13,10 +14,26 @@ impl Linux {
             log: self.vfs.kernel_log_capability(),
             pid,
             name: self.command_name.clone(),
+            trace: self.trace,
         }
     }
 }
 impl SyscallDiagnostics {
+    pub fn fault(&self, tgid: u32, fault: &impl std::fmt::Display) {
+        if self.trace {
+            eprintln!("trames pid {}: {fault}", self.pid);
+        }
+        let name = self.name.bytes();
+        let length = name.iter().position(|b| *b == 0).unwrap_or(15);
+        self.log.diagnostic(
+            4,
+            &format!(
+                "pid={} tgid={tgid} {fault} comm={:?}",
+                self.pid,
+                String::from_utf8_lossy(&name[..length])
+            ),
+        );
+    }
     pub fn unsupported(&self, number: u32, pc: u64, args: [u64; 6]) -> u64 {
         let name = self.name.bytes();
         let length = name.iter().position(|b| *b == 0).unwrap_or(15);

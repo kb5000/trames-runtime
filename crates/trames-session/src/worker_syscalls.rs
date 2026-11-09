@@ -475,11 +475,27 @@ impl Snapshot {
         self.io_signals.lifecycle().stopped() || self.frozen()
     }
     pub fn next_io_signal(&self) -> Option<(u32, bool)> {
-        self.io_signals.next(if self.frozen() {
-            1 << 8
+        if self.frozen() {
+            self.io_signals.next(1 << 8)
         } else {
-            !self.io_signals.mask()
-        })
+            self.io_signals.next_delivery(!self.io_signals.mask())
+        }
+    }
+    pub fn synchronous_fault(&self, fault: &trames_engine::CpuFault) -> Option<bool> {
+        let info = crate::process::fault_info(fault)?;
+        let caught = info.queue(
+            &self.actions,
+            self.io_signals.mask(),
+            &self.io_signals.inbox,
+        );
+        if caught {
+            if let Some(diagnostics) = &self.diagnostics {
+                diagnostics.fault(self.io_signals.tgid(), fault);
+            }
+        } else {
+            self.io_signals.lifecycle().request_exit(info.signal as i32);
+        }
+        Some(caught)
     }
     pub fn io_frame(&self) -> trames_kernel::signal::FrameState {
         let context = *self.io_signals.context.lock().unwrap();

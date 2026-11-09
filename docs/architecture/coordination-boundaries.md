@@ -7,6 +7,14 @@ resource work, scoped mapping admission and joined administration remain distinc
 
 ## Current status at a glance — 2026-11-09
 
+Stage 92 closes recognized guest-fault delivery on source executors: caught CPU
+memory/instruction/trap faults, rejected native entries, precise forced signal
+information, frame construction/return and terminal frame failures use original
+task signal resources and the existing caller View. Fault delivery and diagnostics
+do not end the cohort. Host transport faults remain host failures, and embeddings
+without source state retain their actual boundary. Final dispatch still has cold
+syscall/native-resource cases; the four broad categories are not declared closed.
+
 Stage 91 completes accepted io_uring bodies against their original sealed
 resource context. Cold admission retains the original Files, credentials, fs and
 namespace resources, device policy and the original global publication. It never
@@ -497,14 +505,14 @@ Actual excluded policy effects and missing capabilities retain explicit boundari
 ### Current remaining categories
 
 The count is **four broad categories**, not the number of historical subsystem
-rows. Stages 72–91 remove concrete triggers and close request-authority dependencies inside those categories; they do not
+rows. Stages 72–92 remove concrete triggers and close request-authority dependencies inside those categories; they do not
 prove that the final generic fallback is unreachable.
 
 | Remaining category | Actual trigger | Current scope / authoritative implementation |
 | --- | --- | --- |
 | Host cancellation and final teardown | Host cancel, deadline, shutdown, legacy stopped-hook requests, final CPU/backend drain and actual native-event backend failure | Pause/resume, original init notifications/signals, pressure reclaim, host filesystem commands and terminal/process admission no longer join. Actual terminal teardown and backend failure still stop their actors. Native-event failure returns its original HostIo cause after drain/cancellation, without an owner syscall retry. See [host control](../../crates/trames-session/src/process_vm.rs), [completion](../../crates/trames-session/src/process_exit.rs) and [workers](../../crates/trames-session/src/workers.rs). |
 | Missing capabilities and excluded resources | A genuinely absent source provider, an excluded original FD/node graph, a genuinely absent native event capability or unsupported source request body | There is no filesystem-kind exclusion after stage 82. Published global proc/sys metadata no longer lacks a source provider merely because it uses set_runtime_info. Other node/provider admission still applies. io_uring has exactly two submitter-scoped `require_owner()` maintenance call sites: missing-capability wait-source preparation and deferred original body progress; actual host backend errors take terminal source error handling. They remain connected to actual accepted request lifetime, subscriptions and cancellation. See [path authority](../../crates/trames-vfs/src/path_queries.rs), [maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [wait sources](../../crates/trames-linux/src/direct/uring/wait.rs) and [actor](../../crates/trames-linux/src/direct/uring/actor.rs). |
-| Final execution dispatch fallback | A returned SVC/HLT/fault not completed, parked or accepted by a source scope | The catch-all stops the current cohort for joined dispatch. Ordinary shared-FD ioctl discovery and residual prctl controls/errors and implemented time observations no longer use it. It remains an audit target even though admitted native calls, ordinary guest faults, generated ENOSYS and migrated syscalls have source completion. A backend error is not a software or full-Linux-VM fallback. See [worker dispatch](../../crates/trames-session/src/workers.rs) and [classification](../../crates/trames-session/src/worker_syscalls.rs). |
+| Final execution dispatch fallback | A returned SVC or cold HLT/resource operation not completed, parked or accepted by a source scope; host faults and capability-less embeddings retain their own explicit boundaries | The catch-all stops the current cohort for joined dispatch. Ordinary shared-FD ioctl discovery and residual prctl controls/errors and implemented time observations no longer use it. It remains an audit target even though admitted native calls, ordinary guest faults, generated ENOSYS and migrated syscalls have source completion. Recognized guest faults, caught handlers and signal-frame failures now complete/terminate on source. A backend error is not a software or full-Linux-VM fallback. See [worker dispatch](../../crates/trames-session/src/workers.rs) and [classification](../../crates/trames-session/src/worker_syscalls.rs). |
 | Initial and legacy orchestration | Initial admission, standalone/capability-less nonmember scheduling and other excluded embedding routes | Ordinary live members and preexisting Kernel Futex/Sleep actors migrate, park and wake on the original queue. Cold waiters have metadata only until an event prepares their original mm; child/exec admission and lazy CPU slots no longer require a joined owner. The standalone futex legacy-publication mechanism remains. Solo dispatch is on the caller, so its existence alone is not a cross-thread transition. See [admission](../../crates/trames-session/src/process.rs), [legacy wakes](../../crates/trames-session/src/futex.rs) and [queue](../../crates/trames-session/src/run_queue.rs). |
 
 Supported process/family lifecycle, signals and security policy, mount and task
@@ -3806,3 +3814,51 @@ regressions (two intentionally ignored) and ten FFI cases. Both iPad SDK targets
 compile. Signed HVF and installed Dev evidence belongs to the paired product's
 validation record. No controlled throughput gain or broad category reduction is
 inferred from a passing functional/path regression.
+
+## 92. Original synchronous faults and complete signal-frame delivery — 2026-11-09
+
+Recognized guest CPU faults now retain the original executor through handler
+entry, precise siginfo and guest-edited sigreturn. Unmapped/protected memory,
+file-mapping SIGBUS, breakpoints, illegal instructions and rejected native-call
+entries share the existing fault classifier and common kernel queue policy.
+Default, ignored or blocked synchronous faults keep their existing original-group
+termination. CPU Host transport errors are not converted into guest signals.
+Embeddings without source signal state retain their genuine legacy boundary.
+
+Source and solo force the same precise original thread fault over a prior async
+signal of the same number. Delivery prioritizes KILL, then a thread fault, then
+ordinary pending signals. The idle source selector reads the existing two pending
+bitsets and takes no pending/action/context lock; active signal selection uses the
+existing object locks. Frames retain the original signal mask, alternate stack,
+register and SME records, restorer and guest validation. Invalid sigreturn keeps
+its original errno plus pending SIGSEGV on source. Failed frame construction or
+nesting exhaustion retires the original group with SIGSEGV, without a cohort stop
+or a retry against an unrelated current task.
+
+Caught faults write to the original bounded session log through the existing
+calling-task diagnostics capability and live task name. Fatal fault diagnostics
+retain final retirement publication. There is no new task-wide/global native
+lock, service/resource thread, polling bus, production unsafe block, guest memory
+policy, per-instruction hook or ordinary memory fence. The frame ABI and guest
+memory algorithms remain shared by source and standalone delivery.
+
+The connected process regression covers 48 caught-fault combinations of four/
+twelve CPUs, one execution slot, seccomp ALLOW and normal/alternate stacks. It
+checks exact signal/code/address, edited PC, preserved general register and SP,
+mask/frame restoration, original log and one-cohort completion. Five terminal
+frame/return/nested-fault scenarios run on four/twelve CPUs and one slot while an
+independent root actor completes its marker. Both connected tests fail against
+prior production. Common kernel coverage checks precise thread-info replacement,
+shared-info retention, KILL/fault priority and blocked/ignored/default rejection.
+
+macOS and native ARM64 Linux process suites each pass 444 cases (two intentionally
+ignored); FFI ten and both iPad SDK targets pass. The macOS runtime workspace run
+had one unchanged IPv6 readiness timeout after earlier packages had passed. The
+failed case passes its targeted retry; already passing targets are retained, and
+unreached package/integration/doc targets plus the release/footprint steps pass.
+The original failed runner log is preserved alongside explicit coverage recovery;
+no failed result is overwritten or represented as a pristine raw seven-step run.
+The native ARM64 Linux workflow passes all seven steps. Signed native and installed
+Dev evidence is recorded in the paired product validation. This closes a concrete
+final-dispatch subsystem, not the remaining syscall/native resource fallback,
+actual host cancel/final teardown or initial/capability-less orchestration.

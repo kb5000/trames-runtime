@@ -701,8 +701,7 @@ impl<C: Cpu> Starter<C> {
                                                 } else { work.trace.finish(&mut work.cpu, 0u64.wrapping_sub(interrupted.err().unwrap().0 as u64)); }
                                             }
                                             if snapshot.enter_io_signal(&mut work.cpu, work.memory.as_deref_mut().expect("signal View"), sig, *info, action).is_err() {
-                                                let _ = snapshot.io_signals.inbox.enqueue(11, trames_kernel::signal::Info::default());
-                                                work.control.stop(); break SliceOutcome::Yield { instructions: 0 };
+                                                snapshot.io_signals.lifecycle().request_exit(11);
                                             }
                                             continue;
                                         }
@@ -953,13 +952,11 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                 if let Some(epoch) = &epoch { epoch.progress.fetch_add(retired, Ordering::Relaxed); }
                             }
                             if let (SliceOutcome::Fault(fault),Some(snapshot)) = (&result,work.syscalls.as_ref()) {
-                                if let Some(info) = crate::process::fault_info(fault) {
-                                    let blocked = snapshot.io_signals.context.lock().unwrap().mask & (1 << (info.signal-1)) != 0;
-                                    if snapshot.actions.get(info.signal as usize).handler <= 1 || blocked {
+                                if let Some(caught) = snapshot.synchronous_fault(fault) {
+                                    if !caught {
                                         fatal_fault=match result { SliceOutcome::Fault(fault)=>Some(fault), _=>unreachable!() };
-                                        snapshot.io_signals.lifecycle().request_exit(info.signal as i32);
-                                        continue;
                                     }
+                                    continue;
                                 }
                             }
                             if matches!(result, SliceOutcome::Syscall { .. }) {
@@ -1085,9 +1082,15 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                     continue;
                                 }
                                 if let Some(snapshot) = work.syscalls.as_ref().filter(|s| work.cpu.x(8) as u32 == 139 && s.admit(&work.cpu)) {
-                                    if snapshot.return_io_signal(&mut work.cpu, work.memory.as_deref().expect("signal View")).is_ok() { work.trace.record(work.cpu.x(0)); syscalls += 1; continue; }
-                                    let _ = snapshot.io_signals.inbox.enqueue(11, trames_kernel::signal::Info::default());
-                                    break result;
+                                    match snapshot.return_io_signal(&mut work.cpu, work.memory.as_deref().expect("signal View")) {
+                                        Ok(()) => work.trace.record(work.cpu.x(0)),
+                                        Err(error) => {
+                                            let _ = snapshot.io_signals.inbox.enqueue(11, trames_kernel::signal::Info::default());
+                                            work.trace.finish(&mut work.cpu, 0u64.wrapping_sub(error.0 as u64));
+                                        }
+                                    }
+                                    syscalls += 1;
+                                    continue;
                                 }
                                 if let Some(snapshot) = work.syscalls.as_ref().filter(|snapshot| {
                                     snapshot.seccomp.mode() != 0
@@ -1725,6 +1728,10 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                                                 unreachable!("handled checkpoint")
                                             }
                                         };
+                                        if let Some(caught) = work.syscalls.as_ref().and_then(|s| s.synchronous_fault(&fault)) {
+                                            if !caught { fatal_fault = Some(fault); }
+                                            continue;
+                                        }
                                         break SliceOutcome::Fault(fault);
                                     }
                                 }

@@ -19,6 +19,10 @@ pub struct KernelLogAccess {
     authorized: bool,
 }
 impl KernelLogAccess {
+    /// Diagnostics produced by the runtime use the original bounded log.
+    pub fn diagnostic(&self, priority: u32, message: &str) {
+        self.log.append(priority, message);
+    }
     /// Kernel-produced diagnostics use the original log independently of the
     /// caller's permission to read it through syslog or /dev/kmsg.
     pub fn log_syscall(

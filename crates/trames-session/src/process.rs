@@ -9600,3 +9600,7 @@ mod published_proc_tests;
 #[cfg(all(test, trames_interpreter_conformance))]
 #[path = "process_uring_original_tests.rs"]
 mod uring_original_tests;
+
+#[cfg(all(test, trames_interpreter_conformance))]
+#[path = "process_source_fault_tests.rs"]
+mod source_fault_tests;
