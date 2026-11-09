@@ -151,6 +151,7 @@ impl Linux {
             &paths,
             &self.vfs.descriptor_factory(),
             &Default::default(),
+            self.vfs.direct_descriptors(),
             self.file_executor.clone(),
             self.file_layouts.clone(),
             self.vfs.task_signal(),

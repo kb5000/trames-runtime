@@ -9553,3 +9553,7 @@ mod mqueue_tests;
 #[cfg(all(test, trames_interpreter_conformance))]
 #[path = "process_host_io_tests.rs"]
 mod host_io_tests;
+
+#[cfg(all(test, trames_interpreter_conformance))]
+#[path = "process_uring_authority_tests.rs"]
+mod uring_authority_tests;

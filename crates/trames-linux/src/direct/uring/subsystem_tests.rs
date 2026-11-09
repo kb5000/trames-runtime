@@ -976,7 +976,8 @@ fn fixed_file_size_failure_keeps_original_submitter_signal_when_another_context_
         }
     }
     let directory = std::env::temp_dir().join(format!(
-        "trames-limit-source-{}",
+        "trames-limit-source-{}-{}",
+        std::process::id(),
         trames_memory::new_backing_identity()
     ));
     let mut l = Linux::new(0x100000);
@@ -1033,7 +1034,7 @@ fn fixed_file_size_failure_keeps_original_submitter_signal_when_another_context_
     let (work, result) = receive.recv_timeout(Duration::from_secs(2)).unwrap();
     l.vfs.file_size_limit_handle().set(0);
     result.complete(work.run());
-    let pump = direct(&l, &m, &mut epoch, &caps).with_task_signal(b.clone());
+    let pump = d.with_task_signal(b.clone());
     assert!(matches!(
         enter(&pump, fd, 0, 0, &mut m, &t),
         IoAttempt::Complete(Ok(0))
@@ -1042,8 +1043,25 @@ fn fixed_file_size_failure_keeps_original_submitter_signal_when_another_context_
     assert_eq!(a.0.load(std::sync::atomic::Ordering::Relaxed), 1);
     assert_eq!(b.0.load(std::sync::atomic::Ordering::Relaxed), 0);
     assert!(!l.take_file_size_signal());
-    assert!(!d.urings.actor().owner_required());
-    drop((d, pump, l));
+    // Updating a caller changes future acceptance; old in-flight work above
+    // still publishes to its original submitter. A new request uses B.
+    write[32..40].copy_from_slice(&78u64.to_le_bytes());
+    add(&mut m, &r, write);
+    assert!(matches!(
+        enter(&pump, fd, 1, 0, &mut m, &t),
+        IoAttempt::Complete(Ok(1))
+    ));
+    let (work, result) = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+    result.complete(work.run());
+    assert!(matches!(
+        enter(&pump, fd, 0, 0, &mut m, &t),
+        IoAttempt::Complete(Ok(0))
+    ));
+    assert_eq!(cq(&mut m, &r), (78, -27));
+    assert_eq!(a.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(b.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert!(!pump.urings.actor().owner_required());
+    drop((pump, l));
     files.finish();
     std::fs::remove_dir_all(directory).unwrap();
 }

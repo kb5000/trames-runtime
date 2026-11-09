@@ -707,6 +707,11 @@ pub struct UringSnapshot {
     context: std::sync::OnceLock<Arc<actor::Execution>>,
 }
 impl UringSnapshot {
+    /// Only future acceptance changes. Existing request leases retain their
+    /// original complete execution context independently of this cache.
+    pub(super) fn refresh_context(&mut self) {
+        self.context.take();
+    }
     pub(super) fn refresh_namespaces(
         &mut self,
         membership: trames_vfs::SharedFiles,
@@ -720,7 +725,7 @@ impl UringSnapshot {
         // Old ring roots and their already accepted OFDs stay alive even when
         // absent from the new Files table. Only new acceptance gets new paths.
         self.retained_files.extend(retained);
-        self.context.take();
+        self.refresh_context();
         #[cfg(test)]
         {
             self.rings.clear();
@@ -751,6 +756,7 @@ impl UringSnapshot {
                     paths,
                     factory,
                     files,
+                    self.descriptors.clone().unwrap_or_default(),
                     disk.cloned(),
                     layouts.cloned(),
                     signal.cloned(),
@@ -780,7 +786,11 @@ impl UringSnapshot {
         for ring in rings {
             let mut state = ring.state.lock().unwrap();
             for r in &mut state.pending {
-                if r.resource.is_none() {
+                if r.owner == self.owner
+                    && r.task == self.task
+                    && r.execution.is_none()
+                    && r.resource.is_none()
+                {
                     r.resource = r
                         .file
                         .as_ref()

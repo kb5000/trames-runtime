@@ -13,6 +13,7 @@ pub(crate) struct Execution {
     paths: Mutex<trames_vfs::PathQueries>,
     factory: trames_vfs::DescriptorFactory,
     files: trames_vfs::DirectFiles,
+    descriptors: trames_vfs::DirectFds,
     disk: Option<Arc<dyn FileExecutor>>,
     layouts: Option<Arc<crate::FileLayouts>>,
     signal: Option<Arc<dyn trames_vfs::TaskSignal>>,
@@ -51,6 +52,7 @@ impl Execution {
         paths: &trames_vfs::PathQueries,
         factory: &trames_vfs::DescriptorFactory,
         files: &trames_vfs::DirectFiles,
+        descriptors: trames_vfs::DirectFds,
         disk: Option<Arc<dyn FileExecutor>>,
         layouts: Option<Arc<crate::FileLayouts>>,
         signal: Option<Arc<dyn trames_vfs::TaskSignal>>,
@@ -59,6 +61,7 @@ impl Execution {
             paths: Mutex::new(paths.retain_context()),
             factory: factory.clone(),
             files: files.clone(),
+            descriptors,
             disk,
             layouts,
             signal,
@@ -290,7 +293,18 @@ impl UringActor {
         context: Arc<Execution>,
     ) {
         if request.resource.is_none() {
-            request.resource = request.file.as_ref().and_then(Resource::capture);
+            // Reader/task-sensitive byte resources belong to the submitter,
+            // including requests imported before its first worker capture.
+            // A later CQ observer cannot supply its own reader or re-resolve FD.
+            request.resource = request.file.as_ref().and_then(|file| {
+                file.shared_file()
+                    .and_then(|file| context.descriptors.byte_file(file))
+                    .map(|fd| Resource {
+                        object: Object::Byte(fd),
+                        identity: file.identity(),
+                    })
+                    .or_else(|| Resource::capture(file))
+            });
         }
         let key = (Arc::as_ptr(ring) as usize, request.sequence);
         self.rings

@@ -67,6 +67,180 @@ impl trames_vfs::SignalReader for SignalQueue {
     }
 }
 #[test]
+fn solo_accepted_signalfd_keeps_original_reader_across_foreign_capture_and_source_pump() {
+    for op in [22, 1, 4, 6] {
+        for cancel in [false, true] {
+            let (mut l, mut m, fd, ring) = setup(8);
+            let original = Arc::new(SignalQueue::default());
+            let original_lifetime = Arc::downgrade(&original);
+            let observer = Arc::new(SignalQueue::default());
+            l.vfs.bind_signal_reader(original.clone());
+            let signal = l.vfs.signalfd(-1, 1 << 9, 0).unwrap();
+            register_files(&mut l, &mut m, fd, &[signal as i32]);
+            let mut entry = match op {
+                1 => {
+                    m.write_array(0x2000, 0x3000u64.to_le_bytes()).unwrap();
+                    m.write_array(0x2008, 128u64.to_le_bytes()).unwrap();
+                    data(op, 0, 0x2000, 1, 121, 1)
+                }
+                6 => {
+                    let mut entry = sqe(6, 0, 121);
+                    entry[1] = 1;
+                    entry[28..32].copy_from_slice(&1u32.to_le_bytes());
+                    entry
+                }
+                _ => data(op, 0, 0x3000, 128, 121, 1),
+            };
+            if op == 4 {
+                register_buffers(&mut l, &mut m, fd, 0x3000, 128);
+                entry[40..42].copy_from_slice(&0u16.to_le_bytes());
+            }
+            m.write(0x3000, &[0xa5; 128]).unwrap();
+            add(&mut m, &ring, entry);
+            assert_eq!(
+                l.uring_enter([fd as u64, 1, 0, 0, 0, 0], &mut m, None, 7),
+                Ok((1, true))
+            );
+            assert_eq!(
+                ring.state.lock().unwrap().pending.len(),
+                1,
+                "solo import must retain signal authority: op={op}"
+            );
+            l.vfs.close(signal).unwrap();
+            assert_eq!(l.vfs.eventfd(93, 0).unwrap(), signal);
+            l.vfs.bind_signal_reader(observer.clone());
+            let mut epoch = UringEpoch::default();
+            // Foreign CQ observation cannot donate another task's reader.
+            let _foreign = epoch
+                .capture(&l.vfs, m.instruction_identity().0, 8)
+                .with_actor(l.uring_actor_root());
+            let d = DirectSyscalls::new(l.vfs.direct_descriptors())
+                .with_paths(l.vfs.path_queries())
+                .with_resources(l.vfs.descriptor_factory())
+                .with_signal_reader(observer.clone())
+                .with_urings(
+                    epoch
+                        .capture(&l.vfs, m.instruction_identity().0, 7)
+                        .with_actor(l.uring_actor_root()),
+                );
+            let t = target();
+            let mut background = d.uring_background(7, &Arc::downgrade(&t)).unwrap();
+            assert!(background.progress(&mut m).unwrap());
+            assert!(background.active());
+            let mut wrong = [0; 128];
+            wrong[..4].copy_from_slice(&10u32.to_le_bytes());
+            wrong[8..12].copy_from_slice(&99u32.to_le_bytes());
+            observer.queue.lock().unwrap().push_back(wrong);
+            observer.ready.notify_atomic();
+            assert!(
+                !background.signal.ready(),
+                "an observer cannot wake original signal I/O"
+            );
+            if cancel {
+                d.cancel_task_uring(m.instruction_identity().0, 7);
+                assert!(background.progress(&mut m).unwrap());
+                assert_eq!(cq(&mut m, &ring), (121, -125));
+                assert_eq!(m.read_array::<128>(0x3000).unwrap(), [0xa5; 128]);
+            } else {
+                let mut right = [0; 128];
+                right[..4].copy_from_slice(&10u32.to_le_bytes());
+                right[8..12].copy_from_slice(&41u32.to_le_bytes());
+                original.queue.lock().unwrap().push_back(right);
+                original.ready.notify_atomic();
+                assert!(background.signal.ready());
+                assert!(background.progress(&mut m).unwrap());
+                assert_eq!(cq(&mut m, &ring), (121, if op == 6 { 1 } else { 128 }));
+                if op != 6 {
+                    assert_eq!(m.read_array::<128>(0x3000).unwrap(), right);
+                }
+            }
+            assert_eq!(observer.queue.lock().unwrap().len(), 1);
+            assert!(!l.uring_requires_owner());
+            // Later SQEs use their own submitter, not a permanent reader stored
+            // on the signalfd or ring. Its fixed OFD mask is still the same one.
+            entry[32..40].copy_from_slice(&122u64.to_le_bytes());
+            add(&mut m, &ring, entry);
+            assert!(matches!(
+                d.start(
+                    426,
+                    [fd as u64, 1, 1, 1, 0, 0],
+                    &mut m,
+                    7,
+                    &Arc::downgrade(&t),
+                    None
+                ),
+                Some(IoAttempt::Complete(Ok(1)))
+            ));
+            assert_eq!(cq(&mut m, &ring), (122, if op == 6 { 1 } else { 128 }));
+            if op != 6 {
+                assert_eq!(m.read_array::<128>(0x3000).unwrap(), wrong);
+            }
+            drop(original);
+            assert!(
+                original_lifetime.upgrade().is_none(),
+                "completed/cancelled requests release the original reader"
+            );
+        }
+    }
+}
+#[test]
+fn foreign_capture_leaves_legacy_requests_unbound_until_the_original_submitter_admits_them() {
+    let (mut l, mut m, _fd, ring) = setup(8);
+    let original = Arc::new(SignalQueue::default());
+    let observer = Arc::new(SignalQueue::default());
+    l.vfs.bind_signal_reader(original.clone());
+    let signal = l.vfs.signalfd(-1, 1 << 9, 0).unwrap();
+    let entry = data(22, signal, 0x3000, 128, 123, 0);
+    {
+        let mut state = ring.state.lock().unwrap();
+        state.next += 1;
+        let request = crate::uring::import_request(
+            UringSqe(entry),
+            state.next,
+            &state,
+            &m,
+            7,
+            None,
+            l.uring_clock,
+            |fd| Some(l.vfs.retain_uring_file(fd)),
+        )
+        .unwrap();
+        assert!(request.resource.is_none() && request.execution.is_none());
+        state.pending.push_back(request);
+    }
+    l.track_uring(&ring);
+    l.vfs.bind_signal_reader(observer);
+    let mut epoch = UringEpoch::default();
+    let _foreign = epoch
+        .capture(&l.vfs, m.instruction_identity().0, 8)
+        .with_actor(l.uring_actor_root());
+    {
+        let state = ring.state.lock().unwrap();
+        assert!(state.pending[0].resource.is_none());
+        assert!(state.pending[0].execution.is_none());
+    }
+    l.vfs.bind_signal_reader(original.clone());
+    let d = DirectSyscalls::new(l.vfs.direct_descriptors())
+        .with_paths(l.vfs.path_queries())
+        .with_resources(l.vfs.descriptor_factory())
+        .with_urings(
+            epoch
+                .capture(&l.vfs, m.instruction_identity().0, 7)
+                .with_actor(l.uring_actor_root()),
+        );
+    let t = target();
+    let mut background = d.uring_background(7, &Arc::downgrade(&t)).unwrap();
+    assert!(background.progress(&mut m).unwrap());
+    let mut record = [0; 128];
+    record[..4].copy_from_slice(&10u32.to_le_bytes());
+    original.queue.lock().unwrap().push_back(record);
+    original.ready.notify_atomic();
+    assert!(background.signal.ready());
+    assert!(background.progress(&mut m).unwrap());
+    assert_eq!(cq(&mut m, &ring), (123, 128));
+    assert_eq!(m.read_array::<128>(0x3000).unwrap(), record);
+}
+#[test]
 fn proc_image_reads_use_original_mm_for_fixed_fds_vectors_and_registered_buffers() {
     use std::sync::atomic::Ordering;
     use trames_vfs::{ProcRefresh, ProcSource, ProcTask, ProcessInfo, ProcessView, RuntimeInfo};

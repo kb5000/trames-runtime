@@ -1,11 +1,20 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 83, native host-event failure closure, reviewed on 2026-11-09. The prior shared runtime
-baseline is `bee1f006ca0ee30941834f96a968ecca7937b1e1`.
+This is the consolidated implementation audit through stage 84, original io_uring submitter authority, reviewed on 2026-11-09. The prior shared runtime
+baseline is `43cdaa92f94c867e12f4a9ec0d1afd0039d7f414`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-09
+
+Stage 84 binds accepted io_uring byte resources to the original submitting task,
+including solo-imported signalfd requests before their first worker capture.
+Foreign CQ observers cannot donate their reader; future context changes affect
+only new requests. Original completion, cancellation and lease release remain
+source-owned across close/reuse and live-cohort handoff. This closes an original
+request-authority prerequisite inside the missing/excluded-resource category;
+it does not remove either of its two maintenance setters or reduce the four
+broad remaining categories. The overall goal stays active.
 
 Stage 83 separates genuine absent native-event capabilities from original host
 backend errors across readiness, TCP/socket/file waits, io_uring enter/CQ poll
@@ -417,7 +426,7 @@ Actual excluded policy effects and missing capabilities retain explicit boundari
 ### Current remaining categories
 
 The count is **four broad categories**, not the number of historical subsystem
-rows. Stages 72–82 remove concrete triggers inside those categories; they do not
+rows. Stages 72–84 remove concrete triggers and close request-authority dependencies inside those categories; they do not
 prove that the final generic fallback is unreachable.
 
 | Remaining category | Actual trigger | Current scope / authoritative implementation |
@@ -3327,3 +3336,48 @@ setters, final generic dispatch, initial/legacy orchestration and actual host
 cancel/deadline/shutdown/teardown remain. No new coordinator/service thread,
 polling bus, ordinary memory fence/check or global native-function lock is added.
 Only Mac Dev deployment is in scope; shared code compiles for iPad.
+
+
+## 84. Original io_uring submitter authority across source handoff — 2026-11-09
+
+An accepted request now binds original task-sensitive byte resources from its
+submitting execution context. The solo importer captures the original DirectFds
+capability, including its signal reader, before attempting the body. Acceptance
+uses the retained original OFD rather than resolving the descriptor number again.
+The original signalfd mask remains an OFD property; its reader belongs to each
+submission, not permanently to the ring, FD, creator or later CQ observer.
+
+A foreign capture no longer supplies resources to other tasks' unbound legacy
+requests. Only the matching original mm/task may admit them. Already accepted
+requests retain their sealed execution context and bound resource through numeric
+FD close/reuse, worker capture and pumping by a later context. No observer reader
+can consume or wake that original request. The existing request lease releases
+its reader on completion/cancellation, including fixed files, vector/fixed-buffer
+reads and polling; cancellation preserves untouched output bytes.
+
+Consuming DirectSyscalls configuration changes now invalidate only its future
+io_uring acceptance cache. Previously accepted work retains its old Arc context;
+new submissions see the new original paths, factory/files, task signal, reader,
+disk executor and file-layout capability as configured. Explicit signal-reader
+configuration is preserved when installing an incoming ring snapshot, independent
+of builder order. This cache invalidation is not a per-retry/per-byte authority
+recheck and creates no new synchronization layer.
+
+Regressions compare original and foreign signal queues across solo import,
+foreign capture, source pumping, completion/cancellation and later acceptance.
+A delayed original native-file size failure notifies its original submitter,
+while a later request uses the updated signal sink. The live-cohort fixture keeps
+the original guest asleep on an infinite futex while a peer sends the real signal;
+its already accepted async read completes with no joined service or syscall return
+on four/twelve logical CPUs and a single execution slot. Signed Mac hardware
+acceptance covers native solo and four/twelve-CPU submissions. Baseline/final
+results and source hashes are retained in the product validation record.
+
+This is the complete connected submitter-authority/lifetime correction, not a
+claim that every io_uring capability/body is source-supported. Exactly two
+maintenance require_owner call sites remain, along with genuine resource/provider
+exclusions, final dispatch, initial/legacy orchestration and actual host controls
+or teardown. The broad category count remains four. No new service/coordinator
+thread, polling bus, production unsafe block, ordinary guest memory fence/check
+or global native-function lock is introduced. Shared code remains iPad-compatible;
+only Mac Dev deployment is in scope.

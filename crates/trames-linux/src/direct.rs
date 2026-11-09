@@ -318,6 +318,7 @@ impl DirectSyscalls {
         crate::sysinfo(memory, args[0], |_| self.statistics.as_ref()?.observe())
     }
     pub fn with_signal_reader(mut self, reader: Arc<dyn trames_vfs::SignalReader>) -> Self {
+        self.urings.refresh_context();
         self.signal_reader = Some(reader.clone());
         self.descriptors = self.descriptors.with_signal_reader(Some(reader.clone()));
         if let Some(descriptors) = self.urings.descriptors.take() {
@@ -326,6 +327,7 @@ impl DirectSyscalls {
         self
     }
     pub fn with_task_signal(mut self, task: Arc<dyn trames_vfs::TaskSignal>) -> Self {
+        self.urings.refresh_context();
         self.task_signal = Some(task);
         self
     }
@@ -369,6 +371,7 @@ impl DirectSyscalls {
         }
     }
     pub fn with_resources(mut self, mut resources: trames_vfs::DescriptorFactory) -> Self {
+        self.urings.refresh_context();
         if let Some(identity) = self.local_identity {
             resources = resources.with_local_identity(identity);
         }
@@ -499,6 +502,7 @@ impl DirectSyscalls {
         Some(result)
     }
     pub fn with_paths(mut self, paths: trames_vfs::PathQueries) -> Self {
+        self.urings.refresh_context();
         self.paths = Some(paths);
         self
     }
@@ -564,6 +568,7 @@ impl DirectSyscalls {
         self
     }
     pub fn with_local_identity(mut self, identity: [u32; 3]) -> Self {
+        self.urings.refresh_context();
         self.local_identity = Some(identity);
         if let Some(resources) = self.resources.take() {
             self.resources = Some(resources.with_local_identity(identity));
@@ -574,6 +579,7 @@ impl DirectSyscalls {
         self.files.published(fd)
     }
     pub fn with_files(mut self, files: trames_vfs::DirectFiles) -> Self {
+        self.urings.refresh_context();
         self.files = files;
         self
     }
@@ -637,14 +643,22 @@ impl DirectSyscalls {
         self
     }
     pub fn with_file_executor(mut self, disk: Arc<dyn FileExecutor>) -> Self {
+        self.urings.refresh_context();
         self.file_executor = Some(disk);
         self
     }
     pub fn with_file_layouts(mut self, layouts: Arc<crate::FileLayouts>) -> Self {
+        self.urings.refresh_context();
         self.file_layouts = Some(layouts);
         self
     }
-    pub fn with_urings(mut self, snapshot: UringSnapshot) -> Self {
+    pub fn with_urings(mut self, mut snapshot: UringSnapshot) -> Self {
+        if let Some(reader) = &self.signal_reader {
+            if let Some(descriptors) = snapshot.descriptors.take() {
+                snapshot.descriptors = Some(descriptors.with_signal_reader(Some(reader.clone())));
+            }
+            snapshot.refresh_context();
+        }
         if let Some(descriptors) = &snapshot.descriptors {
             self.descriptors = descriptors.clone();
         }
