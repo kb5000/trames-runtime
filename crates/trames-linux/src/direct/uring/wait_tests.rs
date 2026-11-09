@@ -11,13 +11,94 @@ use std::{
 struct Target(Arc<trames_vfs::HostEvents>);
 impl IoWake for Target {
     fn wake_io(&self, _: &Arc<IoSignal>) {}
-    fn host_events(&self) -> Option<Arc<trames_vfs::HostEvents>> {
-        Some(self.0.clone())
+    fn host_events(&self) -> std::io::Result<Option<Arc<trames_vfs::HostEvents>>> {
+        Ok(Some(self.0.clone()))
     }
 }
 fn target() -> (Arc<dyn IoWake>, Arc<trames_vfs::HostEvents>) {
     let hub = trames_vfs::HostEvents::new().unwrap();
     (Arc::new(Target(hub.clone())), hub)
+}
+#[test]
+fn failed_native_backend_keeps_accepted_request_until_source_completion_or_cancellation() {
+    struct Failed;
+    impl IoWake for Failed {
+        fn wake_io(&self, _: &Arc<IoSignal>) {}
+        fn host_events(&self) -> std::io::Result<Option<Arc<trames_vfs::HostEvents>>> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "original native backend failure",
+            ))
+        }
+    }
+    for cancel in [false, true] {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let (mut l, mut m, ring_fd, ring) = setup(8);
+        l.vfs
+            .configure_network(trames_vfs::NetworkMode::Loopback)
+            .unwrap();
+        let fd = l.vfs.socket(2, 1, 0).unwrap();
+        let socket = l.vfs.socket_fd(fd).unwrap();
+        assert!(matches!(
+            socket.connect(listener.local_addr().unwrap()),
+            Ok(()) | Err(trames_net::NetError(115))
+        ));
+        let (mut peer, _) = listener.accept().unwrap();
+        assert_eq!(socket.connect_complete(), Ok(true));
+        drop(socket);
+        let mut epoch = UringEpoch::default();
+        let d = DirectSyscalls::new(l.vfs.direct_descriptors()).with_urings(
+            epoch
+                .capture(&l.vfs, m.instruction_identity().0, 7)
+                .with_actor(l.uring_actor_root()),
+        );
+        let t: Arc<dyn IoWake> = Arc::new(Failed);
+        m.write(0x2200, &[0xa5]).unwrap();
+        add(&mut m, &ring, read(fd, 0x2200, 96));
+        assert!(matches!(
+            d.start(
+                426,
+                [ring_fd as u64, 1, 0, 0, 0, 0],
+                &mut m,
+                7,
+                &Arc::downgrade(&t),
+                None
+            ),
+            Some(IoAttempt::Complete(Ok(1)))
+        ));
+        let mut background = d.uring_background(7, &Arc::downgrade(&t)).unwrap();
+        let error = background.progress(&mut m).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error
+            .to_string()
+            .contains("original native backend failure"));
+        assert!(!l.uring_requires_owner());
+        assert_eq!(ring.state.lock().unwrap().pending.len(), 1);
+        assert_eq!(m.read_array::<1>(0x2200).unwrap(), [0xa5]);
+        if cancel {
+            d.cancel_task_uring(m.instruction_identity().0, 7);
+            assert!(background.progress(&mut m).unwrap());
+            assert_eq!(cq(&mut m, &ring), (96, -125));
+            assert_eq!(m.read_array::<1>(0x2200).unwrap(), [0xa5]);
+        } else {
+            let (ready_target, hub) = target();
+            let ready = IoSignal::new(0, Arc::downgrade(&ready_target));
+            let tcp = l.vfs.direct_network().get(fd).unwrap().tcp.clone();
+            let _subscription = hub
+                .subscribe(tcp_wait_fd(&tcp).unwrap(), false, &ready)
+                .unwrap();
+            peer.write_all(b"x").unwrap();
+            wait(&hub);
+            assert!(background.progress(&mut m).unwrap());
+            assert_eq!(cq(&mut m, &ring), (96, 1));
+            assert_eq!(m.read_array::<1>(0x2200).unwrap(), *b"x");
+        }
+        assert!(!background.active());
+        assert!(background.progress(&mut m).unwrap());
+        assert!(!l.uring_requires_owner());
+        assert!(ring.state.lock().unwrap().pending.is_empty());
+        assert_eq!(ring.state.lock().unwrap().tail, 1);
+    }
 }
 fn mark_unused(sources: &mut WaitSources) {
     for subscription in sources.hosts.values_mut() {
@@ -40,7 +121,7 @@ fn retained_host_interest_rearms_without_reopening_and_actors_remain_independent
     let mut a = WaitSources::default();
     let mut b = WaitSources::default();
     let opens = Cell::new(0);
-    a.host((1, false), 0, &first, &weak, || {
+    a.host((1, false), 0, &first, || {
         opens.set(opens.get() + 1);
         socket.as_fd().try_clone_to_owned().map(Into::into)
     })
@@ -48,11 +129,11 @@ fn retained_host_interest_rearms_without_reopening_and_actors_remain_independent
     // An unrelated wake must neither duplicate the host FD nor register again.
     for _ in 0..128 {
         mark_unused(&mut a);
-        a.host((1, false), 0, &first, &weak, || panic!("reopened host FD"))
+        a.host((1, false), 0, &first, || panic!("reopened host FD"))
             .unwrap();
     }
     assert_eq!(opens.get(), 1);
-    b.host((1, false), 0, &second, &weak, || {
+    b.host((1, false), 0, &second, || {
         socket.as_fd().try_clone_to_owned().map(Into::into)
     })
     .unwrap();
@@ -63,16 +144,14 @@ fn retained_host_interest_rearms_without_reopening_and_actors_remain_independent
     first.reset();
     second.reset();
     mark_unused(&mut a);
-    a.host((1, false), 0, &first, &weak, || {
-        panic!("rearm must reuse FD")
-    })
-    .unwrap();
+    a.host((1, false), 0, &first, || panic!("rearm must reuse FD"))
+        .unwrap();
     hub.wait(Some(Instant::now())).unwrap();
     assert!(!first.ready() && !second.ready());
     // Cancel the first actor. Only the independently rearmed second may wake.
     drop(a);
     mark_unused(&mut b);
-    b.host((1, false), 0, &second, &weak, || {
+    b.host((1, false), 0, &second, || {
         panic!("second actor reopened FD")
     })
     .unwrap();
@@ -81,7 +160,9 @@ fn retained_host_interest_rearms_without_reopening_and_actors_remain_independent
     assert!(!first.ready() && second.ready());
     assert_eq!(socket.read(&mut [0]).unwrap(), 0);
     // No pending interest means no wait-scoped FD lease remains.
-    assert!(b.refresh(&[], 0, 8, &second, &weak, &UringActor::default()));
+    assert!(b
+        .refresh(&[], 0, 8, &second, &UringActor::default())
+        .unwrap());
     assert!(!b.external());
     drop(socket);
     // Last-close EOF is immediate on this local socketpair. A nonblocking read
@@ -101,7 +182,7 @@ fn host_interest_distinguishes_direction_and_replacement_ofd() {
     let mut sources = WaitSources::default();
     for write in [false, true] {
         sources
-            .host((1, write), 0, &signal, &weak, || {
+            .host((1, write), 0, &signal, || {
                 a.as_fd().try_clone_to_owned().map(Into::into)
             })
             .unwrap();
@@ -109,10 +190,12 @@ fn host_interest_distinguishes_direction_and_replacement_ofd() {
     assert_eq!(sources.hosts.len(), 2);
     // A reused guest FD has a different retained OFD identity. It must acquire
     // a new lease; a stale event may never target the replacement description.
-    assert!(sources.refresh(&[], 0, 7, &signal, &weak, &UringActor::default()));
+    assert!(sources
+        .refresh(&[], 0, 7, &signal, &UringActor::default())
+        .unwrap());
     signal.reset();
     sources
-        .host((2, false), 0, &signal, &weak, || {
+        .host((2, false), 0, &signal, || {
             b.as_fd().try_clone_to_owned().map(Into::into)
         })
         .unwrap();
@@ -144,7 +227,7 @@ fn native_wait_retains_transport_and_releases_it_on_worker_cancellation() {
     let signal = IoSignal::new(7, weak.clone());
     let mut sources = WaitSources::default();
     sources
-        .host((1, false), 0, &signal, &weak, || tcp_wait_fd(&tcp))
+        .host((1, false), 0, &signal, || tcp_wait_fd(&tcp))
         .unwrap();
     drop(socket);
     vfs.close(fd).unwrap();
@@ -248,7 +331,9 @@ fn local_ring_retries_deduplicate_resources_and_drop_finished_interests() {
     let mut sources = WaitSources::default();
     for _ in 0..32 {
         signal.reset();
-        assert!(sources.refresh(&rings, s.owner, 7, &signal, &Arc::downgrade(&t), s.actor()));
+        assert!(sources
+            .refresh(&rings, s.owner, 7, &signal, s.actor())
+            .unwrap());
         assert_eq!(sources.local.len(), 2); // CQ plus one original pipe.
         assert!(!signal.ready());
     }
@@ -258,7 +343,9 @@ fn local_ring_retries_deduplicate_resources_and_drop_finished_interests() {
         s.start([fd as u64, 0, 2, 1, 0, 0], &mut m, 7, &Arc::downgrade(&t)),
         Some(IoAttempt::Complete(Ok(0)))
     ));
-    assert!(sources.refresh(&rings, s.owner, 7, &signal, &Arc::downgrade(&t), s.actor()));
+    assert!(sources
+        .refresh(&rings, s.owner, 7, &signal, s.actor())
+        .unwrap());
     assert_eq!(sources.local.len(), 1); // Only CQ after both reads complete.
     signal.reset();
     l.vfs.write(writer, b"z").unwrap();
@@ -321,7 +408,7 @@ fn subscription_lifetime_cost() {
         for _ in 0..N {
             mark_unused(&mut sources);
             sources
-                .host((1, false), 0, &signal, &weak, || {
+                .host((1, false), 0, &signal, || {
                     socket.as_fd().try_clone_to_owned().map(Into::into)
                 })
                 .unwrap();
@@ -390,7 +477,7 @@ fn ready_native_request_finishes_before_missing_event_capability_escalation() {
     peer.write_all(b"x").unwrap();
     wait(&hub);
     assert!(ready.ready());
-    assert!(background.progress(&mut m));
+    assert!(background.progress(&mut m).unwrap());
     assert!(!background.active());
     assert!(!l.uring_requires_owner());
     assert_eq!(cq(&mut m, &ring), (95, 1));

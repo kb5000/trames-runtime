@@ -453,12 +453,21 @@ impl DirectSyscalls {
             return self.complete_socket(call.finish(result));
         }
         let mut pending = self.socket_wait(call, pid, target);
-        if !self.arm_socket(&mut pending) {
-            return IoAttempt::SocketCheckpoint(pending.retained_socket.take().unwrap());
+        match self.arm_socket(&mut pending) {
+            Ok(true) => {}
+            Ok(false) => {
+                return IoAttempt::SocketCheckpoint(pending.retained_socket.take().unwrap())
+            }
+            Err(error) => {
+                return match self.retry_socket(pending, memory) {
+                    IoAttempt::Blocked(_) => IoAttempt::HostError(error),
+                    result => result,
+                }
+            }
         }
         self.retry_socket(pending, memory)
     }
-    fn arm_socket(&self, pending: &mut PendingIo) -> bool {
+    fn arm_socket(&self, pending: &mut PendingIo) -> std::io::Result<bool> {
         let call = pending.retained_socket.as_ref().unwrap();
         if let Control::Unix {
             socket, connection, ..
@@ -470,31 +479,27 @@ impl DirectSyscalls {
                 socket.subscribe(&pending.signal)
             };
             pending._subscriptions = vec![subscription];
-            return true;
+            return Ok(true);
         }
         let Control::Network(socket) = &call.socket else {
             unreachable!()
         };
         if let Some(subscription) = socket.subscribe(&pending.signal) {
             pending._subscriptions = vec![subscription];
-            return true;
+            return Ok(true);
         }
-        let Some(events) = pending.target.upgrade().and_then(|t| t.host_events()) else {
-            return false;
+        let Some(events) = pending.signal.host_events()? else {
+            return Ok(false);
         };
-        let Ok((fds, delay)) = socket.wait_sources() else {
-            return false;
-        };
+        let (fds, delay) = socket.wait_sources()?;
         let mut subscriptions = Vec::new();
         for fd in fds {
-            let Ok(subscription) = events.subscribe(fd, false, &pending.signal) else {
-                return false;
-            };
+            let subscription = events.subscribe(fd, false, &pending.signal)?;
             subscriptions.push(subscription);
         }
         pending.socket_subscriptions = subscriptions;
         pending.resource_deadline = delay.and_then(|d| Instant::now().checked_add(d));
-        true
+        Ok(true)
     }
     pub(super) fn resume_socket(
         &self,
@@ -502,8 +507,17 @@ impl DirectSyscalls {
         memory: &mut impl CpuMemory,
     ) -> IoAttempt {
         pending.signal.reset();
-        if !self.arm_socket(&mut pending) {
-            return IoAttempt::SocketCheckpoint(pending.retained_socket.take().unwrap());
+        match self.arm_socket(&mut pending) {
+            Ok(true) => {}
+            Ok(false) => {
+                return IoAttempt::SocketCheckpoint(pending.retained_socket.take().unwrap())
+            }
+            Err(error) => {
+                return match self.retry_socket(pending, memory) {
+                    IoAttempt::Blocked(_) => IoAttempt::HostError(error),
+                    result => result,
+                }
+            }
         }
         self.retry_socket(pending, memory)
     }
@@ -602,8 +616,8 @@ mod tests {
     struct Target(Arc<trames_vfs::HostEvents>);
     impl IoWake for Target {
         fn wake_io(&self, _: &Arc<IoSignal>) {}
-        fn host_events(&self) -> Option<Arc<trames_vfs::HostEvents>> {
-            Some(self.0.clone())
+        fn host_events(&self) -> std::io::Result<Option<Arc<trames_vfs::HostEvents>>> {
+            Ok(Some(self.0.clone()))
         }
     }
     fn target() -> (Arc<dyn IoWake>, Arc<trames_vfs::HostEvents>) {

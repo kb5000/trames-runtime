@@ -6,7 +6,6 @@ pub struct UringBackground {
     actor: Arc<UringActor>,
     owner: u64,
     task: u32,
-    target: Weak<dyn IoWake>,
     pub signal: Arc<IoSignal>,
     sources: wait::WaitSources,
     deadline: Option<Instant>,
@@ -26,9 +25,9 @@ impl UringBackground {
             || self.revision != self.actor.revision()
             || self.deadline.is_some_and(|d| d <= Instant::now())
     }
-    pub fn progress(&mut self, memory: &mut impl CpuMemory) -> bool {
+    pub fn progress(&mut self, memory: &mut impl CpuMemory) -> std::io::Result<bool> {
         if !self.needs_progress() {
-            return true;
+            return Ok(true);
         }
         self.signal.reset();
         self.armed = true;
@@ -39,17 +38,24 @@ impl UringBackground {
             .iter()
             .filter_map(|ring| ring.request_deadline(self.owner, self.task))
             .min();
-        if !self.sources.prepare(
+        let prepared = self.sources.prepare(
             &rings,
             self.owner,
             self.task,
             &self.signal,
-            &self.target,
             &self.actor,
             memory,
-        ) {
-            self.actor.require_owner();
-            return false;
+        );
+        match prepared {
+            Ok(true) => {}
+            Ok(false) => {
+                self.actor.require_owner();
+                return Ok(false);
+            }
+            Err(error) => {
+                self.armed = false;
+                return Err(error);
+            }
         }
         let mut active = false;
         self.deadline = [before, self.sources.next_deadline()]
@@ -59,7 +65,7 @@ impl UringBackground {
         for ring in &rings {
             if !ring.poll_pump(self.owner, self.task, memory, &self.actor) {
                 self.actor.require_owner();
-                return false;
+                return Ok(false);
             }
             active |= ring
                 .state
@@ -74,7 +80,7 @@ impl UringBackground {
                 .min();
         }
         self.actor.reset_active(active);
-        true
+        Ok(true)
     }
     pub fn active(&self) -> bool {
         self.actor.active()
@@ -118,7 +124,6 @@ impl DirectSyscalls {
             actor: actor.clone(),
             owner: self.urings.owner,
             task: pid,
-            target: target.clone(),
             signal: IoSignal::new(pid, target.clone()),
             sources: Default::default(),
             deadline: None,

@@ -745,10 +745,18 @@ impl<C: Cpu> Starter<C> {
                             if let Some(epoch) = &epoch {
                                 if job.uring.is_none() { job.uring = work.syscalls.as_ref().and_then(|snapshot| snapshot.direct.uring_background(work.pid, &epoch.io_target)); }
                                 if let Some(ring) = &mut job.uring {
-                                    if !ring.progress(work.memory.as_deref_mut().expect("source task View")) {
-                                        maintenance = true;
-                                        work.control.stop();
-                                        break SliceOutcome::Yield { instructions: 0 };
+                                    match ring.progress(work.memory.as_deref_mut().expect("source task View")) {
+                                        Ok(true) => {},
+                                        Ok(false) => {
+                                            maintenance = true;
+                                            work.control.stop();
+                                            break SliceOutcome::Yield { instructions: 0 };
+                                        }
+                                        Err(error) => {
+                                            epoch.fail_host_io(error);
+                                            maintenance = true;
+                                            break SliceOutcome::Yield { instructions: 0 };
+                                        }
                                     }
                                     if !ring.active() { job.uring = None; }
                                 }
@@ -826,6 +834,7 @@ impl<C: Cpu> Starter<C> {
                                 };
                                 if let Some(began) = began { syscall_time += began.elapsed(); }
                                 match result {
+                                    trames_linux::IoAttempt::HostError(error) => { epoch.as_ref().expect("native I/O execution epoch").fail_host_io(error); maintenance=true; break SliceOutcome::Yield {instructions:0}; },
                                     trames_linux::IoAttempt::Complete(result) => {
                                         if saved_call.as_ref().is_some_and(|c|trames_linux::event_wait(c.number)) { snapshot.finish_wait_mask(); }
                                         work.trace.finish(&mut work.cpu, result.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
@@ -1104,6 +1113,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                                 .expect("retained I/O");
                                             if let Some(began) = began { syscall_time += began.elapsed(); }
                                             match attempt {
+                                                trames_linux::IoAttempt::HostError(error) => { epoch.fail_host_io(error); maintenance=true; break SliceOutcome::Yield {instructions:0}; },
                                                 trames_linux::IoAttempt::Complete(result) => {
                                                     if trames_linux::event_wait(number) { snapshot.finish_wait_mask(); }
                                                     work.trace.finish(&mut work.cpu, result.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
@@ -1145,6 +1155,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                                             work.memory.as_deref_mut().expect("worker view"), work.pid, &epoch.io_target) {
                                             if let Some(began) = began { syscall_time += began.elapsed(); }
                                             match attempt {
+                                                trames_linux::IoAttempt::HostError(error) => { epoch.fail_host_io(error); maintenance=true; break SliceOutcome::Yield {instructions:0}; },
                                                 trames_linux::IoAttempt::Complete(value) => {
                                                     work.trace.finish(&mut work.cpu, value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
                                                     syscalls += 1; continue;
@@ -1170,6 +1181,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                                             if let Some(attempt)=snapshot.direct.start_socket_control(number,args,work.memory.as_deref_mut().expect("worker view"),work.pid,&epoch.io_target) {
                                                 if let Some(began)=began {syscall_time+=began.elapsed();}
                                                 match attempt {
+                                                    trames_linux::IoAttempt::HostError(error) => { epoch.fail_host_io(error); maintenance=true; break SliceOutcome::Yield {instructions:0}; },
                                                     trames_linux::IoAttempt::Complete(value)=>{work.trace.finish(&mut work.cpu, value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));syscalls+=1;continue;}
                                                     trames_linux::IoAttempt::Blocked(pending)=>{
  if let Some(wait)=&pending.retained_poll {snapshot.begin_wait_mask(wait);}parked_io=Some(pending);break SliceOutcome::Yield {instructions:0};}
@@ -1205,6 +1217,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket)=>{for (i,value) in socket.args
                                                 if let Some(attempt) = snapshot.direct.start(number, args, work.memory.as_deref_mut().expect("worker view"), work.pid, &epoch.io_target, None) {
                                                     if let Some(began) = began { syscall_time += began.elapsed(); }
                                                     match attempt {
+                                                        trames_linux::IoAttempt::HostError(error) => { epoch.fail_host_io(error); maintenance=true; break SliceOutcome::Yield {instructions:0}; },
                                                         trames_linux::IoAttempt::Complete(value) => { work.trace.finish(&mut work.cpu, value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64))); syscalls+=1; continue; }
                                                         trames_linux::IoAttempt::Blocked(pending) => {
  if let Some(wait)=&pending.retained_poll {snapshot.begin_wait_mask(wait);} parked_io=Some(pending); break SliceOutcome::Yield { instructions:0 }; }
@@ -1405,6 +1418,7 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                             if let Some(attempt)=snapshot.direct.start(number,args,work.memory.as_deref_mut().expect("wait View"),work.pid,&epoch.io_target,None) {
                                                 if let Some(began)=began{syscall_time+=began.elapsed();}
                                                 match attempt {
+                                                    trames_linux::IoAttempt::HostError(error) => { epoch.fail_host_io(error); maintenance=true; break SliceOutcome::Yield {instructions:0}; },
                                                     trames_linux::IoAttempt::Complete(value)=>{snapshot.finish_wait_mask();work.trace.finish(&mut work.cpu, value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));syscalls+=1;continue;}
                                                     trames_linux::IoAttempt::Blocked(pending)=>{
                                                         if let Some(wait)=&pending.retained_poll {snapshot.begin_wait_mask(wait);}
@@ -1448,6 +1462,7 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                         if let Some(attempt)=snapshot.direct.start_socket_control(number,args,work.memory.as_deref_mut().expect("worker view"),work.pid,&epoch.io_target) {
                                             if let Some(began)=began {syscall_time+=began.elapsed();}
                                             match attempt {
+                                                trames_linux::IoAttempt::HostError(error) => { epoch.fail_host_io(error); maintenance=true; break SliceOutcome::Yield {instructions:0}; },
                                                 trames_linux::IoAttempt::Complete(value)=>{work.trace.finish(&mut work.cpu, value.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64)));syscalls+=1;continue;}
                                                 trames_linux::IoAttempt::Blocked(pending)=>{
  if let Some(wait)=&pending.retained_poll {snapshot.begin_wait_mask(wait);}parked_io=Some(pending);break SliceOutcome::Yield {instructions:0};}
@@ -1483,6 +1498,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket)=>{for (i,value) in socket.args
                                                 .expect("retained I/O");
                                             if let Some(began) = began { syscall_time += began.elapsed(); }
                                             match attempt {
+                                                trames_linux::IoAttempt::HostError(error) => { epoch.fail_host_io(error); maintenance=true; break SliceOutcome::Yield {instructions:0}; },
                                                 trames_linux::IoAttempt::Complete(result) => {
                                                     work.trace.finish(&mut work.cpu, result.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
                                                     syscalls += 1;
@@ -1523,6 +1539,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                                             work.memory.as_deref_mut().expect("worker view"), work.pid, &epoch.io_target) {
                                             if let Some(began) = began { syscall_time += began.elapsed(); }
                                             match attempt {
+                                                trames_linux::IoAttempt::HostError(error) => { epoch.fail_host_io(error); maintenance=true; break SliceOutcome::Yield {instructions:0}; },
                                                 trames_linux::IoAttempt::Complete(value) => {
                                                     work.trace.finish(&mut work.cpu, value.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
                                                     syscalls += 1; continue;
@@ -1718,7 +1735,11 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                     if let Some(epoch) = epoch.as_ref().filter(|_|thread_exit.is_none()) {
                         if job.uring.is_none() { job.uring = work.syscalls.as_ref().and_then(|snapshot| snapshot.direct.uring_background(work.pid, &epoch.io_target)); }
                         if let Some(ring) = &mut job.uring {
-                            if !ring.progress(work.memory.as_deref_mut().expect("source task View")) { work.control.stop(); }
+                            match ring.progress(work.memory.as_deref_mut().expect("source task View")) {
+                                Ok(true) => {},
+                                Ok(false) => work.control.stop(),
+                                Err(error) => epoch.fail_host_io(error),
+                            }
                             if !ring.active() { job.uring = None; }
                         }
                     }

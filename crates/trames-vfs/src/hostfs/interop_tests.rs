@@ -115,8 +115,8 @@ fn native_watch_rearms_on_worker_poller_and_mask_updates_release_interests() {
     struct Wake(Arc<HostEvents>);
     impl IoWake for Wake {
         fn wake_io(&self, _: &Arc<IoSignal>) {}
-        fn host_events(&self) -> Option<Arc<HostEvents>> {
-            Some(self.0.clone())
+        fn host_events(&self) -> std::io::Result<Option<Arc<HostEvents>>> {
+            Ok(Some(self.0.clone()))
         }
     }
     let f = Fixture::new();
@@ -159,8 +159,8 @@ fn first_native_watch_updates_already_subscribed_reads_and_epoll() {
     struct Wake(Arc<HostEvents>);
     impl IoWake for Wake {
         fn wake_io(&self, _: &Arc<IoSignal>) {}
-        fn host_events(&self) -> Option<Arc<HostEvents>> {
-            Some(self.0.clone())
+        fn host_events(&self) -> std::io::Result<Option<Arc<HostEvents>>> {
+            Ok(Some(self.0.clone()))
         }
     }
     for epoll in [false, true] {

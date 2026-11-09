@@ -7,7 +7,6 @@ pub(crate) struct PollWait {
     actor: Arc<UringActor>,
     owner: u64,
     task: u32,
-    target: Weak<dyn IoWake>,
     sources: wait::WaitSources,
     pub(crate) deadline: Option<Instant>,
 }
@@ -72,7 +71,6 @@ impl UringSnapshot {
     pub(crate) fn poll_wait(
         &self,
         resources: Vec<Arc<dyn trames_vfs::DirectPoll>>,
-        target: Weak<dyn IoWake>,
     ) -> Option<PollWait> {
         if resources.is_empty() {
             return None;
@@ -87,7 +85,6 @@ impl UringSnapshot {
             rings: rings.into_values().collect(),
             owner: self.owner,
             task: self.task,
-            target,
             sources: wait::WaitSources::default(),
             deadline: None,
         })
@@ -97,7 +94,11 @@ impl PollWait {
     pub(crate) fn external(&self) -> bool {
         self.sources.external() || self.actor.pending_disk()
     }
-    pub(crate) fn refresh(&mut self, signal: &Arc<IoSignal>, memory: &mut impl CpuMemory) -> bool {
+    pub(crate) fn refresh(
+        &mut self,
+        signal: &Arc<IoSignal>,
+        memory: &mut impl CpuMemory,
+    ) -> std::io::Result<bool> {
         self.deadline = None;
         // Retain a deadline that becomes due during the original body pump.
         let before = self
@@ -110,11 +111,10 @@ impl PollWait {
             self.owner,
             self.task,
             signal,
-            &self.target,
             &self.actor,
             memory,
-        ) {
-            return false;
+        )? {
+            return Ok(false);
         }
         self.deadline = [before, self.sources.next_deadline()]
             .into_iter()
@@ -122,13 +122,13 @@ impl PollWait {
             .min();
         for ring in &self.rings {
             if !ring.poll_pump(self.owner, self.task, memory, &self.actor) {
-                return false;
+                return Ok(false);
             }
             self.deadline = [self.deadline, ring.request_deadline(self.owner, self.task)]
                 .into_iter()
                 .flatten()
                 .min();
         }
-        true
+        Ok(true)
     }
 }

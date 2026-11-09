@@ -797,7 +797,8 @@ pub(super) struct Epoch<C: Cpu> {
     queues: Mutex<Queues<C>>,
     changed: Condvar,
     slot_changed: [Condvar; 32],
-    host_events: OnceLock<Option<Arc<trames_vfs::HostEvents>>>,
+    host_events: OnceLock<Result<Arc<trames_vfs::HostEvents>, Arc<std::io::Error>>>,
+    host_error: OnceLock<Arc<std::io::Error>>,
     pub io_target: Weak<dyn trames_vfs::IoWake>,
     me: Weak<Self>,
     timers: OnceLock<Arc<trames_kernel::timers::Timers>>,
@@ -856,6 +857,7 @@ impl<C: Cpu> Epoch<C> {
             changed: Condvar::new(),
             slot_changed: std::array::from_fn(|_| Condvar::new()),
             host_events: OnceLock::new(),
+            host_error: OnceLock::new(),
             io_target: me.clone(),
             me: me.clone(),
             timers: OnceLock::new(),
@@ -918,9 +920,15 @@ impl<C: Cpu> Epoch<C> {
         &self,
         kernel: &mut crate::process::Kernel<C>,
     ) -> Option<crate::RuntimeError> {
-        self.lifecycle
+        let lifecycle = self
+            .lifecycle
             .get()
-            .and_then(|lifecycle| lifecycle.collect(kernel))
+            .and_then(|lifecycle| lifecycle.collect(kernel));
+        self.host_error
+            .get()
+            .cloned()
+            .map(crate::RuntimeError::HostIo)
+            .or(lifecycle)
     }
     pub fn bind_starter(&self, starter: crate::workers::Starter<C>) {
         self.starter.get_or_init(|| starter);
@@ -1006,7 +1014,7 @@ impl<C: Cpu> Epoch<C> {
         }
         // This condition is for test/owner observers, never production workers.
         self.changed.notify_all();
-        if let Some(Some(events)) = self.host_events.get() {
+        if let Some(Ok(events)) = self.host_events.get() {
             events.wake();
         }
     }
@@ -1197,6 +1205,16 @@ impl<C: Cpu> Epoch<C> {
         let mut q = self.queues.lock().unwrap();
         self.control.stop();
         self.notify(&mut q);
+    }
+    /// Terminal host failure. Keep the first cause and drain original actors;
+    /// never reinterpret it as a missing guest operation or owner retry.
+    pub fn fail_host_io(&self, error: std::io::Error) {
+        let _ = self.host_error.set(Arc::new(error));
+        self.stop();
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
+    pub(crate) fn reject_host_events(&self, error: std::io::Error) {
+        assert!(self.host_events.set(Err(Arc::new(error))).is_ok());
     }
     pub fn assign(&self, chosen: &[(u32, usize)]) {
         let mut q = self.queues.lock().unwrap();
@@ -1609,14 +1627,15 @@ impl<C: Cpu> Epoch<C> {
                 // A parked eventfd can acquire its first native producer on
                 // another worker. Its resource metadata wakes us; initialize
                 // the existing host wait hub here before arming it.
-                let Some(events) = self
-                    .host_events
-                    .get_or_init(|| trames_vfs::HostEvents::new().ok())
-                    .as_ref()
-                else {
-                    self.control.stop();
-                    self.notify(&mut q);
-                    continue;
+                let events = match trames_vfs::IoWake::host_events(self) {
+                    Ok(Some(events)) => events,
+                    Ok(None) => unreachable!("original epoch provides native events"),
+                    Err(error) => {
+                        let _ = self.host_error.set(Arc::new(error));
+                        self.control.stop();
+                        self.notify(&mut q);
+                        continue;
+                    }
                 };
                 q.host_waiting = true;
                 #[cfg(all(test, trames_interpreter_conformance))]
@@ -1636,7 +1655,8 @@ impl<C: Cpu> Epoch<C> {
                 events.disarm();
                 q.host_waiting = false;
                 dispatched = true;
-                if result.is_err() {
+                if let Err(error) = result {
+                    let _ = self.host_error.set(Arc::new(error));
                     self.control.stop();
                 }
                 self.notify(&mut q);
@@ -2036,10 +2056,17 @@ impl<C: Cpu> trames_kernel::timers::TimerWake for Epoch<C> {
 }
 
 impl<C: Cpu> trames_vfs::IoWake for Epoch<C> {
-    fn host_events(&self) -> Option<Arc<trames_vfs::HostEvents>> {
-        self.host_events
-            .get_or_init(|| trames_vfs::HostEvents::new().ok())
-            .clone()
+    fn host_events(&self) -> std::io::Result<Option<Arc<trames_vfs::HostEvents>>> {
+        match self
+            .host_events
+            .get_or_init(|| trames_vfs::HostEvents::new().map_err(Arc::new))
+        {
+            Ok(events) => Ok(Some(events.clone())),
+            Err(error) => Err(error.raw_os_error().map_or_else(
+                || std::io::Error::new(error.kind(), error.clone()),
+                std::io::Error::from_raw_os_error,
+            )),
+        }
     }
     fn wake_io(&self, signal: &Arc<trames_vfs::IoSignal>) {
         let mut q = self.queues.lock().unwrap();
@@ -2479,6 +2506,55 @@ mod tests {
         let peer = listener.accept().unwrap().0;
         assert_eq!(socket.connect_complete(), Ok(true));
         (v, fd, peer)
+    }
+    #[test]
+    fn late_native_source_backend_failure_stops_the_idle_executor_without_owner_retry() {
+        let mut v = trames_vfs::Vfs::default();
+        let fd = v.eventfd(0, 0).unwrap();
+        let direct = trames_linux::DirectSyscalls::new(v.direct_descriptors());
+        let epoch = Epoch::new(Arc::new(Control::new(1000)));
+        epoch.reject_host_events(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "original idle backend failure",
+        ));
+        epoch.add(job(1, &epoch));
+        let mut running = epoch.take(0).unwrap();
+        let Some(trames_linux::IoAttempt::Blocked(wait)) = direct.start(
+            63,
+            [fd as u64, 0x1000, 8, 0, 0, 0],
+            running.work.memory.as_deref_mut().unwrap(),
+            1,
+            &epoch.io_target,
+            None,
+        ) else {
+            panic!("an ordinary eventfd requires no native backend");
+        };
+        epoch.park_io(running, wait);
+        let native = v.native_events().event(fd).unwrap();
+        // Publication may first wake the original task to recheck its level.
+        // No bytes were produced. Its next real native idle wait must retain
+        // the backend error rather than returning a guest/owner checkpoint.
+        for _ in 0..2 {
+            let Some(mut running) = epoch.take(0) else {
+                break;
+            };
+            let wait = running.io.take().unwrap();
+            let trames_linux::IoAttempt::Blocked(wait) =
+                direct.resume(wait, running.work.memory.as_deref_mut().unwrap())
+            else {
+                panic!("no eventfd bytes were produced");
+            };
+            epoch.park_io(running, wait);
+        }
+        assert!(epoch.control.stopped());
+        let error = epoch.host_error.get().unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("original idle backend failure"));
+        let done = epoch.drain();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].syscalls, 0);
+        assert_eq!(done[0].serviced_syscalls, 0);
+        drop(native);
     }
     fn tcp_wait(epoch: &Arc<Epoch>, direct: &trames_linux::DirectSyscalls, fd: u32, pid: u32) {
         epoch.add(job(pid, epoch));

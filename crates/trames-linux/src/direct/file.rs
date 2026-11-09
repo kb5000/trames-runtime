@@ -755,16 +755,19 @@ impl DirectSyscalls {
         signal.reset();
         let wait = match work.wait_sources(&signal) {
             Ok(wait) => wait,
-            Err(_) => return self.complete(number, args, Err(Errno(5))),
+            Err(error) => return IoAttempt::HostError(error),
         };
         let mut subscriptions = vec![pending.result.subscribe(&signal)];
         subscriptions.extend(wait.subscriptions);
         let mut native = Vec::new();
-        if let Some(events) = target.upgrade().and_then(|t| t.host_events()) {
+        if let Some(events) = match signal.host_events() {
+            Ok(events) => events,
+            Err(error) => return IoAttempt::HostError(error),
+        } {
             for (fd, write) in wait.native {
                 match events.subscribe(fd, write, &signal) {
                     Ok(s) => native.push(s),
-                    Err(_) => return self.complete(number, args, Err(Errno(5))),
+                    Err(error) => return IoAttempt::HostError(error),
                 }
             }
         }

@@ -2760,6 +2760,11 @@ impl<C: Cpu> Kernel<C> {
             other => other,
         };
         let result = match byte {
+            Some(trames_linux::IoAttempt::HostError(error)) => {
+                self.backend_error
+                    .get_or_insert_with(|| format!("host event backend: {error}"));
+                Ok(None)
+            }
             Some(trames_linux::IoAttempt::Complete(result)) => result.map(Some),
             Some(trames_linux::IoAttempt::Blocked(wait)) => {
                 if wait.retained_socket.is_some() {
@@ -3031,6 +3036,11 @@ impl<C: Cpu> Kernel<C> {
                     .expect("original PTY operation")
             };
             return match attempt {
+                trames_linux::IoAttempt::HostError(error) => {
+                    self.backend_error
+                        .get_or_insert_with(|| format!("host event backend: {error}"));
+                    Ok(None)
+                }
                 trames_linux::IoAttempt::Complete(result) => result.map(Some),
                 trames_linux::IoAttempt::Blocked(wait) => {
                     p.byte_wait = Some(wait);
@@ -3790,6 +3800,13 @@ impl<C: Cpu> Kernel<C> {
         self.gpu_peak_pending = self.gpu_peak_pending.max(epoch.gpu_peak_pending());
         file_epoch.finish();
         if let Some(error) = checkpoint_error {
+            if matches!(error, RuntimeError::HostIo(_)) {
+                // Host event failure is terminal for this run. Every actual
+                // CPU has returned and its View has drained; cancel accepted
+                // requests against their original task/mm before returning the
+                // host error. No guest operation is replayed by this cleanup.
+                self.cancel_host_io_requests();
+            }
             return Err(error);
         }
         if completed.iter().any(|r| r.outcome.is_none()) {
@@ -3876,6 +3893,13 @@ impl<C: Cpu> Kernel<C> {
         self.processes
             .retain(|&pid, p| pid == 1 || !p.auto_reap || self.exits.waiting(pid));
         Ok(true)
+    }
+    fn cancel_host_io_requests(&self) {
+        for (id, task) in self.processes.iter() {
+            if let Some(actor) = task.linux.uring_actor_root().get() {
+                actor.cancel_task(task.memory.instruction_identity().0, id);
+            }
+        }
     }
     fn log_worker_diagnostics(p: &Process<C>, done: &crate::workers::Done<C>) {
         if let Some(fault) = &done.fatal_fault {
@@ -9525,3 +9549,7 @@ mod memory_query_tests;
 #[cfg(all(test, trames_interpreter_conformance))]
 #[path = "process_mqueue_tests.rs"]
 mod mqueue_tests;
+
+#[cfg(all(test, trames_interpreter_conformance))]
+#[path = "process_host_io_tests.rs"]
+mod host_io_tests;

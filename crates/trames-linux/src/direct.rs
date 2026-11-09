@@ -162,6 +162,9 @@ impl PendingIo {
 // existing boxed task/job; boxing this variant would add a separate wait allocation.
 #[allow(clippy::large_enum_variant)]
 pub enum IoAttempt {
+    /// Native event infrastructure failed; this is neither a guest errno nor
+    /// a request to replay the syscall on an owner.
+    HostError(std::io::Error),
     WaitCheckpoint(Arc<crate::RetainedWait>),
     Complete(Result<u64, Errno>),
     Blocked(PendingIo),
@@ -953,20 +956,17 @@ impl DirectSyscalls {
                 .and_then(|d| Instant::now().checked_add(d))
         });
         let signal = IoSignal::new(pid, target.clone());
-        let subscription = (|| {
-            target
-                .upgrade()?
-                .host_events()?
-                .subscribe(
-                    tcp_wait_fd(&fd.tcp).ok()?,
-                    matches!(number, 64 | 66),
-                    &signal,
-                )
-                .ok()
-        })();
-        let Some(subscription) = subscription else {
-            return IoAttempt::Checkpoint;
-        };
+        let subscription =
+            match signal.subscribe_host(|| tcp_wait_fd(&fd.tcp), matches!(number, 64 | 66)) {
+                Ok(Some(subscription)) => subscription,
+                Ok(None) => return IoAttempt::Checkpoint,
+                Err(error) => {
+                    return match self.transfer_tcp(&fd, number, args, memory) {
+                        Err(Errno(11)) => IoAttempt::HostError(error),
+                        result => self.complete_tcp(self.pipe_signal(number, args, result)),
+                    }
+                }
+            };
         self.resume(
             PendingIo {
                 aio: None,
@@ -1386,19 +1386,17 @@ impl DirectSyscalls {
             .get(args[0] as u32)
             .filter(|_| matches!(number, 63..=66))
         {
-            let subscription = (|| {
-                let events = target.upgrade()?.host_events()?;
-                events
-                    .subscribe(
-                        tcp_wait_fd(&fd.tcp).ok()?,
-                        matches!(number, 64 | 66),
-                        &signal,
-                    )
-                    .ok()
-            })();
-            let Some(subscription) = subscription else {
-                return Some(IoAttempt::Checkpoint);
-            };
+            let subscription =
+                match signal.subscribe_host(|| tcp_wait_fd(&fd.tcp), matches!(number, 64 | 66)) {
+                    Ok(Some(subscription)) => subscription,
+                    Ok(None) => return Some(IoAttempt::Checkpoint),
+                    Err(error) => {
+                        return Some(match self.transfer_tcp(&fd, number, args, memory) {
+                            Err(Errno(11)) => IoAttempt::HostError(error),
+                            result => self.complete_tcp(self.pipe_signal(number, args, result)),
+                        })
+                    }
+                };
             host_subscription = Some(subscription);
             Vec::new()
         } else {
@@ -1798,12 +1796,11 @@ impl DirectSyscalls {
                 pending.epoll_revision = revision;
             }
         }
-        if pending
-            ._subscriptions
-            .iter()
-            .any(|s| s.rearm_host().is_err())
-        {
-            return IoAttempt::Checkpoint;
+        let mut host_error = None;
+        for subscription in &pending._subscriptions {
+            if let Err(error) = subscription.rearm_host() {
+                host_error.get_or_insert(error);
+            }
         }
 
         if let Some(request) = &pending.flock {
@@ -1823,28 +1820,26 @@ impl DirectSyscalls {
             } else {
                 Vec::new()
             };
-            pending.poll_uring = self
-                .urings
-                .poll_wait(ids, pending.target.clone())
-                .map(Box::new);
+            pending.poll_uring = self.urings.poll_wait(ids).map(Box::new);
         }
         if let Some(wait) = &mut pending.poll_uring {
-            if !wait.refresh(&pending.signal, memory) {
-                return pending
-                    .retained_poll
-                    .clone()
-                    .map_or(IoAttempt::Checkpoint, IoAttempt::WaitCheckpoint);
+            match wait.refresh(&pending.signal, memory) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return pending
+                        .retained_poll
+                        .clone()
+                        .map_or(IoAttempt::Checkpoint, IoAttempt::WaitCheckpoint)
+                }
+                Err(error) => {
+                    host_error.get_or_insert(error);
+                }
             }
         }
-        if pending
-            .host_subscription
-            .as_ref()
-            .is_some_and(|s| s.rearm().is_err())
-        {
-            return pending
-                .retained_poll
-                .clone()
-                .map_or(IoAttempt::Checkpoint, IoAttempt::WaitCheckpoint);
+        if let Some(subscription) = &pending.host_subscription {
+            if let Err(error) = subscription.rearm() {
+                host_error.get_or_insert(error);
+            }
         }
         // Preserve the original resource deadline before the final level check.
         // A lazy source can become due between that check and parking, then
@@ -1916,6 +1911,9 @@ impl DirectSyscalls {
                             && pending.deadline.is_some_and(|d| Instant::now() >= d))
                 {
                     return self.complete_pending(&pending, Err(Errno(11)), memory);
+                }
+                if let Some(error) = host_error {
+                    return IoAttempt::HostError(error);
                 }
                 pending.resource_deadline = [
                     resource_deadline,
@@ -3362,8 +3360,8 @@ mod tests {
     struct TcpTarget(Arc<trames_vfs::HostEvents>);
     impl IoWake for TcpTarget {
         fn wake_io(&self, _: &Arc<IoSignal>) {}
-        fn host_events(&self) -> Option<Arc<trames_vfs::HostEvents>> {
-            Some(self.0.clone())
+        fn host_events(&self) -> std::io::Result<Option<Arc<trames_vfs::HostEvents>>> {
+            Ok(Some(self.0.clone()))
         }
     }
     #[test]

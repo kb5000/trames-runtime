@@ -962,8 +962,8 @@ mod tests {
         fn wake_io(&self, _: &Arc<IoSignal>) {
             self.wakes.fetch_add(1, Ordering::Relaxed);
         }
-        fn host_events(&self) -> Option<Arc<HostEvents>> {
-            Some(self.events.clone())
+        fn host_events(&self) -> std::io::Result<Option<Arc<HostEvents>>> {
+            Ok(Some(self.events.clone()))
         }
     }
     fn test_bridge(vfs: &mut Vfs, services: &Arc<Services>) -> (u32, Arc<Bridge>, NativeSocket) {

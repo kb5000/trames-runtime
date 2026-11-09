@@ -1126,7 +1126,6 @@ impl UringSnapshot {
                     owner: self.owner,
                     task: pid,
                     sources: wait::WaitSources::default(),
-                    target: target.clone(),
                 })),
             },
             memory,
@@ -1137,16 +1136,17 @@ impl UringSnapshot {
         pending.signal.reset();
         let wait = pending.uring.as_mut().unwrap();
         let before = wait.ring.request_deadline(wait.owner, wait.task);
-        if !wait.sources.prepare(
+        match wait.sources.prepare(
             std::slice::from_ref(&wait.ring),
             wait.owner,
             wait.task,
             &pending.signal,
-            &wait.target,
             &wait.actor,
             memory,
         ) {
-            return IoAttempt::Checkpoint;
+            Ok(true) => {}
+            Ok(false) => return IoAttempt::Checkpoint,
+            Err(error) => return IoAttempt::HostError(error),
         }
         let deferred = self.progress(&wait.ring, memory, wait.task);
         let mut state = wait.ring.state.lock().unwrap();
@@ -1264,7 +1264,6 @@ pub(super) struct Wait {
     owner: u64,
     task: u32,
     sources: wait::WaitSources,
-    target: Weak<dyn IoWake>,
 }
 impl Wait {
     pub fn external(&self) -> bool {

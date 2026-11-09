@@ -1,11 +1,22 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 82, original mounted-filesystem resolution, reviewed on 2026-11-09. The prior shared runtime
-baseline is `f5e613b0de1847d06a26ec15e77372c4ccf54a16`.
+This is the consolidated implementation audit through stage 83, native host-event failure closure, reviewed on 2026-11-09. The prior shared runtime
+baseline is `bee1f006ca0ee30941834f96a968ecca7937b1e1`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-09
+
+Stage 83 separates genuine absent native-event capabilities from original host
+backend errors across readiness, TCP/socket/file waits, io_uring enter/CQ poll
+and source background maintenance. Creation, descriptor, attach, subscription,
+rearm and idle-wait failures retain their host cause. They no longer request an
+owner replay or fabricate a guest EIO. The existing source executor stops/drains
+its actual CPU actors and cancels accepted requests before returning HostIo.
+One original-resource retry still lets a ready/cancelled stale interest finish
+without needing a native subscription. Legacy missing capabilities and deferred
+request bodies remain explicit; io_uring still has two genuine require_owner
+sites for those cases. The overall goal is active.
 
 Stage 82 deletes filesystem-kind-based source deferral. All implemented mount
 kinds already retain original synchronized topology, filesystem and inode objects;
@@ -411,8 +422,8 @@ prove that the final generic fallback is unreachable.
 
 | Remaining category | Actual trigger | Current scope / authoritative implementation |
 | --- | --- | --- |
-| Host cancellation and final teardown | Host cancel, deadline, shutdown, legacy stopped-hook requests, final CPU/backend drain | Pause/resume, original init notifications/signals, pressure reclaim, host filesystem commands and terminal/process admission no longer join. Actual terminal teardown and backend failure still stop their actors. See [host control](../../crates/trames-session/src/process_vm.rs), [completion](../../crates/trames-session/src/process_exit.rs) and [workers](../../crates/trames-session/src/workers.rs). |
-| Missing capabilities and excluded resources | A genuinely absent source provider, an excluded original FD/node graph, unavailable native event subscription or unsupported source request body | There is no filesystem-kind exclusion after stage 82. Existing node/provider admission still applies. io_uring has exactly two `require_owner()` maintenance call sites: failed wait-source preparation and deferred original body progress. They remain connected to actual accepted request lifetime, subscriptions and cancellation. See [path authority](../../crates/trames-vfs/src/path_queries.rs), [maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [wait sources](../../crates/trames-linux/src/direct/uring/wait.rs) and [actor](../../crates/trames-linux/src/direct/uring/actor.rs). |
+| Host cancellation and final teardown | Host cancel, deadline, shutdown, legacy stopped-hook requests, final CPU/backend drain and actual native-event backend failure | Pause/resume, original init notifications/signals, pressure reclaim, host filesystem commands and terminal/process admission no longer join. Actual terminal teardown and backend failure still stop their actors. Native-event failure returns its original HostIo cause after drain/cancellation, without an owner syscall retry. See [host control](../../crates/trames-session/src/process_vm.rs), [completion](../../crates/trames-session/src/process_exit.rs) and [workers](../../crates/trames-session/src/workers.rs). |
+| Missing capabilities and excluded resources | A genuinely absent source provider, an excluded original FD/node graph, a genuinely absent native event capability or unsupported source request body | There is no filesystem-kind exclusion after stage 82. Existing node/provider admission still applies. io_uring has exactly two `require_owner()` maintenance call sites: missing-capability wait-source preparation and deferred original body progress; actual host backend errors take terminal source error handling. They remain connected to actual accepted request lifetime, subscriptions and cancellation. See [path authority](../../crates/trames-vfs/src/path_queries.rs), [maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [wait sources](../../crates/trames-linux/src/direct/uring/wait.rs) and [actor](../../crates/trames-linux/src/direct/uring/actor.rs). |
 | Final execution dispatch fallback | A returned SVC/HLT/fault not completed, parked or accepted by a source scope | The catch-all stops the current cohort for joined dispatch. It remains an audit target even though admitted native calls, ordinary guest faults, generated ENOSYS and migrated syscalls have source completion. A backend error is not a software or full-Linux-VM fallback. See [worker dispatch](../../crates/trames-session/src/workers.rs) and [classification](../../crates/trames-session/src/worker_syscalls.rs). |
 | Initial and legacy orchestration | Initial admission, legacy nonmember wake/wait adoption and capability-less embedding routes | Ordinary live members migrate, park and wake on the original queue; child/exec admission and lazy CPU slots no longer require a joined owner. Solo dispatch is on the caller, so its existence alone is not a cross-thread transition. See [admission](../../crates/trames-session/src/process.rs), [legacy wakes](../../crates/trames-session/src/futex.rs) and [queue](../../crates/trames-session/src/run_queue.rs). |
 
@@ -3263,3 +3274,56 @@ subscription failures, the final generic dispatch, initial/legacy orchestration
 or actual host cancellation/teardown. No coordinator/resource thread, polling
 bus, new lock, unsafe production code or ordinary memory fence/check is added.
 Only Mac Dev deployment is in scope; shared code remains iPad-compatible.
+
+
+## 83. Native host-event failure and accepted-request closure — 2026-11-09
+
+IoWake::host_events now returns Result<Option<Arc<HostEvents>>>. Ok(None)
+identifies an embedding without this capability; Err is the original native
+backend failure. IoSignal retains the original weak target and provides one
+shared subscription operation. Removing the duplicated weak target fields from
+io_uring wait/background/poll actors does not change their source identity.
+
+Readiness subscriptions retain the original creation, descriptor, driver attach,
+dynamic source or registration error instead of a boolean and invented generic
+message. Rearm preserves its kind, text and raw OS code when present. Native
+TCP/socket waits, stream/file waits, io_uring enter and CQ observers propagate a
+host error separately from a before-effects capability/body checkpoint. Normal
+filesystem/network operation errors still retain their existing guest ABI.
+
+Native waiting follows subscribe-before-retry. A failed stale interest gets an
+original resource retry: completion, cancellation or an already ready operation
+can remove the interest without a backend. If actual waiting is still required,
+the original host error is returned. A failed background actor remains retryable
+for its explicit caller; it never marks owner_required merely for an OS failure.
+Already completed request effects are not replayed or rolled back.
+
+The original Epoch caches the real host poller Result, including its cause, and
+publishes the first terminal host failure once as an immutable original object. Source
+execution and an elected existing idle executor stop/notify the actual CPU actors.
+The error publication adds no resource-callback mutex. Existing lifecycle cleanup and
+Views drain before original task/mm io_uring requests are cancelled; normal CQ
+ECANCELED publication, accepted dependency release and final transport close use
+their existing objects. Runtime returns HostIo instead of joining a syscall pump.
+
+Injection covers native read, retained recvfrom, splice, epoll, ppoll, io_uring
+enter and already-accepted background I/O on one/four execution slots. The guest
+never receives a fabricated return or executes its following marker; no service
+request is sent. Cancellation empties original requests, publishes one ECANCELED
+and leaves the failed payload untouched. Last TCP close is observable after
+subscriptions/capture release. A separate late-native-source test covers failure
+in the idle executor after an eventfd parked without any native requirement.
+
+Shared regressions cover missing capability vs creation/descriptor/attach/dynamic
+failure, real registration failure and unlocked transport lease destruction,
+original raw OS error preservation, and source retry-to-completion/cancellation.
+The same full runtime/kernel workflows and product/hardware/installed evidence
+are recorded by the product validation record. No artificial OS resource limit
+or production failure-injection check is introduced.
+
+This closes erroneous native-infrastructure-to-owner replay, not every excluded
+resource/request body. The two genuine io_uring capability/body maintenance
+setters, final generic dispatch, initial/legacy orchestration and actual host
+cancel/deadline/shutdown/teardown remain. No new coordinator/service thread,
+polling bus, ordinary memory fence/check or global native-function lock is added.
+Only Mac Dev deployment is in scope; shared code compiles for iPad.

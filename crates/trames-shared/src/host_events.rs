@@ -259,6 +259,13 @@ mod tests {
     }
     #[test]
     fn retained_resource_drops_after_fd_and_outside_registry_even_on_failure() {
+        struct Events(Arc<HostEvents>);
+        impl crate::IoWake for Events {
+            fn wake_io(&self, _: &Arc<IoSignal>) {}
+            fn host_events(&self) -> io::Result<Option<Arc<HostEvents>>> {
+                Ok(Some(self.0.clone()))
+            }
+        }
         struct Probe {
             hub: Weak<HostEvents>,
             peer: UnixStream,
@@ -288,13 +295,15 @@ mod tests {
             if fail {
                 hub.registrations.lock().unwrap().next = u64::MAX;
             }
-            let (_target, signal) = signal(1);
-            let subscription = hub.subscribe(fd, false, &signal);
+            let target: Arc<dyn crate::IoWake> = Arc::new(Events(hub.clone()));
+            let signal = IoSignal::new(1, Arc::downgrade(&target));
+            let subscription = signal.subscribe_host(|| Ok(fd), false);
             if fail {
-                assert!(subscription.is_err());
+                let error = subscription.err().unwrap();
+                assert_eq!(error.to_string(), "host wait IDs exhausted");
             } else {
                 assert!(!dropped.load(Ordering::Relaxed));
-                let subscription = subscription.unwrap();
+                let subscription = subscription.unwrap().unwrap();
                 std::thread::spawn(move || drop(subscription))
                     .join()
                     .unwrap();

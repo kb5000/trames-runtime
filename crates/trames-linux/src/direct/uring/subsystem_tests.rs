@@ -99,7 +99,7 @@ fn mqueue_uring_paths_and_accepted_directory_fds_do_not_require_owner_maintenanc
             IoAttempt::Complete(Ok(2))
         ));
         let mut background = d.uring_background(7, &Arc::downgrade(&t)).unwrap();
-        assert!(background.progress(&mut m));
+        assert!(background.progress(&mut m).unwrap());
         l.vfs.close(dir as u32).unwrap();
         // Reuse the numeric fd and replace the pathname while the original
         // accepted operation retains its old directory and mount identity.
@@ -118,7 +118,7 @@ fn mqueue_uring_paths_and_accepted_directory_fds_do_not_require_owner_maintenanc
             assert_eq!(m.read_u64(0x3020).unwrap(), 0);
         } else {
             l.vfs.write(writer, b"x").unwrap();
-            assert!(background.progress(&mut m));
+            assert!(background.progress(&mut m).unwrap());
             assert_eq!(cq(&mut m, &ring), (2, 1));
             assert_eq!(cq(&mut m, &ring), (3, 0));
             assert_eq!(
@@ -270,12 +270,12 @@ fn native_device_opens_and_bridge_requests_use_original_source_resources() {
                 IoAttempt::Complete(Ok(1))
             ));
             let mut background = d.uring_background(7, &Arc::downgrade(&t)).unwrap();
-            assert!(background.progress(&mut m));
+            assert!(background.progress(&mut m).unwrap());
             l.vfs.close(fd).unwrap();
             assert_eq!(l.vfs.open_at(-100, path, 2, 0).unwrap(), fd);
             assert_eq!(original.write(frame), Ok(frame.len()));
             assert!(background.signal.ready());
-            assert!(background.progress(&mut m));
+            assert!(background.progress(&mut m).unwrap());
             assert!(!background.active());
             assert!(!l.uring_requires_owner());
             assert_eq!(cq(&mut m, &ring).0, 172);
@@ -591,14 +591,14 @@ fn source_maintenance_owns_the_original_vm_after_the_ring_fd_is_closed() {
         IoAttempt::Complete(Ok(1))
     ));
     let mut background = d.uring_background(7, &Arc::downgrade(&t)).unwrap();
-    assert!(background.progress(&mut m));
+    assert!(background.progress(&mut m).unwrap());
     l.vfs.close(fd).unwrap();
     l.vfs.close(reader).unwrap();
     let foreign = m.clone();
     l.vfs.write(writer, b"s").unwrap();
     assert!(background.signal.ready());
     assert_eq!(foreign.read_array::<1>(0x2200).unwrap(), [0]);
-    assert!(background.progress(&mut m));
+    assert!(background.progress(&mut m).unwrap());
     assert_eq!(cq(&mut m, &r), (5, 1));
     assert_eq!(m.read_array::<1>(0x2200).unwrap(), *b"s");
     assert_eq!(foreign.read_array::<1>(0x2200).unwrap(), [0]);
@@ -631,9 +631,9 @@ fn solo_accepted_drain_keeps_source_context_across_worker_admission() {
     let d = direct(&l, &m, &mut epoch, &caps);
     let t = target();
     let mut background = d.uring_background(7, &Arc::downgrade(&t)).unwrap();
-    assert!(background.progress(&mut m));
+    assert!(background.progress(&mut m).unwrap());
     l.vfs.write(writer, b"s").unwrap();
-    assert!(background.progress(&mut m));
+    assert!(background.progress(&mut m).unwrap());
     assert_eq!(cq(&mut m, &r), (1, 1));
     let (tag, opened) = cq(&mut m, &r);
     assert_eq!(tag, 2);
@@ -1072,7 +1072,7 @@ fn namespace_switch_preserves_accepted_sqe_context_and_refreshes_new_submissions
     ));
     let actor = l.uring_actor_root().get().unwrap().clone();
     let mut background = d.uring_background(7, &Arc::downgrade(&t)).unwrap();
-    assert!(background.progress(&mut m));
+    assert!(background.progress(&mut m).unwrap());
     let trames_vfs::TaskNamespaceAttempt::Complete(state, result) =
         l.vfs.task_namespaces().unshare(0x600, true).run()
     else {
@@ -1086,7 +1086,7 @@ fn namespace_switch_preserves_accepted_sqe_context_and_refreshes_new_submissions
     m.write(0x2100, b"fresh\0").unwrap();
     // Original accepted request must not re-read this changed guest pointer.
     peer.write(writer, b"x").unwrap();
-    assert!(background.progress(&mut m));
+    assert!(background.progress(&mut m).unwrap());
     assert_eq!(cq(&mut m, &r), (1, 1));
     let (tag, old_fd) = cq(&mut m, &r);
     assert_eq!(tag, 2);
@@ -1123,7 +1123,7 @@ fn credential_drop_keeps_accepted_sqe_authority_but_rejects_future_opens() {
         IoAttempt::Complete(Ok(2))
     ));
     let mut background = d.uring_background(7, &Arc::downgrade(&t)).unwrap();
-    assert!(background.progress(&mut m));
+    assert!(background.progress(&mut m).unwrap());
     let mut state = l.vfs.task_namespaces();
     state.with_credentials(|c, dumpable| {
         let result =
@@ -1137,7 +1137,7 @@ fn credential_drop_keeps_accepted_sqe_authority_but_rejects_future_opens() {
     d.refresh_namespaces(state.resources());
     l.vfs.adopt_task_namespaces(state);
     l.vfs.write(writer, b"x").unwrap();
-    assert!(background.progress(&mut m));
+    assert!(background.progress(&mut m).unwrap());
     assert_eq!(cq(&mut m, &r), (1, 1));
     let (tag, old_fd) = cq(&mut m, &r);
     assert_eq!(tag, 2);
@@ -1173,7 +1173,7 @@ fn corrupt_cq_during_accepted_enter_returns_error_without_replay_or_owner_pump()
         assert_eq!(ring.load_queue(0), 1);
         assert!(!ring.state.lock().unwrap().waits.contains_key(&7));
         let mut background = d.uring_background(7, &Arc::downgrade(&t)).unwrap();
-        assert!(background.progress(&mut m));
+        assert!(background.progress(&mut m).unwrap());
         assert!(!l.uring_requires_owner());
         m.write_array(0x10040, 0u32.to_le_bytes()).unwrap();
         if !complete_before_repair {
@@ -1244,8 +1244,8 @@ fn layout_completion_without_driver_waits_on_original_backing_and_cancels_cleanl
                 result.complete(work.run());
             }
             let mut background = d.uring_background(7, &Arc::downgrade(&t)).unwrap();
-            assert!(background.progress(&mut m));
-            assert!(background.progress(&mut m));
+            assert!(background.progress(&mut m).unwrap());
+            assert!(background.progress(&mut m).unwrap());
             assert!(
                 !background.external(),
                 "a backing publication is not a native disk completion"
@@ -1264,7 +1264,7 @@ fn layout_completion_without_driver_waits_on_original_backing_and_cancels_cleanl
                     background.signal.ready(),
                     "original publication release must wake its request"
                 );
-                assert!(background.progress(&mut m));
+                assert!(background.progress(&mut m).unwrap());
                 if queued {
                     let (work, result) = receive.recv_timeout(Duration::from_secs(2)).unwrap();
                     if cancel_native {
@@ -1276,7 +1276,7 @@ fn layout_completion_without_driver_waits_on_original_backing_and_cancels_cleanl
                         );
                     }
                     result.complete(work.run());
-                    assert!(background.progress(&mut m));
+                    assert!(background.progress(&mut m).unwrap());
                 }
                 if !cancel_native {
                     assert_eq!(cq(&mut m, &ring), (991, 0));

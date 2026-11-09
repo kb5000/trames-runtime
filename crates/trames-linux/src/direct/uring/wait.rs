@@ -42,27 +42,25 @@ impl WaitSources {
         key: (usize, bool),
         slot: usize,
         signal: &Arc<IoSignal>,
-        target: &Weak<dyn IoWake>,
         fd: impl FnOnce() -> std::io::Result<trames_vfs::HostFd>,
-    ) -> Option<()> {
+    ) -> std::io::Result<bool> {
         use std::collections::btree_map::Entry;
         match self.hosts.entry((key.0, key.1, slot)) {
             Entry::Occupied(mut entry) => {
                 let subscription = entry.get_mut();
                 if !subscription.used {
-                    subscription.value.rearm().ok()?;
+                    subscription.value.rearm()?;
                     subscription.used = true;
                 }
             }
             Entry::Vacant(entry) => {
-                let events = target.upgrade()?.host_events()?;
-                entry.insert(Subscription {
-                    value: events.subscribe(fd().ok()?, key.1, signal).ok()?,
-                    used: true,
-                });
+                let Some(value) = signal.subscribe_host(fd, key.1)? else {
+                    return Ok(false);
+                };
+                entry.insert(Subscription { value, used: true });
             }
         }
-        Some(())
+        Ok(true)
     }
     pub(super) fn external(&self) -> bool {
         !self.hosts.is_empty()
@@ -84,15 +82,22 @@ impl WaitSources {
         owner: u64,
         task: u32,
         signal: &Arc<IoSignal>,
-        target: &Weak<dyn IoWake>,
         actor: &UringActor,
         memory: &mut impl CpuMemory,
-    ) -> bool {
-        self.refresh(rings, owner, task, signal, target, actor)
-            || rings
-                .iter()
-                .all(|ring| ring.poll_pump(owner, task, memory, actor))
-                && self.refresh(rings, owner, task, signal, target, actor)
+    ) -> std::io::Result<bool> {
+        let first = self.refresh(rings, owner, task, signal, actor);
+        if matches!(first, Ok(true)) {
+            return first;
+        }
+        // A stale native interest can fail after its request became ready or
+        // was cancelled. Retry original resources before reporting the error.
+        if !rings
+            .iter()
+            .all(|ring| ring.poll_pump(owner, task, memory, actor))
+        {
+            return first.map(|_| false);
+        }
+        self.refresh(rings, owner, task, signal, actor)
     }
     pub(super) fn refresh(
         &mut self,
@@ -100,9 +105,8 @@ impl WaitSources {
         owner: u64,
         task: u32,
         signal: &Arc<IoSignal>,
-        target: &Weak<dyn IoWake>,
         actor: &UringActor,
-    ) -> bool {
+    ) -> std::io::Result<bool> {
         self.deadline = None;
         for subscription in self.local.values_mut() {
             subscription.used = false;
@@ -111,18 +115,20 @@ impl WaitSources {
             subscription.used = false;
         }
         for ring in rings {
-            if !ring.subscribe_requests(owner, task, signal, target, self, actor) {
-                return false;
+            if !ring.subscribe_requests(owner, task, signal, self, actor)? {
+                return Ok(false);
             }
         }
         // Cancellation, completion, dependency changes and CQ backpressure can
         // remove interests. Do not retain their duplicate FDs or stale wakes.
         self.local.retain(|_, s| s.used);
         self.hosts.retain(|_, s| s.used);
-        !self
-            .local
-            .values()
-            .any(|entry| entry.value.iter().any(|s| s.rearm_host().is_err()))
+        for entry in self.local.values() {
+            for subscription in &entry.value {
+                subscription.rearm_host()?;
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -133,10 +139,9 @@ pub(super) trait RingWaitOps {
         owner: u64,
         task: u32,
         signal: &Arc<IoSignal>,
-        target: &Weak<dyn IoWake>,
         sources: &mut WaitSources,
         actor: &UringActor,
-    ) -> bool;
+    ) -> std::io::Result<bool>;
     fn request_deadline(&self, owner: u64, task: u32) -> Option<Instant>;
 }
 impl RingWaitOps for Ring {
@@ -155,10 +160,9 @@ impl RingWaitOps for Ring {
         owner: u64,
         task: u32,
         signal: &Arc<IoSignal>,
-        target: &Weak<dyn IoWake>,
         sources: &mut WaitSources,
         actor: &UringActor,
-    ) -> bool {
+    ) -> std::io::Result<bool> {
         sources.local(LocalSource::Ring(self as *const Self as usize), || {
             vec![self.readiness.subscribe(signal)]
         });
@@ -187,17 +191,10 @@ impl RingWaitOps for Ring {
                         continue;
                     }
                     Object::Tcp(f) => {
-                        if sources
-                            .host(
-                                (resource.identity, events & 4 != 0),
-                                0,
-                                signal,
-                                target,
-                                || tcp_wait_fd(&f.tcp),
-                            )
-                            .is_none()
-                        {
-                            return false;
+                        if !sources.host((resource.identity, events & 4 != 0), 0, signal, || {
+                            tcp_wait_fd(&f.tcp)
+                        })? {
+                            return Ok(false);
                         }
                         continue;
                     }
@@ -208,9 +205,7 @@ impl RingWaitOps for Ring {
                 continue;
             };
             if let Some(socket) = file.socket() {
-                let Ok((fds, delay)) = socket.wait_sources() else {
-                    return false;
-                };
+                let (fds, delay) = socket.wait_sources()?;
                 if let Some(deadline) = delay.and_then(|d| Instant::now().checked_add(d)) {
                     sources.deadline = [sources.deadline, Some(deadline)]
                         .into_iter()
@@ -218,22 +213,15 @@ impl RingWaitOps for Ring {
                         .min();
                 }
                 for (i, fd) in fds.into_iter().enumerate() {
-                    if sources
-                        .host(
-                            (file.identity(), events & 4 != 0),
-                            i,
-                            signal,
-                            target,
-                            || Ok(fd.into()),
-                        )
-                        .is_none()
-                    {
-                        return false;
+                    if !sources.host((file.identity(), events & 4 != 0), i, signal, || {
+                        Ok(fd.into())
+                    })? {
+                        return Ok(false);
                     }
                 }
             }
         }
-        true
+        Ok(true)
     }
     fn request_deadline(&self, owner: u64, task: u32) -> Option<Instant> {
         let state = self.state.lock().unwrap();

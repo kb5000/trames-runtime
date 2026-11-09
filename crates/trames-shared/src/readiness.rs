@@ -8,8 +8,8 @@ use std::sync::{
 
 pub trait IoWake: Send + Sync {
     fn wake_io(&self, signal: &Arc<IoSignal>);
-    fn host_events(&self) -> Option<Arc<crate::HostEvents>> {
-        None
+    fn host_events(&self) -> std::io::Result<Option<Arc<crate::HostEvents>>> {
+        Ok(None)
     }
 }
 pub struct IoSignal {
@@ -24,6 +24,21 @@ struct ExclusiveWake {
     ready: Box<dyn Fn() -> bool + Send + Sync>,
 }
 impl IoSignal {
+    /// A missing embedding capability differs from a failed native backend.
+    pub fn host_events(&self) -> std::io::Result<Option<Arc<crate::HostEvents>>> {
+        self.target
+            .upgrade()
+            .map_or(Ok(None), |target| target.host_events())
+    }
+    pub fn subscribe_host(
+        self: &Arc<Self>,
+        fd: impl FnOnce() -> std::io::Result<crate::HostFd>,
+        write: bool,
+    ) -> std::io::Result<Option<crate::HostSubscription>> {
+        self.host_events()?
+            .map(|events| events.subscribe(fd()?, write, self))
+            .transpose()
+    }
     pub fn new(pid: u32, target: Weak<dyn IoWake>) -> Arc<Self> {
         Arc::new(Self {
             pid,
@@ -149,8 +164,7 @@ impl DynamicHost {
             let signal = self.signal.upgrade();
             let events = signal
                 .as_ref()
-                .and_then(|s| s.target.upgrade())
-                .and_then(|t| t.host_events());
+                .map_or(Ok(None), |signal| signal.host_events())?;
             let host = match (fd, events, signal.as_ref()) {
                 (Some(fd), Some(events), Some(signal)) => {
                     Some(events.subscribe(fd, false, signal)?)
@@ -171,7 +185,7 @@ pub struct IoSubscription {
     source: Option<Arc<Readiness>>,
     id: u64,
     host: Option<crate::HostSubscription>,
-    host_failed: bool,
+    host_error: Option<Arc<std::io::Error>>,
     external: bool,
     dynamic: Option<Box<DynamicHost>>,
     retained_signal: Option<Arc<IoSignal>>,
@@ -200,21 +214,20 @@ impl Readiness {
         self.armed.fetch_or(1, Ordering::AcqRel);
         drop(listeners);
         let driver = self.driver.get().and_then(Weak::upgrade);
-        let host_failed = driver
+        let host_error = driver
             .as_ref()
             .filter(|d| d.external())
-            .is_some_and(|driver| {
-                signal
-                    .target
-                    .upgrade()
-                    .and_then(|t| t.host_events())
-                    .is_some_and(|events| driver.attach(events).is_err())
-            });
+            .and_then(|driver| match signal.host_events() {
+                Ok(Some(events)) => driver.attach(events).err(),
+                Ok(None) => None,
+                Err(error) => Some(error),
+            })
+            .map(Arc::new);
         IoSubscription {
             source: Some(self.clone()),
             id,
             host: None,
-            host_failed,
+            host_error,
             external: false,
             dynamic: None,
             retained_signal: None,
@@ -269,21 +282,21 @@ impl IoSubscription {
     /// Register a native event queue directly, without inventing a guest
     /// readiness resource or a shared listener lock. The queue owns no watched
     /// socket; closing the guest socket is independent of this subscription.
-    /// Registration failures use the executor's existing host-wait fallback.
+    /// Registration failures retain their original host cause for the executor.
     pub fn native(fd: std::io::Result<crate::HostFd>, signal: &Arc<IoSignal>) -> Self {
         let mut subscription = Self {
             source: None,
             id: 0,
             host: None,
-            host_failed: false,
+            host_error: None,
             external: true,
             dynamic: None,
             retained_signal: None,
         };
         match fd {
             Ok(fd) => subscription.with_host(fd, signal),
-            Err(_) => {
-                subscription.host_failed = true;
+            Err(error) => {
+                subscription.host_error = Some(Arc::new(error));
                 subscription
             }
         }
@@ -295,14 +308,10 @@ impl IoSubscription {
         // A joined single-task executor waits on its descriptor set directly;
         // it has no HostEvents hub but must still retry after a native wake.
         self.external = true;
-        if let Some(events) = signal
-            .target
-            .upgrade()
-            .and_then(|target| target.host_events())
-        {
-            match events.subscribe(fd, false, signal) {
-                Ok(host) => self.host = Some(host),
-                Err(_) => self.host_failed = true,
+        match signal.subscribe_host(|| Ok(fd.into()), false) {
+            Ok(host) => self.host = host,
+            Err(error) => {
+                self.host_error.get_or_insert_with(|| Arc::new(error));
             }
         }
         self
@@ -317,8 +326,8 @@ impl IoSubscription {
             signal: Arc::downgrade(signal),
             state: Mutex::default(),
         }));
-        if self.dynamic.as_ref().unwrap().rearm().is_err() {
-            self.host_failed = true;
+        if let Err(error) = self.dynamic.as_ref().unwrap().rearm() {
+            self.host_error.get_or_insert_with(|| Arc::new(error));
         }
         self
     }
@@ -344,8 +353,11 @@ impl IoSubscription {
             .map_or(self.external, |d| d.state.lock().unwrap().external)
     }
     pub fn rearm_host(&self) -> std::io::Result<()> {
-        if self.host_failed {
-            return Err(std::io::Error::other("native subscription failed"));
+        if let Some(error) = &self.host_error {
+            return Err(error.raw_os_error().map_or_else(
+                || std::io::Error::new(error.kind(), error.clone()),
+                std::io::Error::from_raw_os_error,
+            ));
         }
         if let Some(dynamic) = &self.dynamic {
             return dynamic.rearm();
@@ -385,5 +397,123 @@ mod tests {
         assert_eq!(source.armed.load(Ordering::Relaxed), 0);
         source.notify_atomic();
         assert!(!signal.ready());
+    }
+    struct Failed;
+    impl IoWake for Failed {
+        fn wake_io(&self, _: &Arc<IoSignal>) {}
+        fn host_events(&self) -> std::io::Result<Option<Arc<crate::HostEvents>>> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "original backend creation failure",
+            ))
+        }
+    }
+    struct Events(Arc<crate::HostEvents>);
+    impl IoWake for Events {
+        fn wake_io(&self, _: &Arc<IoSignal>) {}
+        fn host_events(&self) -> std::io::Result<Option<Arc<crate::HostEvents>>> {
+            Ok(Some(self.0.clone()))
+        }
+    }
+    #[test]
+    fn native_subscriptions_distinguish_missing_backend_from_original_host_errors() {
+        let missing: Arc<dyn IoWake> = Arc::new(Target);
+        let failed: Arc<dyn IoWake> = Arc::new(Failed);
+        for (target, failure) in [(missing, false), (failed, true)] {
+            let signal = IoSignal::new(1, Arc::downgrade(&target));
+            let result = signal.subscribe_host(
+                || panic!("capability selection precedes fd acquisition"),
+                false,
+            );
+            if failure {
+                let error = result.err().unwrap();
+                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                assert!(error
+                    .to_string()
+                    .contains("original backend creation failure"));
+                let (socket, _) = std::os::unix::net::UnixStream::pair().unwrap();
+                use std::os::fd::AsFd;
+                let subscription = IoSubscription::native(
+                    socket.as_fd().try_clone_to_owned().map(Into::into),
+                    &signal,
+                );
+                let error = subscription.rearm_host().unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                assert!(error
+                    .to_string()
+                    .contains("original backend creation failure"));
+            } else {
+                assert!(result.unwrap().is_none());
+            }
+        }
+        let target: Arc<dyn IoWake> = Arc::new(Events(crate::HostEvents::new().unwrap()));
+        let signal = IoSignal::new(1, Arc::downgrade(&target));
+        let error = signal
+            .subscribe_host(
+                || {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::OutOfMemory,
+                        "original duplicate failure",
+                    ))
+                },
+                false,
+            )
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::OutOfMemory);
+        assert!(error.to_string().contains("original duplicate failure"));
+        let subscription =
+            IoSubscription::native(Err(std::io::Error::from_raw_os_error(24)), &signal);
+        for _ in 0..2 {
+            assert_eq!(
+                subscription.rearm_host().unwrap_err().raw_os_error(),
+                Some(24)
+            );
+        }
+    }
+    #[test]
+    fn driver_attach_and_dynamic_source_failures_keep_their_original_error() {
+        struct Driver;
+        impl ReadinessDriver for Driver {
+            fn attach(&self, _: Arc<crate::HostEvents>) -> std::io::Result<()> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "original attach failure",
+                ))
+            }
+        }
+        struct Dynamic;
+        impl HostSource for Dynamic {
+            fn revision(&self) -> u64 {
+                1
+            }
+            fn fd(&self) -> std::io::Result<Option<crate::HostFd>> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "original dynamic source failure",
+                ))
+            }
+        }
+        let target: Arc<dyn IoWake> = Arc::new(Events(crate::HostEvents::new().unwrap()));
+        let signal = IoSignal::new(1, Arc::downgrade(&target));
+        let driver: Arc<dyn ReadinessDriver> = Arc::new(Driver);
+        let source = Arc::new(Readiness::default());
+        source.set_driver(Arc::downgrade(&driver));
+        let subscription = source.subscribe(&signal);
+        let error = subscription.rearm_host().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(error.to_string().contains("original attach failure"));
+        drop(subscription);
+        assert!(source.listeners.lock().unwrap().is_empty());
+        let dynamic: Arc<dyn HostSource> = Arc::new(Dynamic);
+        let source = Arc::new(Readiness::default());
+        let subscription = source
+            .subscribe(&signal)
+            .with_host_source(Arc::downgrade(&dynamic), &signal);
+        let error = subscription.rearm_host().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+        assert!(error
+            .to_string()
+            .contains("original dynamic source failure"));
     }
 }
