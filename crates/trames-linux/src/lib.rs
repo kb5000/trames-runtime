@@ -24,6 +24,7 @@ pub use direct::{
 };
 mod file_calls;
 mod file_layouts;
+mod ioctl;
 pub use file_layouts::{FileLayoutDriver, FileLayoutRequest, FileLayouts};
 mod host_files;
 pub use host_files::{HostFileAdmission, HostFileLayout, HostFileTask};

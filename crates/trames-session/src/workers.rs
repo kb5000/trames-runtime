@@ -1097,6 +1097,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                             || snapshot.direct.supports_local_message(work.cpu.x(8) as u32, work.cpu.x(0) as u32)
                                             || snapshot.direct.supports_path_query(work.cpu.x(8) as u32)
                                             || snapshot.direct.supports_epoll_control(work.cpu.x(8) as u32)
+                                            || snapshot.direct.supports_ioctl(work.cpu.x(8) as u32, std::array::from_fn(|i|work.cpu.x(i)))
                                             || matches!(work.cpu.x(8) as u32, 23 | 24 | 57 | 101 | 115 | 436)
                                             || work.cpu.x(8) as u32 == 25
                                                 && matches!(work.cpu.x(1), 0 | 1030))
@@ -1107,10 +1108,10 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                     let entry = snapshot.seccomp.entry_decision(number, work.cpu.pc(), args);
                                     if entry.allowed() {
                                         if let Some(epoch) = &epoch {
-                                        if snapshot.direct.supports_call(number, args) {
+                                        if snapshot.direct.supports_call(number, args) || snapshot.direct.supports_ioctl(number, args) {
                                             let attempt = snapshot.direct.start(number, args,
                                                 work.memory.as_deref_mut().expect("worker view"), work.pid, &epoch.io_target, None)
-                                                .expect("retained I/O");
+                                                .unwrap_or(trames_linux::IoAttempt::Checkpoint);
                                             if let Some(began) = began { syscall_time += began.elapsed(); }
                                             match attempt {
                                                 trames_linux::IoAttempt::HostError(error) => { epoch.fail_host_io(error); maintenance=true; break SliceOutcome::Yield {instructions:0}; },

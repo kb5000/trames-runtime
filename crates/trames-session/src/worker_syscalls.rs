@@ -773,6 +773,9 @@ impl Snapshot {
             || self.direct.supports_socket_control(cpu.x(8) as u32)
             || self.direct.supports_path_query(cpu.x(8) as u32)
             || self.direct.supports_epoll_control(cpu.x(8) as u32)
+            || self
+                .direct
+                .supports_ioctl(cpu.x(8) as u32, std::array::from_fn(|i| cpu.x(i)))
             || matches!(cpu.x(8) as u32, 23 | 24 | 57 | 101 | 115 | 436)
             || cpu.x(8) as u32 == 25 && matches!(cpu.x(1), 0 | 1030)
         {

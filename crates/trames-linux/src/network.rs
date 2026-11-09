@@ -422,17 +422,17 @@ impl Vectors {
     }
 }
 impl Linux {
-    pub(super) fn network_ioctl(
-        &mut self,
+    pub(crate) fn network_ioctl(
+        vfs: &mut trames_vfs::Vfs,
         a: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Result<u64> {
-        if self.vfs.local_socket(a[0] as u32)?.is_none() {
-            self.vfs.socket_fd(a[0] as u32)?;
+        if vfs.local_socket(a[0] as u32)?.is_none() {
+            vfs.socket_fd(a[0] as u32)?;
         }
         let request = a[1] as u32;
         if request != 0x5421 {
-            let devices = self.vfs.network_devices();
+            let devices = vfs.network_devices();
             if request == 0x8912 {
                 // SIOCGIFCONF: AArch64 ifconf and two IPv4 ifreq entries.
                 let capacity = u32_at(memory, a[2])?;
@@ -498,8 +498,7 @@ impl Linux {
                     if flags & !(1 | 2 | 8 | 0x40 | 0x1000) != 0 {
                         return Err(Errno(95));
                     }
-                    self.vfs
-                        .set_network_device_up(device.index, flags & 1 != 0)?;
+                    vfs.set_network_device_up(device.index, flags & 1 != 0)?;
                     return Ok(0);
                 }
                 0x8942 => entry[16..20].copy_from_slice(&device.master.unwrap_or(0).to_le_bytes()),
@@ -529,11 +528,7 @@ impl Linux {
                     } else {
                         0x1002
                             | u16::from(device.up)
-                            | if self.vfs.network_carrier(device) {
-                                0x40
-                            } else {
-                                0
-                            }
+                            | if vfs.network_carrier(device) { 0x40 } else { 0 }
                     };
                     entry[16..18].copy_from_slice(&flags.to_le_bytes());
                 }
@@ -563,7 +558,7 @@ impl Linux {
             return Ok(0);
         }
         let enabled = u32_at(memory, a[2])? != 0;
-        self.vfs.set_nonblocking(a[0] as u32, enabled)?;
+        vfs.set_nonblocking(a[0] as u32, enabled)?;
         Ok(0)
     }
     pub fn resume_connect(&self, fd: u32) -> Result<bool> {

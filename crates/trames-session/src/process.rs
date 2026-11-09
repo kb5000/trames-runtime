@@ -9606,3 +9606,7 @@ mod uring_authority_tests;
 #[cfg(all(test, trames_interpreter_conformance))]
 #[path = "process_dormant_tests.rs"]
 mod dormant_tests;
+
+#[cfg(all(test, trames_interpreter_conformance))]
+#[path = "process_ioctl_tests.rs"]
+mod ioctl_tests;

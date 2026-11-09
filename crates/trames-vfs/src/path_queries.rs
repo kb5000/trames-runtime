@@ -222,6 +222,20 @@ impl Vfs {
     }
 }
 impl PathQueries {
+    /// Short descriptor controls use one original shared OFD, without pathname
+    /// or byte-provider admission. No guest-visible descriptor is installed.
+    pub fn fd_control<T>(
+        &self,
+        fd: u32,
+        operation: impl FnOnce(&mut Vfs, u32) -> Result<T>,
+    ) -> Option<Result<T>> {
+        let mut view = self.view.borrow_mut();
+        let file = match view.query.as_ref().unwrap().files.lookup(fd)? {
+            Ok(file) => file.retained(),
+            Err(error) => return Some(Err(error)),
+        };
+        Some(view.with_uring_fd(&file, operation))
+    }
     /// Fresh private control graph; only the original shared Files/resources
     /// are retained. No mutable query-local cache escapes to the new one.
     pub fn retain_context(&self) -> Self {
@@ -441,6 +455,62 @@ impl PathQueries {
         nofollow: bool,
     ) -> Option<Result<()>> {
         self.query(|v| v.access_at(dirfd, path, mode, effective, nofollow))
+    }
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+
+    #[test]
+    fn accepted_control_keeps_original_ofd_across_close_reuse_and_panic() {
+        let mut vfs = Vfs::default();
+        vfs.set_runtime_info(
+            1,
+            RuntimeInfo {
+                processes: vec![ProcessInfo {
+                    pid: 1,
+                    tgid: 1,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        vfs.enable_video_device();
+        let render = vfs.open_at(AT_FDCWD, b"/dev/dri/renderD128", 2, 0).unwrap();
+        let files = vfs.shared_files();
+        let query = vfs.path_queries();
+        for panics in [false, true] {
+            let namespace = vfs.open_at(AT_FDCWD, b"/proc/self/ns/net", 0, 0).unwrap();
+            let operation = || {
+                query.fd_control(namespace, |view, alias| {
+                    files.close(namespace, 0).unwrap().unwrap();
+                    assert_eq!(
+                        files.duplicate_to(render, namespace, 0, 0),
+                        Some(Ok(namespace))
+                    );
+                    assert_eq!(
+                        view.namespace_type(alias),
+                        Ok(Some(linux_namespace::CLONE_NEWNET))
+                    );
+                    assert!(!view.is_render_device(alias)?);
+                    assert!(files.lookup(namespace).unwrap().is_ok());
+                    if panics {
+                        panic!("test original control unwind");
+                    }
+                    Ok(())
+                })
+            };
+            assert_eq!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).is_err(),
+                panics
+            );
+            assert_eq!(
+                query.fd_control(namespace, |view, alias| view.is_render_device(alias)),
+                Some(Ok(true))
+            );
+            vfs.close(namespace).unwrap();
+        }
     }
 }
 #[cfg(test)]

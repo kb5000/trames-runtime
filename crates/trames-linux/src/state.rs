@@ -1348,37 +1348,7 @@ impl Linux {
                     _ => Err(Errno(22)),
                 }
             },
-            29 => {
-                if self.vfs.flags(a[0] as u32)? & trames_vfs::O_PATH != 0 {
-                    return Err(Errno(9));
-                }
-                if a[1] as u32 == 0x541b {
-                    if let Some(bytes) = self.vfs.readable_bytes(a[0] as u32)? {
-                        memory
-                            .write(a[2], &(bytes as u32).to_le_bytes())
-                            .map_err(|_| Errno(14))?;
-                        return Ok(0);
-                    }
-                }
-                if a[1] as u32 == 0x5421 {
-                    let mut value = [0; 4];
-                    memory.read(a[2], &mut value).map_err(|_| Errno(14))?;
-                    self.vfs
-                        .set_nonblocking(a[0] as u32, u32::from_le_bytes(value) != 0)?;
-                    Ok(0)
-                } else if let Some(kind) = self.vfs.namespace_type(a[0] as u32)? {
-                    match a[1] as u32 {
-                        0xb703 => Ok(kind),
-                        _ => Err(Errno(25)),
-                    }
-                } else if self.vfs.is_render_device(a[0] as u32)? {
-                    self.render_ioctl(a[1], a[2], memory)
-                } else if self.vfs.fd_kind(a[0] as u32)? == FdKind::Socket {
-                    self.network_ioctl(a, memory)
-                } else {
-                    Err(Errno(25))
-                }
-            },
+            29 => crate::ioctl::call(&mut self.vfs, a, memory),
             48 | 439 => {
                 if a[2] & !7 != 0 {
                     return Err(Errno(22));

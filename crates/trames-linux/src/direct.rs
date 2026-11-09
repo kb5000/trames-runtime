@@ -409,6 +409,38 @@ impl DirectSyscalls {
         self.record_fd_control();
         Some(result)
     }
+    pub fn supports_ioctl(&self, number: u32, args: [u64; 6]) -> bool {
+        number == 29 && self.paths.is_some() && !matches!(args[1] as u32, 0x5421 | 0x5452)
+    }
+    fn invoke_other_ioctl(
+        &self,
+        args: [u64; 6],
+        memory: &mut impl CpuMemory,
+    ) -> Option<Result<u64, Errno>> {
+        // Task-sensitive PTY controls and shared flag/async changes keep their
+        // existing accepted endpoint and signal-routing implementations.
+        if matches!(args[1] as u32, 0x5421 | 0x5452)
+            || self
+                .descriptors
+                .get(args[0] as u32)
+                .is_some_and(|fd| fd.is_pty())
+        {
+            return None;
+        }
+        let result = self
+            .paths
+            .as_ref()?
+            .fd_control(args[0] as u32, |view, fd| {
+                crate::ioctl::call(
+                    view,
+                    [fd as u64, args[1], args[2], args[3], args[4], args[5]],
+                    memory,
+                )
+            })?;
+        self.record_fd_control();
+        self.completed.set(self.completed.get() + 1);
+        Some(result)
+    }
     pub fn supports_epoll_control(&self, number: u32) -> bool {
         number == 21 && self.membership.is_some()
     }
@@ -1287,8 +1319,13 @@ impl DirectSyscalls {
         target: &Weak<dyn IoWake>,
         saved_deadline: Option<Instant>,
     ) -> Option<IoAttempt> {
-        if number == 29 && !crate::pty::terminal_job_request(args[1] as u32) {
-            if let Some(result) = self.invoke_control(number, args, memory) {
+        if number == 29 {
+            if !crate::pty::terminal_job_request(args[1] as u32) {
+                if let Some(result) = self.invoke_control(number, args, memory) {
+                    return Some(IoAttempt::Complete(result));
+                }
+            }
+            if let Some(result) = self.invoke_other_ioctl(args, memory) {
                 return Some(IoAttempt::Complete(result));
             }
         }
@@ -1993,7 +2030,11 @@ impl DirectSyscalls {
             }
         }
         if matches!(number, 22 | 32 | 441) || !self.supports_call(number, args) {
-            return None;
+            return if number == 29 {
+                self.invoke_other_ioctl(args, memory)
+            } else {
+                None
+            };
         }
         if number == 73 {
             let result = match poll_deadline(memory, args[2], None) {
@@ -4216,3 +4257,6 @@ mod tests {
 
 #[cfg(test)]
 mod socket_control_tests;
+
+#[cfg(test)]
+mod ioctl_tests;

@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Discovery ABI for Trames' own virtual render node; no DRM command submission.
 use crate::state::Linux;
-use trames_memory::Memory;
+use trames_memory::CpuMemory;
 use trames_vfs::Errno;
 impl Linux {
     pub(super) fn render_ioctl(
-        &self,
         request: u64,
         at: u64,
-        memory: &mut Memory,
+        memory: &mut impl CpuMemory,
     ) -> Result<u64, Errno> {
         if request != 0xc0406400 {
             return Err(Errno(25));

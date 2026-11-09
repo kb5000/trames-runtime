@@ -1,11 +1,21 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 86, original dormant-task admission, reviewed on 2026-11-09. The prior shared runtime
-baseline is `4064df29b4288adabea520dfa13dfdf217884af2`.
+This is the consolidated implementation audit through stage 87, shared descriptor ioctl discovery and control, reviewed on 2026-11-09. The prior shared runtime
+baseline is `f35cfc111bac200190f3d2083e838bcbfdd186b6`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-09
+
+Stage 87 closes residual shared-descriptor ioctl discovery/control dispatch.
+Ordinary unknown controls, namespace type, virtual render-node discovery and all
+implemented network-interface controls use one source/solo ABI. The source keeps
+one original shared OFD in its existing sealed resolver; close/reuse cannot
+redirect the accepted operation, and unwinding restores its private alias. There
+is no pathname/provider scan or guest-visible descriptor installation. PTY job
+control and FIONBIO/FIOASYNC retain their existing original-resource execution.
+Actual legacy OFDs and missing providers still defer before effects. Filtered
+entries retain one accepted policy decision. Four broad categories remain.
 
 Stage 86 admits original Futex/Sleep tasks even when no runnable actor selected
 their mm. Their initial queue record has no byte/hardware View. Actual wake,
@@ -315,6 +325,7 @@ is not a claim that all coordinator work is removed.
 | Individual/group/default-fatal exit, STOP/CONT, parent notification and vfork release | Original source task/group resources | Returned CPU/statistics and cold task cleanup use existing source workers; only the original live mm pauses when necessary. Outside-cohort/solo and capability-less embeddings retain their boundary |
 | fork/clone/vfork and execve/execveat | Existing workers handle pure and mixed mapping scopes, nonleader replacement and original old-mm retirement; existing disk pool prepares native images without a CPU slot | Affected actors still quiesce. Capability-less embeddings, solo and host invocation remain separate |
 | Structural VM edits, pins and mapped-file layout changes | Supported mapping/buffer-registration checkpoints publish on existing workers with original task/mm custody; additive anonymous mmap runs directly while peers continue | Proc/cold-mm checkpoints and supported mapped-file transactions now run on existing workers. Unsupported backing/lifetime/policy and capability-less embeddings retain explicit boundaries |
+| Descriptor ioctl discovery and control | Shared namespace type, virtual render discovery, implemented interface queries/link control and ordinary unsupported commands execute on the caller with one retained original OFD and the common solo ABI | Existing PTY/flag/async routes stay source-owned. Actual legacy OFDs or absent providers retain before-effects fallback; unsupported commands preserve their existing errno |
 | Native libc/GPU/video/audio bodies, waits and before-effects mapping/entry checkpoints | Calling/shared-resource execution; exceptional access uses original task/mm custody on an existing executor, then retains resource waits | Capability-less embeddings and actual platform/host lifecycle retain their boundary. Single-CPU/solo calls use their existing caller. Local libc/DirectFile/HVF fallback alone is not an owner transition |
 | Read-only VM observations and implemented non-discard advice | Calling executor, original admitted mappings/reservations and per-page resident metadata; common source/solo ABI | No observation-only join or mm checkpoint. Genuine absent custom observation capabilities retain explicit before-effects fallback; actual discard/mapping mutation remains scoped |
 | Guest halt/poweroff | Calling executor and original root/caller group exit controls; common policy for source/solo | No supported power-control-only join. Missing original shutdown/exit capabilities keep explicit legacy execution. Unsupported restart/kexec and nested PID namespace power behavior retain their existing errno |
@@ -448,14 +459,14 @@ Actual excluded policy effects and missing capabilities retain explicit boundari
 ### Current remaining categories
 
 The count is **four broad categories**, not the number of historical subsystem
-rows. Stages 72–86 remove concrete triggers and close request-authority dependencies inside those categories; they do not
+rows. Stages 72–87 remove concrete triggers and close request-authority dependencies inside those categories; they do not
 prove that the final generic fallback is unreachable.
 
 | Remaining category | Actual trigger | Current scope / authoritative implementation |
 | --- | --- | --- |
 | Host cancellation and final teardown | Host cancel, deadline, shutdown, legacy stopped-hook requests, final CPU/backend drain and actual native-event backend failure | Pause/resume, original init notifications/signals, pressure reclaim, host filesystem commands and terminal/process admission no longer join. Actual terminal teardown and backend failure still stop their actors. Native-event failure returns its original HostIo cause after drain/cancellation, without an owner syscall retry. See [host control](../../crates/trames-session/src/process_vm.rs), [completion](../../crates/trames-session/src/process_exit.rs) and [workers](../../crates/trames-session/src/workers.rs). |
 | Missing capabilities and excluded resources | A genuinely absent source provider, an excluded original FD/node graph, a genuinely absent native event capability or unsupported source request body | There is no filesystem-kind exclusion after stage 82. Existing node/provider admission still applies. io_uring has exactly two submitter-scoped `require_owner()` maintenance call sites: missing-capability wait-source preparation and deferred original body progress; actual host backend errors take terminal source error handling. They remain connected to actual accepted request lifetime, subscriptions and cancellation. See [path authority](../../crates/trames-vfs/src/path_queries.rs), [maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [wait sources](../../crates/trames-linux/src/direct/uring/wait.rs) and [actor](../../crates/trames-linux/src/direct/uring/actor.rs). |
-| Final execution dispatch fallback | A returned SVC/HLT/fault not completed, parked or accepted by a source scope | The catch-all stops the current cohort for joined dispatch. It remains an audit target even though admitted native calls, ordinary guest faults, generated ENOSYS and migrated syscalls have source completion. A backend error is not a software or full-Linux-VM fallback. See [worker dispatch](../../crates/trames-session/src/workers.rs) and [classification](../../crates/trames-session/src/worker_syscalls.rs). |
+| Final execution dispatch fallback | A returned SVC/HLT/fault not completed, parked or accepted by a source scope | The catch-all stops the current cohort for joined dispatch. Ordinary shared-FD ioctl discovery and unsupported-control errors no longer use it. It remains an audit target even though admitted native calls, ordinary guest faults, generated ENOSYS and migrated syscalls have source completion. A backend error is not a software or full-Linux-VM fallback. See [worker dispatch](../../crates/trames-session/src/workers.rs) and [classification](../../crates/trames-session/src/worker_syscalls.rs). |
 | Initial and legacy orchestration | Initial admission, standalone/capability-less nonmember scheduling and other excluded embedding routes | Ordinary live members and preexisting Kernel Futex/Sleep actors migrate, park and wake on the original queue. Cold waiters have metadata only until an event prepares their original mm; child/exec admission and lazy CPU slots no longer require a joined owner. The standalone futex legacy-publication mechanism remains. Solo dispatch is on the caller, so its existence alone is not a cross-thread transition. See [admission](../../crates/trames-session/src/process.rs), [legacy wakes](../../crates/trames-session/src/futex.rs) and [queue](../../crates/trames-session/src/run_queue.rs). |
 
 Supported process/family lifecycle, signals and security policy, mount and task
@@ -3502,3 +3513,58 @@ Kernel Futex/Sleep adoption is a concrete removed trigger within the fourth
 category. This does not complete the overall goal. No new coordinator/resource
 thread, polling bus, guest-memory fence/check, global algorithm lock or production
 unsafe block is introduced. Mac Dev alone is the deployment target.
+
+
+## 87. Original shared descriptor ioctl discovery and control — 2026-11-09
+
+The remaining shared-descriptor ioctl family no longer requires joined dispatch:
+ordinary unsupported requests, namespace NS_GET_NSTYPE, the virtual render node's
+existing DRM_VERSION ABI, and all implemented interface controls (ifconf,
+name/index, flags, address/netmask, MTU, master and hardware address). The same
+canonical ABI serves source and solo execution. This adds no DRM submission or
+new network-control functionality; implemented errors, privilege checks, output
+layout and partial-write ordering remain the original ones.
+
+The source uses its existing sealed resolver and original shared Files. One
+lookup accepts a complete original OFD; the existing private retained-descriptor
+scope then supplies every metadata/resource access. It installs no guest-visible
+FD and restores the private alias even if the operation unwinds. Network topology
+and credentials remain the original context/resources. Existing PTY controls and
+job stops, FIONBIO and FIOASYNC keep their existing accepted endpoint/status/signal
+paths. A genuinely legacy OFD returns a before-effects capability miss, not a
+fabricated guest error or a new service request.
+
+Normal byte/native operations gain no new check or synchronization. The residual
+control route reuses the per-task resolver; it adds no Kernel copy, resource
+actor, coordinator/service thread, polling bus, ordinary guest-memory fence or
+global algorithm lock. Actual object-level synchronization remains unchanged.
+
+Filtered dispatch participates in the existing accepted seccomp decision path.
+An initial integration omitted newly admitted residual controls from that path;
+a second regression exposed terminal-job request numbers on non-terminals still
+skipping the residual route. The common start now distinguishes the actual
+accepted PTY from non-terminal ENOTTY. Both defects were fixed before integration;
+no guest error was substituted for working functionality.
+
+Shared regressions compare source/solo output and errors for twenty descriptor/
+request combinations, invalid pointers/FDs/O_PATH and partial render copyout.
+They verify live original network state and privilege checks, and original OFD
+retention across close/reuse and unwind. The process fixture exercises four/
+twelve CPUs and one execution slot, including an allowed seccomp filter. All
+seven control entries finish before its final futex wait in one cohort, with zero
+services, mapping checkpoints or returned syscalls. The old fixture stops before
+its following marker. Signed native baselines/results and final source-bound
+integration evidence live in the product record
+`docs/validation/descriptor-ioctl-20261109.json`.
+
+The dormant-wait native fixture's old setup pipe ioctl now belongs to this source
+family. Its setup boundary is deliberately changed to the still-unimplemented
+PR_GET_UNALIGN prctl subcommand, preserving the original cold-wait admission
+coverage. That fixture passes on the prior runtime at four/twelve CPUs with two
+cohorts and one returned prctl. Its retained boundary is explicit.
+
+Four broad categories remain. Both original-submitter io_uring maintenance
+escalation setters are unchanged, as are genuine missing providers/legacy OFDs,
+other final SVC/HLT/fault dispatch, actual initial orchestration and host cancel/
+final teardown. Shared-FD ioctl control has been removed as a concrete final-
+dispatch trigger. Only Mac Dev deployment is included; the overall goal is active.
