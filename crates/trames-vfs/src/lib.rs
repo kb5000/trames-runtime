@@ -2,6 +2,8 @@
 //! Shared virtual namespace; host IO is confined to an explicitly selected store.
 #![recursion_limit = "512"]
 mod bpf;
+mod task_name;
+pub use task_name::TaskName;
 mod console;
 #[cfg(unix)]
 pub use console::NativeConsole;

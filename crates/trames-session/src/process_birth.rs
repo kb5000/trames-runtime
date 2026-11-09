@@ -157,7 +157,10 @@ impl Birth {
         source.bind_reads(&memory);
         p.signals.io.proc_view.publish_with_memory(
             &info,
-            p.linux.vfs.proc_resources(),
+            p.linux
+                .vfs
+                .proc_resources()
+                .with_task_name(p.linux.command_name.clone()),
             Some(memory),
         );
         source

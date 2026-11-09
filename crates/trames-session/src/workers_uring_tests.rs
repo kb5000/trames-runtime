@@ -7,6 +7,7 @@ use trames_memory::{Memory, Permissions, PAGE_SIZE};
 fn snapshot(direct: trames_linux::DirectSyscalls) -> crate::worker_syscalls::Snapshot {
     crate::worker_syscalls::Snapshot {
         diagnostics: None,
+        name: Default::default(),
         membarrier_registered: None,
         vfork_release: None,
         native_space: None,

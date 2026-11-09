@@ -1399,7 +1399,11 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                                 }
                                             }
                                         }
-                                        let value=snapshot.invoke(&work.cpu,work.memory.as_deref_mut().expect("task control View")).expect("shared task control");
+                                        let value=if number==167 {
+                                            let args=std::array::from_fn(|i|work.cpu.x(i));
+                                            crate::process::prctl::call(&mut work.cpu,&snapshot.name,snapshot.io_signals.parentage().map(|p|&**p),snapshot.io_signals.family().map(|p|&**p),args,work.memory.as_deref_mut().expect("task control View"))
+                                                .expect("original prctl capability").unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64))
+                                        } else {snapshot.invoke(&work.cpu,work.memory.as_deref_mut().expect("task control View")).expect("shared task control")};
                                         if let Some(began)=began{syscall_time+=began.elapsed();}
                                         work.trace.finish(&mut work.cpu, value);syscalls+=1;continue;
                                     }
@@ -2143,6 +2147,7 @@ mod tests {
     fn syscall_snapshot() -> crate::worker_syscalls::Snapshot {
         crate::worker_syscalls::Snapshot {
             diagnostics: None,
+            name: Default::default(),
             membarrier_registered: None,
             vfork_release: None,
             native_space: None,

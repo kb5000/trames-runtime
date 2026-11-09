@@ -5,31 +5,28 @@ use crate::Linux;
 pub struct SyscallDiagnostics {
     log: trames_vfs::KernelLogAccess,
     pid: u32,
-    name: [u8; 15],
-    length: usize,
+    name: trames_vfs::TaskName,
 }
 impl Linux {
     pub fn syscall_diagnostics(&self, pid: u32) -> SyscallDiagnostics {
-        let length = self.command_name.len().min(15);
-        let mut name = [0; 15];
-        name[..length].copy_from_slice(&self.command_name[..length]);
         SyscallDiagnostics {
             log: self.vfs.kernel_log_capability(),
             pid,
-            name,
-            length,
+            name: self.command_name.clone(),
         }
     }
 }
 impl SyscallDiagnostics {
     pub fn unsupported(&self, number: u32, pc: u64, args: [u64; 6]) -> u64 {
+        let name = self.name.bytes();
+        let length = name.iter().position(|b| *b == 0).unwrap_or(15);
         self.log.log_syscall(
             self.pid,
             number as u64,
             pc.saturating_sub(4),
             args,
             38,
-            &self.name[..self.length],
+            &name[..length],
         );
         (-38i64) as u64
     }

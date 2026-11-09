@@ -119,7 +119,7 @@ impl<C: Cpu> Kernel<C> {
         }
         if matches!(number, 97 | 268 | 277)
             || number == 436 && args[2] & 2 != 0
-            || number == 167 && matches!(args[0], 15 | 22)
+            || number == 167 && args[0] == 22
         {
             self.publish_proc_task(p.rekey.unwrap_or(pid), p);
         }
@@ -215,7 +215,7 @@ impl<C: Cpu> Process<C> {
             namespace_projection: None,
             namespace_ids: [self.tgid, pid, self.group(), self.session()]
                 .map(|id| self.linux.vfs.pid_namespace().hierarchy(id)),
-            command: self.linux.command_name.clone(),
+            command: self.linux.command_name.get(),
             cgroup: self.linux.vfs.cgroup_path(pid),
             nondumpable: self.linux.vfs.dumpable() != 1,
             seccomp: self.seccomp.mode(),
@@ -847,7 +847,7 @@ mod tests {
         use trames_vfs::{FileCommand, FileOutcome, FileValue, FileWork};
         let mut kernel = super::super::tests::kernel();
         let mut first = super::super::tests::process();
-        first.linux.command_name = b"proc-before".to_vec();
+        first.linux.command_name.set(b"proc-before");
         first.linux.auxiliary = vec![23; 32];
         kernel.install_proc_source(&first, None);
         kernel.publish_task(1, &first);
@@ -989,7 +989,7 @@ mod tests {
             "opened proc files cannot keep IoTask -> Files cycles alive"
         );
         replacement.signals.io_directory = source.directory.clone();
-        replacement.linux.command_name = b"proc-reused".to_vec();
+        replacement.linux.command_name.set(b"proc-reused");
         kernel.publish_task(1, &replacement);
         let observed_paths = observer.path_queries();
         assert_eq!(

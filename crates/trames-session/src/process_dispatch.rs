@@ -176,6 +176,7 @@ impl Dispatch {
             trace: std::mem::take(&mut p.trace),
             syscalls: Some(crate::worker_syscalls::Snapshot {
                 diagnostics: Some(p.linux.syscall_diagnostics(id)),
+                name: p.linux.command_name.clone(),
                 membarrier_registered: Some(p.membarrier_registered.clone()),
                 vfork_release: p.vfork.clone(),
                 native_space: Some(p.space.clone()),

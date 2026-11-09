@@ -345,6 +345,7 @@ impl Vfs {
 
 #[derive(Clone)]
 pub struct ProcResources {
+    name: Option<TaskName>,
     dumpable: Dumpable,
     fs: FsHandle,
     paths: fs_context::PathSource,
@@ -355,6 +356,7 @@ pub struct ProcResources {
 impl Vfs {
     pub fn proc_resources(&self) -> ProcResources {
         ProcResources {
+            name: None,
             dumpable: self.dumpable.clone(),
             fs: self.fs.clone(),
             paths: self.path_source(),
@@ -365,6 +367,11 @@ impl Vfs {
     }
 }
 impl ProcResources {
+    pub fn with_task_name(mut self, name: TaskName) -> Self {
+        self.name = Some(name);
+        self
+    }
+
     fn view(&self, lease: &linux_namespace::NamespaceProjection) -> Vfs {
         let mut view = Vfs::empty(self.fs.clone());
         self.paths.install(&mut view.context);
@@ -386,6 +393,10 @@ impl ProcResources {
         view
     }
     pub fn observe(&self, info: &mut ProcessInfo, demand: ProcRefresh) {
+        if let Some(name) = &self.name {
+            info.command = name.get();
+        }
+
         info.nondumpable = !self.dumpable.get();
         if demand.directories() {
             (info.cwd_directory, info.root_directory) = self.paths.directories();
@@ -571,7 +582,6 @@ process_metadata! {
     state: char,
     credentials: Credentials,
     namespace_ids: [Vec<u32>; 4],
-    command: Vec<u8>,
     cgroup: Vec<u8>,
     nondumpable: bool,
     seccomp: u32,
@@ -598,6 +608,7 @@ process_metadata! {
 #[derive(Clone)]
 struct ProcessImage {
     metadata: ProcessMetadata,
+    legacy_command: Vec<u8>,
     resources: ProcResources,
     arguments: Vec<Vec<u8>>,
     environment: Vec<Vec<u8>>,
@@ -706,8 +717,9 @@ impl ProcessView {
     /// Task namespace/Files replacement preserves the loaded image and its mm.
     /// Only an overlapping observer requires a cold copy; ordinary reads keep
     /// their existing single image observation and no extra synchronization.
-    pub fn replace_resources(&self, resources: ProcResources) {
+    pub fn replace_resources(&self, mut resources: ProcResources) {
         if let Some(image) = self.image.write().unwrap().as_mut() {
+            resources.name = image.resources.name.clone();
             Arc::make_mut(image).resources = resources;
         }
     }
@@ -719,6 +731,11 @@ impl ProcessView {
     ) {
         let image = Arc::new(ProcessImage {
             metadata: ProcessMetadata::capture(info),
+            legacy_command: if resources.name.is_none() {
+                info.command.clone()
+            } else {
+                Vec::new()
+            },
             resources,
             arguments: info.arguments.clone(),
             environment: info.environment.clone(),
@@ -738,6 +755,7 @@ impl ProcessView {
     ) -> Option<ProcessInfo> {
         let image = self.image.read().unwrap().clone()?;
         let mut info = image.metadata.project();
+        info.command = image.legacy_command.clone();
         if let Some(policy) = self.seccomp.get() {
             (info.seccomp, info.seccomp_filters) = policy.seccomp();
         }

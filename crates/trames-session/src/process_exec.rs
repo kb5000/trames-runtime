@@ -1481,14 +1481,16 @@ impl Request {
             }
             runtime.linux.executable_path = execute_vfs.executable_display(&file);
             runtime.linux.executable_file = Some(file);
-            runtime.linux.command_name = filename
-                .rsplit(|b| *b == b'/')
-                .next()
-                .unwrap_or_default()
-                .iter()
-                .copied()
-                .take(15)
-                .collect();
+            runtime.linux.command_name.set(
+                &(filename
+                    .rsplit(|b| *b == b'/')
+                    .next()
+                    .unwrap_or_default()
+                    .iter()
+                    .copied()
+                    .take(15)
+                    .collect::<Vec<_>>()),
+            );
             runtime.linux.vfs.credentials = execute_vfs.credentials.clone();
             runtime.linux.vfs.unshare_dumpable();
             runtime.linux.vfs.set_dumpable(execute_vfs.dumpable())?;

@@ -1,11 +1,22 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 87, shared descriptor ioctl discovery and control, reviewed on 2026-11-09. The prior shared runtime
-baseline is `f35cfc111bac200190f3d2083e838bcbfdd186b6`.
+This is the consolidated implementation audit through stage 88, original task prctl controls and live comm, reviewed on 2026-11-09. The prior shared runtime
+baseline is `a77aaf162a5c0575e5b1f1ef259282f9713646d7`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-09
+
+Stage 88 closes the residual prctl family: original per-thread comm, parent-death
+signal, subreaper, backend SME configuration and canonical unsupported-command
+errors execute on the calling worker. Source/solo share the residual ABI; already
+migrated credential and seccomp controls retain their existing original resources.
+Comm is one bounded original name object, forked by value for every new task and
+retained by source execution, proc and diagnostics. Namespace resource changes
+preserve its identity; loaded-image publication supplies the actual new image's
+name. No live rename requires an owner snapshot refresh. Four broad categories
+remain; genuine absent parent/family capabilities and other final dispatch still
+retain their explicit boundaries.
 
 Stage 87 closes residual shared-descriptor ioctl discovery/control dispatch.
 Ordinary unknown controls, namespace type, virtual render-node discovery and all
@@ -333,6 +344,7 @@ is not a claim that all coordinator work is removed.
 | Dynamic proc/sys views and proc pathname/FD consumers | Original PID/mm/Files/fs/namespace resources on the calling worker; owner/solo queries use the same provider | First cross-mm byte export and invalidation now activate on an existing worker using only original task/mm custody. Legacy embeddings without a provider and actual policy remain separate |
 | Mount topology administration | Calling worker and original namespace/fs_struct resources, with existing disk workers only for host-backed path work | Busy transactions park the caller on original readiness. Genuinely excluded path controls keep separate boundaries |
 | Task namespace membership and Files/fs detachment | Calling worker; supported unshare/setns and close_range update original per-task bindings and all future-call consumers; busy namespace transactions return the execution slot | Capability-less embeddings remain. Clone namespace creation retains creator-mm custody; unsupported user/time namespace semantics remain separate |
+| prctl task controls and per-thread comm | Source/solo share residual parent-death/subreaper/name/SME/error handling; existing credential/seccomp routes remain original-resource work. Proc and diagnostics observe the same original name | No production prctl-only join remains. Genuine missing parent/family providers keep before-effects fallback; absent backend SME support keeps its original EINVAL. Name publication/fork/exec retain actual task/image identity |
 | Credentials and capabilities | Supported UID/GID/fs-ID/groups, capget/capset and credential prctl run on the caller; original task credentials feed target permissions and observations | Capability-less embeddings retain their boundary; unsupported user namespaces and file capabilities are unchanged |
 | Memory barriers | Supported membarrier query/register/private/global/get-registrations run on source workers; original active execution leases acknowledge requested fences | Capability-less/solo embeddings keep their joined path. Unsupported sync-core/rseq/global-expedited commands remain unsupported. Ordinary memory accesses acquire no new synchronization |
 | Entropy and random devices | getrandom, original random/urandom OFDs and UUID resources run on the caller; unsupported random-device controls return locally on the accepted OFD | Absent descriptor capabilities retain their own route. Supported getrandom flags remain 0..3 and the existing transfer bound/fault behavior is retained; guest entropy credit/reseed controls remain unsupported |
@@ -459,14 +471,14 @@ Actual excluded policy effects and missing capabilities retain explicit boundari
 ### Current remaining categories
 
 The count is **four broad categories**, not the number of historical subsystem
-rows. Stages 72–87 remove concrete triggers and close request-authority dependencies inside those categories; they do not
+rows. Stages 72–88 remove concrete triggers and close request-authority dependencies inside those categories; they do not
 prove that the final generic fallback is unreachable.
 
 | Remaining category | Actual trigger | Current scope / authoritative implementation |
 | --- | --- | --- |
 | Host cancellation and final teardown | Host cancel, deadline, shutdown, legacy stopped-hook requests, final CPU/backend drain and actual native-event backend failure | Pause/resume, original init notifications/signals, pressure reclaim, host filesystem commands and terminal/process admission no longer join. Actual terminal teardown and backend failure still stop their actors. Native-event failure returns its original HostIo cause after drain/cancellation, without an owner syscall retry. See [host control](../../crates/trames-session/src/process_vm.rs), [completion](../../crates/trames-session/src/process_exit.rs) and [workers](../../crates/trames-session/src/workers.rs). |
 | Missing capabilities and excluded resources | A genuinely absent source provider, an excluded original FD/node graph, a genuinely absent native event capability or unsupported source request body | There is no filesystem-kind exclusion after stage 82. Existing node/provider admission still applies. io_uring has exactly two submitter-scoped `require_owner()` maintenance call sites: missing-capability wait-source preparation and deferred original body progress; actual host backend errors take terminal source error handling. They remain connected to actual accepted request lifetime, subscriptions and cancellation. See [path authority](../../crates/trames-vfs/src/path_queries.rs), [maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [wait sources](../../crates/trames-linux/src/direct/uring/wait.rs) and [actor](../../crates/trames-linux/src/direct/uring/actor.rs). |
-| Final execution dispatch fallback | A returned SVC/HLT/fault not completed, parked or accepted by a source scope | The catch-all stops the current cohort for joined dispatch. Ordinary shared-FD ioctl discovery and unsupported-control errors no longer use it. It remains an audit target even though admitted native calls, ordinary guest faults, generated ENOSYS and migrated syscalls have source completion. A backend error is not a software or full-Linux-VM fallback. See [worker dispatch](../../crates/trames-session/src/workers.rs) and [classification](../../crates/trames-session/src/worker_syscalls.rs). |
+| Final execution dispatch fallback | A returned SVC/HLT/fault not completed, parked or accepted by a source scope | The catch-all stops the current cohort for joined dispatch. Ordinary shared-FD ioctl discovery and residual prctl controls/errors no longer use it. It remains an audit target even though admitted native calls, ordinary guest faults, generated ENOSYS and migrated syscalls have source completion. A backend error is not a software or full-Linux-VM fallback. See [worker dispatch](../../crates/trames-session/src/workers.rs) and [classification](../../crates/trames-session/src/worker_syscalls.rs). |
 | Initial and legacy orchestration | Initial admission, standalone/capability-less nonmember scheduling and other excluded embedding routes | Ordinary live members and preexisting Kernel Futex/Sleep actors migrate, park and wake on the original queue. Cold waiters have metadata only until an event prepares their original mm; child/exec admission and lazy CPU slots no longer require a joined owner. The standalone futex legacy-publication mechanism remains. Solo dispatch is on the caller, so its existence alone is not a cross-thread transition. See [admission](../../crates/trames-session/src/process.rs), [legacy wakes](../../crates/trames-session/src/futex.rs) and [queue](../../crates/trames-session/src/run_queue.rs). |
 
 Supported process/family lifecycle, signals and security policy, mount and task
@@ -3568,3 +3580,55 @@ escalation setters are unchanged, as are genuine missing providers/legacy OFDs,
 other final SVC/HLT/fault dispatch, actual initial orchestration and host cancel/
 final teardown. Shared-FD ioctl control has been removed as a concrete final-
 dispatch trigger. Only Mac Dev deployment is included; the overall goal is active.
+
+
+## 88. Original task prctl controls and live per-thread comm — 2026-11-09
+
+The residual prctl subsystem now executes on the calling worker: parent-death
+signal, child-subreaper, task name, existing backend SME vector-length controls,
+and unsupported-command EINVAL. The source/solo residual dispatcher is shared;
+duplicated parent/subreaper/SME and name bodies are removed. Credential/dumpable/
+capability/no-new-privs and seccomp modes/installations keep their already migrated
+source resource implementations. Actual missing parent/family providers defer
+before effects, and absent backend SME support preserves EINVAL.
+
+A Linux task's comm is now one TaskName object containing sixteen bytes. Retained
+execution, proc and diagnostic capabilities share its identity. Only actual name
+updates and observers take its object-local short mutex; guest input/output runs
+outside that mutex. SET_NAME imports up to fifteen bytes before commit, including
+its original NUL/fault ordering. GET_NAME validates the full sixteen-byte output.
+Failed imports cannot publish a prefix. Ordinary memory/native/CPU operations gain
+no new check, fence, polling, global lock or service thread.
+
+Every clone/fork copies the original name value into a separate identity,
+including CLONE_THREAD/CLONE_VM. Initial load/exec seed their actual image name;
+structural proc publication binds that resource. Namespace/Files resource
+replacement preserves it instead of restoring a cold name snapshot. Production
+proc images no longer carry a duplicate command vector: only legacy embeddings
+without a name capability retain that fallback payload. Diagnostics retain the
+original name and read a stack copy only when emitting a real diagnostic, with
+no new per-diagnostic name allocation.
+
+Shared regressions cover byte limits and page-boundary faults, atomic failed
+imports, diagnostics accepted before rename, original proc observations before
+cohort drain, independent real thread-clone names, namespace rebinding and
+allowed seccomp execution. The process family fixture runs eleven controls on
+four/twelve logical CPUs and one execution slot, including a filter. The old
+runtime stops before its following marker; final source execution uses one cohort
+without returned syscalls, services or mm checkpoints. The interpreter preserves
+its existing unsupported-SME result; native SME behavior has a signed hardware
+fixture with distinct per-thread names and an actual guest naming barrier.
+
+The previous native dormant-wait fixture's setup prctl is now source-owned. Its
+explicit setup is a real eight-byte read on an OFD accepted from legacy runtime
+information without a typed source proc payload provider. Before/final versions
+retain two cohorts, one affected mm and one returned read at four/twelve CPUs;
+the read still returns the real data. This preserves actual dormant admission
+coverage and explicitly records the remaining provider boundary.
+
+Source-bound integration and signed native baseline/final results are recorded
+by the product repository in docs/validation/task-prctl-20261109.json. The broad
+count stays four: actual host cancel/final teardown, genuine missing/excluded
+providers (including both io_uring maintenance escalation setters), other final
+execution dispatch and initial/standalone orchestration. No new prctl functionality
+or complete coordinator-removal claim is made. Only Mac Dev deployment is included.

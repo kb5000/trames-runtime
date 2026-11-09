@@ -82,6 +82,7 @@ impl ExitResources<'_> {
 
 pub(super) struct Snapshot {
     pub diagnostics: Option<trames_linux::SyscallDiagnostics>,
+    pub name: trames_vfs::TaskName,
     pub membarrier_registered: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub vfork_release: Option<Arc<trames_kernel::vfork::Release>>,
     pub native_space: Option<crate::space::Native>,
@@ -701,10 +702,10 @@ impl Snapshot {
             93 | 94 => self.exit_files.is_some(),
             142 => true,
             96 => self.io_signals.thread_addresses().is_some(),
-            167 => match cpu.x(0) as u32 {
+            167 => match cpu.x(0) {
                 1 | 2 => self.io_signals.parentage().is_some(),
                 36 | 37 => self.io_signals.family().is_some(),
-                _ => false,
+                _ => crate::process::prctl::entry(std::array::from_fn(|i| cpu.x(i))),
             },
             _ => false,
         }
@@ -853,32 +854,6 @@ impl Snapshot {
                 std::array::from_fn(|i| cpu.x(i)),
                 memory,
             ),
-            167 if matches!(cpu.x(0) as u32, 36 | 37) => {
-                let family = self.io_signals.family()?;
-                if cpu.x(0) as u32 == 36 {
-                    family.set_subreaper(cpu.x(1) != 0);
-                    Ok(0)
-                } else {
-                    memory
-                        .write(cpu.x(1), &u32::from(family.subreaper()).to_le_bytes())
-                        .map(|()| 0)
-                        .map_err(|_| Errno(14))
-                }
-            }
-            167 if matches!(cpu.x(0) as u32, 1 | 2) => {
-                let parentage = self.io_signals.parentage()?;
-                match cpu.x(0) as u32 {
-                    1 if cpu.x(1) > 64 => Err(Errno(22)),
-                    1 => {
-                        parentage.set_death_signal(cpu.x(1) as u32);
-                        Ok(0)
-                    }
-                    _ => memory
-                        .write(cpu.x(1), &parentage.death_signal().to_le_bytes())
-                        .map(|()| 0)
-                        .map_err(|_| Errno(14)),
-                }
-            }
             96 => {
                 self.io_signals.thread_addresses()?.set_clear_tid(cpu.x(0));
                 Ok(self.identities[6])
@@ -1168,6 +1143,7 @@ mod tests {
             .unwrap();
         let snapshot = Snapshot {
             diagnostics: None,
+            name: Default::default(),
             membarrier_registered: None,
             vfork_release: None,
             native_space: None,
@@ -1307,6 +1283,7 @@ mod tests {
         memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         let snapshot = Snapshot {
             diagnostics: None,
+            name: Default::default(),
             membarrier_registered: None,
             vfork_release: None,
             native_space: None,
@@ -1373,6 +1350,7 @@ mod tests {
             .unwrap();
         let mut snapshot = Snapshot {
             diagnostics: None,
+            name: Default::default(),
             membarrier_registered: None,
             vfork_release: None,
             native_space: None,
@@ -1482,6 +1460,7 @@ mod tests {
             .unwrap();
         let snapshot = Snapshot {
             diagnostics: None,
+            name: Default::default(),
             membarrier_registered: None,
             vfork_release: None,
             native_space: None,
@@ -1556,6 +1535,7 @@ mod tests {
         memory.protect(0x2000, PAGE_SIZE, Permissions::R).unwrap();
         let snapshot = Snapshot {
             diagnostics: None,
+            name: Default::default(),
             membarrier_registered: None,
             vfork_release: None,
             native_space: None,

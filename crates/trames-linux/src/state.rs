@@ -76,7 +76,7 @@ pub struct Linux {
     pub environment: Vec<Vec<u8>>,
     pub executable_path: Vec<u8>,
     pub executable_file: Option<std::sync::Arc<trames_vfs::ExecutableFile>>,
-    pub command_name: Vec<u8>,
+    pub command_name: trames_vfs::TaskName,
     pub argument_pointers: Vec<u64>,
     pub auxiliary: Vec<u8>,
     heap: crate::heap::Heap,
@@ -119,7 +119,7 @@ impl Linux {
             environment: self.environment.clone(),
             executable_path: self.executable_path.clone(),
             executable_file: self.executable_file.clone(),
-            command_name: self.command_name.clone(),
+            command_name: self.command_name.fork(),
             argument_pointers: self.argument_pointers.clone(),
             auxiliary: self.auxiliary.clone(),
             heap: if shared_vm {
@@ -178,7 +178,7 @@ impl Linux {
             environment: Vec::new(),
             executable_path: Vec::new(),
             executable_file: None,
-            command_name: Vec::new(),
+            command_name: Default::default(),
             argument_pointers: Vec::new(),
             auxiliary: Vec::new(),
             heap: crate::heap::Heap::new(brk_base),
@@ -1140,7 +1140,7 @@ impl Linux {
                 cpu.pc().saturating_sub(4),
                 a,
                 raw.wrapping_neg() as u32,
-                &self.command_name,
+                &self.command_name.get(),
             );
         }
         if trace {
@@ -1430,27 +1430,7 @@ impl Linux {
             },
             172 => Ok(1),
             173 => Ok(0),
-            167 if matches!(a[0], 15 | 16) => {
-                if a[0] == 15 {
-                    let mut name = Vec::new();
-                    for i in 0..15 {
-                        let mut byte = [0];
-                        memory.read(a[1] + i, &mut byte).map_err(|_| Errno(14))?;
-                        if byte[0] == 0 {
-                            break;
-                        }
-                        name.push(byte[0]);
-                    }
-                    self.command_name = name;
-                } else {
-                    Self::check(memory, a[1], 16, Access::Write)?;
-                    let mut name = [0; 16];
-                    let len = self.command_name.len().min(15);
-                    name[..len].copy_from_slice(&self.command_name[..len]);
-                    memory.write(a[1], &name).map_err(|_| Errno(14))?;
-                }
-                Ok(0)
-            },
+            167 if matches!(a[0], 15 | 16) => crate::task_name_call(&self.command_name, a, memory),
             169 => {
                 if a[0] != 0 {
                     Self::check(memory, a[0], 16, Access::Write)?;

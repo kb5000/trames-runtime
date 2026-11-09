@@ -450,15 +450,17 @@ impl<C: Cpu> Runtime<C> {
         linux.arguments = argv.to_vec();
         linux.environment = envp.to_vec();
         linux.executable_path = argv.first().cloned().unwrap_or_default();
-        linux.command_name = linux
-            .executable_path
-            .rsplit(|b| *b == b'/')
-            .next()
-            .unwrap_or_default()
-            .iter()
-            .copied()
-            .take(15)
-            .collect();
+        linux.command_name.set(
+            &(linux
+                .executable_path
+                .rsplit(|b| *b == b'/')
+                .next()
+                .unwrap_or_default()
+                .iter()
+                .copied()
+                .take(15)
+                .collect::<Vec<_>>()),
+        );
         if exec_filename.is_none() {
             if let Ok(file) =
                 vfs.executable_file_at(trames_vfs::AT_FDCWD, &linux.executable_path, 0)

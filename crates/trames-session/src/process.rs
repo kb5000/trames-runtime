@@ -63,6 +63,8 @@ mod exit;
 pub(crate) mod lifecycle;
 #[path = "process_pid.rs"]
 mod pid_namespace;
+#[path = "process_prctl.rs"]
+pub(crate) mod prctl;
 #[path = "process_proc.rs"]
 mod proc;
 #[path = "process_signals.rs"]
@@ -716,12 +718,14 @@ fn read_u32(m: &Memory, a: u64) -> Result<u32, Errno> {
 fn read_u64(m: &Memory, a: u64) -> Result<u64, Errno> {
     m.read_u64(a).map_err(|_| Errno(14))
 }
-fn write_u64(m: &mut Memory, a: u64, v: u64) -> Result<(), Errno> {
-    m.write(a, &v.to_le_bytes()).map_err(|_| Errno(14))
-}
+#[cfg(all(test, trames_interpreter_conformance))]
 fn write_u32(m: &mut Memory, a: u64, v: u32) -> Result<(), Errno> {
     m.write(a, &v.to_le_bytes()).map_err(|_| Errno(14))
 }
+fn write_u64(m: &mut Memory, a: u64, v: u64) -> Result<(), Errno> {
+    m.write(a, &v.to_le_bytes()).map_err(|_| Errno(14))
+}
+
 fn strings(m: &Memory, address: u64) -> Result<Vec<Vec<u8>>, Errno> {
     if address == 0 {
         return Ok(Vec::new());
@@ -909,7 +913,7 @@ impl<C: Cpu> Kernel<C> {
                     p.tgid,
                     a[0],
                     value as i64,
-                    String::from_utf8_lossy(&p.linux.command_name)
+                    String::from_utf8_lossy(&p.linux.command_name.get())
                 ),
             );
         }
@@ -963,7 +967,7 @@ impl<C: Cpu> Kernel<C> {
                             "pid={} Vulkan op={operation} result={} pc={pc:#x} comm={:?}",
                             p.tgid,
                             value as i64,
-                            String::from_utf8_lossy(&p.linux.command_name)
+                            String::from_utf8_lossy(&p.linux.command_name.get())
                         ),
                     );
                 }
@@ -1624,7 +1628,7 @@ impl<C: Cpu> Kernel<C> {
             &format!(
                 "pid={pid} tgid={} {fault} comm={:?}",
                 p.tgid,
-                String::from_utf8_lossy(&p.linux.command_name)
+                String::from_utf8_lossy(&p.linux.command_name.get())
             ),
         );
         let Some(fault_info) = fault_info(fault) else {
@@ -2087,39 +2091,9 @@ impl<C: Cpu> Kernel<C> {
             98 | 102 | 103 | 107..=111 | 137 => self.event_call(pid, p, number, a),
             260 => self.wait(pid, p, a),
             95 => self.waitid(p, a),
-            167 if a[0] == 1 => {
-                if a[1] > 64 {
-                    return Err(Errno(22));
-                }
-                p.parentage.set_death_signal(a[1] as u32);
-                Ok(Some(0))
-            },
-            167 if a[0] == 2 => {
-                write_u32(&mut p.memory, a[1], p.parentage.death_signal())?;
-                Ok(Some(0))
-            },
-            167 if matches!(a[0], 36 | 37) => match a[0] {
-                36 => {
-                    p.family.set_subreaper(a[1] != 0);
-                    Ok(Some(0))
-                }
-                37 => {
-                    write_u32(&mut p.memory, a[1], u32::from(p.family.subreaper()))?;
-                    Ok(Some(0))
-                }
-                _ => Err(Errno(22)),
-            },
-            167 if matches!(a[0], 63 | 64) => {
-                let mut config = p.cpu.sme_config().ok_or(Errno(22))?;
-                if a[0] == 64 {
-                    Ok(Some(config.get()))
-                } else {
-                    let value = config.set(a[1], C::sme_lengths()).ok_or(Errno(22))?;
-                    p.cpu.set_sme_config(config);
-                    Ok(Some(value))
-                }
-            },
-            167 if !matches!(a[0], 15 | 16) => Err(Errno(22)),
+            167 if prctl::entry(a) => prctl::call(
+                &mut p.cpu, &p.linux.command_name, Some(&p.parentage), Some(&p.family), a, &mut p.memory
+            ).expect("original task controls").map(Some),
             72 | 73 => self.poll(p, number, a, io),
             22 | 441 => self.epoll(p, number, a, io),
             74 => self.signalfd(p, a),
@@ -2839,7 +2813,7 @@ impl<C: Cpu> Kernel<C> {
                         p.cpu.pc().saturating_sub(4),
                         a,
                         e.0,
-                        &p.linux.command_name,
+                        &p.linux.command_name.get(),
                     );
                 }
                 let raw = error(e);
@@ -3185,7 +3159,7 @@ impl<C: Cpu> Kernel<C> {
                         let fault = match error {
                             Error::Memory(error) => trames_engine::CpuFault::Memory { pc, error },
                             Error::InvalidEntry | Error::Checkpoint => {
-                                p.linux.vfs.log(4, &format!("pid={id} NativeCall rejected module={module:#x} function={function} pc={pc:#x} comm={:?}", String::from_utf8_lossy(&p.linux.command_name)));
+                                p.linux.vfs.log(4, &format!("pid={id} NativeCall rejected module={module:#x} function={function} pc={pc:#x} comm={:?}", String::from_utf8_lossy(&p.linux.command_name.get())));
                                 trames_engine::CpuFault::Trap {
                                     pc,
                                     instruction: trames_accel::native::INSTRUCTION,
@@ -3937,7 +3911,7 @@ impl<C: Cpu> Kernel<C> {
                     "pid={} tgid={} {fault} comm={:?}",
                     done.pid,
                     p.tgid,
-                    String::from_utf8_lossy(&p.linux.command_name)
+                    String::from_utf8_lossy(&p.linux.command_name.get())
                 ),
             );
             if p.linux.trace {
@@ -3948,7 +3922,7 @@ impl<C: Cpu> Kernel<C> {
             }
         }
         if let Some((pc, module, function)) = done.rejected_native {
-            p.linux.vfs.log(4,&format!("pid={} NativeCall rejected module={module:#x} function={function} pc={pc:#x} comm={:?}",done.pid,String::from_utf8_lossy(&p.linux.command_name)));
+            p.linux.vfs.log(4,&format!("pid={} NativeCall rejected module={module:#x} function={function} pc={pc:#x} comm={:?}",done.pid,String::from_utf8_lossy(&p.linux.command_name.get())));
         }
         if let Some((pc, operation, value)) = done.gpu.last_error {
             p.linux.vfs.log(
@@ -3958,7 +3932,7 @@ impl<C: Cpu> Kernel<C> {
                     done.pid,
                     value as i64,
                     done.gpu.errors,
-                    String::from_utf8_lossy(&p.linux.command_name)
+                    String::from_utf8_lossy(&p.linux.command_name.get())
                 ),
             );
         }
@@ -9610,3 +9584,7 @@ mod dormant_tests;
 #[cfg(all(test, trames_interpreter_conformance))]
 #[path = "process_ioctl_tests.rs"]
 mod ioctl_tests;
+
+#[cfg(all(test, trames_interpreter_conformance))]
+#[path = "process_prctl_tests.rs"]
+mod prctl_tests;

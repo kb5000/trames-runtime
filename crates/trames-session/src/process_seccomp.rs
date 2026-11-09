@@ -1027,7 +1027,7 @@ mod tests {
             for policy in [None, Some(ALLOW), Some(0x5002a)] {
                 let mut p = super::super::tests::process();
                 let log = p.linux.vfs.kernel_log_capability();
-                p.linux.command_name = b"unknown-entry-long-name".to_vec();
+                p.linux.command_name.set(b"unknown-entry-long-name");
                 p.linux.vfs.credentials = trames_vfs::Credentials::user(1234, 1234);
                 for (index, word) in [0xd4000001u32, 0xaa0003f3, 0x17fffffe].iter().enumerate() {
                     p.memory
@@ -2196,6 +2196,7 @@ mod tests {
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
                 diagnostics: None,
+                name: Default::default(),
                 membarrier_registered: None,
                 vfork_release: None,
                 native_space: None,
@@ -2434,6 +2435,7 @@ mod tests {
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
                 diagnostics: None,
+                name: Default::default(),
                 membarrier_registered: None,
                 vfork_release: None,
                 native_space: None,
@@ -2542,6 +2544,7 @@ mod tests {
                 ));
                 let snapshot = crate::worker_syscalls::Snapshot {
                     diagnostics: None,
+                    name: Default::default(),
                     membarrier_registered: None,
                     vfork_release: None,
                     native_space: None,
@@ -2677,6 +2680,7 @@ mod tests {
                 ));
                 let snapshot = crate::worker_syscalls::Snapshot {
                     diagnostics: None,
+                    name: Default::default(),
                     membarrier_registered: None,
                     vfork_release: None,
                     native_space: None,
@@ -2798,6 +2802,7 @@ mod tests {
                 ));
                 let snapshot = crate::worker_syscalls::Snapshot {
                     diagnostics: None,
+                    name: Default::default(),
                     membarrier_registered: None,
                     vfork_release: None,
                     native_space: None,
@@ -2927,6 +2932,7 @@ mod tests {
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
                 diagnostics: None,
+                name: Default::default(),
                 membarrier_registered: None,
                 vfork_release: None,
                 native_space: None,
@@ -3919,6 +3925,7 @@ mod tests {
             .unwrap();
         let mut snapshot = crate::worker_syscalls::Snapshot {
             diagnostics: None,
+            name: Default::default(),
             membarrier_registered: None,
             vfork_release: None,
             native_space: None,
@@ -4494,6 +4501,7 @@ mod tests {
                 ));
                 let snapshot = crate::worker_syscalls::Snapshot {
                     diagnostics: None,
+                    name: Default::default(),
                     membarrier_registered: None,
                     vfork_release: None,
                     native_space: None,
@@ -4545,6 +4553,7 @@ mod tests {
             let mut epoch = trames_vfs::FileEpoch::default();
             let snapshot = crate::worker_syscalls::Snapshot {
                 diagnostics: None,
+                name: Default::default(),
                 membarrier_registered: None,
                 vfork_release: None,
                 native_space: None,
@@ -4605,6 +4614,7 @@ mod tests {
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
                 diagnostics: None,
+                name: Default::default(),
                 membarrier_registered: None,
                 vfork_release: None,
                 native_space: None,
@@ -4658,6 +4668,7 @@ mod tests {
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
                 diagnostics: None,
+                name: Default::default(),
                 membarrier_registered: None,
                 vfork_release: None,
                 native_space: None,
@@ -4721,6 +4732,7 @@ mod tests {
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
                 diagnostics: None,
+                name: Default::default(),
                 membarrier_registered: None,
                 vfork_release: None,
                 native_space: None,
@@ -4784,6 +4796,7 @@ mod tests {
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
                 diagnostics: None,
+                name: Default::default(),
                 membarrier_registered: None,
                 vfork_release: None,
                 native_space: None,
@@ -4849,6 +4862,7 @@ mod tests {
             ));
             let snapshot = crate::worker_syscalls::Snapshot {
                 diagnostics: None,
+                name: Default::default(),
                 membarrier_registered: None,
                 vfork_release: None,
                 native_space: None,
@@ -4909,6 +4923,7 @@ mod tests {
                 let mut epoch = trames_vfs::FileEpoch::default();
                 let snapshot = crate::worker_syscalls::Snapshot {
                     diagnostics: None,
+                    name: Default::default(),
                     membarrier_registered: None,
                     vfork_release: None,
                     native_space: None,
