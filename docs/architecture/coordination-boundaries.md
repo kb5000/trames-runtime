@@ -1,11 +1,25 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 74, original init supervision, reviewed on 2026-11-09. The prior shared runtime
+This is the consolidated implementation audit through stage 75, source-owned Mac pressure reclamation, reviewed on 2026-11-09. The prior shared runtime
 baseline is `38590a849a2b559e23eae81d9640b9579faff7ff`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-09
+
+Stage 75 removes the Mac memory-pressure reclamation join. The existing host
+adapter advances a finite original-Machine request in bounded batches while
+vCPUs continue. Each step scans at most 64 mapping records and deactivates an
+8 MiB batch rounded to original physical extents. Native host byte leases retain
+their existing gate/readiness; pending pressure waits do not rescan them without
+release. Normal pressure cancels the request. No worker/resource thread, polling
+bus, global native-call lock or ordinary guest memory fence is added.
+
+This is one-shot reclamation of live stage-two bindings, not a persistent RAM
+quota or a claim about host RSS. Refaults retain the original bytes and may grow
+the working set again. The optional explicit resident target keeps its own
+existing policy and now observes the live shared mapping counter. The common
+Linux/iPad Rust code is unchanged; this mechanism is isolated in the Mac backend.
 
 Stage 74 removes systemd notification and graceful-stop supervision from joined
 control on both products. The existing host adapter drains the original retained
@@ -216,7 +230,8 @@ is not a claim that all coordinator work is removed.
 | Cold process observation and source ownership | Original body custody and current original PID identity; queue publication orders the exit observation | Cold snapshots are lookup hints, not accepted source capabilities. Source Handles and genuinely excluded actors retain their original routes |
 | Host process and native terminal lifecycle | Original process/group/PTY resources and existing execution/disk workers | Accepted launches survive cohort replacement; loading and custody waits release the CPU slot. One-time adapter setup and genuine missing/excluded providers remain explicit; terminal ID 0 transport no longer stops execution |
 | Init notification and graceful-stop supervision | Existing host adapter and original notification endpoint; original PID 1 policy/private inbox | No notification/handshake/root-signal join remains; initial VFS preparation and actual final teardown retain their own lifetime |
-| Actual host/embedding administration | Joined owner handling of the accepted event | Pause/cancel, timezone/transfer, admin/deadline/pressure and actual shutdown. Original embedding terminal input/output/resize/signals progress without a join. FileProvider staged writeback deliberately pauses as previously chosen |
+| Mac host memory-pressure reclamation | Original physical registry/gates and retained byte-lease readiness, progressed by the existing host adapter | No pressure-only join remains. Refaults and physical granularity are backend work; actual cancellation/teardown retains its own lifetime |
+| Actual host/embedding administration | Joined owner handling of the accepted event | Pause/cancel, timezone/transfer, admin/deadline and actual shutdown. Original embedding terminal input/output/resize/signals progress without a join. FileProvider staged writeback deliberately pauses as previously chosen |
 | Last-resort SVC/HLT/fault dispatch | Truly unimplemented numbers complete locally using generated conservative recognition and the original diagnostic log | Known handlers whose actual resource/subcommand is excluded, legacy embeddings and unhandled HLT/fault exits still retain joined fallback. An implemented number returning an errno is not classified as globally unimplemented |
 | Single-CPU/solo execution | Existing coordinated caller path | The owner may itself be the guest executor; this is not evidence of an extra cross-thread syscall RPC |
 
@@ -344,7 +359,7 @@ Actual excluded policy effects and missing capabilities retain explicit boundari
 | io_uring explicit capability/resource escalation | Missing typed source provider, unavailable native event subscription after source retry, actual unsupported body/pinning | Original-Files registration/import and source CQ execution stay direct. Layout and signal completion side transports are deleted: accepted dependencies remain on the request, and legacy signals publish to the original task actor. Production mapped layout uses original FileLayouts. Only the two actual maintenance failure sites still set `owner_required`. | [actor](../../crates/trames-linux/src/direct/uring/actor.rs), [source maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [subscriptions](../../crates/trames-linux/src/direct/uring/wait.rs), [file results](../../crates/trames-linux/src/direct/uring/actor_file.rs) |
 | Native guest mapping and exceptional native memory entry | Original task/mm source checkpoint before body effects; Vulkan import, live-private backing and unstable entry use original Memory | No joined execution category remains for admitted original tasks. Actual capability-less/solo embeddings retain their own route. Affected bytes still quiesce; permission/backing errors and bounded entry retries use the existing common model. | [source native scope](../../crates/trames-session/src/process_lifecycle_native.rs), [Vulkan import](../../crates/trames-vulkan/src/backend.rs), [native memory](../../crates/trames-memory/src/parallel/native.rs), [entry registry](../../crates/trames-accel/src/native.rs), [GPU waits](../../crates/trames-session/src/gpu.rs) |
 | Scheduler/cohort membership | Initial guest admission and legacy nonmember wake; ordinary scheduling metadata and live affinity no longer require the owner | Initial/legacy orchestration retains its boundary. Existing members migrate/park/wake locally; children and exec replacements enter the live queue. Original CPU slots can start directly and lazily from that queue. Periodic checks alone do not tear down the cohort: `cohort_control` tests actual events and original dependencies. | [legacy wake](../../crates/trames-session/src/futex.rs), [queue](../../crates/trames-session/src/run_queue.rs), [owner metadata](../../crates/trames-session/src/process_scheduling.rs), [control checks](../../crates/trames-session/src/process_vm.rs) |
-| Host/legacy embedding administration | Transfer/timezone command, pause/cancel; Mac admin/shutdown/deadline/memory-pressure requests | These actual administration requests retain their join. Original init notifications and authenticated graceful-stop signal delivery no longer join. Host exec construction/loading/admission, original group control and native terminal open/close/input/resize/hangup use original resources and existing workers. FileProvider writeback deliberately pauses when applying staged edits, as chosen by the owner. | [host launch lifecycle](../../crates/trames-session/src/process_lifecycle_host.rs), [original launches](../../crates/trames-session/src/process_host.rs), [shared terminals](../../crates/trames-distro/src/terminals.rs) |
+| Host/legacy embedding administration | Transfer/timezone command, pause/cancel; Mac admin/shutdown/deadline requests | These actual administration requests retain their join. Mac memory-pressure reclamation progresses on original mapping resources without a join. Original init notifications and authenticated graceful-stop signal delivery no longer join. Host exec construction/loading/admission, original group control and native terminal open/close/input/resize/hangup use original resources and existing workers. FileProvider writeback deliberately pauses when applying staged edits, as chosen by the owner. | [host launch lifecycle](../../crates/trames-session/src/process_lifecycle_host.rs), [original launches](../../crates/trames-session/src/process_host.rs), [shared terminals](../../crates/trames-distro/src/terminals.rs) |
 | Final teardown and faults | Actual session/backend teardown, non-notifying native stop and unhandled fault exits | Ordinary last/group/default-fatal exit is source work; CPUs and cold Rc projections return asynchronously, with actual same-mm byte custody where needed. These are not ordinary whole-cohort exit boundaries. Accepted guest faults use the original signal path; actual unhandled/backend failures and final host teardown retain their explicit boundary. A host backend error is not an automatic full-VM or software fallback. | [source completion](../../crates/trames-session/src/process_exit.rs), [fault/dispatch](../../crates/trames-session/src/workers.rs), [native lifecycle](execution-backends.md#live-native-device-authority--2026-11-03) |
 
 The final worker-dispatch catch-all remains authoritative: an exit without a
@@ -2804,3 +2819,56 @@ for exact source/runner/fixture hashes and gates. Only Mac Dev is updated; stabl
 business environments and physical iPad installs remain unchanged. Actual host
 administration, missing/excluded resources, initial/legacy/solo orchestration and
 last-resort dispatch remain. The overall goal stays active.
+
+## 75. Original Mac memory-pressure reclamation closure — 2026-11-09
+
+Mac Output::pressure_target used to request stopped control for every pending
+pressure target. Only after all guest CPUs returned did control call reclaim and
+check the target again. That field/join and duplicate stopped-only body are
+deleted. The same adapter hook now advances one original-Machine Reclaim request;
+solo/stopped callers use the same helper. The existing OS utility callback still
+only latches pressure metadata. No new callback thread or resource service is
+created, and no pressure setting is read by ordinary guest byte accesses.
+
+Warning/critical events retain the existing initial 25%/75% reclamation policy.
+The request consumes an amount once, rather than enforcing a moving resident
+ceiling while running CPUs refault. The registry's initial upper key bounds a
+finite scan. Each progress call takes at most 64 weak resource records under the
+original registry mutex, releases it, and performs at most an 8 MiB batch rounded
+to a physical extent. It does not clone/sort the complete mapping registry on the
+pressure path. Actual eviction uses the original per-mapping byte gate and
+hv_vm_unmap before Darwin's non-destructive MADV_DONTNEED advice. Stable host VA,
+anonymous contents, shared-file aliases and native range ownership remain.
+
+A borrowed mapping subscribes to its original host-lease release. Only those
+original weak resources are retried; without a release event, progress does not
+rescan or append duplicate subscriptions. Cancellation creates no VM ownership
+cycle. The immediate explicit reclaim API retains skip-borrowed semantics without
+leaving unused subscriptions. Optional explicit resident limits retain their
+existing heuristic, using the live shared counter rather than subtracting a
+stale private snapshot. Page-out counters commit with each actual unmap.
+
+All 52 signed HVF hardware tests and both signed product pressure tests pass.
+Coverage includes bounded metadata/byte batches, original borrowed writes,
+cancellation, native range growth/retirement concurrent with reclaim, retained
+address ownership, shared-file pixels, sparse native fork, code protection and
+existing resident-limit behavior. Four/twelve live vCPUs retain monotonically
+increasing counters and untouched sentinel bytes through repeated eviction and
+refault. The real userspace Linux runtime test reaches peak 4/12 execution CPUs
+and stays in one cohort with zero returned SVCs or service requests while a
+pressure event is applied and its pages return. The previous exact product test
+explicitly required joined control; the new hook explicitly rejects that join.
+
+The applicable local Mac product workflow passes. The common runtime has no Rust
+change, so its matching complete Mac/Linux workflow and both iPad compile results
+from stage 74 are reused. This is backend concurrency/reclamation acceptance,
+not a Firefox/Geekbench speedup, host RSS reduction benchmark or proof that every
+page can be reclaimed while a native borrower retains it. Physical extents still
+determine granularity and active CPUs may naturally refault pages.
+
+Exact source/test executable hashes, reuse proof and installed acceptance are in
+the product [validation record](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/memory-pressure-20261109.json).
+Only Mac Dev is updated; stable, business environments and physical iPad installs
+remain unchanged. Actual pause/cancel, transfer/writeback, shutdown, excluded
+resources, initial/legacy/solo orchestration and last-resort dispatch remain.
+The overall coordinator-removal goal stays active.
