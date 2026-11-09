@@ -668,9 +668,31 @@ mod tests {
         assert_eq!(owner.stat_at(AT_FDCWD, b"/new/child"), Err(Errno(2)));
     }
     #[test]
-    fn excluded_owner_path_has_no_namespace_effect_before_retained_handoff() {
+    fn published_global_readonly_namespace_rejection_completes_on_source() {
         let mut owner = Vfs::default();
         owner.set_runtime_info(1, RuntimeInfo::default());
+        let work = owner.path_queries().namespace_work(NamespaceCall::Mkdir {
+            fd: AT_FDCWD,
+            path: b"/proc/new".to_vec(),
+            mode: 0o755,
+        });
+        assert_eq!(count(work), Err(Errno(30)));
+        assert_eq!(owner.stat_at(AT_FDCWD, b"/proc/new"), Err(Errno(2)));
+    }
+    #[test]
+    fn explicitly_unavailable_provider_has_no_namespace_effect_before_retained_handoff() {
+        struct Unavailable;
+        impl ProcSource for Unavailable {
+            fn available(&self, _: ProcRefresh) -> bool {
+                false
+            }
+            fn observe(&self, _: ProcQuery<'_>) -> RuntimeInfo {
+                panic!("unavailable source provider")
+            }
+        }
+        let mut owner = Vfs::default();
+        owner.set_runtime_info(1, RuntimeInfo::default());
+        owner.set_proc_source(Arc::new(Unavailable));
         let work = owner.path_queries().namespace_work(NamespaceCall::Mkdir {
             fd: AT_FDCWD,
             path: b"/proc/new".to_vec(),

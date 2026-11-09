@@ -1,11 +1,21 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 89, original time observation ABI, reviewed on 2026-11-09. The prior shared runtime
-baseline is `3d91b02ae28766f4307c0a4691bab8162b412896`.
+This is the consolidated implementation audit through stage 90, original published global proc/sys resources, reviewed on 2026-11-09. The prior shared runtime
+baseline is `0c736ffe1efb13c2bd504eb9b2f9391b931d0c18`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-09
+
+Stage 90 removes legacy global proc/sys publication as an owner-only resource.
+Existing set_runtime_info data has one original shared publication; private
+resolvers retain that resource, and opened metadata files use common FileWork.
+Reads, directory/metadata lookup, existing read-only namespace errors, registered
+io_uring requests, links, completion and cancellation use the calling executor.
+A later live provider is observed outside the publication lock. Numeric PID/mm
+payloads and explicit unavailable providers keep their actual capability checks.
+Both io_uring maintenance escalation sites and all four broad categories remain;
+this closes a concrete provider dependency, not the full io_uring boundary.
 
 Stage 89 closes the implemented time-observation family: clock_gettime,
 clock_getres and gettimeofday use common source/solo ABI bodies on their calling
@@ -349,7 +359,7 @@ is not a claim that all coordinator work is removed.
 | Read-only VM observations and implemented non-discard advice | Calling executor, original admitted mappings/reservations and per-page resident metadata; common source/solo ABI | No observation-only join or mm checkpoint. Genuine absent custom observation capabilities retain explicit before-effects fallback; actual discard/mapping mutation remains scoped |
 | Guest halt/poweroff | Calling executor and original root/caller group exit controls; common policy for source/solo | No supported power-control-only join. Missing original shutdown/exit capabilities keep explicit legacy execution. Unsupported restart/kexec and nested PID namespace power behavior retain their existing errno |
 | System statistics and live CPU accounting | sysinfo and proc consume original task/mm/host resources; original execution assignments publish live time | No supported-statistics-only join remains. Genuine absent statistics/host capabilities retain legacy execution; load remains a five-second observer-sampled approximation |
-| Dynamic proc/sys views and proc pathname/FD consumers | Original PID/mm/Files/fs/namespace resources on the calling worker; owner/solo queries use the same provider | First cross-mm byte export and invalidation now activate on an existing worker using only original task/mm custody. Legacy embeddings without a provider and actual policy remain separate |
+| Dynamic proc/sys views and proc pathname/FD consumers | Original PID/mm/Files/fs/namespace resources on the calling worker; owner/solo queries use the same provider | First cross-mm byte export and invalidation now activate on an existing worker using only original task/mm custody. Published global metadata retains its original publication; numeric PID/mm paths without their actual provider and actual policy remain separate |
 | Mount topology administration | Calling worker and original namespace/fs_struct resources, with existing disk workers only for host-backed path work | Busy transactions park the caller on original readiness. Genuinely excluded path controls keep separate boundaries |
 | Task namespace membership and Files/fs detachment | Calling worker; supported unshare/setns and close_range update original per-task bindings and all future-call consumers; busy namespace transactions return the execution slot | Capability-less embeddings remain. Clone namespace creation retains creator-mm custody; unsupported user/time namespace semantics remain separate |
 | prctl task controls and per-thread comm | Source/solo share residual parent-death/subreaper/name/SME/error handling; existing credential/seccomp routes remain original-resource work. Proc and diagnostics observe the same original name | No production prctl-only join remains. Genuine missing parent/family providers keep before-effects fallback; absent backend SME support keeps its original EINVAL. Name publication/fork/exec retain actual task/image identity |
@@ -479,13 +489,13 @@ Actual excluded policy effects and missing capabilities retain explicit boundari
 ### Current remaining categories
 
 The count is **four broad categories**, not the number of historical subsystem
-rows. Stages 72–89 remove concrete triggers and close request-authority dependencies inside those categories; they do not
+rows. Stages 72–90 remove concrete triggers and close request-authority dependencies inside those categories; they do not
 prove that the final generic fallback is unreachable.
 
 | Remaining category | Actual trigger | Current scope / authoritative implementation |
 | --- | --- | --- |
 | Host cancellation and final teardown | Host cancel, deadline, shutdown, legacy stopped-hook requests, final CPU/backend drain and actual native-event backend failure | Pause/resume, original init notifications/signals, pressure reclaim, host filesystem commands and terminal/process admission no longer join. Actual terminal teardown and backend failure still stop their actors. Native-event failure returns its original HostIo cause after drain/cancellation, without an owner syscall retry. See [host control](../../crates/trames-session/src/process_vm.rs), [completion](../../crates/trames-session/src/process_exit.rs) and [workers](../../crates/trames-session/src/workers.rs). |
-| Missing capabilities and excluded resources | A genuinely absent source provider, an excluded original FD/node graph, a genuinely absent native event capability or unsupported source request body | There is no filesystem-kind exclusion after stage 82. Existing node/provider admission still applies. io_uring has exactly two submitter-scoped `require_owner()` maintenance call sites: missing-capability wait-source preparation and deferred original body progress; actual host backend errors take terminal source error handling. They remain connected to actual accepted request lifetime, subscriptions and cancellation. See [path authority](../../crates/trames-vfs/src/path_queries.rs), [maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [wait sources](../../crates/trames-linux/src/direct/uring/wait.rs) and [actor](../../crates/trames-linux/src/direct/uring/actor.rs). |
+| Missing capabilities and excluded resources | A genuinely absent source provider, an excluded original FD/node graph, a genuinely absent native event capability or unsupported source request body | There is no filesystem-kind exclusion after stage 82. Published global proc/sys metadata no longer lacks a source provider merely because it uses set_runtime_info. Other node/provider admission still applies. io_uring has exactly two submitter-scoped `require_owner()` maintenance call sites: missing-capability wait-source preparation and deferred original body progress; actual host backend errors take terminal source error handling. They remain connected to actual accepted request lifetime, subscriptions and cancellation. See [path authority](../../crates/trames-vfs/src/path_queries.rs), [maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [wait sources](../../crates/trames-linux/src/direct/uring/wait.rs) and [actor](../../crates/trames-linux/src/direct/uring/actor.rs). |
 | Final execution dispatch fallback | A returned SVC/HLT/fault not completed, parked or accepted by a source scope | The catch-all stops the current cohort for joined dispatch. Ordinary shared-FD ioctl discovery and residual prctl controls/errors and implemented time observations no longer use it. It remains an audit target even though admitted native calls, ordinary guest faults, generated ENOSYS and migrated syscalls have source completion. A backend error is not a software or full-Linux-VM fallback. See [worker dispatch](../../crates/trames-session/src/workers.rs) and [classification](../../crates/trames-session/src/worker_syscalls.rs). |
 | Initial and legacy orchestration | Initial admission, standalone/capability-less nonmember scheduling and other excluded embedding routes | Ordinary live members and preexisting Kernel Futex/Sleep actors migrate, park and wake on the original queue. Cold waiters have metadata only until an event prepares their original mm; child/exec admission and lazy CPU slots no longer require a joined owner. The standalone futex legacy-publication mechanism remains. Solo dispatch is on the caller, so its existence alone is not a cross-thread transition. See [admission](../../crates/trames-session/src/process.rs), [legacy wakes](../../crates/trames-session/src/futex.rs) and [queue](../../crates/trames-session/src/run_queue.rs). |
 
@@ -3686,3 +3696,57 @@ actual host control/final teardown, missing/excluded resources (including both
 io_uring maintenance escalation sites), other final dispatch and initial/legacy
 orchestration remain explicit. Scoped original mm/backing synchronization is not
 reclassified as a whole-cohort syscall handoff.
+
+
+## 90. Original published global proc/sys resources — 2026-11-09
+
+The legacy set_runtime_info API already owns an original synchronized global
+publication. Missing a typed live ProcSource no longer makes those global
+proc/sys resources owner-only. Private query views retain the original publication,
+flattening projection-of-projection capture to the same root. Open descriptions
+retain a type-erased provider over that resource and the existing common FileWork
+path supplies ordinary and io_uring reads. No copied owner VFS, Files table,
+resource thread, polling bus or per-native-call synchronization is introduced.
+The type-erased provider preserves the existing Send/Sync capability boundary;
+no new unsafe trait implementation or higher recursion limit is needed.
+
+Global traversal and metadata refresh use the original published fields. Retained
+OFDs observe later publications and a subsequently installed live provider; its
+callbacks run after releasing the publication lock. Existing read-only namespace
+operations now report their original EROFS directly when this provider suffices.
+The original root has no projection back-reference. Published fdinfo and PID
+bindings retain their existing weak open/task identities, and last-close tests
+verify that a retained file survives owner/table closure and releases its root
+when the last accepted description is gone.
+
+This does not manufacture a live PID/mm capability. Numeric PID paths, argv,
+environment, maps and saved auxv still require their original typed resources.
+An explicitly unavailable ProcSource still defers before effects. Boundary tests
+now name that real exclusion instead of treating every published global file as
+unavailable. They retain functional owner completion, original OFD reuse and
+before-effect namespace assertions. The cold native fixture likewise uses a
+working global read with an explicitly unavailable source provider; prior-runtime
+four/twelve-CPU runs retain two cohorts and one returned read.
+
+The common tests cover version, cpuinfo, meminfo, uptime, stat and CPU sysfs
+metadata, source/solo agreement, updates, provider replacement and last close.
+A linked io_uring read waits for an original eventfd, retains a global description
+across FD close/reuse, then reads its updated publication. A second submitter
+continues independently; cancellation releases the same accepted chain without
+copyout. Completion order is not serialized by this work. The connected process
+fixture runs pread and a fixed-file registered io_uring request on four/twelve
+CPUs, one execution slot and seccomp ALLOW. Prior production stops at pread;
+source execution completes in one cohort with zero returned syscall or service.
+
+Both actual io_uring maintenance escalation sites remain: genuinely missing native
+wait capability and an original body still excluded by its provider. This work
+removes the published global metadata dependency from those triggers rather than
+renaming their joins. Host cancellation/final teardown, other final dispatch and
+initial/legacy orchestration also remain. The overall removal goal stays active.
+
+Both full local runtime workflows pass on macOS and ARM64 Linux. Each host
+passes 441 process regressions (two intentionally ignored) and ten FFI cases;
+strict lint and both iPad SDK targets pass. Signed native and installed Dev
+acceptance are recorded in the paired product's validation record. Source-only
+passing checks are not used as a claim that either maintenance escalation site
+is unreachable.

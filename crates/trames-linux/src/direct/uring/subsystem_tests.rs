@@ -843,6 +843,7 @@ fn proc_control_registered_files_keep_original_resource_and_complete_on_source()
 fn shared_volatile_registered_file_keeps_its_body_boundary_and_original_ofd() {
     let (mut l, mut m, fd, r) = setup(8);
     l.vfs.set_runtime_info(1, Default::default());
+    exclude_proc_provider(&l);
     let file = l.vfs.open_at(-100, b"/proc/version", 0, 0).unwrap();
     assert!(l.vfs.shared_files().lookup(file).unwrap().is_ok());
     m.write_array(0x1200, file.to_le_bytes()).unwrap();

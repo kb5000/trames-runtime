@@ -9592,3 +9592,7 @@ mod prctl_tests;
 #[cfg(all(test, trames_interpreter_conformance))]
 #[path = "process_time_tests.rs"]
 mod time_tests;
+
+#[cfg(all(test, trames_interpreter_conformance))]
+#[path = "process_published_proc_tests.rs"]
+mod published_proc_tests;

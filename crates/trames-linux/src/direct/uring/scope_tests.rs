@@ -82,6 +82,7 @@ fn foreign_background_does_not_adopt_another_submitters_pending_request() {
 fn body_deferral_does_not_disable_another_submitters_live_maintenance() {
     let (mut l, mut m, fd, ring) = setup(8);
     l.vfs.set_runtime_info(1, Default::default());
+    exclude_proc_provider(&l);
     let excluded = l.vfs.open_at(-100, b"/proc/version", 0, 0).unwrap();
     let ordinary = l.vfs.eventfd(0, 0).unwrap();
     let mut epoch = UringEpoch::default();
@@ -126,6 +127,97 @@ fn body_deferral_does_not_disable_another_submitters_live_maintenance() {
     assert_eq!(cq(&mut m, &ring), (7, 8));
     assert_eq!(&m.read_array::<5>(0x2000 + 7 * 32).unwrap(), b"Linux");
     assert!(!l.uring_requires_owner());
+}
+
+#[test]
+fn linked_published_metadata_observes_original_updates_and_releases_on_cancel_or_completion() {
+    for cancel in [false, true] {
+        let (mut l, mut m, fd, ring) = setup(8);
+        l.vfs.set_runtime_info(
+            1,
+            trames_vfs::RuntimeInfo {
+                cpu_count: 2,
+                ..Default::default()
+            },
+        );
+        let published = l
+            .vfs
+            .open_at(-100, b"/sys/devices/system/cpu/online", 0, 0)
+            .unwrap();
+        let gate = l.vfs.eventfd(0, 0).unwrap();
+        let ordinary = l.vfs.eventfd(0, 0).unwrap();
+        let mut epoch = UringEpoch::default();
+        let first = caller(&l, &m, &mut epoch, 7);
+        let second = caller(&l, &m, &mut epoch, 8);
+        let target: Arc<dyn IoWake> = Arc::new(Target);
+        m.write(0x2100, &[0xa5; 8]).unwrap();
+        let mut linked = read(gate, 0x2000, 70);
+        linked[1] = 4; // IOSQE_IO_LINK: published read cannot run before the gate.
+        add(&mut m, &ring, linked);
+        add(&mut m, &ring, read(published, 0x2100, 71));
+        assert!(matches!(
+            first.start(
+                426,
+                [fd as u64, 2, 0, 0, 0, 0],
+                &mut m,
+                7,
+                &Arc::downgrade(&target),
+                None
+            ),
+            Some(IoAttempt::Complete(Ok(2)))
+        ));
+        add(&mut m, &ring, read(ordinary, 0x2200, 8));
+        assert!(matches!(
+            second.start(
+                426,
+                [fd as u64, 1, 0, 0, 0, 0],
+                &mut m,
+                8,
+                &Arc::downgrade(&target),
+                None
+            ),
+            Some(IoAttempt::Complete(Ok(1)))
+        ));
+        // FD reuse cannot replace the accepted publication; another publish
+        // remains visible even though its description is no longer in Files.
+        l.vfs.close(published).unwrap();
+        assert_eq!(l.vfs.eventfd(99, 0).unwrap(), published);
+        l.vfs.set_runtime_info(
+            1,
+            trames_vfs::RuntimeInfo {
+                cpu_count: 6,
+                ..Default::default()
+            },
+        );
+        let mut background = first.uring_background(7, &Arc::downgrade(&target)).unwrap();
+        let mut other = second
+            .uring_background(8, &Arc::downgrade(&target))
+            .unwrap();
+        assert!(background.progress(&mut m).unwrap());
+        assert!(other.progress(&mut m).unwrap());
+        l.vfs.write(ordinary, &9u64.to_le_bytes()).unwrap();
+        assert!(other.signal.ready());
+        assert!(other.progress(&mut m).unwrap());
+        assert_eq!(cq(&mut m, &ring), (8, 8));
+        if cancel {
+            first.cancel_task_uring(m.instruction_identity().0, 7);
+            assert!(background.progress(&mut m).unwrap());
+            let mut cancelled = [cq(&mut m, &ring), cq(&mut m, &ring)];
+            cancelled.sort_unstable();
+            assert_eq!(cancelled, [(70, -125), (71, -125)]);
+            assert_eq!(m.read_array::<8>(0x2100).unwrap(), [0xa5; 8]);
+        } else {
+            l.vfs.write(gate, &1u64.to_le_bytes()).unwrap();
+            assert!(background.signal.ready());
+            assert!(background.progress(&mut m).unwrap());
+            assert_eq!(cq(&mut m, &ring), (70, 8));
+            assert_eq!(cq(&mut m, &ring), (71, 4));
+            assert_eq!(m.read_array::<4>(0x2100).unwrap(), *b"0-5\n");
+        }
+        assert!(!background.active() && !other.active());
+        assert!(!l.uring_requires_owner());
+        assert_eq!(l.vfs.read(published, 8).unwrap(), 99u64.to_le_bytes());
+    }
 }
 
 #[test]

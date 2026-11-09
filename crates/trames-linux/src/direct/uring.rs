@@ -1874,3 +1874,17 @@ mod tests {
 #[cfg(test)]
 #[path = "uring/scope_tests.rs"]
 mod scope_tests;
+
+#[cfg(test)]
+fn exclude_proc_provider(linux: &Linux) {
+    struct Unavailable;
+    impl trames_vfs::ProcSource for Unavailable {
+        fn available(&self, _: trames_vfs::ProcRefresh) -> bool {
+            false
+        }
+        fn observe(&self, _: trames_vfs::ProcQuery<'_>) -> trames_vfs::RuntimeInfo {
+            panic!("the original embedding explicitly has no source provider")
+        }
+    }
+    linux.vfs.set_proc_source(Arc::new(Unavailable));
+}

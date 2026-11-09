@@ -15,6 +15,22 @@ pub(super) struct ProcFile {
     readers: Mutex<Readers>,
     renderer: Mutex<PathQueries>,
 }
+
+// The type-erased source preserves the existing ProcFile capability boundary;
+// its original publication has no Files root. PID bindings and fdinfo retain
+// only their existing weak task/open capabilities.
+pub(super) struct PublishedGlobal(pub(super) Arc<SharedCell<pseudo::PseudoFs>>);
+impl ProcSource for PublishedGlobal {
+    fn observe(&self, query: ProcQuery<'_>) -> RuntimeInfo {
+        // Do not hold the original publication lock across provider callbacks.
+        let source = self.0.borrow().source.clone();
+        if let Some(source) = source.filter(|s| s.available(query.demand)) {
+            source.observe(query)
+        } else {
+            self.0.borrow().runtime.clone()
+        }
+    }
+}
 #[derive(Clone, Copy)]
 enum Payload {
     CommandLine,
@@ -199,15 +215,38 @@ impl ProcFile {
     }
 }
 impl Vfs {
+    pub(super) fn published_global(
+        &self,
+        path: &[u8],
+    ) -> Option<Arc<SharedCell<pseudo::PseudoFs>>> {
+        if path != b"/sys" && !path.starts_with(b"/sys/") {
+            let tail = path.strip_prefix(b"/proc")?;
+            if !tail.is_empty() && !tail.starts_with(b"/") {
+                return None;
+            }
+            let first = tail
+                .strip_prefix(b"/")
+                .unwrap_or(tail)
+                .split(|&b| b == b'/')
+                .next()
+                .unwrap_or_default();
+            if matches!(first, b"self" | b"thread-self")
+                || first.first().is_some_and(u8::is_ascii_digit)
+            {
+                return None;
+            }
+        }
+        self.pseudo.borrow().publication.clone()
+    }
     pub(super) fn proc_runtime_file(&self, path: &ResolvedPath) -> Option<Arc<ProcFile>> {
         if !self.uses_pseudo(path) || !self.pseudo_readonly(path) {
             return None;
         }
-        let source = self.pseudo.borrow().source.clone()?;
+        let source = self.pseudo.borrow().source.clone();
         let demand = ProcRefresh::for_path(path);
         // Live guest bytes still require an actual read capability. Loaded
         // argv/environment metadata must never silently become their authority.
-        if !source.available(demand) {
+        if source.as_ref().is_some_and(|s| !s.available(demand)) {
             return None;
         }
         let parts: Vec<_> = path
@@ -230,11 +269,23 @@ impl Vfs {
                         .as_ref()
                         .and_then(|p| p.at(path, self.proc_namespace(path).id()))
                         .map(|p| p.target.clone())
-                        .or_else(|| source.task(pid))?,
+                        .or_else(|| source.as_ref()?.task(pid))?,
                 )
             }
             None => None,
         };
+        // Published global proc/sys metadata already has an original shared
+        // authority. It does not grant a guest-mm capability for numeric PID
+        // files, cmdline, environment, maps or saved auxv.
+        if source.is_none()
+            && (local_pid.is_some()
+                || demand.arguments()
+                || demand.environment()
+                || demand.mappings()
+                || demand.auxiliary())
+        {
+            return None;
+        }
         let payload = if demand.arguments() {
             Some(Payload::CommandLine)
         } else if demand.environment() {
@@ -264,6 +315,7 @@ impl Vfs {
             query.retained = target.as_ref();
             Some(
                 source
+                    .as_ref()?
                     .observe(query)
                     .processes
                     .into_iter()
@@ -293,14 +345,22 @@ impl Vfs {
             let original = self.pseudo.borrow();
             let mut pseudo = view.pseudo.borrow_mut();
             pseudo.enabled = true;
-            pseudo.source = Some(source.clone());
+            pseudo.source = source.clone();
             pseudo.boot_id = original.boot_id.clone();
             pseudo.video_device = original.video_device.clone();
         }
         Some(Arc::new(ProcFile {
             path: path.key.clone(),
             mount: path.mount.as_ref().map(|m| m.shared.clone()),
-            source,
+            source: source.unwrap_or_else(|| {
+                Arc::new(PublishedGlobal(
+                    self.pseudo
+                        .borrow()
+                        .publication
+                        .clone()
+                        .unwrap_or_else(|| self.pseudo.clone()),
+                ))
+            }),
             target,
             memory,
             saved,
@@ -310,5 +370,193 @@ impl Vfs {
                 view: RefCell::new(view),
             }),
         }))
+    }
+}
+
+#[cfg(test)]
+mod published_tests {
+    use super::*;
+    use std::time::Duration;
+    fn bytes(outcome: FileOutcome) -> Vec<u8> {
+        let FileOutcome::Complete(reply) = outcome else {
+            panic!("global metadata needs no owner/layout/byte wait")
+        };
+        let FileValue::Bytes(bytes) = reply.result.unwrap() else {
+            panic!("metadata bytes")
+        };
+        bytes
+    }
+    fn read(owner: &Vfs, file: FileTarget) -> Vec<u8> {
+        bytes(
+            FileWork::from_vfs(
+                owner,
+                file,
+                FileCommand::Read {
+                    count: 16384,
+                    offset: Some(0),
+                },
+            )
+            .run(),
+        )
+    }
+    #[test]
+    fn all_published_global_metadata_uses_the_original_resource_on_source() {
+        let mut owner = Vfs::default();
+        owner.set_runtime_info(
+            1,
+            RuntimeInfo {
+                cpu_count: 4,
+                uptime: Duration::from_secs(123),
+                memory_limit: 128 << 20,
+                ..Default::default()
+            },
+        );
+        let paths = owner.path_queries();
+        for path in [
+            b"/proc/version".as_slice(),
+            b"/proc/cpuinfo",
+            b"/proc/meminfo",
+            b"/proc/uptime",
+            b"/proc/stat",
+            b"/sys/devices/system/cpu/online",
+        ] {
+            let solo = owner.open_at(AT_FDCWD, path, 0, 0).unwrap();
+            let fd = paths
+                .open_at_resolve(AT_FDCWD, path, 0, 0, 0, &DirectFiles::default())
+                .expect("published global provider is retained")
+                .unwrap();
+            let target = owner
+                .shared_files()
+                .lookup(fd)
+                .unwrap()
+                .unwrap()
+                .file_target()
+                .expect("original metadata FileTarget");
+            assert_eq!(
+                read(&owner, target),
+                owner.pread(solo, 16384, 0).unwrap(),
+                "{}",
+                String::from_utf8_lossy(path)
+            );
+            owner.close(fd).unwrap();
+            owner.close(solo).unwrap();
+        }
+    }
+    #[test]
+    fn retained_global_file_observes_publication_and_live_provider_without_files_cycle() {
+        struct Live(std::sync::Weak<SharedCell<pseudo::PseudoFs>>);
+        impl ProcSource for Live {
+            fn observe(&self, _: ProcQuery<'_>) -> RuntimeInfo {
+                // Provider callbacks can reenter the original publication.
+                let _root = self.0.upgrade().unwrap().borrow().enabled;
+                RuntimeInfo {
+                    cpu_count: 9,
+                    ..Default::default()
+                }
+            }
+        }
+        let mut owner = Vfs::default();
+        owner.set_runtime_info(
+            1,
+            RuntimeInfo {
+                cpu_count: 2,
+                ..Default::default()
+            },
+        );
+        let original = Arc::downgrade(&owner.pseudo);
+        let paths = owner.path_queries();
+        let fd = paths
+            .open_at_resolve(
+                AT_FDCWD,
+                b"/sys/devices/system/cpu/online",
+                0,
+                0,
+                0,
+                &DirectFiles::default(),
+            )
+            .unwrap()
+            .unwrap();
+        let target = owner
+            .shared_files()
+            .lookup(fd)
+            .unwrap()
+            .unwrap()
+            .file_target()
+            .unwrap();
+        assert_eq!(read(&owner, target.clone()), b"0-1\n");
+        owner.set_runtime_info(
+            1,
+            RuntimeInfo {
+                cpu_count: 6,
+                ..Default::default()
+            },
+        );
+        assert_eq!(read(&owner, target.clone()), b"0-5\n");
+        owner.set_proc_source(Arc::new(Live(original.clone())));
+        assert_eq!(read(&owner, target.clone()), b"0-8\n");
+        let work = FileWork::from_vfs(
+            &owner,
+            target.clone(),
+            FileCommand::Read {
+                count: 64,
+                offset: Some(0),
+            },
+        );
+        owner.close(fd).unwrap();
+        drop(paths);
+        drop(owner);
+        assert!(original.upgrade().is_some());
+        assert_eq!(bytes(work.run()), b"0-8\n");
+        drop(target);
+        assert!(
+            original.upgrade().is_none(),
+            "last close must release the original publication"
+        );
+    }
+    #[test]
+    fn published_metadata_does_not_invent_live_pid_memory_or_override_explicit_exclusion() {
+        struct Excluded;
+        impl ProcSource for Excluded {
+            fn available(&self, _: ProcRefresh) -> bool {
+                false
+            }
+            fn observe(&self, _: ProcQuery<'_>) -> RuntimeInfo {
+                panic!("unavailable original provider")
+            }
+        }
+        let mut owner = Vfs::default();
+        owner.set_runtime_info(
+            1,
+            RuntimeInfo {
+                processes: vec![ProcessInfo {
+                    pid: 1,
+                    tgid: 1,
+                    arguments: vec![b"metadata-only".to_vec()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let paths = owner.path_queries();
+        for path in [
+            b"/proc/1/cmdline".as_slice(),
+            b"/proc/1/environ",
+            b"/proc/1/maps",
+            b"/proc/1/auxv",
+        ] {
+            assert!(
+                paths
+                    .open_at_resolve(AT_FDCWD, path, 0, 0, 0, &DirectFiles::default())
+                    .is_none(),
+                "numeric PID metadata is not a live mm capability"
+            );
+        }
+        owner.set_proc_source(Arc::new(Excluded));
+        assert!(owner
+            .path_queries()
+            .open_at_resolve(AT_FDCWD, b"/proc/version", 0, 0, 0, &DirectFiles::default())
+            .is_none());
+        let fd = owner.open_at(AT_FDCWD, b"/proc/version", 0, 0).unwrap();
+        assert!(owner.pread(fd, 8, 0).unwrap().starts_with(b"Linux"));
     }
 }

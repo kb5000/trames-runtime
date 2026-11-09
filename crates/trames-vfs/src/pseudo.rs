@@ -794,6 +794,9 @@ pub(super) struct PseudoFs {
     pub(super) enabled: bool,
     pub(super) runtime: RuntimeInfo,
     pub(super) source: Option<Arc<dyn proc_source::ProcSource>>,
+    /// Only private legacy query views retain their original publication.
+    /// The original root has None; a projection never points back to itself.
+    pub(super) publication: Option<Arc<SharedCell<PseudoFs>>>,
     pub(super) nodes: Arc<SharedCell<PseudoNodes>>,
 }
 #[derive(Default)]
@@ -1498,6 +1501,7 @@ impl Vfs {
             if path != b"/dev"
                 && !path.starts_with(b"/dev/")
                 && self.pseudo.borrow().source.is_none()
+                && self.published_global(path).is_none()
             {
                 return query.defer();
             }

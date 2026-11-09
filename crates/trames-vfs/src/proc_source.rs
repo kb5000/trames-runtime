@@ -288,7 +288,20 @@ impl Vfs {
         path: &P,
         enumerate: bool,
     ) -> Result<()> {
-        let Some(source) = self.pseudo.borrow().source.clone() else {
+        let source = self.pseudo.borrow().source.clone();
+        let Some(source) = source else {
+            if let Some(original) = self.published_global(path.key()) {
+                let mut query = ProcQuery::new(
+                    path.key(),
+                    ProcRefresh::for_path(path.key()).lookup(),
+                    self.proc_namespace(path),
+                    self.pid,
+                );
+                query.enumerate = enumerate;
+                query.content = false;
+                let runtime = proc_file::PublishedGlobal(original).observe(query);
+                self.pseudo.borrow_mut().runtime = runtime;
+            }
             return Ok(());
         };
         let key = path.key();

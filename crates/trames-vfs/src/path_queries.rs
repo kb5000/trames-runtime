@@ -194,6 +194,12 @@ impl Vfs {
             pseudo.enabled = source.enabled;
             pseudo.nodes = source.nodes.clone();
             pseudo.source = source.source.clone();
+            pseudo.publication = source.source.is_none().then(|| {
+                source
+                    .publication
+                    .clone()
+                    .unwrap_or_else(|| self.pseudo.clone())
+            });
             pseudo.boot_id = source.boot_id.clone();
             pseudo.video_device = source.video_device.clone();
         }
@@ -895,16 +901,20 @@ mod tests {
         assert!(owner.stat_fd(fd).is_ok());
     }
     #[test]
-    fn pseudo_traversals_and_owner_fds_defer_even_through_aliases() {
+    fn numeric_pid_without_provider_defers_but_global_metadata_uses_original_publication() {
         let mut owner = Vfs::default();
         owner.set_runtime_info(1, RuntimeInfo::default());
         owner
             .symlink_at(b"/proc/self/status", AT_FDCWD, b"/alias")
             .unwrap();
         let query = owner.path_queries();
-        for path in [b"/proc/self/status".as_slice(), b"/alias", b"/sys/kernel"] {
+        for path in [b"/proc/self/status".as_slice(), b"/alias"] {
             assert!(query.stat_at(AT_FDCWD, path, false).is_none(), "{path:?}");
         }
+        assert_eq!(
+            query.stat_at(AT_FDCWD, b"/sys/kernel", false),
+            Some(owner.stat_at(AT_FDCWD, b"/sys/kernel"))
+        );
         assert_eq!(
             query.stat_at(AT_FDCWD, b"/dev/kmsg", false),
             Some(owner.stat_at(AT_FDCWD, b"/dev/kmsg"))
