@@ -50,6 +50,7 @@ pub(super) struct Socket {
     native: SharedState<Option<Arc<native::Socket>>>,
     guest: SharedState<Option<Arc<virtualnet::Socket>>>,
     path: Cell<Path>,
+    poll_revision: Cell<u64>,
     bound: Cell<Option<SocketAddr>>,
     peer: Cell<Option<SocketAddr>>,
     listening: Cell<bool>,
@@ -75,6 +76,7 @@ impl Socket {
             native: SharedState::new(Some(native)),
             guest: SharedState::new(None),
             path: Cell::new(Path::Idle),
+            poll_revision: Cell::new(0),
             bound: Cell::new(None),
             peer: Cell::new(None),
             listening: Cell::new(false),
@@ -96,6 +98,8 @@ impl Socket {
             s.set_option_bytes(*level, *name, value)?;
         }
         *branch = Some(s.clone());
+        self.poll_revision
+            .update(|revision| revision.wrapping_add(1));
         Ok(s)
     }
     fn guest(&self) -> Result<Arc<virtualnet::Socket>> {
@@ -301,6 +305,8 @@ impl Socket {
                 // half. No guest/native poll waiter survives this syscall.
                 drop(native);
                 self.native.borrow_mut().take();
+                self.poll_revision
+                    .update(|revision| revision.wrapping_add(1));
                 self.guest.borrow_mut().take();
                 let _ = self.native();
                 return Err(error);
@@ -524,6 +530,9 @@ impl Socket {
                 .as_ref()
                 .and_then(|s| s.ancillary_hop())
         }
+    }
+    pub(super) fn wait_revision(&self) -> u64 {
+        (self.poll_revision.get() << 2) | self.path.get() as u64
     }
     pub fn waiters(&self, events: u16) -> (Option<(Arc<native::Socket>, u16)>, Option<Fabric>) {
         let native = (self.path.get() != Path::Guest)

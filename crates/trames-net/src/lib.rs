@@ -405,6 +405,13 @@ impl Socket {
     ) -> trames_shared::IoSubscription {
         self.changed.subscribe(signal)
     }
+    /// Identity of the original event-source selection, not a data epoch.
+    pub fn wait_revision(&self) -> u64 {
+        match &self.backend {
+            SocketBackend::Hybrid(socket) => socket.wait_revision(),
+            _ => 0,
+        }
+    }
     /// The VFS publishes control changes after releasing its admission lock.
     pub fn publish_changes(&self) {
         self.changed.notify_atomic();

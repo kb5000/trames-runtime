@@ -4218,7 +4218,10 @@ still permits final close/FIN; accepted byte work keeps its real transport lease
 Unconnected TCP, UDP, netlink and virtual/hybrid sockets use their original
 readiness, native observers and existing stack deadlines. Only generic sockets
 with changing native sets rebuild those subscriptions; established TCP retains
-its stable observer. Native registration failures retain the original host error.
+its stable observer. The source-selection revision includes actual endpoint
+replacement and route selection. Stable data/backpressure retries emit no
+structural notification or extra readiness publication RMW and cannot self-wake
+a parked retry. Native registration failures retain the original host error.
 No coordinator, resource-service thread or polling message bus is introduced.
 
 Current-offset preadv2/pwritev2 uses the existing pipe, Unix, signalfd, TCP and
@@ -4242,6 +4245,7 @@ executor handoff, cancellation, native/virtual UDP deadlines, vector transports
 and post-write errors/no replay. Four broad categories remain: this does not prove
 the generic final-dispatch catch-all unreachable, remove custom embedding
 boundaries, or eliminate the two actual io_uring maintenance escalations. Full
-cross-platform and native evidence is recorded in the product's batch validation
-record; no production fallback-frequency or throughput gain is inferred from
+cross-platform and native evidence is recorded in the product's
+[batch validation record](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/fd-admission-20261110.json);
+no production fallback-frequency or throughput gain is inferred from
 finite dispatch fixtures.

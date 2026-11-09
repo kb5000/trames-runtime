@@ -45,10 +45,14 @@ impl SocketOperation {
     /// this callback; accept prepares its new OFD separately before publication.
     pub fn with_tcp_publication<T>(&self, operation: impl FnOnce() -> T) -> T {
         let mut publication = self.0.tcp_publication.lock().unwrap();
+        let previous = self.wait_revision();
         let result = operation();
         *publication = Vfs::direct_tcp_shared(&self.0);
+        let changed = self.wait_revision() != previous;
         drop(publication);
-        self.publish_changes();
+        if changed {
+            self.publish_changes();
+        }
         result
     }
     pub fn refresh_tcp(&self) {

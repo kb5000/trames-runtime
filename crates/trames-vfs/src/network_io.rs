@@ -58,11 +58,7 @@ impl DirectNetwork {
             result
         });
         drop(publication);
-        if refresh {
-            if let Some(socket) = &open.socket {
-                socket.publish_changes();
-            }
-        }
+        // Direct native control does not replace the original event sources.
         result
     }
 
@@ -136,6 +132,10 @@ impl Vfs {
     /// This also preserves aliases when the addressed FD is closed.
     pub fn with_socket_control<T>(&mut self, fd: u32, operation: impl FnOnce(&mut Self) -> T) -> T {
         let descriptor = self.fds.get(&fd);
+        let previous = descriptor
+            .as_ref()
+            .and_then(|descriptor| descriptor.open.borrow().socket.clone())
+            .map(|socket| socket.wait_revision());
         let result = operation(self);
         if let Some(descriptor) = descriptor {
             let open = descriptor.open.borrow();
@@ -145,7 +145,9 @@ impl Vfs {
             drop(publication);
             drop(open);
             if let Some(socket) = socket {
-                socket.publish_changes();
+                if previous != Some(socket.wait_revision()) {
+                    socket.publish_changes();
+                }
             }
         }
         result

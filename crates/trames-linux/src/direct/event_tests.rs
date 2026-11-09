@@ -533,3 +533,46 @@ fn nested_virtual_udp_wait_uses_original_stack_deadline_without_owner_or_service
         .join()
         .unwrap();
 }
+
+#[test]
+fn stable_socket_data_and_would_block_do_not_self_wake_topology_waiters() {
+    let mut v = Vfs::default();
+    v.configure_network(trames_vfs::NetworkMode::Loopback)
+        .unwrap();
+    let fd = v.socket(2, 2, 0).unwrap();
+    let socket = v.socket_operation(fd).unwrap();
+    let target: Arc<dyn IoWake> = Arc::new(Wake);
+    let signal = IoSignal::new(1, Arc::downgrade(&target));
+    let _subscription = socket.subscribe_changes(&signal);
+    socket
+        .with_tcp_publication(|| socket.bind("127.0.0.1:0".parse().unwrap()))
+        .unwrap();
+    assert!(
+        signal.ready(),
+        "native/guest selection changes the original event-source set"
+    );
+    signal.reset();
+    let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    for _ in 0..32 {
+        assert_eq!(
+            socket
+                .with_tcp_publication(|| socket.recv(1, 0))
+                .err()
+                .unwrap()
+                .0,
+            11
+        );
+        assert_eq!(
+            socket.with_tcp_publication(|| socket.send(
+                b"data",
+                0,
+                Some(peer.local_addr().unwrap())
+            )),
+            Ok(4)
+        );
+        assert!(
+            !signal.ready(),
+            "stable data retries must not create structural self-wakes"
+        );
+    }
+}
