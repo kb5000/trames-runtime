@@ -2158,7 +2158,7 @@ impl<C: Cpu> Kernel<C> {
                 p.state = State::Sleep(deadline, remaining);
                 Ok(None)
             },
-            113 | 114 => crate::worker_syscalls::clock_with_boot(
+            113 | 114 => trames_linux::clock_read(
                 &mut p.memory,
                 number,
                 a[0],
@@ -9588,3 +9588,7 @@ mod ioctl_tests;
 #[cfg(all(test, trames_interpreter_conformance))]
 #[path = "process_prctl_tests.rs"]
 mod prctl_tests;
+
+#[cfg(all(test, trames_interpreter_conformance))]
+#[path = "process_time_tests.rs"]
+mod time_tests;

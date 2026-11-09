@@ -258,52 +258,8 @@ pub(super) fn clock(
     address: u64,
     started: Instant,
 ) -> Result<u64, Errno> {
-    clock_with_boot(memory, number, id, address, started, None)
+    trames_linux::clock_read(memory, number, id, address, started, None)
 }
-pub(super) fn clock_with_boot(
-    memory: &mut impl CpuMemory,
-    number: u32,
-    id: u64,
-    address: u64,
-    started: Instant,
-    boot: Option<trames_linux::Boottime>,
-) -> Result<u64, Errno> {
-    // clockid_t is a signed 32-bit Linux ABI argument, including raw SVCs.
-    let id = id as u32;
-    if !matches!(id, 0 | 1 | 4..=7) {
-        return Err(Errno(22));
-    }
-    if number == 114 && address == 0 {
-        return Ok(0);
-    }
-    memory
-        .check(address, 16, Access::Write)
-        .map_err(|_| Errno(14))?;
-    let (seconds, nanos) = if number == 114 {
-        (0, 1)
-    } else {
-        // Linux 5 is CLOCK_REALTIME_COARSE; 6 is CLOCK_MONOTONIC_COARSE.
-        // Both coarse clocks use the same epoch as their high-resolution
-        // counterpart. Mixing Unix time with session-monotonic deadlines can
-        // turn GLib/Gecko event waits into an effectively endless busy loop.
-        let elapsed = if matches!(id, 0 | 5) {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|_| Errno(5))?
-        } else if id == 7 {
-            boot.map_or_else(|| started.elapsed(), |b| b.elapsed())
-        } else {
-            started.elapsed()
-        };
-        (elapsed.as_secs(), elapsed.subsec_nanos() as u64)
-    };
-    let mut out = [0; 16];
-    out[..8].copy_from_slice(&seconds.to_le_bytes());
-    out[8..].copy_from_slice(&nanos.to_le_bytes());
-    memory.write_array(address, out).map_err(|_| Errno(14))?;
-    Ok(0)
-}
-
 /// Shared owner/worker sleep ABI. Deadline ownership survives checkpoints;
 /// normal expiry never writes rem, while the owner retains signal/EINTR effects.
 pub(super) fn sleep_parameters(
@@ -787,7 +743,7 @@ impl Snapshot {
         // futex/epoll checkpoint. Ordinary unfiltered calls keep the old path.
         if !matches!(
             cpu.x(8) as u32,
-            25 | 101 | 113..=115 | 124 | 139 | 154..=157 | 163 | 164 | 261 | 166 | 168 | 172..=179 | 278
+            25 | 101 | 113..=115 | 124 | 139 | 154..=157 | 163 | 164 | 261 | 166 | 168 | 169 | 172..=179 | 278
         ) && !(cpu.x(8) as u32 == 29 && matches!(cpu.x(1) as u32, 0x5421 | 0x5452))
             && !(matches!(cpu.x(8) as u32, 160..=162) && self.uts.is_some())
             && !(cpu.x(8) as u32 == 32 && (cpu.x(1) as u32 & 4 != 0 || cpu.x(1) as u32 == 8))
@@ -990,7 +946,8 @@ impl Snapshot {
                     self.io_routes.namespace.local(family.parent()) as u64
                 })),
             number @ 172..=178 => Ok(self.identities[(number - 172) as usize]),
-            number @ (113 | 114) => clock_with_boot(
+            169 => trames_linux::gettimeofday(memory, cpu.x(0), cpu.x(1)),
+            number @ (113 | 114) => trames_linux::clock_read(
                 memory,
                 number,
                 cpu.x(0),

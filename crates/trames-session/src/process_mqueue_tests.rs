@@ -102,8 +102,16 @@ fn mqueue_path_directory_and_namespace_calls_keep_the_original_cohort() {
                 k.processes.insert(id as u32, p);
             }
             drop(memory);
+            // Twelve executors can reserve 12 * 16,384 poll credits before
+            // the first short syscall refunds its unused credit. A 100,000
+            // budget can stop untouched actors at their initial PC; this test
+            // requires every actor to reach its futex, not budget exhaustion.
             assert!(k
-                .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
+                .parallel_epoch(
+                    &mut trames_linux::CapturedOutput::default(),
+                    1_000_000,
+                    true
+                )
                 .unwrap());
             assert!(
                 k.cohort_return_syscalls.is_empty(),
@@ -122,7 +130,7 @@ fn mqueue_path_directory_and_namespace_calls_keep_the_original_cohort() {
                         p.cpu.x(19)
                     );
                 } else {
-                    assert_eq!(p.cpu.x(19), expected, "pid={id} syscall={number}");
+                    assert_eq!(p.cpu.x(19), expected, "pid={id} syscall={number} cpus={cpus} slots={slots} pc={:#x} state={:?} total_syscalls={}", p.cpu.pc, std::mem::discriminant(&p.state), k.syscalls);
                 }
             }
         }

@@ -1,11 +1,19 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 88, original task prctl controls and live comm, reviewed on 2026-11-09. The prior shared runtime
-baseline is `a77aaf162a5c0575e5b1f1ef259282f9713646d7`.
+This is the consolidated implementation audit through stage 89, original time observation ABI, reviewed on 2026-11-09. The prior shared runtime
+baseline is `3d91b02ae28766f4307c0a4691bab8162b412896`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-09
+
+Stage 89 closes the implemented time-observation family: clock_gettime,
+clock_getres and gettimeofday use common source/solo ABI bodies on their calling
+executor. Realtime vDSO gettimeofday still issues SVC, now completed by that
+worker rather than ending the cohort. Wall time remains the original live host
+SystemTime; the immutable monotonic calibration is not extrapolated into a stale
+wall-clock copy. No clock updater, polling service, resource message or new lock
+is added. Four broad categories remain.
 
 Stage 88 closes the residual prctl family: original per-thread comm, parent-death
 signal, subreaper, backend SME configuration and canonical unsupported-command
@@ -471,14 +479,14 @@ Actual excluded policy effects and missing capabilities retain explicit boundari
 ### Current remaining categories
 
 The count is **four broad categories**, not the number of historical subsystem
-rows. Stages 72–88 remove concrete triggers and close request-authority dependencies inside those categories; they do not
+rows. Stages 72–89 remove concrete triggers and close request-authority dependencies inside those categories; they do not
 prove that the final generic fallback is unreachable.
 
 | Remaining category | Actual trigger | Current scope / authoritative implementation |
 | --- | --- | --- |
 | Host cancellation and final teardown | Host cancel, deadline, shutdown, legacy stopped-hook requests, final CPU/backend drain and actual native-event backend failure | Pause/resume, original init notifications/signals, pressure reclaim, host filesystem commands and terminal/process admission no longer join. Actual terminal teardown and backend failure still stop their actors. Native-event failure returns its original HostIo cause after drain/cancellation, without an owner syscall retry. See [host control](../../crates/trames-session/src/process_vm.rs), [completion](../../crates/trames-session/src/process_exit.rs) and [workers](../../crates/trames-session/src/workers.rs). |
 | Missing capabilities and excluded resources | A genuinely absent source provider, an excluded original FD/node graph, a genuinely absent native event capability or unsupported source request body | There is no filesystem-kind exclusion after stage 82. Existing node/provider admission still applies. io_uring has exactly two submitter-scoped `require_owner()` maintenance call sites: missing-capability wait-source preparation and deferred original body progress; actual host backend errors take terminal source error handling. They remain connected to actual accepted request lifetime, subscriptions and cancellation. See [path authority](../../crates/trames-vfs/src/path_queries.rs), [maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [wait sources](../../crates/trames-linux/src/direct/uring/wait.rs) and [actor](../../crates/trames-linux/src/direct/uring/actor.rs). |
-| Final execution dispatch fallback | A returned SVC/HLT/fault not completed, parked or accepted by a source scope | The catch-all stops the current cohort for joined dispatch. Ordinary shared-FD ioctl discovery and residual prctl controls/errors no longer use it. It remains an audit target even though admitted native calls, ordinary guest faults, generated ENOSYS and migrated syscalls have source completion. A backend error is not a software or full-Linux-VM fallback. See [worker dispatch](../../crates/trames-session/src/workers.rs) and [classification](../../crates/trames-session/src/worker_syscalls.rs). |
+| Final execution dispatch fallback | A returned SVC/HLT/fault not completed, parked or accepted by a source scope | The catch-all stops the current cohort for joined dispatch. Ordinary shared-FD ioctl discovery and residual prctl controls/errors and implemented time observations no longer use it. It remains an audit target even though admitted native calls, ordinary guest faults, generated ENOSYS and migrated syscalls have source completion. A backend error is not a software or full-Linux-VM fallback. See [worker dispatch](../../crates/trames-session/src/workers.rs) and [classification](../../crates/trames-session/src/worker_syscalls.rs). |
 | Initial and legacy orchestration | Initial admission, standalone/capability-less nonmember scheduling and other excluded embedding routes | Ordinary live members and preexisting Kernel Futex/Sleep actors migrate, park and wake on the original queue. Cold waiters have metadata only until an event prepares their original mm; child/exec admission and lazy CPU slots no longer require a joined owner. The standalone futex legacy-publication mechanism remains. Solo dispatch is on the caller, so its existence alone is not a cross-thread transition. See [admission](../../crates/trames-session/src/process.rs), [legacy wakes](../../crates/trames-session/src/futex.rs) and [queue](../../crates/trames-session/src/run_queue.rs). |
 
 Supported process/family lifecycle, signals and security policy, mount and task
@@ -3632,3 +3640,49 @@ count stays four: actual host cancel/final teardown, genuine missing/excluded
 providers (including both io_uring maintenance escalation setters), other final
 execution dispatch and initial/standalone orchestration. No new prctl functionality
 or complete coordinator-removal claim is made. Only Mac Dev deployment is included.
+
+## 89. Original time observations and common source/solo ABI — 2026-11-09
+
+The implemented time-observation family now runs on the original calling
+executor. gettimeofday(169), including __kernel_gettimeofday's real vDSO SVC,
+no longer ends a cohort for joined dispatch. Its seccomp ALLOW admission uses
+the existing policy path. clock_gettime(113) and clock_getres(114) keep their
+source execution, with their ABI body moved into the same Linux module. The
+standalone dispatch shares these bodies; there is no duplicate time buffer ABI.
+
+Realtime stays the live original host SystemTime. Monotonic/raw/coarse epochs,
+boottime and sleep/timer deadline ownership are unchanged. The immutable vDSO
+counter calibration describes monotonic time only; copying its offset into a
+realtime fast page would miss host wall-clock changes. Realtime retains its
+existing backend SVC exit on the calling executor. No clock update thread,
+periodic polling, resource RPC, original-memory fence, new lock or unsafe block
+is added. Unimplemented time-setting/accounting APIs keep their original
+unsupported-call completion; this work does not add an emulated clock domain.
+
+gettimeofday retains the original Linux address limit, both-buffer preflight
+before the first store, seconds/microseconds/timezone store order, overlapping
+outputs, nullable destinations and errors. clockid_t retains its low-32-bit ABI;
+clock_getres(NULL), invalid IDs and output-fault precedence are unchanged.
+
+The connected process regression exercises all three APIs on four/twelve CPUs,
+one execution slot and an allowed seccomp policy. It checks successful outputs,
+all supported clock epochs, null and overlapping destinations and failure before
+either gettimeofday destination is changed. The prior runtime stops at its first
+gettimeofday before the completion marker. The shared ABI test also brackets
+realtime observations and tests page-boundary faults.
+
+Full local runtime workflows, 440 process regressions (two intentionally ignored)
+and ten FFI cases pass on macOS and ARM64 Linux; both iPad SDK targets compile.
+The process suite exposed an older mqueue fixture's finite-budget assumption:
+twelve workers can reserve twelve 16,384-credit blocks before refunding unused
+credits, exceeding 100,000. The failure retained an untouched actor at its initial
+PC; it was not an empty directory result. The fixture now uses a bounded million
+instruction budget, retains every functional/one-cohort/no-service assertion and
+passes thirty repetitions. Production budget accounting is unchanged. Signed
+native and installed Dev acceptance are recorded by the paired product validation.
+
+Four broad categories remain. This closes one concrete final-dispatch subsystem;
+actual host control/final teardown, missing/excluded resources (including both
+io_uring maintenance escalation sites), other final dispatch and initial/legacy
+orchestration remain explicit. Scoped original mm/backing synchronization is not
+reclassified as a whole-cohort syscall handoff.

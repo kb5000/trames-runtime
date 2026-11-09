@@ -1431,29 +1431,7 @@ impl Linux {
             172 => Ok(1),
             173 => Ok(0),
             167 if matches!(a[0], 15 | 16) => crate::task_name_call(&self.command_name, a, memory),
-            169 => {
-                if a[0] != 0 {
-                    Self::check(memory, a[0], 16, Access::Write)?;
-                }
-                if a[1] != 0 {
-                    Self::check(memory, a[1], 8, Access::Write)?;
-                }
-                let time = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|_| Errno(5))?;
-                if a[0] != 0 {
-                    memory
-                        .write(a[0], &time.as_secs().to_le_bytes())
-                        .map_err(|_| Errno(14))?;
-                    memory
-                        .write(a[0] + 8, &(time.subsec_micros() as u64).to_le_bytes())
-                        .map_err(|_| Errno(14))?;
-                }
-                if a[1] != 0 {
-                    memory.write(a[1], &[0; 8]).map_err(|_| Errno(14))?;
-                }
-                Ok(0)
-            },
+            169 => crate::gettimeofday(memory, a[0], a[1]),
             @dynamic number if crate::credential_entry(number as u32, a) => {
                 let dumpable = self.vfs.dumpable_state();
                 crate::credential_call(
