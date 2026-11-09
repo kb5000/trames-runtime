@@ -2,6 +2,25 @@
 //! Read-only observations of the original admitted VMA/frame metadata.
 use super::*;
 impl View {
+    pub(super) fn prepare_writeback(
+        &self,
+        address: u64,
+        len: u64,
+    ) -> Option<Result<SyncRange, MemoryError>> {
+        if let Err(error) = self.observe_mapped(address, len) {
+            return Some(Err(error));
+        }
+        let work = SyncRange::capture(
+            self.snapshot
+                .backings
+                .syncs
+                .range(address..address + len)
+                .map(|(_, object)| object),
+        );
+        // Unpublished/custom copied providers need their real original byte
+        // authority. Do not execute their callback on a stale snapshot copy.
+        work.source_scoped().then_some(Ok(work))
+    }
     pub(super) fn observe_mapped(&self, address: u64, len: u64) -> Result<(), MemoryError> {
         let end = Memory::mapping_end(address, len)?;
         let mut at = address;

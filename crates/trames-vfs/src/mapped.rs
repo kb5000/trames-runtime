@@ -837,7 +837,7 @@ impl PageBacking for FileMapping {
         Ok(())
     }
     fn sync_key(&self) -> Option<u64> {
-        Some(self.node.borrow().inode)
+        Some(self.node.identity)
     }
     fn version(&self) -> u64 {
         self.page
@@ -1056,6 +1056,45 @@ impl Vfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mapped_writeback_does_not_merge_equal_reported_inodes_from_distinct_filesystems() {
+        use trames_memory::{Memory, Permissions};
+        let mut first = Vfs::default();
+        let mut second = Vfs::default();
+        let mut memory = Memory::default();
+        for (vfs, base, byte) in [(&mut first, 0x1000, 41), (&mut second, 0x2000, 42)] {
+            vfs.import_file(b"/file", vec![7; PAGE_SIZE as usize])
+                .unwrap();
+            let fd = vfs.open_at(AT_FDCWD, b"/file", 2, 0).unwrap();
+            memory
+                .map_backed(
+                    base,
+                    vfs.mapping_pages(fd, 0, PAGE_SIZE, true, true).unwrap(),
+                    true,
+                    Permissions::RW,
+                    false,
+                )
+                .unwrap();
+            memory.write(base, &[byte]).unwrap();
+        }
+        let a = first.node(b"/file").unwrap();
+        let b = second.node(b"/file").unwrap();
+        assert_eq!(
+            a.borrow().inode,
+            b.borrow().inode,
+            "valid inode numbers are local to each filesystem"
+        );
+        memory.sync_range(0x1000, 2 * PAGE_SIZE).unwrap();
+        for (node, expected) in [(a, 41), (b, 42)] {
+            let node = node.borrow();
+            let Content::File(FileData::Mapped(data)) = &node.content else {
+                panic!("mapped original file")
+            };
+            // Read original storage below its coherent mapping cache, before
+            // VFS drop/sync could accidentally hide a missed writeback.
+            assert_eq!(data.data.borrow().read_at(0, 1).unwrap(), vec![expected]);
+        }
+    }
     #[test]
     fn page_storage_is_send_sync_and_last_worker_release_retires_the_allocation() {
         fn send_sync<T: Send + Sync>() {}

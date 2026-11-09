@@ -31,7 +31,7 @@ mod ownership_tests;
 mod root;
 mod slots;
 use backing::Backed;
-pub use backing::{backing_changed, external_memory_changed, PageBacking, PageSource};
+pub use backing::{backing_changed, external_memory_changed, PageBacking, PageSource, SyncRange};
 pub use cpu_memory::{CpuMemory, CpuSlice};
 pub use native_access::{NativeAccessError, NativeMemory, Transfer};
 pub use reservations::MAX_RESERVATIONS;

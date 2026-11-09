@@ -22,6 +22,39 @@ pub trait PageSource: Send + Sync {
     fn load(&self) -> Result<std::sync::Arc<SharedPage>, MemoryError>;
 }
 
+/// Accepted original writeback resources. No guest pointers, Memory borrow or
+/// View survives capture; unmap/replacement cannot redirect a parked sync.
+#[derive(Default)]
+pub struct SyncRange {
+    objects: Vec<Arc<dyn PageBacking>>,
+}
+impl SyncRange {
+    pub(crate) fn capture<'a>(objects: impl Iterator<Item = &'a Arc<dyn PageBacking>>) -> Self {
+        let mut synced = std::collections::BTreeSet::new();
+        Self {
+            objects: objects
+                .filter(|b| b.sync_required() && b.sync_key().is_none_or(|key| synced.insert(key)))
+                .cloned()
+                .collect(),
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.objects.is_empty()
+    }
+    pub(crate) fn source_scoped(&self) -> bool {
+        self.objects.iter().all(|object| object.layout().is_some())
+    }
+    pub fn into_backings(self) -> Vec<Arc<dyn PageBacking>> {
+        self.objects
+    }
+    pub fn run(self) -> Result<(), MemoryError> {
+        for object in self.objects {
+            object.sync()?;
+        }
+        Ok(())
+    }
+}
+
 /// Retained original mapping resources, movable with their address space.
 /// Implementations synchronize their own metadata and physical byte owners;
 /// Send + Sync does not authorize concurrent structural changes to a Memory.
@@ -154,6 +187,11 @@ pub trait PageBacking: Send + Sync {
         Ok(false)
     }
     fn sync(&self) -> Result<(), MemoryError>;
+    /// Cold writeback selection only. Providers whose sync body is a no-op
+    /// need no retained job or backing publication. Never queried by byte I/O.
+    fn sync_required(&self) -> bool {
+        true
+    }
     fn sync_key(&self) -> Option<u64> {
         None
     }
@@ -317,21 +355,26 @@ impl Memory {
         self.has_external_code |= external_code;
         Ok(())
     }
-    pub fn sync_range(&self, address: u64, len: u64) -> Result<(), MemoryError> {
+    pub fn prepare_sync(&self, address: u64, len: u64) -> Result<SyncRange, MemoryError> {
         if let Some(shared) = &self.shared {
-            return shared.borrow().sync_range(address, len);
+            return shared.borrow().prepare_sync(address, len);
         }
         let end = Self::mapping_end(address, len)?;
         self.check_mapped_range(address, end)?;
-        let mut synced = std::collections::BTreeSet::new();
-        for (_, &frame) in self.pages.range(address..end) {
-            if let Some(b) = &self.frames[frame].as_ref().expect("page").backing {
-                if b.shared && b.object.sync_key().is_none_or(|key| synced.insert(key)) {
-                    b.object.sync()?;
-                }
-            }
-        }
-        Ok(())
+        Ok(SyncRange::capture(
+            self.pages.range(address..end).filter_map(|(_, &frame)| {
+                self.frames[frame]
+                    .as_ref()
+                    .expect("page")
+                    .backing
+                    .as_ref()
+                    .filter(|b| b.shared)
+                    .map(|b| &b.object)
+            }),
+        ))
+    }
+    pub fn sync_range(&self, address: u64, len: u64) -> Result<(), MemoryError> {
+        self.prepare_sync(address, len)?.run()
     }
     pub fn resident(&self, address: u64, len: u64) -> Result<Vec<u8>, MemoryError> {
         if let Some(shared) = &self.shared {
@@ -610,6 +653,9 @@ impl PageSource for RetainedPageSource {
     }
 }
 impl PageBacking for AnonymousPage {
+    fn sync_required(&self) -> bool {
+        false
+    }
     fn parallel_versioned(&self) -> bool {
         // This provider never replaces its retained SharedPage allocation;
         // check() is infallible and version() already covers coordinator and

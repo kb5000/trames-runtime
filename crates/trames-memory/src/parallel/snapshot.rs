@@ -4,6 +4,9 @@ use super::*;
 
 #[derive(Default)]
 pub(super) struct BackingIndex {
+    /// Cold msync selection over original MAP_SHARED writeback resources.
+    /// No extra field or lookup is added to CPU frames or byte translation.
+    pub(super) syncs: BTreeMap<u64, Arc<dyn PageBacking>>,
     layouts: BTreeMap<u64, (Arc<layout::Layout>, usize)>,
     layout_pages: BTreeMap<u64, u64>,
     domains: BTreeMap<u64, BackingDomain>,
@@ -33,10 +36,14 @@ impl BackingIndex {
         &mut self,
         base: u64,
         domain: Option<(u64, u64)>,
-        object: &dyn PageBacking,
+        backing: &Backed,
         physical: u64,
         futex: Option<(u64, u64)>,
     ) {
+        let object = backing.object.as_ref();
+        if backing.shared && object.sync_required() {
+            self.syncs.insert(base, backing.object.clone());
+        }
         if let Some(layout) = object.layout() {
             let identity = layout.identity();
             self.layout_pages.insert(base, identity);
@@ -295,6 +302,7 @@ impl Snapshot {
     }
     fn remove_frame(&mut self, base: u64) -> Option<Frame> {
         let index = self.pages.remove(&base)?;
+        self.backings.syncs.remove(&base);
         let frame = self.frames.swap_remove(index);
         if let Some(moved) = self.frames.get(index) {
             self.pages.insert(moved.base, index);
@@ -327,7 +335,7 @@ impl Snapshot {
             self.backings.insert(
                 frame.base,
                 frame.backing_domain,
-                backing.object.as_ref(),
+                backing,
                 frame.bytes.identity,
                 futex,
             );

@@ -18,6 +18,7 @@ mod console_tests;
 mod ip_message;
 mod local_message;
 mod locks;
+mod memory_sync;
 pub(crate) mod namespace;
 #[cfg(test)]
 mod netlink;
@@ -841,6 +842,9 @@ impl DirectSyscalls {
         std::mem::swap(&mut *self.scratch.borrow_mut(), buffer);
     }
     pub fn supports_call(&self, number: u32, args: [u64; 6]) -> bool {
+        if number == 227 {
+            return self.file_layouts.is_some();
+        }
         if number == 29
             && self
                 .descriptors
@@ -1319,6 +1323,9 @@ impl DirectSyscalls {
         target: &Weak<dyn IoWake>,
         saved_deadline: Option<Instant>,
     ) -> Option<IoAttempt> {
+        if number == 227 {
+            return self.start_memory_sync(args, memory, pid, target);
+        }
         if number == 29 {
             if !crate::pty::terminal_job_request(args[1] as u32) {
                 if let Some(result) = self.invoke_control(number, args, memory) {

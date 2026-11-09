@@ -6,6 +6,7 @@ struct File {
     layout: Arc<layout::Layout>,
     bytes: Mutex<[u8; PAGE_SIZE as usize]>,
     reads: AtomicU64,
+    syncs: AtomicU64,
 }
 impl File {
     fn new() -> Arc<Self> {
@@ -13,6 +14,7 @@ impl File {
             layout: Arc::default(),
             bytes: Mutex::new([0; PAGE_SIZE as usize]),
             reads: AtomicU64::new(0),
+            syncs: AtomicU64::new(0),
         })
     }
     fn map(self: &Arc<Self>, memory: &mut Memory, base: u64, shared: bool) {
@@ -41,7 +43,11 @@ impl PageBacking for File {
         Ok(())
     }
     fn sync(&self) -> Result<(), MemoryError> {
+        self.syncs.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+    fn sync_key(&self) -> Option<u64> {
+        Some(self.layout.identity())
     }
     fn version(&self) -> u64 {
         0
@@ -52,6 +58,70 @@ impl PageBacking for File {
     fn next_page(&self, _: u64) -> Result<Arc<dyn PageBacking>, MemoryError> {
         Err(MemoryError::InvalidRange)
     }
+}
+
+#[test]
+fn writeback_capture_retains_original_shared_backings_across_unmap_and_replacement() {
+    let original = File::new();
+    let replacement = File::new();
+    let mut memory = Memory::default();
+    original.map(&mut memory, 0x1000, true);
+    original.map(&mut memory, 0x2000, true);
+    original.map(&mut memory, 0x3000, false);
+    let mut registry = Registry::default();
+    let mut view = memory.parallel_view(&mut registry).unwrap();
+    view.write(0x1000, &[42]).unwrap();
+    let work = CpuMemory::prepare_sync(&view, 0x1000, 3 * PAGE_SIZE)
+        .unwrap()
+        .unwrap();
+    assert_eq!(original.syncs.load(Ordering::Relaxed), 0);
+    drop(view);
+    memory.commit_parallel().unwrap();
+    memory.unmap(0x1000, 3 * PAGE_SIZE).unwrap();
+    replacement.map(&mut memory, 0x1000, true);
+    work.run().unwrap();
+    assert_eq!(original.syncs.load(Ordering::Relaxed), 1);
+    assert_eq!(replacement.syncs.load(Ordering::Relaxed), 0);
+    let view = memory.parallel_view(&mut registry).unwrap();
+    CpuMemory::prepare_sync(&view, 0x1000, PAGE_SIZE)
+        .unwrap()
+        .unwrap()
+        .run()
+        .unwrap();
+    assert_eq!(
+        replacement.syncs.load(Ordering::Relaxed),
+        1,
+        "index follows mapping replacement"
+    );
+}
+
+#[test]
+fn writeback_selection_preflights_holes_and_never_materializes_anonymous_or_private_bytes() {
+    let file = File::new();
+    let mut memory = Memory::default();
+    file.map(&mut memory, 0x1000, true);
+    file.map(&mut memory, 0x2000, false);
+    memory.map(0x100000000, 1 << 36, Permissions::RW).unwrap();
+    let mut registry = Registry::default();
+    let view = memory.parallel_view(&mut registry).unwrap();
+    let reads = file.reads.load(Ordering::Relaxed);
+    let used = memory.resident_bytes();
+    assert!(matches!(
+        CpuMemory::prepare_sync(&view, 0x1000, 3 * PAGE_SIZE),
+        Some(Err(MemoryError::Unmapped(0x3000)))
+    ));
+    assert!(CpuMemory::prepare_sync(&view, 0x2000, PAGE_SIZE)
+        .unwrap()
+        .unwrap()
+        .is_empty());
+    assert!(CpuMemory::prepare_sync(&view, 0x100000000, 1 << 36)
+        .unwrap()
+        .unwrap()
+        .is_empty());
+    assert_eq!(file.reads.load(Ordering::Relaxed), reads);
+    assert_eq!(memory.resident_bytes(), used);
+    assert_eq!(file.syncs.load(Ordering::Relaxed), 0);
+    assert!(view.snapshot.anonymous.cached(0x100000000).is_none());
 }
 
 #[test]

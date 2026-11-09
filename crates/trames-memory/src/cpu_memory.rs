@@ -26,6 +26,15 @@ impl<M> std::ops::DerefMut for CpuSlice<'_, M> {
 }
 
 pub trait CpuMemory {
+    /// Capture original mapped writeback resources, without reading/faulting
+    /// bytes. An embedding missing this capability defers before effects.
+    fn prepare_sync(
+        &self,
+        _address: u64,
+        _len: u64,
+    ) -> Option<Result<crate::SyncRange, MemoryError>> {
+        None
+    }
     /// Read-only VMA/residency observations. Missing embedding capabilities defer
     /// before effects; neither hook may fault in bytes or allocate observed pages.
     fn validate_mapped(&self, _address: u64, _len: u64) -> Option<Result<(), MemoryError>> {
@@ -162,6 +171,13 @@ pub trait CpuMemory {
 }
 
 impl CpuMemory for Memory {
+    fn prepare_sync(
+        &self,
+        address: u64,
+        len: u64,
+    ) -> Option<Result<crate::SyncRange, MemoryError>> {
+        Some(Memory::prepare_sync(self, address, len))
+    }
     fn validate_mapped(&self, address: u64, len: u64) -> Option<Result<(), MemoryError>> {
         Some(Memory::validate_mapped(self, address, len))
     }

@@ -252,7 +252,7 @@ enum PreparedAction {
 impl DirectSyscalls {
     pub fn file_call(number: u32) -> bool {
         namespace::supported(number)
-            || matches!(number, 45..=47 | 56 | 62..=71 | 76 | 80..=83 | 267 | 285..=287 | 437)
+            || matches!(number, 45..=47 | 56 | 62..=71 | 76 | 80..=83 | 227 | 267 | 285..=287 | 437)
     }
     pub fn file_entry(number: u32, args: [u64; 6]) -> bool {
         Self::file_call(number) || number == 25 && matches!(args[1], 1033 | 1034)
@@ -267,6 +267,9 @@ impl DirectSyscalls {
     ) -> Option<IoAttempt> {
         if !Self::file_entry(number, args) {
             return None;
+        }
+        if number == 227 {
+            return self.start_memory_sync(args, memory, pid, target);
         }
         if namespace::supported(number) {
             if let Some(value) = self.invoke_namespace(number, args, memory) {
@@ -509,6 +512,9 @@ impl DirectSyscalls {
         pid: u32,
         target: &Weak<dyn IoWake>,
     ) -> Option<IoAttempt> {
+        if number == 227 {
+            return self.start_memory_sync(args, memory, pid, target);
+        }
         if number == 25 && matches!(args[1], 1033 | 1034) {
             let control = match vfs.descriptor_control(args[0] as u32) {
                 Ok(control) => control,

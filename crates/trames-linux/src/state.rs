@@ -1406,15 +1406,9 @@ impl Linux {
             },
             216 => self.mremap(a, memory),
             227 => {
-                if !a[0].is_multiple_of(PAGE_SIZE) || a[2] & !7 != 0 || a[2] & 5 == 5 {
-                    return Err(Errno(22));
-                }
-                if a[1] == 0 {
-                    return Ok(0);
-                }
-                let len = Self::page_length(a[1])?;
-                memory.sync_range(a[0], len).map_err(Self::memory_errno)?;
-                Ok(0)
+                crate::memory_sync::prepare(memory, a)
+                    .expect("original writeback capability")?
+                    .run().map(|()| 0).map_err(Self::memory_errno)
             },
             232 => crate::memory_query(memory,232,a).expect("original residency capability"),
             233 => {

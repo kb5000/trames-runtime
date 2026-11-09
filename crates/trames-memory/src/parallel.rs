@@ -1048,6 +1048,9 @@ impl View {
     }
 }
 impl CpuMemory for View {
+    fn prepare_sync(&self, address: u64, len: u64) -> Option<Result<SyncRange, MemoryError>> {
+        self.prepare_writeback(address, len)
+    }
     fn validate_mapped(&self, address: u64, len: u64) -> Option<Result<(), MemoryError>> {
         Some(self.observe_mapped(address, len))
     }
@@ -1568,7 +1571,7 @@ impl Memory {
                 backings.insert(
                     base,
                     frame.backing_domain,
-                    backing.object.as_ref(),
+                    backing,
                     frame.bytes.identity,
                     shared_futex_page_key(page),
                 );

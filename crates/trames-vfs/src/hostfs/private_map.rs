@@ -129,6 +129,9 @@ impl PrivatePage {
     }
 }
 impl PageBacking for PrivatePage {
+    fn sync_required(&self) -> bool {
+        false
+    }
     fn cpu_borrow_safe(&self) -> bool {
         true
     }

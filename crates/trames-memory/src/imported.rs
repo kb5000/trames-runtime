@@ -5,6 +5,9 @@ use std::sync::Arc;
 
 struct ImportedPage(Arc<SharedPage>, u64);
 impl PageBacking for ImportedPage {
+    fn sync_required(&self) -> bool {
+        false
+    }
     fn external_code_updates(&self) -> bool {
         self.0.has_external_revision()
     }
