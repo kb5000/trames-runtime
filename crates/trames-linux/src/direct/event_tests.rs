@@ -390,14 +390,21 @@ fn current_position_v2_native_tcp_and_udp_retain_transport_timeout_and_post_writ
             udp.send_to(b"old!", socket.local_addr().unwrap()).unwrap();
         }
         let until = Instant::now() + Duration::from_secs(2);
-        while !wait.signal.ready() && Instant::now() < until {
-            hub.wait(Some(until)).unwrap();
-        }
-        assert!(wait.signal.ready());
-        assert_eq!(
-            done(DirectSyscalls::default().resume(wait, &mut memory)),
-            Ok(4)
-        );
+        let mut wait = wait;
+        let result = loop {
+            assert!(Instant::now() < until, "original receive did not complete");
+            if !wait.signal.ready() {
+                hub.wait(Some(until)).unwrap();
+                continue;
+            }
+            // Connect/write edges may precede the incoming bytes. Readiness
+            // wakes are hints; the retained receive decides actual completion.
+            match DirectSyscalls::default().resume(wait, &mut memory) {
+                IoAttempt::Blocked(pending) => wait = pending,
+                attempt => break done(attempt),
+            }
+        };
+        assert_eq!(result, Ok(4));
         assert_eq!(memory.read_array::<4>(0x1100).unwrap(), *b"old!");
         assert_eq!(memory.read_array::<4>(0x1300).unwrap(), [0; 4]);
         // A second accepted OFD reaches its existing sync error only after

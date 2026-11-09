@@ -25,6 +25,14 @@ pub struct HostFd {
     _lease: Option<Arc<dyn Send + Sync>>,
 }
 impl HostFd {
+    /// Duplicate the same wait-scoped descriptor and its actual resource lease.
+    /// Used only by an embedding that waits directly instead of using a hub.
+    pub fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            fd: self.fd.as_fd().try_clone_to_owned()?,
+            _lease: self._lease.clone(),
+        })
+    }
     pub fn retained(fd: OwnedFd, lease: Arc<dyn Send + Sync>) -> Self {
         Self {
             fd,

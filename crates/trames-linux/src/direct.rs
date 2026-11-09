@@ -135,6 +135,25 @@ impl PendingIo {
         }
         fds
     }
+    /// Original interests for caller-driven native waiting, including direction.
+    /// Hub-backed subscriptions need no duplicate. Descriptor errors propagate.
+    pub fn native_wait_interests(&self) -> std::io::Result<Vec<(trames_vfs::HostFd, bool)>> {
+        let mut interests: Vec<_> = self
+            .native_wait_fds()
+            .into_iter()
+            .map(|fd| (fd, false))
+            .collect();
+        if let Some(wait) = &self.uring {
+            interests.extend(wait.direct_wait_interests()?);
+        }
+        if let Some(wait) = &self.poll_uring {
+            interests.extend(wait.direct_wait_interests()?);
+        }
+        for subscription in &self._subscriptions {
+            interests.extend(subscription.direct_wait_interest()?);
+        }
+        Ok(interests)
+    }
     pub fn notification_external(&self) -> bool {
         // Native file jobs notify the existing source target directly. Joined
         // execution must park on that notification, rather than sleep/poll.
@@ -700,6 +719,9 @@ impl DirectSyscalls {
         self
     }
     pub fn with_urings(mut self, mut snapshot: UringSnapshot) -> Self {
+        // Builder services and task readers belong to future acceptance, not
+        // the compatibility capture's service-less initial execution context.
+        snapshot.refresh_context();
         if let Some(reader) = &self.signal_reader {
             if let Some(descriptors) = snapshot.descriptors.take() {
                 snapshot.descriptors = Some(descriptors.with_signal_reader(Some(reader.clone())));

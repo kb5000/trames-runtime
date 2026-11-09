@@ -890,7 +890,13 @@ fn capability_less_embedding_defers_before_import_and_original_caller_can_comple
         .with_resources(l.vfs.descriptor_factory())
         .with_urings(
             epoch
-                .capture(&l.vfs, m.instruction_identity().0, 7)
+                .capture_worker(
+                    &l.vfs,
+                    m.instruction_identity().0,
+                    7,
+                    &Default::default(),
+                    &Default::default(),
+                )
                 .with_actor(l.uring_actor_root()),
         );
     add(&mut m, &ring, scalar(22, file, 0x2200, 8, 77));

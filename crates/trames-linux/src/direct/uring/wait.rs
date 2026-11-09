@@ -6,7 +6,8 @@ use super::*;
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum LocalSource {
     Ring(usize),
-    Byte(usize),
+    Byte(usize, u64),
+    Socket(usize),
     Control(usize, u64),
 }
 struct Subscription<T> {
@@ -20,7 +21,7 @@ struct Subscription<T> {
 #[derive(Default)]
 pub(super) struct WaitSources {
     local: BTreeMap<LocalSource, Subscription<Vec<trames_vfs::IoSubscription>>>,
-    hosts: BTreeMap<(usize, bool, usize), Subscription<trames_vfs::HostSubscription>>,
+    hosts: BTreeMap<(usize, bool, usize), Subscription<trames_vfs::IoSubscription>>,
     deadline: Option<Instant>,
 }
 impl WaitSources {
@@ -49,16 +50,82 @@ impl WaitSources {
             Entry::Occupied(mut entry) => {
                 let subscription = entry.get_mut();
                 if !subscription.used {
-                    subscription.value.rearm()?;
+                    subscription.value.rearm_host()?;
                     subscription.used = true;
                 }
             }
             Entry::Vacant(entry) => {
-                let Some(value) = signal.subscribe_host(fd, key.1)? else {
-                    return Ok(false);
-                };
+                let value = trames_vfs::IoSubscription::native_direction(fd(), key.1, signal);
+                value.rearm_host()?;
                 entry.insert(Subscription { value, used: true });
             }
+        }
+        Ok(true)
+    }
+    pub(super) fn direct_wait_interests(&self) -> std::io::Result<Vec<(trames_vfs::HostFd, bool)>> {
+        let mut fds = Vec::new();
+        for subscription in self
+            .hosts
+            .values()
+            .map(|entry| &entry.value)
+            .chain(self.local.values().flat_map(|entry| entry.value.iter()))
+        {
+            if let Some(fd) = subscription.direct_wait_interest()? {
+                fds.push(fd);
+            }
+        }
+        Ok(fds)
+    }
+    fn byte(&mut self, identity: usize, fd: &trames_vfs::DirectFd, signal: &Arc<IoSignal>) -> bool {
+        let revision = fd.epoll_revision().unwrap_or(0);
+        let key = LocalSource::Byte(identity, revision);
+        if !fd.dynamic_poll_sources() {
+            if let Some(entry) = self.local.get_mut(&key) {
+                entry.used = true;
+                return true;
+            }
+        } else {
+            // Native sets below an unchanged epoll can change independently of
+            // its interests. Their own change notification schedules this retry.
+            self.local.remove(&key);
+        }
+        let Some(fresh) = fd.refresh_epoll() else {
+            return false;
+        };
+        let revision = fresh.epoll_accepted_revision().unwrap_or(0);
+        self.local(LocalSource::Byte(identity, revision), || {
+            fresh.subscribe(signal)
+        });
+        // An interest mutation can precede first subscription. Capture proof
+        // before subscribing, then close that gap without a graph-wide lock.
+        if fresh.epoll_revision().is_some_and(|now| now != revision) {
+            signal.notify();
+        }
+        true
+    }
+    fn socket(
+        &mut self,
+        identity: usize,
+        socket: &trames_net::Socket,
+        signal: &Arc<IoSignal>,
+    ) -> std::io::Result<bool> {
+        self.local(LocalSource::Socket(identity), || {
+            vec![socket
+                .subscribe(signal)
+                .unwrap_or_else(|| socket.subscribe_changes(signal))]
+        });
+        if socket.is_netlink() {
+            return Ok(true);
+        }
+        let (sources, delay) = socket.wait_interests();
+        if let Some(deadline) = delay.and_then(|delay| Instant::now().checked_add(delay)) {
+            self.deadline = [self.deadline, Some(deadline)].into_iter().flatten().min();
+        }
+        for source in sources {
+            source.drain();
+            self.host((identity, false), source.identity(), signal, || {
+                source.open()
+            })?;
         }
         Ok(true)
     }
@@ -187,7 +254,13 @@ impl RingWaitOps for Ring {
             if let Some(resource) = &resource {
                 match &resource.object {
                     Object::Byte(f) => {
-                        sources.local(LocalSource::Byte(resource.identity), || f.subscribe(signal));
+                        if let Some(socket) = file.as_ref().and_then(|file| file.socket()) {
+                            if !sources.socket(resource.identity, &socket, signal)? {
+                                return Ok(false);
+                            }
+                        } else if !sources.byte(resource.identity, f, signal) {
+                            return Ok(false);
+                        }
                         continue;
                     }
                     Object::Tcp(f) => {
@@ -205,19 +278,8 @@ impl RingWaitOps for Ring {
                 continue;
             };
             if let Some(socket) = file.socket() {
-                let (fds, delay) = socket.wait_sources()?;
-                if let Some(deadline) = delay.and_then(|d| Instant::now().checked_add(d)) {
-                    sources.deadline = [sources.deadline, Some(deadline)]
-                        .into_iter()
-                        .flatten()
-                        .min();
-                }
-                for (i, fd) in fds.into_iter().enumerate() {
-                    if !sources.host((file.identity(), events & 4 != 0), i, signal, || {
-                        Ok(fd.into())
-                    })? {
-                        return Ok(false);
-                    }
+                if !sources.socket(file.identity(), &socket, signal)? {
+                    return Ok(false);
                 }
             }
         }

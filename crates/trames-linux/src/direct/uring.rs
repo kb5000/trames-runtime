@@ -435,6 +435,11 @@ mod wait;
 pub(super) use poll::PollWait;
 use wait::RingWaitOps;
 
+impl Wait {
+    pub(super) fn direct_wait_interests(&self) -> std::io::Result<Vec<(trames_vfs::HostFd, bool)>> {
+        self.sources.direct_wait_interests()
+    }
+}
 pub(crate) trait RingOps {
     fn outstanding(&self, state: &State) -> usize;
     fn backpressured(&self, state: &State, r: &Request) -> bool;
@@ -705,12 +710,22 @@ pub struct UringSnapshot {
     actor: Option<Arc<std::sync::OnceLock<Arc<UringActor>>>>,
     local_actor: std::sync::OnceLock<Arc<UringActor>>,
     context: std::sync::OnceLock<Arc<actor::Execution>>,
+    staged_files: Cell<bool>,
+    // Compatibility capture retains the same original resources. Production
+    // worker capture already supplies these bindings and allocates no second
+    // resolver. No copied Files, descriptor projection or owner is retained.
+    original: Option<Box<Original>>,
+}
+struct Original {
+    paths: trames_vfs::PathQueries,
+    factory: trames_vfs::DescriptorFactory,
 }
 impl UringSnapshot {
     /// Only future acceptance changes. Existing request leases retain their
     /// original complete execution context independently of this cache.
     pub(super) fn refresh_context(&mut self) {
         self.context.take();
+        self.staged_files.set(false);
     }
     pub(super) fn refresh_namespaces(
         &mut self,
@@ -751,7 +766,13 @@ impl UringSnapshot {
         signal: Option<&Arc<dyn trames_vfs::TaskSignal>>,
     ) {
         if self.context.get().is_none() {
-            if let (Some(paths), Some(factory)) = (paths, factory) {
+            self.staged_files.set(paths.is_some() && factory.is_some());
+            let resources = paths.zip(factory).or_else(|| {
+                self.original
+                    .as_ref()
+                    .map(|source| (&source.paths, &source.factory))
+            });
+            if let Some((paths, factory)) = resources {
                 let _ = self.context.set(Arc::new(actor::Execution::new(
                     paths,
                     factory,
@@ -1005,7 +1026,7 @@ impl UringSnapshot {
                     break;
                 }
                 let context = matches!(r.sqe.opcode(), 1 | 2 | 4 | 5 | 22 | 23)
-                    && (self.context.get().is_some() || r.resource.is_none())
+                    && (self.staged_files.get() || r.resource.is_none())
                     && r.file.is_some()
                     || matches!(
                         r.sqe.opcode(),
@@ -1405,6 +1426,24 @@ impl UringEpoch {
         files: &trames_vfs::DirectFiles,
         retained_files: &BTreeMap<usize, trames_vfs::PreparedFile>,
     ) -> UringSnapshot {
+        let mut snapshot = self.capture_worker(vfs, owner, task, files, retained_files);
+        snapshot.original = Some(Box::new(Original {
+            paths: vfs.path_queries(),
+            factory: vfs.descriptor_factory(),
+        }));
+        snapshot.ensure_context(None, None, files, None, None, None);
+        snapshot
+    }
+    /// Worker builders supply original paths/factory and execution services.
+    /// Avoid retaining a redundant compatibility resolver on every dispatch.
+    pub fn capture_worker(
+        &mut self,
+        vfs: &Vfs,
+        owner: u64,
+        task: u32,
+        files: &trames_vfs::DirectFiles,
+        retained_files: &BTreeMap<usize, trames_vfs::PreparedFile>,
+    ) -> UringSnapshot {
         let mut snapshot = UringSnapshot {
             owner,
             task,
@@ -1434,6 +1473,10 @@ mod subsystem_tests;
 #[cfg(test)]
 #[path = "uring/owned_tests.rs"]
 mod owned_tests;
+
+#[cfg(test)]
+#[path = "uring/maintenance_tests.rs"]
+mod maintenance_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1840,7 +1883,7 @@ mod tests {
         assert!(epoch.finish().is_empty());
     }
     #[test]
-    fn local_uring_boundary_native_tcp_extended_flags_defer_before_consuming() {
+    fn original_capture_validates_native_tcp_extended_flags_without_owner_context() {
         use std::net::{Ipv4Addr, TcpListener};
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let (mut l, mut m, fd, r) = setup(4);
@@ -1862,11 +1905,11 @@ mod tests {
         let mut epoch = UringEpoch::default();
         let s = epoch.capture(&l.vfs, m.instruction_identity().0, 7);
         let t = target();
-        assert!(matches!(
-            start(&s, fd, 1, 1, &mut m, &t),
-            IoAttempt::Checkpoint
-        ));
-        assert_eq!(m.read_array::<4>(0x10000).unwrap(), 0u32.to_le_bytes());
+        complete(start(&s, fd, 1, 1, &mut m, &t), 1);
+        assert_eq!(m.read_array::<4>(0x10000).unwrap(), 1u32.to_le_bytes());
+        assert_eq!(cq(&mut m, &r), (62, -95));
+        assert_eq!(m.read_array::<1>(0x2000).unwrap(), [0]);
+        assert!(!l.uring_requires_owner());
         assert!(epoch.finish().is_empty());
         assert_eq!(r.cq_ready(), 0);
     }

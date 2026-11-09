@@ -14,6 +14,10 @@ pub struct UringBackground {
     revision: u64,
 }
 impl UringBackground {
+    /// Direct native sources when the caller supplies its own wait loop.
+    pub fn native_wait_interests(&self) -> std::io::Result<Vec<(trames_vfs::HostFd, bool)>> {
+        self.sources.direct_wait_interests()
+    }
     pub fn deadline(&self) -> Option<Instant> {
         self.deadline
     }
@@ -82,6 +86,8 @@ impl UringBackground {
         }
         if !active {
             self.actor.finish_scope(&self.scope, self.revision);
+            self.sources = Default::default();
+            self.deadline = None;
         }
         Ok(true)
     }

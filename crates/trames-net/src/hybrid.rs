@@ -548,6 +548,33 @@ impl Socket {
 mod tests {
     use super::*;
     #[test]
+    fn retained_wait_identity_does_not_keep_replaced_native_endpoint_or_binding_alive() {
+        let root = Network::new(NetworkMode::Full);
+        let socket = root.socket(2, 2, 0).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = socket.local_addr().unwrap();
+        let SocketBackend::Hybrid(hybrid) = &socket.backend else {
+            unreachable!()
+        };
+        let (sources, _) = socket.wait_interests();
+        assert_eq!(sources.len(), 1);
+        let old_identity = sources[0].identity();
+        let observer = sources[0].open().unwrap();
+        let duplicate = observer.try_clone().unwrap();
+        drop(sources);
+        drop(hybrid.native.borrow_mut().take().unwrap());
+        // Waiting on an old event queue must not delay the actual UDP close.
+        // The weak allocation lease still prevents identity reuse meanwhile.
+        let rebound = std::net::UdpSocket::bind(address).unwrap();
+        let replacement = hybrid.native().unwrap();
+        let (fresh, _) = socket.wait_interests();
+        assert_eq!(fresh.len(), 1);
+        assert_ne!(fresh[0].identity(), old_identity);
+        assert_eq!(fresh[0].identity(), Arc::as_ptr(&replacement) as usize);
+        assert!(fresh[0].open().is_ok());
+        drop((observer, duplicate, rebound));
+    }
+    #[test]
     fn direct_tcp_option_updates_are_replayed_to_the_real_guest_branch() {
         let root = Network::new(NetworkMode::Full);
         let socket = root.socket(2, 1, 0).unwrap();

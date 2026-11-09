@@ -217,12 +217,14 @@ impl UringFile {
 }
 impl RetainedFd {
     fn uring_supported(open: &OpenDescription) -> Result<()> {
-        // Retaining another ring could form an uncollectable RC cycle. These
-        // descriptor classes need additional process/signal/terminal authority.
+        // Retaining another ring could form an uncollectable RC cycle. Epoll's
+        // original index uses weak OFD watches (including rings), so retaining
+        // that original interest graph does not create a return ownership edge.
+        // Terminal descriptions still need their additional task authority.
         if open
             .anonymous
             .as_ref()
-            .is_some_and(|a| matches!(a, events::Anonymous::Uring(_) | events::Anonymous::Epoll(_)))
+            .is_some_and(|a| matches!(a, events::Anonymous::Uring(_)))
             || matches!(
                 open.kind,
                 FdKind::Stdin | FdKind::Stdout | FdKind::Stderr | FdKind::Terminal

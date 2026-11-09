@@ -91,6 +91,9 @@ impl UringSnapshot {
     }
 }
 impl PollWait {
+    pub(crate) fn direct_wait_interests(&self) -> std::io::Result<Vec<(trames_vfs::HostFd, bool)>> {
+        self.sources.direct_wait_interests()
+    }
     pub(crate) fn external(&self) -> bool {
         self.sources.external() || self.actor.pending_disk(self.owner, self.task)
     }

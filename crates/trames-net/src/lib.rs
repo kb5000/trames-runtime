@@ -282,6 +282,26 @@ macro_rules! delegate {
         }
     }
 }
+/// One original native observer, with stable identity across repeated waits.
+/// The handle keeps that identity allocated until its registration is retired.
+#[derive(Clone)]
+pub struct WaitSource(Arc<native::Socket>);
+impl WaitSource {
+    pub fn identity(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+    pub fn drain(&self) {
+        let _ = self.0.poll_epoch();
+    }
+    pub fn open(&self) -> std::io::Result<trames_shared::HostFd> {
+        Ok(trames_shared::HostFd::retained(
+            self.0.wait_event_fd()?,
+            // Keep the allocation identity, not the endpoint, alive. A
+            // replaced hybrid native branch must still close immediately.
+            Arc::new(Arc::downgrade(&self.0)),
+        ))
+    }
+}
 impl Socket {
     fn wrap(
         backend: SocketBackend,
@@ -366,7 +386,7 @@ impl Socket {
     }
     /// Existing native edge observers and packet-stack timer for one retained
     /// operation. Drain old edges before the deciding retry; no service thread.
-    pub fn wait_sources(&self) -> std::io::Result<(Vec<std::os::fd::OwnedFd>, Option<Duration>)> {
+    pub fn wait_interests(&self) -> (Vec<WaitSource>, Option<Duration>) {
         let _operation = self.operation.read_recursive();
         let (mut native, fabric) = match &self.backend {
             SocketBackend::Native(s) => (vec![s.clone()], None),
@@ -381,11 +401,15 @@ impl Socket {
         if let Some(fabric) = fabric {
             native.extend(fabric.native_waiters().into_iter().map(|(s, _)| s));
         }
-        let fds = native
+        (native.into_iter().map(WaitSource).collect(), delay)
+    }
+    pub fn wait_sources(&self) -> std::io::Result<(Vec<std::os::fd::OwnedFd>, Option<Duration>)> {
+        let (sources, delay) = self.wait_interests();
+        let fds = sources
             .into_iter()
-            .map(|s| {
-                let _ = s.poll_epoch();
-                s.wait_event_fd()
+            .map(|source| {
+                source.drain();
+                source.0.wait_event_fd()
             })
             .collect::<std::io::Result<Vec<_>>>()?;
         Ok((fds, delay))

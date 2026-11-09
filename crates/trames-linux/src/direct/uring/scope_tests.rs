@@ -222,7 +222,7 @@ fn linked_published_metadata_observes_original_updates_and_releases_on_cancel_or
 }
 
 #[test]
-fn missing_native_wait_capability_only_escalates_its_original_submitter() {
+fn hubless_native_wait_uses_original_sources_without_escalating_any_submitter() {
     use std::io::Write;
     use std::net::{Ipv4Addr, TcpListener};
     for cancel in [false, true] {
@@ -266,8 +266,9 @@ fn missing_native_wait_capability_only_escalates_its_original_submitter() {
         let mut native_wait = native
             .uring_background(7, &Arc::downgrade(&target))
             .unwrap();
-        assert!(!native_wait.progress(&mut m).unwrap());
-        assert!(l.uring_requires_owner_for(&m, 7));
+        assert!(native_wait.progress(&mut m).unwrap());
+        assert!(!l.uring_requires_owner_for(&m, 7));
+        assert!(!native_wait.native_wait_interests().unwrap().is_empty());
         assert!(l.worker_uring_pending(&m, 8));
         assert!(!l.uring_requires_owner_for(&m, 8));
         let mut local_wait = local.uring_background(8, &Arc::downgrade(&target)).unwrap();
@@ -283,20 +284,22 @@ fn missing_native_wait_capability_only_escalates_its_original_submitter() {
             assert_eq!(m.read_array::<8>(0x2000).unwrap(), [0xa5; 8]);
         } else {
             let hub = trames_vfs::HostEvents::new().unwrap();
-            let ready = IoSignal::new(0, Arc::downgrade(&target));
-            let tcp = l.vfs.direct_network().get(socket_fd).unwrap().tcp.clone();
-            let _subscription = hub
-                .subscribe(tcp_wait_fd(&tcp).unwrap(), false, &ready)
-                .unwrap();
+            let _subscriptions: Vec<_> = native_wait
+                .native_wait_interests()
+                .unwrap()
+                .into_iter()
+                .map(|(fd, write)| hub.subscribe(fd, write, &native_wait.signal).unwrap())
+                .collect();
             peer.write_all(b"x").unwrap();
             hub.wait(Some(Instant::now() + Duration::from_secs(2)))
                 .unwrap();
-            assert!(ready.ready());
+            assert!(native_wait.signal.ready());
             assert!(native_wait.progress(&mut m).unwrap());
             assert_eq!(cq(&mut m, &ring), (7, 1));
             assert_eq!(m.read_array::<1>(0x2000).unwrap(), *b"x");
         }
         assert!(!native_wait.active() && !local_wait.active());
+        assert!(native_wait.native_wait_interests().unwrap().is_empty());
         assert!(!l.uring_requires_owner());
     }
 }

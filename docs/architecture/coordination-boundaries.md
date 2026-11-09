@@ -1,11 +1,36 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 97, original file-cache advice, reviewed on 2026-11-10. The prior shared runtime
-baseline is `fc59b7b38f3de0428798cf942efd7a6d52fce8d5`.
+This is the consolidated implementation audit through stage 99, connected io_uring maintenance resources, reviewed on 2026-11-10. The prior shared runtime
+baseline is `4169330c9e9696eafeb2919ad1f23f06eddde8a9`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-10
+
+Stage 99 handles the connected io_uring wait/context/lifetime graph as one
+batch. Background maintenance, GETEVENTS and CQ poll/epoll use the same original
+subscriptions. Accepted nested epoll graphs follow interest revisions; dynamic
+socket branches also rebuild when their native set changes. Generic native
+interests use stable original allocation identities, with weak identity leases
+that cannot delay real endpoint close or UDP binding release. Hubless embeddings
+retain fallible native read/write interests for their existing caller wait loop;
+absence of HostEvents is no longer absence of a native event capability.
+
+Compatibility capture retains original resolver/factory resources at capture,
+not from a later CQ observer. The production worker builder supplies its existing
+bindings directly and allocates no redundant compatibility resolver. Future
+acceptance refreshes service/signal context; accepted work retains its original
+one. Ordinary compatibility byte/file fast paths retain their prior staging
+policy. Epoll SQEs can retain the original weak-watch graph without a ring return
+ownership edge; directly retaining another ring remains excluded. Final scope
+completion releases maintenance subscriptions immediately.
+
+The two maintenance setters remain for actual unavailable typed graph providers
+and original bodies that cannot run with their supplied provider. They are not
+removed, renamed or converted into fabricated errno/ready results. Four broad
+categories and the overall goal remain open. Stage 99 does not establish that
+all custom embeddings have live PID/mm observations, or that final dispatch is
+unreachable. See section 99 and the paired product validation record.
 
 Stage 97 closes the implemented file-cache advice family, readahead and
 fadvise64. Source and solo use one original-stat/type/range/flags body. The caller
@@ -566,7 +591,7 @@ prove that the final generic fallback is unreachable.
 | Remaining category | Actual trigger | Current scope / authoritative implementation |
 | --- | --- | --- |
 | Host cancellation and final teardown | Host cancel, deadline, shutdown, legacy stopped-hook requests, final CPU/backend drain and actual native-event backend failure | Pause/resume, original init notifications/signals, pressure reclaim, host filesystem commands and terminal/process admission no longer join. Actual terminal teardown and backend failure still stop their actors. Native-event failure returns its original HostIo cause after drain/cancellation, without an owner syscall retry. See [host control](../../crates/trames-session/src/process_vm.rs), [completion](../../crates/trames-session/src/process_exit.rs) and [workers](../../crates/trames-session/src/workers.rs). |
-| Missing capabilities and excluded resources | A genuinely absent source provider, an excluded original FD/node graph, a genuinely absent native event capability or unsupported source request body | There is no filesystem-kind exclusion after stage 82. Published global proc/sys metadata no longer lacks a source provider merely because it uses set_runtime_info. Other node/provider admission still applies. io_uring has exactly two submitter-scoped `require_owner()` maintenance call sites: missing-capability wait-source preparation and deferred original body progress; actual host backend errors take terminal source error handling. They remain connected to actual accepted request lifetime, subscriptions and cancellation. See [path authority](../../crates/trames-vfs/src/path_queries.rs), [maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [wait sources](../../crates/trames-linux/src/direct/uring/wait.rs) and [actor](../../crates/trames-linux/src/direct/uring/actor.rs). |
+| Missing capabilities and excluded resources | A genuinely absent source provider, an excluded original FD/node graph, a genuinely absent native event capability or unsupported source request body | There is no filesystem-kind exclusion after stage 82. Published global proc/sys metadata no longer lacks a source provider merely because it uses set_runtime_info. Other node/provider admission still applies. io_uring has exactly two submitter-scoped `require_owner()` maintenance call sites: an actually unavailable typed wait graph provider and deferred original body progress. An absent HostEvents hub no longer triggers this boundary: actual native interests are retained with their read/write directions. Compatibility capture carries its own original execution resources; actual host backend errors retain their host cause. They remain connected to actual accepted request lifetime, subscriptions and cancellation. See [path authority](../../crates/trames-vfs/src/path_queries.rs), [maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [wait sources](../../crates/trames-linux/src/direct/uring/wait.rs) and [actor](../../crates/trames-linux/src/direct/uring/actor.rs). |
 | Final execution dispatch fallback | A returned SVC or cold HLT/resource operation not completed, parked or accepted by a source scope; host faults and capability-less embeddings retain their own explicit boundaries | The catch-all stops the current cohort for joined dispatch. Ordinary shared-FD ioctl discovery, residual prctl controls/errors, implemented time observations, FD status/NOATIME, inode seals, anonymous memory-file creation, mapped-memory msync/writeback, file-cache advice, canonical FD/error admission, the complete original epoll/poll/select graph and generic socket event sources, current-offset vector transports, blocking POSIX/OFD locks, directory flock and canonical unknown fcntl commands no longer use it. It remains an audit target even though admitted native calls, ordinary guest faults, generated ENOSYS and migrated syscalls have source completion. Recognized guest faults, caught handlers and signal-frame failures now complete/terminate on source. A backend error is not a software or full-Linux-VM fallback. See [worker dispatch](../../crates/trames-session/src/workers.rs) and [classification](../../crates/trames-session/src/worker_syscalls.rs). |
 | Initial and legacy orchestration | Initial admission, standalone/capability-less nonmember scheduling and other excluded embedding routes | Ordinary live members and preexisting Kernel Futex/Sleep actors migrate, park and wake on the original queue. Cold waiters have metadata only until an event prepares their original mm; child/exec admission and lazy CPU slots no longer require a joined owner. The standalone futex legacy-publication mechanism remains. Solo dispatch is on the caller, so its existence alone is not a cross-thread transition. See [admission](../../crates/trames-session/src/process.rs), [legacy wakes](../../crates/trames-session/src/futex.rs) and [queue](../../crates/trames-session/src/run_queue.rs). |
 
@@ -4249,3 +4274,57 @@ cross-platform and native evidence is recorded in the product's
 [batch validation record](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/fd-admission-20261110.json);
 no production fallback-frequency or throughput gain is inferred from
 finite dispatch fixtures.
+
+
+## 99. Connected io_uring maintenance resources — 2026-11-10
+
+This batch connects original SQE execution context, subscription maintenance,
+enter/CQ observers, native source selection and final retirement. It adds no
+service thread, polling bus, copied Files table, global native-call lock,
+ordinary memory fence or guest byte permission layer.
+
+A stopped actor previously cached a byte subscription by OFD alone. New nested
+epoll interests could wake it once, then leave it parked on old leaves. Cache
+keys now include the actual original graph revision. Subscription precedes the
+deciding retry, with a post-subscription revision comparison to close the initial
+mutation gap. Native/virtual sockets beneath unchanged epoll interests rebuild
+their dynamic native set. Flat stable sources reuse their original subscriptions.
+
+Generic socket interests retain the original control-change subscription and
+stack deadline. Native registrations are keyed by the original native allocation,
+not a vector position that can acquire another endpoint after branch replacement.
+A weak allocation token prevents identity reuse until registration retirement
+while permitting immediate real close/FIN/binding release. Established TCP keeps
+its existing transport lease and direction; genuine event backend errors retain
+the original host error. Caller-driven embeddings without a hub can export the
+same fallible read/write interests and drive their original signal on their own
+existing wait loop. Hub-backed operation needs no extra FD export or poller.
+
+Compatibility UringEpoch capture now retains its actual source resolver/factory.
+Missing later builder bindings no longer force available original bodies through
+legacy admission. The normal worker capture accepts its already supplied bindings
+and skips that extra resolver. Context refresh preserves caller-provided disk,
+layout and signal services, while existing accepted work keeps the prior source
+context. Fast compatibility byte/file work is not forced through an additional
+staging path. An explicitly binding-less worker embedding still defers before
+import and effects; absent live PID/mm content is never synthesized from globals.
+
+Retaining an epoll for an SQE is now valid because its original index and nested
+edges are weak, including watches of the request's own ring. Direct ring SQE
+ownership remains excluded. Tests release the ring after final descriptors and
+its actual memory mappings are dropped; mappings legitimately retain the ring
+until unmap. Cancellation, selected buffers, opaque bodies, native/file/layout
+waits, original readers, foreign CQ observation and existing close/reuse tests
+remain in the connected regression closure. Final idle maintenance immediately
+releases subscriptions and deadlines rather than awaiting another retry.
+
+The new matrix exercises background, GETEVENTS, CQ ppoll and CQ epoll, including
+late nested ADD after parent FD close/reuse, a second deciding park, true leaf
+wake, cross-submitter async cancellation and listener retirement. Native source
+identity/direction and replaced UDP binding release are checked independently.
+The common execution fixture uses four/twelve CPUs and one slot, blocking and
+asynchronous enter: one cohort, zero returned syscall/service and zero mapping
+scope. The paired Mac fixture and integration evidence belong to the product
+[batch record](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/uring-maintenance-20261110.json).
+Neither maintenance guard nor any broad remaining category is declared removed.
+No throughput or production fallback-frequency improvement is inferred here.

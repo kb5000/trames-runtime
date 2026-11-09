@@ -135,6 +135,24 @@ pub trait HostSource: Send + Sync {
     fn revision(&self) -> u64;
     fn fd(&self) -> std::io::Result<Option<crate::HostFd>>;
 }
+enum HostBinding {
+    Registered(crate::HostSubscription),
+    Direct(crate::HostFd, bool),
+}
+impl HostBinding {
+    fn rearm(&self) -> std::io::Result<()> {
+        match self {
+            Self::Registered(subscription) => subscription.rearm(),
+            Self::Direct(..) => Ok(()),
+        }
+    }
+    fn direct_interest(&self) -> std::io::Result<Option<(crate::HostFd, bool)>> {
+        match self {
+            Self::Registered(_) => Ok(None),
+            Self::Direct(fd, write) => fd.try_clone().map(|fd| Some((fd, *write))),
+        }
+    }
+}
 struct DynamicHost {
     source: Weak<dyn HostSource>,
     signal: Weak<IoSignal>,
@@ -143,7 +161,7 @@ struct DynamicHost {
 #[derive(Default)]
 struct DynamicState {
     revision: Option<u64>,
-    host: Option<crate::HostSubscription>,
+    host: Option<HostBinding>,
     external: bool,
 }
 impl DynamicHost {
@@ -166,9 +184,10 @@ impl DynamicHost {
                 .as_ref()
                 .map_or(Ok(None), |signal| signal.host_events())?;
             let host = match (fd, events, signal.as_ref()) {
-                (Some(fd), Some(events), Some(signal)) => {
-                    Some(events.subscribe(fd, false, signal)?)
-                }
+                (Some(fd), Some(events), Some(signal)) => Some(HostBinding::Registered(
+                    events.subscribe(fd, false, signal)?,
+                )),
+                (Some(fd), _, _) => Some(HostBinding::Direct(fd, false)),
                 _ => None,
             };
             let previous = std::mem::replace(&mut state.host, host);
@@ -184,7 +203,7 @@ impl DynamicHost {
 pub struct IoSubscription {
     source: Option<Arc<Readiness>>,
     id: u64,
-    host: Option<crate::HostSubscription>,
+    host: Option<HostBinding>,
     host_error: Option<Arc<std::io::Error>>,
     external: bool,
     dynamic: Option<Box<DynamicHost>>,
@@ -284,6 +303,13 @@ impl IoSubscription {
     /// socket; closing the guest socket is independent of this subscription.
     /// Registration failures retain their original host cause for the executor.
     pub fn native(fd: std::io::Result<crate::HostFd>, signal: &Arc<IoSignal>) -> Self {
+        Self::native_direction(fd, false, signal)
+    }
+    pub fn native_direction(
+        fd: std::io::Result<crate::HostFd>,
+        write: bool,
+        signal: &Arc<IoSignal>,
+    ) -> Self {
         let mut subscription = Self {
             source: None,
             id: 0,
@@ -294,27 +320,50 @@ impl IoSubscription {
             retained_signal: None,
         };
         match fd {
-            Ok(fd) => subscription.with_host(fd, signal),
+            Ok(fd) => subscription.attach_host(fd, write, signal),
             Err(error) => {
                 subscription.host_error = Some(Arc::new(error));
                 subscription
             }
         }
     }
-    /// Retain a native readiness registration on the existing executor's poller.
-    /// The normal subscribe-then-retry protocol also covers readiness arriving
-    /// before this registration; no service thread is introduced.
-    pub fn with_host(mut self, fd: impl Into<crate::HostFd>, signal: &Arc<IoSignal>) -> Self {
-        // A joined single-task executor waits on its descriptor set directly;
-        // it has no HostEvents hub but must still retry after a native wake.
+    /// Attach to the caller's existing poller, or retain the original native
+    /// descriptor for a caller-driven wait. Absence of a hub is not absence of
+    /// the native event source; backend failure retains its original cause.
+    pub fn with_host(self, fd: impl Into<crate::HostFd>, signal: &Arc<IoSignal>) -> Self {
+        self.attach_host(fd.into(), false, signal)
+    }
+    fn attach_host(mut self, fd: crate::HostFd, write: bool, signal: &Arc<IoSignal>) -> Self {
         self.external = true;
-        match signal.subscribe_host(|| Ok(fd.into()), false) {
-            Ok(host) => self.host = host,
+        let result = signal.host_events().and_then(|events| match events {
+            Some(events) => events
+                .subscribe(fd, write, signal)
+                .map(HostBinding::Registered),
+            None => Ok(HostBinding::Direct(fd, write)),
+        });
+        match result {
+            Ok(host) => self.host = Some(host),
             Err(error) => {
                 self.host_error.get_or_insert_with(|| Arc::new(error));
             }
         }
         self
+    }
+    /// Original descriptors for an embedding's existing direct wait loop.
+    /// Hub-backed registrations need no duplicate or second native poller.
+    pub fn direct_wait_interest(&self) -> std::io::Result<Option<(crate::HostFd, bool)>> {
+        if let Some(dynamic) = &self.dynamic {
+            return dynamic
+                .state
+                .lock()
+                .unwrap()
+                .host
+                .as_ref()
+                .map_or(Ok(None), HostBinding::direct_interest);
+        }
+        self.host
+            .as_ref()
+            .map_or(Ok(None), HostBinding::direct_interest)
     }
     pub fn with_host_source(
         mut self,
@@ -379,6 +428,40 @@ impl Drop for IoSubscription {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hubless_native_interests_preserve_direction_and_drive_the_original_signal() {
+        use std::os::fd::AsFd;
+        struct Caller;
+        impl IoWake for Caller {
+            fn wake_io(&self, _: &Arc<IoSignal>) {}
+        }
+        let target: Arc<dyn IoWake> = Arc::new(Caller);
+        for write in [false, true] {
+            let signal = IoSignal::new(7, Arc::downgrade(&target));
+            let (socket, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            let subscription = IoSubscription::native_direction(
+                socket.as_fd().try_clone_to_owned().map(Into::into),
+                write,
+                &signal,
+            );
+            subscription.rearm_host().unwrap();
+            let (fd, direction) = subscription.direct_wait_interest().unwrap().unwrap();
+            assert_eq!(direction, write);
+            let events = crate::HostEvents::new().unwrap();
+            let registration = events.subscribe(fd, direction, &signal).unwrap();
+            if !write {
+                use std::io::Write;
+                peer.write_all(b"r").unwrap();
+            }
+            events
+                .wait(Some(
+                    std::time::Instant::now() + std::time::Duration::from_secs(2),
+                ))
+                .unwrap();
+            assert!(signal.ready());
+            drop(registration);
+        }
+    }
     struct Target;
     impl IoWake for Target {
         fn wake_io(&self, _: &Arc<IoSignal>) {

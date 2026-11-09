@@ -233,7 +233,7 @@ impl Dispatch {
                     .with_kernel_log(p.linux.vfs.kernel_log_capability())
                     .with_urings(
                         uring_epoch
-                            .capture_all(
+                            .capture_worker(
                                 &p.linux.vfs,
                                 p.memory.instruction_identity().0,
                                 id,
