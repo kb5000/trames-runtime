@@ -1045,6 +1045,20 @@ impl<C: Cpu> Epoch<C> {
         self.ready_slots.store(slots, Ordering::Relaxed);
     }
     fn ready(&self, q: &mut Queues<C>, job: Box<Job<C>>) {
+        if job.work.memory.is_none() {
+            // A dormant original actor has no byte View until an actual event
+            // makes it runnable. Existing workers prepare only this mm under
+            // its original custody; unrelated executing domains keep their Views.
+            let id = job.domain.as_ref().expect("registered dormant mm").id;
+            q.idle_notified = false;
+            q.domains.pause_bytes(id);
+            q.domains.hold(job);
+            self.capture_paused(q);
+            // An idle executor is notified by the caller. With every slot busy,
+            // reuse the existing bounded-slice hint for one maintenance turn.
+            self.next_deadline.store(0, Ordering::Relaxed);
+            return;
+        }
         if let Some(snapshot) = &job.work.syscalls {
             snapshot.io_signals.proc_view.waiting(false);
         }
@@ -1147,12 +1161,26 @@ impl<C: Cpu> Epoch<C> {
             job.uring = snapshot.direct.uring_background(pid, &self.io_target);
         }
     }
-    pub fn add(self: &Arc<Self>, mut job: Box<Job<C>>) {
+    pub fn add(self: &Arc<Self>, job: Box<Job<C>>) {
+        self.add_inner(job, None);
+    }
+    pub fn add_dormant(self: &Arc<Self>, job: Box<Job<C>>, memory: u64) {
+        assert!(
+            job.work.memory.is_none(),
+            "dormant admission owns no byte View"
+        );
+        self.add_inner(job, Some(memory));
+    }
+    fn add_inner(self: &Arc<Self>, mut job: Box<Job<C>>, dormant: Option<u64>) {
         self.bind_job(&mut job);
         let pid = job.work.pid;
         let mut q = self.queues.lock().unwrap();
         assert!(q.members.insert(pid), "duplicate cohort task");
-        q.domains.register(&mut job);
+        if let Some(memory) = dormant {
+            q.domains.register_waiting(&mut job, memory);
+        } else {
+            q.domains.register(&mut job);
+        }
         if q.domains.paused(pid) {
             q.domains.hold(job);
             self.capture_paused(&mut q);
@@ -1500,6 +1528,45 @@ impl<C: Cpu> Epoch<C> {
             if self.control.stopped() {
                 return None;
             }
+            // Timer/sleeper events can make a dormant mm need its first View.
+            // Publish those scopes before claiming source work, so one executor
+            // cannot sleep with freshly prepared metadata work still unclaimed.
+            if let Some(timers) = self.timers.get().filter(|t| t.due()) {
+                // Signal callbacks may acquire this queue. Timer maintenance
+                // runs on this existing executor, always outside its mutex.
+                drop(q);
+                timers.tick();
+                q = self.queues.lock().unwrap();
+            }
+            let now = Instant::now();
+            let expired: Vec<_> = q
+                .parked
+                .iter()
+                .filter_map(|(&pid, job)| {
+                    (job.wake_deadline().is_some_and(|d| d <= now)).then_some(pid)
+                })
+                .collect();
+            for pid in expired {
+                // The first dormant wake may already hold expired siblings of
+                // the same mm in its preparation scope.
+                let Some(mut job) = q.parked.remove(&pid) else {
+                    continue;
+                };
+                if job
+                    .waiting
+                    .as_ref()
+                    .and_then(WaitState::deadline)
+                    .is_some_and(|d| d <= now)
+                    && !matches!(job.waiting, Some(WaitState::Signal(_)))
+                {
+                    let waiting = job.waiting.take().unwrap();
+                    job.work.trace.finish(&mut job.work.cpu, waiting.expire());
+                }
+                // I/O must perform a final resource check and scatter, even on
+                // timeout. Keep its pending call and do not execute SVC twice.
+                job.stats.resumes += 1;
+                self.ready(&mut q, job);
+            }
             if let Some(lifecycle) = self.lifecycle.get() {
                 let retired = q.domains.take_retired();
                 if !retired.is_empty() {
@@ -1562,38 +1629,6 @@ impl<C: Cpu> Epoch<C> {
                     q = self.queues.lock().unwrap();
                     continue;
                 }
-            }
-            if let Some(timers) = self.timers.get().filter(|t| t.due()) {
-                // Signal callbacks may acquire this queue. Timer maintenance
-                // runs on this existing executor, always outside its mutex.
-                drop(q);
-                timers.tick();
-                q = self.queues.lock().unwrap();
-            }
-            let now = Instant::now();
-            let expired: Vec<_> = q
-                .parked
-                .iter()
-                .filter_map(|(&pid, job)| {
-                    (job.wake_deadline().is_some_and(|d| d <= now)).then_some(pid)
-                })
-                .collect();
-            for pid in expired {
-                let mut job = q.parked.remove(&pid).unwrap();
-                if job
-                    .waiting
-                    .as_ref()
-                    .and_then(WaitState::deadline)
-                    .is_some_and(|d| d <= now)
-                    && !matches!(job.waiting, Some(WaitState::Signal(_)))
-                {
-                    let waiting = job.waiting.take().unwrap();
-                    job.work.trace.finish(&mut job.work.cpu, waiting.expire());
-                }
-                // I/O must perform a final resource check and scatter, even on
-                // timeout. Keep its pending call and do not execute SVC twice.
-                job.stats.resumes += 1;
-                self.ready(&mut q, job);
             }
             let deadline = q
                 .parked

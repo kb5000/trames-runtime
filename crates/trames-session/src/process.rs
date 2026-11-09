@@ -3556,6 +3556,18 @@ impl<C: Cpu> Kernel<C> {
             return Ok(false);
         }
         let timeout = self.parallel_timeout().min(io.control_poll_interval());
+        // Original sleeping actors remain addressable by futexes, deadlines and
+        // signals even when no runnable CPU selected their mm. Register their
+        // wait metadata now; byte/hardware Views are prepared only on a wake.
+        let warm: std::collections::BTreeSet<_> = members.iter().map(|(id, _)| *id).collect();
+        let dormant: Vec<_> = self
+            .processes
+            .iter()
+            .filter_map(|(id, p)| {
+                (!warm.contains(&id) && matches!(p.state, State::Futex { .. } | State::Sleep(..)))
+                    .then_some(id)
+            })
+            .collect();
         let began = Instant::now();
         let Some(mut views) = self.prepare_parallel_views(&members) else {
             return Ok(false);
@@ -3590,8 +3602,23 @@ impl<C: Cpu> Kernel<C> {
                 &mut network_epoch,
             ));
         }
+        for id in dormant {
+            let memory = self.processes.read(&id).memory.instruction_identity().0;
+            let job = self.capture_worker(
+                id,
+                None,
+                &control,
+                &mut file_epoch,
+                &mut uring_epoch,
+                &mut network_epoch,
+            );
+            epoch.add_dormant(job, memory);
+            members.push((id, 0));
+        }
         // No cached connection/policy decision survives into guest execution.
         drop(network_epoch);
+        let owned_waiters: std::collections::BTreeSet<_> =
+            members.iter().map(|(id, _)| *id).collect();
         epoch.assign(&chosen);
         for &(_, slot) in &chosen {
             self.workers
@@ -3620,8 +3647,10 @@ impl<C: Cpu> Kernel<C> {
                 }
                 match self.cohort_live_control(&epoch, &members, io) {
                     Ok(false) => {
-                        deadline =
-                            Instant::now() + self.parallel_timeout().min(io.control_poll_interval())
+                        deadline = Instant::now()
+                            + self
+                                .parallel_timeout_for(Some(&owned_waiters))
+                                .min(io.control_poll_interval())
                     }
                     result => {
                         checkpoint_error = result.err();
@@ -4116,6 +4145,12 @@ impl<C: Cpu> Kernel<C> {
         self.gpu_transfers.merge(stats.gpu.transfers);
     }
     fn parallel_timeout(&self) -> Duration {
+        self.parallel_timeout_for(None)
+    }
+    fn parallel_timeout_for(
+        &self,
+        owned_waiters: Option<&std::collections::BTreeSet<u32>>,
+    ) -> Duration {
         let now = Instant::now();
         // Bounded host control and affinity fairness even when every guest spins
         // forever. A local instruction poll does not yield to the coordinator.
@@ -4128,6 +4163,17 @@ impl<C: Cpu> Kernel<C> {
             .collect();
         for (id, p) in self.processes.iter() {
             if p.frozen(id) {
+                continue;
+            }
+            // The queue owns these original waits and their changing deadlines.
+            // Their cold Process projection can retain an expired old deadline;
+            // using it would spin host control instead of collecting its events.
+            if owned_waiters.is_some_and(|owned| owned.contains(&id))
+                && matches!(
+                    p.state,
+                    State::Futex { .. } | State::Sleep(..) | State::Sigwait { .. }
+                )
+            {
                 continue;
             }
             if matches!(p.state, State::Gpu { .. }) && !p.worker_gpu_candidate() {
@@ -9556,3 +9602,7 @@ mod host_io_tests;
 #[cfg(all(test, trames_interpreter_conformance))]
 #[path = "process_uring_authority_tests.rs"]
 mod uring_authority_tests;
+
+#[cfg(all(test, trames_interpreter_conformance))]
+#[path = "process_dormant_tests.rs"]
+mod dormant_tests;

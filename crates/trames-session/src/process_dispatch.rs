@@ -5,7 +5,7 @@ impl<C: Cpu> Kernel<C> {
     pub(super) fn capture_worker(
         &mut self,
         id: u32,
-        view: Box<trames_memory::parallel::View>,
+        view: impl Into<Option<Box<trames_memory::parallel::View>>>,
         control: &Arc<crate::workers::Control>,
         file_epoch: &mut trames_vfs::FileEpoch,
         uring_epoch: &mut trames_linux::UringEpoch,
