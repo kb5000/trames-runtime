@@ -261,3 +261,111 @@ fn bpf_ofd_worker_lifetime_preserves_original_program_registry_and_quota() {
     assert_eq!(v.bpf_get_fd(id), Err(Errno(2)));
     v.bpf_load_device(&bpf_allow()).unwrap();
 }
+
+#[test]
+fn native_device_namespace_opens_and_metadata_use_original_shared_nodes() {
+    let mut v = Vfs::default();
+    snapshot(&mut v);
+    v.attach_bridge(Default::default());
+    let mut epoch = FileEpoch::default();
+    let files = epoch.capture(&v, true);
+    let paths = v.path_queries();
+    assert_eq!(
+        paths.open_at_resolve(AT_FDCWD, b"/dev/dri/renderD128", 2, 0, 0, &files),
+        Some(Err(Errno(2)))
+    );
+    v.enable_video_device();
+
+    for (path, flags) in [
+        (b"/dev/dri".as_slice(), O_DIRECTORY),
+        (b"/dev/dri/renderD128", 2),
+        (b"/dev/block", O_DIRECTORY),
+        (b"/dev/block/253:0", 0),
+        (b"/dev/block/253:1", O_PATH | 0x20000),
+        (b"/dev/vda", 0),
+        (b"/dev/vda1", 0),
+        (b"/dev/kmsg", 2 | O_NONBLOCK),
+        (b"/dev/trames-bridge", 2),
+    ] {
+        let fd = paths
+            .open_at_resolve(AT_FDCWD, path, flags, 0, 0, &files)
+            .expect("native device source open")
+            .unwrap();
+        let stat = paths
+            .uring_query(|view| view.stat_fd(fd))
+            .expect("source device metadata")
+            .unwrap();
+        assert_eq!(stat, v.stat_fd(fd).unwrap());
+        let descriptor = v.shared_files().lookup(fd).unwrap().unwrap();
+        assert!(descriptor.open.mount_resource.get().is_some() || descriptor.open.node.is_some());
+        v.close(fd).unwrap();
+    }
+    let mut user = v.clone_with_resources(true, true);
+    user.credentials = Credentials::user(1000, 1000);
+    assert_eq!(
+        user.path_queries()
+            .open_at_resolve(AT_FDCWD, b"/dev/trames-bridge", 2, 0, 0, &files),
+        Some(Err(Errno(13)))
+    );
+    epoch.finish();
+}
+
+#[test]
+fn bridge_source_waits_retain_accepted_ofd_but_snapshots_do_not_keep_connections_alive() {
+    struct Wake;
+    impl IoWake for Wake {
+        fn wake_io(&self, _: &Arc<IoSignal>) {}
+    }
+    let broker = trames_bridge::Broker::default();
+    let mut v = Vfs::default();
+    snapshot(&mut v);
+    v.attach_bridge(broker.clone());
+    let mut epoch = FileEpoch::default();
+    let files = epoch.capture(&v, true);
+    let paths = v.path_queries();
+    let fd = paths
+        .open_at_resolve(AT_FDCWD, b"/dev/trames-bridge", 2, 0, 0, &files)
+        .unwrap()
+        .unwrap();
+    assert!(v.epoch_stream_io(fd));
+    let descriptor = v.shared_files().lookup(fd).unwrap().unwrap();
+    let weak = Arc::downgrade(descriptor.open.bridge.as_ref().unwrap());
+    let frozen = DirectFd::shared_byte(&descriptor.open).unwrap();
+    let original = descriptor.direct_byte().unwrap();
+    let target: Arc<dyn IoWake> = Arc::new(Wake);
+    let signal = IoSignal::new(7, Arc::downgrade(&target));
+    let subscriptions = original.subscribe(&signal);
+    assert!(!subscriptions[0].external());
+    let frame = b"{\"version\":1,\"id\":7,\"method\":\"clipboard.read\",\"params\":{}}\n";
+    assert_eq!(original.write(frame), Ok(frame.len()));
+    assert!(subscriptions[0].external());
+    assert!(original.next_deadline().is_some());
+    assert!(broker.poll(65536).unwrap().is_some());
+    v.close(fd).unwrap();
+    assert!(
+        weak.upgrade().is_some(),
+        "accepted work retains its original connection"
+    );
+    let replacement = paths
+        .open_at_resolve(AT_FDCWD, b"/dev/trames-bridge", 2, 0, 0, &files)
+        .unwrap()
+        .unwrap();
+    assert_eq!(replacement, fd);
+    signal.reset();
+    let cancel = b"{\"version\":1,\"id\":8,\"method\":\"request.cancel\",\"params\":{\"id\":7}}\n";
+    assert_eq!(original.write(cancel), Ok(cancel.len()));
+    assert!(signal.ready());
+    assert_eq!(original.poll_ready(1), Some(1));
+    assert!(!subscriptions[0].external());
+    assert!(original.next_deadline().is_none());
+    assert!(!original.read(65536).unwrap().is_empty());
+    assert_eq!(v.read(replacement, 65536), Err(Errno(11)));
+    drop(original);
+    assert!(
+        weak.upgrade().is_none(),
+        "weak snapshot/subscription cannot retain last close"
+    );
+    assert_eq!(frozen.poll_ready(1), Some(16));
+    v.close(replacement).unwrap();
+    epoch.finish();
+}

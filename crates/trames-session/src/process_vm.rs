@@ -1140,6 +1140,103 @@ mod tests {
             assert!(k.cohort_return_native.is_empty());
         }
     }
+    #[test]
+    fn native_device_open_and_bridge_read_keep_four_and_twelve_cpu_cohorts() {
+        struct Host {
+            checks: usize,
+            sent: bool,
+            done: Arc<SharedPage>,
+            deadline: Instant,
+        }
+        impl GuestOutput for Host {
+            fn source_console(&mut self) -> Arc<dyn trames_vfs::ConsoleIo> {
+                Arc::new(trames_vfs::CapturedConsole::default())
+            }
+            fn poll_control(&mut self, vfs: &trames_vfs::Vfs) -> std::io::Result<bool> {
+                self.checks += 1;
+                if self.checks >= 3 && !self.sent {
+                    if let Some(info) = vfs
+                        .fd_snapshot()
+                        .into_iter()
+                        .find(|info| info.target == b"/dev/trames-bridge")
+                    {
+                        let sender = vfs
+                            .shared_files()
+                            .lookup(info.fd)
+                            .unwrap()
+                            .unwrap()
+                            .direct_byte()
+                            .unwrap();
+                        let frame =
+                            b"{\"version\":1,\"id\":7,\"method\":\"bridge.info\",\"params\":{}}\n";
+                        assert_eq!(sender.write(frame), Ok(frame.len()));
+                        self.sent = true;
+                    }
+                }
+                Ok(count(&self.done) != 0 || Instant::now() >= self.deadline)
+            }
+            fn control(&mut self, _: &mut trames_vfs::Vfs) -> std::io::Result<bool> {
+                Ok(count(&self.done) == 0 && Instant::now() < self.deadline)
+            }
+            fn control_poll_interval(&self) -> Duration {
+                Duration::from_millis(1)
+            }
+            fn write(&mut self, _: OutputFd, bytes: &[u8]) -> std::io::Result<usize> {
+                Ok(bytes.len())
+            }
+        }
+        for (cpus, slots) in [(4, 4), (12, 12), (4, 1)] {
+            let mut k = super::super::tests::kernel();
+            k.cpu_count = cpus;
+            k.workers = crate::workers::Pool::new(slots);
+            k.per_cpu = vec![Duration::ZERO; cpus];
+            let done = Arc::new(SharedPage::new([0; PAGE_SIZE as usize]));
+            for id in 1..=cpus {
+                let mut p = super::super::tests::process();
+                p.tgid = id as u32;
+                p.vm_id = id as u64;
+                p.signals
+                    .io
+                    .scheduling
+                    .set_affinity(if slots == 1 { 1 } else { 1 << (id - 1) });
+                if id == 1 {
+                    p.linux.vfs.set_runtime_info(1, Default::default());
+                    p.linux.vfs.attach_bridge(Default::default());
+                    p.memory.write(0x1000, b"/dev/trames-bridge\0").unwrap();
+                    map(&mut p, 0x3000, done.clone(), None);
+                    for (i, value) in [(-100i64) as u64, 0x1000, 2, 0].into_iter().enumerate() {
+                        p.cpu.set_x(i, value);
+                    }
+                    code(
+                        &mut p,
+                        &[
+                            0xd2800708, 0xd4000001, 0xaa0003f4, 0xaa1403e0, 0xd2840001, 0xd2808002,
+                            0xd28007e8, 0xd4000001, 0xd2860001, 0xf9000020, 0x14000000,
+                        ],
+                    );
+                } else {
+                    code(&mut p, &[0x14000000]);
+                }
+                k.processes.insert(id as u32, p);
+            }
+            let mut host = Host {
+                checks: 0,
+                sent: false,
+                done: done.clone(),
+                deadline: Instant::now() + Duration::from_secs(5),
+            };
+            assert!(matches!(
+                k.drive(&mut host, u64::MAX),
+                Err(RuntimeError::Cancelled)
+            ));
+            assert!(host.sent);
+            assert!(count(&done) > 0 && count(&done) < 1024);
+            assert_eq!(k.parallel_rounds, 1);
+            assert!(k.cohort_return_syscalls.is_empty());
+            assert_eq!(k.service_requests, 0);
+            assert_eq!(k.serviced_syscalls, 0);
+        }
+    }
     fn native_bridge_retains_cohort(idle_peer: bool, start_parked: bool) {
         struct Roundtrip {
             checks: usize,

@@ -69,6 +69,148 @@ fn scalar(op: u8, fd: u32, address: u64, length: u32, tag: u64) -> [u8; 64] {
     s
 }
 #[test]
+fn native_device_scalar_vector_and_positioned_errors_share_the_original_abi() {
+    let (mut l, mut m, _, _) = setup(16);
+    l.vfs.set_runtime_info(7, Default::default());
+    l.vfs.enable_video_device();
+    l.vfs.attach_bridge(Default::default());
+    let mut files = trames_vfs::FileEpoch::default();
+    let caps = files.capture(&l.vfs, true);
+    let mut epoch = UringEpoch::default();
+    let d = direct(&l, &m, &mut epoch, &caps);
+    m.write(0x2100, b"x").unwrap();
+    m.write(0x2200, &0x2100u64.to_le_bytes()).unwrap();
+    m.write(0x2208, &1u64.to_le_bytes()).unwrap();
+    for path in [
+        b"/dev/dri/renderD128".as_slice(),
+        b"/dev/vda",
+        b"/dev/vda1",
+        b"/dev/trames-bridge",
+    ] {
+        for flags in [0, 1, 2, 0x200000] {
+            let fd = l.vfs.open_at(-100, path, flags, 0).unwrap() as u64;
+            let mut calls = vec![(62, [fd, 0, 999, 0, 0, 0])];
+            for number in 63..=66 {
+                calls.push((
+                    number,
+                    [fd, if number < 65 { 0x2100 } else { 0x2200 }, 0, 0, 0, 0],
+                ));
+            }
+            for offset in [0, u64::MAX] {
+                for length in [0, 1] {
+                    for number in 67..=70 {
+                        calls.push((
+                            number,
+                            [
+                                fd,
+                                if number < 69 { 0x2100 } else { 0x2200 },
+                                length,
+                                offset,
+                                0,
+                                0,
+                            ],
+                        ));
+                    }
+                }
+            }
+            if path != b"/dev/trames-bridge" {
+                calls.extend([
+                    (63, [fd, 0x2100, 1, 0, 0, 0]),
+                    (64, [fd, 0x2100, 1, 0, 0, 0]),
+                ]);
+            }
+            for (number, args) in calls {
+                let expected = l.syscall(
+                    number as u64,
+                    args,
+                    &mut m,
+                    &mut crate::CapturedOutput::default(),
+                );
+                assert_eq!(
+                    d.invoke(number, args, &mut m),
+                    Some(expected),
+                    "{} syscall {number} args {args:?}",
+                    String::from_utf8_lossy(path)
+                );
+            }
+            l.vfs.close(fd as u32).unwrap();
+        }
+    }
+}
+#[test]
+fn native_device_opens_and_bridge_requests_use_original_source_resources() {
+    let (mut l, mut m, ring_fd, ring) = setup(16);
+    l.vfs.set_runtime_info(7, Default::default());
+    l.vfs.enable_video_device();
+    l.vfs.attach_bridge(Default::default());
+    let mut files = trames_vfs::FileEpoch::default();
+    let caps = files.capture(&l.vfs, true);
+    let mut epoch = UringEpoch::default();
+    let d = direct(&l, &m, &mut epoch, &caps);
+    let t = target();
+    for (tag, path) in [
+        b"/dev/dri/renderD128".as_slice(),
+        b"/dev/kmsg",
+        b"/dev/vda",
+        b"/dev/vda1",
+        b"/dev/trames-bridge",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        m.write(0x2100, &[path, b"\0"].concat()).unwrap();
+        let mut open = scalar(18, (-100i32) as u32, 0x2100, 0, tag as u64 + 100);
+        open[28..32].copy_from_slice(&2u32.to_le_bytes());
+        let fd = submit(&d, &mut m, ring_fd, &ring, open, &t);
+        assert!(fd >= 0, "{} returned {fd}", String::from_utf8_lossy(path));
+        assert!(l.vfs.stat_fd(fd as u32).is_ok());
+        if path == b"/dev/trames-bridge" {
+            let fd = fd as u32;
+            let frame = b"{\"version\":1,\"id\":7,\"method\":\"bridge.info\",\"params\":{}}\n";
+            m.write(0x3000, frame).unwrap();
+            let mut write = scalar(23, fd, 0x3000, frame.len() as u32, 170);
+            write[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+            assert_eq!(
+                submit(&d, &mut m, ring_fd, &ring, write, &t),
+                frame.len() as i32
+            );
+            let mut read = scalar(22, fd, 0x3100, 1024, 171);
+            read[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+            assert!(submit(&d, &mut m, ring_fd, &ring, read, &t) > 0);
+            let original = l
+                .vfs
+                .shared_files()
+                .lookup(fd)
+                .unwrap()
+                .unwrap()
+                .direct_byte()
+                .unwrap();
+            let mut read = scalar(22, fd, 0x3100, 1024, 172);
+            read[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+            add(&mut m, &ring, read);
+            assert!(matches!(
+                enter(&d, ring_fd, 1, 0, &mut m, &t),
+                IoAttempt::Complete(Ok(1))
+            ));
+            let mut background = d.uring_background(7, &Arc::downgrade(&t)).unwrap();
+            assert!(background.progress(&mut m));
+            l.vfs.close(fd).unwrap();
+            assert_eq!(l.vfs.open_at(-100, path, 2, 0).unwrap(), fd);
+            assert_eq!(original.write(frame), Ok(frame.len()));
+            assert!(background.signal.ready());
+            assert!(background.progress(&mut m));
+            assert!(!background.active());
+            assert!(!l.uring_requires_owner());
+            assert_eq!(cq(&mut m, &ring).0, 172);
+            assert_eq!(
+                l.vfs.read(fd, 1024),
+                Err(Errno(11)),
+                "FD reuse cannot receive the original connection's reply"
+            );
+        }
+    }
+}
+#[test]
 fn mapped_layout_sqe_uses_source_resource_and_keeps_accepted_work_after_cancellation() {
     struct Queue(std::sync::mpsc::Sender<(trames_vfs::FileWork, Arc<crate::FileResult>)>);
     impl FileExecutor for Queue {

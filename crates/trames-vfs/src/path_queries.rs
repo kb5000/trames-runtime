@@ -121,6 +121,9 @@ impl Authority {
         if file.open.node.as_ref().is_some_and(|n| {
             let state = n.borrow();
             n.simple_device.is_none()
+                && !matches!(state.content, Content::Device(device) if device.source_open())
+                && !(matches!(state.content, Content::Directory | Content::Symlink(_))
+                    && matches!(&file.open.kind, FdKind::Node(path) if matches!(path.as_slice(), b"/dev/dri" | b"/dev/block") || path.starts_with(b"/dev/dri/") || path.starts_with(b"/dev/block/")))
                 && file.open.pty.is_none()
                 && state.volatile
                 && !(n.proc_node.get().is_some()
@@ -191,6 +194,8 @@ impl Vfs {
         view.credentials = self.credentials.clone();
         view.dumpable = self.dumpable.clone();
         view.kernel_log = self.kernel_log.clone();
+        view.bridge = self.bridge.clone();
+        view.native_services = self.native_services.clone();
         view.uts = self.uts.clone();
         view.network = self.network.clone();
         view.root_network = self.root_network.clone();
@@ -215,7 +220,7 @@ impl Vfs {
             pseudo.nodes = source.nodes.clone();
             pseudo.source = source.source.clone();
             pseudo.boot_id = source.boot_id.clone();
-            pseudo.video_device = source.video_device;
+            pseudo.video_device = source.video_device.clone();
         }
         view.query = Some(Authority {
             files: self
@@ -852,14 +857,13 @@ mod tests {
             .symlink_at(b"/proc/self/status", AT_FDCWD, b"/alias")
             .unwrap();
         let query = owner.path_queries();
-        for path in [
-            b"/proc/self/status".as_slice(),
-            b"/alias",
-            b"/sys/kernel",
-            b"/dev/kmsg",
-        ] {
+        for path in [b"/proc/self/status".as_slice(), b"/alias", b"/sys/kernel"] {
             assert!(query.stat_at(AT_FDCWD, path, false).is_none(), "{path:?}");
         }
+        assert_eq!(
+            query.stat_at(AT_FDCWD, b"/dev/kmsg", false),
+            Some(owner.stat_at(AT_FDCWD, b"/dev/kmsg"))
+        );
         // A deferred result must not poison a later ordinary query.
         assert_eq!(
             query.stat_at(AT_FDCWD, b"/missing", false),

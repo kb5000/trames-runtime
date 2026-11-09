@@ -790,7 +790,7 @@ pub struct RuntimeInfo {
 #[derive(Default)]
 pub(super) struct PseudoFs {
     pub(super) boot_id: Arc<std::sync::OnceLock<Result<Vec<u8>>>>,
-    pub(super) video_device: bool,
+    pub(super) video_device: Arc<std::sync::atomic::AtomicBool>,
     pub(super) enabled: bool,
     pub(super) runtime: RuntimeInfo,
     pub(super) source: Option<Arc<dyn proc_source::ProcSource>>,
@@ -958,6 +958,11 @@ pub(super) enum Device {
     Vda1,
 }
 impl Device {
+    /// Complete resource-backed opens need no task/session transition. PTYs
+    /// retain their original terminal capability and acquisition algorithm.
+    pub(super) fn source_open(self) -> bool {
+        !matches!(self, Self::Ptmx | Self::Pts(..))
+    }
     /// Resolve guest device numbers only. Never open a host device node.
     pub(super) fn node(rdev: u32, block: bool) -> Content {
         if block {
@@ -1051,7 +1056,10 @@ impl Vfs {
             .is_some_and(|n| matches!(n.borrow().content, Content::Device(Device::Render))))
     }
     pub fn enable_video_device(&self) {
-        self.pseudo.borrow_mut().video_device = true;
+        self.pseudo
+            .borrow()
+            .video_device
+            .store(true, Ordering::Relaxed);
     }
     pub fn set_runtime_info(&mut self, pid: u32, mut runtime: RuntimeInfo) {
         self.begin_proc_query();
@@ -1606,7 +1614,8 @@ impl Vfs {
             }
             if let Some(query) = &self.query {
                 if self.terminal_task.get().is_none()
-                    || !(path == b"/dev/ptmx"
+                    && (path == b"/dev/tty"
+                        || path == b"/dev/ptmx"
                         || path == b"/dev/pts"
                         || path.starts_with(b"/dev/pts/"))
                 {
@@ -1668,15 +1677,15 @@ impl Vfs {
             b"/dev/dri" | b"/sys/dev/char" | b"/sys/class/drm" |
             b"/sys/devices/platform" | b"/sys/devices/platform/trames" |
             b"/sys/devices/platform/trames/drm" | b"/sys/devices/platform/trames/drm/renderD128" |
-            b"/sys/bus" | b"/sys/bus/platform" if self.pseudo.borrow().video_device => return Ok(directory()),
-            b"/dev/dri/renderD128" if self.pseudo.borrow().video_device => return Ok(Some((Content::Device(Device::Render), 0o20666))),
-            b"/sys/dev/char/226:128" | b"/sys/class/drm/renderD128" if self.pseudo.borrow().video_device => return Ok(link(b"../../devices/platform/trames/drm/renderD128".to_vec())),
-            b"/sys/devices/platform/trames/drm/renderD128/device" if self.pseudo.borrow().video_device => return Ok(link(b"../..".to_vec())),
-            b"/sys/devices/platform/trames/drm/renderD128/subsystem" if self.pseudo.borrow().video_device => return Ok(link(b"../../../../../class/drm".to_vec())),
-            b"/sys/devices/platform/trames/subsystem" if self.pseudo.borrow().video_device => return Ok(link(b"../../../bus/platform".to_vec())),
-            b"/sys/devices/platform/trames/drm/renderD128/dev" if self.pseudo.borrow().video_device => return Ok(regular(b"226:128\n".to_vec())),
-            b"/sys/devices/platform/trames/drm/renderD128/uevent" if self.pseudo.borrow().video_device => return Ok(regular(b"MAJOR=226\nMINOR=128\nDEVNAME=dri/renderD128\nDEVTYPE=drm_minor\n".to_vec())),
-            b"/sys/devices/platform/trames/uevent" if self.pseudo.borrow().video_device => return Ok(regular(b"DRIVER=trames\nMODALIAS=platform:trames\n".to_vec())),
+            b"/sys/bus" | b"/sys/bus/platform" if self.pseudo.borrow().video_device.load(Ordering::Relaxed) => return Ok(directory()),
+            b"/dev/dri/renderD128" if self.pseudo.borrow().video_device.load(Ordering::Relaxed) => return Ok(Some((Content::Device(Device::Render), 0o20666))),
+            b"/sys/dev/char/226:128" | b"/sys/class/drm/renderD128" if self.pseudo.borrow().video_device.load(Ordering::Relaxed) => return Ok(link(b"../../devices/platform/trames/drm/renderD128".to_vec())),
+            b"/sys/devices/platform/trames/drm/renderD128/device" if self.pseudo.borrow().video_device.load(Ordering::Relaxed) => return Ok(link(b"../..".to_vec())),
+            b"/sys/devices/platform/trames/drm/renderD128/subsystem" if self.pseudo.borrow().video_device.load(Ordering::Relaxed) => return Ok(link(b"../../../../../class/drm".to_vec())),
+            b"/sys/devices/platform/trames/subsystem" if self.pseudo.borrow().video_device.load(Ordering::Relaxed) => return Ok(link(b"../../../bus/platform".to_vec())),
+            b"/sys/devices/platform/trames/drm/renderD128/dev" if self.pseudo.borrow().video_device.load(Ordering::Relaxed) => return Ok(regular(b"226:128\n".to_vec())),
+            b"/sys/devices/platform/trames/drm/renderD128/uevent" if self.pseudo.borrow().video_device.load(Ordering::Relaxed) => return Ok(regular(b"MAJOR=226\nMINOR=128\nDEVNAME=dri/renderD128\nDEVTYPE=drm_minor\n".to_vec())),
+            b"/sys/devices/platform/trames/uevent" if self.pseudo.borrow().video_device.load(Ordering::Relaxed) => return Ok(regular(b"DRIVER=trames\nMODALIAS=platform:trames\n".to_vec())),
             b"/proc" | b"/sys" | b"/sys/fs" | b"/sys/fs/cgroup" | b"/sys/class" | b"/sys/class/net" | b"/sys/devices" |
             b"/sys/devices/system" | b"/sys/devices/system/cpu" | b"/sys/devices/virtual" | b"/sys/devices/virtual/net" | b"/sys/block" |
             b"/sys/class/block" | b"/sys/devices/virtual/block" | b"/sys/devices/virtual/block/vda" |
@@ -2531,7 +2540,7 @@ impl Vfs {
             .collect(),
             _ => Vec::new(),
         };
-        if self.pseudo.borrow().video_device {
+        if self.pseudo.borrow().video_device.load(Ordering::Relaxed) {
             match path {
                 b"/dev" => names.push(b"dri".to_vec()),
                 b"/sys" => names.push(b"bus".to_vec()),

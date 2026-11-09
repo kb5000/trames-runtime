@@ -1,11 +1,27 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 75, source-owned Mac pressure reclamation, reviewed on 2026-11-09. The prior shared runtime
-baseline is `effa704003797f610f0608cd8b3ff73fd787d621`.
+This is the consolidated implementation audit through stage 77, original native devices and Bridge resources, reviewed on 2026-11-09. The prior shared runtime
+baseline is `e3e94de96f47d74115b3084fb3d43c15ff72ed21`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-09
+
+Stage 77 closes native special-device pathname/OFD execution and Bridge
+bytes/readiness through original shared resources. Original device availability,
+namespace and credentials remain live; accepted bytes and waits retain their OFD
+identity. The Bridge protocol retains its original broker mutex and limits,
+notifies original readiness after unlocking, and exposes pure queue observation.
+No new coordinator, resource thread, polling bus, global native-call lock or
+ordinary guest-memory check/fence is introduced. io_uring's two genuine
+maintenance-failure setters and the final dispatch fallback remain. The overall
+coordinator-removal goal is active.
+
+Stage 76 moves host imports/exports, conditional editor saves and timezone work
+to the existing disk pool and original namespace/inode/backing resources. Actual
+mapped dependants still quiesce; unrelated workers keep executing. Explicit pause
+can drain accepted disk/backing work without resuming guest execution. Original
+conditional replacement, metadata, quota, cancellation and old-OFD rules remain.
 
 Stage 75 removes the Mac memory-pressure reclamation join. The existing host
 adapter advances a finite original-Machine request in bounded batches while
@@ -357,6 +373,7 @@ Actual excluded policy effects and missing capabilities retain explicit boundari
 | Event waits and remaining owner/mixed cases | Admitted pselect6, ppoll, epoll_pwait and epoll_pwait2, including temporary masks, use workers; excluded owner/dynamic FDs, unavailable source pumps and actual lifecycle/task-policy effects retain their boundary | One imported wait retains original OFDs/sets, mask and deadline through parking and cohort handoff. Source I/O signals interrupt locally and sigreturn restores the pre-wait mask. All pending sources now use the same queues. Caught signals interrupt locally; STOP/CONT retains the original wait and uses shared group control. Default termination uses original source group cleanup. | [poll ownership](../../crates/trames-linux/src/poll.rs), [wait admission](../../crates/trames-session/src/process.rs), [cohort control](../../crates/trames-session/src/process_vm.rs) |
 | VM and pin topology | brk growth, munmap/mremap, non-additive mmap, mprotect, mincore/madvise and io_uring buffer pin/register variants requiring mm edits | Affected mm/backing checkpoint on the existing run queue. Existing workers commit and rebuild supported Views, including proc byte activation and cold-mm cleanup; unsupported backing and excluded policy effects retain explicit boundaries. Retained external byte borrowers park only the actual dependency. Pure policy errors complete before quiescence; accepted decisions travel with the original entry. Additive private-anonymous mmap publishes directly. | [VM ABI classification](../../crates/trames-session/src/worker_syscalls.rs), [domain queue](../../crates/trames-session/src/run_queue.rs), [VM commit](../../crates/trames-session/src/process_vm.rs), [View admission](../../crates/trames-memory/src/parallel.rs) |
 | Mapped-file layout | Truncate/growth/allocate that changes a live mapped backing layout | Original backing publication leases identify affected mms. Existing workers return their bytes, then the same disk pool runs the accepted mutation while holding its original exclusive ticket. New aliases wait on that backing; original mmap/OFD authority survives cancellation. No process-wide pause counters or actor scan remain. Byte transfer and sync alone do not imply this checkpoint. | [file checkpoint](../../crates/trames-session/src/process_file_io.rs), [original file job](../../crates/trames-vfs/src/file_work.rs), [resize](../../crates/trames-vfs/src/memfd.rs) |
+| Native special-device pathname/OFD and Bridge bytes | Original shared pseudo-node cache, live device availability, original connection bytes/readiness/deadlines and retained accepted OFDs | Source execution covers supported devices and Bridge; absent providers and unsupported APIs retain their explicit boundary/result. Passive snapshots are weak and cannot postpone last close. | [source descriptors](../../crates/trames-vfs/src/direct_io.rs), [path authority](../../crates/trames-vfs/src/path_queries.rs), [Bridge](../../crates/trames-bridge/src/lib.rs) |
 | io_uring explicit capability/resource escalation | Missing typed source provider, unavailable native event subscription after source retry, actual unsupported body/pinning | Original-Files registration/import and source CQ execution stay direct. Layout and signal completion side transports are deleted: accepted dependencies remain on the request, and legacy signals publish to the original task actor. Production mapped layout uses original FileLayouts. Only the two actual maintenance failure sites still set `owner_required`. | [actor](../../crates/trames-linux/src/direct/uring/actor.rs), [source maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [subscriptions](../../crates/trames-linux/src/direct/uring/wait.rs), [file results](../../crates/trames-linux/src/direct/uring/actor_file.rs) |
 | Native guest mapping and exceptional native memory entry | Original task/mm source checkpoint before body effects; Vulkan import, live-private backing and unstable entry use original Memory | No joined execution category remains for admitted original tasks. Actual capability-less/solo embeddings retain their own route. Affected bytes still quiesce; permission/backing errors and bounded entry retries use the existing common model. | [source native scope](../../crates/trames-session/src/process_lifecycle_native.rs), [Vulkan import](../../crates/trames-vulkan/src/backend.rs), [native memory](../../crates/trames-memory/src/parallel/native.rs), [entry registry](../../crates/trames-accel/src/native.rs), [GPU waits](../../crates/trames-session/src/gpu.rs) |
 | Scheduler/cohort membership | Initial guest admission and legacy nonmember wake; ordinary scheduling metadata and live affinity no longer require the owner | Initial/legacy orchestration retains its boundary. Existing members migrate/park/wake locally; children and exec replacements enter the live queue. Original CPU slots can start directly and lazily from that queue. Periodic checks alone do not tear down the cohort: `cohort_control` tests actual events and original dependencies. | [legacy wake](../../crates/trames-session/src/futex.rs), [queue](../../crates/trames-session/src/run_queue.rs), [owner metadata](../../crates/trames-session/src/process_scheduling.rs), [control checks](../../crates/trames-session/src/process_vm.rs) |
@@ -2917,3 +2934,56 @@ mapped exports complete on 4/12 execution CPUs within one cohort, including the
 explicit pause route. These are scoped conformance results, not browser or
 throughput performance claims. Capability-less legacy embeddings retain their
 explicit boundary. The overall coordinator-removal goal remains active.
+
+## 77. Original native-device namespace and Bridge resource closure — 2026-11-09
+
+Supported native device opens no longer depend on terminal-only capability or a
+joined VFS body. `/dev/dri`, virtual block nodes/aliases, kmsg and Bridge resolve
+through the same shared pseudo-node cache and original Files/credentials. Cached
+pseudo-node identity is resolved before the missing-identity escalation. Video
+device availability is an original shared atomic flag rather than a frozen
+worker projection. Guest device nodes never open a host device.
+
+Stateless/error-only device bytes call the existing device implementation.
+Sequential empty reads preserve the original VFS early completion, while
+positioned calls retain their original device/offset errors. The regression
+matrix compares scalar, vector and positioned read/write and seek against the
+original Linux ABI with read-only/write-only/read-write/O_PATH opens, empty
+buffers and invalid offsets. Existing driver functionality is unchanged.
+
+Bridge DirectFd snapshots use a weak original connection. Accepted DirectFd/OFD
+work retains that connection; closing and reusing its descriptor number cannot
+redirect a pending reply. The original broker lock protects framing, bounded
+input/output, pending requests, cancellation and consent-based host replies.
+A fixed notification array collects changed original connections under that lock
+and wakes subscribers only after unlocking. No new lock serializes unrelated
+native calls, and notifications allocate no per-frame registry.
+
+Readiness observation never expires requests or emits callbacks while the run
+queue holds its metadata lock. Due requests are lazily readable; actual body/host
+operations materialize the same timeout response. Only future deadlines are
+armed, preventing a past-deadline retry loop under output/CQ backpressure.
+Dynamic external readiness keeps a host-reply waiter alive. Draining the original
+output wakes blocked writers; read/write epochs follow that original stream.
+Passive snapshots and subscriptions cannot retain the final connection.
+
+Conformance covers source SQE opens, pending Bridge CQ completion after FD
+close/reuse, reentrant host-reply wake after unlock, backpressure, timeout,
+cancellation, original permissions and live video availability. A real guest
+opens the Bridge and blocks on a read while peers execute. The 4-CPU, 12-CPU and
+4-CPU/one-execution-slot cases require one cohort, zero returned syscalls and
+zero coordinator service requests.
+
+The two io_uring maintenance escalation sites are deliberately unchanged.
+Genuinely absent typed/wait capabilities, excluded resources/bodies, actual host
+administration, final dispatch and initial/legacy orchestration remain open.
+This batch does not claim the overall coordinator-removal goal is complete.
+
+Both local runtime workflows pass all seven steps. The complete process suite
+passes 408 tests with two intentionally ignored on macOS and ARM64 Linux; all
+nine FFI tests pass on both hosts. Strict core/FFI lint and iPad device/simulator
+SDK checks pass. macOS and Linux reuse unchanged results after the two obsolete
+device-deferral test expectations were corrected; a later source-comment/doc
+correction changes no executable behavior. Product hardware and installed
+acceptance are recorded by the consumer's
+[validation record](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/native-devices-20261109.json).

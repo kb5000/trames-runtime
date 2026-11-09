@@ -678,15 +678,15 @@ impl Vfs {
                     proc_binding: proc.binding.clone(),
                 });
             }
-            if let Some(query) = &self.query {
-                return query.defer();
-            }
             if let Some(key) = self.pseudo.borrow().path_of(node) {
                 return Ok(ResolvedPath {
                     proc_binding: None,
                     key,
                     mount: mount.clone(),
                 });
+            }
+            if let Some(query) = &self.query {
+                return query.defer();
             }
         }
         let key = match mount {

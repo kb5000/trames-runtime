@@ -530,6 +530,9 @@ impl Vfs {
         if let Some(log) = &o.kernel_log {
             return log.poll(0).1;
         }
+        if let Some(bridge) = &o.bridge {
+            return bridge.peek(0).1;
+        }
         if let Some(Anonymous::Uring(ring)) = &o.anonymous {
             return ring.cq_epoch();
         }

@@ -295,7 +295,7 @@ impl Vfs {
             pseudo.enabled = true;
             pseudo.source = Some(source.clone());
             pseudo.boot_id = original.boot_id.clone();
-            pseudo.video_device = original.video_device;
+            pseudo.video_device = original.video_device.clone();
         }
         Some(Arc::new(ProcFile {
             path: path.key.clone(),

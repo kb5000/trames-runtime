@@ -187,13 +187,7 @@ mod tests {
             assert_eq!(cap.read(0), Ok(Vec::new()));
             v.close(alias).unwrap();
         }
-        for path in [
-            b"/proc/self/status".as_slice(),
-            b"/dev/kmsg",
-            b"/dev/tty",
-            b"/dev/ptmx",
-            b"/dev/dri/renderD128",
-        ] {
+        for path in [b"/proc/self/status".as_slice(), b"/dev/tty", b"/dev/ptmx"] {
             assert!(
                 query
                     .0
@@ -202,6 +196,9 @@ mod tests {
                 "{path:?}"
             );
         }
+        let log = open(&query, b"/dev/kmsg", 0).unwrap();
+        assert_eq!(query.0.stat_fd(log), Some(v.stat_fd(log)));
+        assert_eq!(open(&query, b"/dev/dri/renderD128", 0), Err(Errno(2)));
     }
     #[test]
     fn cold_concurrent_device_open_uses_one_original_cache_inode_with_distinct_ofds() {

@@ -237,9 +237,11 @@ enum ByteResource {
     Mounts(Arc<mounts::watch::MountWatch>),
     Regular,
     SimpleDevice(simple_device::Kind),
+    Device(pseudo::Device),
     UnixControl(std::sync::Weak<ipc::LocalResource>),
     UnixDatagram(Arc<ipc::channel::Resource>),
     Kmsg(Arc<kernel_log::Kmsg>),
+    Bridge(std::sync::Weak<trames_bridge::Connection>),
     PollOnly(Arc<dyn DirectPoll>),
     Event(Arc<EventCounter>),
     Timer(Arc<TimerFd>),
@@ -384,6 +386,17 @@ pub struct DirectFd {
     pub(super) origin: Option<OfdIdentity>,
 }
 impl DirectFd {
+    fn resource_device(open: &SharedOpenDescription) -> Option<pseudo::Device> {
+        let node = open.node.as_ref()?;
+        if node.regular_file || node.simple_device.is_some() {
+            return None;
+        }
+        let n = node.borrow();
+        match n.content {
+            Content::Device(device) if device.source_open() => Some(device),
+            _ => None,
+        }
+    }
     /// Read-only tty probes on an actual non-terminal never need guest bytes.
     /// Real terminals, including embedding PTY 0, retain their PTY authority.
     pub fn terminal_query_error(&self) -> Option<Errno> {
@@ -532,6 +545,8 @@ impl DirectFd {
             ByteResource::Mounts(file.watch.clone())
         } else if let Some(log) = &open.kernel_log {
             ByteResource::Kmsg(log.clone())
+        } else if let Some(bridge) = &open.bridge {
+            ByteResource::Bridge(Arc::downgrade(bridge))
         } else if let Some(local) = &open.local {
             match local.direct().or_else(|| local.direct_message()) {
                 Some((data, side)) => ByteResource::Unix { data, side },
@@ -571,12 +586,16 @@ impl DirectFd {
                     ByteResource::SimpleDevice(open.node.as_ref()?.simple_device?)
                 }
                 None => {
-                    let end = open.pipe.as_ref()?;
-                    ByteResource::Pipe {
-                        data: end.data.clone(),
-                        read: end.read,
-                        write: end.write,
-                        initial_write_epoch: end.initial_write_epoch,
+                    if let Some(device) = Self::resource_device(open) {
+                        ByteResource::Device(device)
+                    } else {
+                        let end = open.pipe.as_ref()?;
+                        ByteResource::Pipe {
+                            data: end.data.clone(),
+                            read: end.read,
+                            write: end.write,
+                            initial_write_epoch: end.initial_write_epoch,
+                        }
                     }
                 }
             }
@@ -634,6 +653,7 @@ impl DirectFd {
                 std::sync::Weak::ptr_eq(a, b)
             }
             (ByteResource::Kmsg(a), ByteResource::Kmsg(b)) => a.same_log(b),
+            (ByteResource::Bridge(a), ByteResource::Bridge(b)) => std::sync::Weak::ptr_eq(a, b),
             (ByteResource::Epoll(a), _) => a.snapshot().iter().any(|(_, _, fd)| {
                 fd.resolve_with(a.signal_reader.as_ref())
                     .is_some_and(|fd| fd.shares_resource(other))
@@ -691,13 +711,20 @@ impl DirectFd {
             )],
             ByteResource::Mounts(watch) => vec![watch.subscribe(signal)],
             ByteResource::Cgroup(file, _) => vec![file.subscribe(signal)],
-            ByteResource::Regular | ByteResource::SimpleDevice(_) => Vec::new(),
+            ByteResource::Regular | ByteResource::SimpleDevice(_) | ByteResource::Device(_) => {
+                Vec::new()
+            }
             ByteResource::UnixControl(local) => local
                 .upgrade()
                 .map(|local| local.subscribe(signal))
                 .into_iter()
                 .collect(),
             ByteResource::Kmsg(log) => vec![log.subscribe(signal)],
+            ByteResource::Bridge(bridge) => bridge
+                .upgrade()
+                .map(|b| b.subscribe(signal))
+                .into_iter()
+                .collect(),
             ByteResource::PollOnly(poll) => vec![poll.subscribe(signal)],
             ByteResource::Event(counter) => vec![counter.readiness.subscribe(signal)],
             ByteResource::Timer(timer) => vec![timer.subscribe(signal)],
@@ -764,6 +791,8 @@ impl DirectFd {
             ByteResource::Mounts(file.watch.clone())
         } else if let Some(log) = &open.kernel_log {
             ByteResource::Kmsg(log.clone())
+        } else if let Some(bridge) = &open.bridge {
+            ByteResource::Bridge(Arc::downgrade(bridge))
         } else if let Some(events::Anonymous::Event(counter)) = &open.anonymous {
             ByteResource::Event(counter.clone())
         } else if let Some(events::Anonymous::Timer(timer)) = &open.anonymous {
@@ -1060,6 +1089,7 @@ impl DirectFd {
     pub fn next_deadline(&self) -> Option<std::time::Instant> {
         match &self.resource {
             ByteResource::Timer(timer) => timer.deadline(),
+            ByteResource::Bridge(bridge) => bridge.upgrade().and_then(|b| b.next_deadline()),
             ByteResource::Epoll(epoll) => epoll
                 .snapshot()
                 .iter()
@@ -1121,7 +1151,9 @@ impl DirectFd {
                 )
             }),
             ByteResource::Mounts(watch) => watch.peek(events),
-            ByteResource::Regular | ByteResource::SimpleDevice(_) => (events & 5, [0; 2]),
+            ByteResource::Regular | ByteResource::SimpleDevice(_) | ByteResource::Device(_) => {
+                (events & 5, [0; 2])
+            }
             ByteResource::Cgroup(file, _) => {
                 if self.flags & O_PATH != 0 {
                     (32, [0; 2])
@@ -1133,6 +1165,9 @@ impl DirectFd {
                 (local.poll(events), local.poll_epoch())
             }),
             ByteResource::Kmsg(log) => log.poll(events),
+            ByteResource::Bridge(bridge) => {
+                bridge.upgrade().map_or((16, [0; 2]), |b| b.peek(events))
+            }
             ByteResource::PollOnly(poll) => poll.poll(events),
             ByteResource::Event(counter) => (counter.poll(events), counter.epoch()),
             ByteResource::Timer(timer) => timer.poll(events),
@@ -1234,6 +1269,10 @@ impl DirectFd {
         if offset > i64::MAX as u64 {
             return Err(Errno(22));
         }
+        if let ByteResource::Device(device) = self.resource {
+            self.check_read_access()?;
+            return device.read(count);
+        }
         if let ByteResource::Cgroup(file, Some(caller)) = &self.resource {
             self.check_read_access()?;
             return file.cgroup_read(caller, offset, count)?.ok_or(Errno(19));
@@ -1248,8 +1287,18 @@ impl DirectFd {
             .simple_read(kind, count)
     }
     pub fn device_pwrite(&self, bytes: &[u8], offset: u64) -> Result<usize> {
+        // The original bridge pwrite ABI rejects seeking before offset/flags.
+        if matches!(self.resource, ByteResource::Bridge(_)) {
+            return Err(Errno(29));
+        }
         if offset > i64::MAX as u64 {
             return Err(Errno(22));
+        }
+        if let ByteResource::Device(device) = self.resource {
+            if self.flags & O_PATH != 0 || self.flags & 3 == 0 {
+                return Err(Errno(9));
+            }
+            return device.write(bytes);
         }
         if let ByteResource::Cgroup(file, Some(caller)) = &self.resource {
             if self.flags & O_PATH != 0 || self.flags & 3 == 0 {
@@ -1269,7 +1318,10 @@ impl DirectFd {
     pub fn positioned_bytes(&self) -> bool {
         matches!(
             self.resource,
-            ByteResource::SimpleDevice(_) | ByteResource::Cgroup(..)
+            ByteResource::SimpleDevice(_)
+                | ByteResource::Device(_)
+                | ByteResource::Bridge(_)
+                | ByteResource::Cgroup(..)
         )
     }
     pub fn byte_seek(&self, offset: i64, whence: u32) -> Result<u64> {
@@ -1278,7 +1330,7 @@ impl DirectFd {
         }
         match &self.resource {
             ByteResource::Kmsg(log) => log.seek(offset, whence),
-            ByteResource::SimpleDevice(_) => Ok(0),
+            ByteResource::SimpleDevice(_) | ByteResource::Device(_) => Ok(0),
             ByteResource::Cgroup(..) => {
                 let mut position = self
                     ._file
@@ -1357,6 +1409,18 @@ impl DirectFd {
             }
             ByteResource::Cgroup(_, None) => return None,
             ByteResource::Kmsg(log) => log.read(count),
+            ByteResource::Device(device) => {
+                // The original sequential VFS read completes empty buffers
+                // before invoking the device body (unlike positioned reads).
+                if count == 0 {
+                    Ok(Vec::new())
+                } else {
+                    device.read(count)
+                }
+            }
+            ByteResource::Bridge(bridge) => bridge
+                .upgrade()
+                .map_or(Err(Errno(9)), |b| b.read(count).map_err(Errno)),
             ByteResource::SimpleDevice(_) => unreachable!("typed device read"),
             ByteResource::Event(counter) => counter.read(count),
             ByteResource::Timer(timer) => timer.read(count),
@@ -1460,6 +1524,10 @@ impl DirectFd {
             }
             ByteResource::Cgroup(_, None) => Err(Errno(95)),
             ByteResource::Kmsg(log) => log.write(bytes),
+            ByteResource::Device(device) => device.write(bytes),
+            ByteResource::Bridge(bridge) => bridge
+                .upgrade()
+                .map_or(Err(Errno(9)), |b| b.write(bytes).map_err(Errno)),
             ByteResource::SimpleDevice(_) => unreachable!("typed device write"),
             ByteResource::Mounts(_) => Err(Errno(22)),
             ByteResource::Event(counter) => counter.write(bytes),

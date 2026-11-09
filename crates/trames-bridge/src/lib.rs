@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 pub const VERSION: u32 = 1;
@@ -62,6 +62,9 @@ fn failure(id: Option<u64>, code: &str, message: &str) -> Value {
 struct Stream {
     input: Vec<u8>,
     output: VecDeque<u8>,
+    readiness: Arc<trames_shared::Readiness>,
+    epoch: [u64; 2],
+    slot: usize,
 }
 struct Pending {
     connection: u64,
@@ -75,17 +78,50 @@ struct State {
     streams: BTreeMap<u64, Stream>,
     pending: BTreeMap<u64, Pending>,
     accel: hash::Registry,
+    changed: [Option<Arc<trames_shared::Readiness>>; MAX_CONNECTIONS],
 }
 #[derive(Clone, Default)]
 pub struct Broker(Arc<Mutex<State>>);
 pub struct Connection {
     broker: Broker,
     id: u64,
+    readiness: Arc<trames_shared::Readiness>,
+}
+struct Guard<'a>(Option<MutexGuard<'a, State>>);
+impl std::ops::Deref for Guard<'_> {
+    type Target = State;
+    fn deref(&self) -> &State {
+        self.0.as_ref().unwrap()
+    }
+}
+impl std::ops::DerefMut for Guard<'_> {
+    fn deref_mut(&mut self) -> &mut State {
+        self.0.as_mut().unwrap()
+    }
+}
+impl Drop for Guard<'_> {
+    fn drop(&mut self) {
+        let notifications = std::mem::take(&mut self.0.as_mut().unwrap().changed);
+        drop(self.0.take());
+        for ready in notifications.into_iter().flatten() {
+            ready.notify_locked();
+        }
+    }
+}
+impl State {
+    fn changed(&mut self, connection: u64, direction: usize) {
+        if let Some(stream) = self.streams.get_mut(&connection) {
+            stream.epoch[direction] = stream.epoch[direction].wrapping_add(1);
+            self.changed[stream.slot].get_or_insert_with(|| stream.readiness.clone());
+        }
+    }
 }
 impl Drop for Connection {
     fn drop(&mut self) {
-        if let Ok(mut s) = self.broker.0.lock() {
-            s.streams.remove(&self.id);
+        if let Ok(mut s) = self.broker.lock() {
+            if let Some(stream) = s.streams.remove(&self.id) {
+                s.changed[stream.slot] = Some(self.readiness.clone());
+            }
             s.pending.retain(|_, p| p.connection != self.id);
         }
     }
@@ -105,6 +141,7 @@ fn output(s: &mut State, connection: u64, value: Value) -> Result<(), u32> {
         return Err(11);
     }
     stream.output.extend(bytes);
+    s.changed(connection, 0);
     Ok(())
 }
 fn expire(s: &mut State, now: Instant) {
@@ -128,21 +165,43 @@ fn expire(s: &mut State, now: Instant) {
     }
 }
 impl Broker {
+    fn lock(&self) -> Result<Guard<'_>, u32> {
+        self.0.lock().map(|guard| Guard(Some(guard))).map_err(|_| 5)
+    }
     pub fn connect(&self) -> Result<Arc<Connection>, u32> {
-        let mut s = self.0.lock().map_err(|_| 5u32)?;
+        let mut s = self.lock()?;
         if s.streams.len() >= MAX_CONNECTIONS {
             return Err(24);
         }
         let id = next(&mut s)?;
-        s.streams.insert(id, Stream::default());
-        Ok(Arc::new(Connection {
+        let occupied = s
+            .streams
+            .values()
+            .fold(0u32, |mask, stream| mask | (1 << stream.slot));
+        let slot = (!occupied).trailing_zeros() as usize;
+        let readiness = Arc::new(trames_shared::Readiness::default());
+        s.streams.insert(
+            id,
+            Stream {
+                input: Vec::new(),
+                output: VecDeque::new(),
+                readiness: readiness.clone(),
+                epoch: [0; 2],
+                slot,
+            },
+        );
+        let connection = Arc::new(Connection {
             broker: self.clone(),
             id,
-        }))
+            readiness,
+        });
+        let driver: Arc<dyn trames_shared::ReadinessDriver> = connection.clone();
+        connection.readiness.set_driver(Arc::downgrade(&driver));
+        Ok(connection)
     }
     /// A request is claimed only after checking the caller's output capacity.
     pub fn poll(&self, capacity: usize) -> Result<Option<Vec<u8>>, u32> {
-        let mut s = self.0.lock().map_err(|_| 5u32)?;
+        let mut s = self.lock()?;
         expire(&mut s, Instant::now());
         let Some((&ticket, p)) = s
             .pending
@@ -163,7 +222,7 @@ impl Broker {
         Ok(Some(data))
     }
     pub fn active(&self, ticket: u64) -> bool {
-        let Ok(mut s) = self.0.lock() else {
+        let Ok(mut s) = self.lock() else {
             return false;
         };
         expire(&mut s, Instant::now());
@@ -184,7 +243,7 @@ impl Broker {
         {
             return Err(22);
         }
-        let mut s = self.0.lock().map_err(|_| 5u32)?;
+        let mut s = self.lock()?;
         expire(&mut s, Instant::now());
         let p = s.pending.get(&r.ticket).ok_or(2u32)?;
         if p.deadline <= Instant::now() {
@@ -205,37 +264,71 @@ impl Broker {
     }
 }
 impl Connection {
-    pub fn poll(&self, events: u16) -> u16 {
-        let Ok(mut s) = self.broker.0.lock() else {
-            return 8;
+    /// Pure readiness observation: a run queue may hold its own metadata lock.
+    /// Expired replies are readable lazily; only a body/host operation publishes
+    /// bytes and emits notifications, after releasing the broker's mutex.
+    pub fn peek(&self, events: u16) -> (u16, [u64; 2]) {
+        let Ok(s) = self.broker.0.lock() else {
+            return (8, [0; 2]);
         };
-        expire(&mut s, Instant::now());
         let Some(stream) = s.streams.get(&self.id) else {
-            return 32;
+            return (32, [0; 2]);
         };
+        let now = Instant::now();
+        let expired = s
+            .pending
+            .values()
+            .filter(|p| p.connection == self.id && p.deadline <= now)
+            .count() as u64;
         let mut ready = 0;
-        if !stream.output.is_empty() {
+        if !stream.output.is_empty() || expired != 0 {
             ready |= events & 1;
         }
         if stream.input.len() < MAX_FRAME && stream.output.len() < MAX_OUTPUT - 8192 {
             ready |= events & 4;
         }
-        ready
+        (
+            ready,
+            [stream.epoch[0].wrapping_add(expired), stream.epoch[1]],
+        )
+    }
+    pub fn poll(&self, events: u16) -> u16 {
+        self.peek(events).0
+    }
+    pub fn subscribe(
+        &self,
+        signal: &Arc<trames_shared::IoSignal>,
+    ) -> trames_shared::IoSubscription {
+        self.readiness.subscribe(signal)
+    }
+    pub fn next_deadline(&self) -> Option<Instant> {
+        let s = self.broker.0.lock().ok()?;
+        let now = Instant::now();
+        s.pending
+            .values()
+            .filter(|p| p.connection == self.id && p.deadline > now)
+            .map(|p| p.deadline)
+            .min()
     }
     pub fn read(&self, count: usize) -> Result<Vec<u8>, u32> {
-        let mut s = self.broker.0.lock().map_err(|_| 5u32)?;
+        let mut s = self.broker.lock()?;
         expire(&mut s, Instant::now());
         let stream = s.streams.get_mut(&self.id).ok_or(9u32)?;
         if stream.output.is_empty() && count != 0 {
             return Err(11);
         }
-        Ok(stream
+        let bytes: Vec<_> = stream
             .output
             .drain(..count.min(stream.output.len()))
-            .collect())
+            .collect();
+        if !bytes.is_empty() {
+            s.changed(self.id, 1);
+        }
+        Ok(bytes)
     }
+
     pub fn write(&self, bytes: &[u8]) -> Result<usize, u32> {
-        let mut s = self.broker.0.lock().map_err(|_| 5u32)?;
+        let mut s = self.broker.lock()?;
         expire(&mut s, Instant::now());
         let mut consumed = 0;
         while consumed < bytes.len().min(MAX_OUTPUT) {
@@ -248,19 +341,36 @@ impl Connection {
             let length = end.unwrap_or(rest.len());
             if length > MAX_FRAME - stream.input.len() {
                 s.streams.get_mut(&self.id).ok_or(9u32)?.input.clear();
+                s.changed(self.id, 1);
                 return if consumed == 0 { Err(90) } else { Ok(consumed) };
             }
             let stream = s.streams.get_mut(&self.id).ok_or(9u32)?;
             stream.input.extend_from_slice(&rest[..length]);
             consumed += length;
+            s.changed(self.id, 1);
             if end.is_some() {
-                let frame = std::mem::take(&mut stream.input);
+                let frame = std::mem::take(&mut s.streams.get_mut(&self.id).ok_or(9u32)?.input);
                 submit(&mut s, self.id, &frame)?;
             }
         }
         Ok(consumed)
     }
 }
+impl trames_shared::ReadinessDriver for Connection {
+    fn external(&self) -> bool {
+        self.broker
+            .0
+            .lock()
+            .is_ok_and(|s| s.pending.values().any(|p| p.connection == self.id))
+    }
+    fn notification_only(&self) -> bool {
+        true
+    }
+    fn attach(&self, _: Arc<trames_shared::HostEvents>) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn submit(s: &mut State, connection: u64, frame: &[u8]) -> Result<(), u32> {
     let request: Request = match serde_json::from_slice(frame) {
         Ok(r) => r,
@@ -417,6 +527,99 @@ mod tests {
     }
     fn poll(b: &Broker) -> Value {
         serde_json::from_slice(&b.poll(65536).unwrap().unwrap()).unwrap()
+    }
+    #[test]
+    fn replies_notify_original_connection_after_unlock_and_pure_peek_never_notifies() {
+        use trames_shared::{IoSignal, IoWake};
+        struct Wake {
+            connection: std::sync::Weak<Connection>,
+            replies: Mutex<Vec<Value>>,
+        }
+        impl IoWake for Wake {
+            fn wake_io(&self, _: &Arc<IoSignal>) {
+                if let Some(c) = self.connection.upgrade() {
+                    if c.peek(1).0 == 1 {
+                        self.replies.lock().unwrap().extend(read(&c));
+                    }
+                }
+            }
+        }
+        let broker = Broker::default();
+        let c = broker.connect().unwrap();
+        let target = Arc::new(Wake {
+            connection: Arc::downgrade(&c),
+            replies: Mutex::default(),
+        });
+        let w: Arc<dyn IoWake> = target.clone();
+        let signal = IoSignal::new(7, Arc::downgrade(&w));
+        let subscription = c.subscribe(&signal);
+        assert!(!subscription.external());
+        request(&c, 73, "clipboard.read", json!({}));
+        assert!(subscription.external());
+        signal.reset();
+        let host = poll(&broker);
+        broker
+            .reply(
+                &serde_json::to_vec(
+                    &json!({"version":1,"ticket":host["ticket"],"result":{"text":"original"}}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(signal.ready());
+        assert_eq!(target.replies.lock().unwrap()[0]["id"], 73);
+        assert!(!subscription.external());
+        signal.reset();
+        request(&c, 74, "clipboard.read", json!({}));
+        let ticket = poll(&broker)["ticket"].as_u64().unwrap();
+        broker
+            .0
+            .lock()
+            .unwrap()
+            .pending
+            .get_mut(&ticket)
+            .unwrap()
+            .deadline = Instant::now();
+        signal.reset();
+        let epoch = c.peek(1).1;
+        assert_eq!(c.peek(1).0, 1);
+        assert_eq!(
+            c.next_deadline(),
+            None,
+            "past deadlines must not create polling retries"
+        );
+        assert!(
+            !signal.ready(),
+            "readiness observation must not reenter the run queue"
+        );
+        assert_eq!(c.peek(1).1, epoch);
+        drop(subscription);
+        assert_eq!(read(&c)[0]["error"]["code"], "timeout");
+    }
+    #[test]
+    fn output_backpressure_uses_original_stream_wakeup_and_edge_epochs() {
+        struct Wake;
+        impl trames_shared::IoWake for Wake {
+            fn wake_io(&self, _: &Arc<trames_shared::IoSignal>) {}
+        }
+        let broker = Broker::default();
+        let c = broker.connect().unwrap();
+        let target: Arc<dyn trames_shared::IoWake> = Arc::new(Wake);
+        let signal = trames_shared::IoSignal::new(7, Arc::downgrade(&target));
+        let _subscription = c.subscribe(&signal);
+        let frame = b"{\"version\":1,\"id\":1,\"method\":\"bridge.info\",\"params\":{}}\n";
+        while c.poll(4) != 0 {
+            assert_eq!(c.write(frame), Ok(frame.len()));
+        }
+        signal.reset();
+        let before = c.peek(5).1;
+        assert_eq!(c.write(frame), Err(11));
+        assert!(!signal.ready());
+        c.read(MAX_OUTPUT / 2).unwrap();
+        assert!(signal.ready());
+        assert_eq!(c.poll(4), 4);
+        assert_ne!(c.peek(5).1[1], before[1]);
+        assert_eq!(c.write(frame), Ok(frame.len()));
     }
     #[test]
     fn coalesced_frames_partial_tail_and_full_pending_queue_allow_cancel() {

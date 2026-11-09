@@ -1081,10 +1081,11 @@ impl Vfs {
         matches!(
             o.kind,
             FdKind::Stdin | FdKind::Stdout | FdKind::Stderr | FdKind::PipeRead | FdKind::PipeWrite
-        ) || o.bridge.is_none() && o.local.as_ref().is_some_and(|socket| socket.kind() == 1)
+        ) || o.bridge.is_some()
+            || o.local.as_ref().is_some_and(|socket| socket.kind() == 1)
     }
-    /// Ready byte I/O only; recvmsg/SCM_RIGHTS, native bridge and PTY job control
-    /// stay on their joined paths. Local sockets never reference worker Memory.
+    /// Ready byte I/O shares original OFDs with message and terminal operations.
+    /// Local sockets never reference worker Memory.
     pub fn epoch_stream_io(&self, fd: u32) -> bool {
         self.descriptor(fd)
             .is_ok_and(|d| Self::ordinary_stream(&d.open.borrow()))
@@ -2404,6 +2405,9 @@ impl Vfs {
                     if !pty
                         && !controlling_tty
                         && node.simple_device.is_none()
+                        && !matches!(n.content, Content::Device(device) if device.source_open())
+                        && !(matches!(n.content, Content::Directory)
+                            && matches!(p.as_ref(), b"/dev/dri" | b"/dev/block"))
                         && oom.is_none()
                         && network_control.is_none()
                         && mount_file.is_none()
