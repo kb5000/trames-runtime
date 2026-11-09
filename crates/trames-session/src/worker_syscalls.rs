@@ -227,8 +227,10 @@ impl<C: Cpu> crate::workers::Work<C> {
                 .replace_resources(state.proc_resources());
         }
         snapshot.namespaces = Some(state);
-        self.cpu
-            .set_x(0, result.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
+        self.trace.finish(
+            &mut self.cpu,
+            result.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)),
+        );
     }
 }
 

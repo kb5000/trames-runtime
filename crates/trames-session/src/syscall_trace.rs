@@ -22,6 +22,7 @@ enum Outcome {
     Return(u64),
     Replaced,
     Restarted,
+    Trapped,
 }
 impl Trace {
     pub fn enable(&mut self, enabled: bool) {
@@ -56,9 +57,15 @@ impl Trace {
             self.begin(pid, cpu.x(8) as u32, std::array::from_fn(|i| cpu.x(i)));
         }
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
+    pub fn retained_number(&self) -> Option<u32> {
+        self.0.as_ref()?.call.as_ref().map(|call| call.number)
+    }
     fn outcome(&mut self, outcome: Outcome) {
         if let Some(call) = self.0.as_mut().and_then(|state| state.call.as_mut()) {
-            call.result = Some(outcome);
+            if call.result.is_none() {
+                call.result = Some(outcome);
+            }
         }
     }
     pub fn record(&mut self, value: u64) {
@@ -69,6 +76,9 @@ impl Trace {
     }
     pub fn restart(&mut self) {
         self.outcome(Outcome::Restarted);
+    }
+    pub fn trapped(&mut self) {
+        self.outcome(Outcome::Trapped);
     }
     pub fn finish<C: Cpu>(&mut self, cpu: &mut C, value: u64) {
         cpu.set_x(0, value);
@@ -108,6 +118,7 @@ impl std::fmt::Display for Outcome {
             Self::Return(value) => write!(f, "{}", *value as i64),
             Self::Replaced => f.write_str("suspended/replaced"),
             Self::Restarted => f.write_str("restarted"),
+            Self::Trapped => f.write_str("trapped"),
         }
     }
 }
@@ -147,6 +158,7 @@ mod tests {
         trace.begin(2, 63, [9; 6]);
         trace.begin(2, 999, [0; 6]); // original operation is still parked
         trace.record((-4i64) as u64);
+        trace.replaced(); // Later teardown cannot overwrite a completed call.
         let call = trace.0.as_ref().unwrap().call.as_ref().unwrap();
         assert_eq!((call.pid, call.number, call.args), (2, 63, [9; 6]));
         assert!(matches!(call.result, Some(Outcome::Return(v)) if v == (-4i64) as u64));

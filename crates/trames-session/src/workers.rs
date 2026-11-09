@@ -708,7 +708,6 @@ impl<C: Cpu> Starter<C> {
                                 if wait.ready() {
                                     if let Some((state, result)) = wait.run() {
                                         work.finish_namespaces(state, result);
-                                        work.trace.record(work.cpu.x(0));
                                         job.waiting = None;
                                         continue;
                                     }
@@ -962,7 +961,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                         if entry.action()==0x0003_0000 && snapshot.io_signals.mask()&(1<<30)==0 && snapshot.actions.get(31).handler>1 {
                                             snapshot.io_signals.inbox.discard(31);
                                             let info=trames_kernel::signal::Info{sender:entry.data(),uid:0xc000_00b7,status:number as i32,code:1,timer:None,fault:Some(work.cpu.pc()),poll:None};
-                                            if snapshot.io_signals.inbox.enqueue(31,info).is_ok(){continue;}
+                                            if snapshot.io_signals.inbox.enqueue(31,info).is_ok(){work.trace.trapped();continue;}
                                         }
                                         snapshot.io_signals.lifecycle().request_exit(31);
                                         continue;
@@ -1058,7 +1057,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                     continue;
                                 }
                                 if let Some(snapshot) = work.syscalls.as_ref().filter(|s| work.cpu.x(8) as u32 == 139 && s.admit(&work.cpu)) {
-                                    if snapshot.return_io_signal(&mut work.cpu, work.memory.as_deref().expect("signal View")).is_ok() { syscalls += 1; continue; }
+                                    if snapshot.return_io_signal(&mut work.cpu, work.memory.as_deref().expect("signal View")).is_ok() { work.trace.record(work.cpu.x(0)); syscalls += 1; continue; }
                                     let _ = snapshot.io_signals.inbox.enqueue(11, trames_kernel::signal::Info::default());
                                     break result;
                                 }

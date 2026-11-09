@@ -780,6 +780,7 @@ impl<C: Cpu> Kernel<C> {
                 p.state = State::Ready;
             }
             0x0003_0000 => {
+                p.trace.trapped();
                 // force_sig_seccomp cannot be suppressed by ignoring or
                 // blocking SIGSYS; Linux forces its fatal default action.
                 if p.signals.mask & (1u64 << 30) != 0 || p.signals.actions.get(31).handler == 1 {
@@ -1650,6 +1651,7 @@ mod tests {
         use super::super::tests::{kernel, process};
         for slots in [1, 2] {
             let mut p = process();
+            p.linux.trace = true;
             p.memory
                 .write_array(0x4000, 0xd4000001u32.to_le_bytes())
                 .unwrap();
@@ -1699,6 +1701,11 @@ mod tests {
                 .unwrap());
             let p = k.processes.read(&1);
             assert_eq!(p.cpu.x(28), 77);
+            assert_eq!(
+                p.trace.retained_number(),
+                None,
+                "the trapped SVC cannot own handler diagnostics"
+            );
             assert_eq!(p.cpu.x(0), 31);
             let sp = p.cpu.sp;
             for (index, arg) in args.iter().enumerate() {
