@@ -358,10 +358,7 @@ impl Connection {
 }
 impl trames_shared::ReadinessDriver for Connection {
     fn external(&self) -> bool {
-        self.broker
-            .0
-            .lock()
-            .is_ok_and(|s| s.pending.values().any(|p| p.connection == self.id))
+        self.next_deadline().is_some()
     }
     fn notification_only(&self) -> bool {
         true
@@ -587,6 +584,10 @@ mod tests {
             c.next_deadline(),
             None,
             "past deadlines must not create polling retries"
+        );
+        assert!(
+            !subscription.external(),
+            "an expired request has no remaining native producer"
         );
         assert!(
             !signal.ready(),

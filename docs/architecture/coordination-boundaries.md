@@ -2987,3 +2987,11 @@ device-deferral test expectations were corrected; a later source-comment/doc
 correction changes no executable behavior. Product hardware and installed
 acceptance are recorded by the consumer's
 [validation record](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/native-devices-20261109.json).
+
+The expiry follow-up marks only future native requests as external producers.
+Accepted wait retries capture their existing resource deadline before the final
+level check, so crossing a lazy expiry before parking cannot discard that wake.
+io_uring enter, CQ polling and background pumps retain pre-pump deadlines as
+well as newly established ones. Due requests do not create a repeated past-time
+wake after the worker has observed them. Ready ordinary byte calls gain no extra
+resource scan, and ordinary guest memory access is unchanged.

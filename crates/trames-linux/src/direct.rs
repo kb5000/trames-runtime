@@ -1818,6 +1818,23 @@ impl DirectSyscalls {
                 .clone()
                 .map_or(IoAttempt::Checkpoint, IoAttempt::WaitCheckpoint);
         }
+        // Preserve the original resource deadline before the final level check.
+        // A lazy source can become due between that check and parking, then
+        // omit past deadlines. Metadata changes during the attempt notify the
+        // already-subscribed signal, so no second resource scan is necessary.
+        let resource_deadline = if pending.native_tcp.is_some() {
+            None
+        } else if let Some(file) = &pending.retained_byte {
+            file.fd.next_deadline()
+        } else if pending.number == 116 {
+            None
+        } else if let Some(poll) = &pending.retained_poll {
+            poll.next_deadline()
+        } else {
+            self.descriptors
+                .get(pending.args[0] as u32)
+                .and_then(|fd| fd.next_deadline())
+        };
         let result = if let Some(fd) = &pending.native_tcp {
             self.transfer_tcp(fd, pending.number, pending.args, memory)
         } else if let Some(file) = &pending.retained_byte {
@@ -1872,19 +1889,6 @@ impl DirectSyscalls {
                 {
                     return self.complete_pending(&pending, Err(Errno(11)), memory);
                 }
-                let resource_deadline = if pending.native_tcp.is_some() {
-                    None
-                } else if let Some(file) = &pending.retained_byte {
-                    file.fd.next_deadline()
-                } else if pending.number == 116 {
-                    None
-                } else if let Some(poll) = &pending.retained_poll {
-                    poll.next_deadline()
-                } else {
-                    self.descriptors
-                        .get(pending.args[0] as u32)
-                        .and_then(|fd| fd.next_deadline())
-                };
                 pending.resource_deadline = [
                     resource_deadline,
                     pending.poll_uring.as_ref().and_then(|w| w.deadline),

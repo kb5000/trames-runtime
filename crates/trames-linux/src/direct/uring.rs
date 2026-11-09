@@ -1136,6 +1136,7 @@ impl UringSnapshot {
     pub(super) fn resume(&self, mut pending: PendingIo, memory: &mut impl CpuMemory) -> IoAttempt {
         pending.signal.reset();
         let wait = pending.uring.as_mut().unwrap();
+        let before = wait.ring.request_deadline(wait.owner, wait.task);
         if !wait.sources.prepare(
             std::slice::from_ref(&wait.ring),
             wait.owner,
@@ -1175,6 +1176,7 @@ impl UringSnapshot {
         let checkpoint = deferred;
         drop(state);
         pending.resource_deadline = [
+            before,
             wait.ring.request_deadline(wait.owner, wait.task),
             wait.sources.next_deadline(),
         ]

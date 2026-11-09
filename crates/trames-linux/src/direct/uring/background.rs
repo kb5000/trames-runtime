@@ -34,6 +34,11 @@ impl UringBackground {
         self.armed = true;
         self.revision = self.actor.revision();
         let rings = self.actor.rings();
+        // Retain a deadline that becomes due during the original body pump.
+        let before = rings
+            .iter()
+            .filter_map(|ring| ring.request_deadline(self.owner, self.task))
+            .min();
         if !self.sources.prepare(
             &rings,
             self.owner,
@@ -47,7 +52,10 @@ impl UringBackground {
             return false;
         }
         let mut active = false;
-        self.deadline = self.sources.next_deadline();
+        self.deadline = [before, self.sources.next_deadline()]
+            .into_iter()
+            .flatten()
+            .min();
         for ring in &rings {
             if !ring.poll_pump(self.owner, self.task, memory, &self.actor) {
                 self.actor.require_owner();

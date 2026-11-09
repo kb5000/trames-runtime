@@ -99,6 +99,12 @@ impl PollWait {
     }
     pub(crate) fn refresh(&mut self, signal: &Arc<IoSignal>, memory: &mut impl CpuMemory) -> bool {
         self.deadline = None;
+        // Retain a deadline that becomes due during the original body pump.
+        let before = self
+            .rings
+            .iter()
+            .filter_map(|ring| ring.request_deadline(self.owner, self.task))
+            .min();
         if !self.sources.prepare(
             &self.rings,
             self.owner,
@@ -110,7 +116,10 @@ impl PollWait {
         ) {
             return false;
         }
-        self.deadline = self.sources.next_deadline();
+        self.deadline = [before, self.sources.next_deadline()]
+            .into_iter()
+            .flatten()
+            .min();
         for ring in &self.rings {
             if !ring.poll_pump(self.owner, self.task, memory, &self.actor) {
                 return false;
