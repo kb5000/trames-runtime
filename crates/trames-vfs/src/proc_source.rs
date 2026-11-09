@@ -335,8 +335,11 @@ impl Vfs {
         }
         if !source.available(demand) {
             return match &self.query {
-                Some(query) => query.defer(),
-                None => Ok(()), // Legacy embedding provides joined host accounting.
+                Some(query) if !query.original || self.published_global(path.key()).is_none() => {
+                    query.defer()
+                }
+                Some(_) => Ok(()), // Original published global accounting, not a guest-mm reader.
+                None => Ok(()),    // Legacy embedding provides joined host accounting.
             };
         }
         let mut query = ProcQuery::new(key, demand, namespace, self.pid);

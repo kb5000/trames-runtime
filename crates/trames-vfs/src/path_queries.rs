@@ -12,6 +12,9 @@ pub(super) struct Authority {
     pub(super) retained: Option<(u32, RetainedFd)>,
     pub(super) peer: Option<(u32, SharedFd)>,
     pub(super) accepted: Option<BTreeMap<u32, Option<Result<SharedFd>>>>,
+    // A retained io_uring context owns the complete original resource graph.
+    // This selects that graph, not a second permission or memory policy.
+    pub(super) original: bool,
     deferred: Arc<std::sync::atomic::AtomicBool>,
     pub(super) file_layout_exclusive: bool,
     pub(super) capture_open: bool,
@@ -62,6 +65,7 @@ impl Authority {
             retained: None,
             peer: None,
             accepted: None,
+            original: false,
             deferred: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             file_layout_exclusive: false,
             capture_open: false,
@@ -77,6 +81,7 @@ impl Authority {
             retained: None,
             peer: None,
             accepted: None,
+            original: false,
             deferred: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             file_layout_exclusive: false,
             capture_open: false,
@@ -107,6 +112,9 @@ impl Authority {
                     cloexec: false.into(),
                 });
             }
+        }
+        if self.original {
+            return self.files.observation_descriptor(fd);
         }
         let lookup = self
             .accepted
@@ -194,7 +202,7 @@ impl Vfs {
             pseudo.enabled = source.enabled;
             pseudo.nodes = source.nodes.clone();
             pseudo.source = source.source.clone();
-            pseudo.publication = source.source.is_none().then(|| {
+            pseudo.publication = Some({
                 source
                     .publication
                     .clone()
@@ -211,6 +219,7 @@ impl Vfs {
             retained: None,
             peer: None,
             accepted: None,
+            original: false,
             namespace_io: self.namespace_host_work(),
             devices: self
                 .query
@@ -258,7 +267,7 @@ impl PathQueries {
         policy: u64,
         files: &DirectFiles,
     ) -> Option<Result<u32>> {
-        self.uring_query(|v| {
+        let operation = |v: &mut Vfs| {
             if let Some(file) = file {
                 v.with_uring_path_fd(file, |v, alias| {
                     v.open_at_resolve_published(
@@ -273,7 +282,22 @@ impl PathQueries {
             } else {
                 v.open_at_resolve_published(dirfd, path, flags, mode, policy, Some(files))
             }
-        })
+        };
+        let result = self.uring_query(operation);
+        if result.is_some()
+            || self
+                .view
+                .borrow()
+                .query
+                .as_ref()
+                .unwrap()
+                .open_work
+                .borrow()
+                .is_some()
+        {
+            return result;
+        }
+        self.uring_original(None, operation).0
     }
     pub fn uring_stat(
         &self,
@@ -282,7 +306,7 @@ impl PathQueries {
         path: &[u8],
         flags: u32,
     ) -> Option<Result<([u8; 128], u64)>> {
-        self.uring_query(|v| {
+        let operation = |v: &mut Vfs| {
             let operation = |v: &mut Vfs, dirfd: i32| {
                 if path.is_empty() && flags & 0x1000 != 0 {
                     if dirfd == AT_FDCWD {
@@ -299,7 +323,9 @@ impl PathQueries {
             } else {
                 operation(v, dirfd)
             }
-        })
+        };
+        self.uring_query(operation)
+            .or_else(|| self.uring_original(None, operation).0)
     }
     /// Execute accepted original-resource operations in this source task's
     /// sealed resolver. Existing query admission remains in force; retaining
@@ -313,6 +339,77 @@ impl PathQueries {
         deferred.store(false, Ordering::Relaxed);
         let result = operation(&mut view);
         (!deferred.swap(false, Ordering::Relaxed)).then_some(result)
+    }
+    /// Complete a cold accepted body using its original resources. Resolver
+    /// caches stay private; Files, credentials, namespaces and device policy
+    /// remain those captured at acceptance. Ordinary FileWork/layout admission
+    /// remains enabled, including native disk staging and backing waits.
+    pub fn uring_original<T>(
+        &self,
+        descriptors: Option<&DirectFds>,
+        operation: impl FnOnce(&mut Vfs) -> Result<T>,
+    ) -> (Option<Result<T>>, bool) {
+        struct Restore<'a> {
+            view: &'a mut Vfs,
+            files: DescriptorTable,
+            pseudo: Arc<SharedCell<pseudo::PseudoFs>>,
+            reader: Option<Arc<dyn SignalReader>>,
+            observed: Option<proc_source::Observation>,
+            original: bool,
+            file_size_signal: bool,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.view.fds = std::mem::take(&mut self.files);
+                self.view.pseudo = self.pseudo.clone();
+                *self.view.signal_reader.borrow_mut() = self.reader.take();
+                self.view.source_observed.set(self.observed);
+                self.view.query.as_mut().unwrap().original = self.original;
+                self.view.file_size_signal.set(self.file_size_signal);
+            }
+        }
+        let mut view = self.view.borrow_mut();
+        let publication = view.pseudo.borrow().publication.clone().unwrap();
+        let pseudo = {
+            let root = publication.borrow();
+            Arc::new(SharedCell::new(pseudo::PseudoFs {
+                boot_id: root.boot_id.clone(),
+                video_device: root.video_device.clone(),
+                enabled: root.enabled,
+                runtime: root.runtime.clone(),
+                source: root.source.clone(),
+                publication: Some(publication.clone()),
+                nodes: root.nodes.clone(),
+            }))
+        };
+        let query = view.query.as_mut().unwrap();
+        let original = std::mem::replace(&mut query.original, true);
+        let deferred = query.deferred.clone();
+        deferred.store(false, Ordering::Relaxed);
+        let files = DescriptorTable::observe(query.files.clone());
+        let files = std::mem::replace(&mut view.fds, files);
+        let pseudo = std::mem::replace(&mut view.pseudo, pseudo);
+        let reader = std::mem::replace(
+            &mut *view.signal_reader.borrow_mut(),
+            descriptors.and_then(|fds| fds.2.clone()),
+        );
+        let observed = view.source_observed.replace(None);
+        let file_size_signal = view.file_size_signal.replace(false);
+        let guard = Restore {
+            view: &mut view,
+            files,
+            pseudo,
+            reader,
+            observed,
+            original,
+            file_size_signal,
+        };
+        let result = operation(guard.view);
+        let signal = guard.view.file_size_signal.replace(false);
+        (
+            (!deferred.swap(false, Ordering::Relaxed)).then_some(result),
+            signal,
+        )
     }
     /// Anonymous kernel resources use the original filesystem/budget and live
     /// Files domain, with no pathname lookup or owner control projection.

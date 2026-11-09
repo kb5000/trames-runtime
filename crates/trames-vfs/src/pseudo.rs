@@ -794,7 +794,7 @@ pub(super) struct PseudoFs {
     pub(super) enabled: bool,
     pub(super) runtime: RuntimeInfo,
     pub(super) source: Option<Arc<dyn proc_source::ProcSource>>,
-    /// Only private legacy query views retain their original publication.
+    /// Private query views retain their original publication.
     /// The original root has None; a projection never points back to itself.
     pub(super) publication: Option<Arc<SharedCell<PseudoFs>>>,
     pub(super) nodes: Arc<SharedCell<PseudoNodes>>,
@@ -1381,7 +1381,7 @@ impl Vfs {
             return Err(Errno(13));
         }
         if let Some(query) = &self.query {
-            if !original.shareable() {
+            if !query.original && !original.shareable() {
                 return query.defer();
             }
         }

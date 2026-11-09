@@ -69,6 +69,8 @@ mod timer_io;
 pub use direct_io::{DirectFd, DirectFds, DirectPoll};
 pub use readiness::{IoSignal, IoSubscription, IoWake};
 mod signal_reader;
+#[cfg(test)]
+mod uring_context_tests;
 pub use signal_reader::SignalReader;
 pub use timer_io::TimerFd;
 pub use trames_shared::{HostEvents, HostFd, HostSubscription, Readiness, ReadinessDriver};
@@ -2402,7 +2404,8 @@ impl Vfs {
                     let controlling_tty = matches!(n.content, Content::Terminal)
                         && self.terminal_task.get().is_some()
                         && self.controlling_terminal() != Some(0);
-                    if !pty
+                    if !query.original
+                        && !pty
                         && !controlling_tty
                         && node.simple_device.is_none()
                         && !matches!(n.content, Content::Device(device) if device.source_open())

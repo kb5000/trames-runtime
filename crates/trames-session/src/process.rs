@@ -9596,3 +9596,7 @@ mod time_tests;
 #[cfg(all(test, trames_interpreter_conformance))]
 #[path = "process_published_proc_tests.rs"]
 mod published_proc_tests;
+
+#[cfg(all(test, trames_interpreter_conformance))]
+#[path = "process_uring_original_tests.rs"]
+mod uring_original_tests;

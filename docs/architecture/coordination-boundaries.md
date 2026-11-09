@@ -7,6 +7,14 @@ resource work, scoped mapping admission and joined administration remain distinc
 
 ## Current status at a glance — 2026-11-09
 
+Stage 91 completes accepted io_uring bodies against their original sealed
+resource context. Cold admission retains the original Files, credentials, fs and
+namespace resources, device policy and the original global publication. It never
+borrows the current task's Linux or donates a CQ observer's context. Opaque data
+OFDs expose only their actual FileWork target, retaining native disk staging and
+backing/layout waits. Genuine absent live PID/mm providers and capability-less
+embeddings still defer before effects; both maintenance escalation sites remain.
+
 Stage 90 removes legacy global proc/sys publication as an owner-only resource.
 Existing set_runtime_info data has one original shared publication; private
 resolvers retain that resource, and opened metadata files use common FileWork.
@@ -489,7 +497,7 @@ Actual excluded policy effects and missing capabilities retain explicit boundari
 ### Current remaining categories
 
 The count is **four broad categories**, not the number of historical subsystem
-rows. Stages 72–90 remove concrete triggers and close request-authority dependencies inside those categories; they do not
+rows. Stages 72–91 remove concrete triggers and close request-authority dependencies inside those categories; they do not
 prove that the final generic fallback is unreachable.
 
 | Remaining category | Actual trigger | Current scope / authoritative implementation |
@@ -3750,3 +3758,51 @@ strict lint and both iPad SDK targets pass. Signed native and installed Dev
 acceptance are recorded in the paired product's validation record. Source-only
 passing checks are not used as a claim that either maintenance escalation site
 is unreachable.
+
+## 91. Original accepted io_uring bodies and full resource context — 2026-11-09
+
+An accepted io_uring request now completes its cold original body on its executing
+worker, after the shared fast path has an actual before-effect admission miss.
+The canonical body remains shared with standalone dispatch. Source execution does
+not borrow a Task/Linux projection, acquire the current task's memory, recreate
+its SQE metadata or resolve a reused numeric descriptor. Its existing caller View
+supplies guest bytes. No task-wide mutex, resource RPC, additional worker/service
+thread, polling bus, production unsafe block or ordinary memory check/fence is
+introduced.
+
+The retained sealed resolver already owns the original fs, mount/namespace,
+credentials, Files and device-policy resources. It now retains the original
+publication even when a typed proc source is installed. A cold operation uses a
+private rendering cache initialized from that publication; provider replacement
+is visible without changing the request's original credentials/namespace/Files.
+The ordinary resolver's admission is restored by a scoped guard on return and
+unwind. Signal-reader authority is borrowed from the accepted DirectFds only for
+that operation, rather than stored in proc renderers or shared OFDs. File-size
+signals go to the original submitter, after releasing the resolver mutex.
+
+Retaining the full original OFD grants access to its existing FileWork data
+resource even if a namespace/anonymous control remains opaque. It does not publish
+that control as a complete shared descriptor. Ordinary native file jobs, selected
+buffers, resource dependencies, backing/layout exclusivity and cancellation use
+the same asynchronous FileWork machinery. Open retries preserve PreparedOpen;
+they do not replay it as a synchronous host open.
+
+Published global accounting can use its actual original publication when the
+old typed observer is unavailable. That is not a guest-mm capability: numeric PID
+paths and live argv/environment/maps requirements keep their real provider
+checks. A capability-less embedding defers before SQ import/copyout and its real
+caller can still complete the original request. Missing native event capability
+retains the existing boundary; actual native backend errors retain terminal
+source error handling. Neither require_owner maintenance setter is deleted or
+claimed unreachable by this change.
+
+Regression evidence covers 4/12 CPUs, one execution slot, seccomp ALLOW, blocking
+and asynchronous enter, fixed-file close/reuse, independent submitters, original
+Files/credentials/root after replacement, private admission and unwind, signal
+state and last-close resource release. The new connected process case fails
+against prior production before its completion marker. Both complete local
+runtime workflows pass on macOS and ARM64 Linux; each host passes 442 process
+regressions (two intentionally ignored) and ten FFI cases. Both iPad SDK targets
+compile. Signed HVF and installed Dev evidence belongs to the paired product's
+validation record. No controlled throughput gain or broad category reduction is
+inferred from a passing functional/path regression.

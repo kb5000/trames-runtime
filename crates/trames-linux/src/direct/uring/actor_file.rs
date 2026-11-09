@@ -235,7 +235,7 @@ pub(super) fn execute(
             None => Err(Errno(11)),
         });
     }
-    let file: FileTarget = request.file.as_ref()?.shared_file()?.file_target()?;
+    let file: FileTarget = request.file.as_ref()?.file_target()?;
     let (command, parts) = match parameters(request, memory) {
         Ok(parameters) => parameters,
         Err(e) => return Some(Err(e)),

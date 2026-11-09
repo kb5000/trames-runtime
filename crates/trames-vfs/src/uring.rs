@@ -136,6 +136,12 @@ impl UringFile {
     pub fn shared_file(&self) -> Option<SharedFd> {
         self.original.is_none().then(|| self.file.clone())
     }
+    /// The accepted full OFD retains its actual byte/backing resources even
+    /// when its namespace/anonymous control is opaque. This grants FileWork
+    /// its existing data capability, not a reconstructed shared descriptor.
+    pub fn file_target(&self) -> Option<FileTarget> {
+        self.file.file_target()
+    }
     pub fn is_eventfd(&self) -> bool {
         matches!(
             self.file.open.control,
@@ -984,6 +990,7 @@ mod original_tests {
             assert!(files.lookup(fd).is_none());
             let accepted = files.uring_file(fd).unwrap();
             assert!(accepted.shared_file().is_none());
+            assert_eq!(accepted.file_target().is_some(), regular);
             let (ring_fd, ring) = v.uring_create(4, 8).unwrap();
             ring.state.lock().unwrap().files = Some(vec![Some(ring.bind_file(&accepted).unwrap())]);
             drop(accepted);

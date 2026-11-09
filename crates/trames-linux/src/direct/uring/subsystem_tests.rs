@@ -840,7 +840,7 @@ fn proc_control_registered_files_keep_original_resource_and_complete_on_source()
 }
 
 #[test]
-fn shared_volatile_registered_file_keeps_its_body_boundary_and_original_ofd() {
+fn shared_volatile_registered_file_completes_its_original_body_on_source() {
     let (mut l, mut m, fd, r) = setup(8);
     l.vfs.set_runtime_info(1, Default::default());
     exclude_proc_provider(&l);
@@ -861,13 +861,9 @@ fn shared_volatile_registered_file_keeps_its_body_boundary_and_original_ofd() {
     add(&mut m, &r, read);
     assert!(matches!(
         enter(&d, fd, 1, 1, &mut m, &target()),
-        IoAttempt::Checkpoint
+        IoAttempt::Complete(Ok(1))
     ));
     assert_eq!(r.load_queue(0), 1);
-    assert_eq!(
-        l.uring_enter([fd as u64, 0, 1, 1, 0, 0], &mut m, Some(1), 7),
-        Ok((1, true))
-    );
     let completion = cq(&mut m, &r);
     assert_eq!(completion.0, 77);
     assert!(completion.1 > 0);
@@ -879,6 +875,41 @@ fn shared_volatile_registered_file_keeps_its_body_boundary_and_original_ofd() {
     assert_eq!(l.vfs.read(replacement, 8).unwrap(), 3u64.to_le_bytes());
     assert!(epoch.finish().is_empty());
     files.finish();
+}
+
+#[test]
+fn capability_less_embedding_defers_before_import_and_original_caller_can_complete() {
+    let (mut l, mut m, fd, ring) = setup(8);
+    l.vfs.set_runtime_info(1, Default::default());
+    exclude_proc_provider(&l);
+    let file = l.vfs.open_at(-100, b"/proc/version", 0, 0).unwrap();
+    let mut epoch = UringEpoch::default();
+    // This embedding supplies descriptors and a factory, but no path/resource
+    // root. It must not acquire one from an arbitrary CQ observer.
+    let d = DirectSyscalls::new(l.vfs.direct_descriptors())
+        .with_resources(l.vfs.descriptor_factory())
+        .with_urings(
+            epoch
+                .capture(&l.vfs, m.instruction_identity().0, 7)
+                .with_actor(l.uring_actor_root()),
+        );
+    add(&mut m, &ring, scalar(22, file, 0x2200, 8, 77));
+    let t = target();
+    assert!(matches!(
+        enter(&d, fd, 1, 1, &mut m, &t),
+        IoAttempt::Checkpoint
+    ));
+    assert_eq!(ring.load_queue(0), 0);
+    assert_eq!(ring.cq_ready(), 0);
+    assert_eq!(m.read_array::<8>(0x2200).unwrap(), [0; 8]);
+    assert!(d.uring_background(7, &Arc::downgrade(&t)).is_none());
+    assert_eq!(
+        l.uring_enter([fd as u64, 1, 1, 1, 0, 0], &mut m, None, 7),
+        Ok((1, true))
+    );
+    assert_eq!(cq(&mut m, &ring), (77, 8));
+    assert_eq!(m.read_array::<8>(0x2200).unwrap(), *b"Linux ve");
+    assert!(!l.uring_requires_owner());
 }
 
 #[test]

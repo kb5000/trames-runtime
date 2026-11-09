@@ -78,13 +78,52 @@ impl Execution {
         actor: &UringActor,
         ring: &Uring,
     ) -> Option<Result<(i32, bool)>> {
-        if call.retained {
-            return self
-                .paths
-                .lock()
-                .unwrap()
-                .uring_query(|vfs| crate::uring::execute::retained(vfs, request, memory, None));
+        let mut signal = false;
+        let result = if call.retained && !matches!(request.sqe.opcode(), 18 | 19 | 21 | 28 | 45) {
+            self.paths.lock().unwrap().uring_query(|vfs| {
+                let result = crate::uring::execute::retained(vfs, request, memory, None);
+                signal = vfs.take_file_size_signal();
+                result
+            })
+        } else {
+            self.run_shared(call, request, memory, actor, ring)
+        };
+        if signal {
+            self.raise_file_size(actor);
         }
+        if result.is_some() {
+            return result;
+        }
+        // A shared body's None is a before-effect admission miss. Native file
+        // jobs/layouts always retain FileIo and return their original wait.
+        // The sealed original context is independent of the current observer.
+        let (result, signal) = self
+            .paths
+            .lock()
+            .unwrap()
+            .uring_original(Some(&self.descriptors), |vfs| {
+                crate::uring::execute::retained(vfs, request, memory, None)
+            });
+        if signal {
+            self.raise_file_size(actor);
+        }
+        result
+    }
+    fn raise_file_size(&self, actor: &UringActor) {
+        if let Some(task) = &self.signal {
+            task.raise(25);
+        } else {
+            actor.file_size_signal.store(true, Ordering::Relaxed);
+        }
+    }
+    fn run_shared(
+        &self,
+        call: &mut Accepted,
+        request: &mut Request,
+        memory: &mut impl CpuMemory,
+        actor: &UringActor,
+        ring: &Uring,
+    ) -> Option<Result<(i32, bool)>> {
         let s = &request.sqe;
         Some(match s.opcode() {
             1 | 2 | 3 | 4 | 5 | 17 | 22 | 23 | 55 => {
@@ -304,10 +343,11 @@ impl UringActor {
             .insert(key.0, Arc::downgrade(ring));
         // Decide original body admission once, not on every retry/byte copy.
         let retained = request.file.as_ref().is_some_and(|file| {
-            let shared = file.shared_file();
-            shared.is_none()
-                || matches!(request.sqe.opcode(), 1 | 2 | 3 | 4 | 5 | 17 | 22 | 23 | 55)
-                    && shared.and_then(|f| f.file_target()).is_none()
+            if matches!(request.sqe.opcode(), 1 | 2 | 3 | 4 | 5 | 17 | 22 | 23 | 55) {
+                file.file_target().is_none()
+            } else {
+                file.shared_file().is_none()
+            }
         });
         self.accepted.lock().unwrap().insert(
             key,

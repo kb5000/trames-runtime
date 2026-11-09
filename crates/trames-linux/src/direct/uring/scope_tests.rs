@@ -79,7 +79,7 @@ fn foreign_background_does_not_adopt_another_submitters_pending_request() {
     );
 }
 #[test]
-fn body_deferral_does_not_disable_another_submitters_live_maintenance() {
+fn original_body_completion_does_not_disable_another_submitters_live_maintenance() {
     let (mut l, mut m, fd, ring) = setup(8);
     l.vfs.set_runtime_info(1, Default::default());
     exclude_proc_provider(&l);
@@ -107,11 +107,14 @@ fn body_deferral_does_not_disable_another_submitters_live_maintenance() {
             Some(IoAttempt::Complete(Ok(1)))
         ));
     }
-    let mut background = first.uring_background(7, &Arc::downgrade(&target)).unwrap();
-    assert!(!background.progress(&mut m).unwrap());
+    if let Some(mut background) = first.uring_background(7, &Arc::downgrade(&target)) {
+        assert!(background.progress(&mut m).unwrap());
+        assert!(!background.active());
+    }
+    assert_eq!(cq(&mut m, &ring), (7, 8));
     assert!(
         l.worker_uring_pending(&m, 8),
-        "a real excluded body cannot disable another source"
+        "completing an original body cannot disable another source"
     );
     let mut other = second
         .uring_background(8, &Arc::downgrade(&target))
@@ -121,10 +124,8 @@ fn body_deferral_does_not_disable_another_submitters_live_maintenance() {
     assert!(other.signal.ready());
     assert!(other.progress(&mut m).unwrap());
     assert_eq!(cq(&mut m, &ring), (8, 8));
-    assert!(l.uring_requires_owner_for(&m, 7));
+    assert!(!l.uring_requires_owner_for(&m, 7));
     assert!(!l.uring_requires_owner_for(&m, 8));
-    assert!(l.progress_uring(&mut m, 7));
-    assert_eq!(cq(&mut m, &ring), (7, 8));
     assert_eq!(&m.read_array::<5>(0x2000 + 7 * 32).unwrap(), b"Linux");
     assert!(!l.uring_requires_owner());
 }
