@@ -380,7 +380,7 @@ impl<C: Cpu> Process<C> {
                     .as_ref()
                     .is_some_and(|(_, ring, _)| trames_linux::UringEpoch::can_adopt(ring));
         }
-        if let State::Blocked(number @ (22 | 73 | 441), args) = self.state {
+        if let State::Blocked(number @ (22 | 72 | 73 | 441), args) = self.state {
             if self.seccomp.mode() == 0
                 && trames_linux::UringEpoch::poll_rings(
                     &self.linux.vfs,
@@ -395,7 +395,7 @@ impl<C: Cpu> Process<C> {
             }
         }
         let State::Blocked(
-            number @ (0..=4 | 22 | 63..=66 | 73 | 206 | 207 | 211 | 212 | 292 | 441),
+            number @ (0..=4 | 22 | 63..=66 | 72 | 73 | 206 | 207 | 211 | 212 | 292 | 441),
             args,
         ) = self.state
         else {
@@ -404,8 +404,26 @@ impl<C: Cpu> Process<C> {
         if self.seccomp.mode() != 0 {
             return false;
         }
-        // Most retained waits are poll/epoll, pipes or Unix sockets. Their
-        // eligibility never depends on scanning every native TCP socket.
+        // Cold legacy event waits need actual source admission, not only the
+        // broad entry classifier (which also accepts invalid-FD results). An
+        // absent original provider must retain its real owner-side deadline.
+        if trames_linux::event_wait(number) {
+            let fds = self
+                .linux
+                .vfs
+                .direct_descriptors()
+                .with_signal_reader(Some(self.signals.reader(self.linux.vfs.pid_namespace())));
+            return trames_linux::RetainedWait::prepare_worker(
+                &fds,
+                &self.memory,
+                number,
+                args,
+                self.poll_deadline,
+            )
+            .is_some();
+        }
+        // Most retained waits are pipes or Unix sockets. Their eligibility
+        // never depends on scanning every native TCP socket.
         trames_linux::DirectSyscalls::new(self.linux.vfs.direct_descriptors())
             .with_aio(self.linux.aio.clone(), self.linux.vfs.native_events())
             .supports_call(number, args)
@@ -3409,7 +3427,7 @@ impl<C: Cpu> Kernel<C> {
                 let local_ring = p.worker_io_candidate(id)
                     && match p.state {
                         State::Blocked(426, _) => true,
-                        State::Blocked(number @ (22 | 73 | 441), args) => {
+                        State::Blocked(number @ (22 | 72 | 73 | 441), args) => {
                             trames_linux::UringEpoch::poll_rings(
                                 &p.linux.vfs,
                                 number,
@@ -7972,7 +7990,9 @@ mod tests {
         k.processes.get_mut(&1).unwrap().state = State::Blocked(63, [0; 6]);
         assert_eq!(k.parallel_timeout(), Duration::from_millis(10));
         k.processes.get_mut(&1).unwrap().state = State::Blocked(22, [0; 6]);
-        assert_eq!(k.parallel_timeout(), Duration::ZERO);
+        // Invalid epoll FD validation now belongs to this live source task;
+        // the joined owner must not spin on its stale timeout metadata.
+        assert_eq!(k.parallel_timeout(), Duration::from_millis(10));
         k.processes.get_mut(&1).unwrap().state =
             State::Sleep(Instant::now() + Duration::from_millis(1), 0);
         assert_eq!(k.parallel_timeout(), Duration::from_millis(10));
@@ -8021,8 +8041,18 @@ mod tests {
         p.state = State::Blocked(73, [0, 0, 0, 0, 0, 0]);
         drop(custody);
         assert_eq!(k.parallel_timeout(), Duration::from_millis(10));
-        // An owner-side pselect still needs its saved timeout boundary.
+        // Pselect is now source-owned too. Only a genuinely missing original
+        // provider retains its saved owner-side deadline: legacy host stdin,
+        // without an embedding console, inside an otherwise valid epoll.
         k.processes.get_mut(&1).unwrap().state = State::Blocked(72, [0; 6]);
+        assert_eq!(k.parallel_timeout(), Duration::from_millis(10));
+        {
+            let mut p = k.processes.get_mut(&1).unwrap();
+            let ep = p.linux.vfs.epoll_create(0).unwrap();
+            p.linux.vfs.epoll_ctl(ep, 1, 0, 1, 0).unwrap();
+            assert!(p.linux.vfs.direct_descriptors().epoll(ep).is_none());
+            p.state = State::Blocked(22, [ep as u64, 0x1000, 1, u64::MAX, 0, 0]);
+        }
         assert_eq!(k.parallel_timeout(), Duration::ZERO);
     }
     #[test]
@@ -9704,3 +9734,7 @@ mod memfd_tests;
 #[cfg(all(test, trames_interpreter_conformance))]
 #[path = "process_memory_sync_tests.rs"]
 mod memory_sync_tests;
+
+#[cfg(all(test, trames_interpreter_conformance))]
+#[path = "process_dispatch_tests.rs"]
+mod dispatch_tests;

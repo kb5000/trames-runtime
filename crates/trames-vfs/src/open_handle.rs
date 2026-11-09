@@ -80,12 +80,6 @@ impl OpenView<'_> {
             Self::Owner(open) => open.downgrade(),
         }
     }
-    pub(super) fn owned(&self) -> OpenHandle {
-        match self {
-            Self::Shared(open) => OpenHandle::Shared((*open).clone()),
-            Self::Owner(open) => (*open).clone(),
-        }
-    }
 }
 pub(super) enum OpenRead<'a> {
     Shared(OpenDescription),

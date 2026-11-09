@@ -76,6 +76,7 @@ pub use signal_reader::SignalReader;
 pub use timer_io::TimerFd;
 pub use trames_shared::{HostEvents, HostFd, HostSubscription, Readiness, ReadinessDriver};
 mod epoll;
+mod epoll_graph;
 mod events;
 mod uring;
 pub use uring::{
@@ -770,7 +771,7 @@ pub struct Vfs {
     record_locks: Arc<locks::Registry>,
     file_size_limit: FileSizeLimit,
     file_size_signal: Cell<bool>,
-    next_open: Arc<AtomicU64>,
+    next_open: Arc<descriptor_factory::OpenIds>,
     proc_accessed: Cell<bool>,
     proc_refresh: Cell<ProcRefresh>,
     source_observed: Cell<Option<proc_source::Observation>>,
@@ -912,7 +913,7 @@ impl Vfs {
             record_locks: Arc::default(),
             file_size_limit: FileSizeLimit::default(),
             file_size_signal: Cell::new(false),
-            next_open: Arc::new(AtomicU64::new(1)),
+            next_open: Arc::new(descriptor_factory::OpenIds::default()),
             proc_accessed: Cell::new(false),
             proc_refresh: Cell::new(ProcRefresh::Independent),
             source_observed: Cell::new(None),
@@ -2851,28 +2852,26 @@ impl Vfs {
     }
     /// Bounded splice through a pipe. Commit pipe consumption only after the
     /// destination accepts bytes; EAGAIN must never lose buffered stream data.
-    pub fn splice(
-        &mut self,
+    /// Existing splice descriptor/type prelude, without byte or offset effects.
+    pub fn check_splice(
+        &self,
         input: u32,
         output: u32,
-        count: usize,
         from: Option<u64>,
         to: Option<u64>,
-    ) -> Result<usize> {
-        let files = self.shared_files();
-        if let (Some(Ok(source)), Some(Ok(dest))) = (files.lookup(input), files.lookup(output)) {
-            if StreamTransfer::admitted(&source, &dest) {
-                let mut transfer =
-                    StreamTransfer::new(source, dest, Ok(from), Ok(to), count as u64, true, 0);
-                return match transfer.execute(self)? {
-                    FileValue::Transfer { count, .. } => Ok(count as usize),
-                    _ => unreachable!(),
-                };
-            }
-        }
+    ) -> Result<()> {
         let source = self.descriptor(input)?.open.clone();
         let dest = self.descriptor(output)?.open.clone();
-        if OpenHandle::ptr_eq(&source, &dest) {
+        Self::splice_pipes(&source, &dest, from, to).map(|_| ())
+    }
+    #[allow(clippy::type_complexity)] // Original read/write pipe-end capabilities.
+    fn splice_pipes(
+        source: &OpenHandle,
+        dest: &OpenHandle,
+        from: Option<u64>,
+        to: Option<u64>,
+    ) -> Result<(Option<(Pipe, bool)>, Option<(Pipe, bool)>)> {
+        if OpenHandle::ptr_eq(source, dest) {
             return Err(Errno(22));
         }
         let source_pipe = {
@@ -2892,7 +2891,7 @@ impl Vfs {
             }
             o.pipe.as_ref().map(|p| (p.pipe.clone(), p.write))
         };
-        for open in [&source, &dest] {
+        for open in [source, dest] {
             let o = open.borrow();
             if o.socket
                 .as_ref()
@@ -2918,6 +2917,30 @@ impl Vfs {
         {
             return Err(Errno(9));
         }
+        Ok((source_pipe, dest_pipe))
+    }
+    pub fn splice(
+        &mut self,
+        input: u32,
+        output: u32,
+        count: usize,
+        from: Option<u64>,
+        to: Option<u64>,
+    ) -> Result<usize> {
+        let files = self.shared_files();
+        if let (Some(Ok(source)), Some(Ok(dest))) = (files.lookup(input), files.lookup(output)) {
+            if StreamTransfer::admitted(&source, &dest) {
+                let mut transfer =
+                    StreamTransfer::new(source, dest, Ok(from), Ok(to), count as u64, true, 0);
+                return match transfer.execute(self)? {
+                    FileValue::Transfer { count, .. } => Ok(count as usize),
+                    _ => unreachable!(),
+                };
+            }
+        }
+        let source = self.descriptor(input)?.open.clone();
+        let dest = self.descriptor(output)?.open.clone();
+        let (source_pipe, dest_pipe) = Self::splice_pipes(&source, &dest, from, to)?;
         if count == 0 {
             return Ok(0);
         }

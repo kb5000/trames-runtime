@@ -3014,7 +3014,7 @@ mod tests {
         }
     }
     #[test]
-    fn filtered_epoll_and_inotify_controls_keep_one_decision_and_original_fallbacks() {
+    fn filtered_epoll_and_inotify_controls_keep_one_decision_and_original_interests_on_source() {
         for (number, nested, decision) in [
             (21, false, ALLOW),
             (21, true, ALLOW),
@@ -3078,7 +3078,7 @@ mod tests {
                 kernel.syscalls
             );
             assert_eq!(kernel.service_requests, 0);
-            let direct = decision == ALLOW && !nested;
+            let direct = decision == ALLOW;
             if number == 21 {
                 assert_eq!(kernel.worker_fd_syscalls > 100, direct);
                 let v = &mut kernel.processes.get_mut(&1).unwrap().linux.vfs;

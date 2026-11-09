@@ -14,6 +14,13 @@ impl std::ops::Deref for SocketOperation {
         self.0.socket.as_deref().expect("network OFD")
     }
 }
+impl SharedFd {
+    /// Socket authority for this accepted OFD, without a second numeric lookup.
+    pub fn socket_operation(&self) -> Option<SocketOperation> {
+        self.open.socket.as_ref()?;
+        Some(SocketOperation(self.open.clone()))
+    }
+}
 impl SocketOperation {
     pub fn shares_resources(&self, fds: &DirectFds) -> bool {
         fds.1.as_ref().is_some_and(|files| {
@@ -40,6 +47,8 @@ impl SocketOperation {
         let mut publication = self.0.tcp_publication.lock().unwrap();
         let result = operation();
         *publication = Vfs::direct_tcp_shared(&self.0);
+        drop(publication);
+        self.publish_changes();
         result
     }
     pub fn refresh_tcp(&self) {

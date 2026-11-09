@@ -46,25 +46,12 @@ impl<C: Cpu> Kernel<C> {
         which: u64,
         who: u64,
     ) -> Result<u64, Errno> {
-        if !(1..=3).contains(&which) || (who as i32) < 0 {
-            return Err(Errno(22));
-        }
-        if which != 1 {
-            return Err(Errno(95));
-        }
-        let target = if who as u32 == 0 {
-            0
-        } else {
-            p.linux.vfs.global_pid(who as u32)?
-        };
-        if target == 0 || target == pid || self.processes.contains_key(&target) {
-            // No explicit I/O priority is installed (CLASS_NONE, data 0).
-            // This describes the virtual scheduler; no host PID is consulted.
-            Ok(0)
-        } else {
-            Err(Errno(3))
-        }
+        trames_kernel::scheduling::ioprio_get(which, who, |who| {
+            let target = p.linux.vfs.global_pid(who)?;
+            Ok(target == pid || self.processes.contains_key(&target))
+        })
     }
+
     pub(super) fn fixed_limits(&self) -> trames_kernel::limits::Fixed {
         trames_kernel::limits::Fixed {
             address_space: if self.memory_limits.is_host_managed() {

@@ -35,6 +35,16 @@ pub(super) enum FileResize {
     },
 }
 impl Vfs {
+    /// Canonical fallocate range prelude, before descriptor/type admission.
+    pub fn allocation_end(offset: u64, length: u64) -> Result<u64> {
+        if length == 0 || offset > i64::MAX as u64 || length > i64::MAX as u64 {
+            return Err(Errno(22));
+        }
+        offset
+            .checked_add(length)
+            .filter(|n| *n <= i64::MAX as u64)
+            .ok_or(Errno(27))
+    }
     /// Apply the host-managed session policy to the existing resource budget,
     /// including files already retained by FD transfers or native mappings.
     pub fn use_host_shared_memory(&self) {
@@ -47,13 +57,7 @@ impl Vfs {
     /// extends logical EOF without changing existing bytes or the fd position.
     /// KEEP_SIZE is supported for shared files; guest hole punching is separate.
     pub fn allocate_fd(&mut self, fd: u32, mode: u64, offset: u64, length: u64) -> Result<()> {
-        if length == 0 || offset > i64::MAX as u64 || length > i64::MAX as u64 {
-            return Err(Errno(22));
-        }
-        let end = offset
-            .checked_add(length)
-            .filter(|n| *n <= i64::MAX as u64)
-            .ok_or(Errno(27))?;
+        let end = Self::allocation_end(offset, length)?;
         {
             let descriptor = self.descriptor(fd)?;
             let open = descriptor.open.borrow();

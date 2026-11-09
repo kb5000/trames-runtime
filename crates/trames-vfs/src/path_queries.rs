@@ -251,6 +251,56 @@ impl PathQueries {
         };
         Some(view.with_uring_fd(&file, operation))
     }
+    /// Control an already accepted original OFD after a retained byte operation.
+    pub fn retained_control<T>(
+        &self,
+        file: SharedFd,
+        operation: impl FnOnce(&mut Vfs, u32) -> Result<T>,
+    ) -> Result<T> {
+        self.view
+            .borrow_mut()
+            .with_uring_fd(&file.retained(), operation)
+    }
+    /// Run a cold, before-effects prelude against two already observed original
+    /// lookup results. Private role aliases distinguish even the same guest FD
+    /// observed on either side of a concurrent close/reuse. No slot is published.
+    pub fn fd_pair<T>(
+        &self,
+        files: [Option<Result<SharedFd>>; 2],
+        operation: impl FnOnce(&mut Vfs, [u32; 2]) -> Result<T>,
+    ) -> Option<Result<T>> {
+        struct Restore<'a> {
+            view: &'a mut Vfs,
+            accepted: Option<BTreeMap<u32, Option<Result<SharedFd>>>>,
+            original: bool,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                let query = self.view.query.as_mut().unwrap();
+                query.accepted = self.accepted.take();
+                query.original = self.original;
+            }
+        }
+        let mut view = self.view.borrow_mut();
+        let aliases = [u32::MAX - 1, u32::MAX];
+        let query = view.query.as_mut().unwrap();
+        let accepted = query
+            .accepted
+            .replace(aliases.into_iter().zip(files).collect());
+        let original = std::mem::replace(&mut query.original, false);
+        query.clear_deferred();
+        let scope = Restore {
+            view: &mut view,
+            accepted,
+            original,
+        };
+        let result = operation(scope.view, aliases);
+        if scope.view.query.as_ref().unwrap().take_deferred() {
+            None
+        } else {
+            Some(result)
+        }
+    }
     /// Fresh private control graph; only the original shared Files/resources
     /// are retained. No mutable query-local cache escapes to the new one.
     pub fn retain_context(&self) -> Self {
@@ -1214,3 +1264,45 @@ mod tests {
 mod directory_tests;
 #[cfg(test)]
 mod mqueue_tests;
+
+#[cfg(test)]
+mod fd_admission_tests {
+    use super::*;
+    #[test]
+    fn frozen_fd_role_results_survive_reuse_and_restore_control_bindings_on_unwind() {
+        let mut v = Vfs::default();
+        let fd = v.eventfd(17, 0).unwrap();
+        let files = v.shared_files();
+        let old = files.lookup(fd).unwrap();
+        let bad = files.lookup(fd + 1);
+        let query = v.path_queries();
+        v.close(fd).unwrap();
+        assert_eq!(v.eventfd(99, 0).unwrap(), fd);
+        assert_eq!(v.eventfd(44, 0).unwrap(), fd + 1);
+        assert_eq!(
+            query.fd_pair([Some(old.clone()), bad.clone()], |view, aliases| {
+                assert_eq!(view.read(aliases[0], 8).unwrap(), 17u64.to_le_bytes());
+                view.fd_kind(aliases[1])
+            }),
+            Some(Err(Errno(9)))
+        );
+        assert_eq!(v.read(fd, 8).unwrap(), 99u64.to_le_bytes());
+        assert_eq!(v.read(fd + 1, 8).unwrap(), 44u64.to_le_bytes());
+        assert!(query
+            .fd_pair([None, bad.clone()], |view, aliases| view
+                .fd_kind(aliases[0]))
+            .is_none());
+        assert_eq!(
+            query.fd_pair([Some(Err(Errno(9))), None], |view, aliases| view
+                .fd_kind(aliases[0])),
+            Some(Err(Errno(9)))
+        );
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            query.fd_pair::<()>([Some(old), bad], |_, _| panic!("callback unwind"));
+        }));
+        let view = query.view.borrow();
+        assert!(view.query.as_ref().unwrap().accepted.is_none());
+        assert!(!view.query.as_ref().unwrap().original);
+        assert!(view.fd_kind(fd).is_ok());
+    }
+}

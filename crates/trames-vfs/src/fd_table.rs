@@ -421,6 +421,25 @@ impl SharedFiles {
         };
         Some(open)
     }
+    /// Preserve a known descriptor/type error separately from absent legacy
+    /// metadata. The returned original epoll core is accepted under membership.
+    pub(super) fn epoll_open(&self, fd: u32) -> Option<Result<Arc<SharedOpenDescription>>> {
+        let entries = self.0.entries.lock().unwrap();
+        let Some(slot) = entries.get(&fd) else {
+            return Some(Err(Errno(9)));
+        };
+        let open = match &slot.open {
+            SlotOpen::Shared(open) => open.clone(),
+            SlotOpen::Owner(_, _, metadata) => metadata.as_ref()?.upgrade()?,
+        };
+        Some(SharedFd::new(open.clone()).ready().and_then(|()| {
+            if matches!(&open.control, Some(events::SharedControl::Epoll(_))) {
+                Ok(open)
+            } else {
+                Err(Errno(22))
+            }
+        }))
+    }
     /// Poll admission may use an epoll's complete shared interest core without
     /// promoting its owner projection into a transferable/shared descriptor.
     pub(super) fn poll_lookup(&self, fd: u32) -> Option<Result<PollOpen>> {
@@ -440,16 +459,18 @@ impl SharedFiles {
                 .tcp_publication
                 .lock()
                 .unwrap()
-                .as_ref()?
-                .tcp
-                .poll_only();
-            return Some(Ok(PollOpen::Tcp(open, tcp)));
+                .as_ref()
+                .map(|publication| publication.tcp.poll_only());
+            return Some(Ok(if let Some(tcp) = tcp {
+                PollOpen::Tcp(open, tcp)
+            } else {
+                PollOpen::Shared(SharedFd::new(open))
+            }));
         }
         match &slot.open {
             SlotOpen::Shared(_) => Some(Ok(PollOpen::Shared(SharedFd::new(open)))),
             SlotOpen::Owner(_, _, _)
-                if matches!(&open.control,
-                Some(events::SharedControl::Epoll(live)) if live.owner_count()==0) =>
+                if matches!(&open.control, Some(events::SharedControl::Epoll(_))) =>
             {
                 Some(Ok(PollOpen::Epoll(open)))
             }
@@ -587,19 +608,20 @@ impl SharedFd {
         }
 
         if self.open.kind == FdKind::Socket && self.open.local.is_none() {
-            if let Some(mut fd) = DirectFd::netlink_poll(&self.open) {
-                fd.origin = Some(OfdIdentity::new(&self.open));
-                return Some(fd);
-            }
             let tcp = self
                 .open
                 .tcp_publication
                 .lock()
                 .unwrap()
-                .as_ref()?
-                .tcp
-                .poll_only();
-            return Some(DirectFd::tcp_poll(&self.open, tcp));
+                .as_ref()
+                .map(|publication| publication.tcp.poll_only());
+            let mut fd = if let Some(tcp) = tcp {
+                DirectFd::tcp_poll(&self.open, tcp)
+            } else {
+                DirectFd::socket_poll(&self.open)?
+            };
+            fd.origin = Some(OfdIdentity::new(&self.open));
+            return Some(fd);
         }
         // Named FIFO descriptions keep their pathname kind, but their poll
         // state and subscriptions still belong to the real pipe resource.

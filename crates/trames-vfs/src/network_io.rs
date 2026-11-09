@@ -44,7 +44,7 @@ impl DirectNetwork {
     ) -> Option<T> {
         let open = self.1.as_ref()?.socket_control(fd)?;
         let mut publication = refresh.then(|| open.tcp_publication.lock().unwrap());
-        open.socket_control.as_ref()?.with_native(|control| {
+        let result = open.socket_control.as_ref()?.with_native(|control| {
             let result = operation(control);
             if let Some(publication) = publication.as_mut() {
                 **publication = control.direct_tcp().map(|tcp| DirectTcpFd {
@@ -56,7 +56,14 @@ impl DirectNetwork {
                 });
             }
             result
-        })
+        });
+        drop(publication);
+        if refresh {
+            if let Some(socket) = &open.socket {
+                socket.publish_changes();
+            }
+        }
+        result
     }
 
     pub fn is_socket(&self, fd: u32) -> bool {
@@ -134,6 +141,12 @@ impl Vfs {
             let open = descriptor.open.borrow();
             let mut publication = open.shared.tcp_publication.lock().unwrap();
             *publication = Self::direct_tcp_open(&open);
+            let socket = open.socket.clone();
+            drop(publication);
+            drop(open);
+            if let Some(socket) = socket {
+                socket.publish_changes();
+            }
         }
         result
     }

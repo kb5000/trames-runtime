@@ -472,7 +472,10 @@ fn enrolled_deadlines_do_not_poll_stale_projections_or_hide_legacy_waits() {
     );
     {
         let mut p = k.processes.get_mut(&1).unwrap();
-        p.state = State::Blocked(72, [0; 6]);
+        let ep = p.linux.vfs.epoll_create(0).unwrap();
+        p.linux.vfs.epoll_ctl(ep, 1, 0, 1, 0).unwrap();
+        assert!(p.linux.vfs.direct_descriptors().epoll(ep).is_none());
+        p.state = State::Blocked(22, [ep as u64, 0x1000, 1, u64::MAX, 0, 0]);
         p.poll_deadline = Some(Instant::now());
     }
     assert_eq!(k.parallel_timeout_for(Some(&owned)), Duration::ZERO);

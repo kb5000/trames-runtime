@@ -232,6 +232,8 @@ pub(super) struct PreparedFileCall {
     action: PreparedAction,
 }
 enum PreparedAction {
+    Byte(RetainedByte),
+    Socket(RetainedSocket),
     Owner {
         work: trames_vfs::FileWork,
         output: FileOutput,
@@ -303,7 +305,13 @@ impl DirectSyscalls {
                 return Some(IoAttempt::Complete(value));
             }
         }
-        self.start_prepared_file(number, args, memory, pid, target)
+        if let Some(attempt) = self.start_prepared_file(number, args, memory, pid, target) {
+            return Some(attempt);
+        }
+        if matches!(number, 286 | 287) && args[3] == u64::MAX {
+            return self.start(number, args, memory, pid, target, None);
+        }
+        None
     }
     pub(super) fn prepare_open_work(
         &self,
@@ -448,6 +456,10 @@ impl DirectSyscalls {
         }
         let accepted = self.file_prepared.borrow_mut().take().unwrap();
         Some(match accepted.action {
+            PreparedAction::Socket(call) => self.start_retained_socket(call, memory, pid, target),
+            PreparedAction::Byte(file) => {
+                self.start_retained_byte(file, number, args, memory, pid, target)
+            }
             PreparedAction::Layout { work, output } => {
                 let pending = FilePending::new(Arc::default(), output, work.target().cloned());
                 let signal = IoSignal::new(pid, target.clone());
@@ -616,7 +628,16 @@ impl DirectSyscalls {
             }
         }
         let (file, command, output) = if matches!(number, 71 | 76 | 285) {
-            let (file, command, output) = copy_import(&vfs.shared_files(), number, args, memory)?;
+            let (file, command, output) = match copy_import(
+                &vfs.shared_files(),
+                || vfs.path_queries(),
+                number,
+                args,
+                memory,
+            )? {
+                Ok(prepared) => prepared,
+                Err(error) => return Some(IoAttempt::Complete(Err(error))),
+            };
             let command = match command {
                 Ok(command) => command,
                 Err(error) => return Some(IoAttempt::Complete(Err(error))),
@@ -626,11 +647,45 @@ impl DirectSyscalls {
             if !matches!(number, 46 | 47 | 62..=70 | 80 | 82 | 83 | 267 | 286 | 287) {
                 return None;
             }
-            let original = vfs.shared_files().lookup(args[0] as u32)?.ok()?;
-            let file = if matches!(number, 82 | 83 | 267) {
-                original.filesystem_target()
+            if matches!(number, 286 | 287) {
+                if let Err(error) = crate::file_calls::vector_flags(args[5]) {
+                    return Some(IoAttempt::Complete(Err(error)));
+                }
+            }
+            let original = match vfs.shared_files().lookup(args[0] as u32)? {
+                Ok(file) => file,
+                Err(error) => return Some(IoAttempt::Complete(Err(fd_error(number, args, error)))),
+            };
+            if matches!(number, 63..=70 | 286 | 287) {
+                if let Some(target) = original.nonbyte_target() {
+                    let (command, output) =
+                        match import(number, args, memory, &mut self.scratch.borrow_mut()) {
+                            Ok(call) => call,
+                            Err(error) => return Some(IoAttempt::Complete(Err(error))),
+                        };
+                    return Some(self.complete_file_attempt(
+                        trames_vfs::FileWork::descriptor_owned(vfs, target, command),
+                        output,
+                        memory,
+                    ));
+                }
+            }
+            let file = if matches!(number, 286 | 287)
+                && args[3] == u64::MAX
+                && original.file_target().is_none()
+                && original.nonbyte_target().is_none()
+            {
+                let file = match self.retain_byte_file(number, args, original)? {
+                    Ok(file) => file,
+                    Err(error) => return Some(IoAttempt::Complete(Err(error))),
+                };
+                return self.start_owned_byte(Some(file), number, args, memory, pid, target);
+            } else if matches!(number, 63..=66) {
+                original
+                    .file_target()
+                    .or_else(|| original.nonbyte_target())?
             } else {
-                original.file_target()?
+                original.filesystem_target()
             };
             let (command, output) =
                 match import(number, args, memory, &mut self.scratch.borrow_mut()) {
@@ -867,8 +922,8 @@ pub(super) fn import(
     use trames_vfs::FileCommand as Command;
     let offset = (matches!(number, 67..=70) || matches!(number, 286 | 287) && a[3] != u64::MAX)
         .then_some(a[3]);
-    if matches!(number, 286 | 287) && a[5] & !6 != 0 {
-        return Err(Errno(95));
+    if matches!(number, 286 | 287) {
+        crate::file_calls::vector_flags(a[5])?;
     }
     match number {
         62 => Ok((
@@ -981,8 +1036,17 @@ impl DirectSyscalls {
             if self.file_prepared(number, a) {
                 return None;
             }
-            let (file, command, output) =
-                copy_import(self.membership.as_ref()?, number, a, memory)?;
+            self.paths.as_ref()?;
+            let (file, command, output) = match copy_import(
+                self.membership.as_ref()?,
+                || self.paths.as_ref().expect("source copy path authority"),
+                number,
+                a,
+                memory,
+            )? {
+                Ok(prepared) => prepared,
+                Err(error) => return Some(Err(error)),
+            };
             return match command {
                 Ok(command) => self.prepare_file_fallback(number, a, file, command, output, memory),
                 Err(error) => Some(Err(error)),
@@ -1001,28 +1065,83 @@ impl DirectSyscalls {
         if self.file_prepared(number, a) {
             return None;
         }
-        let access = if matches!(number, 82 | 83 | 267) {
-            self.membership
-                .as_ref()?
-                .lookup(a[0] as u32)?
-                .ok()
-                .map(|f| trames_vfs::FileAccess::Full(f.filesystem_target()))
+        if matches!(number, 286 | 287) {
+            if let Err(error) = crate::file_calls::vector_flags(a[5]) {
+                return Some(Err(error));
+            }
+        }
+        let access = if let Some(files) = &self.membership {
+            let original = match files.lookup(a[0] as u32)? {
+                Ok(file) => file,
+                Err(error) => return Some(Err(fd_error(number, a, error))),
+            };
+            if matches!(number, 82 | 83 | 267) {
+                trames_vfs::FileAccess::Full(original.filesystem_target())
+            } else {
+                match self.files.accept_or_return(original) {
+                    Ok(fast) => trames_vfs::FileAccess::Fast(fast),
+                    Err(original) => {
+                        let descriptor = matches!(number, 63..=70 | 286 | 287)
+                            .then(|| original.nonbyte_target())
+                            .flatten();
+                        if let Some(target) = descriptor {
+                            trames_vfs::FileAccess::Descriptor(target)
+                        } else {
+                            if matches!(number, 286 | 287)
+                                && a[3] == u64::MAX
+                                && original.file_target().is_none()
+                            {
+                                let action = if let Some(byte) =
+                                    self.retain_byte_file(number, a, original.clone())
+                                {
+                                    match byte {
+                                        Ok(file) => PreparedAction::Byte(file),
+                                        Err(error) => return Some(Err(error)),
+                                    }
+                                } else {
+                                    match self.prepare_v2_ip(original, number, a, memory)? {
+                                        Ok(call) => PreparedAction::Socket(call),
+                                        Err(error) => return Some(Err(error)),
+                                    }
+                                };
+                                self.file_prepared.replace(Some(PreparedFileCall {
+                                    number,
+                                    args: a,
+                                    action,
+                                }));
+                                return None;
+                            }
+                            let target = if matches!(number, 63..=66) {
+                                original
+                                    .file_target()
+                                    .or_else(|| original.nonbyte_target())?
+                            } else {
+                                original.filesystem_target()
+                            };
+                            trames_vfs::FileAccess::Full(target)
+                        }
+                    }
+                }
+            }
         } else {
-            self.files.resolve(a[0] as u32).or_else(|| {
-                self.membership
-                    .as_ref()?
-                    .lookup(a[0] as u32)?
-                    .ok()?
-                    .file_target()
-                    .map(trames_vfs::FileAccess::Full)
-            })
-        }?;
+            self.files.resolve(a[0] as u32)?
+        };
         let (fast, target) = match access {
             trames_vfs::FileAccess::Fast(file) => {
                 let target = file.target();
                 (Some(file), target)
             }
             trames_vfs::FileAccess::Full(target) => (None, Some(target)),
+            trames_vfs::FileAccess::Descriptor(target) => {
+                let (command, output) =
+                    match import(number, a, memory, &mut self.scratch.borrow_mut()) {
+                        Ok(prepared) => prepared,
+                        Err(error) => return Some(Err(error)),
+                    };
+                let reply =
+                    trames_vfs::FileWork::descriptor_reply(self.paths.as_ref()?, target, command);
+                return Some(self.finish_file_reply(reply, output, memory));
+            }
         };
         let (mut command, output) = match import(number, a, memory, &mut self.scratch.borrow_mut())
         {
@@ -1068,18 +1187,32 @@ impl DirectSyscalls {
     }
 }
 
-fn copy_import(
-    files: &trames_vfs::SharedFiles,
-    number: u32,
-    a: [u64; 6],
-    memory: &impl CpuMemory,
-) -> Option<(
+fn fd_error(number: u32, a: [u64; 6], error: Errno) -> Errno {
+    if number == 47 {
+        if let Err(range) = trames_vfs::Vfs::allocation_end(a[2], a[3]) {
+            return range;
+        }
+    }
+    error
+}
+type ImportedCopy = (
     trames_vfs::FileTarget,
     Result<trames_vfs::FileCommand, Errno>,
     FileOutput,
-)> {
+);
+
+fn copy_import<Q: std::borrow::Borrow<trames_vfs::PathQueries>>(
+    files: &trames_vfs::SharedFiles,
+    paths: impl FnOnce() -> Q,
+    number: u32,
+    a: [u64; 6],
+    memory: &impl CpuMemory,
+) -> Option<Result<ImportedCopy, Errno>> {
     let range = number == 285;
     let splice = number == 76;
+    if range && a[5] != 0 || splice && a[5] & !15 != 0 {
+        return Some(Err(Errno(22)));
+    }
     let (input, output, from, to, count, flags) = if splice {
         (a[0], a[2], a[1], a[3], a[4], a[5] as u32)
     } else if range {
@@ -1089,8 +1222,35 @@ fn copy_import(
     };
     // Resolve each original OFD once. A concurrent close/reuse must not retarget
     // a pair already accepted while deciding between file and stream work.
-    let input = files.lookup(input as u32)?.ok()?;
-    let output = files.lookup(output as u32)?.ok()?;
+    let input = files.lookup(input as u32);
+    let output = files.lookup(output as u32);
+    let (input, output) = match (input, output) {
+        (Some(Ok(input)), Some(Ok(output))) => (input, output),
+        (input, output) => {
+            // No data operation can be reached: at least one role has an
+            // actual lookup error or absent capability, frozen for this call.
+            let paths = paths();
+            let result: Result<u64, Errno> =
+                paths.borrow().fd_pair([input, output], |vfs, aliases| {
+                    let mut args = a;
+                    if splice || range {
+                        args[0] = aliases[0] as u64;
+                        args[2] = aliases[1] as u64;
+                    } else {
+                        args[1] = aliases[0] as u64;
+                        args[0] = aliases[1] as u64;
+                    }
+                    if splice {
+                        let (from, to) = crate::file_calls::splice_parameters(vfs, args, memory)?;
+                        vfs.check_splice(aliases[0], aliases[1], from, to)?;
+                    } else {
+                        crate::file_calls::CopyParameters::prepare(vfs, number, args, memory)?;
+                    }
+                    unreachable!("a frozen rejected operand cannot pass transfer admission")
+                })?;
+            return Some(Err(result.unwrap_err()));
+        }
+    };
     let offset = |pointer| -> Result<Option<u64>, Errno> {
         if pointer == 0 {
             return Ok(None);
@@ -1118,13 +1278,40 @@ fn copy_import(
                 splice,
                 flags,
             )));
-        return Some((target, Ok(command), FileOutput::CopyOffsets { from, to }));
+        return Some(Ok((
+            target,
+            Ok(command),
+            FileOutput::CopyOffsets { from, to },
+        )));
     }
-    if splice {
-        return None;
+    if splice || input.file_target().is_none() || output.file_target().is_none() {
+        let paths = paths();
+        let result =
+            paths
+                .borrow()
+                .fd_pair([Some(Ok(input)), Some(Ok(output))], |vfs, aliases| {
+                    let mut args = a;
+                    if splice || range {
+                        args[0] = aliases[0] as u64;
+                        args[2] = aliases[1] as u64;
+                    } else {
+                        args[1] = aliases[0] as u64;
+                        args[0] = aliases[1] as u64;
+                    }
+                    if splice {
+                        let (from, to) = crate::file_calls::splice_parameters(vfs, args, memory)?;
+                        vfs.check_splice(aliases[0], aliases[1], from, to)
+                    } else {
+                        crate::file_calls::CopyParameters::prepare(vfs, number, args, memory)
+                            .map(|_| ())
+                    }
+                })?;
+        // A valid but unadmitted body still lacks actual source capability.
+        // A canonical prelude error is complete and requires no owner replay.
+        return result.err().map(Err);
     }
-    let input = input.file_target()?;
-    let output = output.file_target()?;
+    let input = input.file_target().expect("accepted regular input");
+    let output = output.file_target().expect("accepted regular output");
     let command = if range && a[5] != 0 {
         Err(Errno(22))
     } else {
@@ -1138,7 +1325,7 @@ fn copy_import(
             )),
         })
     };
-    Some((output, command, FileOutput::CopyOffsets { from, to }))
+    Some(Ok((output, command, FileOutput::CopyOffsets { from, to })))
 }
 
 #[cfg(test)]

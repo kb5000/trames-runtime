@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! In-process event descriptors. No guest descriptor is a host descriptor.
 use super::*;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub(super) enum Anonymous {
@@ -11,15 +10,11 @@ pub(super) enum Anonymous {
     Signal(Arc<SignalMask>),
     Event(Arc<direct_io::EventCounter>),
     Timer(Arc<TimerFd>),
-    Epoll {
-        watches: Arc<SharedCell<BTreeMap<(u32, u64), Watch>>>,
-        cursor: Arc<Mutex<Option<(u32, u64)>>>,
-        shared: Arc<epoll::LiveEpoll>,
-    },
+    Epoll(Arc<epoll::LiveEpoll>),
 }
 
-/// Shared control portions of the original anonymous resources. Epoll keeps
-/// owner-only targets in Anonymous; its admitted live index contains no Rc.
+/// Shared control portions of the original anonymous resources, including
+/// epoll's one original interest index.
 pub(super) struct SignalMask {
     mask: AtomicU64,
     pub(super) revision: AtomicU64,
@@ -62,7 +57,7 @@ impl SharedControl {
             Anonymous::Event(counter) => Self::Event(counter.clone()),
             Anonymous::Timer(timer) => Self::Timer(timer.clone()),
             Anonymous::Inotify(instance) => Self::Inotify(instance.clone()),
-            Anonymous::Epoll { shared, .. } => Self::Epoll(shared.clone()),
+            Anonymous::Epoll(shared) => Self::Epoll(shared.clone()),
         })
     }
     pub(super) fn owner_projection(&self) -> Option<Anonymous> {
@@ -74,20 +69,11 @@ impl SharedControl {
             Self::Event(counter) => Anonymous::Event(counter.clone()),
             Self::Timer(timer) => Anonymous::Timer(timer.clone()),
             Self::Inotify(instance) => Anonymous::Inotify(instance.clone()),
-            Self::Epoll(shared) => Anonymous::Epoll {
-                watches: shared.legacy.clone(),
-                cursor: shared.cursor.clone(),
-                shared: shared.clone(),
-            },
+            Self::Epoll(shared) => Anonymous::Epoll(shared.clone()),
         })
     }
 }
 
-#[derive(Clone)]
-pub(super) struct Watch {
-    pub(super) open: OpenWeak,
-    pub(super) state: Arc<Mutex<WatchState>>,
-}
 pub(super) struct WatchState {
     pub events: u32,
     pub data: u64,
@@ -138,7 +124,7 @@ impl Anonymous {
             Self::Signal(_) => b"anon_inode:[signalfd]",
             Self::Event(_) => b"anon_inode:[eventfd]",
             Self::Timer(_) => b"anon_inode:[timerfd]",
-            Self::Epoll { .. } => b"anon_inode:[eventpoll]",
+            Self::Epoll(_) => b"anon_inode:[eventpoll]",
         }
     }
     pub(super) fn poll(
@@ -172,21 +158,23 @@ impl Anonymous {
             }
             Self::Event(counter) => counter.poll(events),
             Self::Timer(timer) => timer.poll(events).0,
-            Self::Epoll {
-                watches, shared, ..
-            } => {
-                if shared.ready_with(reader)
-                    || watches.borrow().values().any(|w| {
-                        let state = w.state.lock().unwrap();
-                        state.armed
-                            && w.open.upgrade().is_some_and(|o| {
-                                let o = o.borrow();
-                                let ready =
-                                    Vfs::peek_poll_open(&o, state.events as u16, pending, reader);
-                                ready != 0 && state.ready(ready, Vfs::poll_epoch_with(&o, reader))
-                            })
+            Self::Epoll(live) => {
+                let Some(_traversal) = epoll::Traversal::enter(live) else {
+                    return 0;
+                };
+                if live.snapshot().iter().any(|(_, state, target)| {
+                    epoll::inspect::<false>(state, target.is_nested(), |requested| {
+                        let Some(open) = target.original_open() else {
+                            return Ok(None);
+                        };
+                        let open = open.borrow();
+                        Ok(Some((
+                            Vfs::peek_poll_open(&open, requested, pending, reader),
+                            Vfs::poll_epoch_with(&open, reader),
+                        )))
                     })
-                {
+                    .is_ok_and(|ready| ready.is_some())
+                }) {
                     events & 1
                 } else {
                     0
@@ -204,11 +192,9 @@ impl Anonymous {
         match self {
             Self::Event(counter) => counter.read(count),
             Self::Timer(timer) => timer.read(count),
-            Self::Bpf(_)
-            | Self::Signal(_)
-            | Self::Epoll { .. }
-            | Self::Inotify(_)
-            | Self::Uring(_) => Err(Errno(22)),
+            Self::Bpf(_) | Self::Signal(_) | Self::Epoll(_) | Self::Inotify(_) | Self::Uring(_) => {
+                Err(Errno(22))
+            }
         }
     }
     pub(super) fn write(&mut self, bytes: &[u8]) -> Result<usize> {
@@ -219,51 +205,6 @@ impl Anonymous {
     }
 }
 
-impl Vfs {
-    /// Prepare original owner interests at an execution capture boundary.
-    /// TCP may have been registered before connect completed. Once connected,
-    /// its native transport cannot change routes or become a DNS endpoint;
-    /// later namespace filtering affects bytes, never this poll-only authority.
-    pub(super) fn promote_tcp_epoll_watches(&self) {
-        let descriptors = self.fds.entries();
-        for descriptor in descriptors.values() {
-            let owner = descriptor.open.owned();
-            if !matches!(owner.borrow().control, Some(SharedControl::Epoll(_))) {
-                continue;
-            }
-            let mut open = owner.borrow_mut();
-            let Some(Anonymous::Epoll {
-                watches, shared, ..
-            }) = open.anonymous.as_mut()
-            else {
-                continue;
-            };
-            let mut watches = watches.borrow_mut();
-            let promoted: Vec<_> = watches
-                .iter()
-                .filter_map(|(&key, watch)| {
-                    let target = watch.open.upgrade()?;
-                    let poll = direct_io::DirectFd::snapshot_tcp_poll(&target.borrow())?;
-                    Some((
-                        key,
-                        watch.state.clone(),
-                        direct_io::WatchResource::Owner(poll),
-                    ))
-                })
-                .collect();
-            if promoted.is_empty() {
-                continue;
-            }
-            for (key, _, _) in &promoted {
-                watches.remove(key);
-            }
-            let count = watches.len();
-            drop(watches);
-            shared.promote(promoted, count);
-            FD_FLAGS_REVISION.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-}
 impl Vfs {
     /// The descriptor holds only its mask. Signals belong to the reading task,
     /// never to the descriptor's creator or the host process.
@@ -342,173 +283,13 @@ impl Vfs {
         if flags & !O_CLOEXEC != 0 {
             return Err(Errno(22));
         }
-        let shared = Arc::new(epoll::LiveEpoll::default());
-        self.anonymous(
-            flags,
-            Anonymous::Epoll {
-                watches: shared.legacy.clone(),
-                cursor: shared.cursor.clone(),
-                shared,
-            },
-        )
+        let shared = epoll::LiveEpoll::new(self.next_open.epolls.clone());
+        self.anonymous(flags, Anonymous::Epoll(shared))
     }
     pub fn epoll_ctl(&self, fd: u32, op: u32, target: u32, events: u32, data: u64) -> Result<()> {
         let epoll = self.descriptor(fd)?.open.clone();
-        let target_number = target;
-        let target = self.descriptor(target)?.open.clone();
-        if OpenHandle::ptr_eq(&epoll, &target) {
-            return Err(Errno(22));
-        }
-        let t = target.borrow();
-        let cgroup = matches!(t.control, Some(SharedControl::Cgroup(_)));
-        if t.namespace.is_some()
-            || matches!(t.kind, FdKind::Node(_))
-                && t.bridge.is_none()
-                && t.pipe.is_none()
-                && t.kernel_log.is_none()
-                && t.mount_file.is_none()
-                && !cgroup
-        {
-            return Err(Errno(1));
-        }
-        // Accept ET only for sources with explicit wakeup generations.
-        if op != 2
-            && events & 0x80000000 != 0
-            && !matches!(t.kind, FdKind::Terminal)
-            && t.local.is_none()
-            && t.pipe.is_none()
-            && t.kernel_log.is_none()
-            && t.mount_file.is_none()
-            && !cgroup
-            && t.socket.as_ref().and_then(|s| s.poll_epoch()).is_none()
-            && !matches!(
-                t.anonymous,
-                Some(
-                    Anonymous::Event(_)
-                        | Anonymous::Timer(_)
-                        | Anonymous::Inotify(_)
-                        | Anonymous::Uring(_)
-                        | Anonymous::Epoll { .. }
-                )
-            )
-        {
-            return Err(Errno(95));
-        }
-        if matches!(t.anonymous, Some(Anonymous::Bpf(_))) {
-            return Err(Errno(1));
-        }
-        let key = (target_number, t.id);
-        let nested = matches!(t.anonymous, Some(Anonymous::Epoll { .. }));
-        // The caller's descriptor number distinguishes separate dup registrations.
-        drop(t);
-        if op == 1 && nested {
-            fn check(
-                at: &OpenHandle,
-                source: &OpenHandle,
-                target: &OpenHandle,
-                chain: &mut Vec<usize>,
-            ) -> Result<()> {
-                let open = at.borrow();
-                if let Some(Anonymous::Epoll { watches, .. }) = &open.anonymous {
-                    if chain.contains(&at.identity()) || chain.len() >= 5 {
-                        return Err(Errno(40));
-                    }
-                    chain.push(at.identity());
-                    for child in watches.borrow().values().filter_map(|w| w.open.upgrade()) {
-                        check(&child, source, target, chain)?;
-                    }
-                    if OpenHandle::ptr_eq(at, source) {
-                        check(target, source, target, chain)?;
-                    }
-                    chain.pop();
-                }
-                Ok(())
-            }
-            for descriptor in self.fds.entries().values() {
-                check(&descriptor.open.owned(), &epoll, &target, &mut Vec::new())?;
-            }
-        }
-        if self.epoll_ctl_key(epoll, target, key, op, events, data)? {
-            // Only owner-only interests require rebuilding their captures.
-            // Admitted interests publish on this object's live index instead.
-            FD_FLAGS_REVISION.fetch_add(1, Ordering::Relaxed);
-        }
-        Ok(())
-    }
-    fn epoll_ctl_key(
-        &self,
-        epoll: OpenHandle,
-        target: OpenHandle,
-        key: (u32, u64),
-        op: u32,
-        events: u32,
-        data: u64,
-    ) -> Result<bool> {
-        let mut e = epoll.borrow_mut();
-        let Some(Anonymous::Epoll {
-            watches, shared, ..
-        }) = e.anonymous.as_mut()
-        else {
-            return Err(Errno(22));
-        };
-        let mut watches = watches.borrow_mut();
-        watches.retain(|_, w| w.open.strong_count() != 0);
-        shared.set_owner_count(watches.len());
-        // An admitted target has one live shared registration, not an owner
-        // copy plus a worker snapshot. Nested and signal targets stay here.
-        if !watches.contains_key(&key) {
-            let t = target.borrow();
-            let nested = matches!(t.anonymous, Some(Anonymous::Epoll { .. }));
-            let unbound_signal = matches!(t.anonymous, Some(Anonymous::Signal(_)))
-                && self.signal_reader.borrow().is_none();
-            drop(t);
-            if !nested && !unbound_signal {
-                if let Some(resource) = direct_io::WatchResource::capture(&target.downgrade(), None)
-                {
-                    drop(watches);
-                    return shared
-                        .update(key, op, events, data, resource)
-                        .map(|()| false);
-                }
-            }
-        }
-        epoll::validate(
-            op,
-            events,
-            watches.get(&key).map(|w| w.state.lock().unwrap().events),
-            matches!(target.borrow().anonymous, Some(Anonymous::Epoll { .. })),
-        )?;
-        let result = match op {
-            1 if watches.contains_key(&key) => Err(Errno(17)),
-            2 | 3 if !watches.contains_key(&key) => Err(Errno(2)),
-            2 => {
-                let watch = watches.remove(&key).unwrap();
-                watch.state.lock().unwrap().armed = false;
-                shared.set_owner_count(watches.len());
-                Ok(())
-            }
-            _ => {
-                if op == 1 && watches.len() + shared.len() >= 1024 {
-                    return Err(Errno(28));
-                }
-                watches.insert(
-                    key,
-                    Watch {
-                        open: target.downgrade(),
-                        state: Arc::new(Mutex::new(WatchState {
-                            events,
-                            data,
-                            armed: true,
-                            last_ready: 0,
-                            last_epoch: [0; 2],
-                        })),
-                    },
-                );
-                shared.set_owner_count(watches.len());
-                Ok(())
-            }
-        };
-        result.map(|()| true)
+        let target_open = self.descriptor(target)?.open.clone();
+        epoll::control(epoll, target_open, target, op, events, data)
     }
     pub fn epoll_wait(
         &self,
@@ -524,6 +305,9 @@ impl Vfs {
         Self::poll_epoch_with(o, None)
     }
     fn poll_epoch_with(o: &OpenDescription, reader: Option<&Arc<dyn SignalReader>>) -> [u64; 2] {
+        if let Some(SharedControl::Cgroup(file)) = &o.control {
+            return file.poll(0).1;
+        }
         if let Some(file) = &o.mount_file {
             return file.watch.poll(0).1;
         }
@@ -554,87 +338,95 @@ impl Vfs {
         if let Some(Anonymous::Timer(timer)) = &o.anonymous {
             return timer.epoch();
         }
-        if let Some(Anonymous::Epoll {
-            watches, shared, ..
-        }) = &o.anonymous
-        {
-            let generation = watches
-                .borrow()
-                .values()
-                .filter_map(|watch| watch.open.upgrade())
+        if let Some(Anonymous::Signal(mask)) = &o.anonymous {
+            let mut epoch = reader.map_or([0; 2], |reader| reader.poll(mask.get()).1);
+            epoch[0] = epoch[0].wrapping_add(mask.revision.load(Ordering::Relaxed));
+            return epoch;
+        }
+        if let Some(Anonymous::Epoll(live)) = &o.anonymous {
+            let Some(_traversal) = epoll::Traversal::enter(live) else {
+                return [live.revision(), 0];
+            };
+            let generation = live
+                .snapshot()
+                .iter()
+                .filter_map(|watch| watch.2.original_open())
                 .map(|open| Self::poll_epoch_with(&open.borrow(), reader))
-                .fold(shared.epoch_with(reader), |sum, epoch| {
+                .fold(live.revision(), |sum, epoch| {
                     sum.wrapping_add(epoch[0]).wrapping_add(epoch[1])
                 });
             return [generation, 0];
         }
+
         o.pty
             .as_ref()
             .map_or([0; 2], |end| end.pair.poll_epoch(end.master))
     }
-    /// Armed host-input watches can wake externally without a socket or PTY.
-    /// Inspect only existing watch metadata; do not consume readiness/one-shots.
+    /// Armed host input retains the original endpoint, including nested sets.
     pub fn epoll_waits_for_stdin(&self, fd: u32) -> Result<bool> {
-        let descriptor = self.descriptor(fd)?;
-        let open = descriptor.open.borrow();
-        let Some(Anonymous::Epoll { watches, .. }) = &open.anonymous else {
-            return Err(Errno(22));
+        let live = match &self.descriptor(fd)?.open.borrow().anonymous {
+            Some(Anonymous::Epoll(live)) => live.clone(),
+            _ => return Err(Errno(22)),
         };
-        let ready = watches.borrow().values().any(|watch| {
-            watch.state.lock().unwrap().armed
-                && watch
-                    .open
-                    .upgrade()
-                    .is_some_and(|open| open.borrow().kind == FdKind::Stdin)
-        });
-        Ok(ready)
+        fn stdin(live: &Arc<epoll::LiveEpoll>) -> bool {
+            let Some(_traversal) = epoll::Traversal::enter(live) else {
+                return false;
+            };
+            live.snapshot().iter().any(|(_, state, target)| {
+                if !state.lock().unwrap().armed {
+                    return false;
+                }
+                let Some(open) = target.original_open() else {
+                    return false;
+                };
+                let open = open.borrow();
+                open.kind == FdKind::Stdin
+                    || matches!(&open.anonymous, Some(Anonymous::Epoll(child)) if stdin(child))
+            })
+        }
+        Ok(stdin(&live))
     }
-    /// Observe readiness without consuming edges, disarming one-shot watches,
-    /// acknowledging native notifications or advancing the delivery cursor.
+    fn epoll_target_poll(
+        &self,
+        target: &direct_io::WatchResource,
+        events: u16,
+        pending: u64,
+        special: &mut impl FnMut(&FdKind, u16) -> Result<Option<(u16, [u64; 2])>>,
+    ) -> Result<Option<(u16, [u64; 2])>> {
+        let Some(open) = target.original_open() else {
+            return Ok(None);
+        };
+        let open = open.borrow();
+        if open.pty.is_none() {
+            if let Some(ready) = special(&open.kind, events)? {
+                return Ok(Some(ready));
+            }
+        }
+        let reader = self.signal_reader.borrow();
+        Ok(Some((
+            Self::peek_poll_open(&open, events, pending, reader.as_ref()),
+            Self::poll_epoch_with(&open, reader.as_ref()),
+        )))
+    }
     pub fn epoll_ready_signals(
         &self,
         fd: u32,
         pending: u64,
         mut special: impl FnMut(&FdKind, u16) -> Result<Option<(u16, [u64; 2])>>,
     ) -> Result<bool> {
-        let descriptor = self.descriptor(fd)?;
-        let open = descriptor.open.borrow();
-        let Some(Anonymous::Epoll {
-            watches, shared, ..
-        }) = &open.anonymous
-        else {
-            return Err(Errno(22));
+        let live = match &self.descriptor(fd)?.open.borrow().anonymous {
+            Some(Anonymous::Epoll(live)) => live.clone(),
+            _ => return Err(Errno(22)),
         };
-        if shared.ready_with(self.signal_reader.borrow().as_ref()) {
-            return Ok(true);
-        }
-        for watch in watches.borrow().values() {
-            let state = watch.state.lock().unwrap();
-            if !state.armed {
-                continue;
-            }
-            let Some(target) = watch.open.upgrade() else {
-                continue;
-            };
-            let target = target.borrow();
-            let requested = state.events as u16;
-            let special = if target.pty.is_none() {
-                special(&target.kind, requested)?
-            } else {
-                None
-            };
-            let (ready, epoch) = special.unwrap_or_else(|| {
-                (
-                    Self::peek_poll_open(
-                        &target,
-                        requested,
-                        pending,
-                        self.signal_reader.borrow().as_ref(),
-                    ),
-                    Self::poll_epoch_with(&target, self.signal_reader.borrow().as_ref()),
-                )
-            });
-            if ready != 0 && state.ready(ready, epoch) {
+        let Some(_traversal) = epoll::Traversal::enter(&live) else {
+            return Ok(false);
+        };
+        for (_, state, target) in live.snapshot().iter() {
+            if epoll::inspect::<false>(state, target.is_nested(), |events| {
+                self.epoll_target_poll(target, events, pending, &mut special)
+            })?
+            .is_some()
+            {
                 return Ok(true);
             }
         }
@@ -647,89 +439,29 @@ impl Vfs {
         pending: u64,
         mut special: impl FnMut(&FdKind, u16) -> Result<Option<(u16, [u64; 2])>>,
     ) -> Result<Vec<(u32, u64)>> {
-        let e_descriptor = self.descriptor(fd)?;
-        let mut e = e_descriptor.open.borrow_mut();
-        let Some(Anonymous::Epoll {
-            watches,
-            cursor,
-            shared,
-        }) = e.anonymous.as_mut()
-        else {
-            return Err(Errno(22));
+        let live = match &self.descriptor(fd)?.open.borrow().anonymous {
+            Some(Anonymous::Epoll(live)) => live.clone(),
+            _ => return Err(Errno(22)),
         };
-        let mut watches = {
-            let mut entries = watches.borrow_mut();
-            entries.retain(|_, w| w.open.strong_count() != 0);
-            entries.clone()
+        let Some(_traversal) = epoll::Traversal::enter(&live) else {
+            return Ok(Vec::new());
         };
-        watches.retain(|_, w| w.open.strong_count() != 0);
-        shared.set_owner_count(watches.len());
-        if watches.is_empty() {
-            return shared.wait_with(max, &[], self.signal_reader.borrow().as_ref());
-        }
-        let mut cursor = cursor.lock().unwrap();
-        let live = shared.snapshot();
-        let mut keys: Vec<_> = watches
-            .keys()
-            .copied()
-            .chain(live.iter().map(|w| w.0))
-            .collect();
-        keys.sort_unstable();
-        let start = cursor.map_or(0, |c| keys.partition_point(|k| *k <= c));
+        let mut cursor = live.cursor.lock().unwrap();
+        let watches = live.snapshot();
         let mut result = Vec::new();
-        for &key in keys[start..].iter().chain(keys[..start].iter()) {
-            let Some(watch) = watches.get(&key) else {
-                let at = live.binary_search_by_key(&key, |w| w.0).unwrap();
-                let (_, state, target) = &live[at];
-                let Some(fd) = target.resolve_with(self.signal_reader.borrow().as_ref()) else {
-                    continue;
-                };
-                let mut state = state.lock().unwrap();
-                if !state.armed {
-                    continue;
-                }
-                let (ready, epoch) = fd.peek_poll(state.events as u16);
-                if let Some(event) = state.observe(ready, epoch) {
-                    fd.acknowledge(epoch);
-                    result.push(event);
-                    *cursor = Some(key);
-                    if result.len() == max {
-                        break;
+        for (key, state, target) in epoll::ordered(&watches, *cursor) {
+            if let Some((event, epoch)) =
+                epoll::inspect::<true>(state, target.is_nested(), |events| {
+                    self.epoll_target_poll(target, events, pending, &mut special)
+                })?
+            {
+                if let Some(open) = target.original_open() {
+                    if let Some(file) = &open.borrow().mount_file {
+                        file.watch.acknowledge(epoch[0]);
                     }
                 }
-                continue;
-            };
-            let mut state = watch.state.lock().unwrap();
-            if !state.armed {
-                continue;
-            }
-            let Some(open) = watch.open.upgrade() else {
-                continue;
-            };
-            let o = open.borrow();
-            let requested = (state.events & 0xffff) as u16;
-            let override_ready = if o.pty.is_none() {
-                special(&o.kind, requested)?
-            } else {
-                None
-            };
-            let (ready, epoch) = override_ready.unwrap_or_else(|| {
-                (
-                    Self::peek_poll_open(
-                        &o,
-                        requested,
-                        pending,
-                        self.signal_reader.borrow().as_ref(),
-                    ),
-                    Self::poll_epoch_with(&o, self.signal_reader.borrow().as_ref()),
-                )
-            });
-            if let Some(event) = state.observe(ready, epoch) {
-                if let Some(file) = &o.mount_file {
-                    file.watch.acknowledge(epoch[0]);
-                }
                 result.push(event);
-                *cursor = Some(key);
+                *cursor = Some(*key);
                 if result.len() == max {
                     break;
                 }
@@ -876,7 +608,7 @@ pub(super) fn anonymous_descriptor(id: u64, flags: u32, anonymous: Anonymous) ->
     } else {
         2
     };
-    Descriptor {
+    let descriptor = Descriptor {
         open: OpenHandle::new(OpenDescription {
             shared: Arc::new(SharedOpenDescription {
                 console: Default::default(),
@@ -919,5 +651,9 @@ pub(super) fn anonymous_descriptor(id: u64, flags: u32, anonymous: Anonymous) ->
             mount: None,
         }),
         cloexec: (flags & O_CLOEXEC != 0).into(),
+    };
+    if let Some(SharedControl::Epoll(live)) = &descriptor.open.borrow().control {
+        live.bind(&descriptor.open.borrow().shared);
     }
+    descriptor
 }

@@ -735,3 +735,206 @@ fn size_failure_notifies_the_source_without_inline_or_native_owner_checkpoint() 
         }
     }
 }
+
+#[test]
+fn source_fd_errors_preserve_canonical_abi_precedence_without_owner_work() {
+    let mut linux = Linux::new(0x100000);
+    linux
+        .vfs
+        .import_file(b"/input", b"unchanged".to_vec())
+        .unwrap();
+    let file = linux.vfs.open_at(-100, b"/input", 2, 0).unwrap() as u64;
+    let directory = linux.vfs.open_at(-100, b"/", 0, 0).unwrap() as u64;
+    let pipe = linux.vfs.pipe(0).unwrap().map(u64::from);
+    let mut memory = Memory::default();
+    memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+    let direct = DirectSyscalls::new(linux.vfs.direct_descriptors())
+        .with_paths(linux.vfs.path_queries())
+        .with_resources(linux.vfs.descriptor_factory());
+    let bad = u32::MAX as u64;
+    let target = t();
+    let mut calls = Vec::new();
+    for fd in [bad, 1234] {
+        for number in [46, 47, 67, 68, 69, 70, 82, 83, 267, 286, 287] {
+            for operands in [
+                [fd, 0x1000, 0, 0, 0, 0],
+                [fd, u64::MAX, u64::MAX, u64::MAX, 0, 0],
+            ] {
+                calls.push((number, operands));
+            }
+        }
+        for flags in [0, 1, 6, u64::MAX] {
+            calls.push((286, [fd, u64::MAX, u64::MAX, 0, 0, flags]));
+            calls.push((287, [fd, 0x1000, 0, u64::MAX, 0, flags]));
+        }
+        for (offset, length) in [(0, 0), (0, 1), (u64::MAX, 1), (i64::MAX as u64, 1)] {
+            calls.push((47, [fd, u64::MAX, offset, length, 0, 0]));
+        }
+        for peer in [bad, file, directory, pipe[0], pipe[1]] {
+            for pointer in [0, 0x1000, u64::MAX] {
+                for flags in [0, 16, 1u64 << 40] {
+                    calls.push((71, [peer, fd, pointer, 3, 0, 0]));
+                    calls.push((71, [fd, peer, pointer, 3, 0, 0]));
+                    calls.push((76, [fd, pointer, peer, pointer, 3, flags]));
+                    calls.push((76, [peer, pointer, fd, pointer, 3, flags]));
+                    calls.push((285, [fd, pointer, peer, pointer, 3, flags]));
+                    calls.push((285, [peer, pointer, fd, pointer, 3, flags]));
+                }
+            }
+        }
+    }
+    for fd in [directory, linux.vfs.epoll_create(0).unwrap() as u64] {
+        for number in [63, 64, 65, 66, 67, 68, 69, 70, 286, 287] {
+            calls.push((number, [fd, 0x1000, 0, 0, 0, 0]));
+            if matches!(number, 286 | 287) {
+                calls.push((number, [fd, 0x1000, 0, u64::MAX, 0, 0]));
+            }
+        }
+    }
+    for (number, args) in calls {
+        let expected = linux.syscall(
+            number,
+            args,
+            &mut memory,
+            &mut crate::CapturedOutput::default(),
+        );
+        let attempt = direct.start_file_call(
+            number as u32,
+            args,
+            &mut memory,
+            1,
+            &Arc::downgrade(&target),
+        );
+        assert!(
+            matches!(attempt, Some(IoAttempt::Complete(value)) if value == expected),
+            "source {number} {args:?}: {expected:?}"
+        );
+        let attempt = direct.start_owned_file(
+            &mut linux.vfs,
+            number as u32,
+            args,
+            &mut memory,
+            1,
+            &Arc::downgrade(&target),
+        );
+        assert!(
+            matches!(attempt, Some(IoAttempt::Complete(value)) if value == expected),
+            "owned {number} {args:?}: {expected:?}"
+        );
+    }
+    assert_eq!(linux.vfs.pread(file as u32, 9, 0).unwrap(), b"unchanged");
+    assert_eq!(linux.vfs.seek(file as u32, 0, 1), Ok(0));
+    assert_eq!(memory.read_u64(0x1000), Ok(0));
+}
+
+#[test]
+fn current_position_v2_pipe_wait_retains_original_fd_and_sync_error_follows_write() {
+    let mut v = trames_vfs::Vfs::default();
+    let [read, write] = v.pipe(0).unwrap();
+    let alias = v.dup(read, 0, false).unwrap();
+    let mut memory = Memory::default();
+    memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+    memory.write_array(0x1000, 0x1100u64.to_le_bytes()).unwrap();
+    memory.write_array(0x1008, 4u64.to_le_bytes()).unwrap();
+    memory.write(0x1100, b"data").unwrap();
+    let direct = DirectSyscalls::new(v.direct_descriptors()).with_paths(v.path_queries());
+    let target = t();
+    let args = [read as u64, 0x1000, 1, u64::MAX, 0, 0];
+    let Some(IoAttempt::Blocked(wait)) =
+        direct.start_file_call(286, args, &mut memory, 1, &Arc::downgrade(&target))
+    else {
+        panic!("a real pipe wait must return its execution slot")
+    };
+    v.close(read).unwrap();
+    assert_eq!(v.eventfd(99, 0).unwrap(), read);
+    v.write(write, b"old!").unwrap();
+    assert!(wait.signal.ready());
+    assert!(matches!(
+        direct.resume(wait, &mut memory),
+        IoAttempt::Complete(Ok(4))
+    ));
+    assert_eq!(memory.read_array::<4>(0x1100).unwrap(), *b"old!");
+    assert_eq!(v.read(read, 8).unwrap(), 99u64.to_le_bytes());
+    let args = [write as u64, 0x1000, 1, u64::MAX, 0, 2];
+    assert!(matches!(
+        direct.start_file_call(287, args, &mut memory, 1, &Arc::downgrade(&target)),
+        Some(IoAttempt::Complete(Err(Errno(22))))
+    ));
+    assert_eq!(v.read(alias, 4).unwrap(), b"old!");
+}
+
+#[test]
+fn fd_control_and_epoll_errors_complete_after_their_original_parameter_preludes() {
+    let mut v = trames_vfs::Vfs::default();
+    let event = v.eventfd(1, 0).unwrap();
+    let timer = v.timerfd(1, 0).unwrap();
+    let notify = v.inotify_init(0).unwrap();
+    v.import_file(b"/watched", vec![]).unwrap();
+    let wd = v.inotify_add(notify, b"/watched", 2).unwrap();
+    let epoll = v.epoll_create(0).unwrap();
+    v.epoll_ctl(epoll, 1, event, 1, 55).unwrap();
+    let direct = DirectSyscalls::new(v.direct_descriptors()).with_paths(v.path_queries());
+    let mut memory = Memory::default();
+    memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+    let target = t();
+    for number in [28, 86, 87] {
+        for (fd, expected) in [(u32::MAX, 9), (event, 22)] {
+            let args = [fd as u64, u64::MAX, u64::MAX, u64::MAX, 0, 0];
+            assert!(direct.supports_call(number, args));
+            assert_eq!(
+                direct.invoke(number, args, &mut memory),
+                Some(Err(Errno(expected)))
+            );
+            assert!(
+                matches!(direct.start(number, args, &mut memory, 1, &Arc::downgrade(&target), None), Some(IoAttempt::Complete(Err(Errno(error)))) if error == expected)
+            );
+        }
+    }
+    for number in [86, 87] {
+        let args = [timer as u64, u64::MAX, u64::MAX, u64::MAX, 0, 0];
+        let expected = crate::timerfd_control_with_boot(
+            &v.timerfd_resource(timer).unwrap(),
+            number,
+            args,
+            &mut memory,
+            Instant::now(),
+            None,
+        );
+        assert!(expected.is_err());
+        assert_eq!(direct.invoke(number, args, &mut memory), Some(expected));
+    }
+    assert_eq!(
+        direct.invoke(28, [notify as u64, wd as u64, 0, 0, 0, 0], &mut memory),
+        Some(Ok(0))
+    );
+    assert_eq!(v.inotify_remove(notify, wd), Err(Errno(22)));
+    for number in [22, 441] {
+        for (args, expected) in [
+            ([u32::MAX as u64, 0x1000, 1, 0, 0, 0], 9),
+            ([event as u64, 0x1000, 1, 0, 0, 0], 22),
+            ([u32::MAX as u64, 0x9000, 1, 0, 0, 0], 14),
+            ([u32::MAX as u64, 0x1000, 0, 0, 0, 0], 22),
+            ([u32::MAX as u64, 0x1000, 1, 0, 0x1200, 7], 22),
+        ] {
+            assert!(direct.supports_call(number, args));
+            assert!(
+                matches!(direct.start(number, args, &mut memory, 1, &Arc::downgrade(&target), None), Some(IoAttempt::Complete(Err(Errno(error)))) if error == expected),
+                "epoll {number} {args:?}"
+            );
+        }
+    }
+    let wait = crate::RetainedWait::prepare_worker(
+        &direct.descriptors(),
+        &memory,
+        22,
+        [epoll as u64, 0x1000, 1, 0, 0, 0],
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    v.close(epoll).unwrap();
+    assert_eq!(v.eventfd(7, 0).unwrap(), epoll);
+    assert_eq!(wait.check(&mut memory), Ok(1));
+    assert_eq!(memory.read_u64(0x1008), Ok(55));
+    assert_eq!(v.read(epoll, 8).unwrap(), 7u64.to_le_bytes());
+}

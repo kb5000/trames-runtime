@@ -108,6 +108,13 @@ impl IoRoutes {
         memory: &mut impl CpuMemory,
         migration: &mut Option<Arc<crate::completion::Completion>>,
     ) -> Result<u64, Errno> {
+        if number == 31 {
+            return crate::scheduling::ioprio_get(a[0], a[1], |who| {
+                let global = self.namespace.global(who).ok_or(Errno(3))?;
+                Ok(global == source.pid.load(Ordering::Relaxed)
+                    || self.directory.proc_task(global).is_some())
+            });
+        }
         if matches!(number, 125 | 126) {
             return match a[0] as u32 {
                 1 | 2 => Ok(if number == 125 { 99 } else { 1 }),

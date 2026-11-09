@@ -560,14 +560,14 @@ Actual excluded policy effects and missing capabilities retain explicit boundari
 ### Current remaining categories
 
 The count is **four broad categories**, not the number of historical subsystem
-rows. Stages 72–97 remove concrete triggers and close request-authority dependencies inside those categories; they do not
+rows. Stages 72–98 remove concrete triggers and close request-authority dependencies inside those categories; they do not
 prove that the final generic fallback is unreachable.
 
 | Remaining category | Actual trigger | Current scope / authoritative implementation |
 | --- | --- | --- |
 | Host cancellation and final teardown | Host cancel, deadline, shutdown, legacy stopped-hook requests, final CPU/backend drain and actual native-event backend failure | Pause/resume, original init notifications/signals, pressure reclaim, host filesystem commands and terminal/process admission no longer join. Actual terminal teardown and backend failure still stop their actors. Native-event failure returns its original HostIo cause after drain/cancellation, without an owner syscall retry. See [host control](../../crates/trames-session/src/process_vm.rs), [completion](../../crates/trames-session/src/process_exit.rs) and [workers](../../crates/trames-session/src/workers.rs). |
 | Missing capabilities and excluded resources | A genuinely absent source provider, an excluded original FD/node graph, a genuinely absent native event capability or unsupported source request body | There is no filesystem-kind exclusion after stage 82. Published global proc/sys metadata no longer lacks a source provider merely because it uses set_runtime_info. Other node/provider admission still applies. io_uring has exactly two submitter-scoped `require_owner()` maintenance call sites: missing-capability wait-source preparation and deferred original body progress; actual host backend errors take terminal source error handling. They remain connected to actual accepted request lifetime, subscriptions and cancellation. See [path authority](../../crates/trames-vfs/src/path_queries.rs), [maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [wait sources](../../crates/trames-linux/src/direct/uring/wait.rs) and [actor](../../crates/trames-linux/src/direct/uring/actor.rs). |
-| Final execution dispatch fallback | A returned SVC or cold HLT/resource operation not completed, parked or accepted by a source scope; host faults and capability-less embeddings retain their own explicit boundaries | The catch-all stops the current cohort for joined dispatch. Ordinary shared-FD ioctl discovery, residual prctl controls/errors, implemented time observations, FD status/NOATIME, inode seals, anonymous memory-file creation, mapped-memory msync/writeback, file-cache advice, blocking POSIX/OFD locks, directory flock and canonical unknown fcntl commands no longer use it. It remains an audit target even though admitted native calls, ordinary guest faults, generated ENOSYS and migrated syscalls have source completion. Recognized guest faults, caught handlers and signal-frame failures now complete/terminate on source. A backend error is not a software or full-Linux-VM fallback. See [worker dispatch](../../crates/trames-session/src/workers.rs) and [classification](../../crates/trames-session/src/worker_syscalls.rs). |
+| Final execution dispatch fallback | A returned SVC or cold HLT/resource operation not completed, parked or accepted by a source scope; host faults and capability-less embeddings retain their own explicit boundaries | The catch-all stops the current cohort for joined dispatch. Ordinary shared-FD ioctl discovery, residual prctl controls/errors, implemented time observations, FD status/NOATIME, inode seals, anonymous memory-file creation, mapped-memory msync/writeback, file-cache advice, canonical FD/error admission, the complete original epoll/poll/select graph and generic socket event sources, current-offset vector transports, blocking POSIX/OFD locks, directory flock and canonical unknown fcntl commands no longer use it. It remains an audit target even though admitted native calls, ordinary guest faults, generated ENOSYS and migrated syscalls have source completion. Recognized guest faults, caught handlers and signal-frame failures now complete/terminate on source. A backend error is not a software or full-Linux-VM fallback. See [worker dispatch](../../crates/trames-session/src/workers.rs) and [classification](../../crates/trames-session/src/worker_syscalls.rs). |
 | Initial and legacy orchestration | Initial admission, standalone/capability-less nonmember scheduling and other excluded embedding routes | Ordinary live members and preexisting Kernel Futex/Sleep actors migrate, park and wake on the original queue. Cold waiters have metadata only until an event prepares their original mm; child/exec admission and lazy CPU slots no longer require a joined owner. The standalone futex legacy-publication mechanism remains. Solo dispatch is on the caller, so its existence alone is not a cross-thread transition. See [admission](../../crates/trames-session/src/process.rs), [legacy wakes](../../crates/trames-session/src/futex.rs) and [queue](../../crates/trames-session/src/run_queue.rs). |
 
 Supported process/family lifecycle, signals and security policy, mount and task
@@ -4185,3 +4185,63 @@ one cohort with no returned syscall/service and no mapping checkpoint. Signed
 native before/after and installed Dev evidence belongs to the paired product
 validation. The four broad categories, both io_uring maintenance escalation sites
 and full coordinator-removal objective remain open.
+
+
+## 98. Original descriptor admission and the complete event graph — 2026-11-10
+
+This is one connected subsystem batch, including admission, controls, waiting,
+resource identity and their execution-dispatch dependencies. It is not a sequence
+of per-syscall fast paths. Known invalid FD/type/argument results are distinct
+from genuinely absent providers; they execute the canonical body on the caller.
+Transfer, allocation and vector preludes are shared with solo execution. A cold,
+scoped two-role binding freezes original OFDs/errors through numeric close/reuse;
+no guest-visible alias or copied Files table is published. Ready ordinary file
+work retains its existing preparation path without another OFD lookup or clone.
+
+Epoll has one original interest index, one capacity and one delivery cursor for
+source and solo callers. The old owner/shared watch split is removed. Registrations
+use original OFD identity, including foreign transferred FDs with colliding local
+open IDs. Nested ADD/DEL validates the actual connected topology, including
+cycles and the existing depth limit, under its topology resource. Independent
+original graphs join with ordered root locks when real FD transfers connect them.
+Flat controls, readiness, ordinary data I/O and CPU execution take no topology
+gate. Weak watches/reverse edges do not retain closed endpoints. A bounded walk
+handles concurrent retired snapshots without recursive host locks or new guest
+race errors; parent watch state is unlocked before visiting a child.
+
+Interest mutations propagate subscription revisions to original parents. An
+accepted epoll, ppoll or pselect wait refreshes its actual original sources after
+changes and subscribes before the deciding retry. It does not re-import a changed
+FD set or resolve a reused numeric FD. Caller-specific signalfd readers remain
+caller-specific through nesting. The existing weak native TCP poll observer
+still permits final close/FIN; accepted byte work keeps its real transport lease.
+Unconnected TCP, UDP, netlink and virtual/hybrid sockets use their original
+readiness, native observers and existing stack deadlines. Only generic sockets
+with changing native sets rebuild those subscriptions; established TCP retains
+its stable observer. Native registration failures retain the original host error.
+No coordinator, resource-service thread or polling message bus is introduced.
+
+Current-offset preadv2/pwritev2 uses the existing pipe, Unix, signalfd, TCP and
+raw-IP bodies and their original ABI rules. Blocking calls return execution slots.
+Timeouts, cancellation and original resources survive handoff. RWF sync follows
+actual writes and targets the original OFD; an absent sync provider retains the
+completed message result rather than replaying its byte effect. Non-data FD byte
+operations use the canonical descriptor body. io_uring setup enters its existing
+source implementation; ioprio, personality and nonwaiting futex validation share
+existing kernel state/results rather than joining only to validate a call.
+
+Cold legacy event adoption also uses actual typed provider admission, rather
+than the broad entry classifier. Pselect now adopts like poll/epoll. A genuinely
+missing provider still retains its real owner-side deadline; stale deadline
+metadata for source-owned waits does not spin unrelated CPUs.
+
+Regression coverage includes nested alias/depth/cycle/foreign-graph cases,
+concurrent opposite ADD and DEL/reverse-ADD/MOD/wait, the shared watch capacity,
+ET/ONESHOT/EXCLUSIVE, caller signal context, late subscriptions after close/reuse,
+executor handoff, cancellation, native/virtual UDP deadlines, vector transports
+and post-write errors/no replay. Four broad categories remain: this does not prove
+the generic final-dispatch catch-all unreachable, remove custom embedding
+boundaries, or eliminate the two actual io_uring maintenance escalations. Full
+cross-platform and native evidence is recorded in the product's batch validation
+record; no production fallback-frequency or throughput gain is inferred from
+finite dispatch fixtures.

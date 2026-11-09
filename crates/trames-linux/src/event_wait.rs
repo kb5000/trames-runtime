@@ -20,6 +20,15 @@ enum Sources {
     Select(RetainedSelect),
     Epoll(DirectFd),
 }
+impl Sources {
+    fn dynamic(&self) -> bool {
+        match self {
+            Self::Poll(poll) => poll.dynamic_sources(),
+            Self::Select(select) => select.dynamic_sources(),
+            Self::Epoll(fd) => fd.dynamic_poll_sources(),
+        }
+    }
+}
 #[derive(Clone)]
 pub struct RetainedWait {
     sources: Sources,
@@ -28,6 +37,7 @@ pub struct RetainedWait {
     pub deadline: Option<Instant>,
     pub mask: Option<u64>,
     remaining: u64,
+    dynamic_sources: bool,
 }
 pub fn event_wait(number: u32) -> bool {
     matches!(number, 22 | 72 | 73 | 441)
@@ -110,10 +120,14 @@ impl RetainedWait {
                 Ok(s) => s,
                 Err(e) => return Some(Err(e)),
             }),
-            22 | 441 => Sources::Epoll(fds.get(args[0] as u32).filter(|fd| fd.is_epoll())?),
+            22 | 441 => Sources::Epoll(match fds.epoll(args[0] as u32)? {
+                Ok(fd) => fd,
+                Err(error) => return Some(Err(error)),
+            }),
             _ => return None,
         };
         Some(Ok(Self {
+            dynamic_sources: sources.dynamic(),
             sources,
             number,
             args,
@@ -140,6 +154,7 @@ impl RetainedWait {
                 Sources::Select(RetainedSelect::prepare_joined(vfs, memory, args)?)
             };
             Ok(Self {
+                dynamic_sources: sources.dynamic(),
                 sources,
                 number,
                 args,
@@ -231,9 +246,15 @@ impl RetainedWait {
     }
     pub fn rearm(self: &Arc<Self>, fds: &DirectFds) -> Option<Arc<Self>> {
         let sources = match &self.sources {
-            Sources::Epoll(_) => return Some(self.clone()),
+            Sources::Epoll(fd) => {
+                let fresh = fd.refresh_epoll()?;
+                if fresh.epoll_accepted_revision() == fd.epoll_accepted_revision() {
+                    return Some(self.clone());
+                }
+                Sources::Epoll(fresh)
+            }
             Sources::Poll(p) => {
-                if p.fully_retained() {
+                if p.fully_bound() && p.epoll_revision(true) == p.epoll_revision(false) {
                     return Some(self.clone());
                 }
                 Sources::Poll(p.rearm(fds)?)
@@ -247,14 +268,25 @@ impl RetainedWait {
             }
         };
         let mut wait = (**self).clone();
+        wait.dynamic_sources = sources.dynamic();
         wait.sources = sources;
         Some(Arc::new(wait))
     }
+    pub fn dynamic_sources(&self) -> bool {
+        self.dynamic_sources
+    }
     pub fn epoll_revision(&self) -> Option<u64> {
-        if let Sources::Epoll(fd) = &self.sources {
-            fd.epoll_revision()
-        } else {
-            None
+        match &self.sources {
+            Sources::Epoll(fd) => fd.epoll_revision(),
+            Sources::Poll(p) => p.epoll_revision(false),
+            Sources::Select(s) => s.epoll_revision(false),
+        }
+    }
+    pub fn epoll_accepted_revision(&self) -> Option<u64> {
+        match &self.sources {
+            Sources::Epoll(fd) => fd.epoll_accepted_revision(),
+            Sources::Poll(p) => p.epoll_revision(true),
+            Sources::Select(s) => s.epoll_revision(true),
         }
     }
     pub fn subscribe(&self, signal: &Arc<IoSignal>) -> Vec<IoSubscription> {

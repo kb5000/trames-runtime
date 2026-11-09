@@ -199,7 +199,7 @@ pub(crate) struct Services {
 #[derive(Clone)]
 struct Importer {
     fs: FsHandle,
-    ids: Arc<AtomicU64>,
+    ids: Arc<descriptor_factory::OpenIds>,
 }
 struct Bridge {
     local: Arc<LocalResource>,

@@ -2,8 +2,129 @@
 use crate::state::Linux;
 use crate::{GuestOutput, MAX_WRITE};
 use trames_memory::{Access, CpuMemory, Memory};
-use trames_vfs::Errno;
+use trames_vfs::{Errno, Vfs};
 type Result<T> = std::result::Result<T, Errno>;
+/// Shared transfer prelude. It accepts the caller's actual VFS bindings and
+/// imports pointers before data effects; source rejection uses the same order.
+fn regular_file(vfs: &Vfs, fd: u32) -> Result<[u8; 128]> {
+    let stat = vfs.stat_fd(fd)?;
+    if u32::from_le_bytes(stat[16..20].try_into().expect("mode")) & 0o170000 != 0o100000 {
+        return Err(Errno(22));
+    }
+    Ok(stat)
+}
+fn copy_offset(vfs: &Vfs, fd: u32, pointer: u64, memory: &impl CpuMemory) -> Result<u64> {
+    if pointer == 0 {
+        return Err(Errno(22));
+    }
+    Linux::check(memory, pointer, 8, Access::Read)?;
+    Linux::check(memory, pointer, 8, Access::Write)?;
+    vfs.fd_kind(fd)?;
+    let offset = memory.read_u64(pointer).map_err(|_| Errno(14))?;
+    if offset > i64::MAX as u64 {
+        return Err(Errno(22));
+    }
+    Ok(offset)
+}
+pub(crate) fn splice_parameters(
+    vfs: &mut Vfs,
+    a: [u64; 6],
+    memory: &impl CpuMemory,
+) -> Result<(Option<u64>, Option<u64>)> {
+    if a[5] & !15 != 0 {
+        return Err(Errno(22));
+    }
+    let input = a[0] as u32;
+    let output = a[2] as u32;
+    // Pipes and sockets reject an offset before pointer access.
+    if a[1] != 0 {
+        vfs.seek(input, 0, 1)?;
+    }
+    if a[3] != 0 {
+        vfs.seek(output, 0, 1)?;
+    }
+    let from = if a[1] == 0 {
+        None
+    } else {
+        Some(copy_offset(vfs, input, a[1], memory)?)
+    };
+    let to = if a[3] == 0 {
+        None
+    } else {
+        Some(copy_offset(vfs, output, a[3], memory)?)
+    };
+    Ok((from, to))
+}
+pub(crate) struct CopyParameters {
+    input: u32,
+    output: u32,
+    in_pointer: u64,
+    out_pointer: u64,
+    count: u64,
+    from_offset: u64,
+    to_offset: Option<u64>,
+}
+impl CopyParameters {
+    pub(crate) fn prepare(
+        vfs: &mut Vfs,
+        number: u32,
+        a: [u64; 6],
+        memory: &impl CpuMemory,
+    ) -> Result<Self> {
+        let copy = number == 285;
+        let (input, output, in_pointer, out_pointer, count) = if copy {
+            (a[0] as u32, a[2] as u32, a[1], a[3], a[4])
+        } else {
+            (a[1] as u32, a[0] as u32, a[2], 0, a[3])
+        };
+        if copy && a[5] != 0 {
+            return Err(Errno(22));
+        }
+        let from = regular_file(vfs, input)?;
+        vfs.fd_kind(output)?;
+        let from_offset = if in_pointer == 0 {
+            vfs.seek(input, 0, 1)?
+        } else {
+            copy_offset(vfs, input, in_pointer, memory)?
+        };
+        let to_offset = if copy {
+            let to = regular_file(vfs, output)?;
+            if vfs.flags(output)? & 0x400 != 0 {
+                return Err(Errno(9));
+            }
+            let offset = if out_pointer == 0 {
+                vfs.seek(output, 0, 1)?
+            } else {
+                copy_offset(vfs, output, out_pointer, memory)?
+            };
+            if from[..16] == to[..16]
+                && from_offset < offset.saturating_add(count)
+                && offset < from_offset.saturating_add(count)
+            {
+                return Err(Errno(22));
+            }
+            Some(offset)
+        } else {
+            None
+        };
+        Ok(Self {
+            input,
+            output,
+            in_pointer,
+            out_pointer,
+            count,
+            from_offset,
+            to_offset,
+        })
+    }
+}
+pub(crate) fn vector_flags(flags: u64) -> Result<()> {
+    if flags & !6 != 0 {
+        Err(Errno(95))
+    } else {
+        Ok(())
+    }
+}
 impl Linux {
     pub(crate) fn decode_open_how(
         memory: &impl CpuMemory,
@@ -47,26 +168,6 @@ impl Linux {
         Ok((flags as u32, mode as u32, resolve))
     }
 
-    fn regular_file(&self, fd: u32) -> Result<[u8; 128]> {
-        let stat = self.vfs.stat_fd(fd)?;
-        if u32::from_le_bytes(stat[16..20].try_into().expect("mode")) & 0o170000 != 0o100000 {
-            return Err(Errno(22));
-        }
-        Ok(stat)
-    }
-    fn copy_offset(&self, fd: u32, pointer: u64, memory: &Memory) -> Result<u64> {
-        if pointer == 0 {
-            return Err(Errno(22));
-        }
-        Self::check(memory, pointer, 8, Access::Read)?;
-        Self::check(memory, pointer, 8, Access::Write)?;
-        self.vfs.fd_kind(fd)?;
-        let offset = memory.read_u64(pointer).map_err(|_| Errno(14))?;
-        if offset > i64::MAX as u64 {
-            return Err(Errno(22));
-        }
-        Ok(offset)
-    }
     pub(super) fn file_syscall(
         &mut self,
         number: u64,
@@ -89,9 +190,7 @@ impl Linux {
                     as u64)
             }
             286 | 287 => {
-                if a[5] & !6 != 0 {
-                    return Err(Errno(95));
-                }
+                vector_flags(a[5])?;
                 let result = if a[3] == u64::MAX {
                     if number == 286 {
                         self.readv(a, memory, io)?
@@ -107,28 +206,9 @@ impl Linux {
                 Ok(result)
             }
             76 => {
-                if a[5] & !15 != 0 {
-                    return Err(Errno(22));
-                }
                 let input = a[0] as u32;
                 let output = a[2] as u32;
-                // Pipes and sockets reject an offset before pointer access.
-                if a[1] != 0 {
-                    self.vfs.seek(input, 0, 1)?;
-                }
-                if a[3] != 0 {
-                    self.vfs.seek(output, 0, 1)?;
-                }
-                let from = if a[1] == 0 {
-                    None
-                } else {
-                    Some(self.copy_offset(input, a[1], memory)?)
-                };
-                let to = if a[3] == 0 {
-                    None
-                } else {
-                    Some(self.copy_offset(output, a[3], memory)?)
-                };
+                let (from, to) = splice_parameters(&mut self.vfs, a, memory)?;
                 let n =
                     self.vfs
                         .splice(input, output, a[4].min(MAX_WRITE as u64) as usize, from, to)?
@@ -146,42 +226,15 @@ impl Linux {
                 Ok(n)
             }
             71 | 285 => {
-                let copy = number == 285;
-                let (input, output, in_pointer, out_pointer, count) = if copy {
-                    (a[0] as u32, a[2] as u32, a[1], a[3], a[4])
-                } else {
-                    (a[1] as u32, a[0] as u32, a[2], 0, a[3])
-                };
-                if copy && a[5] != 0 {
-                    return Err(Errno(22));
-                }
-                let from = self.regular_file(input)?;
-                self.vfs.fd_kind(output)?;
-                let from_offset = if in_pointer == 0 {
-                    self.vfs.seek(input, 0, 1)?
-                } else {
-                    self.copy_offset(input, in_pointer, memory)?
-                };
-                let to_offset = if copy {
-                    let to = self.regular_file(output)?;
-                    if self.vfs.flags(output)? & 0x400 != 0 {
-                        return Err(Errno(9));
-                    }
-                    let offset = if out_pointer == 0 {
-                        self.vfs.seek(output, 0, 1)?
-                    } else {
-                        self.copy_offset(output, out_pointer, memory)?
-                    };
-                    if from[..16] == to[..16]
-                        && from_offset < offset.saturating_add(count)
-                        && offset < from_offset.saturating_add(count)
-                    {
-                        return Err(Errno(22));
-                    }
-                    Some(offset)
-                } else {
-                    None
-                };
+                let CopyParameters {
+                    input,
+                    output,
+                    in_pointer,
+                    out_pointer,
+                    count,
+                    from_offset,
+                    to_offset,
+                } = CopyParameters::prepare(&mut self.vfs, number as u32, a, memory)?;
                 let bytes =
                     self.vfs
                         .pread(input, (count.min(MAX_WRITE as u64)) as usize, from_offset)?;

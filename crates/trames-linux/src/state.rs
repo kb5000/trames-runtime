@@ -1142,6 +1142,13 @@ impl Linux {
             memory.read_u64(a[3] + 8).map_err(|_| Errno(14))?,
         ))
     }
+    /// The native AArch64 execution domain can only be queried/reselected.
+    pub fn personality(value: u64) -> Result<u64> {
+        match value as u32 {
+            0 | u32::MAX => Ok(0),
+            _ => Err(Errno(22)),
+        }
+    }
     trames_shared::syscall_dispatch! {
         number number, args a;
         pub(crate) fn syscall(
@@ -1156,12 +1163,7 @@ impl Linux {
             5..=17 | 33..=41 | 43 | 44 | 49..=55 | 88 | 276 | 279 | 452 => {
                 crate::direct::namespace::owner(number as u32, a, memory, &mut self.vfs)
             },
-            92 => match a[0] as u32 {
-                // Only the native AArch64 Linux execution domain exists.
-                // Query and reselect it; other personality modes stay unsupported.
-                0 | u32::MAX => Ok(0),
-                _ => Err(Errno(22)),
-            },
+            92 => Self::personality(a[0]),
             425 => self.uring_setup(a, memory),
             426 => self
                 .uring_enter(a, memory, None, 0)

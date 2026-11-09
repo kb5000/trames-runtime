@@ -20,6 +20,7 @@ pub struct RetainedSocket {
     connecting: bool,
     accepted_address: Option<Vec<u8>>,
     message: Option<Arc<ip_message::Message>>,
+    post_sync: Option<(trames_vfs::SharedFd, bool)>,
 }
 impl RetainedSocket {
     pub(super) fn uring(
@@ -75,6 +76,7 @@ impl RetainedSocket {
                 connecting: false,
                 accepted_address: request.path.clone(),
                 message,
+                post_sync: None,
             })
         })())
     }
@@ -137,7 +139,7 @@ impl RetainedSocket {
             .is_some_and(|message| message.pipe_signal())
     }
     pub fn events(&self) -> u16 {
-        if matches!(self.number, 64 | 66 | 203 | 206 | 211 | 269) {
+        if matches!(self.number, 64 | 66 | 203 | 206 | 211 | 269 | 287) {
             4
         } else {
             1
@@ -172,7 +174,7 @@ impl RetainedSocket {
                 if let Some(message) = &self.message {
                     return Some(message.progress(
                         socket,
-                        self.number,
+                        byte_number(self.number),
                         self.args,
                         memory,
                         &self.factory,
@@ -318,11 +320,59 @@ impl DirectSyscalls {
                 connecting: false,
                 accepted_address: None,
                 message: Some(message),
+                post_sync: None,
             },
             memory,
             pid,
             target,
         ))
+    }
+    pub(super) fn prepare_v2_ip(
+        &self,
+        file: trames_vfs::SharedFd,
+        number: u32,
+        args: [u64; 6],
+        memory: &impl CpuMemory,
+    ) -> Option<Result<RetainedSocket, Errno>> {
+        let socket = file.socket_operation()?;
+        let factory = self.resources.as_ref()?;
+        Some((|| {
+            let message =
+                ip_message::Message::raw(byte_number(number), args, memory, socket.flags())?;
+            let deadline = socket
+                .io_timeout(number == 286)
+                .and_then(|duration| Instant::now().checked_add(duration));
+            Ok(RetainedSocket {
+                socket: Control::Network(socket),
+                factory: factory.clone(),
+                number,
+                args,
+                deadline,
+                connecting: false,
+                accepted_address: None,
+                message: Some(Arc::new(message)),
+                post_sync: (number == 287 && args[5] & 6 != 0).then_some((file, args[5] & 4 == 0)),
+            })
+        })())
+    }
+    fn finish_socket(&self, call: RetainedSocket, result: Result<u64, Errno>) -> IoAttempt {
+        let mut result = call.finish(result);
+        if result.is_ok() {
+            if let Some((file, data_only)) = &call.post_sync {
+                let Some(paths) = &self.paths else {
+                    // The message retains its terminal result. A true missing
+                    // control provider never replays the completed byte effect.
+                    return IoAttempt::SocketCheckpoint(call);
+                };
+                result = result.and_then(|count| {
+                    paths.retained_control(file.clone(), |vfs, alias| {
+                        vfs.sync_fd(alias, *data_only)
+                    })?;
+                    Ok(count)
+                });
+            }
+        }
+        self.complete_socket(result)
     }
     fn prepare_socket_call(
         &self,
@@ -391,6 +441,7 @@ impl DirectSyscalls {
                 connecting: false,
                 accepted_address: None,
                 message,
+                post_sync: None,
             })
         })())
     }
@@ -451,7 +502,7 @@ impl DirectSyscalls {
             return IoAttempt::SocketCheckpoint(call);
         }
         if !call.waits(&result) {
-            return self.complete_socket(call.finish(result));
+            return self.finish_socket(call, result);
         }
         let mut pending = self.socket_wait(call, pid, target);
         match self.arm_socket(&mut pending) {
@@ -492,6 +543,7 @@ impl DirectSyscalls {
         let Some(events) = pending.signal.host_events()? else {
             return Ok(false);
         };
+        pending._subscriptions = vec![socket.subscribe_changes(&pending.signal)];
         let (fds, delay) = socket.wait_sources()?;
         let mut subscriptions = Vec::new();
         for fd in fds {
@@ -532,7 +584,7 @@ impl DirectSyscalls {
         } else if call.waits(&result) {
             IoAttempt::Blocked(pending)
         } else {
-            self.complete_socket(call.finish(result))
+            self.finish_socket(pending.retained_socket.take().unwrap(), result)
         }
     }
     pub fn start_owned_socket_control(
@@ -600,7 +652,7 @@ impl DirectSyscalls {
             return IoAttempt::SocketCheckpoint(call);
         };
         if !call.waits(&result) {
-            return self.complete_socket(call.finish(result));
+            return self.finish_socket(call, result);
         }
         if matches!(call.socket, Control::Unix { .. }) {
             return self.start_retained_socket(call, memory, pid, target);

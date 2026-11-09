@@ -74,8 +74,28 @@ impl Attributes {
     }
 }
 
+/// Existing virtual I/O-priority query: CLASS_NONE, with original task
+/// presence supplied by the caller. The host scheduler is never consulted.
+pub fn ioprio_get(
+    which: u64,
+    who: u64,
+    present: impl FnOnce(u32) -> Result<bool, trames_vfs::Errno>,
+) -> Result<u64, trames_vfs::Errno> {
+    if !(1..=3).contains(&which) || (who as i32) < 0 {
+        return Err(trames_vfs::Errno(22));
+    }
+    if which != 1 {
+        return Err(trames_vfs::Errno(95));
+    }
+    if who as u32 == 0 || present(who as u32)? {
+        Ok(0)
+    } else {
+        Err(trames_vfs::Errno(3))
+    }
+}
+
 pub fn call(number: u32) -> bool {
-    matches!(number, 118..=123 | 125..=127 | 140 | 141 | 274 | 275)
+    matches!(number, 31 | 118..=123 | 125..=127 | 140 | 141 | 274 | 275)
 }
 
 /// Preserve round-robin queue priority while relocating an earlier flexible

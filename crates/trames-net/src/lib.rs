@@ -266,6 +266,7 @@ pub struct Socket {
     timeouts: [Cell<Option<Duration>>; 2],
     // Drop after the backend and namespace; the lease itself contains no Arc.
     _reservation: socket_quota::Reservation,
+    changed: Arc<trames_shared::Readiness>,
 }
 enum SocketBackend {
     Hybrid(Arc<hybrid::Socket>),
@@ -295,6 +296,7 @@ impl Socket {
             namespace,
             timeouts: [Cell::new(None), Cell::new(None)],
             _reservation: reservation,
+            changed: Arc::default(),
         })
     }
     pub fn is_stream(&self) -> bool {
@@ -387,6 +389,25 @@ impl Socket {
             })
             .collect::<std::io::Result<Vec<_>>>()?;
         Ok((fds, delay))
+    }
+    /// Timer of the original packet stack without duplicating native FDs.
+    pub fn wait_delay(&self) -> Option<Duration> {
+        let _operation = self.operation.read_recursive();
+        match &self.backend {
+            SocketBackend::Hybrid(socket) => socket.waiters(5).1.map(|fabric| fabric.next_wait()),
+            SocketBackend::Virtual(socket) => Some(socket.fabric().next_wait()),
+            _ => None,
+        }
+    }
+    pub fn subscribe_changes(
+        &self,
+        signal: &Arc<trames_shared::IoSignal>,
+    ) -> trames_shared::IoSubscription {
+        self.changed.subscribe(signal)
+    }
+    /// The VFS publishes control changes after releasing its admission lock.
+    pub fn publish_changes(&self) {
+        self.changed.notify_atomic();
     }
     pub fn info(&self) -> Option<SocketInfo> {
         let _operation = self.operation.read_recursive();

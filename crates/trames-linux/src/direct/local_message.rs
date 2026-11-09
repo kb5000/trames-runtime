@@ -150,8 +150,8 @@ impl DirectSyscalls {
             original_paths: None,
         };
         Some(
-            crate::network::unix::prepare_transfer(number, args, memory, &io)?.map(|prepared| {
-                RetainedByte {
+            crate::network::unix::prepare_transfer(byte_number(number), args, memory, &io)?.map(
+                |prepared| RetainedByte {
                     fd: fd.clone(),
                     operation: ByteOperation::Message(Arc::new(AcceptedMessage {
                         transfer: Transfer::Single { prepared, datagram },
@@ -160,8 +160,8 @@ impl DirectSyscalls {
                         number,
                         args,
                     })),
-                }
-            }),
+                },
+            ),
         )
     }
     pub(super) fn start_local_message(
@@ -228,7 +228,31 @@ impl DirectSyscalls {
         memory: &mut impl CpuMemory,
         original_paths: Option<&trames_vfs::Vfs>,
     ) -> Option<Result<u64, Errno>> {
+        if matches!(number, 286 | 287) {
+            if let Err(error) = crate::file_calls::vector_flags(args[5]) {
+                return Some(Err(error));
+            }
+            let paths = if number == 287 && args[5] & 6 != 0 {
+                Some(self.paths.as_ref()?)
+            } else {
+                None
+            };
+            let result =
+                self.transfer_retained(file, byte_number(number), args, memory, original_paths)?;
+            return Some(result.and_then(|count| {
+                if let Some(paths) = paths {
+                    paths.retained_control(
+                        file.fd.shared_file().expect("accepted byte OFD"),
+                        |vfs, alias| vfs.sync_fd(alias, args[5] & 4 == 0),
+                    )?;
+                }
+                Ok(count)
+            }));
+        }
         self.terminal_stop.set(false);
+        if let ByteOperation::Tcp(tcp) = &file.operation {
+            return Some(self.transfer_tcp(tcp, number, args, memory));
+        }
         if let ByteOperation::Signal(read) = &file.operation {
             return Some(read.check(&file.fd, memory));
         }

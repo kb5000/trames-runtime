@@ -233,7 +233,7 @@ enum ByteResource {
     Console(console::ConsoleEndpoint),
     Cgroup(Arc<cgroup::CgroupFile>, Option<cgroup::CgroupAccess>),
     TcpPoll(trames_net::TcpPoll),
-    NetlinkPoll(std::sync::Weak<NetSocket>),
+    SocketPoll(std::sync::Weak<NetSocket>),
     Mounts(Arc<mounts::watch::MountWatch>),
     Regular,
     SimpleDevice(simple_device::Kind),
@@ -265,15 +265,39 @@ enum ByteResource {
 }
 #[derive(Clone)]
 pub(super) enum WatchResource {
+    Original(OpenWeak),
+    Nested(OpenWeak),
     Shared(std::sync::Weak<SharedOpenDescription>),
     Owner(DirectFd),
 }
 impl WatchResource {
     pub(super) fn live(&self) -> bool {
         match self {
+            Self::Original(open) | Self::Nested(open) => open.strong_count() != 0,
             Self::Shared(open) => open.strong_count() != 0,
             Self::Owner(fd) => fd.origin.as_ref().is_none_or(OfdIdentity::is_live),
         }
+    }
+    pub(super) fn is_nested(&self) -> bool {
+        matches!(self, Self::Nested(_))
+    }
+    pub(super) fn original_open(&self) -> Option<OpenHandle> {
+        match self {
+            Self::Original(open) | Self::Nested(open) => open.upgrade(),
+            Self::Shared(open) => open.upgrade().map(OpenHandle::Shared),
+            Self::Owner(fd) => fd.origin.as_ref()?.open().map(OpenHandle::Shared),
+        }
+    }
+    pub(super) fn nested(&self) -> Option<Arc<epoll::LiveEpoll>> {
+        if !self.is_nested() {
+            return None;
+        }
+        let open = self.original_open()?;
+        let result = match &open.borrow().anonymous {
+            Some(events::Anonymous::Epoll(live)) => Some(live.clone()),
+            _ => None,
+        };
+        result
     }
     pub(super) fn accepted(fd: &DirectFd) -> Self {
         if let Some(file) = &fd._file {
@@ -292,55 +316,16 @@ impl WatchResource {
         }
         target
     }
-    pub(super) fn capture(
-        open: &OpenWeak,
-        polls: Option<&BTreeMap<usize, Arc<dyn DirectPoll>>>,
-    ) -> Option<Self> {
-        match open {
-            OpenWeak::Shared(open) => {
-                // Ownership can be shared before the endpoint is directly
-                // pollable (UDP, virtual transports, pre-connect TCP).
-                let shared = open.upgrade()?;
-                if !matches!(shared.control, Some(events::SharedControl::Signal(_))) {
-                    SharedFd::new(shared).direct_poll()?;
-                }
-                Some(Self::Shared(open.clone()))
-            }
-            OpenWeak::Owner(_) => {
-                let open = open.upgrade()?;
-                let open = open.borrow();
-                let fd = match polls {
-                    Some(polls) => DirectFd::snapshot_poll(&open, polls),
-                    None => {
-                        DirectFd::snapshot(&open).or_else(|| DirectFd::snapshot_tcp_poll(&open))
-                    }
-                }?;
-                Some(Self::Owner(fd))
-            }
-        }
-    }
     pub(super) fn resolve(&self) -> Option<DirectFd> {
         self.resolve_with(None)
     }
     pub(super) fn resolve_with(&self, reader: Option<&Arc<dyn SignalReader>>) -> Option<DirectFd> {
         let fd = match self {
+            Self::Original(open) | Self::Nested(open) => {
+                DirectFd::source_poll(open.upgrade()?, reader)?
+            }
             Self::Shared(weak) => {
-                let open = weak.upgrade()?;
-                if let Some(events::SharedControl::Signal(mask)) = &open.control {
-                    let mask = mask.clone();
-                    DirectFd::signal(SharedFd::new(open), mask, reader?.clone())
-                } else if open.kind == FdKind::Socket && open.local.is_none() {
-                    let tcp = open
-                        .tcp_publication
-                        .lock()
-                        .unwrap()
-                        .as_ref()?
-                        .tcp
-                        .poll_only();
-                    DirectFd::tcp_poll(&open, tcp)
-                } else {
-                    SharedFd::new(open).direct_poll()?
-                }
+                DirectFd::source_poll(OpenHandle::Shared(weak.upgrade()?), reader)?
             }
             Self::Owner(fd) => fd
                 .origin
@@ -354,25 +339,13 @@ impl WatchResource {
 pub(super) type DirectWatch = ((u32, u64), Arc<Mutex<events::WatchState>>, WatchResource);
 #[derive(Clone)]
 struct DirectEpoll {
-    watches: Option<Arc<Vec<DirectWatch>>>,
+    accepted_revision: Option<u64>,
     live: Arc<epoll::LiveEpoll>,
     signal_reader: Option<Arc<dyn SignalReader>>,
 }
-struct WatchSnapshot<'a> {
-    live: Arc<Vec<DirectWatch>>,
-    frozen: &'a [DirectWatch],
-}
-impl WatchSnapshot<'_> {
-    fn iter(&self) -> impl Iterator<Item = &DirectWatch> {
-        epoll::ordered(&self.live, self.frozen, None)
-    }
-}
 impl DirectEpoll {
-    fn snapshot(&self) -> WatchSnapshot<'_> {
-        WatchSnapshot {
-            live: self.live.snapshot(),
-            frozen: self.watches.as_deref().map_or(&[], |w| w.as_slice()),
-        }
+    fn snapshot(&self) -> Arc<Vec<DirectWatch>> {
+        self.live.snapshot()
     }
 }
 /// Retained byte authority with immutable access bits and live OFD status.
@@ -520,10 +493,10 @@ impl DirectFd {
             origin: None,
         }
     }
-    pub(super) fn netlink_poll(open: &SharedOpenDescription) -> Option<Self> {
-        let socket = open.socket.as_ref().filter(|s| s.is_netlink())?;
+    pub(super) fn socket_poll(open: &SharedOpenDescription) -> Option<Self> {
+        let socket = open.socket.as_ref()?;
         Some(Self {
-            resource: ByteResource::NetlinkPoll(Arc::downgrade(socket)),
+            resource: ByteResource::SocketPoll(Arc::downgrade(socket)),
             flags: open.flags.get(),
             status: open.flags.clone(),
             _file: None,
@@ -536,7 +509,7 @@ impl DirectFd {
         matches!(&self.resource,ByteResource::Console(console) if console.io.host_work())
     }
     pub fn is_netlink(&self) -> bool {
-        matches!(self.resource, ByteResource::NetlinkPoll(_))
+        matches!(&self.resource, ByteResource::SocketPoll(socket) if socket.upgrade().is_some_and(|socket| socket.is_netlink()))
     }
     pub(super) fn shared_byte(open: &SharedOpenDescription) -> Option<Self> {
         let resource = if let Some(console) = open.console.get() {
@@ -609,59 +582,107 @@ impl DirectFd {
         })
     }
     fn epoll_byte(live: &Arc<epoll::LiveEpoll>) -> Option<ByteResource> {
-        let watches = if live.owner_count() == 0 {
-            None
-        } else {
-            let mut direct = Vec::new();
-            for (&key, watch) in live.legacy.borrow().iter() {
-                if watch.open.strong_count() == 0 {
-                    continue;
-                }
-                // Unbound embedding signalfds still need a caller signal reader.
-                if matches!(&watch.open,OpenWeak::Shared(w) if w.upgrade().is_some_and(|o|matches!(o.control,Some(events::SharedControl::Signal(_)))))
-                {
-                    return None;
-                }
-                direct.push((
-                    key,
-                    watch.state.clone(),
-                    WatchResource::capture(&watch.open, None)?,
-                ));
-            }
-            (!direct.is_empty()).then(|| Arc::new(direct))
-        };
         Some(ByteResource::Epoll(DirectEpoll {
+            accepted_revision: None,
             signal_reader: None,
-            watches,
             live: live.clone(),
         }))
+    }
+    fn source_poll(open: OpenHandle, reader: Option<&Arc<dyn SignalReader>>) -> Option<Self> {
+        let view = open.borrow();
+        let mut fd = if let Some(events::Anonymous::Signal(mask)) = &view.anonymous {
+            Self::signal(
+                SharedFd::new(view.shared.clone()),
+                mask.clone(),
+                reader?.clone(),
+            )
+        } else {
+            match &open {
+                OpenHandle::Shared(file) => SharedFd::new(file.clone()).direct_poll()?,
+                OpenHandle::Owner(_) => Self::snapshot(&view)
+                    .or_else(|| Self::snapshot_tcp_poll(&view))
+                    .or_else(|| SharedFd::new(view.shared.clone()).direct_poll())?,
+            }
+        };
+        if fd.origin.is_none() {
+            fd.origin = Some(OfdIdentity::new(&view.shared));
+        }
+        Some(fd.bind_context(reader, None))
+    }
+    fn epoll_complete(&self, stack: &mut [usize; 5], depth: usize) -> bool {
+        let ByteResource::Epoll(epoll) = &self.resource else {
+            return true;
+        };
+        let id = Arc::as_ptr(&epoll.live) as usize;
+        // A DEL/reverse-ADD can overlap immutable snapshots. That transient
+        // branch is not an absent provider or a reason to stop all workers.
+        if depth == stack.len() || stack[..depth].contains(&id) {
+            return true;
+        }
+        stack[depth] = id;
+        epoll.snapshot().iter().all(|(_, _, resource)| {
+            match resource.resolve_with(epoll.signal_reader.as_ref()) {
+                Some(fd) => fd.epoll_complete(stack, depth + 1),
+                None => !resource.live(),
+            }
+        })
+    }
+    pub fn refresh_epoll(&self) -> Option<Self> {
+        let ByteResource::Epoll(epoll) = &self.resource else {
+            return Some(self.clone());
+        };
+        let revision = epoll.live.revision();
+        if epoll.accepted_revision != Some(revision) && !self.epoll_complete(&mut [0; 5], 0) {
+            return None;
+        }
+        let mut result = self.clone();
+        if let ByteResource::Epoll(epoll) = &mut result.resource {
+            epoll.accepted_revision = Some(revision);
+        }
+        Some(result)
+    }
+    pub fn epoll_accepted_revision(&self) -> Option<u64> {
+        match &self.resource {
+            ByteResource::Epoll(epoll) => epoll.accepted_revision,
+            _ => None,
+        }
     }
     pub(super) fn with_ofd(mut self, file: SharedFd) -> Self {
         self._file = Some(file);
         self
     }
     // A conservative scheduling hint, never an access/FD authority check.
-    // Live interests exclude nested epoll; frozen owner captures follow the
-    // validated acyclic owner graph, so this traversal cannot cycle.
+    // Original nested interests use the same bounded topology traversal as
+    // readiness; no graph lock spans a scheduling hint.
     fn shares_resource(&self, other: &Self) -> bool {
         match (&self.resource, &other.resource) {
             (ByteResource::Console(a), ByteResource::Console(b)) => {
                 a.stream == b.stream && Arc::ptr_eq(&a.io, &b.io)
             }
             (ByteResource::TcpPoll(a), ByteResource::TcpPoll(b)) => a.shares_socket(b),
-            (ByteResource::NetlinkPoll(a), ByteResource::NetlinkPoll(b)) => {
+            (ByteResource::SocketPoll(a), ByteResource::SocketPoll(b)) => {
                 std::sync::Weak::ptr_eq(a, b)
             }
             (ByteResource::Kmsg(a), ByteResource::Kmsg(b)) => a.same_log(b),
             (ByteResource::Bridge(a), ByteResource::Bridge(b)) => std::sync::Weak::ptr_eq(a, b),
-            (ByteResource::Epoll(a), _) => a.snapshot().iter().any(|(_, _, fd)| {
-                fd.resolve_with(a.signal_reader.as_ref())
-                    .is_some_and(|fd| fd.shares_resource(other))
-            }),
-            (_, ByteResource::Epoll(b)) => b.snapshot().iter().any(|(_, _, fd)| {
-                fd.resolve_with(b.signal_reader.as_ref())
-                    .is_some_and(|fd| self.shares_resource(&fd))
-            }),
+            (ByteResource::Epoll(a), _) => {
+                let Some(_traversal) = epoll::Traversal::enter(&a.live) else {
+                    return false;
+                };
+                a.snapshot().iter().any(|(_, _, fd)| {
+                    fd.resolve_with(a.signal_reader.as_ref())
+                        .is_some_and(|fd| fd.shares_resource(other))
+                })
+            }
+            (_, ByteResource::Epoll(b)) => {
+                let Some(_traversal) = epoll::Traversal::enter(&b.live) else {
+                    return false;
+                };
+                b.snapshot().iter().any(|(_, _, fd)| {
+                    fd.resolve_with(b.signal_reader.as_ref())
+                        .is_some_and(|fd| self.shares_resource(&fd))
+                })
+            }
             (ByteResource::Signal(a, _), ByteResource::Signal(b, _)) => Arc::ptr_eq(a, b),
             (ByteResource::Event(a), ByteResource::Event(b)) => Arc::ptr_eq(a, b),
             (ByteResource::Timer(a), ByteResource::Timer(b)) => Arc::ptr_eq(a, b),
@@ -684,27 +705,53 @@ impl DirectFd {
         match &self.resource {
             ByteResource::Console(console) => console.io.native_wait_fds(console.stream),
             ByteResource::TcpPoll(tcp) => tcp.poll_event_fd().map(Into::into).into_iter().collect(),
+            ByteResource::SocketPoll(socket) => socket
+                .upgrade()
+                .and_then(|socket| socket.wait_sources().ok())
+                .map_or_else(Vec::new, |(fds, _)| {
+                    fds.into_iter().map(Into::into).collect()
+                }),
             ByteResource::Timer(timer) => timer.native_fd().into_iter().collect(),
             #[cfg(all(feature = "hostfs", unix))]
             ByteResource::Inotify(queue) => queue.native_fd().map(Into::into).into_iter().collect(),
-            ByteResource::Epoll(epoll) => epoll
-                .snapshot()
-                .iter()
-                .filter(|(_, state, _)| state.lock().unwrap().armed)
-                .filter_map(|(_, _, fd)| fd.resolve_with(epoll.signal_reader.as_ref()))
-                .flat_map(|fd| fd.native_wait_fds())
-                .collect(),
+            ByteResource::Epoll(epoll) => {
+                let Some(_traversal) = epoll::Traversal::enter(&epoll.live) else {
+                    return Vec::new();
+                };
+                epoll
+                    .snapshot()
+                    .iter()
+                    .filter(|(_, state, _)| state.lock().unwrap().armed)
+                    .filter_map(|(_, _, fd)| fd.resolve_with(epoll.signal_reader.as_ref()))
+                    .flat_map(|fd| fd.native_wait_fds())
+                    .collect()
+            }
             _ => Vec::new(),
         }
     }
     pub fn subscribe(&self, signal: &Arc<crate::IoSignal>) -> Vec<crate::IoSubscription> {
         match &self.resource {
             ByteResource::Console(console) => console.io.subscribe(signal),
-            ByteResource::NetlinkPoll(socket) => socket
-                .upgrade()
-                .and_then(|s| s.subscribe(signal))
-                .into_iter()
-                .collect(),
+            ByteResource::SocketPoll(socket) => {
+                let Some(socket) = socket.upgrade() else {
+                    return Vec::new();
+                };
+                if let Some(subscription) = socket.subscribe(signal) {
+                    return vec![subscription];
+                }
+                // The ordinary connected TCP path above keeps its stable
+                // native observer. Unconnected/UDP/packet-stack sockets use
+                // their original live native set and existing fabric timer.
+                let mut subscriptions = vec![socket.subscribe_changes(signal)];
+                match socket.wait_sources() {
+                    Ok((fds, _)) => subscriptions.extend(
+                        fds.into_iter()
+                            .map(|fd| IoSubscription::native(Ok(fd.into()), signal)),
+                    ),
+                    Err(error) => subscriptions.push(IoSubscription::native(Err(error), signal)),
+                }
+                subscriptions
+            }
             ByteResource::TcpPoll(tcp) => vec![IoSubscription::native(
                 tcp.poll_event_fd().map(Into::into),
                 signal,
@@ -740,6 +787,9 @@ impl DirectFd {
             }
             ByteResource::Pty { data, .. } => vec![data.subscribe(signal)],
             ByteResource::Epoll(epoll) => {
+                let Some(_traversal) = epoll::Traversal::enter(&epoll.live) else {
+                    return Vec::new();
+                };
                 let mut subscriptions = vec![epoll.live.changed.subscribe(signal)];
                 subscriptions.extend(
                     epoll
@@ -799,7 +849,7 @@ impl DirectFd {
             ByteResource::Timer(timer.clone())
         } else if let Some(events::Anonymous::Inotify(instance)) = &open.anonymous {
             ByteResource::Inotify(instance.capability())
-        } else if let Some(events::Anonymous::Epoll { shared, .. }) = &open.anonymous {
+        } else if let Some(events::Anonymous::Epoll(shared)) = &open.anonymous {
             Self::epoll_byte(shared)?
         } else if matches!(open.kind, FdKind::PipeRead | FdKind::PipeWrite) {
             let end = open.pipe.as_ref()?;
@@ -865,29 +915,7 @@ impl DirectFd {
             Some(events::Anonymous::Uring(ring)) => {
                 ByteResource::PollOnly(polls.get(&(Arc::as_ptr(ring) as usize))?.clone())
             }
-            Some(events::Anonymous::Epoll {
-                watches, shared, ..
-            }) => {
-                let mut direct = Vec::new();
-                for (&key, watch) in watches.borrow().iter() {
-                    if watch.open.strong_count() != 0 {
-                        if matches!(&watch.open, OpenWeak::Shared(w) if w.upgrade().is_some_and(|o|matches!(o.control,Some(events::SharedControl::Signal(_)))))
-                        {
-                            return None;
-                        }
-                        direct.push((
-                            key,
-                            watch.state.clone(),
-                            WatchResource::capture(&watch.open, Some(polls))?,
-                        ));
-                    }
-                }
-                ByteResource::Epoll(DirectEpoll {
-                    signal_reader: None,
-                    watches: (!direct.is_empty()).then(|| Arc::new(direct)),
-                    live: shared.clone(),
-                })
-            }
+            Some(events::Anonymous::Epoll(shared)) => Self::epoll_byte(shared)?,
             _ => return Self::snapshot(open),
         };
         Some(Self {
@@ -901,7 +929,7 @@ impl DirectFd {
     pub fn is_poll_only(&self) -> bool {
         matches!(
             self.resource,
-            ByteResource::NetlinkPoll(_)
+            ByteResource::SocketPoll(_)
                 | ByteResource::TcpPoll(_)
                 | ByteResource::UnixControl(_)
                 | ByteResource::PollOnly(_)
@@ -912,32 +940,42 @@ impl DirectFd {
     pub fn poll_resources(&self) -> Vec<Arc<dyn DirectPoll>> {
         match &self.resource {
             ByteResource::PollOnly(poll) => vec![poll.clone()],
-            ByteResource::Epoll(epoll) => epoll
-                .snapshot()
-                .iter()
-                .filter(|(_, state, _)| state.lock().unwrap().armed)
-                .flat_map(|(_, _, fd)| {
-                    fd.resolve_with(epoll.signal_reader.as_ref())
-                        .map(|fd| fd.poll_resources())
-                        .unwrap_or_default()
-                })
-                .collect(),
+            ByteResource::Epoll(epoll) => {
+                let Some(_traversal) = epoll::Traversal::enter(&epoll.live) else {
+                    return Vec::new();
+                };
+                epoll
+                    .snapshot()
+                    .iter()
+                    .filter(|(_, state, _)| state.lock().unwrap().armed)
+                    .flat_map(|(_, _, fd)| {
+                        fd.resolve_with(epoll.signal_reader.as_ref())
+                            .map(|fd| fd.poll_resources())
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            }
             _ => Vec::new(),
         }
     }
     pub fn poll_identities(&self) -> Vec<usize> {
         match &self.resource {
             ByteResource::PollOnly(poll) => vec![poll.identity()],
-            ByteResource::Epoll(epoll) => epoll
-                .snapshot()
-                .iter()
-                .filter(|(_, state, _)| state.lock().unwrap().armed)
-                .flat_map(|(_, _, fd)| {
-                    fd.resolve_with(epoll.signal_reader.as_ref())
-                        .map(|fd| fd.poll_identities())
-                        .unwrap_or_default()
-                })
-                .collect(),
+            ByteResource::Epoll(epoll) => {
+                let Some(_traversal) = epoll::Traversal::enter(&epoll.live) else {
+                    return Vec::new();
+                };
+                epoll
+                    .snapshot()
+                    .iter()
+                    .filter(|(_, state, _)| state.lock().unwrap().armed)
+                    .flat_map(|(_, _, fd)| {
+                        fd.resolve_with(epoll.signal_reader.as_ref())
+                            .map(|fd| fd.poll_identities())
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            }
             _ => Vec::new(),
         }
     }
@@ -1080,27 +1118,59 @@ impl DirectFd {
         }
     }
     pub fn poll_ready(&self, events: u16) -> Option<u16> {
-        (!self.is_epoll()).then(|| self.poll(events).0)
+        Some(self.poll(events).0)
     }
     /// Preserve the original poll epoch for worker multishot edge detection.
     pub fn poll_state(&self, events: u16) -> Option<(u16, [u64; 2])> {
-        (!self.is_epoll()).then(|| self.poll(events))
+        Some(self.poll(events))
+    }
+    pub fn dynamic_poll_sources(&self) -> bool {
+        match &self.resource {
+            ByteResource::SocketPoll(socket) => {
+                socket.upgrade().is_some_and(|socket| !socket.is_netlink())
+            }
+            ByteResource::Epoll(epoll) => {
+                let Some(_traversal) = epoll::Traversal::enter(&epoll.live) else {
+                    return false;
+                };
+                epoll.snapshot().iter().any(|(_, _, target)| {
+                    target
+                        .resolve_with(epoll.signal_reader.as_ref())
+                        .is_some_and(|fd| fd.dynamic_poll_sources())
+                })
+            }
+            _ => false,
+        }
+    }
+    pub fn poll_deadline(&self, events: u16) -> Option<std::time::Instant> {
+        if events & 1 == 0 && matches!(self.resource, ByteResource::Timer(_)) {
+            return None;
+        }
+        self.next_deadline()
     }
     pub fn next_deadline(&self) -> Option<std::time::Instant> {
         match &self.resource {
             ByteResource::Timer(timer) => timer.deadline(),
+            ByteResource::SocketPoll(socket) => socket
+                .upgrade()
+                .and_then(|socket| socket.wait_delay())
+                .and_then(|delay| std::time::Instant::now().checked_add(delay)),
             ByteResource::Bridge(bridge) => bridge.upgrade().and_then(|b| b.next_deadline()),
-            ByteResource::Epoll(epoll) => epoll
-                .snapshot()
-                .iter()
-                .filter_map(|(_, state, fd)| {
-                    let fd = fd.resolve_with(epoll.signal_reader.as_ref())?;
-                    let state = state.lock().unwrap();
-                    (state.armed && state.events & 1 != 0)
-                        .then(|| fd.next_deadline())
-                        .flatten()
-                })
-                .min(),
+            ByteResource::Epoll(epoll) => {
+                let _traversal = epoll::Traversal::enter(&epoll.live)?;
+                epoll
+                    .snapshot()
+                    .iter()
+                    .filter_map(|(_, state, fd)| {
+                        let fd = fd.resolve_with(epoll.signal_reader.as_ref())?;
+                        let armed = {
+                            let state = state.lock().unwrap();
+                            state.armed.then_some(state.events as u16)
+                        };
+                        armed.and_then(|events| fd.poll_deadline(events))
+                    })
+                    .min()
+            }
             _ => None,
         }
     }
@@ -1144,7 +1214,7 @@ impl DirectFd {
         match &self.resource {
             ByteResource::Console(console) => console.io.poll(console.stream, events),
             ByteResource::TcpPoll(tcp) => tcp.poll(events).unwrap_or((32, [0; 2])),
-            ByteResource::NetlinkPoll(socket) => socket.upgrade().map_or((32, [0; 2]), |s| {
+            ByteResource::SocketPoll(socket) => socket.upgrade().map_or((32, [0; 2]), |s| {
                 (
                     s.poll(events).unwrap_or(32),
                     s.poll_epoch().unwrap_or([0; 2]),
@@ -1204,17 +1274,26 @@ impl DirectFd {
                 (ready, data.io_epoch)
             }
             ByteResource::Epoll(epoll) => {
+                let Some(_traversal) = epoll::Traversal::enter(&epoll.live) else {
+                    return (0, [epoll.live.revision(), 0]);
+                };
                 let mut ready = false;
-                let mut generation = 0u64;
+                let mut generation = epoll.live.revision();
                 for (_, state, resource) in epoll.snapshot().iter() {
-                    let state = state.lock().unwrap();
-                    if state.armed {
-                        if let Some(fd) = resource.resolve_with(epoll.signal_reader.as_ref()) {
-                            let (events, epoch) = fd.peek_poll(state.events as u16);
-                            generation = generation.wrapping_add(epoch[0]).wrapping_add(epoch[1]);
-                            ready |= events != 0 && state.ready(events, epoch);
-                        }
-                    }
+                    let observed =
+                        epoll::inspect::<false>(state, resource.is_nested(), |requested| {
+                            let Some(fd) = resource.resolve_with(epoll.signal_reader.as_ref())
+                            else {
+                                return Ok(None);
+                            };
+                            let result = fd.peek_poll(requested);
+                            generation = generation
+                                .wrapping_add(result.1[0])
+                                .wrapping_add(result.1[1]);
+                            Ok(Some(result))
+                        })
+                        .expect("poll observation has no guest effects");
+                    ready |= observed.is_some();
                 }
                 (if ready { events & 1 } else { 0 }, [generation, 0])
             }
@@ -1224,11 +1303,10 @@ impl DirectFd {
         let ByteResource::Epoll(epoll) = &self.resource else {
             return Err(Errno(22));
         };
-        epoll.live.wait_with(
-            max,
-            epoll.watches.as_deref().map_or(&[], |w| w.as_slice()),
-            epoll.signal_reader.as_ref(),
-        )
+        let Some(_traversal) = epoll::Traversal::enter(&epoll.live) else {
+            return Ok(Vec::new());
+        };
+        epoll.live.wait_with(max, epoll.signal_reader.as_ref())
     }
     pub fn epoll_revision(&self) -> Option<u64> {
         if let ByteResource::Epoll(epoll) = &self.resource {
@@ -1427,7 +1505,7 @@ impl DirectFd {
             ByteResource::Inotify(queue) => queue.read(count),
             ByteResource::Epoll(_)
             | ByteResource::TcpPoll(_)
-            | ByteResource::NetlinkPoll(_)
+            | ByteResource::SocketPoll(_)
             | ByteResource::PollOnly(_)
             | ByteResource::Regular
             | ByteResource::UnixControl(_)
@@ -1533,7 +1611,7 @@ impl DirectFd {
             ByteResource::Event(counter) => counter.write(bytes),
             ByteResource::Epoll(_)
             | ByteResource::TcpPoll(_)
-            | ByteResource::NetlinkPoll(_)
+            | ByteResource::SocketPoll(_)
             | ByteResource::PollOnly(_)
             | ByteResource::Regular
             | ByteResource::Timer(_)
@@ -1571,8 +1649,18 @@ impl DirectFds {
                 .map(|fd| fd.bind_context(self.2.as_ref(), self.3.as_ref()))
         }
     }
+    /// Retain original TCP byte and readiness authority for a compound syscall.
+    /// Ordinary scalar/vector TCP dispatch retains its existing direct route.
+    pub fn tcp_file(&self, file: SharedFd) -> Option<(DirectFd, DirectTcpFd)> {
+        let tcp = file.direct_tcp()?;
+        let fd = DirectFd::tcp_poll(&file.open, tcp.tcp.poll_only()).with_ofd(file);
+        Some((fd, tcp))
+    }
     pub fn shared_files(&self) -> Option<SharedFiles> {
         self.1.clone()
+    }
+    pub fn has_membership(&self) -> bool {
+        self.1.is_some()
     }
     pub(super) fn with_cgroup_access(mut self, access: cgroup::CgroupAccess) -> Self {
         self.3 = Some(access);
@@ -1586,10 +1674,51 @@ impl DirectFds {
         self.get_raw(fd)
             .map(|fd| fd.bind_context(self.2.as_ref(), self.3.as_ref()))
     }
+    /// Poll/select admission distinguishes an invalid numeric descriptor from
+    /// an actual missing provider. Accept one original OFD and no Files copy.
+    pub fn polling(&self, fd: u32) -> Option<Result<DirectFd>> {
+        let Some(files) = &self.1 else {
+            return self.get(fd).map(Ok);
+        };
+        let original = match files.observation_descriptor(fd) {
+            Ok(file) => file.open,
+            Err(error) => return Some(Err(error)),
+        };
+        let fresh = DirectFd::source_poll(original.clone(), self.2.as_ref()).or_else(|| {
+            let cached = self.0.get(fd as usize)?.as_ref()?;
+            cached
+                .ofd_identity()
+                .matches(&original.borrow().shared)
+                .then(|| cached.clone())
+        })?;
+        Some(Ok(fresh
+            .bind_context(self.2.as_ref(), self.3.as_ref())
+            .refresh_epoll()?))
+    }
+    /// Accept the original epoll core and its caller's real poll providers.
+    /// Interest updates never rebuild a copied owner watch table.
+    pub fn epoll(&self, fd: u32) -> Option<Result<DirectFd>> {
+        let Some(files) = &self.1 else {
+            return self.get(fd).filter(DirectFd::is_epoll).map(Ok);
+        };
+        let open = match files.epoll_open(fd)? {
+            Ok(open) => open,
+            Err(error) => return Some(Err(error)),
+        };
+        let accepted = DirectFd::source_poll(OpenHandle::Shared(open), self.2.as_ref())?;
+        Some(Ok(accepted.refresh_epoll()?))
+    }
     fn get_raw(&self, fd: u32) -> Option<DirectFd> {
         if let Some(result) = self.1.as_ref().and_then(|files| files.poll_lookup(fd)) {
             return match result.ok()? {
                 fd_table::PollOpen::Shared(file) => {
+                    if let Some(events::SharedControl::Epoll(_)) = &file.open.control {
+                        return DirectFd::source_poll(
+                            OpenHandle::Shared(file.open),
+                            self.2.as_ref(),
+                        )?
+                        .refresh_epoll();
+                    }
                     if let Some(events::SharedControl::Signal(mask)) = &file.open.control {
                         let mask = mask.clone();
                         Some(DirectFd::signal(file, mask, self.2.as_ref()?.clone()))
@@ -1599,27 +1728,25 @@ impl DirectFds {
                 }
                 fd_table::PollOpen::Tcp(open, tcp) => Some(DirectFd::tcp_poll(&open, tcp)),
                 fd_table::PollOpen::Epoll(open) => {
-                    let mut fd = DirectFd::shared_byte(&open)?;
-                    fd.origin = Some(OfdIdentity::new(&open));
-                    Some(fd)
+                    DirectFd::source_poll(OpenHandle::Shared(open), self.2.as_ref())?
+                        .refresh_epoll()
                 }
             };
         }
         if let Some(open) = self.1.as_ref().and_then(|files| files.control_open(fd)) {
-            if let Some(events::SharedControl::Epoll(live)) = &open.control {
-                if live.owner_count() == 0 {
-                    let mut result = DirectFd::shared_byte(&open)?;
-                    result.origin = Some(OfdIdentity::new(&open));
-                    return Some(result);
-                }
-                let cached = self.0.get(fd as usize)?.as_ref()?;
-                if let ByteResource::Epoll(epoll) = &cached.resource {
-                    return Arc::ptr_eq(live, &epoll.live).then(|| cached.clone());
-                }
+            if let Some(events::SharedControl::Epoll(_)) = &open.control {
+                return DirectFd::source_poll(OpenHandle::Shared(open), self.2.as_ref())?
+                    .refresh_epoll();
             }
             return None;
         }
         let cached = self.0.get(fd as usize)?.clone()?;
+        if let Some(files) = &self.1 {
+            let actual = files.observation_descriptor(fd).ok()?;
+            if !cached.ofd_identity().matches(&actual.open.borrow().shared) {
+                return None;
+            }
+        }
         (!cached.is_epoll()).then_some(cached)
     }
     pub fn epoll_control(
@@ -1630,33 +1757,12 @@ impl DirectFds {
         events: u32,
         data: u64,
     ) -> Option<Result<()>> {
-        let open = self.1.as_ref()?.control_open(fd)?;
-        let Some(events::SharedControl::Epoll(live)) = &open.control else {
-            return None;
-        };
-        let target_fd = self.get(target)?;
-        let identity = target_fd.ofd_identity();
-        let target_open = identity.open()?;
-        if Arc::ptr_eq(&open, &target_open) {
-            return Some(Err(Errno(22)));
-        }
-        if target_fd.is_epoll() {
-            if op != 2 && events & epoll::EXCLUSIVE != 0 {
-                return Some(Err(Errno(22)));
-            }
-            return None;
-        }
-        if matches!(
-            target_fd.resource,
-            ByteResource::Regular | ByteResource::SimpleDevice(_)
-        ) {
-            return Some(Err(Errno(1)));
-        }
-        let key = (target, target_open.id);
-        if live.owner_count() != 0 && !live.contains(key) {
-            return None;
-        }
-        Some(live.update(key, op, events, data, WatchResource::accepted(&target_fd)))
+        let files = self.1.as_ref()?;
+        Some((|| {
+            let epoll = files.observation_descriptor(fd)?.open;
+            let target_open = files.observation_descriptor(target)?.open;
+            epoll::control(epoll, target_open, target, op, events, data)
+        })())
     }
     fn candidates(&self) -> Vec<DirectFd> {
         self.0
@@ -1787,7 +1893,6 @@ impl Vfs {
         &self,
         polls: &BTreeMap<usize, Arc<dyn DirectPoll>>,
     ) -> DirectFds {
-        self.promote_tcp_epoll_watches();
         let descriptors = self.fds.entries();
         let mut entries = vec![
             None;
@@ -1808,7 +1913,6 @@ impl Vfs {
         )
     }
     pub fn direct_descriptors(&self) -> DirectFds {
-        self.promote_tcp_epoll_watches();
         self.descriptor_snapshots()
             .1
             .with_signal_reader(self.signal_reader.borrow().clone())
@@ -1826,23 +1930,17 @@ fn native_wait_open(open: &OpenDescription) -> Vec<HostFd> {
             .map(Into::into)
             .into_iter()
             .collect(),
-        Some(events::Anonymous::Epoll {
-            watches, shared, ..
-        }) => shared
-            .snapshot()
-            .iter()
-            .filter(|w| w.1.lock().unwrap().armed)
-            .filter_map(|w| w.2.resolve())
-            .flat_map(|fd| fd.native_wait_fds())
-            .chain(
-                watches
-                    .borrow()
-                    .values()
-                    .filter(|watch| watch.state.lock().unwrap().armed)
-                    .filter_map(|watch| watch.open.upgrade())
-                    .flat_map(|open| native_wait_open(&open.borrow())),
-            )
-            .collect(),
+        Some(events::Anonymous::Epoll(live)) => {
+            let Some(_traversal) = epoll::Traversal::enter(live) else {
+                return Vec::new();
+            };
+            live.snapshot()
+                .iter()
+                .filter(|w| w.1.lock().unwrap().armed)
+                .filter_map(|w| w.2.original_open())
+                .flat_map(|open| native_wait_open(&open.borrow()))
+                .collect()
+        }
         _ => Vec::new(),
     }
 }

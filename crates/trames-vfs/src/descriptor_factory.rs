@@ -5,7 +5,7 @@ use super::*;
 #[derive(Clone)]
 pub struct DescriptorFactory {
     pub(super) files: SharedFiles,
-    ids: Arc<AtomicU64>,
+    ids: Arc<OpenIds>,
     owner: (u32, u32),
     network: trames_net::Network,
     local_network: Arc<linux_namespace::RootNetwork>,
@@ -16,8 +16,20 @@ pub struct DescriptorFactory {
     devices: cgroup::DeviceAuthority,
     pub(super) cgroups: Arc<SharedCell<cgroup::Cgroups>>,
 }
-pub(super) fn next_id(ids: &AtomicU64) -> u64 {
-    (1u64 << 62) | ids.fetch_add(1, Ordering::Relaxed)
+pub(super) struct OpenIds {
+    next: AtomicU64,
+    pub(super) epolls: Arc<epoll_graph::Graph>,
+}
+impl Default for OpenIds {
+    fn default() -> Self {
+        Self {
+            next: AtomicU64::new(1),
+            epolls: Arc::default(),
+        }
+    }
+}
+pub(super) fn next_id(ids: &OpenIds) -> u64 {
+    (1u64 << 62) | ids.next.fetch_add(1, Ordering::Relaxed)
 }
 impl Vfs {
     pub fn descriptor_factory(&self) -> DescriptorFactory {
@@ -302,15 +314,8 @@ impl DescriptorFactory {
         if flags & !O_CLOEXEC != 0 {
             return Err(Errno(22));
         }
-        let shared = Arc::new(epoll::LiveEpoll::default());
-        self.anonymous(
-            flags,
-            events::Anonymous::Epoll {
-                watches: shared.legacy.clone(),
-                cursor: shared.cursor.clone(),
-                shared,
-            },
-        )
+        let shared = epoll::LiveEpoll::new(self.ids.epolls.clone());
+        self.anonymous(flags, events::Anonymous::Epoll(shared))
     }
     pub fn timerfd(&self, clock: u32, flags: u32) -> Result<u32> {
         if !matches!(clock, 0 | 1 | 7) || flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {

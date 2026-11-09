@@ -219,15 +219,15 @@ impl RetainedFd {
     fn uring_supported(open: &OpenDescription) -> Result<()> {
         // Retaining another ring could form an uncollectable RC cycle. These
         // descriptor classes need additional process/signal/terminal authority.
-        if open.anonymous.as_ref().is_some_and(|a| {
-            matches!(
-                a,
-                events::Anonymous::Uring(_) | events::Anonymous::Epoll { .. }
+        if open
+            .anonymous
+            .as_ref()
+            .is_some_and(|a| matches!(a, events::Anonymous::Uring(_) | events::Anonymous::Epoll(_)))
+            || matches!(
+                open.kind,
+                FdKind::Stdin | FdKind::Stdout | FdKind::Stderr | FdKind::Terminal
             )
-        }) || matches!(
-            open.kind,
-            FdKind::Stdin | FdKind::Stdout | FdKind::Stderr | FdKind::Terminal
-        ) {
+        {
             return Err(Errno(95));
         }
         Ok(())
@@ -656,10 +656,13 @@ impl Vfs {
         fn visit(open: &OpenDescription, rings: &mut Vec<Arc<Uring>>) -> Option<()> {
             match &open.anonymous {
                 Some(events::Anonymous::Uring(r)) => rings.push(r.clone()),
-                Some(events::Anonymous::Epoll { watches, .. }) => {
-                    for watch in watches.borrow().values() {
-                        if watch.state.lock().unwrap().armed {
-                            if let Some(target) = watch.open.upgrade() {
+                Some(events::Anonymous::Epoll(live)) => {
+                    let Some(_traversal) = epoll::Traversal::enter(live) else {
+                        return Some(());
+                    };
+                    for (_, state, target) in live.snapshot().iter() {
+                        if state.lock().unwrap().armed {
+                            if let Some(target) = target.original_open() {
                                 visit(&target.borrow(), rings)?;
                             }
                         }

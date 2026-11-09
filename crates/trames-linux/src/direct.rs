@@ -15,6 +15,8 @@ pub(crate) mod file;
 pub use aio::{Aio, RetainedAio};
 #[cfg(test)]
 mod console_tests;
+#[cfg(test)]
+mod event_tests;
 mod ip_message;
 mod local_message;
 mod locks;
@@ -73,6 +75,7 @@ enum ByteOperation {
     Plain,
     Message(Arc<local_message::AcceptedMessage>),
     Signal(Arc<signal_read::SignalRead>),
+    Tcp(Arc<trames_vfs::DirectTcpFd>),
 }
 impl RetainedByte {
     fn message(&self) -> Option<&Arc<local_message::AcceptedMessage>> {
@@ -111,6 +114,15 @@ impl PendingIo {
     pub fn tcp_liveness(&self) -> Option<trames_net::TcpLease> {
         self.native_tcp
             .as_ref()
+            .or_else(|| {
+                self.retained_byte.as_ref().and_then(|file| {
+                    if let ByteOperation::Tcp(tcp) = &file.operation {
+                        Some(&**tcp)
+                    } else {
+                        None
+                    }
+                })
+            })
             .map(|fd| fd.tcp.retain().expect("accepted TCP transport"))
     }
     pub fn native_wait_fds(&self) -> Vec<trames_vfs::HostFd> {
@@ -773,7 +785,9 @@ impl DirectSyscalls {
             return matches!(number, 63..=66);
         }
         if let Some(fd) = self.descriptors.get(fd) {
-            return Self::supports_fd(number, &fd) || matches!(number, 63..=66) && fd.is_netlink();
+            if Self::supports_fd(number, &fd) || matches!(number, 63..=66) && fd.is_netlink() {
+                return true;
+            }
         }
         matches!(number, 63..=66) && self.raw_ip_socket(fd).is_some()
     }
@@ -817,6 +831,33 @@ impl DirectSyscalls {
         args: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
+        if let Some(paths) = self
+            .paths
+            .as_ref()
+            .filter(|_| matches!(number, 28 | 86 | 87))
+        {
+            let result = paths.fd_control(args[0] as u32, |vfs, alias| {
+                if number == 28 {
+                    return vfs.inotify_remove(alias, args[1] as i32).map(|()| 0);
+                }
+                let timer = vfs.timerfd_resource(alias)?;
+                crate::timer::timerfd_control_with_boot(
+                    &timer,
+                    number,
+                    args,
+                    memory,
+                    self.started.unwrap_or_else(Instant::now),
+                    self.boot_clock,
+                )
+            })?;
+            self.completed.set(self.completed.get() + 1);
+            if number == 28 {
+                self.record_fd_control();
+            } else {
+                self.timer_completed.set(self.timer_completed.get() + 1);
+            }
+            return Some(result);
+        }
         // Acceptance, type validation, execution and accounting use one OFD.
         // Another CLONE_FILES task may close or replace its numeric slot.
         let fd = self.descriptors.get(args[0] as u32)?;
@@ -842,6 +883,12 @@ impl DirectSyscalls {
         std::mem::swap(&mut *self.scratch.borrow_mut(), buffer);
     }
     pub fn supports_call(&self, number: u32, args: [u64; 6]) -> bool {
+        if matches!(number, 28 | 86 | 87) && self.paths.is_some() {
+            return true;
+        }
+        if matches!(number, 22 | 441) && self.descriptors.has_membership() {
+            return true;
+        }
         if crate::file_advice::entry(number) {
             return self.paths.is_some();
         }
@@ -1498,7 +1545,7 @@ impl DirectSyscalls {
         ))
     }
     fn retain_byte(&self, number: u32, args: [u64; 6]) -> Option<Result<RetainedByte, Errno>> {
-        if !matches!(number, 29 | 63..=70) {
+        if !matches!(number, 29 | 63..=70 | 286 | 287) {
             return None;
         }
         if number == 29
@@ -1506,10 +1553,37 @@ impl DirectSyscalls {
         {
             return None;
         }
+        if matches!(number, 286 | 287) {
+            if let Err(error) = crate::file_calls::vector_flags(args[5]) {
+                return Some(Err(error));
+            }
+            if args[3] != u64::MAX || number == 287 && args[5] & 6 != 0 && self.paths.is_none() {
+                return None;
+            }
+        }
         let file = match self.membership.as_ref()?.lookup(args[0] as u32)? {
             Ok(file) => file,
             Err(error) => return Some(Err(error)),
         };
+        self.retain_byte_file(number, args, file)
+    }
+    fn retain_byte_file(
+        &self,
+        number: u32,
+        args: [u64; 6],
+        file: trames_vfs::SharedFd,
+    ) -> Option<Result<RetainedByte, Errno>> {
+        if matches!(number, 286 | 287) {
+            if file.file_target().is_some() {
+                return None;
+            }
+            if let Some((fd, tcp)) = self.descriptors.tcp_file(file.clone()) {
+                return Some(Ok(RetainedByte {
+                    fd,
+                    operation: ByteOperation::Tcp(Arc::new(tcp)),
+                }));
+            }
+        }
         let fd = self.descriptors.byte_file(file)?;
         if number == 29 && (!fd.is_pty() || !Self::supports_fd_call(number, args, &fd)) {
             return None;
@@ -1550,6 +1624,7 @@ impl DirectSyscalls {
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
         let wait = accepted.borrow();
+        let revision = wait.epoll_accepted_revision();
         if !self.urings.poll_pump(&wait.poll_resources(), memory) {
             return IoAttempt::WaitCheckpoint(accepted.into());
         }
@@ -1562,7 +1637,6 @@ impl DirectSyscalls {
         }
         let signal = IoSignal::new(pid, target.clone());
         let subscriptions = wait.subscribe(&signal);
-        let revision = wait.epoll_revision();
         let wait = accepted.into();
         self.resume(
             PendingIo {
@@ -1679,14 +1753,14 @@ impl DirectSyscalls {
         original_paths: Option<&trames_vfs::Vfs>,
     ) -> IoAttempt {
         let mut file = file;
-        let result = if matches!(number, 63 | 65)
+        let result = if matches!(number, 63 | 65 | 286)
             && file.fd.is_signalfd()
             && matches!(file.operation, ByteOperation::Plain)
         {
             if let Err(e) = file.fd.check_read_access() {
                 return self.complete_byte(&file, Err(e));
             }
-            let read = match signal_read::SignalRead::prepare(number, args, memory) {
+            let read = match signal_read::SignalRead::prepare(byte_number(number), args, memory) {
                 Ok(r) => r,
                 Err(e) => return self.complete_byte(&file, Err(e)),
             };
@@ -1720,12 +1794,18 @@ impl DirectSyscalls {
         }
         let signal = IoSignal::new(pid, target.clone());
         let subscriptions = file.subscribe(&signal);
+        let deadline = if let ByteOperation::Tcp(tcp) = &file.operation {
+            tcp.timeouts[usize::from(matches!(number, 63 | 65 | 286))]
+                .and_then(|timeout| Instant::now().checked_add(timeout))
+        } else {
+            None
+        };
         self.resume_inner_in(
             PendingIo {
                 aio: None,
                 number,
                 args,
-                deadline: None,
+                deadline,
                 signal,
                 flock: None,
                 record: None,
@@ -1860,9 +1940,17 @@ impl DirectSyscalls {
         if let Some(wait) = &pending.retained_poll {
             let revision = wait.epoll_revision();
             if pending.epoll_revision != revision {
-                pending._subscriptions = wait.subscribe(&pending.signal);
+                let Some(refreshed) = wait.rearm(&self.descriptors) else {
+                    return IoAttempt::WaitCheckpoint(wait.clone());
+                };
+                pending._subscriptions = refreshed.subscribe(&pending.signal);
+                pending.retained_poll = Some(refreshed);
                 pending.poll_uring = None;
                 pending.epoll_revision = revision;
+            } else if wait.dynamic_sources() {
+                // Only generic socket waits have a changing original native
+                // set. Connected TCP/flat event waits keep their subscriptions.
+                pending._subscriptions = wait.subscribe(&pending.signal);
             }
         }
         let mut host_error = None;
@@ -1972,7 +2060,7 @@ impl DirectSyscalls {
         match result {
             Err(Errno(11)) => {
                 if !self.terminal_stop.get()
-                    && ((matches!(pending.number, 63..=66 | 206 | 207 | 210..=212 | 269)
+                    && ((matches!(pending.number, 63..=66 | 206 | 207 | 210..=212 | 269 | 286 | 287)
                         && pending.retained_byte.as_ref().map_or_else(
                             || {
                                 pending.native_tcp.as_ref().map_or_else(
@@ -2114,8 +2202,16 @@ fn socket_flags(number: u32, args: [u64; 6]) -> u32 {
         _ => 0,
     }
 }
+fn byte_number(number: u32) -> u32 {
+    match number {
+        286 => 65,
+        287 => 66,
+        number => number,
+    }
+}
+
 fn signals_pipe(number: u32, args: [u64; 6]) -> bool {
-    matches!(number, 64 | 66)
+    matches!(number, 64 | 66 | 287)
         || matches!(number, 206 | 211 | 269) && socket_flags(number, args) & 0x4000 == 0
 }
 
@@ -2953,7 +3049,7 @@ mod tests {
         assert_eq!(direct.timer_completed(), 0);
     }
     #[test]
-    fn ppoll_mixed_resources_preflight_defer_and_preserve_timeout_and_mask_boundaries() {
+    fn ppoll_mixed_resources_preflight_invalid_fd_and_preserve_timeout_and_mask_boundaries() {
         let mut v = Vfs::default();
         let [r, w] = v.pipe(0).unwrap();
         let event = v.eventfd(1, 0).unwrap();
@@ -2977,7 +3073,8 @@ mod tests {
         }
         let before = m.read_array::<32>(0x1100).unwrap();
         m.write_array(0x1118, 999u32.to_le_bytes()).unwrap();
-        assert_eq!(direct.invoke(73, args, &mut m), None);
+        assert_eq!(direct.invoke(73, args, &mut m), Some(Ok(4)));
+        assert_eq!(m.read_array::<2>(0x111e).unwrap(), 32u16.to_le_bytes());
         assert_eq!(m.read_array::<24>(0x1100).unwrap(), before[..24]);
         assert_eq!(
             direct.invoke(73, [0x1ffc, 1, 0, 0, 0, 0], &mut m),

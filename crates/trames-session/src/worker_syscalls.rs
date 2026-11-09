@@ -756,7 +756,7 @@ impl Snapshot {
         // futex/epoll checkpoint. Ordinary unfiltered calls keep the old path.
         if !matches!(
             cpu.x(8) as u32,
-            25 | 101 | 113..=115 | 124 | 139 | 154..=157 | 163 | 164 | 261 | 166 | 168 | 169 | 172..=179 | 278
+            25 | 92 | 98 | 101 | 113..=115 | 124 | 139 | 154..=157 | 163 | 164 | 261 | 166 | 168 | 169 | 172..=179 | 278
         ) && !(cpu.x(8) as u32 == 29 && matches!(cpu.x(1) as u32, 0x5421 | 0x5452))
             && !(matches!(cpu.x(8) as u32, 160..=162) && self.uts.is_some())
             && !(cpu.x(8) as u32 == 32 && (cpu.x(1) as u32 & 4 != 0 || cpu.x(1) as u32 == 8))
@@ -823,6 +823,7 @@ impl Snapshot {
                 std::array::from_fn(|i| cpu.x(i)),
                 memory,
             ),
+            92 => trames_linux::Linux::personality(cpu.x(0)),
             96 => {
                 self.io_signals.thread_addresses()?.set_clear_tid(cpu.x(0));
                 Ok(self.identities[6])
@@ -852,7 +853,7 @@ impl Snapshot {
                     )
                 })
             }
-            number @ (19 | 20 | 26 | 59 | 74 | 85 | 198 | 199 | 280) => self
+            number @ (19 | 20 | 26 | 59 | 74 | 85 | 198 | 199 | 280 | 425) => self
                 .direct
                 .invoke_creation(number, std::array::from_fn(|i| cpu.x(i)), memory)?,
             number if self.direct.supports_path_query(number) => {
@@ -875,7 +876,9 @@ impl Snapshot {
             number @ (29 | 62..=66 | 73 | 86 | 87 | 116 | 206 | 207 | 210..=212) => self
                 .direct
                 .invoke(number, std::array::from_fn(|i| cpu.x(i)), memory)?,
-            98 if self.futex_queue(cpu) => futex_queue(
+            // Every non-wait futex command shares the canonical validation and
+            // terminal unsupported result; unknown operations are not owner work.
+            98 if !self.futex_wait(cpu) => futex_queue(
                 &self.futex.table,
                 memory,
                 self.futex.vm,

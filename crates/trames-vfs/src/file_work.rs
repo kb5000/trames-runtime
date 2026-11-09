@@ -191,6 +191,27 @@ impl SharedFd {
     pub fn filesystem_target(&self) -> FileTarget {
         FileTarget(self.clone())
     }
+    /// Descriptor kinds whose byte call terminates in the canonical VFS body.
+    /// This grants no signal reader, socket transport or device data provider.
+    pub fn nonbyte_target(&self) -> Option<FileTarget> {
+        (self.open.namespace_resource.is_some()
+            || matches!(
+                &self.open.control,
+                Some(
+                    events::SharedControl::Uring(_)
+                        | events::SharedControl::Bpf(_)
+                        | events::SharedControl::Epoll(_)
+                )
+            )
+            || self.open.node.as_ref().is_some_and(|node| {
+                !node.regular_file
+                    && matches!(
+                        node.borrow().content,
+                        Content::Directory | Content::Symlink(_)
+                    )
+            }))
+        .then(|| self.filesystem_target())
+    }
     pub fn file_target(&self) -> Option<FileTarget> {
         let open = &self.open;
         if open
@@ -310,6 +331,38 @@ impl PreparedOpen {
     }
 }
 impl FileWork {
+    /// Cold non-data descriptors use their canonical ABI body rather than the
+    /// regular-file write specialization. No byte provider or host job is added.
+    pub fn descriptor_reply(
+        paths: &PathQueries,
+        target: FileTarget,
+        mut command: FileCommand,
+    ) -> FileReply {
+        let result = paths.retained_control(target.0, |vfs, fd| command.execute(vfs, fd));
+        Self::descriptor_result(result, &mut command)
+    }
+    pub fn descriptor_owned(
+        vfs: &mut Vfs,
+        target: FileTarget,
+        mut command: FileCommand,
+    ) -> FileReply {
+        let result = vfs.with_uring_fd(&target.0.retained(), |vfs, fd| command.execute(vfs, fd));
+        Self::descriptor_result(result, &mut command)
+    }
+    fn descriptor_result(result: Result<FileValue>, command: &mut FileCommand) -> FileReply {
+        let scratch = match command {
+            FileCommand::Write { bytes, .. } | FileCommand::WriteSync { bytes, .. } => {
+                Some(std::mem::take(bytes))
+            }
+            _ => None,
+        };
+        FileReply {
+            result,
+            file_size_signal: false,
+            scratch,
+        }
+    }
+
     pub fn waiting(&self) -> bool {
         if self.console_wait().is_some() {
             return !self.ready();

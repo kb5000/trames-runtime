@@ -83,6 +83,7 @@ struct PublishedEpoch;
 pub enum FileAccess {
     Fast(DirectFile),
     Full(FileTarget),
+    Descriptor(FileTarget),
 }
 impl DirectFiles {
     pub fn published(&self, fd: u32) -> bool {
@@ -137,21 +138,36 @@ impl DirectFiles {
     /// Resolve prepared authority for an already accepted shared lookup.
     /// Do not look up its numeric FD again while constructing a request.
     pub fn accept(&self, file: SharedFd) -> Option<DirectFile> {
-        if let Some(prepared) = self.1.get(&file.identity()) {
+        self.accept_or_return(file).ok()
+    }
+    /// Consume the one accepted lookup. A full-path miss returns that same
+    /// original OFD instead of requiring another numeric lookup or Arc clone.
+    pub fn accept_or_return(&self, file: SharedFd) -> std::result::Result<DirectFile, SharedFd> {
+        let (prepared, publication) = if let Some(prepared) = self.1.get(&file.identity()) {
             debug_assert!(prepared.0.origin == file.ofd_identity());
-            return prepared.accept(Some(file));
+            (prepared, None)
+        } else {
+            let Some(publication) = &self.3 else {
+                return Err(file);
+            };
+            let Some(published) = file.open.file_authority.get() else {
+                return Err(file);
+            };
+            if published.epoch.as_ptr() != Arc::as_ptr(&publication.epoch) {
+                return Err(file);
+            }
+            (&published.prepared, Some(publication))
+        };
+        let Some(mut accepted) = prepared.accept(None) else {
+            return Err(file);
+        };
+        if let Some(publication) = publication {
+            accepted.clear_setid = publication.clear_setid;
+            accepted.unlimited = publication.unlimited;
+            accepted.prepared.1 = publication.limit.clone();
         }
-        let publication = self.3.as_ref()?;
-        let published = file.open.file_authority.get()?;
-        if published.epoch.as_ptr() != Arc::as_ptr(&publication.epoch) {
-            return None;
-        }
-        let prepared = published.prepared.clone();
-        let mut accepted = prepared.accept(Some(file))?;
-        accepted.clear_setid = publication.clear_setid;
-        accepted.unlimited = publication.unlimited;
-        accepted.prepared.1 = publication.limit.clone();
-        Some(accepted)
+        accepted.file = Some(file);
+        Ok(accepted)
     }
     /// Cold preparation of fixed or already-accepted io_uring descriptions.
     pub fn retain(&self, file: &RetainedFd) -> Option<DirectFile> {

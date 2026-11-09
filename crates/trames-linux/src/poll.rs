@@ -43,16 +43,13 @@ impl Entry {
     }
     fn ready(
         &self,
-        joined: bool,
+        _joined: bool,
         owner: &mut impl FnMut(u32, &OfdIdentity, u16) -> Result<u16, Errno>,
     ) -> Result<u16, Errno> {
         Ok(match &self.source {
             Source::Ignored => 0,
             Source::Invalid => 32,
             Source::Owner(id) => owner(self.fd, id, self.events)?,
-            Source::Direct(fd) if joined && !fd.retains_ofd() => {
-                owner(self.fd, &fd.ofd_identity(), self.events)?
-            }
             Source::Direct(fd) => fd.poll_ready(self.events).expect("pollable resource"),
         })
     }
@@ -109,10 +106,12 @@ impl Poll {
             let events = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
             let source = if fd < 0 {
                 Source::Ignored
-            } else if let Some(resource) = fds.get(fd as u32).filter(|fd| !fd.is_epoll()) {
-                Source::Direct(resource)
             } else {
-                Source::owner(owner?, fd as u32)
+                match fds.polling(fd as u32) {
+                    Some(Ok(resource)) => Source::Direct(resource),
+                    Some(Err(_)) => Source::Invalid,
+                    None => Source::owner(owner?, fd as u32),
+                }
             };
             entries.push(Entry {
                 address: address + 6,
@@ -173,17 +172,38 @@ impl Poll {
         self.entries
             .iter()
             .filter_map(|entry| match &entry.source {
-                Source::Direct(fd) if entry.events & 1 != 0 => fd.next_deadline(),
+                Source::Direct(fd) => fd.poll_deadline(entry.events),
                 _ => None,
             })
             .min()
     }
 }
+fn revisions<'a>(fds: impl Iterator<Item = &'a DirectFd>, accepted: bool) -> Option<u64> {
+    let mut result = None;
+    for fd in fds {
+        let revision = if accepted {
+            fd.epoll_accepted_revision()
+        } else {
+            fd.epoll_revision()
+        };
+        if let Some(revision) = revision {
+            result = Some(result.unwrap_or(0u64).wrapping_add(revision));
+        }
+    }
+    result
+}
 impl RetainedPoll {
-    pub(crate) fn fully_retained(&self) -> bool {
+    pub(crate) fn dynamic_sources(&self) -> bool {
+        self.0.direct().any(DirectFd::dynamic_poll_sources)
+    }
+    pub(crate) fn epoll_revision(&self, accepted: bool) -> Option<u64> {
+        revisions(self.0.direct(), accepted)
+    }
+
+    pub(crate) fn fully_bound(&self) -> bool {
         self.0.entries.iter().all(|entry| match &entry.source {
             Source::Ignored | Source::Invalid => true,
-            Source::Direct(fd) => fd.retains_ofd(),
+            Source::Direct(_) => true,
             Source::Owner(_) => false,
         })
     }
@@ -237,7 +257,6 @@ impl RetainedPoll {
             .iter()
             .filter_map(|entry| match &entry.source {
                 Source::Owner(id) => Some((entry.fd, id.clone())),
-                Source::Direct(fd) if !fd.retains_ofd() => Some((entry.fd, fd.ofd_identity())),
                 _ => None,
             })
             .collect()
@@ -246,7 +265,7 @@ impl RetainedPoll {
         fds.shares_with(self.0.direct())
     }
     pub(crate) fn rearm(&self, fds: &DirectFds) -> Option<Self> {
-        if self.fully_retained() {
+        if self.fully_bound() && self.epoll_revision(true) == self.epoll_revision(false) {
             return Some(self.clone());
         }
         let entries = self
@@ -256,17 +275,12 @@ impl RetainedPoll {
             .cloned()
             .map(|mut entry| {
                 match &entry.source {
-                    Source::Owner(id) => {
-                        let fresh = fds
-                            .get(entry.fd)
-                            .filter(|fd| !fd.is_epoll() && &fd.ofd_identity() == id)?;
-                        entry.source = Source::Direct(fresh);
+                    Source::Direct(fd) if fd.is_epoll() => {
+                        entry.source = Source::Direct(fd.refresh_epoll()?);
                     }
-                    Source::Direct(old) if !old.retains_ofd() => {
-                        entry.source = fds
-                            .get(entry.fd)
-                            .filter(|fd| fd.ofd_identity() == old.ofd_identity())
-                            .map_or(Source::Invalid, Source::Direct);
+                    Source::Owner(id) => {
+                        let fresh = fds.get(entry.fd).filter(|fd| &fd.ofd_identity() == id)?;
+                        entry.source = Source::Direct(fresh);
                     }
                     _ => {}
                 }
@@ -297,6 +311,16 @@ impl RetainedPoll {
     }
 }
 impl RetainedSelect {
+    pub(crate) fn dynamic_sources(&self) -> bool {
+        self.sets
+            .iter()
+            .flat_map(|set| set.entries.iter())
+            .any(|entry| matches!(&entry.source, Source::Direct(fd) if fd.dynamic_poll_sources()))
+    }
+    pub(crate) fn epoll_revision(&self, accepted: bool) -> Option<u64> {
+        revisions(self.direct(), accepted)
+    }
+
     pub(crate) fn same_capture(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.sets, &other.sets)
     }
@@ -354,17 +378,10 @@ impl RetainedSelect {
             for fd in
                 (0..args[0] as u32).filter(|fd| bits[*fd as usize / 8] & (1 << (*fd % 8)) != 0)
             {
-                let source = if let Some(resource) = fds.get(fd).filter(|fd| !fd.is_epoll()) {
-                    Source::Direct(resource)
-                } else if let Some(vfs) = owner {
-                    Source::owner(vfs, fd)
-                } else if fds
-                    .shared_files()
-                    .is_some_and(|files| files.lookup(fd).is_some_and(|f| f.is_err()))
-                {
-                    Source::Invalid
-                } else {
-                    return None;
+                let source = match fds.polling(fd) {
+                    Some(Ok(resource)) => Source::Direct(resource),
+                    Some(Err(_)) => Source::Invalid,
+                    None => Source::owner(owner?, fd),
                 };
                 entries.push(Entry {
                     address: 0,
@@ -404,10 +421,9 @@ impl RetainedSelect {
     }
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
         self.entries()
-            .filter(|e| e.events & 1 != 0)
             .filter_map(|e| {
                 if let Source::Direct(fd) = &e.source {
-                    fd.next_deadline()
+                    fd.poll_deadline(e.events)
                 } else {
                     None
                 }
@@ -437,10 +453,14 @@ impl RetainedSelect {
         fds.shares_with(self.direct())
     }
     pub(crate) fn rearm(&self, fds: &DirectFds) -> Option<Self> {
-        if self.entries().all(|e| {
-            matches!(&e.source,Source::Direct(fd) if fd.retains_ofd())
-                || matches!(e.source, Source::Invalid | Source::Ignored)
-        }) {
+        if self.epoll_revision(true) == self.epoll_revision(false)
+            && self.entries().all(|e| {
+                matches!(
+                    e.source,
+                    Source::Direct(_) | Source::Invalid | Source::Ignored
+                )
+            })
+        {
             return Some(self.clone());
         }
         let sets = self
@@ -452,16 +472,19 @@ impl RetainedSelect {
                     .iter()
                     .cloned()
                     .map(|mut e| {
+                        if let Source::Direct(fd) = &e.source {
+                            if fd.is_epoll() {
+                                e.source = Source::Direct(fd.refresh_epoll()?);
+                                return Some(e);
+                            }
+                        }
                         let id = match &e.source {
                             Source::Owner(id) => Some(id.clone()),
-                            Source::Direct(fd) if !fd.retains_ofd() => Some(fd.ofd_identity()),
                             _ => None,
                         };
                         if let Some(id) = id {
-                            e.source = Source::Direct(
-                                fds.get(e.fd)
-                                    .filter(|fd| !fd.is_epoll() && fd.ofd_identity() == id)?,
-                            );
+                            e.source =
+                                Source::Direct(fds.get(e.fd).filter(|fd| fd.ofd_identity() == id)?);
                         }
                         Some(e)
                     })
