@@ -1745,6 +1745,13 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                     // Withdraw before requesting a checkpoint: this worker is
                     // already out of guest code and must not kick its next job.
                     drop(execution_guard);
+                    if let Some(epoch) = epoch.as_ref().filter(|epoch| epoch.source_lifecycle()) {
+                        match &outcome {
+                            None => epoch.fail_execution(crate::RuntimeError::Arguments("CPU worker panicked")),
+                            Some(SliceOutcome::Fault(trames_engine::CpuFault::Host(error))) => epoch.fail_execution(crate::RuntimeError::Backend(error.clone())),
+                            _ => {}
+                        }
+                    }
                     // Reuse credits across native returns. Refund only when this
                     // assignment ends, avoiding a global RMW pair per libc call.
                     work.control.remaining.fetch_add(credit, Ordering::Relaxed);

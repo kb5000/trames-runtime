@@ -260,6 +260,17 @@ impl Dispatch {
         );
         job.pending_cpu = p.pending_cpu.take();
         job.pending_accounted = job.pending_cpu.is_some();
+        if matches!(job.pending_cpu, Some(SliceOutcome::Syscall { .. })) {
+            if let Some(entry) = p.seccomp_entry.take() {
+                job.work
+                    .syscalls
+                    .as_mut()
+                    .expect("source policy")
+                    .seccomp
+                    .restore_entry(&entry, &job.work.cpu);
+                job.seccomp_entry = Some(entry);
+            }
+        }
         if let State::Gpu {
             job: compile,
             pc,

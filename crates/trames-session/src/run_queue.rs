@@ -1321,6 +1321,13 @@ impl<C: Cpu> Epoch<C> {
     }
     /// Terminal host failure. Keep the first cause and drain original actors;
     /// never reinterpret it as a missing guest operation or owner retry.
+    pub(crate) fn fail_execution(&self, error: crate::RuntimeError) {
+        self.lifecycle
+            .get()
+            .expect("source execution lifecycle")
+            .host_error(error);
+        self.fail();
+    }
     pub fn fail_host_io(&self, error: std::io::Error) {
         let _ = self.host_error.set(Arc::new(error));
         self.fail();

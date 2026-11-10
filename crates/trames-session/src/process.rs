@@ -116,6 +116,11 @@ enum State {
     },
     Zombie(i32),
 }
+pub(super) struct Continuation {
+    outcome: Option<SliceOutcome>,
+    policy: seccomp::Seccomp,
+    entry: Option<seccomp::EntryDecision>,
+}
 pub(crate) struct Process<C: Cpu> {
     cpu: C,
     pending_cpu: Option<SliceOutcome>,
@@ -4695,8 +4700,14 @@ pub(super) fn run<C: Cpu>(
             .expect("initial task slot")
             .into_presence(),
     );
+    let (pending_cpu, policy, entry) = if let Some(continuation) = runtime.continuation.take() {
+        let (policy, entry) = continuation.policy.resume_binding(continuation.entry);
+        (continuation.outcome, policy, entry)
+    } else {
+        (None, seccomp::Seccomp::default(), None)
+    };
     let mut root = Process::<C> {
-        pending_cpu: runtime.continuation.take(),
+        pending_cpu,
         trace: Default::default(),
         cpu: std::mem::take(&mut runtime.cpu),
         last_cpu: 0,
@@ -4741,8 +4752,8 @@ pub(super) fn run<C: Cpu>(
         membarrier_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         limits,
         oom: Arc::new(trames_vfs::OomTask::default()),
-        seccomp: seccomp::Seccomp::default(),
-        seccomp_entry: None,
+        seccomp: policy,
+        seccomp_entry: entry,
     };
     root.signals
         .io
@@ -4940,7 +4951,11 @@ pub(super) fn run<C: Cpu>(
     if let Some(p) = kernel.processes.remove(&1) {
         let p = p.into_inner();
         runtime.cpu = p.cpu;
-        runtime.continuation = p.pending_cpu;
+        runtime.continuation = Some(Continuation {
+            outcome: p.pending_cpu,
+            policy: p.seccomp,
+            entry: p.seccomp_entry,
+        });
         runtime.memory = p.memory;
         runtime.linux = p.linux;
     }

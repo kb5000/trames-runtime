@@ -173,7 +173,7 @@ impl From<MemoryError> for RuntimeError {
 
 pub use trames_vulkan::Display as VulkanDisplay;
 pub struct Runtime<C: Cpu> {
-    continuation: Option<trames_engine::SliceOutcome>,
+    continuation: Option<process::Continuation>,
     pub memory_limits: MemoryLimits,
     pub vulkan_display: VulkanDisplay,
     pub cpu: C,

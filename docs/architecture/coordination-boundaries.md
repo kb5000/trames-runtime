@@ -4514,7 +4514,9 @@ original mm metadata, cancels accepted requests where appropriate and shuts down
 root networking on normal completion. The caller collects diagnostics and flushes
 host output; it does not execute an unfinished SVC/native operation or perform
 source retirement. Budget continuations retain accepted CPU traps without
-re-accounting their retired instructions.
+re-accounting their retired instructions. The retained policy and original BPF
+entry decision are rebound with the root rather than re-evaluating an accepted
+call against a later filter publication.
 
 The connected native ownership dependency is also removed: context retirement
 no longer blocks on an unrelated active GPU lease. The original resource keeps

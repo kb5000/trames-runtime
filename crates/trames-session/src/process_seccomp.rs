@@ -112,6 +112,28 @@ impl Seccomp {
         current.entry_value = None;
         current
     }
+    /// Runtime::run rebinds its retained root to a fresh session directory.
+    /// Keep the original policy and accepted decision, with a new task binding.
+    pub(super) fn resume_binding(
+        &self,
+        mut entry: Option<EntryDecision>,
+    ) -> (Self, Option<EntryDecision>) {
+        let policy = self.uncaptured().fork();
+        if let Some(entry) = &mut entry {
+            assert!(Arc::ptr_eq(&entry.policy, &self.original));
+            entry.policy = policy.original.clone();
+        }
+        (policy, entry)
+    }
+    pub(super) fn restore_entry<C: trames_engine::Cpu>(&mut self, entry: &EntryDecision, cpu: &C) {
+        assert!(Arc::ptr_eq(&entry.policy, &self.original));
+        assert_eq!(
+            (entry.number, entry.pc, entry.args),
+            (cpu.x(8) as u32, cpu.pc(), std::array::from_fn(|i| cpu.x(i)))
+        );
+        self.capture_entry();
+        self.entry_value = Some(entry.value);
+    }
     pub(super) fn bind(&self, task: &Arc<trames_kernel::signal::IoTask>, pid: u32) {
         let binding = self.original.binding.get_or_init(|| Binding {
             task: Arc::downgrade(task),
@@ -820,6 +842,22 @@ impl<C: Cpu> Kernel<C> {
 
 #[cfg(all(test, trames_interpreter_conformance))]
 mod tests {
+    #[test]
+    fn resumed_root_keeps_current_policy_and_original_entry_with_a_fresh_task_binding() {
+        let mut policy = Seccomp::default();
+        let entry = policy.entry_decision(172, 0x4004, [0; 6]);
+        policy.push(Arc::new(
+            Filter::validate(vec![i(6, 0, 0, 0x50007)]).unwrap(),
+        ));
+        let (next, entry) = policy.resume_binding(Some(entry));
+        assert!(!Arc::ptr_eq(&policy.original, &next.original));
+        assert!(next.original.binding.get().is_none());
+        assert_eq!(
+            entry.unwrap().value_for(&next, 172, 0x4004, [0; 6]),
+            Some(ALLOW)
+        );
+        assert_eq!(next.decision(172, 0x4004, [0; 6]), 0x50007);
+    }
     #[test]
     fn entropy_fd_controls_preserve_access_and_policy_without_owner_fallback() {
         for path in [b"/dev/random".as_slice(), b"/dev/urandom"] {
