@@ -42,6 +42,7 @@ impl<C: Cpu> Handle<C> {
     }
     /// Existing joined collection may wait for the object it is collecting.
     /// Source executors must continue to use nonblocking try_admit instead.
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub fn collect_admission(&self) -> Admission<C> {
         Admission {
             _permit: self.0.write_owned().into_admission(),
@@ -433,6 +434,7 @@ impl<C: Cpu> Table<C> {
     pub fn get(&self, id: &u32) -> Option<Read<C>> {
         self.directory.read_entry(*id, &self.handle(id)?)
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub fn get_mut(&self, id: &u32) -> Option<Write<C>> {
         self.directory.write_entry(*id, &self.handle(id)?)
     }
@@ -449,6 +451,7 @@ impl<C: Cpu> Table<C> {
     pub fn insert(&mut self, id: u32, process: impl Install<C>) -> Option<Write<C>> {
         process.install(self, id)
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub fn checkout(&self, id: &u32) -> Option<Checkout<C>> {
         let task = self.handle(id)?;
         let value = self.directory.write_entry(*id, &task)?;
@@ -467,12 +470,15 @@ impl<C: Cpu> Table<C> {
             .remove_original(*id, &task.0)
             .then_some(value)
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub fn contains_key(&self, id: &u32) -> bool {
         self.handle(id).is_some()
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub fn keys(&self) -> impl Iterator<Item = u32> {
         self.entries().map(|(id, _)| id)
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub fn len(&self) -> usize {
         let members = self.directory.0.lock();
         members.tasks.len()
@@ -507,6 +513,7 @@ impl<C: Cpu> Table<C> {
         self.entries()
             .filter_map(move |(id, task)| directory.write_entry(id, &task).map(|body| (id, body)))
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub fn retain(&mut self, mut retain: impl FnMut(&u32, &Process<C>) -> bool) {
         for (id, task) in self.entries() {
             if let Some(body) = self.directory.read_entry(id, &task) {
@@ -518,23 +525,27 @@ impl<C: Cpu> Table<C> {
     }
 }
 
+#[cfg(all(test, trames_interpreter_conformance))]
 pub(super) struct Checkout<C: Cpu> {
     value: Option<Write<C>>,
     directory: Directory<C>,
     id: u32,
     excluded: std::rc::Rc<RefCell<std::collections::BTreeSet<u32>>>,
 }
+#[cfg(all(test, trames_interpreter_conformance))]
 impl<C: Cpu> Deref for Checkout<C> {
     type Target = Process<C>;
     fn deref(&self) -> &Process<C> {
         self.value.as_ref().expect("scoped original task")
     }
 }
+#[cfg(all(test, trames_interpreter_conformance))]
 impl<C: Cpu> DerefMut for Checkout<C> {
     fn deref_mut(&mut self) -> &mut Process<C> {
         self.value.as_mut().expect("scoped original task")
     }
 }
+#[cfg(all(test, trames_interpreter_conformance))]
 impl<C: Cpu> Drop for Checkout<C> {
     fn drop(&mut self) {
         if let Some(value) = self.value.take() {
@@ -564,6 +575,7 @@ impl<C: Cpu> Install<C> for Write<C> {
             .map(|task| task.write())
     }
 }
+#[cfg(all(test, trames_interpreter_conformance))]
 impl<C: Cpu> Install<C> for Checkout<C> {
     fn install(mut self, table: &Table<C>, id: u32) -> Option<Write<C>> {
         assert!(

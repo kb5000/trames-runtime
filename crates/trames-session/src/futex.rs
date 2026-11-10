@@ -58,6 +58,7 @@ struct Ready {
     tickets: VecDeque<Arc<Ticket>>,
     waiting: Vec<ReadyWait>,
     source: Option<ReadySource>,
+    #[cfg(all(test, trames_interpreter_conformance))]
     owner: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 struct ReadyWait {
@@ -77,20 +78,25 @@ impl ReadySource {
 }
 enum Notify {
     Source(Arc<trames_shared::IoSignal>),
+    #[cfg(all(test, trames_interpreter_conformance))]
     Owner(Arc<dyn Fn() + Send + Sync>),
 }
 impl Ready {
     fn notifier(&self) -> Option<Notify> {
-        self.source
+        let target = self
+            .source
             .as_ref()
             .and_then(ReadySource::active)
-            .map(Notify::Source)
-            .or_else(|| self.owner.clone().map(Notify::Owner))
+            .map(Notify::Source);
+        #[cfg(all(test, trames_interpreter_conformance))]
+        let target = target.or_else(|| self.owner.clone().map(Notify::Owner));
+        target
     }
 }
 fn notify(target: Option<Notify>) {
     match target {
         Some(Notify::Source(signal)) => signal.notify(),
+        #[cfg(all(test, trames_interpreter_conformance))]
         Some(Notify::Owner(wake)) => wake(),
         None => {}
     }
@@ -188,6 +194,7 @@ fn shard((a, b, c): Key) -> usize {
     ((a ^ b.rotate_left(17) ^ (c >> 2) ^ (c >> 12)) as usize) & (SHARDS - 1)
 }
 impl Futexes {
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub fn wait<E>(
         &self,
         key: Key,
@@ -275,9 +282,11 @@ impl Futexes {
         }
         Effect { woken, moved }
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub fn take_ready(&self, out: &mut Vec<Arc<Ticket>>) {
         out.extend(self.take_for(None));
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub fn bind_owner(&self, wake: Arc<dyn Fn() + Send + Sync>) {
         self.0.ready.lock().unwrap().owner = Some(wake);
     }

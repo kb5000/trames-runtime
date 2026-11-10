@@ -278,8 +278,9 @@ fn sysinfo_and_live_cpu_statistics_keep_four_twelve_and_one_slot_cohorts() {
         fn source_console(&mut self) -> Arc<dyn trames_vfs::ConsoleIo> {
             Arc::new(trames_vfs::CapturedConsole::default())
         }
-        fn control_poll_interval(&self) -> Duration {
-            Duration::from_millis(1)
+        fn host_interest(&mut self, wait: &mut trames_linux::HostWait) -> std::io::Result<()> {
+            wait.until(std::time::Instant::now() + Duration::from_millis(1));
+            Ok(())
         }
         fn poll_host(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<trames_linux::HostState> {
             let info = ProcSource::observe(

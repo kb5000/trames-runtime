@@ -2,20 +2,26 @@
 //! Exit resource completion uses original task/mm readiness. Other CPUs keep
 //! running; owner-local projections do not require a whole-cohort checkpoint.
 use super::*;
-use crate::workers::{Done, Event};
+#[cfg(all(test, trames_interpreter_conformance))]
+use crate::workers::Done;
+#[cfg(all(test, trames_interpreter_conformance))]
+use crate::workers::Event;
 use trames_kernel::task_control::Group;
 
 #[derive(Default)]
 pub(super) struct Retirements {
     groups: BTreeMap<usize, Arc<Group>>,
+    #[cfg(all(test, trames_interpreter_conformance))]
     waits: BTreeMap<u32, Wait>,
     pub(super) memory: Arc<crate::retired_memory::RetiredMemory>,
 }
 impl Retirements {
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn waiting(&self, pid: u32) -> bool {
         self.waits.contains_key(&pid)
     }
 }
+#[cfg(all(test, trames_interpreter_conformance))]
 struct Wait {
     task: Arc<trames_kernel::signal::IoTask>,
     status: i32,
@@ -23,26 +29,35 @@ struct Wait {
     _subscriptions: Vec<trames_vfs::IoSubscription>,
     _target: Arc<dyn trames_vfs::IoWake>,
 }
+#[cfg(all(test, trames_interpreter_conformance))]
 struct Wake<C: Cpu> {
     events: std::sync::mpsc::Sender<Event<C>>,
+    #[cfg(all(test, trames_interpreter_conformance))]
     owner: std::thread::Thread,
 }
+#[cfg(all(test, trames_interpreter_conformance))]
 impl<C: Cpu> trames_vfs::IoWake for Wake<C> {
     fn wake_io(&self, _: &Arc<trames_vfs::IoSignal>) {
+        #[cfg(all(test, trames_interpreter_conformance))]
         let _ = self.events.send(Event::Retired);
+        #[cfg(all(test, trames_interpreter_conformance))]
         self.owner.unpark();
     }
 }
 impl<C: Cpu> Kernel<C> {
     pub(super) fn memory_retirements(&self) -> Arc<crate::retired_memory::RetiredMemory> {
+        #[cfg(all(test, trames_interpreter_conformance))]
         self.exits.memory.bind_owner(|| {
             Arc::new(Wake {
                 events: self.workers.events(),
+                #[cfg(all(test, trames_interpreter_conformance))]
+                #[cfg(all(test, trames_interpreter_conformance))]
                 owner: std::thread::current(),
             })
         });
         self.exits.memory.clone()
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn retire_detached_memory(
         &mut self,
         memory: Memory,
@@ -55,6 +70,7 @@ impl<C: Cpu> Kernel<C> {
             .entry(Arc::as_ptr(&group) as usize)
             .or_insert(group);
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn accept_source_return(&mut self, mut done: Done<C>) -> Result<(), RuntimeError> {
         let status = done.thread_exit.expect("accepted source exit");
         for group in std::mem::take(&mut done.exit_groups) {
@@ -76,6 +92,7 @@ impl<C: Cpu> Kernel<C> {
         }
         self.begin_source_projection(pid, status)
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn wait_exit_memory(&mut self, pid: u32, status: i32) {
         if self.exits.waits.contains_key(&pid) {
             return;
@@ -83,6 +100,7 @@ impl<C: Cpu> Kernel<C> {
         let p = &self.processes.read(&pid);
         let target: Arc<dyn trames_vfs::IoWake> = Arc::new(Wake {
             events: self.workers.events(),
+            #[cfg(all(test, trames_interpreter_conformance))]
             owner: std::thread::current(),
         });
         let signal = trames_vfs::IoSignal::new(pid, Arc::downgrade(&target));
@@ -98,6 +116,7 @@ impl<C: Cpu> Kernel<C> {
             },
         );
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn begin_source_projection(&mut self, pid: u32, status: i32) -> Result<(), RuntimeError> {
         {
             let p = &mut *self.processes.get_mut(&pid).expect("returned task");
@@ -110,6 +129,7 @@ impl<C: Cpu> Kernel<C> {
         }
         self.finish_source_memory(pid, status)
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn finish_source_memory(&mut self, pid: u32, status: i32) -> Result<(), RuntimeError> {
         let borrowed = {
             let p = &self.processes.read(&pid);
@@ -158,6 +178,7 @@ impl<C: Cpu> Kernel<C> {
         }
         Ok(())
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn retire_cold_task(
         &mut self,
         pid: u32,
@@ -228,6 +249,7 @@ impl<C: Cpu> Kernel<C> {
         self.resume_futex_ready();
         self.begin_source_projection(pid, status)
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn process_exits(
         &mut self,
         epoch: Option<&crate::run_queue::Epoch<C>>,

@@ -125,7 +125,14 @@ impl NativeTerminals {
         }
         result
     }
-    pub fn pump(&mut self, channels: &mut BTreeMap<u64, Channel>) {
+    pub fn subscribe(&self, signal: &Arc<trames_vfs::IoSignal>) -> Vec<trames_vfs::IoSubscription> {
+        self.masters
+            .values()
+            .map(|master| master.pair.subscribe(signal))
+            .collect()
+    }
+    pub fn pump(&mut self, channels: &mut BTreeMap<u64, Channel>) -> bool {
+        let before = self.masters.len();
         for (&id, channel) in channels.iter_mut() {
             if !self.masters.contains_key(&id) && channel.phase == "starting" {
                 let (rows, columns) = channel.size.take().unwrap_or((24, 80));
@@ -193,6 +200,7 @@ impl NativeTerminals {
             }
             true
         });
+        self.masters.len() != before
     }
 }
 

@@ -34,16 +34,23 @@ pub(super) fn fault_info(fault: &trames_engine::CpuFault) -> Option<trames_kerne
     })
 }
 
-use trames_linux::{execution_io::Output as GuestOutput, HostState, Linux, SyscallOutcome};
+#[cfg(all(test, trames_interpreter_conformance))]
+use trames_linux::SyscallOutcome;
+use trames_linux::{execution_io::Output as GuestOutput, HostState, Linux};
 use trames_memory::{Access, Memory};
 use trames_vfs::capabilities;
-use trames_vfs::{Errno, FdKind, AT_FDCWD, MAX_FDS, O_NONBLOCK};
+#[cfg(all(test, trames_interpreter_conformance))]
+use trames_vfs::FdKind;
+use trames_vfs::{Errno, AT_FDCWD};
+#[cfg(all(test, trames_interpreter_conformance))]
+use trames_vfs::{MAX_FDS, O_NONBLOCK};
 
 #[cfg(all(test, trames_interpreter_conformance))]
 const MAX_PROCESSES: usize = trames_vfs::MAX_TASKS;
 #[cfg(all(test, trames_interpreter_conformance))]
 const TOTAL_MAPPED_LIMIT: usize = 1024 * 1024 * 1024;
 use trames_kernel::scheduling::assign_cpus;
+#[cfg(all(test, trames_interpreter_conformance))]
 pub(crate) use trames_kernel::signal::UNBLOCKABLE;
 #[path = "process_birth.rs"]
 mod birth;
@@ -159,6 +166,7 @@ pub(crate) struct Process<C: Cpu> {
     cpu_time: Duration,
     vm_id: u64,
     space: crate::space::Native,
+    #[cfg(all(test, trames_interpreter_conformance))]
     rekey: Option<u32>,
     membarrier_registered: Arc<std::sync::atomic::AtomicBool>,
     limits: Arc<trames_kernel::limits::Limits>,
@@ -570,6 +578,7 @@ impl<C: Cpu> Process<C> {
             } else {
                 Default::default()
             },
+            #[cfg(all(test, trames_interpreter_conformance))]
             rekey: None,
             membarrier_registered: Arc::new(std::sync::atomic::AtomicBool::new(
                 self.membarrier_registered
@@ -626,7 +635,9 @@ struct ProcMaps {
 // Joined shared resources notify through guest execution or a worker. Timers
 // also resume at the accepted wait's deadline. Host-backed resources retain
 // their host event path.
+#[cfg(all(test, trames_interpreter_conformance))]
 struct JoinedByteWake(std::thread::Thread);
+#[cfg(all(test, trames_interpreter_conformance))]
 impl trames_vfs::IoWake for JoinedByteWake {
     fn wake_io(&self, _: &Arc<trames_vfs::IoSignal>) {
         self.0.unpark();
@@ -640,6 +651,7 @@ enum ExecutionMode {
 }
 pub(crate) struct Kernel<C: Cpu> {
     host_launches: Arc<host::Launches<C>>,
+    #[cfg(all(test, trames_interpreter_conformance))]
     byte_target: Arc<dyn trames_vfs::IoWake>,
     exits: exit::Retirements,
     layout_work: std::sync::OnceLock<Arc<trames_linux::FileLayouts>>,
@@ -653,6 +665,7 @@ pub(crate) struct Kernel<C: Cpu> {
     completed: Option<Exit>,
     source_completed: bool,
     futexes: crate::futex::Futexes,
+    #[cfg(all(test, trames_interpreter_conformance))]
     futex_ready: Vec<std::sync::Arc<crate::futex::Ticket>>,
     parallel_memory: trames_memory::parallel::Registry,
     parallel_rounds: u64,
@@ -690,6 +703,7 @@ pub(crate) struct Kernel<C: Cpu> {
     disk_reads: u64,
     peak_disk_reads: usize,
     disk_read_bytes: u64,
+    #[cfg(all(test, trames_interpreter_conformance))]
     write_buffer: Vec<u8>,
     serviced_syscalls: u64,
     service_wait: Duration,
@@ -717,7 +731,9 @@ pub(crate) struct Kernel<C: Cpu> {
     proc_maps: RefCell<BTreeMap<u64, ProcMaps>>,
     proc_source: Option<Arc<crate::proc_views::Source>>,
     guest_shutdown: std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(all(test, trames_interpreter_conformance))]
     proc_owner_waits: Vec<proc::ProcReadWait<C>>,
+    host_wait: Option<trames_linux::HostWait>,
     profile_syscalls: bool,
     idle: Duration,
     load: Arc<std::sync::Mutex<crate::proc_views::Load>>,
@@ -749,6 +765,7 @@ fn put_args<C: Cpu>(cpu: &mut C, a: [u64; 6]) {
         cpu.set_x(i, value);
     }
 }
+#[cfg(all(test, trames_interpreter_conformance))]
 fn read_u32(m: &Memory, a: u64) -> Result<u32, Errno> {
     let mut b = [0; 4];
     m.read(a, &mut b).map_err(|_| Errno(14))?;
@@ -761,6 +778,7 @@ fn read_u64(m: &Memory, a: u64) -> Result<u64, Errno> {
 fn write_u32(m: &mut Memory, a: u64, v: u32) -> Result<(), Errno> {
     m.write(a, &v.to_le_bytes()).map_err(|_| Errno(14))
 }
+#[cfg(all(test, trames_interpreter_conformance))]
 fn write_u64(m: &mut Memory, a: u64, v: u64) -> Result<(), Errno> {
     m.write(a, &v.to_le_bytes()).map_err(|_| Errno(14))
 }
@@ -814,6 +832,7 @@ impl<C: Cpu> Kernel<C> {
             self.publish_task(id, p);
         }
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn native_call(
         &mut self,
         p: &mut Process<C>,
@@ -961,12 +980,14 @@ impl<C: Cpu> Kernel<C> {
             fallback: false,
         }))
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn gpu_context(&self, p: &Process<C>) -> trames_vulkan::Context {
         p.gpu_context(&self.gpu_budget, &self.gpu_display)
     }
     fn existing_gpu(p: &Process<C>) -> Option<trames_vulkan::Context> {
         p.space.existing_gpu()
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn resume_gpu(&mut self, pid: u32, p: &mut Process<C>) -> bool {
         let State::Gpu {
             retired,
@@ -1024,6 +1045,7 @@ impl<C: Cpu> Kernel<C> {
         }
         true
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn resource_id(&self) -> u64 {
         self.next_resource
             .try_update(
@@ -1033,6 +1055,7 @@ impl<C: Cpu> Kernel<C> {
             )
             .expect("resource identity overflow")
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn other_memory(&self, vm_id: u64) -> usize {
         let mut spaces = BTreeMap::new();
         for p in self
@@ -1254,6 +1277,7 @@ impl<C: Cpu> Kernel<C> {
             }
         }
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn close_exit_files(&self, p: &mut Process<C>) {
         p.linux.vfs.sync_task_namespaces();
         p.linux.executable_file = None;
@@ -1268,6 +1292,7 @@ impl<C: Cpu> Kernel<C> {
         p.linux.vfs.release_descriptors();
         p.linux.vfs.retire_context();
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn exit_one(&mut self, pid: u32, p: &mut Process<C>, status: i32) {
         if p.family.registry().is_none() {
             birth::Birth::capture(self).publish_family(pid, p);
@@ -1324,6 +1349,7 @@ impl<C: Cpu> Kernel<C> {
         p.retained_poll = None;
         p.linux.executable_file = None;
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn collect_exit_projection(&mut self, pid: u32, p: &mut Process<C>, status: i32) {
         Self::clear_exit_resources(p);
         if p.memory.coordinator_ownership().1 == 1 {
@@ -1356,6 +1382,7 @@ impl<C: Cpu> Kernel<C> {
             p.auto_reap = false;
         }
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn finish_group(&mut self, tgid: u32) {
         if let Some(mut leader) = self.processes.get_mut(&tgid) {
             if let Some(status) = leader.signals.io.lifecycle().exit_status() {
@@ -1372,6 +1399,7 @@ impl<C: Cpu> Kernel<C> {
             }
         }
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn exit(&mut self, pid: u32, p: &mut Process<C>, status: i32) {
         p.signals.io.lifecycle().begin_group_exit(status);
         p.signals.io.begin_exit(pid, status);
@@ -1417,6 +1445,7 @@ impl<C: Cpu> Kernel<C> {
             release.finish();
         }
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn prepare_signal(p: &mut Process<C>, sig: u32, sender: u32) -> bool {
         if sig == 0 || matches!(p.state, State::Zombie(_)) {
             return false;
@@ -1435,6 +1464,7 @@ impl<C: Cpu> Kernel<C> {
         }
         p.signals.should_queue(sig)
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn queue_one(pid: u32, p: &mut Process<C>, sig: u32, sender: u32) {
         if matches!(sig, 9 | 18..=22) {
             p.bind_signals();
@@ -1466,6 +1496,7 @@ impl<C: Cpu> Kernel<C> {
             );
         }
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn may_signal(source: &Process<C>, target: &Process<C>, sig: u32) -> bool {
         let a = &source.linux.vfs.credentials;
         let b = &target.linux.vfs.credentials;
@@ -1475,6 +1506,7 @@ impl<C: Cpu> Kernel<C> {
                 .any(|id| *id == b.uid || *id == b.suid)
             || sig == 18 && source.session() == target.session()
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn thread_signal(
         &mut self,
         pid: u32,
@@ -1549,6 +1581,7 @@ impl<C: Cpu> Kernel<C> {
         }
         Ok(0)
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn signal(
         &mut self,
         pid: u32,
@@ -1650,6 +1683,7 @@ impl<C: Cpu> Kernel<C> {
         }
         Ok(0)
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn synchronous_fault(&mut self, pid: u32, p: &mut Process<C>, fault: &trames_engine::CpuFault) {
         p.linux.vfs.log(
             4,
@@ -1676,6 +1710,7 @@ impl<C: Cpu> Kernel<C> {
             self.exit(pid, p, 11);
         }
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn deliver(&mut self, pid: u32, p: &mut Process<C>) -> Result<bool, Errno> {
         let stopped = p.stopped();
         let selected = p
@@ -1863,6 +1898,7 @@ impl<C: Cpu> Kernel<C> {
         p.state = State::Ready;
         Ok(true)
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn sigreturn(p: &mut Process<C>) -> Result<(), Errno> {
         let mut state = p.cpu.architectural_state();
         let registers = if let Some(config) = p.cpu.sme_config() {
@@ -1883,11 +1919,13 @@ impl<C: Cpu> Kernel<C> {
         p.state = State::Ready;
         Ok(())
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn reap_waited(&mut self) {
         self.families.prune();
         self.processes
             .retain(|id, p| *id != p.tgid || p.signals.presence.present());
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn wait(&mut self, _pid: u32, p: &mut Process<C>, a: [u64; 6]) -> Result<Option<u64>, Errno> {
         let request = trames_kernel::children::Wait::prepare(260, a)?;
         let result = p.children.wait(
@@ -1903,6 +1941,7 @@ impl<C: Cpu> Kernel<C> {
     }
     trames_shared::syscall_dispatch! {
         number number, args a;
+        #[cfg(all(test, trames_interpreter_conformance))]
         fn syscall(
         &mut self,
         pid: u32,
@@ -2350,6 +2389,7 @@ impl<C: Cpu> Kernel<C> {
 
         }
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn call(
         &mut self,
         pid: u32,
@@ -2363,6 +2403,7 @@ impl<C: Cpu> Kernel<C> {
         });
         self.proc_after_call(pid, p, number, a);
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn call_with<I: GuestOutput>(
         &mut self,
         pid: u32,
@@ -2920,6 +2961,7 @@ impl<C: Cpu> Kernel<C> {
             _ => false,
         }
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn readiness(
         &self,
         p: &Process<C>,
@@ -2946,6 +2988,7 @@ impl<C: Cpu> Kernel<C> {
         };
         Ok(ready)
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn poll(
         &mut self,
         p: &mut Process<C>,
@@ -3002,6 +3045,7 @@ impl<C: Cpu> Kernel<C> {
             result.map(Some)
         }
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn terminal_call(
         &mut self,
         pid: u32,
@@ -3061,6 +3105,7 @@ impl<C: Cpu> Kernel<C> {
             },
         ))
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn pump_guest_ptys(&mut self) {
         let pairs = self
             .processes
@@ -3127,6 +3172,7 @@ impl<C: Cpu> Kernel<C> {
             }
         }
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn finish_slice(
         &mut self,
         id: u32,
@@ -3481,6 +3527,7 @@ impl<C: Cpu> Kernel<C> {
         }
         // Product admission captures original actors before any CPU starts.
         // Standalone compatibility fixtures retain their old bounded contract.
+        #[cfg(all(test, trames_interpreter_conformance))]
         if !terminal {
             // Mapping/signal effects precede dispatch. Ready services may take a
             // parked CPU's own View; mapping mutation waits for every CPU to return.
@@ -3649,7 +3696,8 @@ impl<C: Cpu> Kernel<C> {
                 Ok(false)
             };
         }
-        let timeout = self.parallel_timeout().min(io.control_poll_interval());
+        #[cfg(all(test, trames_interpreter_conformance))]
+        let timeout = self.parallel_timeout();
         // Original sleeping actors remain addressable by futexes, deadlines and
         // signals even when no runnable CPU selected their mm. Register their
         // wait metadata now; byte/hardware Views are prepared only on a wake.
@@ -3716,6 +3764,7 @@ impl<C: Cpu> Kernel<C> {
             persistent,
         );
         epoch.bind_session(terminal);
+        epoch.bind_host_wait(io.waits_for_host());
         epoch.bind_timers(self.timers.clone());
         self.publish_io_tasks(None);
         epoch.bind_lifecycle(lifecycle::Lifecycle::capture(self));
@@ -3753,6 +3802,7 @@ impl<C: Cpu> Kernel<C> {
         }
         // No cached connection/policy decision survives into guest execution.
         drop(network_epoch);
+        #[cfg(all(test, trames_interpreter_conformance))]
         let owned_waiters: std::collections::BTreeSet<_> =
             members.iter().map(|(id, _)| *id).collect();
         epoch.assign(&chosen);
@@ -3762,159 +3812,182 @@ impl<C: Cpu> Kernel<C> {
                 .map_err(|_| RuntimeError::Arguments("CPU worker disconnected"))?;
         }
         self.parallel_dispatch_time += began.elapsed();
-        let mut deadline = Instant::now() + timeout;
         let mut stopped = 0;
-        let mut checkpoint_error = None;
-        let mut proc_waits = std::mem::take(&mut self.proc_owner_waits);
-        if let Some(source) = &self.proc_source {
-            let reads = source.take_reads();
-            checkpoint_error = self
-                .activate_proc_reads(Some(&epoch), reads, &mut proc_waits)
-                .err();
-        }
-        loop {
-            if checkpoint_error.is_some() {
-                break;
-            }
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                if !persistent {
-                    break;
-                }
-                match self.cohort_live_control(&epoch, &members, io) {
-                    Ok(false) => {
-                        deadline = Instant::now()
-                            + self
-                                .parallel_timeout_for(Some(&owned_waiters))
-                                .min(io.control_poll_interval())
-                    }
-                    result => {
-                        checkpoint_error = result.err();
-                        break;
-                    }
-                }
-                continue;
-            }
-            match self
-                .workers
-                .event_timeout(left)
-                .map_err(|_| RuntimeError::Arguments("CPU worker failed"))?
+        let mut checkpoint_error;
+        #[cfg(all(test, trames_interpreter_conformance))]
+        let mut proc_waits: Vec<proc::ProcReadWait<C>> = Vec::new();
+        if terminal {
+            checkpoint_error = self.wait_source(&epoch, io).err();
+        } else {
+            #[cfg(all(test, trames_interpreter_conformance))]
             {
-                Some(crate::workers::Event::<C>::EpochStopped(_)) => {
-                    stopped += 1;
-                    break;
+                checkpoint_error = None;
+                let mut deadline = Instant::now() + timeout;
+                proc_waits = std::mem::take(&mut self.proc_owner_waits);
+                if let Some(source) = &self.proc_source {
+                    let reads = source.take_reads();
+                    checkpoint_error = self
+                        .activate_proc_reads(Some(&epoch), reads, &mut proc_waits)
+                        .err();
                 }
-                Some(crate::workers::Event::<C>::Done(_)) => unreachable!("cohort completion"),
-                Some(crate::workers::Event::<C>::Retired) => {
-                    let result = (|| {
-                        for done in epoch.take_retired() {
-                            self.accept_source_return(done)?;
-                        }
-                        self.process_exits(Some(&epoch))
-                    })();
-                    if let Err(error) = result {
-                        checkpoint_error = Some(error);
+                loop {
+                    if checkpoint_error.is_some() {
                         break;
                     }
-                    if self
-                        .processes
-                        .get(&1)
-                        .is_some_and(|p| p.family.status().is_some())
-                    {
-                        break;
-                    }
-                }
-                Some(crate::workers::Event::<C>::VmReady) => {
-                    let mut reads = self
-                        .proc_source
-                        .as_ref()
-                        .map_or_else(Vec::new, |s| s.take_reads());
-                    let mut retries = Vec::new();
-                    let mut index = 0;
-                    while index < proc_waits.len() {
-                        if proc_waits[index].signal.ready() {
-                            let wait = proc_waits.swap_remove(index);
-                            if let Some(checkpoint) = wait.checkpoint {
-                                retries.push(checkpoint);
-                            }
-                            if let Some(report) = wait.report {
-                                reads.push(report);
-                            }
-                        } else {
-                            index += 1;
-                        }
-                    }
-                    if let Err(error) =
-                        self.activate_proc_reads(Some(&epoch), reads, &mut proc_waits)
-                    {
-                        for checkpoint in retries {
-                            epoch.restore_checkpoint(checkpoint, false);
-                        }
-                        checkpoint_error = Some(error);
-                        break;
-                    }
-                    while !control.stopped() {
-                        let Some(checkpoint) = retries.pop().or_else(|| epoch.take_checkpoint())
-                        else {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        if !persistent {
                             break;
-                        };
-                        match self.vm_checkpoint(&epoch, checkpoint, io, &mut proc_waits) {
-                            Ok(true) => {
-                                members =
-                                    epoch.member_ids().into_iter().map(|pid| (pid, 0)).collect();
-                                let launch = (|| {
-                                    for slot in
-                                        epoch.additional_slots(epoch.active_slots(), self.cpu_count)
-                                    {
-                                        self.workers.ensure(slot).map_err(|_| {
-                                            RuntimeError::Arguments("cannot start CPU worker")
-                                        })?;
-                                        self.workers.launch(slot, epoch.clone()).map_err(|_| {
-                                            RuntimeError::Arguments("CPU worker disconnected")
-                                        })?;
-                                    }
-                                    Ok::<_, RuntimeError>(())
-                                })();
-                                if let Err(error) = launch {
-                                    checkpoint_error = Some(error);
-                                    epoch.fail();
-                                    break;
-                                }
+                        }
+                        match self.cohort_live_control(&epoch, &members, io) {
+                            Ok(false) => {
+                                deadline =
+                                    Instant::now() + self.parallel_timeout_for(Some(&owned_waiters))
                             }
                             result => {
                                 checkpoint_error = result.err();
-                                epoch.fail();
                                 break;
                             }
                         }
+                        continue;
                     }
-                    for checkpoint in retries {
-                        epoch.restore_checkpoint(checkpoint, false);
-                    }
-                }
-                Some(crate::workers::Event::<C>::Idle) => {
-                    match self.cohort_live_control(&epoch, &members, io) {
-                        Ok(false) => {}
-                        result => {
-                            checkpoint_error = result.err();
+                    match self
+                        .workers
+                        .event_timeout(left)
+                        .map_err(|_| RuntimeError::Arguments("CPU worker failed"))?
+                    {
+                        Some(crate::workers::Event::<C>::EpochStopped(_)) => {
+                            stopped += 1;
                             break;
                         }
-                    }
-                    if !io.waits_for_host()
-                        && !self
-                            .processes
-                            .get(&1)
-                            .is_some_and(|p| p.linux.vfs.has_native_services())
-                        && epoch.idle()
-                    {
-                        if terminal {
-                            epoch.fail_execution(RuntimeError::Deadlock);
+                        Some(crate::workers::Event::<C>::Done(_)) => {
+                            unreachable!("cohort completion")
                         }
-                        break;
+                        Some(crate::workers::Event::<C>::Retired) => {
+                            let result = (|| {
+                                for done in epoch.take_retired() {
+                                    self.accept_source_return(done)?;
+                                }
+                                self.process_exits(Some(&epoch))
+                            })();
+                            if let Err(error) = result {
+                                checkpoint_error = Some(error);
+                                break;
+                            }
+                            if self
+                                .processes
+                                .get(&1)
+                                .is_some_and(|p| p.family.status().is_some())
+                            {
+                                break;
+                            }
+                        }
+                        Some(crate::workers::Event::<C>::VmReady) => {
+                            let mut reads = self
+                                .proc_source
+                                .as_ref()
+                                .map_or_else(Vec::new, |s| s.take_reads());
+                            let mut retries = Vec::new();
+                            let mut index = 0;
+                            while index < proc_waits.len() {
+                                if proc_waits[index].signal.ready() {
+                                    let wait = proc_waits.swap_remove(index);
+                                    if let Some(checkpoint) = wait.checkpoint {
+                                        retries.push(checkpoint);
+                                    }
+                                    if let Some(report) = wait.report {
+                                        reads.push(report);
+                                    }
+                                } else {
+                                    index += 1;
+                                }
+                            }
+                            if let Err(error) =
+                                self.activate_proc_reads(Some(&epoch), reads, &mut proc_waits)
+                            {
+                                for checkpoint in retries {
+                                    epoch.restore_checkpoint(checkpoint, false);
+                                }
+                                checkpoint_error = Some(error);
+                                break;
+                            }
+                            while !control.stopped() {
+                                let Some(checkpoint) =
+                                    retries.pop().or_else(|| epoch.take_checkpoint())
+                                else {
+                                    break;
+                                };
+                                match self.vm_checkpoint(&epoch, checkpoint, io, &mut proc_waits) {
+                                    Ok(true) => {
+                                        members = epoch
+                                            .member_ids()
+                                            .into_iter()
+                                            .map(|pid| (pid, 0))
+                                            .collect();
+                                        let launch = (|| {
+                                            for slot in epoch.additional_slots(
+                                                epoch.active_slots(),
+                                                self.cpu_count,
+                                            ) {
+                                                self.workers.ensure(slot).map_err(|_| {
+                                                    RuntimeError::Arguments(
+                                                        "cannot start CPU worker",
+                                                    )
+                                                })?;
+                                                self.workers.launch(slot, epoch.clone()).map_err(
+                                                    |_| {
+                                                        RuntimeError::Arguments(
+                                                            "CPU worker disconnected",
+                                                        )
+                                                    },
+                                                )?;
+                                            }
+                                            Ok::<_, RuntimeError>(())
+                                        })();
+                                        if let Err(error) = launch {
+                                            checkpoint_error = Some(error);
+                                            epoch.fail();
+                                            break;
+                                        }
+                                    }
+                                    result => {
+                                        checkpoint_error = result.err();
+                                        epoch.fail();
+                                        break;
+                                    }
+                                }
+                            }
+                            for checkpoint in retries {
+                                epoch.restore_checkpoint(checkpoint, false);
+                            }
+                        }
+                        Some(crate::workers::Event::<C>::Idle) => {
+                            match self.cohort_live_control(&epoch, &members, io) {
+                                Ok(false) => {}
+                                result => {
+                                    checkpoint_error = result.err();
+                                    break;
+                                }
+                            }
+                            if !io.waits_for_host()
+                                && !self
+                                    .processes
+                                    .get(&1)
+                                    .is_some_and(|p| p.linux.vfs.has_native_services())
+                                && epoch.idle()
+                            {
+                                if terminal {
+                                    epoch.fail_execution(RuntimeError::Deadlock);
+                                }
+                                break;
+                            }
+                        }
+                        None => {}
                     }
                 }
-                None => {}
             }
+            #[cfg(not(all(test, trames_interpreter_conformance)))]
+            unreachable!("bounded execution is an interpreter fixture");
         }
         if checkpoint_error.is_some() {
             epoch.fail();
@@ -3936,6 +4009,7 @@ impl<C: Cpu> Kernel<C> {
             {
                 Some(crate::workers::Event::<C>::EpochStopped(_)) => stopped += 1,
                 Some(crate::workers::Event::<C>::Done(_)) => unreachable!("cohort completion"),
+                #[cfg(all(test, trames_interpreter_conformance))]
                 Some(
                     crate::workers::Event::<C>::VmReady
                     | crate::workers::Event::<C>::Idle
@@ -3945,6 +4019,7 @@ impl<C: Cpu> Kernel<C> {
             }
         }
         self.parallel_stop_time += began.elapsed();
+        #[cfg(all(test, trames_interpreter_conformance))]
         for wait in proc_waits {
             if let Some(report) = wait.report {
                 if let Some(source) = &self.proc_source {
@@ -3966,7 +4041,10 @@ impl<C: Cpu> Kernel<C> {
             checkpoint_error = Some(RuntimeError::Arguments("cannot start CPU worker"));
         }
         // Source creation can extend membership without a VmReady round trip.
-        members = epoch.member_ids().into_iter().map(|id| (id, 0)).collect();
+        #[cfg(all(test, trames_interpreter_conformance))]
+        {
+            members = epoch.member_ids().into_iter().map(|id| (id, 0)).collect();
+        }
         if control.closing() {
             // The host waits for a source lifecycle result, never restores a
             // CPU or executes an accepted SVC/native call after session close.
@@ -3975,7 +4053,7 @@ impl<C: Cpu> Kernel<C> {
                 .map_err(|_| RuntimeError::Arguments("session completion executor failed"))?;
             self.source_completed = true;
             if let Some(error) = epoch.collect_closed(self) {
-                checkpoint_error = Some(error);
+                checkpoint_error.get_or_insert(error);
             }
             let _ = uring_epoch.finish();
             self.gpu_peak_pending = self.gpu_peak_pending.max(epoch.gpu_peak_pending());
@@ -4012,112 +4090,118 @@ impl<C: Cpu> Kernel<C> {
                 }
             }
         }
-        assert!(
-            !terminal,
-            "source execution cannot return guest work to the host"
-        );
-        if let Some(error) = epoch.collect_lifecycle(self) {
-            checkpoint_error = Some(error);
-        }
-        let completed = epoch.drain();
-        let _ = uring_epoch.finish();
-        self.gpu_peak_pending = self.gpu_peak_pending.max(epoch.gpu_peak_pending());
-        file_epoch.finish();
-        if let Some(error) = checkpoint_error {
-            if matches!(error, RuntimeError::HostIo(_)) {
-                // Host event failure is terminal for this run. Every actual
-                // CPU has returned and its View has drained; cancel accepted
-                // requests against their original task/mm before returning the
-                // host error. No guest operation is replayed by this cleanup.
-                self.cancel_host_io_requests();
+        #[cfg(all(test, trames_interpreter_conformance))]
+        {
+            assert!(
+                !terminal,
+                "source execution cannot return guest work to the host"
+            );
+            if let Some(error) = epoch.collect_lifecycle(self) {
+                checkpoint_error = Some(error);
             }
-            return Err(error);
-        }
-        if completed.iter().any(|r| r.outcome.is_none()) {
+            let completed = epoch.drain();
+            let _ = uring_epoch.finish();
+            self.gpu_peak_pending = self.gpu_peak_pending.max(epoch.gpu_peak_pending());
+            file_epoch.finish();
+            if let Some(error) = checkpoint_error {
+                if matches!(error, RuntimeError::HostIo(_)) {
+                    // Host event failure is terminal for this run. Every actual
+                    // CPU has returned and its View has drained; cancel accepted
+                    // requests against their original task/mm before returning the
+                    // host error. No guest operation is replayed by this cleanup.
+                    self.cancel_host_io_requests();
+                }
+                return Err(error);
+            }
+            if completed.iter().any(|r| r.outcome.is_none()) {
+                for done in completed {
+                    let mut task =
+                        done.task
+                            .as_ref()
+                            .map(|task| task.write())
+                            .unwrap_or_else(|| {
+                                self.processes
+                                    .get_mut(&done.pid)
+                                    .expect("dispatched process")
+                            });
+                    task.cpu = done.cpu;
+                    task.trace = done.trace;
+                }
+                return Err(RuntimeError::Arguments("CPU worker panicked"));
+            }
+            let mut outcomes = Vec::new();
             for done in completed {
-                let mut task = done
-                    .task
-                    .as_ref()
-                    .map(|task| task.write())
-                    .unwrap_or_else(|| {
-                        self.processes
-                            .get_mut(&done.pid)
-                            .expect("dispatched process")
-                    });
-                task.cpu = done.cpu;
-                task.trace = done.trace;
-            }
-            return Err(RuntimeError::Arguments("CPU worker panicked"));
-        }
-        let mut outcomes = Vec::new();
-        for done in completed {
-            if done.thread_exit.is_some() {
-                self.accept_source_return(done)?;
-            } else {
-                let (pid, _, outcome) = self.restore_worker_return(done);
-                outcomes.push((pid, outcome));
-            }
-        }
-        self.process_exits(None)?;
-        let began = Instant::now();
-        // Source returns committed quiescent mms or retained their real idle
-        // dependency. Live wrappers publish the remaining ordinary cohort work.
-        let mut committed = std::collections::BTreeSet::new();
-        for &(id, _) in &members {
-            let Some(mut p) = self.processes.get_mut(&id) else {
-                continue;
-            };
-            if p.signals.io.live()
-                && !self.exits.waiting(id)
-                && committed.insert(p.memory.coordinator_ownership().0)
-            {
-                p.memory.commit_parallel()?;
-            }
-        }
-        self.parallel_memory_time += began.elapsed();
-        outcomes.retain(|(pid, _)| self.processes.read(pid).signals.io.live());
-        self.parallel_rounds += 1;
-        self.next_parallel_pid = chosen.last().expect("cohort task").0;
-        // Successful worker wakes are already committed. Publish readiness
-        // before any returned syscall (requeue/exit/signal) can change tasks.
-        self.resume_futex_ready();
-        // Source waits already retired PID visibility. Drop their completed
-        // owner projections before any returned PID query can inspect them.
-        self.reap_waited();
-        outcomes.sort_by_key(|v| v.0);
-        for (id, _) in &outcomes {
-            if let State::Gpu {
-                retired: true,
-                instructions,
-                ..
-            } = &mut self.processes.get_mut(id).unwrap().state
-            {
-                *instructions = self.instructions;
-            }
-        }
-        for (id, outcome) in outcomes {
-            let Some(mut p) = self.processes.checkout(&id) else {
-                continue;
-            };
-            // A preceding exit_group/exec may have killed this returned peer.
-            if !matches!(p.state, State::Zombie(_)) {
-                // KILL queued by a preceding cgroup.kill cannot permit an
-                // uncommitted fork to create a survivor outside its snapshot.
-                if p.pending_bits() & (1 << 8) != 0 {
-                    let _ = self.deliver(id, &mut p);
+                if done.thread_exit.is_some() {
+                    self.accept_source_return(done)?;
                 } else {
-                    self.finish_slice(id, &mut p, outcome, io, false);
+                    let (pid, _, outcome) = self.restore_worker_return(done);
+                    outcomes.push((pid, outcome));
                 }
             }
-            let actual = p.rekey.take().unwrap_or(id);
-            if !p.auto_reap || actual == 1 {
-                self.processes.insert(actual, p);
+            self.process_exits(None)?;
+            let began = Instant::now();
+            // Source returns committed quiescent mms or retained their real idle
+            // dependency. Live wrappers publish the remaining ordinary cohort work.
+            let mut committed = std::collections::BTreeSet::new();
+            for &(id, _) in &members {
+                let Some(mut p) = self.processes.get_mut(&id) else {
+                    continue;
+                };
+                if p.signals.io.live()
+                    && !self.exits.waiting(id)
+                    && committed.insert(p.memory.coordinator_ownership().0)
+                {
+                    p.memory.commit_parallel()?;
+                }
             }
+            self.parallel_memory_time += began.elapsed();
+            outcomes.retain(|(pid, _)| self.processes.read(pid).signals.io.live());
+            self.parallel_rounds += 1;
+            self.next_parallel_pid = chosen.last().expect("cohort task").0;
+            // Successful worker wakes are already committed. Publish readiness
+            // before any returned syscall (requeue/exit/signal) can change tasks.
+            self.resume_futex_ready();
+            // Source waits already retired PID visibility. Drop their completed
+            // owner projections before any returned PID query can inspect them.
+            self.reap_waited();
+            outcomes.sort_by_key(|v| v.0);
+            for (id, _) in &outcomes {
+                if let State::Gpu {
+                    retired: true,
+                    instructions,
+                    ..
+                } = &mut self.processes.get_mut(id).unwrap().state
+                {
+                    *instructions = self.instructions;
+                }
+            }
+            for (id, outcome) in outcomes {
+                let Some(mut p) = self.processes.checkout(&id) else {
+                    continue;
+                };
+                // A preceding exit_group/exec may have killed this returned peer.
+                if !matches!(p.state, State::Zombie(_)) {
+                    // KILL queued by a preceding cgroup.kill cannot permit an
+                    // uncommitted fork to create a survivor outside its snapshot.
+                    if p.pending_bits() & (1 << 8) != 0 {
+                        let _ = self.deliver(id, &mut p);
+                    } else {
+                        self.finish_slice(id, &mut p, outcome, io, false);
+                    }
+                }
+                let actual = p.rekey.take().unwrap_or(id);
+                if !p.auto_reap || actual == 1 {
+                    self.processes.insert(actual, p);
+                }
+            }
+            self.processes
+                .retain(|&pid, p| pid == 1 || !p.auto_reap || self.exits.waiting(pid));
+            Ok(true)
         }
-        self.processes
-            .retain(|&pid, p| pid == 1 || !p.auto_reap || self.exits.waiting(pid));
-        Ok(true)
+        #[cfg(not(all(test, trames_interpreter_conformance)))]
+        unreachable!("source execution cannot return guest work to the host");
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn cancel_host_io_requests(&self) {
         for (id, task) in self.processes.iter() {
             if let Some(actor) = task.linux.uring_actor_root().get() {
@@ -4159,12 +4243,14 @@ impl<C: Cpu> Kernel<C> {
             );
         }
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn restore_worker_return(
         &mut self,
         done: crate::workers::Done<C>,
     ) -> (u32, Option<i32>, SliceOutcome) {
         self.adopt_worker_return(done, true)
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn adopt_worker_return(
         &mut self,
         done: crate::workers::Done<C>,
@@ -4250,9 +4336,11 @@ impl<C: Cpu> Kernel<C> {
         self.gpu_peer_instructions += stats.gpu.peer_instructions;
         self.gpu_transfers.merge(stats.gpu.transfers);
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn parallel_timeout(&self) -> Duration {
         self.parallel_timeout_for(None)
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn parallel_timeout_for(
         &self,
         owned_waiters: Option<&std::collections::BTreeSet<u32>>,
@@ -4350,38 +4438,43 @@ impl<C: Cpu> Kernel<C> {
 
     fn drive(&mut self, io: &mut impl GuestOutput, limit: u64) -> Result<Exit, RuntimeError> {
         io.bind_host_files(self.workers.file_executor(), self.file_layout_work());
+        let mut wait =
+            trames_linux::HostWait::new().map_err(|e| RuntimeError::HostIo(Arc::new(e)))?;
+        io.bind_host_wake(wait.wake());
         loop {
+            wait.begin();
+            io.host_interest(&mut wait)
+                .map_err(|e| RuntimeError::HostIo(Arc::new(e)))?;
             if let Some(exit) = self.completed.take() {
-                while !io
-                    .flush_output()
-                    .map_err(|_| RuntimeError::Arguments("terminal master output failed"))?
-                {
-                    std::thread::park_timeout(Duration::from_millis(2));
+                loop {
+                    if io
+                        .flush_output()
+                        .map_err(|_| RuntimeError::Arguments("terminal master output failed"))?
+                    {
+                        return Ok(exit);
+                    }
+                    wait.wait().map_err(|e| RuntimeError::HostIo(Arc::new(e)))?;
+                    wait.begin();
+                    io.host_interest(&mut wait)
+                        .map_err(|e| RuntimeError::HostIo(Arc::new(e)))?;
                 }
-                return Ok(exit);
             }
-            self.process_exits(None)?;
-            self.progress_proc_reads()?;
-            if let Some(error) = self.backend_error.take() {
-                return Err(RuntimeError::Backend(error));
-            }
-            self.pump_guest_ptys();
-            self.tick_timers();
             self.host_poll(io)?;
-            self.poll_file_layouts();
             if io.paused() {
-                std::thread::park_timeout(Duration::from_millis(10));
+                wait.wait().map_err(|e| RuntimeError::HostIo(Arc::new(e)))?;
                 continue;
             }
-            if let Some(root) = self.processes.get(&1) {
-                root.linux.vfs.dispatch_native_events();
+            self.host_wait = Some(wait);
+            let admitted = self.execution_epoch(io, limit, true, ExecutionMode::Source)?;
+            wait = self
+                .host_wait
+                .take()
+                .expect("source returns original host wait");
+            if !admitted {
+                return Err(RuntimeError::Arguments(
+                    "original source admission did not create a session",
+                ));
             }
-            if self.execution_epoch(io, limit, true, ExecutionMode::Source)? {
-                continue;
-            }
-            return Err(RuntimeError::Arguments(
-                "original source admission did not create a session",
-            ));
         }
     }
 }
@@ -4471,6 +4564,7 @@ pub(super) fn run<C: Cpu>(
         cpu_time: Duration::ZERO,
         vm_id: 1,
         space: Default::default(),
+        #[cfg(all(test, trames_interpreter_conformance))]
         rekey: None,
         membarrier_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         limits,
@@ -4486,6 +4580,7 @@ pub(super) fn run<C: Cpu>(
     let count = runtime.cpu_count.clamp(1, 32);
     let mut kernel = Kernel::<C> {
         host_launches: Default::default(),
+        #[cfg(all(test, trames_interpreter_conformance))]
         byte_target: Arc::new(JoinedByteWake(std::thread::current())),
         exits: Default::default(),
         layout_work: Default::default(),
@@ -4499,6 +4594,7 @@ pub(super) fn run<C: Cpu>(
         completed: None,
         source_completed: false,
         futexes: Default::default(),
+        #[cfg(all(test, trames_interpreter_conformance))]
         futex_ready: Vec::new(),
         parallel_memory: trames_memory::parallel::Registry::default(),
         parallel_rounds: 0,
@@ -4536,6 +4632,7 @@ pub(super) fn run<C: Cpu>(
         disk_reads: 0,
         peak_disk_reads: 0,
         disk_read_bytes: 0,
+        #[cfg(all(test, trames_interpreter_conformance))]
         write_buffer: Vec::new(),
         serviced_syscalls: 0,
         service_wait: Duration::ZERO,
@@ -4563,7 +4660,9 @@ pub(super) fn run<C: Cpu>(
         proc_maps: RefCell::new(BTreeMap::new()),
         proc_source: None,
         guest_shutdown: Default::default(),
+        #[cfg(all(test, trames_interpreter_conformance))]
         proc_owner_waits: Vec::new(),
+        host_wait: None,
         profile_syscalls: runtime.profile_syscalls,
         idle: Duration::ZERO,
         load: Arc::default(),
@@ -5630,7 +5729,7 @@ mod tests {
             p.memory
                 .protect(0x4000, PAGE_SIZE, Permissions::RX)
                 .unwrap();
-            let pending = Arc::new(exec::Pending::new(std::thread::current()));
+            let pending = Arc::new(exec::Pending::new());
             p.exec_pending = Some(exec::Preparation::Disk(pending.clone()));
             p.state = State::Blocked(221, [0x1000, 0, 0, 0, 0, 0]);
             k.processes.insert(1, p);
@@ -6198,6 +6297,7 @@ mod tests {
             cpu_time: Duration::ZERO,
             vm_id: 1,
             space: Default::default(),
+            #[cfg(all(test, trames_interpreter_conformance))]
             rekey: None,
             membarrier_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             limits,
@@ -6375,6 +6475,7 @@ mod tests {
     pub(super) fn kernel() -> Kernel {
         Kernel {
             host_launches: Default::default(),
+            #[cfg(all(test, trames_interpreter_conformance))]
             byte_target: Arc::new(JoinedByteWake(std::thread::current())),
             exits: Default::default(),
             layout_work: Default::default(),
@@ -6388,6 +6489,7 @@ mod tests {
             source_completed: false,
             workers: crate::workers::Pool::new(1),
             futexes: Default::default(),
+            #[cfg(all(test, trames_interpreter_conformance))]
             futex_ready: Vec::new(),
             parallel_memory: trames_memory::parallel::Registry::default(),
             parallel_rounds: 0,
@@ -6425,6 +6527,7 @@ mod tests {
             disk_reads: 0,
             peak_disk_reads: 0,
             disk_read_bytes: 0,
+            #[cfg(all(test, trames_interpreter_conformance))]
             write_buffer: Vec::new(),
             serviced_syscalls: 0,
             service_wait: Duration::ZERO,
@@ -6452,7 +6555,9 @@ mod tests {
             proc_maps: RefCell::new(BTreeMap::new()),
             proc_source: None,
             guest_shutdown: Default::default(),
+            #[cfg(all(test, trames_interpreter_conformance))]
             proc_owner_waits: Vec::new(),
+            host_wait: None,
             profile_syscalls: false,
             idle: Duration::ZERO,
             load: Arc::default(),
@@ -7640,11 +7745,14 @@ mod tests {
     }
     #[test]
     fn continuous_peers_cancel_at_control_checkpoints_and_commit_the_exact_budget() {
-        struct CancelAfterTwoPolls(usize);
-        impl GuestOutput for CancelAfterTwoPolls {
+        struct CancelAt(Instant);
+        impl GuestOutput for CancelAt {
+            fn host_interest(&mut self, wait: &mut trames_linux::HostWait) -> std::io::Result<()> {
+                wait.until(self.0);
+                Ok(())
+            }
             fn poll_host(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<HostState> {
-                self.0 += 1;
-                Ok(HostState::from_cancelled(self.0 >= 3))
+                Ok(HostState::from_cancelled(Instant::now() >= self.0))
             }
             fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo> {
                 std::sync::Arc::new(trames_vfs::CapturedConsole::default())
@@ -7656,7 +7764,10 @@ mod tests {
         }
         let mut k = spinning_peers();
         assert!(matches!(
-            k.drive(&mut CancelAfterTwoPolls(0), u64::MAX),
+            k.drive(
+                &mut CancelAt(Instant::now() + Duration::from_millis(20)),
+                u64::MAX
+            ),
             Err(RuntimeError::Cancelled)
         ));
         assert!(k.instructions > 0);

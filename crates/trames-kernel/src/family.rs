@@ -29,6 +29,7 @@ pub struct Family {
     registry: std::sync::OnceLock<Weak<Families>>,
     status: std::sync::OnceLock<i32>,
     host_status: std::sync::OnceLock<Arc<std::sync::atomic::AtomicI32>>,
+    host_ready: std::sync::OnceLock<Arc<trames_shared::Readiness>>,
 }
 impl Default for Family {
     fn default() -> Self {
@@ -45,6 +46,7 @@ impl Default for Family {
             registry: Default::default(),
             status: Default::default(),
             host_status: Default::default(),
+            host_ready: Default::default(),
         }
     }
 }
@@ -77,6 +79,9 @@ impl Family {
     }
     pub fn status(&self) -> Option<i32> {
         self.status.get().copied()
+    }
+    pub fn bind_host_ready(&self, ready: Arc<trames_shared::Readiness>) {
+        self.host_ready.get_or_init(|| ready);
     }
     pub fn bind_host_status(&self, status: Arc<std::sync::atomic::AtomicI32>) {
         self.host_status.get_or_init(|| status);
@@ -425,7 +430,7 @@ impl Families {
     /// its actual shutdown victims complete. Dependencies are original family
     /// references, not a Process scan or a retry on an owner thread.
     pub fn complete(&self, family: &Arc<Family>, status: i32) -> bool {
-        let (exits, reaped) = {
+        let (exits, reaped, host_notices) = {
             let mut state = self.0.lock().unwrap();
             let Some(_) = state.original(family) else {
                 return false;
@@ -439,6 +444,7 @@ impl Families {
                 .get_or_insert(status);
             let mut ready = vec![family.clone()];
             let mut exits = Vec::new();
+            let mut host_notices = Vec::new();
             while let Some(current) = ready.pop() {
                 let Some(entry) = state.original(&current) else {
                     continue;
@@ -459,6 +465,7 @@ impl Families {
                     .expect("one original family completion");
                 if let Some(host) = current.host_status.get() {
                     host.store(status, Ordering::Relaxed);
+                    host_notices.extend(current.host_ready.get().cloned());
                 }
                 if let Some((notice, status)) = entry.binding.child.finish_quiet(Some(status), auto)
                 {
@@ -490,8 +497,15 @@ impl Families {
                     }
                 }
             }
-            (exits, state.entries[&id].binding.child.reaped())
+            (
+                exits,
+                state.entries[&id].binding.child.reaped(),
+                host_notices,
+            )
         };
+        for ready in host_notices {
+            ready.notify_locked();
+        }
         for (notice, info) in exits {
             notice.signal(info);
         }

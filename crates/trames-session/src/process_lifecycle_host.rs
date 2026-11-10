@@ -83,7 +83,7 @@ impl<C: Cpu> Lifecycle<C> {
                         }
                     };
                     drop(_custody);
-                    let result = Arc::new(exec::Pending::new(self.owner.clone()));
+                    let result = Arc::new(exec::Pending::new());
                     self.images.submit_image(request, result.clone());
                     work.phase = Phase::Image(child, exec::Preparation::Disk(result));
                 }
@@ -321,8 +321,9 @@ mod tests {
             fn host_spawn(&mut self) -> Option<trames_linux::HostSpawn> {
                 self.output.host_spawn()
             }
-            fn control_poll_interval(&self) -> Duration {
-                Duration::from_millis(1)
+            fn host_interest(&mut self, wait: &mut trames_linux::HostWait) -> std::io::Result<()> {
+                wait.until(std::time::Instant::now() + Duration::from_millis(1));
+                Ok(())
             }
             fn poll_host(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<HostState> {
                 assert!(

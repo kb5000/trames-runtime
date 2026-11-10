@@ -2,13 +2,16 @@
 //! Detached original mms finish on existing executors after their last borrower.
 //! Membership never covers memory commits, notifications or final destruction.
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+#[cfg(all(test, trames_interpreter_conformance))]
+use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, Weak};
 use trames_memory::{Memory, MemoryError};
 use trames_shared::{IoSignal, IoSubscription, IoWake};
 
 #[derive(Default)]
 pub(crate) struct RetiredMemory {
     pending: Mutex<BTreeMap<u64, Pending>>,
+    #[cfg(all(test, trames_interpreter_conformance))]
     owner: OnceLock<(Arc<dyn IoWake>, Arc<IoSignal>)>,
     executor: Mutex<Option<Weak<IoSignal>>>,
 }
@@ -180,6 +183,7 @@ impl IoWake for RetiredMemory {
 impl RetiredMemory {
     /// The legacy outside-epoch driver observes this same resource. It is not
     /// needed for completion while an execution epoch has an active subscriber.
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub fn bind_owner(&self, target: impl FnOnce() -> Arc<dyn IoWake>) {
         self.owner.get_or_init(|| {
             let target = target();
@@ -203,8 +207,12 @@ impl RetiredMemory {
             .and_then(Weak::upgrade);
         if let Some(executor) = executor {
             executor.notify();
-        } else if let Some((_, signal)) = self.owner.get() {
-            signal.notify();
+        } else {
+            #[cfg(all(test, trames_interpreter_conformance))]
+            #[cfg(all(test, trames_interpreter_conformance))]
+            if let Some((_, signal)) = self.owner.get() {
+                signal.notify();
+            }
         }
     }
     pub fn bind_reader(self: &Arc<Self>, signal: Arc<IoSignal>) -> Driver {
@@ -258,6 +266,7 @@ impl RetiredMemory {
         }
     }
     pub fn pump(&self) -> Result<(), MemoryError> {
+        #[cfg(all(test, trames_interpreter_conformance))]
         if let Some((_, signal)) = self.owner.get() {
             signal.reset();
         }

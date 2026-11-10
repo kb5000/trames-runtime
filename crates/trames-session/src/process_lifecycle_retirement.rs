@@ -682,6 +682,7 @@ impl<C: Cpu> Lifecycle<C> {
             wait: None,
         });
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn collect_retirements(&self, kernel: &mut Kernel<C>) {
         for work in std::mem::take(&mut *self.retiring.lock().unwrap()) {
             if let Some(done) = work.done {

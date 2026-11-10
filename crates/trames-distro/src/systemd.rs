@@ -137,6 +137,12 @@ pub struct Monitor {
     shutdown_sent: bool,
 }
 impl Monitor {
+    pub fn subscribe(
+        &self,
+        signal: &std::sync::Arc<trames_vfs::IoSignal>,
+    ) -> trames_vfs::IoSubscription {
+        self.socket.subscribe(signal)
+    }
     /// Drain the original nonblocking endpoint while guest executors continue.
     /// Returning a guest signal does not request a stopped scheduler callback.
     pub fn control(&mut self, stopping: bool) -> Result<Option<u32>> {

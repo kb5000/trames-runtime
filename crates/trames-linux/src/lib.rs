@@ -4,6 +4,7 @@
 #![recursion_limit = "256"]
 use std::io;
 use trames_execution::Registers;
+pub use trames_shared::{HostWait, HostWake};
 pub mod image;
 pub mod vdso;
 use trames_memory::{Access, Memory, ADDRESS_LIMIT};
@@ -110,6 +111,7 @@ pub struct HostProcess {
     state: std::sync::atomic::AtomicU32,
     status: std::sync::Arc<std::sync::atomic::AtomicI32>,
     cancellation: std::sync::OnceLock<std::sync::Arc<trames_shared::Readiness>>,
+    completion: std::sync::Arc<trames_shared::Readiness>,
     control: std::sync::OnceLock<std::sync::Arc<dyn Fn(u32, u32) + Send + Sync>>,
 }
 impl Default for HostProcess {
@@ -118,6 +120,7 @@ impl Default for HostProcess {
             state: Default::default(),
             status: std::sync::Arc::new(std::sync::atomic::AtomicI32::new(HOST_RUNNING)),
             cancellation: Default::default(),
+            completion: Default::default(),
             control: Default::default(),
         }
     }
@@ -175,9 +178,13 @@ impl HostProcess {
             }
         }
     }
+    pub fn completion(&self) -> std::sync::Arc<trames_shared::Readiness> {
+        self.completion.clone()
+    }
     pub fn fail(&self, errno: u32) {
         self.status
             .store(-(errno as i32), std::sync::atomic::Ordering::Relaxed);
+        self.completion.notify_locked();
     }
     pub fn subscribe(
         &self,
@@ -234,10 +241,12 @@ pub trait GuestOutput {
     fn waits_for_host(&self) -> bool {
         false
     }
-    /// Maximum interval between actual embedding transport/control polls.
-    fn control_poll_interval(&self) -> std::time::Duration {
-        std::time::Duration::MAX
+    /// Register original host transports before the deciding nonblocking pass.
+    fn host_interest(&mut self, _wait: &mut HostWait) -> io::Result<()> {
+        Ok(())
     }
+    /// Producers retain this notification, never the guest dispatcher.
+    fn bind_host_wake(&mut self, _wake: std::sync::Arc<HostWake>) {}
     /// Complete accepted host output before normal session teardown.
     fn flush_output(&mut self) -> io::Result<bool> {
         Ok(true)
@@ -324,10 +333,12 @@ pub mod execution_io {
         fn waits_for_host(&self) -> bool {
             false
         }
-        /// Maximum interval between actual embedding transport/control polls.
-        fn control_poll_interval(&self) -> std::time::Duration {
-            std::time::Duration::MAX
+        /// Register original host transports before the deciding nonblocking pass.
+        fn host_interest(&mut self, _wait: &mut HostWait) -> io::Result<()> {
+            Ok(())
         }
+        /// Producers retain this notification, never the guest dispatcher.
+        fn bind_host_wake(&mut self, _wake: std::sync::Arc<HostWake>) {}
         /// Complete accepted host output before normal session teardown.
         fn flush_output(&mut self) -> io::Result<bool> {
             Ok(true)
@@ -397,8 +408,11 @@ pub mod execution_io {
         fn waits_for_host(&self) -> bool {
             super::GuestOutput::waits_for_host(self)
         }
-        fn control_poll_interval(&self) -> std::time::Duration {
-            super::GuestOutput::control_poll_interval(self)
+        fn host_interest(&mut self, wait: &mut HostWait) -> io::Result<()> {
+            super::GuestOutput::host_interest(self, wait)
+        }
+        fn bind_host_wake(&mut self, wake: std::sync::Arc<HostWake>) {
+            super::GuestOutput::bind_host_wake(self, wake)
         }
         fn flush_output(&mut self) -> io::Result<bool> {
             super::GuestOutput::flush_output(self)

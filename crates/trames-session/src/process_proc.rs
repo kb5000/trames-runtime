@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Structural process-view publication; live state stays on original resources.
 use super::*;
+#[cfg(all(test, trames_interpreter_conformance))]
 pub(super) struct ProcReadWait<C: Cpu> {
     pub checkpoint: Option<crate::run_queue::Checkpoint<C>>,
     pub report: Option<trames_memory::MemoryReport>,
@@ -8,6 +9,7 @@ pub(super) struct ProcReadWait<C: Cpu> {
     pub subscriptions: Vec<trames_vfs::IoSubscription>,
 }
 impl<C: Cpu> Kernel<C> {
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn proc_read_wait(&self) -> ProcReadWait<C> {
         let source: Arc<dyn trames_vfs::IoWake> = self.proc_source.as_ref().unwrap().clone();
         ProcReadWait {
@@ -17,6 +19,7 @@ impl<C: Cpu> Kernel<C> {
             subscriptions: Vec::new(),
         }
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn activate_proc_reads(
         &mut self,
         epoch: Option<&crate::run_queue::Epoch<C>>,
@@ -53,24 +56,7 @@ impl<C: Cpu> Kernel<C> {
         }
         Ok(())
     }
-    pub(super) fn progress_proc_reads(&mut self) -> Result<(), RuntimeError> {
-        let mut reports = self
-            .proc_source
-            .as_ref()
-            .map_or_else(Vec::new, |s| s.take_reads());
-        let waits = std::mem::take(&mut self.proc_owner_waits);
-        let mut pending = Vec::new();
-        for wait in waits {
-            if wait.signal.ready() {
-                reports.extend(wait.report);
-            } else {
-                pending.push(wait);
-            }
-        }
-        let result = self.activate_proc_reads(None, reports, &mut pending);
-        self.proc_owner_waits = pending;
-        result
-    }
+
     pub(super) fn install_proc_source(
         &mut self,
         root: &Process<C>,
@@ -86,7 +72,9 @@ impl<C: Cpu> Kernel<C> {
         directory: Arc<trames_kernel::signal::IoDirectory>,
         host: Option<Arc<dyn Fn() -> trames_linux::HostMemoryInfo + Send + Sync>>,
     ) -> Arc<crate::proc_views::Source> {
+        #[cfg(all(test, trames_interpreter_conformance))]
         let events = self.workers.events();
+        #[cfg(all(test, trames_interpreter_conformance))]
         let owner = std::thread::current();
         Arc::new(crate::proc_views::Source {
             directory,
@@ -101,15 +89,18 @@ impl<C: Cpu> Kernel<C> {
             limits: self.memory_limits,
             host,
             reads: Default::default(),
+            #[cfg(all(test, trames_interpreter_conformance))]
             wake: Arc::new(move || {
                 let _ = events.send(crate::workers::Event::<C>::VmReady);
                 owner.unpark();
             }),
         })
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn publish_proc_task(&self, pid: u32, p: &Process<C>) {
         super::birth::Birth::capture(self).publish_proc(pid, p);
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn proc_after_call(&self, pid: u32, p: &Process<C>, number: u32, args: [u64; 6]) {
         if self.proc_source.is_none() {
             return;

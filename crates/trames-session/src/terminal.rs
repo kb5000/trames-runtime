@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Host transport for the original embedding PTY. No guest syscall executes here.
-use std::{io, sync::Arc, time::Duration};
+use std::{io, sync::Arc};
 use trames_linux::{GuestOutput, HostMemoryInfo, HostSpawn, OutputFd, TerminalEvent};
 pub use trames_vfs::terminal::Terminal;
 use trames_vfs::{Errno, Pty, Vfs};
@@ -50,11 +50,16 @@ impl Write {
     }
 }
 type Reply = (Vec<u8>, usize, Result<usize, Errno>);
-pub(crate) struct Pending(std::sync::Mutex<Option<Reply>>, std::thread::Thread);
+pub(crate) struct Pending(
+    std::sync::Mutex<Option<Reply>>,
+    Option<Arc<trames_linux::HostWake>>,
+);
 impl Pending {
     pub(crate) fn complete(&self, bytes: Vec<u8>, offset: usize, result: Result<usize, Errno>) {
         *self.0.lock().unwrap() = Some((bytes, offset, result));
-        self.1.unpark();
+        if let Some(wake) = &self.1 {
+            wake.notify();
+        }
     }
 }
 
@@ -66,6 +71,7 @@ pub(crate) struct Adapter<'a, T: GuestOutput> {
     console: Option<Arc<dyn trames_vfs::ConsoleIo>>,
     executor: Arc<dyn Executor>,
     pending: Option<Arc<Pending>>,
+    wake: Option<Arc<trames_linux::HostWake>>,
 }
 impl<'a, T: GuestOutput> Adapter<'a, T> {
     pub fn new(inner: &'a mut T, terminal: Option<Arc<Pty>>, executor: Arc<dyn Executor>) -> Self {
@@ -78,6 +84,7 @@ impl<'a, T: GuestOutput> Adapter<'a, T> {
             console,
             executor,
             pending: None,
+            wake: None,
         }
     }
     fn collect_output(&mut self) -> io::Result<bool> {
@@ -104,7 +111,14 @@ impl<'a, T: GuestOutput> Adapter<'a, T> {
             return Ok(());
         };
         let mut input = [0; 4096];
-        let capacity = pair.terminal.borrow().input_capacity().min(input.len());
+        let capacity = {
+            let tty = pair.terminal.borrow();
+            if tty.eof {
+                0
+            } else {
+                tty.input_capacity().min(input.len())
+            }
+        };
         if capacity != 0 {
             match self.inner.poll_stdin(&mut input[..capacity]) {
                 Ok(0) => pair.terminal.borrow_mut().eof = true,
@@ -147,7 +161,7 @@ impl<'a, T: GuestOutput> Adapter<'a, T> {
         if self.consumed != self.output.len() {
             if let Some(console) = self.console.as_ref().filter(|c| c.host_work()) {
                 if console.poll(trames_vfs::ConsoleStream::Output, 4).0 != 0 {
-                    let result = Arc::new(Pending(Default::default(), std::thread::current()));
+                    let result = Arc::new(Pending(Default::default(), self.wake.clone()));
                     let work = Write {
                         source: console.clone(),
                         pair: pair.clone(),
@@ -213,14 +227,33 @@ impl<T: GuestOutput> GuestOutput for Adapter<'_, T> {
     fn waits_for_host(&self) -> bool {
         self.terminal.is_some() || self.inner.waits_for_host()
     }
-    fn control_poll_interval(&self) -> Duration {
-        self.inner
-            .control_poll_interval()
-            .min(if self.terminal.is_some() {
-                Duration::from_millis(2)
-            } else {
-                Duration::MAX
-            })
+    fn bind_host_wake(&mut self, wake: Arc<trames_linux::HostWake>) {
+        self.wake = Some(wake.clone());
+        self.inner.bind_host_wake(wake);
+    }
+    fn host_interest(&mut self, wait: &mut trames_linux::HostWait) -> io::Result<()> {
+        self.inner.host_interest(wait)?;
+        if let Some(pair) = &self.terminal {
+            wait.retain([pair.subscribe(wait.signal())]);
+            if let Some(console) = &self.console {
+                wait.retain(console.subscribe(wait.signal()));
+                let input = {
+                    let tty = pair.terminal.borrow();
+                    !tty.eof && tty.input_capacity() != 0
+                };
+                if input {
+                    for fd in console.native_wait_fds(trames_vfs::ConsoleStream::Input) {
+                        wait.watch_owned(fd, false)?;
+                    }
+                }
+                if self.pending.is_none() && self.consumed != self.output.len() {
+                    for fd in console.native_wait_fds(trames_vfs::ConsoleStream::Output) {
+                        wait.watch_owned(fd, true)?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
     fn cancellation_requested(&self) -> bool {
         self.inner.cancellation_requested()
@@ -459,5 +492,59 @@ mod tests {
         let saved = adapter.finish().unwrap();
         assert!(saved.output_queue.is_empty());
         assert_eq!(*output.lock().unwrap(), b"nativex\r\n");
+    }
+
+    use std::{
+        os::fd::AsFd,
+        time::{Duration, Instant},
+    };
+    struct ClosedInput(std::os::unix::net::UnixStream);
+    impl trames_vfs::ConsoleIo for ClosedInput {
+        fn read(&self, _: usize) -> Result<Vec<u8>, Errno> {
+            Ok(Vec::new())
+        }
+        fn write(&self, _: trames_vfs::ConsoleStream, bytes: &[u8]) -> Result<usize, Errno> {
+            Ok(bytes.len())
+        }
+        fn poll(&self, _: trames_vfs::ConsoleStream, events: u16) -> (u16, [u64; 2]) {
+            (events, [0; 2])
+        }
+        fn native_wait_fds(&self, stream: trames_vfs::ConsoleStream) -> Vec<trames_vfs::HostFd> {
+            if stream == trames_vfs::ConsoleStream::Input {
+                vec![self.0.as_fd().try_clone_to_owned().unwrap().into()]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+    struct NoWrites;
+    impl Executor for NoWrites {
+        fn write(&self, _: Write) {
+            panic!("no output");
+        }
+    }
+    #[test]
+    fn permanent_host_eof_does_not_keep_the_terminal_wait_readable() {
+        let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(writer);
+        let mut host = Host {
+            source: Arc::new(ClosedInput(reader)),
+            eof: true,
+            ..Host::default()
+        };
+        let (vfs, pair) = terminal();
+        let mut adapter = Adapter::new(&mut host, Some(pair), Arc::new(NoWrites));
+        adapter.poll_host(&vfs).unwrap();
+        let mut wait = trames_linux::HostWait::new().unwrap();
+        wait.begin();
+        adapter.host_interest(&mut wait).unwrap();
+        adapter.poll_host(&vfs).unwrap();
+        let at = Instant::now() + Duration::from_millis(20);
+        wait.until(at);
+        wait.wait().unwrap();
+        assert!(
+            Instant::now() >= at,
+            "closed stdin caused an immediate wake"
+        );
     }
 }

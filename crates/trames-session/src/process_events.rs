@@ -3,6 +3,7 @@
 use super::*;
 
 impl<C: Cpu> Kernel<C> {
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn timerfd(
         &self,
         p: &mut Process<C>,
@@ -27,6 +28,7 @@ impl<C: Cpu> Kernel<C> {
         )
         .map(Some)
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn epoll(
         &mut self,
         p: &mut Process<C>,
@@ -93,6 +95,7 @@ impl<C: Cpu> Kernel<C> {
             Ok(None)
         }
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn wake_futex(
         &mut self,
         p: &Process<C>,
@@ -105,10 +108,12 @@ impl<C: Cpu> Kernel<C> {
         }
         Self::futex_key(p, address, false).map_or(0, |key| self.wake_futex_key(key, count, bits))
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn futex_key(p: &Process<C>, address: u64, private: bool) -> Result<(u64, u64, u64), Errno> {
         crate::worker_syscalls::futex_key(&p.memory, p.vm_id, address, private)
     }
 
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn wake_futex_key(&mut self, key: (u64, u64, u64), count: u32, bits: u32) -> u64 {
         let woke = self.futexes.wake(key, count, bits);
         if woke != 0 {
@@ -116,6 +121,7 @@ impl<C: Cpu> Kernel<C> {
         }
         woke
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn resume_futex_ready(&mut self) -> bool {
         let mut ready = std::mem::take(&mut self.futex_ready);
         self.futexes.take_ready(&mut ready);
@@ -138,6 +144,7 @@ impl<C: Cpu> Kernel<C> {
         self.futex_ready = ready;
         progress
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn resume_event(&mut self, p: &mut Process<C>) -> bool {
         if let State::Barrier(wait) = &p.state {
             if let Some(value) = wait.finish() {
@@ -224,9 +231,8 @@ impl<C: Cpu> Kernel<C> {
             _ => false,
         }
     }
-    pub(super) fn tick_timers(&self) {
-        self.timers.tick();
-    }
+
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn event_call(
         &mut self,
         pid: u32,

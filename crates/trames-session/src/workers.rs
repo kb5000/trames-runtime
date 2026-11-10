@@ -129,8 +129,11 @@ pub(super) struct Done<C: Cpu> {
 pub(super) enum Event<C: Cpu> {
     Done(Box<Done<C>>),
     EpochStopped(usize),
+    #[cfg(all(test, trames_interpreter_conformance))]
     VmReady,
+    #[cfg(all(test, trames_interpreter_conformance))]
     Retired,
+    #[cfg(all(test, trames_interpreter_conformance))]
     Idle,
 }
 pub(super) fn native_fault(
@@ -1250,6 +1253,7 @@ impl<C: Cpu> Drop for Pool<C> {
         }) {
             match self.event_timeout(Duration::from_millis(10)) {
                 Ok(Some(Event::<C>::Done(_) | Event::<C>::EpochStopped(_))) => {}
+                #[cfg(all(test, trames_interpreter_conformance))]
                 Ok(Some(Event::<C>::VmReady | Event::<C>::Idle | Event::<C>::Retired)) => {}
                 Ok(None) => {
                     for slot in self.workers.iter() {

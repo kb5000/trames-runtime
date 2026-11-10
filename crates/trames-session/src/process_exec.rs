@@ -152,6 +152,7 @@ impl<C: Cpu> Kernel<C> {
         p.state = State::Ready;
         old_memory
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn commit_exec_task(
         &mut self,
         pid: u32,
@@ -227,6 +228,7 @@ impl<C: Cpu> Kernel<C> {
         self.retire_detached_memory(old_memory)?;
         Ok(())
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn exec_checkpoint(
         &mut self,
         epoch: &crate::run_queue::Epoch<C>,
@@ -1539,22 +1541,19 @@ pub(crate) struct Pending<C: Cpu> {
     result: std::sync::Mutex<Option<Result<Image<C>, Errno>>>,
     ready: std::sync::atomic::AtomicBool,
     readiness: Arc<trames_shared::Readiness>,
-    owner: std::thread::Thread,
 }
 impl<C: Cpu> Pending<C> {
-    pub(super) fn new(owner: std::thread::Thread) -> Self {
+    pub(super) fn new() -> Self {
         Self {
             result: Default::default(),
             ready: Default::default(),
             readiness: Arc::default(),
-            owner,
         }
     }
     pub(crate) fn complete(&self, result: Result<Image<C>, Errno>) {
         *self.result.lock().unwrap() = Some(result);
         self.ready.store(true, std::sync::atomic::Ordering::Release);
         self.readiness.notify_locked();
-        self.owner.unpark();
     }
     pub(super) fn ready(&self) -> bool {
         self.ready.load(std::sync::atomic::Ordering::Acquire)

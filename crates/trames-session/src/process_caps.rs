@@ -2,6 +2,7 @@
 //! Serial/task-owner entry for the same credential ABI used by source workers.
 use super::*;
 impl<C: Cpu> Kernel<C> {
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn credential_call(
         &self,
         pid: u32,

@@ -5,6 +5,7 @@ use super::*;
 impl<C: Cpu> Kernel<C> {
     /// Serial/traced execution uses the same backing publication as source
     /// CPUs. Waiting retains readiness on the task, never a process-wide pause.
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn admit_owner_layouts(
         &self,
         pid: u32,
@@ -37,6 +38,7 @@ impl<C: Cpu> Kernel<C> {
         self.layout_work
             .get_or_init(|| {
                 let layouts = trames_linux::FileLayouts::new(self.workers.file_executor());
+                #[cfg(all(test, trames_interpreter_conformance))]
                 layouts.bind_owner(trames_shared::IoSignal::new(
                     0,
                     Arc::downgrade(&self.byte_target),
@@ -45,6 +47,7 @@ impl<C: Cpu> Kernel<C> {
             })
             .clone()
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn start_file_checkpoint(
         &mut self,
         _pid: u32,
@@ -77,6 +80,7 @@ impl<C: Cpu> Kernel<C> {
             }
         }
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn poll_file_layouts(&mut self) {
         if let Some(layouts) = self.layout_work.get().cloned() {
             let tasks = self.processes.directory();
@@ -168,8 +172,9 @@ mod tests {
                 ))
             }
 
-            fn control_poll_interval(&self) -> Duration {
-                Duration::from_millis(1)
+            fn host_interest(&mut self, wait: &mut trames_linux::HostWait) -> std::io::Result<()> {
+                wait.until(std::time::Instant::now() + Duration::from_millis(1));
+                Ok(())
             }
             fn write(&mut self, _: OutputFd, bytes: &[u8]) -> std::io::Result<usize> {
                 Ok(bytes.len())

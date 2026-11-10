@@ -6,11 +6,11 @@
 #[macro_export]
 macro_rules! syscall_dispatch {
     (number $number:ident, args $args:ident;
-     $vis:vis fn $name:ident $params:tt -> $result:ty;
+     $(#[$attr:meta])* $vis:vis fn $name:ident $params:tt -> $result:ty;
      $known_vis:vis fn $known:ident;
      { $($arms:tt)* }) => {
         $crate::syscall_dispatch!(@collect
-            [$number $args] [$vis fn $name $params -> $result] [$known_vis fn $known]
+            [$number $args] [$(#[$attr])* $vis fn $name $params -> $result] [$known_vis fn $known]
             [] [] [] ; $($arms)*);
     };
     (@collect $ids:tt $function:tt $known:tt
@@ -34,9 +34,10 @@ macro_rules! syscall_dispatch {
             [$($patterns,)* $pattern,] [$($tests,)*] ; $($rest)*);
     };
     (@emit [$number:ident $args:ident]
-     [$vis:vis fn $name:ident $params:tt -> $result:ty]
+     [$(#[$attr:meta])* $vis:vis fn $name:ident $params:tt -> $result:ty]
      [$known_vis:vis fn $known:ident]
      [$($body:tt)*] [$($patterns:pat,)*] [$($tests:expr,)*]) => {
+        $(#[$attr])*
         $vis fn $name $params -> $result {
             match $number { $($body)* }
         }

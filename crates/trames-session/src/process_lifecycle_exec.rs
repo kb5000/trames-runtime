@@ -36,7 +36,7 @@ impl<C: Cpu> Lifecycle<C> {
                 );
                 match request {
                     Ok(request) => {
-                        let result = Arc::new(exec::Pending::new(self.owner.clone()));
+                        let result = Arc::new(exec::Pending::new());
                         p.exec_pending = Some(exec::Preparation::Disk(result.clone()));
                         self.images.submit_image(request, result);
                     }

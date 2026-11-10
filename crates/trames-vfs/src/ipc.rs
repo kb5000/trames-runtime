@@ -207,7 +207,7 @@ impl LocalResource {
     fn side(&self) -> usize {
         self.channel.side()
     }
-    pub(super) fn subscribe(&self, signal: &Arc<IoSignal>) -> IoSubscription {
+    pub fn subscribe(&self, signal: &Arc<IoSignal>) -> IoSubscription {
         self.channel.borrow().resource.readiness.subscribe(signal)
     }
     fn notify(&self) {

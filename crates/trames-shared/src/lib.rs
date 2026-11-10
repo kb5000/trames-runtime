@@ -23,6 +23,8 @@ pub use custody::{Admission, Custody, CustodyRead, CustodyWrite, OwnedRead, Owne
 pub use logical_size::{LogicalSize, SizeCycle};
 mod readiness;
 pub use readiness::{HostSource, IoSignal, IoSubscription, IoWake, Readiness, ReadinessDriver};
+mod host_wait;
+pub use host_wait::{HostWait, HostWake};
 mod host_events;
 pub use host_events::{HostEvents, HostFd, HostSubscription};
 mod pipe;

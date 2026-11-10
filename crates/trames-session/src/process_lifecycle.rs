@@ -47,7 +47,6 @@ pub(crate) struct Lifecycle<C: Cpu> {
     futexes: crate::futex::Futexes,
     futex_driver: std::sync::OnceLock<crate::futex::ReadyDriver>,
     images: Arc<dyn exec::Executor<C>>,
-    owner: std::thread::Thread,
 }
 struct MemoryWake {
     signal: Arc<trames_shared::IoSignal>,
@@ -71,6 +70,7 @@ struct Report {
 }
 /// Selection inspects already-accepted job metadata, never task-body locks.
 /// Mixed mapping/lifecycle requests use the same original affected resources.
+#[cfg(all(test, trames_interpreter_conformance))]
 pub(crate) fn eligible<'a, C: Cpu>(
     jobs: impl Iterator<Item = &'a Job<C>>,
     proc_reads: bool,
@@ -102,10 +102,19 @@ pub(crate) fn eligible<'a, C: Cpu>(
     requested
 }
 impl<C: Cpu> Lifecycle<C> {
+    pub(crate) fn has_native_services(&self) -> bool {
+        self.tasks
+            .handle(&1)
+            .is_some_and(|root| root.read().linux.vfs.has_native_services())
+    }
     pub(super) fn capture(kernel: &Kernel<C>) -> Self {
+        #[cfg(all(test, trames_interpreter_conformance))]
         let owner = std::thread::current();
+        #[cfg(all(test, trames_interpreter_conformance))]
         let events = kernel.workers.events();
+        #[cfg(all(test, trames_interpreter_conformance))]
         let wake_owner = owner.clone();
+        #[cfg(all(test, trames_interpreter_conformance))]
         kernel.futexes.bind_owner(Arc::new(move || {
             let _ = events.send(crate::workers::Event::VmReady);
             wake_owner.unpark();
@@ -131,7 +140,6 @@ impl<C: Cpu> Lifecycle<C> {
             futexes: kernel.futexes.clone(),
             futex_driver: Default::default(),
             images: kernel.workers.image_executor(),
-            owner,
         }
     }
     pub(crate) fn bind_memory(
@@ -217,6 +225,7 @@ impl<C: Cpu> Lifecycle<C> {
             epoch.fail();
         }
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(crate) fn collect(&self, kernel: &mut Kernel<C>) -> Option<RuntimeError> {
         self.collect_retirements(kernel);
         self.collect_report(kernel)

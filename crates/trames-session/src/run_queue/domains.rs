@@ -172,6 +172,7 @@ pub(super) struct Domains<C: Cpu> {
     entries: BTreeMap<u64, Entry<C>>,
     tasks: BTreeMap<u32, u64>,
     retired: Vec<u64>,
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub events: Option<Sender<crate::workers::Event<C>>>,
     pub source_lifecycle: bool,
 }
@@ -205,9 +206,10 @@ impl<C: Cpu> Domains<C> {
             entry.domain.interrupt();
         }
     }
-    pub fn new(events: Option<Sender<crate::workers::Event<C>>>) -> Self {
+    pub fn new(_events: Option<Sender<crate::workers::Event<C>>>) -> Self {
         Self {
-            events,
+            #[cfg(all(test, trames_interpreter_conformance))]
+            events: _events,
             ..Self::default()
         }
     }
@@ -286,6 +288,7 @@ impl<C: Cpu> Domains<C> {
             .get(&id)
             .is_some_and(|entry| entry.domain.paused() && entry.running == 0)
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub fn memory_owned(&self, id: u64) -> bool {
         self.entries
             .get(&id)
@@ -388,11 +391,13 @@ impl<C: Cpu> Domains<C> {
             let entry = self.entries.get_mut(&id).unwrap();
             entry.notified = true;
             entry.quiescent = Some(Instant::now());
+            #[cfg(all(test, trames_interpreter_conformance))]
             let ids = if entry.mm_only {
                 BTreeSet::from([id])
             } else {
                 self.closure(BTreeSet::from([id]))
             };
+            #[cfg(all(test, trames_interpreter_conformance))]
             if !self.source_group(&ids) {
                 if let Some(events) = &self.events {
                     let _ = events.send(crate::workers::Event::<C>::VmReady);
@@ -400,16 +405,24 @@ impl<C: Cpu> Domains<C> {
             }
         }
     }
-    fn source_group(&self, ids: &BTreeSet<u64>) -> bool {
-        self.source_lifecycle
-            && crate::process::lifecycle::eligible(
-                ids.iter()
-                    .flat_map(|id| self.entries[id].jobs.iter().map(Box::as_ref)),
-                ids.iter().any(|id| self.entries[id].proc_reads),
-                ids.iter().all(|id| self.entries[id].mm_only),
-                false,
-                ids.iter().any(|id| self.entries[id].layouts),
-            )
+    fn source_group(&self, _ids: &BTreeSet<u64>) -> bool {
+        #[cfg(all(test, trames_interpreter_conformance))]
+        {
+            let ids = _ids;
+            self.source_lifecycle
+                && crate::process::lifecycle::eligible(
+                    ids.iter()
+                        .flat_map(|id| self.entries[id].jobs.iter().map(Box::as_ref)),
+                    ids.iter().any(|id| self.entries[id].proc_reads),
+                    ids.iter().all(|id| self.entries[id].mm_only),
+                    false,
+                    ids.iter().any(|id| self.entries[id].layouts),
+                )
+        }
+        #[cfg(not(all(test, trames_interpreter_conformance)))]
+        {
+            self.source_lifecycle
+        }
     }
     /// A file writer needs returned bytes, not admission to another mm's
     /// structural operation. Drain this original domain independently even

@@ -304,6 +304,7 @@ impl EntryDecision {
             _ => None,
         }
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn value_for(&self, policy: &Seccomp, number: u32, pc: u64, args: [u64; 6]) -> Option<u32> {
         (self.number == number
             && self.pc == pc
@@ -605,6 +606,7 @@ impl Seccomp {
         }
     }
     // Explicit joined/debug embedding path uses the same resource implementation.
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(crate) fn local_call(
         &mut self,
         number: u32,
@@ -769,6 +771,7 @@ impl Filter {
     }
 }
 impl<C: Cpu> Kernel<C> {
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn seccomp(&mut self, p: &mut Process<C>, a: [u64; 6]) -> Result<u64, Errno> {
         p.seccomp.local_call(
             277,
@@ -779,6 +782,7 @@ impl<C: Cpu> Kernel<C> {
         )
     }
     /// True means the syscall was consumed without executing its implementation.
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn filter_syscall(
         &mut self,
         pid: u32,

@@ -1,12 +1,28 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 106, complete source-capability
-admission and final coordinator removal, reviewed on 2026-11-10. The prior shared
-runtime baseline is `365f858bc345280fd0ae7af616aef5b6aae89b1b`. Mac HVF and the iPad
+This is the consolidated implementation audit through stage 107, native host waits and release compatibility
+entry removal, reviewed on 2026-11-11. The prior shared
+runtime baseline is `74f5c7f3f9961c879b51142bec84a065ab810dad`. Mac HVF and the iPad
 interpreter share this userspace Linux kernel. Historical stage paragraphs retain
 their prior counts; the authoritative current category inventory is below.
 
-## Current status at a glance — 2026-11-10
+## Current status at a glance — 2026-11-11
+
+Stage 107 removes the remaining host scheduling/compatibility entry class.
+Release builds no longer contain the caller's task/deadline scan, legacy VM
+checkpoint receiver, Kernel syscall body/call wrapper or joined CPU restoration.
+The ABI recognizer is generated independently of that fixture-only body.
+`VmReady`, `Retired` and `Idle` are fixture-only events. Existing source workers
+own scope admission, retirement, memory maintenance and idle failure.
+
+Embedding transport work waits on native descriptor interests and original
+resource subscriptions. The waiter arms before the deciding nonblocking pass;
+completion, input/output, pause/cancel and file commands retain actual wakes.
+No implicit 2 ms terminal or 10 ms control timer remains. The caller bootstraps,
+services actual embedding activity, waits for teardown and returns the result;
+it cannot execute or retry guest work. Actual backend errors and explicit
+embedding deadlines retain their meaning. Both products use the same contract.
+See the paired product's stage 107 validation for native and iPad SDK evidence.
 
 Stage 106 closes the last missing-capability/resource category. The current
 production coordinator-dispatch category count is **zero**. The missing-resource
@@ -606,11 +622,12 @@ Actual excluded policy effects and missing capabilities retain explicit boundari
 
 ### Current remaining categories
 
-The count is **zero broad coordinator-dispatch categories** after stage 106.
+The count is **zero broad coordinator-dispatch categories** after stage 107.
 No production missing-provider tag or generic handoff remains. The source-only
 execution mode cannot select a bounded compatibility route in a release build.
 Architecture gates reject reintroducing admission suspension, owner-maintenance
-setters, the synchronous statistics callback or the host guest-retry loop.
+setters, the synchronous statistics callback or the host guest-retry loop. They also reject release checkpoint receivers,
+caller task scans and implicit periodic control APIs.
 
 | Former category | Final disposition |
 | --- | --- |

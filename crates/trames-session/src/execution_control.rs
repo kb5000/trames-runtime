@@ -19,6 +19,7 @@ pub(crate) enum End {
 }
 pub(crate) struct Control {
     phase: AtomicU8,
+    wake: std::sync::OnceLock<std::sync::Arc<trames_linux::HostWake>>,
     pub(crate) remaining: AtomicU64,
     terminal_budget: bool,
 }
@@ -30,6 +31,7 @@ impl Control {
     pub(crate) fn with_budget(budget: u64, terminal_budget: bool) -> Self {
         Self {
             phase: AtomicU8::new(RUNNING),
+            wake: Default::default(),
             remaining: AtomicU64::new(budget),
             terminal_budget: terminal_budget && budget != u64::MAX,
         }
@@ -50,12 +52,18 @@ impl Control {
         #[cfg(not(all(test, trames_interpreter_conformance)))]
         self.close(End::Budget);
     }
+    pub(crate) fn bind_host(&self, wake: std::sync::Arc<trames_linux::HostWake>) {
+        let _ = self.wake.set(wake);
+    }
     pub(crate) fn close(&self, reason: End) {
         let _ = self
             .phase
             .try_update(Ordering::Release, Ordering::Relaxed, |phase| {
                 (phase < CLOSING).then_some(reason as u8)
             });
+        if let Some(wake) = self.wake.get() {
+            wake.notify();
+        }
     }
     pub(crate) fn end(&self) -> Option<End> {
         match self.phase.load(Ordering::Acquire) {

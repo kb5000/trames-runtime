@@ -12,6 +12,7 @@ pub(super) struct Child<C: Cpu> {
 impl<C: Cpu> Child<C> {
     /// Original membership is published before any executor can run the child.
     /// This transfers the completed body without a Kernel/table callback.
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn publish(self, directory: &tasks::Directory<C>) -> Option<u64> {
         directory.publish(self.id, self.process.into());
         self.value
@@ -620,6 +621,7 @@ impl Birth {
         ));
         let p = &mut *child.process;
         p.family.bind_host_status(child.host.status_cell());
+        p.family.bind_host_ready(child.host.completion());
         p.vm_id = self.resource_id();
         p.wait_event.bind_presence(&p.signals.presence);
         self.admit_child(

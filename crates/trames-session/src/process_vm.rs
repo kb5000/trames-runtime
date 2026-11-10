@@ -4,6 +4,7 @@
 use super::*;
 
 impl<C: Cpu> Kernel<C> {
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn vm_checkpoint(
         &mut self,
         epoch: &crate::run_queue::Epoch<C>,
@@ -282,26 +283,52 @@ impl<C: Cpu> Kernel<C> {
         result
     }
 
+    pub(super) fn wait_source(
+        &mut self,
+        epoch: &crate::run_queue::Epoch<C>,
+        io: &mut impl GuestOutput,
+    ) -> Result<(), RuntimeError> {
+        let mut wait = match self.host_wait.take() {
+            Some(wait) => wait,
+            None => trames_linux::HostWait::new().map_err(|e| RuntimeError::HostIo(Arc::new(e)))?,
+        };
+        let wake = wait.wake();
+        epoch.control.bind_host(wake.clone());
+        io.bind_host_wake(wake);
+        epoch.bind_host_wait(io.waits_for_host());
+        while !epoch.control.closing() {
+            wait.begin();
+            io.host_interest(&mut wait)
+                .map_err(|e| RuntimeError::HostIo(Arc::new(e)))?;
+            self.cohort_live_control(epoch, &[], io)?;
+            if epoch.control.closing() {
+                break;
+            }
+            wait.wait().map_err(|e| RuntimeError::HostIo(Arc::new(e)))?;
+        }
+        self.host_wait = Some(wait);
+        Ok(())
+    }
     #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn cohort_control(
         &mut self,
-        members: &[(u32, usize)],
+        _members: &[(u32, usize)],
         io: &mut impl GuestOutput,
     ) -> Result<bool, RuntimeError> {
-        self.cohort_control_inner(None, members, io)
+        self.cohort_control_inner(None, _members, io)
     }
     pub(super) fn cohort_live_control(
         &mut self,
         epoch: &crate::run_queue::Epoch<C>,
-        members: &[(u32, usize)],
+        _members: &[(u32, usize)],
         io: &mut impl GuestOutput,
     ) -> Result<bool, RuntimeError> {
-        self.cohort_control_inner(Some(epoch), members, io)
+        self.cohort_control_inner(Some(epoch), _members, io)
     }
     fn cohort_control_inner(
         &mut self,
         epoch: Option<&crate::run_queue::Epoch<C>>,
-        members: &[(u32, usize)],
+        _members: &[(u32, usize)],
         io: &mut impl GuestOutput,
     ) -> Result<bool, RuntimeError> {
         self.persistent_control_checks += 1;
@@ -341,6 +368,20 @@ impl<C: Cpu> Kernel<C> {
         if epoch.is_some_and(|epoch| epoch.source_session()) {
             return Ok(false);
         }
+        #[cfg(all(test, trames_interpreter_conformance))]
+        {
+            self.compatibility_control(epoch, _members, io)
+        }
+        #[cfg(not(all(test, trames_interpreter_conformance)))]
+        unreachable!("live control requires original source resources")
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
+    fn compatibility_control(
+        &self,
+        epoch: Option<&crate::run_queue::Epoch<C>>,
+        members: &[(u32, usize)],
+        io: &mut impl GuestOutput,
+    ) -> Result<bool, RuntimeError> {
         let now = Instant::now();
         let members: std::collections::BTreeSet<_> = members.iter().map(|(pid, _)| *pid).collect();
         Ok(self.processes.iter().any(|(pid, p)| {
@@ -671,6 +712,12 @@ mod tests {
     }
     struct Stop(Arc<AtomicBool>);
     impl GuestOutput for Stop {
+        // Explicit observation clock for this white-box fixture only.
+        fn host_interest(&mut self, wait: &mut trames_linux::HostWait) -> std::io::Result<()> {
+            wait.until(Instant::now() + Duration::from_millis(1));
+            Ok(())
+        }
+
         fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo> {
             std::sync::Arc::new(trames_vfs::CapturedConsole::default())
         }
@@ -693,6 +740,12 @@ mod tests {
             deadline: Instant,
         }
         impl GuestOutput for Completed {
+            // Explicit observation clock for this white-box fixture only.
+            fn host_interest(&mut self, wait: &mut trames_linux::HostWait) -> std::io::Result<()> {
+                wait.until(Instant::now() + Duration::from_millis(1));
+                Ok(())
+            }
+
             fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo> {
                 std::sync::Arc::new(trames_vfs::CapturedConsole::default())
             }
@@ -994,6 +1047,12 @@ mod tests {
     fn persistent_checks_keep_jobs_and_translations_until_actual_cancellation() {
         struct Polls(u64);
         impl GuestOutput for Polls {
+            // Explicit observation clock for this white-box fixture only.
+            fn host_interest(&mut self, wait: &mut trames_linux::HostWait) -> std::io::Result<()> {
+                wait.until(Instant::now() + Duration::from_millis(1));
+                Ok(())
+            }
+
             fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo> {
                 std::sync::Arc::new(trames_vfs::CapturedConsole::default())
             }
@@ -1062,8 +1121,9 @@ mod tests {
             fn paused(&self) -> bool {
                 self.paused
             }
-            fn control_poll_interval(&self) -> Duration {
-                Duration::from_millis(1)
+            fn host_interest(&mut self, wait: &mut trames_linux::HostWait) -> std::io::Result<()> {
+                wait.until(std::time::Instant::now() + Duration::from_millis(1));
+                Ok(())
             }
             fn poll_host(
                 &mut self,
@@ -1234,8 +1294,9 @@ mod tests {
                 ))
             }
 
-            fn control_poll_interval(&self) -> Duration {
-                Duration::from_millis(1)
+            fn host_interest(&mut self, wait: &mut trames_linux::HostWait) -> std::io::Result<()> {
+                wait.until(std::time::Instant::now() + Duration::from_millis(1));
+                Ok(())
             }
             fn write(&mut self, _: OutputFd, bytes: &[u8]) -> std::io::Result<usize> {
                 Ok(bytes.len())
@@ -1302,6 +1363,12 @@ mod tests {
             finished: bool,
         }
         impl GuestOutput for Roundtrip {
+            // Explicit observation clock for this white-box fixture only.
+            fn host_interest(&mut self, wait: &mut trames_linux::HostWait) -> std::io::Result<()> {
+                wait.until(Instant::now() + Duration::from_millis(1));
+                Ok(())
+            }
+
             fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo> {
                 std::sync::Arc::new(trames_vfs::CapturedConsole::default())
             }
@@ -1429,8 +1496,9 @@ mod tests {
             fn paused(&self) -> bool {
                 self.paused
             }
-            fn control_poll_interval(&self) -> Duration {
-                Duration::from_millis(1)
+            fn host_interest(&mut self, wait: &mut trames_linux::HostWait) -> std::io::Result<()> {
+                wait.until(std::time::Instant::now() + Duration::from_millis(1));
+                Ok(())
             }
             fn waits_for_host(&self) -> bool {
                 true

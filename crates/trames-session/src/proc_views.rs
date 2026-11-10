@@ -23,6 +23,7 @@ pub(super) struct Source {
     pub limits: crate::MemoryLimits,
     pub host: Option<Arc<dyn Fn() -> trames_linux::HostMemoryInfo + Send + Sync>>,
     pub reads: Mutex<Reads>,
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub wake: Arc<dyn Fn() + Send + Sync>,
 }
 /// The existing five-second exponential sample, advanced by actual observers.
@@ -80,6 +81,7 @@ impl Drop for ReadDriver {
                 !reads.pending.is_empty() || reads.waiting.iter().any(|wait| wait.signal.ready());
             drop(reads);
             if pending {
+                #[cfg(all(test, trames_interpreter_conformance))]
                 (self.source.wake)();
             }
         }
@@ -132,6 +134,7 @@ impl Source {
             }
         }));
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub fn take_reads(&self) -> Vec<trames_memory::MemoryReport> {
         self.take_for(None)
     }
@@ -206,6 +209,7 @@ impl Source {
         if let Some(signal) = executor {
             signal.notify();
         } else {
+            #[cfg(all(test, trames_interpreter_conformance))]
             (self.wake)();
         }
     }

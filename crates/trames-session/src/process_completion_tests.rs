@@ -317,8 +317,9 @@ fn initial_busy_memory_is_admitted_without_host_cpu_execution() {
             );
             Ok(HostState::Running)
         }
-        fn control_poll_interval(&self) -> Duration {
-            Duration::from_millis(1)
+        fn host_interest(&mut self, wait: &mut trames_linux::HostWait) -> std::io::Result<()> {
+            wait.until(std::time::Instant::now() + Duration::from_millis(1));
+            Ok(())
         }
         fn write(&mut self, _: trames_linux::OutputFd, bytes: &[u8]) -> std::io::Result<usize> {
             Ok(bytes.len())
@@ -361,6 +362,7 @@ fn explicit_host_cancel_finishes_on_source_without_a_stopped_host_hook() {
     struct Output {
         cancel: bool,
         polls: usize,
+        cancel_after: Instant,
     }
     impl GuestOutput for Output {
         fn source_console(&mut self) -> Arc<dyn trames_vfs::ConsoleIo> {
@@ -369,12 +371,13 @@ fn explicit_host_cancel_finishes_on_source_without_a_stopped_host_hook() {
         fn write(&mut self, _: trames_linux::OutputFd, bytes: &[u8]) -> std::io::Result<usize> {
             Ok(bytes.len())
         }
-        fn control_poll_interval(&self) -> Duration {
-            Duration::from_millis(1)
+        fn host_interest(&mut self, wait: &mut trames_linux::HostWait) -> std::io::Result<()> {
+            wait.until(std::time::Instant::now() + Duration::from_millis(1));
+            Ok(())
         }
         fn poll_host(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<trames_linux::HostState> {
             self.polls += 1;
-            self.cancel = self.polls > 1;
+            self.cancel = Instant::now() >= self.cancel_after;
             Ok(trames_linux::HostState::Running)
         }
         fn cancellation_requested(&self) -> bool {
@@ -392,6 +395,7 @@ fn explicit_host_cancel_finishes_on_source_without_a_stopped_host_hook() {
         let mut output = Output {
             cancel: false,
             polls: 0,
+            cancel_after: Instant::now() + Duration::from_millis(10),
         };
         assert!(matches!(
             k.drive(&mut output, u64::MAX),
@@ -600,4 +604,115 @@ fn reserved_budget_waits_for_actual_source_cpu_quiescence_and_refunds_unused_cre
     k.workers.finish_closed(epoch.clone()).unwrap();
     assert!(epoch.collect_closed(&mut k).is_none());
     assert_eq!(k.instructions, 10);
+}
+
+#[test]
+fn a_live_source_waits_for_its_host_event_without_periodic_task_scans() {
+    struct Host {
+        deadline: Instant,
+        polls: usize,
+    }
+    impl GuestOutput for Host {
+        fn source_console(&mut self) -> Arc<dyn trames_vfs::ConsoleIo> {
+            Arc::new(trames_vfs::CapturedConsole::default())
+        }
+        fn host_interest(&mut self, wait: &mut trames_linux::HostWait) -> std::io::Result<()> {
+            wait.until(self.deadline);
+            Ok(())
+        }
+        fn poll_host(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<HostState> {
+            self.polls += 1;
+            Ok(HostState::from_cancelled(Instant::now() >= self.deadline))
+        }
+        fn write(&mut self, _: trames_linux::OutputFd, bytes: &[u8]) -> std::io::Result<usize> {
+            Ok(bytes.len())
+        }
+    }
+    for cpus in [1, 4, 12] {
+        let mut k = kernel();
+        k.cpu_count = cpus;
+        k.per_cpu.resize(cpus, Duration::ZERO);
+        let mut root = admitted_process(&k);
+        executable(&mut root, &[0x14000000]);
+        k.publish_task(1, &root);
+        k.processes.insert(1, root);
+        let mut host = Host {
+            deadline: Instant::now() + Duration::from_millis(80),
+            polls: 0,
+        };
+        assert!(matches!(
+            k.drive(&mut host, u64::MAX),
+            Err(RuntimeError::Cancelled)
+        ));
+        assert!(
+            host.polls <= 4,
+            "unexpected periodic host polls: {}",
+            host.polls
+        );
+        assert!(k.source_completed);
+        assert!(k.cohort_return_syscalls.is_empty());
+    }
+}
+
+#[test]
+fn an_initially_paused_source_resumes_from_the_original_host_notification() {
+    use std::sync::atomic::Ordering;
+    struct Host {
+        paused: Arc<std::sync::atomic::AtomicBool>,
+        observed: std::sync::mpsc::Sender<()>,
+        bound: Option<std::sync::mpsc::Sender<Arc<trames_linux::HostWake>>>,
+        deadline: Instant,
+    }
+    impl GuestOutput for Host {
+        fn source_console(&mut self) -> Arc<dyn trames_vfs::ConsoleIo> {
+            Arc::new(trames_vfs::CapturedConsole::default())
+        }
+        fn bind_host_wake(&mut self, wake: Arc<trames_linux::HostWake>) {
+            if let Some(bound) = self.bound.take() {
+                bound.send(wake).unwrap();
+            }
+        }
+        fn paused(&self) -> bool {
+            let paused = self.paused.load(Ordering::Relaxed);
+            if paused {
+                let _ = self.observed.send(());
+            }
+            paused
+        }
+        fn host_interest(&mut self, wait: &mut trames_linux::HostWait) -> std::io::Result<()> {
+            wait.until(self.deadline);
+            Ok(())
+        }
+        fn poll_host(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<HostState> {
+            Ok(HostState::from_cancelled(Instant::now() >= self.deadline))
+        }
+        fn write(&mut self, _: trames_linux::OutputFd, bytes: &[u8]) -> std::io::Result<usize> {
+            Ok(bytes.len())
+        }
+    }
+    let mut k = kernel();
+    let mut root = admitted_process(&k);
+    executable(&mut root, &[0xd28000e0, 0xd2800ba8, 0xd4000001]);
+    k.publish_task(1, &root);
+    k.processes.insert(1, root);
+    let paused = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (bound, binding) = std::sync::mpsc::channel();
+    let (observed, observation) = std::sync::mpsc::channel();
+    let resume = paused.clone();
+    let producer = std::thread::spawn(move || {
+        let wake: Arc<trames_linux::HostWake> =
+            binding.recv_timeout(Duration::from_secs(2)).unwrap();
+        observation.recv_timeout(Duration::from_secs(2)).unwrap();
+        resume.store(false, Ordering::Relaxed);
+        wake.notify();
+    });
+    let mut host = Host {
+        paused,
+        observed,
+        bound: Some(bound),
+        deadline: Instant::now() + Duration::from_secs(3),
+    };
+    assert_eq!(k.drive(&mut host, 100000).unwrap().code, 7);
+    producer.join().unwrap();
+    assert!(k.source_completed);
 }

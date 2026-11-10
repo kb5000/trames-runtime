@@ -126,7 +126,7 @@ impl PtyIo {
             job_references: Default::default(),
         }
     }
-    pub(crate) fn subscribe(&self, signal: &Arc<crate::IoSignal>) -> crate::IoSubscription {
+    pub fn subscribe(&self, signal: &Arc<crate::IoSignal>) -> crate::IoSubscription {
         self.terminal.readiness.subscribe(signal)
     }
     pub(crate) fn notify(&self) {

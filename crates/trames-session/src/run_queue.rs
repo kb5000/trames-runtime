@@ -829,6 +829,7 @@ pub(super) struct Epoch<C: Cpu> {
     pub local_vm: bool,
     persistent: bool,
     terminal: AtomicBool,
+    host_external: AtomicBool,
 }
 impl<C: Cpu> Epoch<C> {
     pub fn memory_barrier(
@@ -889,6 +890,7 @@ impl<C: Cpu> Epoch<C> {
             local_vm: events.is_some(),
             persistent,
             terminal: AtomicBool::new(false),
+            host_external: AtomicBool::new(false),
         })
     }
     pub fn with_events(
@@ -927,6 +929,9 @@ impl<C: Cpu> Epoch<C> {
             }
         }
     }
+    pub(crate) fn bind_host_wait(&self, external: bool) {
+        self.host_external.store(external, Ordering::Relaxed);
+    }
     pub(crate) fn bind_session(&self, terminal: bool) {
         self.terminal.store(terminal, Ordering::Relaxed);
     }
@@ -935,6 +940,7 @@ impl<C: Cpu> Epoch<C> {
         assert!(self.lifecycle.set(lifecycle).is_ok());
         self.queues.lock().unwrap().domains.source_lifecycle = true;
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub fn collect_lifecycle(
         &self,
         kernel: &mut crate::process::Kernel<C>,
@@ -1264,6 +1270,7 @@ impl<C: Cpu> Epoch<C> {
             id,
         }
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(crate) fn controls(&self, id: u32) -> bool {
         let q = self.queues.lock().unwrap();
         q.members.contains(&id) || q.host_admissions.contains(&id)
@@ -1422,6 +1429,7 @@ impl<C: Cpu> Epoch<C> {
     }
     /// The creator's checkpoint still owns all private execution actors of
     /// this mm. Register a child there, never in the runnable queue early.
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub fn admit_checkpoint(&self, checkpoint: &mut Checkpoint<C>, mut job: Box<Job<C>>) {
         self.bind_job(&mut job);
         let mut q = self.queues.lock().unwrap();
@@ -1503,16 +1511,23 @@ impl<C: Cpu> Epoch<C> {
         source: bool,
     ) -> Option<(Checkpoint<C>, Vec<trames_vfs::IoSubscription>)> {
         if let Some(index) = q.custody_waits.iter().position(|wait| {
-            wait.signal.ready()
-                && (q.domains.source_lifecycle
-                    && crate::process::lifecycle::eligible(
-                        wait.checkpoint.jobs.iter().map(Box::as_ref),
-                        wait.checkpoint.proc_reads,
-                        wait.checkpoint.mm_only,
-                        wait.checkpoint.source_retry,
-                        wait.checkpoint.layout_only,
-                    ))
-                    == source
+            #[cfg(all(test, trames_interpreter_conformance))]
+            {
+                wait.signal.ready()
+                    && (q.domains.source_lifecycle
+                        && crate::process::lifecycle::eligible(
+                            wait.checkpoint.jobs.iter().map(Box::as_ref),
+                            wait.checkpoint.proc_reads,
+                            wait.checkpoint.mm_only,
+                            wait.checkpoint.source_retry,
+                            wait.checkpoint.layout_only,
+                        ))
+                        == source
+            }
+            #[cfg(not(all(test, trames_interpreter_conformance)))]
+            {
+                wait.signal.ready() && q.domains.source_lifecycle == source
+            }
         }) {
             let wait = q.custody_waits.swap_remove(index);
             Some((wait.checkpoint, wait._subscriptions))
@@ -1522,6 +1537,7 @@ impl<C: Cpu> Epoch<C> {
                 .map(|checkpoint| (checkpoint, Vec::new()))
         }
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub fn take_checkpoint(&self) -> Option<Checkpoint<C>> {
         let claimed = Self::claim_checkpoint(&mut self.queues.lock().unwrap(), false);
         // Subscription destruction stays outside the queue mutex.
@@ -1535,6 +1551,7 @@ impl<C: Cpu> Epoch<C> {
     ) {
         let mut q = self.queues.lock().unwrap();
         let ready = signal.ready();
+        #[cfg(all(test, trames_interpreter_conformance))]
         let source = q.domains.source_lifecycle
             && crate::process::lifecycle::eligible(
                 checkpoint.jobs.iter().map(Box::as_ref),
@@ -1551,6 +1568,7 @@ impl<C: Cpu> Epoch<C> {
         // Publication and wake share this mutex. A release before publication
         // is latched in the signal; a later release finds the published wait.
         if ready {
+            #[cfg(all(test, trames_interpreter_conformance))]
             if let Some(events) = q.domains.events.as_ref().filter(|_| !source) {
                 let _ = events.send(crate::workers::Event::VmReady);
             }
@@ -1879,7 +1897,25 @@ impl<C: Cpu> Epoch<C> {
                         && !lifecycle.futex_pending()
                 })
             {
-                if self.persistent {
+                if self.source_session() {
+                    if !self.host_external.load(Ordering::Relaxed)
+                        && !self.host_pause.load(Ordering::Relaxed)
+                    {
+                        drop(q);
+                        let native = self
+                            .lifecycle
+                            .get()
+                            .is_some_and(|lifecycle| lifecycle.has_native_services());
+                        if !native && self.idle() {
+                            self.fail_execution(crate::RuntimeError::Deadlock);
+                        }
+                        q = self.queues.lock().unwrap();
+                        if self.control.closing() {
+                            continue;
+                        }
+                    }
+                } else if self.persistent {
+                    #[cfg(all(test, trames_interpreter_conformance))]
                     if !q.idle_notified {
                         q.idle_notified = true;
                         if let Some(events) = &q.domains.events {
@@ -2111,6 +2147,7 @@ impl<C: Cpu> Epoch<C> {
         q.finished.push(done);
         if exited && !q.retirement_notified {
             q.retirement_notified = true;
+            #[cfg(all(test, trames_interpreter_conformance))]
             if let Some(events) = q
                 .domains
                 .events
@@ -2132,6 +2169,7 @@ impl<C: Cpu> Epoch<C> {
         }
     }
     /// The complete CPU/metrics return once, without waiting for unrelated Views.
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub fn take_retired(&self) -> Vec<Done<C>> {
         if self.lifecycle.get().is_some() {
             return Vec::new();
@@ -2155,6 +2193,7 @@ impl<C: Cpu> Epoch<C> {
         q.retirement_notified = false;
         retired
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub fn member_ids(&self) -> Vec<u32> {
         self.queues
             .lock()
@@ -2167,6 +2206,7 @@ impl<C: Cpu> Epoch<C> {
     pub fn contains(&self, pid: u32) -> bool {
         self.queues.lock().unwrap().members.contains(&pid)
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub fn memory_owned(&self, id: u64) -> bool {
         self.queues.lock().unwrap().domains.memory_owned(id)
     }
@@ -2267,19 +2307,21 @@ impl<C: Cpu> trames_vfs::IoWake for Epoch<C> {
             self.notify(&mut q);
             return;
         }
-        if let Some(wait) = q
+        if let Some(_wait) = q
             .custody_waits
             .iter()
             .find(|wait| Arc::ptr_eq(&wait.signal, signal))
         {
+            #[cfg(all(test, trames_interpreter_conformance))]
             let source = q.domains.source_lifecycle
                 && crate::process::lifecycle::eligible(
-                    wait.checkpoint.jobs.iter().map(Box::as_ref),
-                    wait.checkpoint.proc_reads,
-                    wait.checkpoint.mm_only,
-                    wait.checkpoint.source_retry,
-                    wait.checkpoint.layout_only,
+                    _wait.checkpoint.jobs.iter().map(Box::as_ref),
+                    _wait.checkpoint.proc_reads,
+                    _wait.checkpoint.mm_only,
+                    _wait.checkpoint.source_retry,
+                    _wait.checkpoint.layout_only,
                 );
+            #[cfg(all(test, trames_interpreter_conformance))]
             if let Some(events) = q.domains.events.as_ref().filter(|_| !source) {
                 let _ = events.send(crate::workers::Event::VmReady);
             }

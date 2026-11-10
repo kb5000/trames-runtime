@@ -33,6 +33,7 @@ struct State<C: Cpu> {
 pub(super) struct Launches<C: Cpu> {
     state: Mutex<State<C>>,
     count: AtomicUsize,
+    #[cfg(all(test, trames_interpreter_conformance))]
     owner: std::thread::Thread,
 }
 impl<C: Cpu> Default for Launches<C> {
@@ -43,6 +44,7 @@ impl<C: Cpu> Default for Launches<C> {
                 reader: None,
             }),
             count: Default::default(),
+            #[cfg(all(test, trames_interpreter_conformance))]
             owner: std::thread::current(),
         }
     }
@@ -63,6 +65,7 @@ impl<C: Cpu> Drop for Driver<C> {
             let ready = state.pending.iter().any(Launch::ready);
             drop(state);
             if ready {
+                #[cfg(all(test, trames_interpreter_conformance))]
                 self.source.owner.unpark();
             }
         }
@@ -151,6 +154,7 @@ impl<C: Cpu> Launches<C> {
         if let Some(reader) = reader {
             reader.notify();
         } else {
+            #[cfg(all(test, trames_interpreter_conformance))]
             self.owner.unpark();
         }
     }

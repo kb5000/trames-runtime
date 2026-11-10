@@ -6,6 +6,7 @@ use super::*;
 use trames_kernel::signal::SS_DISABLE;
 
 impl<C: Cpu> Kernel<C> {
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn reboot_guest(
         &mut self,
         pid: u32,
@@ -24,11 +25,13 @@ impl<C: Cpu> Kernel<C> {
         self.exit(pid, p, 0);
         Ok(None)
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn sigaltstack(p: &mut Process<C>, new: u64, old: u64) -> Result<u64, Errno> {
         p.signals
             .alt_stack
             .call(p.cpu.sp(), new, old, &mut p.memory)
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn membarrier(p: &Process<C>, command: u64, flags: u64) -> Result<u64, Errno> {
         match crate::barrier::prepare(&p.membarrier_registered, command, flags)? {
             crate::barrier::Action::Complete(value) => Ok(value),
@@ -39,6 +42,7 @@ impl<C: Cpu> Kernel<C> {
             }
         }
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn ioprio_get(
         &self,
         pid: u32,
@@ -63,6 +67,7 @@ impl<C: Cpu> Kernel<C> {
             tasks: self.task_capacity.limit() as u64,
         }
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn limit_authority(
         &self,
         pid: u32,
@@ -77,6 +82,7 @@ impl<C: Cpu> Kernel<C> {
             fixed: self.fixed_limits(),
         }
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn rlimit(
         &self,
         pid: u32,

@@ -3,6 +3,7 @@
 //! priorities are deliberately independent from guest permissions and policy.
 use super::*;
 impl<C: Cpu> Kernel<C> {
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn scheduling(
         &self,
         p: &mut Process<C>,
@@ -18,6 +19,7 @@ impl<C: Cpu> Kernel<C> {
         }
         .scheduling(&p.signals.io, self.cpu_count, number, a, &mut p.memory)
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn mempolicy(p: &mut Process<C>, a: [u64; 6]) -> Result<Option<u64>, Errno> {
         trames_linux::memory_query(&mut p.memory, 236, a)
             .expect("memory policy ABI")
