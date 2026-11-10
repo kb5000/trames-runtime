@@ -600,6 +600,47 @@ mod tests {
         assert_eq!(&v.stat_fd(0).unwrap()[32..40], &0x8800u64.to_le_bytes());
     }
     #[test]
+    fn caller_proc_aliases_keep_inode_identity_but_follow_the_current_reader_through_path_fds() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(
+            1,
+            RuntimeInfo {
+                processes: vec![
+                    ProcessInfo {
+                        pid: 1,
+                        tgid: 1,
+                        ..Default::default()
+                    },
+                    ProcessInfo {
+                        pid: 2,
+                        tgid: 2,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        for (path, thread) in [
+            (b"/proc/self".as_slice(), false),
+            (b"/proc/thread-self".as_slice(), true),
+        ] {
+            let fd = v.open_at(AT_FDCWD, path, O_PATH | O_NOFOLLOW, 0).unwrap();
+            let inode = v.stat_fd(fd).unwrap()[8..16].to_vec();
+            for pid in [1, 2, 1, 2] {
+                v.set_process_context(pid);
+                let expected = if thread {
+                    format!("{pid}/task/{pid}")
+                } else {
+                    pid.to_string()
+                };
+                assert_eq!(v.readlink_at(AT_FDCWD, path).unwrap(), expected.as_bytes());
+                assert_eq!(v.readlink_at(fd as i32, b"").unwrap(), expected.as_bytes());
+                assert_eq!(v.stat_fd(fd).unwrap()[8..16], inode);
+            }
+            v.close(fd).unwrap();
+        }
+    }
+    #[test]
     fn process_views_are_live_readonly_and_outside_storage_quota() {
         let mut v = Vfs::default();
         let before = v.capacity();
@@ -1484,6 +1525,21 @@ impl Vfs {
         }
         Ok(())
     }
+    /// Caller-dependent proc aliases have one inode, not one shared target.
+    /// Resolve their value from this query's original caller/namespace context.
+    pub(super) fn proc_caller_link<P: PathArg + ?Sized>(&self, at: &P) -> Result<Option<Vec<u8>>> {
+        if !matches!(at.key(), b"/proc/self" | b"/proc/thread-self")
+            || !self.uses_pseudo(at)
+            || !self.pseudo.borrow().enabled
+        {
+            return Ok(None);
+        }
+        self.refresh_proc_source(at)?;
+        Ok(match self.pseudo_content(at)? {
+            Some((Content::Symlink(target), _)) => Some(target),
+            _ => None,
+        })
+    }
     pub(super) fn pseudo_node<P: PathArg + ?Sized>(&self, at: &P) -> Result<Option<NodeRef>> {
         let path = at.key();
         if ![b"/proc".as_slice(), b"/sys", b"/dev"].iter().any(|base| {
@@ -1507,7 +1563,13 @@ impl Vfs {
             }
         }
         self.refresh_proc_source(at)?;
-        let content = self.pseudo_content(at)?;
+        let content = if matches!(path, b"/proc/self" | b"/proc/thread-self") {
+            // A cached target would be overwritten by another caller between
+            // lookup and follow/readlink. Only inode/type metadata is shared.
+            Some((Content::Symlink(Vec::new()), 0o120777))
+        } else {
+            self.pseudo_content(at)?
+        };
         if let Some((content, mode)) = content {
             let identity = self.proc_path_identity(at);
             let node = self.pseudo.borrow_mut().cache_process(

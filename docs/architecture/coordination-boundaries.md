@@ -4531,3 +4531,14 @@ missing-provider/body escalation sites and final generic dispatch remain under
 the three categories above. See the [paired validation](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/session-completion-20261110.json)
 for exact common, hardware and installed Dev outcomes. No throughput claim or
 stable deployment is implied by this architectural change.
+
+The terminal-path hardware audit also exposed a shared proc alias cache race:
+`/proc/self` and `/proc/thread-self` stored a caller's link target in an inode
+shared with other callers. Another executor could overwrite it between lookup
+and follow, bind an open to the wrong original task, and later return ESRCH when
+that task exited. These aliases now cache only inode/type metadata. Resolution,
+readlink and empty-path O_PATH reads compute the target from the current query's
+original caller/namespace context. Inode identity remains shared; no global
+resolver lock, owner handoff or ordinary file-byte check is added. The unchanged
+native proc workload failed within four repetitions before the fix and passes
+100 consecutive four/twelve-CPU repetitions after it.

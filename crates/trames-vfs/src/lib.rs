@@ -1865,6 +1865,8 @@ impl Vfs {
                 };
                 if let Some(node) = node {
                     if let Content::Symlink(target) = &node.borrow().content {
+                        let caller_target = self.proc_caller_link(&current)?;
+                        let target = caller_target.as_deref().unwrap_or(target);
                         if policy & 4 != 0 {
                             return Err(Errno(40));
                         }
@@ -1939,6 +1941,9 @@ impl Vfs {
                 if let Some(target) = self.proc_directory_readlink(&path)? {
                     return Ok(target);
                 }
+                if let Some(target) = self.proc_caller_link(&path)? {
+                    return Ok(target);
+                }
             }
             self.refresh_pseudo_fd(dirfd as u32)?;
             let open = description.borrow();
@@ -1951,6 +1956,9 @@ impl Vfs {
         let dest = self.resolve_final(dirfd, path, false)?;
         self.check_proc_inspection(&dest, true)?;
         if let Some(target) = self.proc_directory_readlink(&dest)? {
+            return Ok(target);
+        }
+        if let Some(target) = self.proc_caller_link(&dest)? {
             return Ok(target);
         }
         let node = self.node(&dest)?;

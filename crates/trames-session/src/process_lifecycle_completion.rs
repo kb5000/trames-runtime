@@ -50,8 +50,13 @@ impl<C: Cpu> Lifecycle<C> {
                 p.linux.vfs.set_lock_owner(p.tgid);
                 p.linux.vfs.release_process_locks();
             }
-            if p.signals.io.live() && committed.insert(p.memory.coordinator_ownership().0) {
-                p.memory.commit_parallel()?;
+            if p.signals.io.live() {
+                // Runtime retains root CPU/Memory/VFS on an error, but native
+                // invocation authority ends here, rather than in host-side Drop.
+                p.space.retire();
+                if committed.insert(p.memory.coordinator_ownership().0) {
+                    p.memory.commit_parallel()?;
+                }
             }
         }
         if epoch.control.end() == Some(crate::execution_control::End::Exited) {
