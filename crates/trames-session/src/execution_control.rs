@@ -30,7 +30,7 @@ impl Control {
         Self {
             phase: AtomicU8::new(RUNNING),
             remaining: AtomicU64::new(budget),
-            terminal_budget,
+            terminal_budget: terminal_budget && budget != u64::MAX,
         }
     }
     /// Existing compatibility admission boundary, never session completion.
@@ -77,14 +77,17 @@ impl Control {
             }) {
             Ok(left) => Some(left.min(super::workers::POLL_INSTRUCTIONS)),
             Err(_) => {
-                if self.terminal_budget {
-                    self.close(End::Budget);
-                } else {
+                if !self.terminal_budget {
                     self.handoff();
                 }
                 None
             }
         }
+    }
+    /// Zero unallocated credit may still belong to a running CPU. Only the
+    /// queue's real quiescence boundary can declare a finite budget exhausted.
+    pub(crate) fn budget_ready(&self) -> bool {
+        !self.terminal_budget || self.remaining.load(Ordering::Relaxed) != 0
     }
     #[cfg(all(test, trames_interpreter_conformance))]
     pub(crate) fn stop(&self) {

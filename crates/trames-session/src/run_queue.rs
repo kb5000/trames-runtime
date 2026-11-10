@@ -1620,6 +1620,11 @@ impl<C: Cpu> Epoch<C> {
             if self.control.stopped() {
                 return None;
             }
+            if q.running == 0 && q.completing == 0 && !self.control.budget_ready() {
+                self.control.close(crate::execution_control::End::Budget);
+                self.notify(&mut q);
+                return None;
+            }
             // Timer/sleeper events can make a dormant mm need its first View.
             // Publish those scopes before claiming source work, so one executor
             // cannot sleep with freshly prepared metadata work still unclaimed.
@@ -1744,16 +1749,17 @@ impl<C: Cpu> Epoch<C> {
                 .ready
                 .iter()
                 .position(|j| q.initial_slots.get(&j.work.pid) == Some(&slot));
-            let available = (!self.host_pause.load(Ordering::Relaxed))
-                .then(|| {
-                    preferred.or_else(|| {
-                        q.ready.iter().position(|j| {
-                            j.affinity() & (1 << slot) != 0
-                                && !q.initial_slots.contains_key(&j.work.pid)
-                        })
+            let available = (!self.host_pause.load(Ordering::Relaxed)
+                && self.control.budget_ready())
+            .then(|| {
+                preferred.or_else(|| {
+                    q.ready.iter().position(|j| {
+                        j.affinity() & (1 << slot) != 0
+                            && !q.initial_slots.contains_key(&j.work.pid)
                     })
                 })
-                .flatten();
+            })
+            .flatten();
             let external = q.parked.values().any(|j| {
                 j.io.as_ref().is_some_and(|io| io.external_wait())
                     || j.uring.as_ref().is_some_and(|ring| ring.external())

@@ -759,7 +759,7 @@ impl<C: Cpu> Starter<C> {
                                 let accepted = pending.compile.is_some();
                                 let call = pending.call;
                                 if !accepted && credit == 0 {
-                                    let Some(claimed) = work.control.claim() else { job.gpu_pending = Some(pending); break SliceOutcome::Yield { instructions: 0 }; };
+                                    let Some(claimed) = work.control.claim() else { job.gpu_pending = Some(pending); yielded = !work.control.stopped(); break SliceOutcome::Yield { instructions: 0 }; };
                                     credit = claimed;
                                 }
                                 let epoch = epoch.as_ref().expect("GPU cohort wait");
@@ -889,6 +889,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                             }
                             if credit == 0 {
                                 let Some(claimed) = work.control.claim() else {
+                                    yielded = !work.control.stopped();
                                     break SliceOutcome::Yield { instructions: 0 };
                                 };
                                 credit = claimed;

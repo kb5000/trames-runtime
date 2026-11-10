@@ -4549,3 +4549,11 @@ not an absent capability. `/dev/tty` now uses the same original source open body
 for embedding and ordinary PTYs. The existing twelve-CPU host lifecycle test
 retains its one-cohort/zero-return requirement; no bootstrap boundary is hidden
 or removed from the accounting.
+
+Finite instruction budgets are also owned by the existing queue's quiescence
+boundary. Zero unallocated credit can still be reserved by an active CPU. An
+executor without credit yields its slot and waits on the existing queue; refunds
+are published before returning that assignment. Terminal budget completion waits
+until no CPU or scoped executor owns such work. Unlimited sessions bypass the
+additional atomic credit probe. A deterministic reservation/refund regression
+covers the boundary without relying on thread timing or a joined caller retry.

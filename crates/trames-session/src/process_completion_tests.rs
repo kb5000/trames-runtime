@@ -250,3 +250,55 @@ fn single_cpu_bootstrap_opens_original_embedding_terminal_zero_without_owner_ret
     assert!(k.cohort_return_syscalls.is_empty());
     assert_eq!(k.serviced_syscalls, 0);
 }
+
+#[test]
+fn reserved_budget_waits_for_actual_source_cpu_quiescence_and_refunds_unused_credit() {
+    let mut k = kernel();
+    for pid in [1, 2] {
+        let mut task = admitted_process(&k);
+        task.tgid = pid;
+        executable(&mut task, &[0x14000000]);
+        k.publish_task(pid, &task);
+        k.processes.insert(pid, task);
+    }
+    let control = Arc::new(Control::with_budget(10, true));
+    let epoch = crate::run_queue::Epoch::with_events(control.clone(), k.workers.events(), true);
+    epoch.bind_lifecycle(lifecycle::Lifecycle::capture(&k));
+    for (pid, _, view) in k.prepare_parallel_views(&[(1, 0), (2, 0)]).unwrap() {
+        epoch.add(k.capture_worker(
+            pid,
+            view,
+            &control,
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+        ));
+    }
+    let mut first = epoch.take(0).unwrap();
+    assert_eq!(control.claim(), Some(10));
+    assert_eq!(control.claim(), None);
+    assert_eq!(
+        control.end(),
+        None,
+        "unallocated zero is not retired budget"
+    );
+    control.refund(4);
+    first.stats.instructions = 6;
+    epoch.park(first, None);
+    let mut second = epoch.take(0).unwrap();
+    assert_eq!(control.claim(), Some(4));
+    assert_eq!(control.claim(), None);
+    assert_eq!(
+        control.end(),
+        None,
+        "the second CPU still owns its reservation"
+    );
+    second.stats.instructions = 4;
+    epoch.park(second, None);
+    assert!(epoch.take(0).is_none());
+    assert_eq!(control.end(), Some(End::Budget));
+    k.workers.ensure(0).unwrap();
+    k.workers.finish_closed(epoch.clone()).unwrap();
+    assert!(epoch.collect_closed(&mut k).is_none());
+    assert_eq!(k.instructions, 10);
+}
