@@ -1,11 +1,21 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 100, original task-memory observations, reviewed on 2026-11-10. The prior shared runtime
-baseline is `796981af99a03add75eb70abd332767dd1ee9122`.
+This is the consolidated implementation audit through stage 101, original futex delivery and exit dependencies, reviewed on 2026-11-10. The prior shared runtime
+baseline is `789f4de84e83b3dcd83a3b18b1ebac9606406b8f`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-10
+
+Stage 101 replaces the full unbound futex-ready stop mechanism. Original tickets
+are delivered through the current weak executor binding; existing workers admit
+exact cold waits using original nonblocking task/mm custody. Ordinary WAKE,
+bitset wake, both requeues and clear_tid from ordinary, fatal and cold exits no
+longer stop the cohort. Five production stop sites and their legacy latch are
+removed. Source replacement, stopped owner handoff and custody retry retain the
+same resource, not a copied task table or new service thread. WAKE_OP now shares
+the original guest atomic-update and ordered bucket implementation with solo.
+The broad category count remains four; final generic dispatch is still audited.
 
 Stage 100 separates original per-task RSS/mapping observations from global
 host/quota accounting as one resource subsystem. The typed proc demand now carries
@@ -609,7 +619,7 @@ prove that the final generic fallback is unreachable.
 | Host cancellation and final teardown | Host cancel, deadline, shutdown, legacy stopped-hook requests, final CPU/backend drain and actual native-event backend failure | Pause/resume, original init notifications/signals, pressure reclaim, host filesystem commands and terminal/process admission no longer join. Actual terminal teardown and backend failure still stop their actors. Native-event failure returns its original HostIo cause after drain/cancellation, without an owner syscall retry. See [host control](../../crates/trames-session/src/process_vm.rs), [completion](../../crates/trames-session/src/process_exit.rs) and [workers](../../crates/trames-session/src/workers.rs). |
 | Missing capabilities and excluded resources | A genuinely absent source provider, an excluded original FD/node graph, a genuinely absent native event capability or unsupported source request body | There is no filesystem-kind exclusion after stage 82. Published global proc/sys metadata no longer lacks a source provider merely because it uses set_runtime_info. Other node/provider admission still applies. io_uring has exactly two submitter-scoped `require_owner()` maintenance call sites: an actually unavailable typed wait graph provider and deferred original body progress. An absent HostEvents hub no longer triggers this boundary: actual native interests are retained with their read/write directions. Compatibility capture carries its own original execution resources; per-task memory observations do not require a host-global statistics callback. Actual missing global providers and host backend errors retain their own boundary/cause. They remain connected to actual accepted request lifetime, subscriptions and cancellation. See [path authority](../../crates/trames-vfs/src/path_queries.rs), [maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [wait sources](../../crates/trames-linux/src/direct/uring/wait.rs) and [actor](../../crates/trames-linux/src/direct/uring/actor.rs). |
 | Final execution dispatch fallback | A returned SVC or cold HLT/resource operation not completed, parked or accepted by a source scope; host faults and capability-less embeddings retain their own explicit boundaries | The catch-all stops the current cohort for joined dispatch. Ordinary shared-FD ioctl discovery, residual prctl controls/errors, implemented time observations, FD status/NOATIME, inode seals, anonymous memory-file creation, mapped-memory msync/writeback, file-cache advice, canonical FD/error admission, the complete original epoll/poll/select graph and generic socket event sources, current-offset vector transports, blocking POSIX/OFD locks, directory flock and canonical unknown fcntl commands no longer use it. It remains an audit target even though admitted native calls, ordinary guest faults, generated ENOSYS and migrated syscalls have source completion. Recognized guest faults, caught handlers and signal-frame failures now complete/terminate on source. A backend error is not a software or full-Linux-VM fallback. See [worker dispatch](../../crates/trames-session/src/workers.rs) and [classification](../../crates/trames-session/src/worker_syscalls.rs). |
-| Initial and legacy orchestration | Initial admission, standalone/capability-less nonmember scheduling and other excluded embedding routes | Ordinary live members and preexisting Kernel Futex/Sleep actors migrate, park and wake on the original queue. Cold waiters have metadata only until an event prepares their original mm; child/exec admission and lazy CPU slots no longer require a joined owner. The standalone futex legacy-publication mechanism remains. Solo dispatch is on the caller, so its existence alone is not a cross-thread transition. See [admission](../../crates/trames-session/src/process.rs), [legacy wakes](../../crates/trames-session/src/futex.rs) and [queue](../../crates/trames-session/src/run_queue.rs). |
+| Initial and legacy orchestration | Initial admission, standalone/capability-less nonmember scheduling and other excluded embedding routes | Ordinary live members and preexisting Kernel Futex/Sleep actors migrate, park and wake on the original queue. Cold waiters have metadata only until an event prepares their original mm; child/exec admission and lazy CPU slots no longer require a joined owner. Unbound futex delivery now admits exact original cold waiters on existing executors; only standalone caller-side ready draining remains. Solo dispatch is on the caller, so its existence alone is not a cross-thread transition. See [admission](../../crates/trames-session/src/process.rs), [legacy wakes](../../crates/trames-session/src/futex.rs) and [queue](../../crates/trames-session/src/run_queue.rs). |
 
 Supported process/family lifecycle, signals and security policy, mount and task
 namespace administration, proc views, transfers, timers, event waits, terminals,
@@ -4388,3 +4398,41 @@ Final native evidence and exact cross-platform source/binary checks belong to th
 The four broad categories and two genuine io_uring missing-provider/body guards
 remain. This closes a concrete availability dependency, not universal custom
 provider coverage or the final generic dispatch catch-all.
+
+
+## 101. Original futex delivery, admission and exit dependency graph — 2026-11-10
+
+Unbound wake tickets formerly latched `Effect.legacy` into `Authority.readied`.
+Four worker branches and cold exit retirement then stopped every CPU so the owner
+could adopt them. The new persistent Ready resource retains exact tickets and
+custody subscriptions. Its current weak driver checks original signal identity
+and active control; old driver Drop cannot disconnect a replacement. Notifications
+run outside futex buckets, readiness locks and run-queue locks. Bound-ticket
+callbacks remain the fast path, with no added resource lock for their delivery.
+
+An existing executor drains Ready, first attempting its own exact queued wait.
+Nonmembers use the original task directory, nonblocking original task/mm custody
+and Arc ticket identity before CPU/trace capture. Existing dormant-mm admission
+prepares Views only as required by that original address space. Custody contention
+retains real readiness and gives back the slot. Pending custody work prevents a
+finite cohort from mistaking it for terminal idle. Stopped drivers hand tickets
+back to the same caller-side drain; no new owner service or task/Files island is
+created. Cancellation, timeout, wait/PID reuse and frozen task policy retain their
+original semantics.
+
+WAKE_OP joins the common non-PI ABI instead of returning an unconditional ENOSYS.
+Its atomic word operation and both wake selections share the ordered buckets
+with compare-and-enqueue/requeue, using the existing CPU atomic-update contract.
+Signed operands/comparisons, masked legacy shifts, equal keys and invalid-compare
+write-before-error follow the [Linux original](https://github.com/torvalds/linux/blob/v6.12/kernel/futex/waitwake.c#L194).
+Unknown/PI operations retain their existing unsupported result.
+
+The original cold-waiter fixture fails on the prior runtime because its first
+WAKE stops the cohort. Final one/four/twelve-slot fixtures include normal/bitset
+wake, requeue and ordinary/seccomp-fatal/cold exit clear_tid. Original custody
+waits, release-before-publication, source replacement, stopped owner handoff and
+wait/PID reuse are validated together. Cross-platform source hashes and signed
+hardware outcomes are in the [paired record](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/futex-delivery-20261110.json).
+Five legacy stop sites are removed, but the four broad categories, two io_uring
+missing-provider/body guards and final dispatch audit remain. This is not a
+controlled throughput or production fallback-frequency measurement.

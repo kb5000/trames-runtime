@@ -249,8 +249,12 @@ impl<C: Cpu> Kernel<C> {
                     p.state = State::Futex { wait, deadline };
                     Ok(None)
                 } else {
-                    let effect =
-                        crate::worker_syscalls::futex_queue(&self.futexes, &p.memory, p.vm_id, a)?;
+                    let effect = crate::worker_syscalls::futex_queue(
+                        &self.futexes,
+                        &mut p.memory,
+                        p.vm_id,
+                        a,
+                    )?;
                     if effect.woken != 0 {
                         self.resume_futex_ready();
                     }

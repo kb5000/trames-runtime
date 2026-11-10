@@ -918,7 +918,7 @@ impl<C: Cpu> Epoch<C> {
         }
     }
     pub fn bind_lifecycle(&self, lifecycle: crate::process::lifecycle::Lifecycle<C>) {
-        lifecycle.bind_memory(self.io_target.clone());
+        lifecycle.bind_memory(self.io_target.clone(), &self.control);
         assert!(self.lifecycle.set(lifecycle).is_ok());
         self.queues.lock().unwrap().domains.source_lifecycle = true;
     }
@@ -1225,6 +1225,12 @@ impl<C: Cpu> Epoch<C> {
                 let _ = self.activate(slot);
             }
         }
+    }
+    pub(crate) fn admit_dormant(&self, job: Box<Job<C>>, memory: u64) {
+        self.me
+            .upgrade()
+            .expect("live futex admission")
+            .add_dormant(job, memory);
     }
     pub(crate) fn submit_host(&self, request: trames_linux::HostSpawn) -> bool {
         if let Some(lifecycle) = self.lifecycle.get() {
@@ -1610,6 +1616,14 @@ impl<C: Cpu> Epoch<C> {
                     q.completing -= 1;
                     continue;
                 }
+                if lifecycle.futex_ready() {
+                    q.completing += 1;
+                    drop(q);
+                    lifecycle.activate_futexes(self);
+                    q = self.queues.lock().unwrap();
+                    q.completing -= 1;
+                    continue;
+                }
                 if lifecycle.proc_ready() {
                     q.completing += 1;
                     drop(q);
@@ -1736,6 +1750,7 @@ impl<C: Cpu> Epoch<C> {
                     !lifecycle.retirements_pending()
                         && !lifecycle.layouts_pending()
                         && !lifecycle.host_pending()
+                        && !lifecycle.futex_pending()
                 })
             {
                 if self.persistent {

@@ -610,7 +610,6 @@ impl<C: Cpu> Starter<C> {
                                     }
                                     if let Some(crate::run_queue::WaitState::Futex { wait, .. }) = &job.waiting { wait.cancel(); }
                                     thread_exit = snapshot.exit_thread(work.pid, status, work.memory.as_deref_mut().expect("exit View"));
-                                    if snapshot.futex.take_readied() { work.control.stop(); }
                                     break SliceOutcome::Yield { instructions: 0 };
                                 }
                                 if let Some(wake) = snapshot.io_wake.as_ref().filter(|s| s.ready()) { wake.reset(); }
@@ -981,7 +980,6 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                         if entry.action()==0 {
                                             if let Some(exit)=snapshot.exit_thread(work.pid,entry.fatal_signal(),work.memory.as_deref_mut().expect("seccomp exit View")) {
                                                 thread_exit=Some(exit);
-                                                if snapshot.futex.take_readied(){work.control.stop();}
                                             } else {job.seccomp_entry=Some(entry);syscalls-=1;}
                                             break result;
                                         }
@@ -1353,9 +1351,6 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                             if work.cpu.x(8) as u32 == 94 { snapshot.io_signals.lifecycle().request_exit(status); }
                                             if let Some(exit) = epoch.as_ref().and_then(|_| snapshot.exit_thread(work.pid,status,work.memory.as_deref_mut().expect("exit View"))) {
                                                 thread_exit=Some(exit);syscalls+=1;
-                                                // An actual excluded legacy waiter still needs its
-                                                // existing owner adoption, after accepted cleanup.
-                                                if snapshot.futex.take_readied() {work.control.stop();}
                                             } else {job.seccomp_entry=entry;}
                                             break result;
                                         }
@@ -1575,14 +1570,6 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                                         }
                                         work.trace.finish(&mut work.cpu, value);
                                         syscalls += 1;
-                                        if work.cpu.x(8) as u32 == 98
-                                            && snapshot.futex.take_readied()
-                                        {
-                                            // A task became runnable: request a
-                                            // scheduling boundary, not an RPC or
-                                            // a replay of this completed wake.
-                                            work.control.stop();
-                                        }
                                         continue;
                                     }
                                     if epoch.as_ref().is_some_and(|epoch| epoch.local_vm)
@@ -2510,27 +2497,24 @@ mod tests {
                     pool.ensure(slot).unwrap();
                     pool.launch(slot, epoch.clone()).unwrap();
                 }
-                let mut returned = None;
-                if !legacy_wait {
-                    assert!(matches!(
-                        receive.recv_timeout(Duration::from_secs(5)),
-                        Ok(Event::Retired)
-                    ));
-                    let mut results = epoch.take_retired();
-                    assert_eq!(results.len(), 1);
-                    assert_eq!(
-                        (results[0].pid, results[0].thread_exit),
-                        (30, Some(23 << 8))
-                    );
-                    returned = results.pop();
-                    assert!(epoch.take_retired().is_empty());
-                    assert!(matches!(
-                        receive.recv_timeout(Duration::from_secs(5)),
-                        Ok(Event::Idle)
-                    ));
-                    assert!(!control.stopped(), "individual exit stopped its live peer");
-                    epoch.stop();
-                }
+                assert!(matches!(
+                    receive.recv_timeout(Duration::from_secs(5)),
+                    Ok(Event::Retired)
+                ));
+                let mut results = epoch.take_retired();
+                assert_eq!(results.len(), 1);
+                assert_eq!(
+                    (results[0].pid, results[0].thread_exit),
+                    (30, Some(23 << 8))
+                );
+                let returned = results.pop();
+                assert!(epoch.take_retired().is_empty());
+                assert!(matches!(
+                    receive.recv_timeout(Duration::from_secs(5)),
+                    Ok(Event::Idle)
+                ));
+                assert!(!control.stopped(), "individual exit stopped its live peer");
+                epoch.stop();
                 for _ in 0..slots {
                     assert!(matches!(
                         pool.event_timeout(Duration::from_secs(5)).unwrap(),
@@ -4512,7 +4496,7 @@ mod tests {
         }
     }
     #[test]
-    fn actual_futex_wake_commits_locally_and_requests_only_a_scheduling_boundary() {
+    fn actual_unbound_futex_wake_commits_without_stopping_the_producer() {
         let table = crate::futex::Futexes::default();
         let wait = table
             .wait((0, 7, 0x2000), 2, 1, || Ok::<_, ()>(()))
@@ -4537,7 +4521,7 @@ mod tests {
         assert_eq!(done.serviced_syscalls, 0);
         assert_eq!(done.cpu.x(0), 1);
         assert_eq!(done.cpu.pc, 0x1004);
-        assert_eq!(done.instructions, 1);
+        assert_eq!(done.instructions, 100);
         assert!(matches!(done.outcome, Some(SliceOutcome::Yield { .. })));
         assert!(wait.woken());
         let mut ready = Vec::new();

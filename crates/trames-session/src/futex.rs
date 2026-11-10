@@ -51,7 +51,78 @@ impl Ticket {
 
 struct Inner {
     queues: [Mutex<Queues>; SHARDS],
-    ready: Mutex<VecDeque<Arc<Ticket>>>,
+    ready: Mutex<Ready>,
+}
+#[derive(Default)]
+struct Ready {
+    tickets: VecDeque<Arc<Ticket>>,
+    waiting: Vec<ReadyWait>,
+    source: Option<ReadySource>,
+    owner: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+struct ReadyWait {
+    ticket: Arc<Ticket>,
+    signal: Arc<trames_shared::IoSignal>,
+    _subscriptions: Vec<trames_shared::IoSubscription>,
+}
+struct ReadySource {
+    signal: Weak<trames_shared::IoSignal>,
+    control: Weak<crate::workers::Control>,
+}
+impl ReadySource {
+    fn active(&self) -> Option<Arc<trames_shared::IoSignal>> {
+        self.control.upgrade().filter(|c| !c.stopped())?;
+        self.signal.upgrade()
+    }
+}
+enum Notify {
+    Source(Arc<trames_shared::IoSignal>),
+    Owner(Arc<dyn Fn() + Send + Sync>),
+}
+impl Ready {
+    fn notifier(&self) -> Option<Notify> {
+        self.source
+            .as_ref()
+            .and_then(ReadySource::active)
+            .map(Notify::Source)
+            .or_else(|| self.owner.clone().map(Notify::Owner))
+    }
+}
+fn notify(target: Option<Notify>) {
+    match target {
+        Some(Notify::Source(signal)) => signal.notify(),
+        Some(Notify::Owner(wake)) => wake(),
+        None => {}
+    }
+}
+impl trames_shared::IoWake for Inner {
+    fn wake_io(&self, _: &Arc<trames_shared::IoSignal>) {
+        let target = self.ready.lock().unwrap().notifier();
+        notify(target);
+    }
+}
+pub(super) struct ReadyDriver {
+    table: Futexes,
+    pub signal: Arc<trames_shared::IoSignal>,
+}
+impl Drop for ReadyDriver {
+    fn drop(&mut self) {
+        let target = {
+            let mut ready = self.table.0.ready.lock().unwrap();
+            if !ready
+                .source
+                .as_ref()
+                .is_some_and(|source| source.signal.ptr_eq(&Arc::downgrade(&self.signal)))
+            {
+                return;
+            }
+            ready.source = None;
+            (!ready.tickets.is_empty() || ready.waiting.iter().any(|wait| wait.signal.ready()))
+                .then(|| ready.notifier())
+                .flatten()
+        };
+        notify(target);
+    }
 }
 impl Default for Inner {
     fn default() -> Self {
@@ -182,7 +253,7 @@ impl Futexes {
     fn publish(&self, selected: Vec<Arc<Ticket>>, moved: u64) -> Effect {
         // Scheduler callbacks run after unlocking all buckets and keys.
         let woken = selected.len() as u64;
-        let mut legacy = false;
+        let mut unbound = Vec::new();
         for ticket in selected {
             let target = ticket
                 .target
@@ -191,18 +262,153 @@ impl Futexes {
                 .as_ref()
                 .and_then(Weak::upgrade);
             if !target.is_some_and(|epoch| epoch.wake(&ticket)) {
-                self.0.ready.lock().unwrap().push_back(ticket);
-                legacy = true;
+                unbound.push(ticket);
             }
         }
-        Effect {
-            woken,
-            moved,
-            legacy,
+        if !unbound.is_empty() {
+            let target = {
+                let mut ready = self.0.ready.lock().unwrap();
+                ready.tickets.extend(unbound);
+                ready.notifier()
+            };
+            notify(target);
         }
+        Effect { woken, moved }
     }
     pub fn take_ready(&self, out: &mut Vec<Arc<Ticket>>) {
-        out.extend(self.0.ready.lock().unwrap().drain(..));
+        out.extend(self.take_for(None));
+    }
+    pub fn bind_owner(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        self.0.ready.lock().unwrap().owner = Some(wake);
+    }
+    pub fn bind_source(
+        &self,
+        signal: Arc<trames_shared::IoSignal>,
+        control: &Arc<crate::workers::Control>,
+    ) -> ReadyDriver {
+        let pending = {
+            let mut ready = self.0.ready.lock().unwrap();
+            ready.source = Some(ReadySource {
+                signal: Arc::downgrade(&signal),
+                control: Arc::downgrade(control),
+            });
+            !ready.tickets.is_empty() || ready.waiting.iter().any(|wait| wait.signal.ready())
+        };
+        if pending {
+            signal.notify();
+        }
+        ReadyDriver {
+            table: self.clone(),
+            signal,
+        }
+    }
+    pub fn take_source_ready(&self, signal: &Arc<trames_shared::IoSignal>) -> Vec<Arc<Ticket>> {
+        self.take_for(Some(signal))
+    }
+    pub fn source_pending(&self, signal: &Arc<trames_shared::IoSignal>) -> bool {
+        let ready = self.0.ready.lock().unwrap();
+        ready
+            .source
+            .as_ref()
+            .and_then(ReadySource::active)
+            .is_some_and(|current| Arc::ptr_eq(&current, signal))
+            && (!ready.tickets.is_empty() || !ready.waiting.is_empty())
+    }
+    fn take_for(&self, source: Option<&Arc<trames_shared::IoSignal>>) -> Vec<Arc<Ticket>> {
+        let mut ready = self.0.ready.lock().unwrap();
+        let current = ready.source.as_ref().and_then(ReadySource::active);
+        match (source, current.as_ref()) {
+            (Some(requested), Some(current)) if Arc::ptr_eq(requested, current) => {}
+            (None, None) => {}
+            _ => return Vec::new(),
+        }
+        let mut tickets: Vec<_> = ready.tickets.drain(..).collect();
+        let mut retired = Vec::new();
+        let mut i = 0;
+        while i < ready.waiting.len() {
+            if ready.waiting[i].signal.ready() {
+                let wait = ready.waiting.swap_remove(i);
+                tickets.push(wait.ticket.clone());
+                retired.push(wait);
+            } else {
+                i += 1;
+            }
+        }
+        drop(ready);
+        drop(retired);
+        tickets
+    }
+    pub fn ready_target(&self) -> Weak<dyn trames_shared::IoWake> {
+        Arc::downgrade(&(self.0.clone() as Arc<dyn trames_shared::IoWake>))
+    }
+    pub fn defer_ready(
+        &self,
+        ticket: Arc<Ticket>,
+        signal: Arc<trames_shared::IoSignal>,
+        subscriptions: Vec<trames_shared::IoSubscription>,
+    ) {
+        let target = {
+            let mut ready = self.0.ready.lock().unwrap();
+            ready.waiting.push(ReadyWait {
+                ticket,
+                signal: signal.clone(),
+                _subscriptions: subscriptions,
+            });
+            signal.ready().then(|| ready.notifier()).flatten()
+        };
+        notify(target);
+    }
+    /// The atomic guest update and both wake selections share the ordered
+    /// buckets with compare-and-enqueue/requeue. Callbacks run after unlocking.
+    pub fn wake_op<E>(
+        &self,
+        first: Key,
+        second: Key,
+        counts: [u32; 2],
+        update: impl FnOnce() -> Result<bool, E>,
+    ) -> Result<Effect, E> {
+        fn select(queues: &mut Queues, key: Key, count: u32, selected: &mut Vec<Arc<Ticket>>) {
+            let mut remaining = count;
+            if let Some(queue) = queues.get_mut(&key) {
+                queue.retain(|ticket| {
+                    if remaining != 0 && ticket.claim(WOKEN) {
+                        remaining -= 1;
+                        selected.push(ticket.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if queue.is_empty() {
+                    queues.remove(&key);
+                }
+            }
+        }
+        let mut selected = Vec::new();
+        {
+            let (a, b) = (shard(first), shard(second));
+            let mut low = self.0.queues[a.min(b)].lock().unwrap();
+            let mut high = (a != b).then(|| self.0.queues[a.max(b)].lock().unwrap());
+            let comparison = update()?;
+            if a == b {
+                select(&mut low, first, counts[0], &mut selected);
+                if comparison {
+                    select(&mut low, second, counts[1], &mut selected);
+                }
+            } else {
+                let high = high.as_mut().unwrap();
+                let (one, two) = if a < b {
+                    (&mut low, high)
+                } else {
+                    (high, &mut low)
+                };
+                select(one, first, counts[0], &mut selected);
+                if comparison {
+                    select(two, second, counts[1], &mut selected);
+                }
+            }
+        }
+        Ok(self.publish(selected, 0))
     }
     /// Compare, wake and move under the same ordered bucket locks. Tickets keep
     /// their original deadline/epoch target; no Process walk or callback is needed.
@@ -311,7 +517,6 @@ impl Futexes {
 pub(super) struct Effect {
     pub woken: u64,
     pub moved: u64,
-    pub legacy: bool,
 }
 impl Effect {
     pub fn total(&self) -> u64 {
@@ -326,7 +531,6 @@ pub(super) struct Authority {
     completed: Cell<u64>,
     requeues: Cell<u64>,
     woken: Cell<u64>,
-    readied: Cell<bool>,
 }
 impl Default for Authority {
     fn default() -> Self {
@@ -341,7 +545,6 @@ impl Authority {
             completed: Cell::new(0),
             requeues: Cell::new(0),
             woken: Cell::new(0),
-            readied: Cell::new(false),
         }
     }
     pub fn record(&self, effect: &Effect, requeue: bool) {
@@ -351,7 +554,6 @@ impl Authority {
             self.completed.set(self.completed.get() + 1);
         }
         self.woken.set(self.woken.get() + effect.woken);
-        self.readied.set(self.readied.get() || effect.legacy);
     }
     pub fn requeues(&self) -> u64 {
         self.requeues.get()
@@ -361,9 +563,6 @@ impl Authority {
     }
     pub fn completed(&self) -> u64 {
         self.completed.get()
-    }
-    pub fn take_readied(&self) -> bool {
-        self.readied.replace(false)
     }
 }
 
@@ -380,6 +579,104 @@ mod tests {
     }
     fn empty(table: &Futexes) {
         assert!(table.0.queues.iter().all(|q| q.lock().unwrap().is_empty()));
+    }
+    struct ReadyWake {
+        table: Weak<Inner>,
+        hits: std::sync::atomic::AtomicUsize,
+    }
+    impl trames_shared::IoWake for ReadyWake {
+        fn wake_io(&self, _: &Arc<trames_shared::IoSignal>) {
+            let table = self.table.upgrade().unwrap();
+            // Both readiness and futex bucket locks must be released before
+            // callbacks can enter the original executor queue.
+            assert!(table.ready.try_lock().is_ok());
+            assert!(table.queues.iter().all(|q| q.try_lock().is_ok()));
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    fn ready_signal(table: &Futexes) -> (Arc<ReadyWake>, Arc<trames_shared::IoSignal>) {
+        let wake = Arc::new(ReadyWake {
+            table: Arc::downgrade(&table.0),
+            hits: Default::default(),
+        });
+        let target: Arc<dyn trames_shared::IoWake> = wake.clone();
+        let signal = trames_shared::IoSignal::new(0, Arc::downgrade(&target));
+        (wake, signal)
+    }
+    #[test]
+    fn unbound_ready_delivery_follows_exact_driver_replacement_and_stopped_owner_handoff() {
+        let table = Futexes::default();
+        let (old_wake, old_signal) = ready_signal(&table);
+        let (new_wake, new_signal) = ready_signal(&table);
+        let old_control = Arc::new(crate::workers::Control::new(100));
+        let new_control = Arc::new(crate::workers::Control::new(100));
+        let old = table.bind_source(old_signal.clone(), &old_control);
+        let wait = register(&table, (0, 7, 0x1000), 3, 1);
+        assert_eq!(table.wake((0, 7, 0x1000), 1, 1), 1);
+        assert_eq!(old_wake.hits.load(Ordering::Relaxed), 1);
+        let new = table.bind_source(new_signal.clone(), &new_control);
+        assert_eq!(new_wake.hits.load(Ordering::Relaxed), 1);
+        drop(old);
+        assert!(table.take_source_ready(&old_signal).is_empty());
+        let mut owner = Vec::new();
+        table.take_ready(&mut owner);
+        assert!(owner.is_empty());
+        let ready = table.take_source_ready(&new_signal);
+        assert_eq!(ready.len(), 1);
+        assert!(Arc::ptr_eq(&ready[0], &wait.ticket));
+        assert!(!table.source_pending(&new_signal));
+        let retry = trames_shared::IoSignal::new(3, table.ready_target());
+        table.defer_ready(wait.ticket.clone(), retry.clone(), Vec::new());
+        assert!(table.source_pending(&new_signal));
+        assert!(table.take_source_ready(&new_signal).is_empty());
+        let owner_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits = owner_hits.clone();
+        let original = Arc::downgrade(&table.0);
+        table.bind_owner(Arc::new(move || {
+            assert!(original.upgrade().unwrap().ready.try_lock().is_ok());
+            hits.fetch_add(1, Ordering::Relaxed);
+        }));
+        new_control.stop();
+        retry.notify();
+        assert_eq!(owner_hits.load(Ordering::Relaxed), 1);
+        assert!(table.take_source_ready(&new_signal).is_empty());
+        table.take_ready(&mut owner);
+        assert_eq!(owner.len(), 1);
+        assert!(Arc::ptr_eq(&owner[0], &wait.ticket));
+        drop(new);
+        drop(wait);
+        drop(owner);
+        drop(ready);
+        empty(&table);
+        assert!(table.0.ready.lock().unwrap().waiting.is_empty());
+    }
+    #[test]
+    fn deferred_futex_release_before_publication_and_final_driver_drop_cannot_lose_wakes() {
+        let table = Futexes::default();
+        let (wake, signal) = ready_signal(&table);
+        let control = Arc::new(crate::workers::Control::new(100));
+        let driver = table.bind_source(signal.clone(), &control);
+        let wait = register(&table, (0, 7, 0x1000), 3, 1);
+        table.wake((0, 7, 0x1000), 1, 1);
+        let tickets = table.take_source_ready(&signal);
+        assert_eq!(tickets.len(), 1);
+        signal.reset();
+        let retry = trames_shared::IoSignal::new(3, table.ready_target());
+        retry.notify();
+        table.defer_ready(tickets[0].clone(), retry, Vec::new());
+        assert!(signal.ready());
+        assert!(wake.hits.load(Ordering::Relaxed) >= 2);
+        let owner_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits = owner_hits.clone();
+        table.bind_owner(Arc::new(move || {
+            hits.fetch_add(1, Ordering::Relaxed);
+        }));
+        drop(driver);
+        assert_eq!(owner_hits.load(Ordering::Relaxed), 1);
+        let mut owner = Vec::new();
+        table.take_ready(&mut owner);
+        assert_eq!(owner.len(), 1);
+        assert!(Arc::ptr_eq(&owner[0], &wait.ticket));
     }
     #[test]
     fn compare_requeue_is_one_transaction_and_moves_original_keys_and_bitsets() {
@@ -399,7 +696,7 @@ mod tests {
             .iter()
             .all(|w| !w.woken() && *w.ticket.key.lock().unwrap() == old));
         let effect = table.requeue(old, new, 1, 2, || Ok::<_, ()>(())).unwrap();
-        assert_eq!((effect.woken, effect.moved, effect.legacy), (1, 2, true));
+        assert_eq!((effect.woken, effect.moved), (1, 2));
         assert!(waits[0].woken());
         assert!(waits[1..]
             .iter()

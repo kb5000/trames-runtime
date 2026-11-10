@@ -368,7 +368,7 @@ pub(super) fn futex_parameters(
 /// One ABI/validation implementation for owner and worker queue operations.
 pub(super) fn futex_queue(
     table: &crate::futex::Futexes,
-    memory: &impl CpuMemory,
+    memory: &mut impl CpuMemory,
     vm: u64,
     a: [u64; 6],
 ) -> Result<crate::futex::Effect, Errno> {
@@ -395,6 +395,56 @@ pub(super) fn futex_queue(
                     return Err(Errno(11));
                 }
                 Ok(())
+            })
+        }
+        5 => {
+            if a[4] & 3 != 0 {
+                return Err(Errno(22));
+            }
+            memory
+                .check(a[4], 4, Access::Write)
+                .map_err(|_| Errno(14))?;
+            let second = futex_key(memory, vm, a[4], a[1] & 128 != 0)?;
+            let encoded = a[5] as u32;
+            let op = (encoded >> 28) & 7;
+            if op > 4 {
+                return Err(Errno(38));
+            }
+            let mut arg = ((encoded << 8) as i32 >> 20) as u32;
+            if encoded & (1 << 31) != 0 {
+                arg = 1u32 << (arg & 31);
+            }
+            let compare = (encoded << 20) as i32 >> 20;
+            // Linux's legacy wake-op wakes at least one waiter for each
+            // selected queue even when its signed count is zero/negative.
+            let counts = [a[2], a[3]].map(|count| (count as i32).max(1) as u32);
+            table.wake_op(key, second, counts, || {
+                let old = memory
+                    .atomic_update(a[4], 4, |bytes| {
+                        let old = u32::from_le_bytes(bytes.try_into().unwrap());
+                        let value = match op {
+                            0 => arg,
+                            1 => old.wrapping_add(arg),
+                            2 => old | arg,
+                            3 => old & !arg,
+                            4 => old ^ arg,
+                            _ => unreachable!(),
+                        };
+                        bytes.copy_from_slice(&value.to_le_bytes());
+                        (old as i32, true)
+                    })
+                    .map_err(|_| Errno(14))?;
+                // Invalid comparison still follows the atomic operation, as
+                // Linux does; it suppresses both wakes and returns ENOSYS.
+                Ok(match (encoded >> 24) & 15 {
+                    0 => old == compare,
+                    1 => old != compare,
+                    2 => old < compare,
+                    3 => old >= compare,
+                    4 => old <= compare,
+                    5 => old > compare,
+                    _ => return Err(Errno(38)),
+                })
             })
         }
         _ => Err(Errno(38)),
@@ -628,7 +678,7 @@ impl Snapshot {
         })())
     }
     fn futex_queue<C: Cpu>(&self, cpu: &C) -> bool {
-        cpu.x(8) as u32 == 98 && matches!(cpu.x(1) & 127, 1 | 10 | 3 | 4)
+        cpu.x(8) as u32 == 98 && matches!(cpu.x(1) & 127, 1 | 10 | 3 | 4 | 5)
     }
     pub fn timer_entry<C: Cpu>(&self, cpu: &C) -> Option<crate::process::seccomp::EntryDecision> {
         (self.seccomp.mode() != 0
@@ -1041,7 +1091,7 @@ mod tests {
     }
     #[test]
     fn queue_abi_checks_before_effects_and_owner_and_view_share_the_same_implementation() {
-        fn check(memory: &impl CpuMemory) {
+        fn check(memory: &mut impl CpuMemory) {
             let table = crate::futex::Futexes::default();
             let first = table
                 .wait((0, 7, 0x1000), 1, 1, || Ok::<_, ()>(()))
@@ -1072,9 +1122,97 @@ mod tests {
         }
         let mut memory = Memory::default();
         memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
-        check(&memory);
-        let view = memory.parallel_view(&mut Default::default()).unwrap();
-        check(&view);
+        check(&mut memory);
+        let mut view = memory.parallel_view(&mut Default::default()).unwrap();
+        check(&mut view);
+    }
+    #[test]
+    fn wake_op_shares_atomic_memory_and_signed_comparisons_between_owner_and_view() {
+        fn check(memory: &mut impl CpuMemory) {
+            let old = -5i32;
+            let arg = -3i32;
+            for op in 0..5 {
+                for cmp in 0..6 {
+                    let table = crate::futex::Futexes::default();
+                    let first = table
+                        .wait((0, 7, 0x1000), 1, 1, || Ok::<_, ()>(()))
+                        .unwrap();
+                    let second = table
+                        .wait((0, 7, 0x1004), 2, 2, || Ok::<_, ()>(()))
+                        .unwrap();
+                    memory.write_array(0x1004, old.to_le_bytes()).unwrap();
+                    let encoded = (op << 28)
+                        | (cmp << 24)
+                        | (((arg as u32) & 4095) << 12)
+                        | ((arg as u32) & 4095);
+                    let compare = match cmp {
+                        0 => old == arg,
+                        1 => old != arg,
+                        2 => old < arg,
+                        3 => old >= arg,
+                        4 => old <= arg,
+                        5 => old > arg,
+                        _ => unreachable!(),
+                    };
+                    let expected = match op {
+                        0 => arg,
+                        1 => old.wrapping_add(arg),
+                        2 => old | arg,
+                        3 => old & !arg,
+                        4 => old ^ arg,
+                        _ => unreachable!(),
+                    };
+                    let effect = futex_queue(
+                        &table,
+                        memory,
+                        7,
+                        [0x1000, 133, 1, 1, 0x1004, encoded as u64],
+                    )
+                    .unwrap();
+                    assert_eq!(effect.woken, 1 + u64::from(compare));
+                    assert!(first.woken());
+                    assert_eq!(second.woken(), compare);
+                    assert_eq!(
+                        memory.read_array::<4>(0x1004).unwrap(),
+                        expected.to_le_bytes()
+                    );
+                }
+            }
+            let table = crate::futex::Futexes::default();
+            let wait = table
+                .wait((0, 7, 0x1004), 3, 1, || Ok::<_, ()>(()))
+                .unwrap();
+            memory.write_array(0x1004, 0u32.to_le_bytes()).unwrap();
+            // Shift 33 follows Linux's legacy masked shift; invalid comparison
+            // commits the atomic word but does not wake either original queue.
+            assert_eq!(
+                futex_queue(&table, memory, 7, [0x1000, 133, 1, 1, 0x1004, 0x86021000])
+                    .unwrap_err()
+                    .0,
+                38
+            );
+            assert_eq!(memory.read_array::<4>(0x1004).unwrap(), 2u32.to_le_bytes());
+            assert!(!wait.woken());
+            assert_eq!(
+                futex_queue(&table, memory, 7, [0x1000, 133, 1, 1, 0x1004, 0x50000000])
+                    .unwrap_err()
+                    .0,
+                38
+            );
+            assert_eq!(memory.read_array::<4>(0x1004).unwrap(), 2u32.to_le_bytes());
+            // Same-key selections must consume distinct tickets only once.
+            let second = table
+                .wait((0, 7, 0x1004), 4, 1, || Ok::<_, ()>(()))
+                .unwrap();
+            let effect = futex_queue(&table, memory, 7, [0x1004, 133, 0, 0, 0x1004, 2]).unwrap();
+            assert_eq!(effect.woken, 2);
+            assert!(wait.woken() && second.woken());
+        }
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        check(&mut memory);
+        let mut view = memory.parallel_view(&mut Default::default()).unwrap();
+        check(&mut view);
     }
     #[test]
     fn shared_wait_parser_preserves_absolute_clocks_flags_and_error_order() {
@@ -1156,7 +1294,7 @@ mod tests {
             program_break: Default::default(),
             uts: None,
             direct: Default::default(),
-            futex: crate::futex::Authority::new(table, 7),
+            futex: crate::futex::Authority::new(table.clone(), 7),
         };
         let mut view = memory.parallel_view(&mut Default::default()).unwrap();
         let mut cpu = Cpu::new(0x4004, 0);
@@ -1172,7 +1310,10 @@ mod tests {
         assert_eq!(snapshot.invoke(&cpu, &mut view), Some(1));
         assert!(first.woken());
         assert!(!second.woken() && !other_vm.woken());
-        assert!(snapshot.futex.take_readied());
+        let mut ready = Vec::new();
+        table.take_ready(&mut ready);
+        assert_eq!(ready.len(), 1);
+        assert!(Arc::ptr_eq(&ready[0], &first.ticket));
         cpu.set_x(1, 138);
         cpu.set_x(5, 4);
         assert_eq!(snapshot.invoke(&cpu, &mut view), Some(0));
@@ -1180,7 +1321,10 @@ mod tests {
         assert_eq!(snapshot.invoke(&cpu, &mut view), Some(1));
         assert!(second.woken() && !other_vm.woken());
         assert_eq!(snapshot.invoke(&cpu, &mut view), Some(0));
-        assert!(snapshot.futex.take_readied());
+        let mut ready = Vec::new();
+        table.take_ready(&mut ready);
+        assert_eq!(ready.len(), 1);
+        assert!(Arc::ptr_eq(&ready[0], &second.ticket));
         cpu.set_x(2, 0);
         assert_eq!(snapshot.invoke(&cpu, &mut view), Some(0));
         cpu.set_x(5, 0);

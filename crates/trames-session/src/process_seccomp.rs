@@ -3957,7 +3957,7 @@ mod tests {
         };
         let mut cpu = Cpu::new(0x4004, 0);
         cpu.set_x(8, 98);
-        for op in [0, 9, 1, 10, 3, 4, 128, 137, 129, 138, 131, 132] {
+        for op in [0, 9, 1, 10, 3, 4, 5, 128, 137, 129, 138, 131, 132, 133] {
             put_args(&mut cpu, [0x1000, op, 1, 1, 0x1004, 1]);
             for decision in [ALLOW, 0x50007, 0x30009, 0, KILL_PROCESS] {
                 snapshot.seccomp = Seccomp::default();

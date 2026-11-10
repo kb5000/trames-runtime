@@ -4,6 +4,8 @@
 use super::*;
 use crate::run_queue::{Checkpoint, Epoch, Job};
 use std::sync::Mutex;
+#[path = "process_lifecycle_futex.rs"]
+mod futex;
 #[path = "process_lifecycle_host.rs"]
 mod host_launch;
 #[path = "process_lifecycle_exec.rs"]
@@ -39,6 +41,7 @@ pub(crate) struct Lifecycle<C: Cpu> {
     retiring: Mutex<Vec<retirement::Retiring<C>>>,
     timers: Arc<trames_kernel::timers::Timers>,
     futexes: crate::futex::Futexes,
+    futex_driver: std::sync::OnceLock<crate::futex::ReadyDriver>,
     images: Arc<dyn exec::Executor<C>>,
     owner: std::thread::Thread,
 }
@@ -100,6 +103,13 @@ pub(crate) fn eligible<'a, C: Cpu>(
 }
 impl<C: Cpu> Lifecycle<C> {
     pub(super) fn capture(kernel: &Kernel<C>) -> Self {
+        let owner = std::thread::current();
+        let events = kernel.workers.events();
+        let wake_owner = owner.clone();
+        kernel.futexes.bind_owner(Arc::new(move || {
+            let _ = events.send(crate::workers::Event::VmReady);
+            wake_owner.unpark();
+        }));
         Self {
             birth: birth::Birth::capture(kernel),
             host_launches: kernel.host_launches.clone(),
@@ -119,11 +129,21 @@ impl<C: Cpu> Lifecycle<C> {
             retiring: Default::default(),
             timers: kernel.timers.clone(),
             futexes: kernel.futexes.clone(),
+            futex_driver: Default::default(),
             images: kernel.workers.image_executor(),
-            owner: std::thread::current(),
+            owner,
         }
     }
-    pub(crate) fn bind_memory(&self, target: std::sync::Weak<dyn trames_shared::IoWake>) {
+    pub(crate) fn bind_memory(
+        &self,
+        target: std::sync::Weak<dyn trames_shared::IoWake>,
+        control: &Arc<crate::workers::Control>,
+    ) {
+        let signal = trames_shared::IoSignal::new(0, target.clone());
+        assert!(self
+            .futex_driver
+            .set(self.futexes.bind_source(signal, control))
+            .is_ok());
         let signal = trames_shared::IoSignal::new(0, target.clone());
         assert!(self
             .host_driver
@@ -169,6 +189,10 @@ impl<C: Cpu> Lifecycle<C> {
         self.memory_wake
             .get()
             .is_some_and(|wake| Arc::ptr_eq(signal, &wake.signal))
+            || self
+                .futex_driver
+                .get()
+                .is_some_and(|driver| Arc::ptr_eq(signal, &driver.signal))
             || self
                 .layout_driver
                 .get()

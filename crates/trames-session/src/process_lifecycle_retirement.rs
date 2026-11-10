@@ -555,11 +555,6 @@ impl<C: Cpu> Lifecycle<C> {
             for group in exit.groups {
                 self.exit_groups.watch(&group);
             }
-            if futex.take_readied() {
-                // Only a waiter excluded from this execution epoch (e.g. an
-                // actual traced task) needs the existing policy/owner boundary.
-                epoch.stop();
-            }
             // The View is dropped by this block before final mm projection.
         }
         p.linux.vfs.set_lock_owner(p.tgid);
