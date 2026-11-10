@@ -1301,12 +1301,13 @@ impl Vfs {
         let pair = if let Some(pair) = self.embedding_terminal.get() {
             pair.clone()
         } else {
-            let slave = self.pseudo.borrow_mut().cache(
+            let cached = self.pseudo.borrow().prepare(
                 0,
                 b"/dev/pts/0",
                 Content::Device(pseudo::Device::Pts(0, 0)),
                 0o20620,
             )?;
+            let slave = cached.finish();
             {
                 let mut node = slave.borrow_mut();
                 node.uid = self.credentials.fsuid;

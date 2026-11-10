@@ -75,7 +75,10 @@ mod tests {
             &mut Default::default(),
             &mut Default::default(),
         );
-        job.work.credential_call(146, [1000, 0, 0, 0, 0, 0]);
+        let mut memory = job.work.memory.take().unwrap();
+        job.work
+            .credential_call(146, [1000, 0, 0, 0, 0, 0], &mut *memory);
+        job.work.memory = Some(memory);
         assert_eq!(job.work.cpu.x(0), 0);
         // The cold Process has not been collected or used to publish metadata.
         assert_eq!(k.processes.read(&2).linux.vfs.credentials.uid, 0);

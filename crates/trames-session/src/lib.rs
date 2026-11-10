@@ -20,6 +20,7 @@ mod run_queue;
 mod signal_actions;
 mod space;
 mod structural;
+mod syscall_dispatch;
 mod syscall_trace;
 mod terminal;
 mod video;

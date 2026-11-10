@@ -460,6 +460,7 @@ pub(super) struct Job<C: Cpu> {
     pub gpu_pending: Option<crate::gpu::Pending>,
     pub domain: Option<Arc<Domain>>,
     pub checkpoint: Option<SliceOutcome>,
+    pub maintenance_scope: bool,
     /// Guest code reached this exit during a bounded exclusive-mm window.
     /// Its syscall/native/fault handling still belongs to normal dispatch.
     pub pending_cpu: Option<SliceOutcome>,
@@ -495,6 +496,7 @@ impl<C: Cpu> Job<C> {
             gpu_pending: None,
             domain: None,
             checkpoint: None,
+            maintenance_scope: false,
             pending_cpu: None,
             pending_accounted: false,
             seccomp_entry: None,
@@ -746,6 +748,7 @@ impl Stats {
             after: self.after,
             worker: self.worker,
             instructions: self.instructions,
+            missing: None,
             chunks: self.chunks,
             syscalls: self.syscalls,
             direct_syscalls: self.direct_syscalls,
@@ -1290,10 +1293,67 @@ impl<C: Cpu> Epoch<C> {
             false
         }
     }
-    pub fn handoff(&self) {
+    pub(crate) fn source_session(&self) -> bool {
+        self.terminal.load(Ordering::Relaxed) && self.source_lifecycle()
+    }
+    /// Joining cannot suspend a production session. Its source completion or
+    /// specific missing-capability return must already have ended admission.
+    pub fn join(&self) {
         let mut q = self.queues.lock().unwrap();
-        self.control.handoff();
+        if self.source_session() {
+            assert!(
+                self.control.stopped(),
+                "only source completion or an explicit missing resource can stop admission"
+            );
+        } else {
+            self.test_handoff();
+        }
         self.notify(&mut q);
+    }
+    fn test_handoff(&self) {
+        #[cfg(all(test, trames_interpreter_conformance))]
+        self.control.handoff();
+        #[cfg(not(all(test, trames_interpreter_conformance)))]
+        unreachable!("production execution requires an original source session");
+    }
+    pub(crate) fn futex_target(&self) -> Weak<dyn crate::futex::Wake> {
+        self.me.clone()
+    }
+    /// Only a diagnosed, unavailable embedding capability can return an
+    /// operation to its actual host provider. Ordinary CPU exits cannot.
+    pub(crate) fn missing_capability(
+        &self,
+        mut job: Job<C>,
+        missing: crate::process::lifecycle::dispatch_calls::Missing,
+    ) {
+        let outcome = job.checkpoint.take();
+        let mut done = job.finish(outcome, self.progress.load(Ordering::Relaxed));
+        done.missing = Some(missing);
+        let mut q = self.queues.lock().unwrap();
+        q.finished.push(done);
+        self.control.missing_capability(missing);
+        self.notify(&mut q);
+    }
+    pub(crate) fn has_missing_capability(&self) -> bool {
+        self.queues
+            .lock()
+            .unwrap()
+            .finished
+            .iter()
+            .any(|done| done.missing.is_some())
+    }
+    /// A source scope retired this original CPU. Its slot was already returned
+    /// when the scope was taken, so there is no running-count decrement here.
+    pub(crate) fn finish_checkpoint_retired(&self, done: Done<C>) {
+        assert!(done.thread_exit.is_some());
+        let mut q = self.queues.lock().unwrap();
+        q.finished.push(done);
+        self.notify(&mut q);
+        drop(q);
+        self.lifecycle
+            .get()
+            .expect("original source retirement")
+            .notify_retirement();
     }
     /// One-way session completion. The waiting host receives no guest work.
     fn end(&self, reason: crate::execution_control::End) {
@@ -1312,12 +1372,16 @@ impl<C: Cpu> Epoch<C> {
         if self.terminal.load(Ordering::Relaxed) {
             self.end(crate::execution_control::End::Exited);
         } else {
-            self.handoff();
+            let mut q = self.queues.lock().unwrap();
+            self.test_handoff();
+            self.notify(&mut q);
         }
     }
     #[cfg(all(test, trames_interpreter_conformance))]
     pub(crate) fn stop(&self) {
-        self.handoff();
+        let mut q = self.queues.lock().unwrap();
+        self.test_handoff();
+        self.notify(&mut q);
     }
     /// Terminal host failure. Keep the first cause and drain original actors;
     /// never reinterpret it as a missing guest operation or owner retry.
@@ -1847,7 +1911,7 @@ impl<C: Cpu> Epoch<C> {
                         }
                     }
                 } else {
-                    self.control.handoff();
+                    self.test_handoff();
                     self.notify(&mut q);
                     return None;
                 }
@@ -2080,8 +2144,8 @@ impl<C: Cpu> Epoch<C> {
                 let _ = events.send(crate::workers::Event::<C>::Retired);
             }
         }
-        if !exited {
-            self.control.handoff();
+        if !exited && !self.control.closing() {
+            self.test_handoff();
         }
         self.notify(&mut q);
         drop(q);

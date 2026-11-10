@@ -304,7 +304,7 @@ impl EntryDecision {
             _ => None,
         }
     }
-    fn value_for(self, policy: &Seccomp, number: u32, pc: u64, args: [u64; 6]) -> Option<u32> {
+    fn value_for(&self, policy: &Seccomp, number: u32, pc: u64, args: [u64; 6]) -> Option<u32> {
         (self.number == number
             && self.pc == pc
             && self.args == args
@@ -786,13 +786,23 @@ impl<C: Cpu> Kernel<C> {
         number: u32,
         args: [u64; 6],
     ) -> bool {
-        let decision = p
+        let entry = p
             .seccomp_entry
             .take()
-            .and_then(|entry| entry.value_for(&p.seccomp, number, p.cpu.pc(), args))
-            .unwrap_or_else(|| p.seccomp.decision(number, p.cpu.pc(), args));
+            .filter(|entry| {
+                entry
+                    .value_for(&p.seccomp, number, p.cpu.pc(), args)
+                    .is_some()
+            })
+            .unwrap_or_else(|| p.seccomp.entry_decision(number, p.cpu.pc(), args));
+        let decision = entry
+            .value_for(&p.seccomp, number, p.cpu.pc(), args)
+            .expect("same accepted syscall entry");
         match decision & 0xffff_0000 {
-            ALLOW => return false,
+            ALLOW => {
+                p.seccomp_entry = Some(entry);
+                return false;
+            }
             0x0005_0000 => {
                 p.cpu.set_x(0, error(Errno((decision & 0xffff).min(4095))));
                 p.state = State::Ready;

@@ -237,14 +237,16 @@ impl Vfs {
             pts.allocate_slave(id, &self.credentials)?
         } else {
             let path = format!("/dev/pts/{id}").into_bytes();
-            let mut pseudo = self.pseudo.borrow_mut();
+            let pseudo = self.pseudo.borrow();
             pseudo.nodes.borrow_mut().entries.remove(&(0, path.clone()));
-            let node = pseudo.cache(
+            let cached = pseudo.prepare(
                 0,
                 &path,
                 Content::Device(pseudo::Device::Pts(id, id)),
                 0o20620,
             )?;
+            drop(pseudo);
+            let node = cached.finish();
             node.borrow_mut().uid = self.credentials.fsuid;
             node.borrow_mut().gid = 5;
             (id, node)

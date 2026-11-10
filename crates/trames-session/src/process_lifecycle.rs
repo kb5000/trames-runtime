@@ -6,6 +6,8 @@ use crate::run_queue::{Checkpoint, Epoch, Job};
 use std::sync::Mutex;
 #[path = "process_lifecycle_completion.rs"]
 mod completion;
+#[path = "process_lifecycle_dispatch.rs"]
+pub(crate) mod dispatch_calls;
 #[path = "process_lifecycle_futex.rs"]
 mod futex;
 #[path = "process_lifecycle_host.rs"]
@@ -91,12 +93,8 @@ pub(crate) fn eligible<'a, C: Cpu>(
             }
             match outcome {
                 SliceOutcome::NativeCall { .. } => {}
-                SliceOutcome::Syscall { .. }
-                    if job.structural_call().is_some()
-                        && job
-                            .seccomp_entry
-                            .as_ref()
-                            .is_none_or(|entry| entry.allowed()) => {}
+                SliceOutcome::Syscall { .. } => {}
+                SliceOutcome::Yield { .. } if job.maintenance_scope => {}
                 _ => return false,
             }
         }
@@ -454,6 +452,7 @@ impl<C: Cpu> Lifecycle<C> {
             }
         }
         report.time[2] += began.elapsed();
+        self.dispatch_calls(epoch, checkpoint, report, slot)?;
         *pending_image = self.prepare_images(epoch, checkpoint);
         if pending_image.is_some() {
             report.time[0] = Duration::ZERO;

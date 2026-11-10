@@ -33,12 +33,24 @@ impl Control {
             terminal_budget: terminal_budget && budget != u64::MAX,
         }
     }
-    /// Existing compatibility admission boundary, never session completion.
-    /// Kept distinct so closing cannot re-enter the guest on the waiting host.
-    pub(crate) fn handoff(&self) {
+    /// The only production suspension carries a diagnosed missing resource.
+    pub(crate) fn missing_capability(&self, _: crate::process::lifecycle::dispatch_calls::Missing) {
+        self.suspend();
+    }
+    fn suspend(&self) {
         let _ = self
             .phase
             .compare_exchange(RUNNING, HANDOFF, Ordering::Release, Ordering::Relaxed);
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
+    pub(crate) fn handoff(&self) {
+        self.suspend();
+    }
+    fn finish_bounded_test(&self) {
+        #[cfg(all(test, trames_interpreter_conformance))]
+        self.suspend();
+        #[cfg(not(all(test, trames_interpreter_conformance)))]
+        self.close(End::Budget);
     }
     pub(crate) fn close(&self, reason: End) {
         let _ = self
@@ -78,7 +90,7 @@ impl Control {
             Ok(left) => Some(left.min(super::workers::POLL_INSTRUCTIONS)),
             Err(_) => {
                 if !self.terminal_budget {
-                    self.handoff();
+                    self.finish_bounded_test();
                 }
                 None
             }

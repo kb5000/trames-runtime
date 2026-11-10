@@ -847,6 +847,21 @@ pub(super) struct PseudoNodes {
     next_inode: u64,
     next_gc: usize,
 }
+/// Cache identity and inode contents use separate object locks. A resolver may
+/// already hold an inode while observing proc metadata, so finish an update only
+/// after releasing the outer pseudo publication and its inode index.
+pub(super) struct CachedNode {
+    node: NodeRef,
+    content: Option<Content>,
+}
+impl CachedNode {
+    pub(super) fn finish(self) -> NodeRef {
+        if let Some(content) = self.content {
+            self.node.borrow_mut().content = content;
+        }
+        self.node
+    }
+}
 impl PseudoFs {
     pub(super) fn path_of(&self, node: &NodeRef) -> Option<Vec<u8>> {
         self.nodes
@@ -856,6 +871,7 @@ impl PseudoFs {
             .find(|(_, n)| Arc::ptr_eq(n, node))
             .map(|((_, p), _)| p.clone())
     }
+    #[cfg(test)]
     pub(super) fn cache(
         &mut self,
         ns: u64,
@@ -865,8 +881,9 @@ impl PseudoFs {
     ) -> Result<NodeRef> {
         self.cache_process(ns, path, content, mode, 0, None)
     }
+    #[cfg(test)]
     fn cache_process(
-        &mut self,
+        &self,
         ns: u64,
         path: &[u8],
         content: Content,
@@ -874,6 +891,28 @@ impl PseudoFs {
         identity: u64,
         namespace: Option<&PidNamespace>,
     ) -> Result<NodeRef> {
+        Ok(self
+            .prepare_process(ns, path, content, mode, identity, namespace)?
+            .finish())
+    }
+    pub(super) fn prepare(
+        &self,
+        ns: u64,
+        path: &[u8],
+        content: Content,
+        mode: u32,
+    ) -> Result<CachedNode> {
+        self.prepare_process(ns, path, content, mode, 0, None)
+    }
+    fn prepare_process(
+        &self,
+        ns: u64,
+        path: &[u8],
+        content: Content,
+        mode: u32,
+        identity: u64,
+        namespace: Option<&PidNamespace>,
+    ) -> Result<CachedNode> {
         let mut nodes = self.nodes.borrow_mut();
         let key = (ns, path.to_vec());
         if nodes.identities.get(&key).copied().unwrap_or(0) != identity {
@@ -883,10 +922,10 @@ impl PseudoFs {
         if let Some(node) = nodes.entries.get(&key).cloned() {
             drop(nodes);
             debug_assert_eq!(node.simple_device, simple_device::Kind::content(&content));
-            if node.simple_device.is_none() {
-                node.borrow_mut().content = content;
-            }
-            return Ok(node);
+            return Ok(CachedNode {
+                content: node.simple_device.is_none().then_some(content),
+                node,
+            });
         }
         if nodes.entries.len() >= nodes.next_gc.max(4096) {
             nodes.next_gc = nodes.entries.len().saturating_add(4096);
@@ -940,10 +979,10 @@ impl PseudoFs {
             if let Some(node) = nodes.entries.get(&key).cloned() {
                 drop(nodes);
                 debug_assert_eq!(node.simple_device, simple_device::Kind::content(&content));
-                if node.simple_device.is_none() {
-                    node.borrow_mut().content = content;
-                }
-                return Ok(node);
+                return Ok(CachedNode {
+                    content: node.simple_device.is_none().then_some(content),
+                    node,
+                });
             }
         }
         if identity != 0 {
@@ -983,7 +1022,10 @@ impl PseudoFs {
             seals: None,
         }));
         nodes.entries.insert((ns, path.to_vec()), node.clone());
-        Ok(node)
+        Ok(CachedNode {
+            node,
+            content: None,
+        })
     }
 }
 #[derive(Clone, Copy)]
@@ -1572,7 +1614,7 @@ impl Vfs {
         };
         if let Some((content, mode)) = content {
             let identity = self.proc_path_identity(at);
-            let node = self.pseudo.borrow_mut().cache_process(
+            let cached = self.pseudo.borrow().prepare_process(
                 if path.starts_with(b"/proc")
                     && self.proc_namespace(at).is_nested()
                     // The rootfs mountpoint placeholder is shared by every
@@ -1590,6 +1632,7 @@ impl Vfs {
                 identity,
                 Some(self.pid_namespace()),
             )?;
+            let node = cached.finish();
             if self.pseudo.borrow().source.is_some() {
                 let binding = at
                     .proc_binding()

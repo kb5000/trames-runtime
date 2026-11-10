@@ -335,6 +335,12 @@ impl<C: Cpu> Kernel<C> {
                 directory.host_signal_group(group, signal);
             }
         }
+        // Every original product actor was admitted before launch. Later
+        // births publish through source admission, including initially frozen
+        // or sleeping tasks. Host polling never revives a cold owner snapshot.
+        if epoch.is_some_and(|epoch| epoch.source_session()) {
+            return Ok(false);
+        }
         let now = Instant::now();
         let members: std::collections::BTreeSet<_> = members.iter().map(|(pid, _)| *pid).collect();
         Ok(self.processes.iter().any(|(pid, p)| {

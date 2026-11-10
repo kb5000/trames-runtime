@@ -2834,6 +2834,7 @@ impl<C: Cpu> Kernel<C> {
             }
         };
         if raw.is_some() {
+            p.seccomp_entry = None;
             p.file_entry = None;
             p.retained_file = None;
             p.file_checkpoint = None;
@@ -2871,6 +2872,7 @@ impl<C: Cpu> Kernel<C> {
             p.trace.record(value);
             p.trace.flush();
         } else if matches!(p.state, State::Ready | State::Zombie(_)) {
+            p.seccomp_entry = None;
             p.trace.replaced();
             p.trace.flush();
         } else {
@@ -3419,72 +3421,76 @@ impl<C: Cpu> Kernel<C> {
         for p in self.processes.values() {
             p.linux.vfs.bind_console(console.clone());
         }
-        // Mapping/signal effects precede dispatch. Ready services may take a
-        // parked CPU's own View; mapping mutation waits for every CPU to return.
-        let ids: Vec<_> = self.processes.keys().collect();
-        for id in ids {
-            let Some(mut p) = self.processes.checkout(&id) else {
-                continue;
-            };
-            if !matches!(p.state, State::Zombie(_))
-                && !p.frozen(id)
-                && self.admit_owner_layouts(id, &mut p)?
-            {
-                if !p.worker_gpu_candidate() {
-                    self.resume_gpu(id, &mut p);
-                }
-                let local_ring = p.worker_io_candidate(id)
-                    && match p.state {
-                        State::Blocked(426, _) => true,
-                        State::Blocked(number @ (22 | 72 | 73 | 441), args) => {
-                            trames_linux::UringEpoch::poll_rings(
-                                &p.linux.vfs,
-                                number,
-                                args,
-                                &p.memory,
-                                id,
-                            )
-                            .is_some()
-                        }
-                        _ => false,
-                    };
-                if p.linux.uring_requires_owner_for(&p.memory, id)
-                    || !local_ring && !p.linux.worker_uring_pending(&p.memory, id)
+        // Product admission captures original actors before any CPU starts.
+        // Standalone compatibility fixtures retain their old bounded contract.
+        if !terminal {
+            // Mapping/signal effects precede dispatch. Ready services may take a
+            // parked CPU's own View; mapping mutation waits for every CPU to return.
+            let ids: Vec<_> = self.processes.keys().collect();
+            for id in ids {
+                let Some(mut p) = self.processes.checkout(&id) else {
+                    continue;
+                };
+                if !matches!(p.state, State::Zombie(_))
+                    && !p.frozen(id)
+                    && self.admit_owner_layouts(id, &mut p)?
                 {
-                    {
-                        let task = &mut *p;
-                        task.linux.progress_uring(&mut task.memory, id)
-                    };
-                }
-                if !matches!(p.state, State::Policy(_) | State::Barrier(_)) {
-                    self.resume_event(&mut p);
-                }
-                if self.deliver(id, &mut p).is_err() {
-                    self.exit(id, &mut p, 11);
-                }
-                // call/control/deliver publish resource changes immediately.
-                p.publish_stop_hold(id);
-                match p.state.clone() {
-                    State::Blocked(..) if p.stopped() && !p.stop_held() => {}
-                    State::Blocked(..)
-                        if p.worker_io_candidate(id)
-                            || matches!(p.state, State::Blocked(95 | 260, _)) =>
-                    {
-                        // The worker owns the retry; do not perform byte I/O in
-                        // the coordinator before preparing its execution View.
+                    if !p.worker_gpu_candidate() {
+                        self.resume_gpu(id, &mut p);
                     }
-                    State::Blocked(number, a) => self.call(id, &mut p, number, a, io),
-                    State::Sleep(deadline, _) if Instant::now() >= deadline => {
-                        p.state = State::Ready;
-                        p.cpu.set_x(0, 0);
-                        p.trace.record(0);
+                    let local_ring = p.worker_io_candidate(id)
+                        && match p.state {
+                            State::Blocked(426, _) => true,
+                            State::Blocked(number @ (22 | 72 | 73 | 441), args) => {
+                                trames_linux::UringEpoch::poll_rings(
+                                    &p.linux.vfs,
+                                    number,
+                                    args,
+                                    &p.memory,
+                                    id,
+                                )
+                                .is_some()
+                            }
+                            _ => false,
+                        };
+                    if p.linux.uring_requires_owner_for(&p.memory, id)
+                        || !local_ring && !p.linux.worker_uring_pending(&p.memory, id)
+                    {
+                        {
+                            let task = &mut *p;
+                            task.linux.progress_uring(&mut task.memory, id)
+                        };
                     }
-                    _ => {}
+                    if !matches!(p.state, State::Policy(_) | State::Barrier(_)) {
+                        self.resume_event(&mut p);
+                    }
+                    if self.deliver(id, &mut p).is_err() {
+                        self.exit(id, &mut p, 11);
+                    }
+                    // call/control/deliver publish resource changes immediately.
+                    p.publish_stop_hold(id);
+                    match p.state.clone() {
+                        State::Blocked(..) if p.stopped() && !p.stop_held() => {}
+                        State::Blocked(..)
+                            if p.worker_io_candidate(id)
+                                || matches!(p.state, State::Blocked(95 | 260, _)) =>
+                        {
+                            // The worker owns the retry; do not perform byte I/O in
+                            // the coordinator before preparing its execution View.
+                        }
+                        State::Blocked(number, a) => self.call(id, &mut p, number, a, io),
+                        State::Sleep(deadline, _) if Instant::now() >= deadline => {
+                            p.state = State::Ready;
+                            p.cpu.set_x(0, 0);
+                            p.trace.record(0);
+                        }
+                        _ => {}
+                    }
                 }
-            }
-            let actual = p.rekey.take().unwrap_or(id);
-            if !p.auto_reap || actual == 1 {
-                self.processes.insert(actual, p);
+                let actual = p.rekey.take().unwrap_or(id);
+                if !p.auto_reap || actual == 1 {
+                    self.processes.insert(actual, p);
+                }
             }
         }
         let mut ready: Vec<_> = self
@@ -3502,29 +3508,39 @@ impl<C: Cpu> Kernel<C> {
             .map(|id| self.processes.read(id).vm_id)
             .collect();
         let mut members: Vec<_> = ready.iter().map(|&id| (id, 0)).collect();
-        members.extend(self.processes.iter().filter_map(|(id, p)| {
-            if p.frozen(id) {
-                return None;
-            }
-            ((p.stopped() && p.control_candidate(id))
-                || (p.linux.worker_uring_pending(&p.memory, id)
-                    && !matches!(p.state, State::Ready | State::Zombie(_))
-                    && !p.worker_gpu_candidate())
-                || (matches!(p.state, State::Futex { .. }) && (terminal || vms.contains(&p.vm_id)))
-                || (matches!(p.state, State::Sleep(..)) && (terminal || vms.contains(&p.vm_id)))
-                || (matches!(
-                    p.state,
-                    State::Sigwait { .. }
-                        | State::Suspend(_)
-                        | State::Blocked(95 | 260, _)
-                        | State::Completion(_)
-                        | State::Namespace(_)
-                        | State::Policy(_)
-                        | State::Barrier(_)
-                ))
-                || p.worker_io_candidate(id))
-            .then_some((id, 0))
-        }));
+        if terminal {
+            members = self
+                .processes
+                .iter()
+                .filter_map(|(id, p)| (!matches!(p.state, State::Zombie(_))).then_some((id, 0)))
+                .collect();
+        } else {
+            members.extend(self.processes.iter().filter_map(|(id, p)| {
+                if p.frozen(id) {
+                    return None;
+                }
+                ((p.stopped() && p.control_candidate(id))
+                    || (p.linux.worker_uring_pending(&p.memory, id)
+                        && !matches!(p.state, State::Ready | State::Zombie(_))
+                        && !p.worker_gpu_candidate())
+                    || (matches!(p.state, State::Futex { .. })
+                        && (terminal || vms.contains(&p.vm_id)))
+                    || (matches!(p.state, State::Sleep(..))
+                        && (terminal || vms.contains(&p.vm_id)))
+                    || (matches!(
+                        p.state,
+                        State::Sigwait { .. }
+                            | State::Suspend(_)
+                            | State::Blocked(95 | 260, _)
+                            | State::Completion(_)
+                            | State::Namespace(_)
+                            | State::Policy(_)
+                            | State::Barrier(_)
+                    ))
+                    || p.worker_io_candidate(id))
+                .then_some((id, 0))
+            }));
+        }
         if !terminal
             && members.len() < 2
             && !members.iter().any(|(id, _)| {
@@ -3536,15 +3552,36 @@ impl<C: Cpu> Kernel<C> {
         {
             return Ok(false);
         }
-        let chosen = assign_cpus(
-            members.iter().map(|(id, _)| {
-                (
-                    *id,
-                    self.processes.read(id).signals.io.scheduling.affinity(),
-                )
-            }),
+        let mut chosen = assign_cpus(
+            members
+                .iter()
+                .filter(|(id, _)| {
+                    !terminal || {
+                        let p = self.processes.read(id);
+                        p.runnable()
+                            || p.worker_gpu_candidate()
+                            || matches!(p.state, State::Blocked(..))
+                    }
+                })
+                .map(|(id, _)| {
+                    (
+                        *id,
+                        self.processes.read(id).signals.io.scheduling.affinity(),
+                    )
+                }),
             self.cpu_count,
         );
+        if terminal && chosen.is_empty() && !members.is_empty() {
+            chosen = assign_cpus(
+                members.iter().take(1).map(|(id, _)| {
+                    (
+                        *id,
+                        self.processes.read(id).signals.io.scheduling.affinity(),
+                    )
+                }),
+                self.cpu_count,
+            );
+        }
         if chosen.is_empty() {
             return Ok(false);
         }
@@ -3561,7 +3598,7 @@ impl<C: Cpu> Kernel<C> {
         // signals even when no runnable CPU selected their mm. Register their
         // wait metadata now; byte/hardware Views are prepared only on a wake.
         let warm: std::collections::BTreeSet<_> = members.iter().map(|(id, _)| *id).collect();
-        let dormant: Vec<_> = self
+        let mut dormant: Vec<_> = self
             .processes
             .iter()
             .filter_map(|(id, p)| {
@@ -3569,8 +3606,34 @@ impl<C: Cpu> Kernel<C> {
                     .then_some(id)
             })
             .collect();
+        let prepare: Vec<_> = members
+            .iter()
+            .copied()
+            .filter(|(id, _)| {
+                if !terminal {
+                    return true;
+                }
+                let p = self.processes.read(id);
+                !matches!(
+                    p.state,
+                    State::Futex { .. }
+                        | State::Sleep(..)
+                        | State::Sigwait { .. }
+                        | State::Suspend(_)
+                        | State::Completion(_)
+                        | State::Namespace(_)
+                        | State::Policy(_)
+                        | State::Barrier(_)
+                )
+            })
+            .collect();
+        if terminal {
+            dormant.extend(members.iter().filter_map(|(id, _)| {
+                (!prepare.iter().any(|(ready, _)| ready == id)).then_some(*id)
+            }));
+        }
         let began = Instant::now();
-        let mut views = self.prepare_parallel_views(&members).unwrap_or_default();
+        let mut views = self.prepare_parallel_views(&prepare).unwrap_or_default();
         if let Some(error) = self.backend_error.take() {
             return Err(RuntimeError::Backend(error));
         }
@@ -3578,7 +3641,7 @@ impl<C: Cpu> Kernel<C> {
         // Its existing release subscription wakes an execution worker to
         // prepare the first byte View under original mm custody.
         let deferred = if views.is_empty() {
-            members.clone()
+            prepare.clone()
         } else {
             Vec::new()
         };
@@ -3788,6 +3851,9 @@ impl<C: Cpu> Kernel<C> {
                             .is_some_and(|p| p.linux.vfs.has_native_services())
                         && epoch.idle()
                     {
+                        if terminal {
+                            epoch.fail_execution(RuntimeError::Deadlock);
+                        }
                         break;
                     }
                 }
@@ -3797,7 +3863,12 @@ impl<C: Cpu> Kernel<C> {
         if checkpoint_error.is_some() {
             epoch.fail();
         }
-        epoch.handoff();
+        if terminal && !control.closing() && !epoch.has_missing_capability() {
+            epoch.fail_execution(RuntimeError::Arguments(
+                "execution returned without a source completion or missing capability",
+            ));
+        }
+        epoch.join();
         let began = Instant::now();
         // Native file work owns its resources and publishes directly to its
         // accepted source. Joining CPU Views never waits for unrelated disk I/O.
@@ -3923,7 +3994,26 @@ impl<C: Cpu> Kernel<C> {
             if done.thread_exit.is_some() {
                 self.accept_source_return(done)?;
             } else {
+                let missing = done.missing;
+                let retained_io = done.io.is_some();
                 let (pid, _, outcome) = self.restore_worker_return(done);
+                if terminal
+                    && (missing.is_none()
+                        || missing == Some(lifecycle::dispatch_calls::Missing::UringWaitGraph))
+                {
+                    if matches!(
+                        outcome,
+                        SliceOutcome::Syscall { .. } | SliceOutcome::NativeCall { .. }
+                    ) && !retained_io
+                    {
+                        self.processes.get_mut(&pid).unwrap().pending_cpu = Some(outcome);
+                    }
+                    if missing == Some(lifecycle::dispatch_calls::Missing::UringWaitGraph) {
+                        let p = &mut *self.processes.get_mut(&pid).unwrap();
+                        p.linux.progress_uring(&mut p.memory, pid);
+                    }
+                    continue;
+                }
                 outcomes.push((pid, outcome));
             }
         }

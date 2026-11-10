@@ -54,6 +54,134 @@ fn single_cpu_root_exit_is_completed_by_the_source_lifecycle() {
 }
 
 #[test]
+fn an_unclassified_cpu_yield_requeues_the_original_job_without_host_dispatch() {
+    for cpus in [1, 4, 12] {
+        let mut k = kernel();
+        k.cpu_count = cpus;
+        k.per_cpu.resize(cpus, Duration::ZERO);
+        let mut p = admitted_process(&k);
+        executable(&mut p, &[0xd28000e0, 0xd2800ba8, 0xd4000001]);
+        p.pending_cpu = Some(SliceOutcome::Yield { instructions: 0 });
+        k.publish_task(1, &p);
+        k.processes.insert(1, p);
+        assert_eq!(
+            k.drive(&mut trames_linux::CapturedOutput::default(), 10000)
+                .unwrap()
+                .code,
+            7
+        );
+        assert_eq!(k.parallel_rounds, 1);
+        assert!(k.cohort_return_syscalls.is_empty());
+        assert_eq!(k.service_requests, 0);
+    }
+}
+
+#[test]
+fn a_missing_host_provider_never_dispatches_an_unrelated_accepted_call_on_the_host() {
+    struct Output {
+        console: Arc<dyn trames_vfs::ConsoleIo>,
+        samples: std::cell::Cell<usize>,
+    }
+    impl GuestOutput for Output {
+        fn source_console(&mut self) -> Arc<dyn trames_vfs::ConsoleIo> {
+            self.console.clone()
+        }
+        fn host_memory(&self) -> Option<trames_linux::HostMemoryInfo> {
+            self.samples.set(self.samples.get() + 1);
+            Some(trames_linux::HostMemoryInfo {
+                total: 1 << 30,
+                free: 1 << 29,
+                available: 1 << 29,
+            })
+        }
+        fn write(&mut self, _: trames_linux::OutputFd, _: &[u8]) -> std::io::Result<usize> {
+            panic!("console bytes must use their original source provider")
+        }
+    }
+    for cpus in [1, 4, 12] {
+        let host_thread = std::thread::current().id();
+        let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = writes.clone();
+        let console = Arc::new(trames_vfs::ConsoleCallbacks::new(
+            |_| Ok(Vec::new()),
+            move |_, bytes| {
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push((std::thread::current().id(), bytes.to_vec()));
+                Ok(bytes.len())
+            },
+            |_, events| (events, [0; 2]),
+        ));
+        let mut output = Output {
+            console,
+            samples: std::cell::Cell::new(0),
+        };
+        let mut k = kernel();
+        k.cpu_count = cpus;
+        k.per_cpu.resize(cpus, Duration::ZERO);
+        k.workers = crate::workers::Pool::new(1);
+        k.memory_limits = crate::MemoryLimits::host_managed();
+        let mut root = admitted_process(&k);
+        root.signals.io.scheduling.set_affinity(1);
+        executable(
+            &mut root,
+            &[
+                0xd4000001, 0xd2860009, 0xb940012a, 0x34ffffea, 0xd28000e0, 0xd2800ba8, 0xd4000001,
+            ],
+        );
+        root.memory.write(0x1800, b"peer").unwrap();
+        root.memory.protect(0x5000, 4096, Permissions::RW).unwrap();
+        for (i, word) in [
+            0xd4000001u32,
+            0xd2860009,
+            0xd280002a,
+            0xb900012a,
+            0x14000000,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            root.memory
+                .write_array(0x5000 + i as u64 * 4, word.to_le_bytes())
+                .unwrap();
+        }
+        root.memory.protect(0x5000, 4096, Permissions::RX).unwrap();
+        root.cpu.set_x(0, 0x1000);
+        root.cpu.set_x(8, 179);
+        let memory = root.memory.share();
+        let mut peer = root.fork_with_memory(memory);
+        peer.tgid = 2;
+        peer.cpu.set_pc(0x5004);
+        for (i, value) in [1, 0x1800, 4, 0, 0, 0].into_iter().enumerate() {
+            peer.cpu.set_x(i, value);
+        }
+        peer.cpu.set_x(8, 64);
+        peer.pending_cpu = Some(SliceOutcome::Syscall { instructions: 0 });
+        peer.seccomp_entry = Some(
+            peer.seccomp
+                .entry_decision(64, 0x5004, [1, 0x1800, 4, 0, 0, 0]),
+        );
+        k.install_proc_source(&root, None);
+        k.publish_task(1, &root);
+        k.processes.insert(1, root);
+        k.processes.insert(2, peer);
+        k.publish_io_tasks(None);
+        let exit = k.drive(&mut output, 1000000).unwrap();
+        assert_eq!(exit.code, 7);
+        assert!(output.samples.get() > 0);
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].1, b"peer");
+        assert_ne!(
+            writes[0].0, host_thread,
+            "unrelated accepted SVC executed on the waiting host"
+        );
+        assert_eq!(k.service_requests, 0);
+    }
+}
+
+#[test]
 fn initial_busy_memory_is_admitted_without_host_cpu_execution() {
     struct Backing(Arc<trames_memory::layout::Layout>);
     impl trames_memory::PageBacking for Backing {

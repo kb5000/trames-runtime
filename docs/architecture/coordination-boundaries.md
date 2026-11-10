@@ -1,27 +1,34 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 104, host embedding
-and initial execution orchestration, reviewed on 2026-11-10. The prior shared
-runtime baseline is `bfa2cc071ed6f8142eceb8b98f9c5059bae64ecf`. Mac HVF and the iPad
+This is the consolidated implementation audit through stage 105, complete original-source
+execution dispatch, reviewed on 2026-11-10. The prior shared
+runtime baseline is `257914058941add91700ba25704f8433725eba8e`. Mac HVF and the iPad
 interpreter share this userspace Linux kernel. Historical stage paragraphs retain
 their prior counts; the authoritative current category inventory is below.
 
 ## Current status at a glance — 2026-11-10
 
-Stage 104 closes the host embedding/initial execution orchestration category.
-Host setup runs before CPU admission and is absent from the execution-facing
-trait. Live polling cannot request a joined mutable callback. One/multiple CPU,
-initial backing waits, cold host launches and subsequent ready instructions all
-use existing execution workers. The Kernel has no CPU engine; its legacy mapping
-compatibility handler cannot execute guest instructions or native CPU batching.
+Stage 105 closes the final generic execution-dispatch category. Warm View and
+cold original Memory calls use one accepted dispatcher. A cold operation takes
+only its original task/mm custody and runs on an existing executor; it does not
+create a Kernel projection or a resource service. Initial frozen, blocked and
+sleeping actors remain original source jobs, so host polling cannot resume them
+by scanning a second task table. Unknown CPU yields requeue their original job;
+ordinary SVC/HLT exits cannot stop admission for host dispatch.
 
-The remaining count is **two**: actual missing original capabilities/resources
-(including the two submitter-scoped io_uring maintenance escalation setters), and
-the final unfinished-operation compatibility dispatch. The latter still includes
-nonmember resource retries; it is not a host embedding contract or CPU runner.
-Stage 103's one-way source terminal completion remains in force. Architecture
-checks freeze compatibility handoffs and reject mutable host callbacks, setup
-from execution, backend opt-out flags and caller CPU loops. See section 104.
+The remaining count is **one**: actual missing original capabilities/resources.
+A typed missing resource is attached to its exact accepted operation before
+admission can suspend. Other returned CPUs retain their accepted traps for source
+execution; one missing provider cannot authorize unrelated host syscall work.
+The two submitter-scoped io_uring maintenance escalation setters remain explicit.
+Normal physical interruption, affected-mm custody, one-way completion and actual
+object waits are not coordinator dispatch. The architecture gate rejects generic
+production handoffs instead of allowing a debt ceiling to grow. Bounded standalone
+interpreter tests alone retain the legacy handoff helper under test-only cfg.
+See the paired iPad repository's stage 105 record for final acceptance.
+
+Stage 104's bootstrap-only setup, live host interface and execution-worker CPU
+entry remain enforced, as does stage 103's one-way source terminal completion.
 
 Stage 102 unifies the complete original task/mm structural control pipeline:
 worker admission, pinning preflight, scoped eligibility, clone/exec group work,
@@ -484,7 +491,7 @@ exec credential publication synchronize on the original group; ordinary entry
 reads one immutable version without a lock or allocation.
 
 Stage 58's scoped memory and stage 57's task/image lifecycle remain source-owned.
-Actual unhandled/control work can still end the current execution cohort. The
+Actual missing resources can still end the current execution cohort. The
 table records supported source execution and explicit remaining boundaries; this
 is not a claim that all coordinator work is removed.
 
@@ -523,7 +530,7 @@ is not a claim that all coordinator work is removed.
 | Live host pause/resume | Original cohort flag, execution leases and queue; accepted backing/lifecycle completion uses existing workers | No live pause-only join remains. Initial/solo execution and legacy stopped hooks keep their separate route; guest STOP/CONT, freezer and mapping pause remain independent |
 | Host filesystem commands | Original namespace/inode/backing resources and the existing disk pool | Streaming import/export, conditional FileProvider saves and timezone updates no longer join. Only genuinely absent host-I/O bindings retain the legacy stopped command route; apply-on-return is the chosen admission policy |
 | Actual host/embedding administration | Explicit cancellation, admin/deadline and final shutdown handling | These actual events retain their boundary. Normal host terminal transport, accepted filesystem commands and live pause/resume are source/resource work |
-| Last-resort SVC/HLT/fault dispatch | Truly unimplemented numbers complete locally using generated conservative recognition and the original diagnostic log | Known handlers whose actual resource/subcommand is excluded, legacy embeddings and unhandled HLT/fault exits still retain joined fallback. An implemented number returning an errno is not classified as globally unimplemented |
+| SVC/HLT/fault continuation | One source dispatcher over warm View or cold original Memory; cold native calls retain original task/mm custody, yields requeue and guest faults retain source signal/exit semantics | Only diagnosed absent original capabilities can suspend for their provider. Generic CPU exits cannot request host dispatch; backend failures retain their real terminal cause |
 | Single-CPU/solo execution | Existing coordinated caller path | The owner may itself be the guest executor; this is not evidence of an extra cross-thread syscall RPC |
 
 Initial guest admission and exceptional legacy/control rescheduling still involve
@@ -566,8 +573,8 @@ flowchart LR
 The `Join` edge requires the current cohort to return its Views. `Scope`
 quiesces its actual mm/backing dependencies. There is no compatibility RPC edge.
 
-The Kernel owner admits and collects execution cohorts and handles the remaining
-joined scopes. Original task membership and supported structural publication are
+The host admits and collects execution cohorts and serves only explicitly missing
+embedding capabilities. Original task membership and supported structural publication are
 shared with existing executors. An admitted short operation runs on its calling
 worker. A blocked resource operation can return its execution slot and resume
 from original readiness without a syscall RPC to that owner. Native disk jobs own
@@ -577,9 +584,10 @@ The relevant scopes are:
 
 - **Resource wait:** only the caller parks; other CPUs continue.
 - **Affected-domain checkpoint:** only the required mm/backing users quiesce;
-  the owner publishes their structural change.
+  an existing source executor publishes their structural change.
 - **Joined owner path:** the current cohort ends, its Views return, then the owner
-  runs task/control or compatibility work. This is broader than one-resource wait.
+  serves the diagnosed missing provider. It cannot dispatch unrelated returned
+  SVC/HLT work. This is broader than one-resource wait.
 - **Local execution fallback:** a different implementation runs on the same worker;
   the word `fallback` alone does not identify a coordinator transition.
 
@@ -636,22 +644,29 @@ Actual excluded policy effects and missing capabilities retain explicit boundari
 
 ### Current remaining categories
 
-The count is **two broad categories**. Stage 103 removes production terminal
-completion, and stage 104 removes host embedding/initial execution orchestration.
-The final unfinished-operation dispatcher remains reachable; it cannot run guest
-instructions. Bootstrap is completed before admission and has no live callback.
+The count is **one broad category**. Stages 103–105 remove production terminal
+completion, host embedding/initial execution orchestration and final generic
+execution dispatch respectively. Bootstrap has no live mutable callback. CPU
+interruptions and affected-resource scopes cannot request joined syscall work.
 
 | Remaining category | Actual trigger | Current scope / authoritative implementation |
 | --- | --- | --- |
 | Missing capabilities and excluded resources | A genuinely absent source provider, an excluded original FD/node graph, a genuinely absent native event capability or unsupported source request body | There is no filesystem-kind exclusion after stage 82. Published global proc/sys metadata no longer lacks a source provider merely because it uses set_runtime_info. Other node/provider admission still applies. io_uring has exactly two submitter-scoped `require_owner()` maintenance call sites: an actually unavailable typed wait graph provider and deferred original body progress. An absent HostEvents hub no longer triggers this boundary: actual native interests are retained with their read/write directions. Compatibility capture carries its own original execution resources; per-task memory observations do not require a host-global statistics callback. Actual missing global providers and host backend errors retain their own boundary/cause. They remain connected to actual accepted request lifetime, subscriptions and cancellation. See [path authority](../../crates/trames-vfs/src/path_queries.rs), [maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [wait sources](../../crates/trames-linux/src/direct/uring/wait.rs) and [actor](../../crates/trames-linux/src/direct/uring/actor.rs). |
-| Final execution dispatch fallback | A returned SVC or cold HLT/resource operation not completed, parked or accepted by a source scope, including nonmember resource retries | The catch-all stops the current cohort for joined dispatch. Ordinary shared-FD ioctl discovery, residual prctl controls/errors, implemented time observations, FD status/NOATIME, inode seals, anonymous memory-file creation, mapped-memory msync/writeback, file-cache advice, canonical FD/error admission, the complete original epoll/poll/select graph and generic socket event sources, current-offset vector transports, blocking POSIX/OFD locks, directory flock and canonical unknown fcntl commands no longer use it. It remains an audit target even though admitted native calls, ordinary guest faults, generated ENOSYS and migrated syscalls have source completion. Recognized guest faults, caught handlers and signal-frame failures now complete/terminate on source. A backend error is not a software or full-Linux-VM fallback. See [worker dispatch](../../crates/trames-session/src/workers.rs) and [classification](../../crates/trames-session/src/worker_syscalls.rs). |
+
+The source return carries `HostStatistics`, `WaitGraph`, `ByteProvider` or
+`UringWaitGraph` on the original operation. This is an explicit capability class,
+not four newly counted architectural categories. Unsupported APIs preserve their
+existing result; a missing capability is not converted to a success or new errno.
+The common dispatcher and source continuation are in
+[syscall dispatch](../../crates/trames-session/src/syscall_dispatch.rs) and
+[original-memory continuation](../../crates/trames-session/src/process_lifecycle_dispatch.rs).
 
 
 Supported process/family lifecycle, signals and security policy, mount and task
 namespace administration, proc views, transfers, timers, event waits, terminals,
 native devices/Bridge, diagnostics, system statistics, guest power control and
 read-only memory observations are source-owned. An excluded underlying resource
-can still take the second category; this is not a claim that every custom
+can still take the remaining category; this is not a claim that every custom
 embedding or unsupported API has acquired an implementation.
 
 Actual mapping edits, discard, backing/layout changes and external byte leases
@@ -4594,3 +4609,36 @@ explicit, rather than being converted into guest errors or terminal cancellation
 See the [paired validation](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/host-orchestration-20261110.json)
 for common, Linux, iPad SDK, signed native and installed Dev results. Stable and
 physical iPad deployment are outside this batch. No throughput gain is inferred.
+
+
+## 105. Complete original-source execution dispatch — 2026-11-10
+
+The warm and cold paths share the same policy, session ABI and resource bodies.
+Accepted descriptors, deadlines, pending results and policy decisions stay on the
+original job. Cold full Linux dispatch borrows the original task's Linux state
+and Memory after its real mm closure quiesces; there is no copied task map or
+snapshot Kernel. Submitted file layout work retains the existing disk executor.
+Background ring maintenance takes its submitter's source scope before it can
+report an actually missing wait graph. Other already parked waits retain their
+original state and cannot be retired merely to run background progress.
+
+An imported blocked structural call retains its actual syscall registers and
+accepted seccomp decision. It cannot be interpreted as an ordinary byte-I/O retry
+or filtered again after a concurrent policy change. Every non-zombie initial
+actor is admitted as an original job, including frozen and non-byte wait states.
+Byte Views are still prepared only for real byte/CPU work. A missing provider on
+one task does not permit dispatching another task's accepted syscall on the host.
+
+Shared original-VFS cold execution exposed a proc cache/inode lock inversion.
+Inode interning now produces a pending content update; actual inode mutation
+occurs after releasing the pseudo publication and inode index locks. Original
+inode identity, caller-specific proc aliases and update contents are preserved.
+No global resolver lock, algorithm lock or new ordinary-memory fence is added.
+
+Concentrated validation includes all prior session regressions, a full ABI corpus
+against the canonical complete entry, unclassified yields at one/four/twelve CPUs
+and a missing-provider/accepted-peer regression that checks the actual execution
+thread. The existing concurrent filtered proc-open test covers the lock inversion.
+The paired product record includes macOS/ARM64 Linux runtime CI, both iPad SDKs,
+Mac product gates, signed hardware and installed Dev acceptance. Stable apps and
+physical iPad installations are outside this batch. No throughput gain is inferred.

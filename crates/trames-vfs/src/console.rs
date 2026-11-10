@@ -178,6 +178,17 @@ impl ConsoleEndpoint {
     }
 }
 impl Vfs {
+    /// The byte provider already bound to this original descriptor. This does
+    /// not bind a host callback or rediscover an accepted I/O request.
+    pub fn bound_console(&self, fd: u32) -> Option<Arc<dyn ConsoleIo>> {
+        self.fds
+            .get(&fd)?
+            .open
+            .borrow()
+            .console
+            .get()
+            .map(|end| end.io.clone())
+    }
     pub fn bind_console(&self, io: Arc<dyn ConsoleIo>) {
         if self.fds.cache().console_bound {
             return;

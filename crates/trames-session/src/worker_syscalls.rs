@@ -114,7 +114,12 @@ pub(super) struct Snapshot {
 }
 
 impl<C: Cpu> crate::workers::Work<C> {
-    pub fn policy_call(&mut self, number: u32, args: [u64; 6]) -> crate::process::seccomp::Attempt {
+    pub fn policy_call(
+        &mut self,
+        number: u32,
+        args: [u64; 6],
+        memory: &impl CpuMemory,
+    ) -> crate::process::seccomp::Attempt {
         let snapshot = self.syscalls.as_mut().expect("policy task");
         let namespace = snapshot.io_routes.namespace.clone();
         snapshot
@@ -122,16 +127,12 @@ impl<C: Cpu> crate::workers::Work<C> {
             .as_mut()
             .expect("original task authority")
             .with_credentials(|credentials, _| {
-                snapshot.seccomp.start(
-                    number,
-                    args,
-                    self.memory.as_deref().expect("policy View"),
-                    credentials,
-                    namespace,
-                )
+                snapshot
+                    .seccomp
+                    .start(number, args, memory, credentials, namespace)
             })
     }
-    pub fn credential_call(&mut self, number: u32, args: [u64; 6]) {
+    pub fn credential_call(&mut self, number: u32, args: [u64; 6], memory: &mut impl CpuMemory) {
         let snapshot = self.syscalls.as_mut().expect("credential task");
         let mut state = snapshot.namespaces.take().expect("original task authority");
         let directory = snapshot.io_routes.directory.clone();
@@ -144,9 +145,7 @@ impl<C: Cpu> crate::workers::Work<C> {
                 local,
                 number,
                 args,
-                self.memory
-                    .as_deref_mut()
-                    .expect("credential caller memory"),
+                memory,
                 |target| {
                     let global = namespace.global(target).ok_or(Errno(3))?;
                     let task = directory.proc_task(global).ok_or(Errno(3))?;
@@ -617,7 +616,7 @@ impl Snapshot {
         cpu: &C,
         memory: &mut impl CpuMemory,
         pid: u32,
-        epoch: &Arc<crate::run_queue::Epoch<C>>,
+        epoch: &crate::run_queue::Epoch<C>,
     ) -> Option<Result<crate::run_queue::WaitState, Errno>> {
         if matches!(cpu.x(8) as u32, 101 | 115) {
             return Some(
@@ -640,25 +639,18 @@ impl Snapshot {
             let key = futex_parameters(memory, self.futex.vm, std::array::from_fn(|i| cpu.x(i)))?;
             let (bits, deadline) =
                 futex_wait_parameters(memory, std::array::from_fn(|i| cpu.x(i)), self.started)?;
-            let wait = self.futex.table.wait_target(
-                key,
-                pid,
-                bits,
-                Some({
-                    let target = Arc::downgrade(epoch);
-                    let target: std::sync::Weak<dyn crate::futex::Wake> = target;
-                    target
-                }),
-                || {
-                    let value = u32::from_le_bytes(
-                        memory.read_array::<4>(cpu.x(0)).map_err(|_| Errno(14))?,
-                    );
-                    if value != cpu.x(2) as u32 {
-                        return Err(Errno(11));
-                    }
-                    Ok(())
-                },
-            )?;
+            let wait =
+                self.futex
+                    .table
+                    .wait_target(key, pid, bits, Some(epoch.futex_target()), || {
+                        let value = u32::from_le_bytes(
+                            memory.read_array::<4>(cpu.x(0)).map_err(|_| Errno(14))?,
+                        );
+                        if value != cpu.x(2) as u32 {
+                            return Err(Errno(11));
+                        }
+                        Ok(())
+                    })?;
             Ok(crate::run_queue::WaitState::Futex { wait, deadline })
         })())
     }

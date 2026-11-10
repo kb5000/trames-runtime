@@ -150,7 +150,10 @@ impl Dispatch {
             Some(crate::run_queue::WaitState::Completion(
                 crate::run_queue::CompletionWait::new(release.clone()),
             ))
-        } else if !matches!(p.state, State::Ready) && !source_io && !p.worker_gpu_candidate() {
+        } else if !matches!(p.state, State::Ready | State::Blocked(..))
+            && !source_io
+            && !p.worker_gpu_candidate()
+        {
             Some(crate::run_queue::WaitState::OwnerEvent)
         } else {
             None
@@ -293,9 +296,30 @@ impl Dispatch {
                     + self.instructions.saturating_sub(instructions),
             }));
         }
+        if let State::Blocked(number, args) = p.state {
+            if crate::structural::Call::decode(number, args).is_some() && job.pending_cpu.is_none()
+            {
+                job.work.cpu.set_x(8, number as u64);
+                for (i, value) in args.iter().enumerate() {
+                    job.work.cpu.set_x(i, *value);
+                }
+                job.pending_cpu = Some(SliceOutcome::Syscall { instructions: 0 });
+                job.pending_accounted = true;
+                if let Some(entry) = p.seccomp_entry.take() {
+                    job.work
+                        .syscalls
+                        .as_mut()
+                        .unwrap()
+                        .seccomp
+                        .restore_entry(&entry, &job.work.cpu);
+                    job.seccomp_entry = Some(entry);
+                }
+            }
+        }
         let io_retry = match p.state {
             State::Blocked(number, args)
-                if !matches!(job.waiting, Some(crate::run_queue::WaitState::Child(_))) =>
+                if crate::structural::Call::decode(number, args).is_none()
+                    && !matches!(job.waiting, Some(crate::run_queue::WaitState::Child(_))) =>
             {
                 Some((number, args))
             }
