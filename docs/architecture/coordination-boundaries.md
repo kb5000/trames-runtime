@@ -1,11 +1,21 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 101, original futex delivery and exit dependencies, reviewed on 2026-11-10. The prior shared runtime
-baseline is `789f4de84e83b3dcd83a3b18b1ebac9606406b8f`.
+This is the consolidated implementation audit through stage 102, unified original task/mm structural dispatch, reviewed on 2026-11-10. The prior shared runtime
+baseline is `0894bef6642da29df58da8dea4cc71221068913e`.
 Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
 resource work, scoped mapping admission and joined administration remain distinct.
 
 ## Current status at a glance — 2026-11-10
+
+Stage 102 unifies the complete original task/mm structural control pipeline:
+worker admission, pinning preflight, scoped eligibility, clone/exec group work,
+image replacement, mapping/layout admission, bounded native batching and proc
+accounting consume one typed Linux ABI classification. Full syscall registers
+remain intact for policy and guest visibility. Accepted structural calls cannot
+fall between duplicated phase-specific number/command whitelists. io_uring's
+whole existing registration control ABI normalizes its unsigned selectors once;
+nonpinning controls retain their direct path and cold resource misses retain the
+same original-resource scope, including filtered callers.
 
 Stage 101 replaces the full unbound futex-ready stop mechanism. Original tickets
 are delivered through the current weak executor binding; existing workers admit
@@ -611,7 +621,7 @@ Actual excluded policy effects and missing capabilities retain explicit boundari
 ### Current remaining categories
 
 The count is **four broad categories**, not the number of historical subsystem
-rows. Stages 72–100 remove concrete triggers and close request-authority dependencies inside those categories; they do not
+rows. Stages 72–102 remove concrete triggers and close request-authority dependencies inside those categories; they do not
 prove that the final generic fallback is unreachable.
 
 | Remaining category | Actual trigger | Current scope / authoritative implementation |
@@ -4436,3 +4446,40 @@ hardware outcomes are in the [paired record](https://github.com/kb5000/trames-ip
 Five legacy stop sites are removed, but the four broad categories, two io_uring
 missing-provider/body guards and final dispatch audit remain. This is not a
 controlled throughput or production fallback-frequency measurement.
+
+
+## 102. Unified original task/mm structural dispatch — 2026-11-10
+
+This batch closes a residual dispatch dependency for the complete structural
+control family, not just one syscall guard. A single Call/Memory classification
+now defines break/unmap/remap/map/protection/residency/advice/registration and
+clone/exec/execveat. Worker policy/preflight, original scope selection, task group
+admission, image work, mapping/layout checks, native batching and proc accounting
+consume those variants. Pure registration controls retain the direct path;
+original-memory pinning enters its real mm scope before effects. Other genuine
+cold registration admissions can use that same original task/mm path even for
+an accepted filtered caller.
+
+The prior stages repeated raw x8 and command comparisons independently. With
+ABI-equivalent upper register bits, clone reached its original worker and then
+panicked, pin registration missed the scope and stopped the cohort, and native
+mmap batching could bypass the normal fresh-map boundary. All those phases now
+use the same ABI interpretation without changing guest registers. The common
+io_uring register body also decodes opcode and nr_args as unsigned int once,
+covering fixed buffers/files, updates, eventfd, probe and provided-buffer rings.
+Raw arguments stay available to BPF; its accepted decision is carried once into
+the source scope. Actual object custody, original reader quiescence and file
+layout admission remain unchanged; no global algorithm lock, per-byte check,
+ordinary fence, polling bus or new service thread is added.
+
+The before/after fixture uses the identical test file. It covers thirty connected
+mapping/task/registration calls at four/twelve CPUs, one slot and a policy that
+inspects the upper raw argument word. Separate valid clone plus execve/execveat
+fixtures replace the child image, return its real exit status to its parent and
+leave unrelated actors in one cohort. A native Linux raw-SVC oracle independently
+confirms the number/command/count ABI. Native hardware acceptance also covers
+wide-number clone creation, pin/unpin and mapping/protect/residency/discard/remap
+on the same original queue. See the [paired validation](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/structural-dispatch-20261110.json)
+for exact source hashes and outcomes. This is not a controlled throughput claim.
+The four broad categories, both io_uring missing-provider/body guards and final
+generic-dispatch audit remain open; the overall objective is not declared done.

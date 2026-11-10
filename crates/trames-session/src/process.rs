@@ -9742,3 +9742,7 @@ mod memory_sync_tests;
 #[cfg(all(test, trames_interpreter_conformance))]
 #[path = "process_dispatch_tests.rs"]
 mod dispatch_tests;
+
+#[cfg(all(test, trames_interpreter_conformance))]
+#[path = "process_structural_tests.rs"]
+mod structural_tests;

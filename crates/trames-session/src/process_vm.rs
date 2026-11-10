@@ -43,7 +43,7 @@ impl<C: Cpu> Kernel<C> {
                 .jobs
                 .iter()
                 .filter(|job| job.checkpoint.is_some())
-                .all(|job| matches!(job.work.cpu.x(8) as u32, 220 | 221 | 281));
+                .all(|job| job.structural_call().is_some_and(|call| call.task()));
         if checkpoint.proc_reads && !lifecycle_only {
             let mut wait = self.proc_read_wait();
             let mut ids = std::collections::BTreeSet::new();
@@ -155,7 +155,10 @@ impl<C: Cpu> Kernel<C> {
                         return Ok(false);
                     }
                 }
-                if p.cpu.x(8) as u32 == 220 {
+                if matches!(
+                    crate::structural::Call::from_cpu(&p.cpu),
+                    Some(crate::structural::Call::Clone)
+                ) {
                     // Copy actual signal state before inheriting it. Mapping
                     // custody alone did not need this task-state handoff.
                     p.signals.finish_io();
@@ -196,21 +199,12 @@ impl<C: Cpu> Kernel<C> {
                 let mut extra = false;
                 let mut used_window = false;
                 loop {
-                    let number = p.cpu.x(8) as u32;
-                    assert!(crate::worker_syscalls::vm_entry(&p.cpu));
+                    let call = crate::structural::Call::from_cpu(&p.cpu)
+                        .and_then(|call| call.memory())
+                        .expect("original memory operation");
+                    let number = call.number();
                     let args = std::array::from_fn(|i| p.cpu.x(i));
-                    let kind = match number {
-                        214 => 0,
-                        215 => 1,
-                        216 => 2,
-                        222 => 3,
-                        226 => 4,
-                        232 => 5,
-                        233 if args[2] as u32 == 4 => 6,
-                        233 => 7,
-                        427 => 8,
-                        _ => unreachable!(),
-                    };
+                    let kind = call.index();
                     self.vm_checkpoint_calls[kind] += 1;
                     let call_began = Instant::now();
                     p.trace = std::mem::take(&mut job.work.trace);
@@ -265,7 +259,9 @@ impl<C: Cpu> Kernel<C> {
                     self.vm_checkpoint_batch[1] += 1;
                     used_window = true;
                     if matches!(outcome, SliceOutcome::Syscall { .. })
-                        && crate::worker_syscalls::vm_entry(&p.cpu)
+                        && crate::structural::Call::from_cpu(&p.cpu)
+                            .and_then(|call| call.memory())
+                            .is_some()
                     {
                         p.cpu.clear_exclusive();
                         extra = true;

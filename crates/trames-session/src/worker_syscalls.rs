@@ -235,21 +235,6 @@ impl<C: Cpu> crate::workers::Work<C> {
     }
 }
 
-/// These operations change or inspect this mm's mappings, without changing
-/// task/FD/namespace authority. Filtered/traced callers retain the joined path.
-pub(super) fn vm_call(number: u32) -> bool {
-    matches!(number, 214..=216 | 222 | 226 | 232 | 233)
-}
-
-pub(super) fn vm_entry<C: Cpu>(cpu: &C) -> bool {
-    vm_call(cpu.x(8) as u32) || cpu.x(8) as u32 == 427 && matches!(cpu.x(1), 0 | 22)
-}
-/// Task birth uses only the original parent mm's custody, including filtered
-/// ALLOW entries. Namespace/Files/parent resources keep their own actual locks.
-pub(super) fn custody_entry<C: Cpu>(cpu: &C) -> bool {
-    vm_entry(cpu) || matches!(cpu.x(8) as u32, 220 | 221 | 281)
-}
-
 #[cfg(all(test, trames_interpreter_conformance))]
 pub(super) fn clock(
     memory: &mut impl CpuMemory,

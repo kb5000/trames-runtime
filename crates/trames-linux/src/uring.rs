@@ -490,10 +490,15 @@ pub(crate) fn setup_parameters(
 /// Structural pinning can defer before any registration change is published.
 pub(crate) fn register(
     ring: &Arc<Uring>,
-    a: [u64; 6],
+    mut a: [u64; 6],
     memory: &mut impl trames_memory::CpuMemory,
     mut accept: impl FnMut(u32) -> Option<Result<trames_vfs::UringFile>>,
 ) -> Option<Result<u64>> {
+    // The Linux ABI declares both opcode and nr_args as unsigned int. Decode
+    // them once for direct controls and original-memory pinning alike, without
+    // changing the guest's preserved register values.
+    a[1] = u64::from(a[1] as u32);
+    a[3] = u64::from(a[3] as u32);
     let deferred = std::cell::Cell::new(false);
     let mut accepted_originals = Vec::new();
     let mut retired_graph = Vec::new();

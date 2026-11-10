@@ -111,7 +111,11 @@ impl<C: Cpu> Kernel<C> {
             .io
             .proc_view
             .waiting(!matches!(p.state, State::Ready));
-        if crate::worker_syscalls::vm_call(number) || matches!(number, 196 | 197) {
+        if crate::structural::Call::decode(number, args)
+            .and_then(|call| call.memory())
+            .is_some()
+            || matches!(number, 196 | 197)
+        {
             p.memory.memory_report();
         }
         if p.cpu.x(0) > u64::MAX - 4095 {

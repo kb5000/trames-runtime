@@ -16,7 +16,7 @@ impl<C: Cpu> Lifecycle<C> {
         for job in checkpoint
             .jobs
             .iter()
-            .filter(|job| matches!(job.checkpoint_syscall(), Some(221 | 281)))
+            .filter(|job| job.structural_call().is_some_and(|call| call.exec()))
         {
             let original = job.work.task.as_ref().expect("original exec task");
             let p = &mut *original.write();
@@ -29,7 +29,7 @@ impl<C: Cpu> Lifecycle<C> {
                 p.linux.vfs.set_lock_owner(p.tgid);
                 let request = exec::Request::capture(
                     p,
-                    job.work.cpu.x(8) as u32,
+                    job.structural_call().expect("accepted exec").number(),
                     args(&job.work.cpu),
                     self.birth.memory_limits.per_process,
                     self.birth.started,
@@ -67,7 +67,7 @@ impl<C: Cpu> Lifecycle<C> {
         for job in checkpoint
             .jobs
             .iter()
-            .filter(|job| matches!(job.checkpoint_syscall(), Some(221 | 281)))
+            .filter(|job| job.structural_call().is_some_and(|call| call.exec()))
         {
             let group = job
                 .work
@@ -109,7 +109,7 @@ impl<C: Cpu> Lifecycle<C> {
         while let Some(index) = checkpoint
             .jobs
             .iter()
-            .position(|job| matches!(job.checkpoint_syscall(), Some(221 | 281)))
+            .position(|job| job.structural_call().is_some_and(|call| call.exec()))
         {
             let mut job = checkpoint.jobs.remove(index);
             let pid = job.work.pid;
@@ -122,7 +122,7 @@ impl<C: Cpu> Lifecycle<C> {
                 continue;
             }
             let began = Instant::now();
-            let number = job.work.cpu.x(8) as u32;
+            let number = job.structural_call().expect("accepted exec").number();
             let a = args(&job.work.cpu);
             let group = p.signals.io.lifecycle().clone();
             let members = &groups[&(Arc::as_ptr(&group) as usize)];

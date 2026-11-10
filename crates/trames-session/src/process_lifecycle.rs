@@ -90,7 +90,7 @@ pub(crate) fn eligible<'a, C: Cpu>(
             match outcome {
                 SliceOutcome::NativeCall { .. } => {}
                 SliceOutcome::Syscall { .. }
-                    if crate::worker_syscalls::custody_entry(&job.work.cpu)
+                    if job.structural_call().is_some()
                         && job
                             .seccomp_entry
                             .as_ref()
@@ -289,7 +289,7 @@ impl<C: Cpu> Lifecycle<C> {
                 .jobs
                 .iter()
                 .filter(|j| j.checkpoint.is_some())
-                .all(|j| matches!(j.checkpoint_syscall(), Some(220 | 221 | 281)));
+                .all(|j| j.structural_call().is_some_and(|call| call.task()));
         for job in &mut checkpoint.jobs {
             drop(job.work.memory.take());
             job.work.cpu.clear_exclusive();
@@ -402,7 +402,7 @@ impl<C: Cpu> Lifecycle<C> {
         for job in checkpoint
             .jobs
             .iter()
-            .filter(|job| matches!(job.checkpoint_syscall(), Some(220 | 221 | 281)))
+            .filter(|job| job.structural_call().is_some_and(|call| call.task()))
         {
             let task = job
                 .work
@@ -488,7 +488,10 @@ impl<C: Cpu> Lifecycle<C> {
             if p.signals.io.lifecycle().termination().is_some() {
                 continue;
             }
-            assert_eq!(job.work.cpu.x(8), 220);
+            assert_eq!(
+                crate::structural::Call::from_cpu(&job.work.cpu),
+                Some(crate::structural::Call::Clone)
+            );
             let began = Instant::now();
             p.linux.vfs.sync_task_namespaces();
             p.linux.vfs.set_process_context(job.work.pid);

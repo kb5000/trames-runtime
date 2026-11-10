@@ -71,11 +71,9 @@ impl<C: Cpu> Lifecycle<C> {
         let batch = !C::EXACT_INSTRUCTIONS && epoch.checkpoint_owns_all_jobs(checkpoint);
         let deadline = Instant::now() + Duration::from_micros(250);
         for job in &mut checkpoint.jobs {
-            if job.checkpoint_syscall().is_none()
-                || !crate::worker_syscalls::vm_entry(&job.work.cpu)
-            {
+            let Some(call) = job.structural_call().and_then(|call| call.memory()) else {
                 continue;
-            }
+            };
             let original = job
                 .work
                 .task
@@ -87,7 +85,7 @@ impl<C: Cpu> Lifecycle<C> {
                 job.checkpoint = None;
                 continue;
             }
-            if job.work.cpu.x(8) == 222 {
+            if call.mapping() {
                 let args = args(&job.work.cpu);
                 if let Err(layout) = p.linux.admit_mmap(args, &p.memory) {
                     let signal =
@@ -122,19 +120,11 @@ impl<C: Cpu> Lifecycle<C> {
             let mut extra = false;
             let mut used_window = false;
             loop {
-                let number = p.cpu.x(8) as u32;
-                let kind = match number {
-                    214 => 0,
-                    215 => 1,
-                    216 => 2,
-                    222 => 3,
-                    226 => 4,
-                    232 => 5,
-                    233 if p.cpu.x(2) as u32 == 4 => 6,
-                    233 => 7,
-                    427 => 8,
-                    _ => unreachable!("accepted mapping operation"),
-                };
+                let call = crate::structural::Call::from_cpu(&p.cpu)
+                    .and_then(|call| call.memory())
+                    .expect("accepted original memory operation");
+                let number = call.number();
+                let kind = call.index();
                 let began = Instant::now();
                 // The selected mapping ABI has no host terminal/output effects.
                 // Use the same Linux implementation as the joined caller.
@@ -203,8 +193,9 @@ impl<C: Cpu> Lifecycle<C> {
                 report.mapping_batch[1] += 1;
                 used_window = true;
                 if matches!(outcome, SliceOutcome::Syscall { .. })
-                    && crate::worker_syscalls::vm_entry(&p.cpu)
-                    && p.cpu.x(8) != 222
+                    && crate::structural::Call::from_cpu(&p.cpu)
+                        .and_then(|call| call.memory())
+                        .is_some_and(|call| !call.mapping())
                 {
                     p.cpu.clear_exclusive();
                     extra = true;

@@ -18,6 +18,7 @@ mod retired_memory;
 mod run_queue;
 mod signal_actions;
 mod space;
+mod structural;
 mod syscall_trace;
 mod terminal;
 mod video;

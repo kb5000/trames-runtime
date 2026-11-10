@@ -1315,7 +1315,7 @@ trames_linux::IoAttempt::ByteCheckpoint(file) => {
                                 // Carry an allowed/deferred decision exactly once.
                                 if epoch.as_ref().is_some_and(|epoch| epoch.local_vm)
                                     && work.syscalls.as_ref().is_some_and(|snapshot| snapshot.seccomp.mode() != 0 || work.cpu.x(8) as u32 == 427)
-                                    && crate::worker_syscalls::custody_entry(&work.cpu)
+                                    && crate::structural::Call::from_cpu(&work.cpu).is_some_and(|call| call.preflight())
                                     && !(work.cpu.x(8) as u32 == 214 && work.cpu.x(0) == 0)
                                 {
                                     let snapshot=work.syscalls.as_ref().expect("custody task");
@@ -1599,9 +1599,11 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                                         unreachable!("local VM execution requires original task custody");
                                     }
                                     if epoch.as_ref().is_some_and(|epoch| epoch.local_vm)
-                                        && snapshot.seccomp.mode() == 0
-                                        && crate::worker_syscalls::custody_entry(&work.cpu)
+                                        && crate::structural::Call::from_cpu(&work.cpu).is_some()
                                     {
+                                        if snapshot.seccomp.mode() != 0 {
+                                            job.seccomp_entry=Some(snapshot.seccomp.entry_decision(work.cpu.x(8) as u32,work.cpu.pc(),std::array::from_fn(|i|work.cpu.x(i))));
+                                        }
                                         vm_checkpoint = true;
                                         break result;
                                     }

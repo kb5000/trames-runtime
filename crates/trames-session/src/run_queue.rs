@@ -468,6 +468,10 @@ pub(super) struct Job<C: Cpu> {
     pub seccomp_entry: Option<crate::process::seccomp::EntryDecision>,
 }
 impl<C: Cpu> Job<C> {
+    pub fn structural_call(&self) -> Option<crate::structural::Call> {
+        self.checkpoint_syscall()?;
+        crate::structural::Call::from_cpu(&self.work.cpu)
+    }
     pub fn checkpoint_syscall(&self) -> Option<u32> {
         matches!(self.checkpoint, Some(SliceOutcome::Syscall { .. }))
             .then(|| self.work.cpu.x(8) as u32)
@@ -1291,7 +1295,7 @@ impl<C: Cpu> Epoch<C> {
         q.running -= 1;
         q.domains.returned(job.work.pid);
         job.checkpoint = Some(outcome);
-        if matches!(job.checkpoint_syscall(), Some(220 | 221 | 281)) {
+        if job.structural_call().is_some_and(|call| call.task()) {
             q.domains.pause_bytes(id);
         } else {
             q.domains.pause(BTreeSet::from([id]));
