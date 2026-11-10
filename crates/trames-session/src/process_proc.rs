@@ -77,10 +77,19 @@ impl<C: Cpu> Kernel<C> {
         host: Option<Arc<dyn Fn() -> trames_linux::HostMemoryInfo + Send + Sync>>,
     ) {
         root.memory.renew_memory_report();
+        let source = self.make_proc_source(root.signals.io_directory.clone(), host);
+        root.linux.vfs.set_proc_source(source.clone());
+        self.proc_source = Some(source);
+    }
+    pub(super) fn make_proc_source(
+        &self,
+        directory: Arc<trames_kernel::signal::IoDirectory>,
+        host: Option<Arc<dyn Fn() -> trames_linux::HostMemoryInfo + Send + Sync>>,
+    ) -> Arc<crate::proc_views::Source> {
         let events = self.workers.events();
         let owner = std::thread::current();
-        let source = Arc::new(crate::proc_views::Source {
-            directory: root.signals.io_directory.clone(),
+        Arc::new(crate::proc_views::Source {
+            directory,
             counters: Arc::default(),
             created: std::sync::atomic::AtomicU32::new(self.task_ids.created()),
             load: self.load.clone(),
@@ -96,9 +105,7 @@ impl<C: Cpu> Kernel<C> {
                 let _ = events.send(crate::workers::Event::<C>::VmReady);
                 owner.unpark();
             }),
-        });
-        root.linux.vfs.set_proc_source(source.clone());
-        self.proc_source = Some(source);
+        })
     }
     pub(super) fn publish_proc_task(&self, pid: u32, p: &Process<C>) {
         super::birth::Birth::capture(self).publish_proc(pid, p);

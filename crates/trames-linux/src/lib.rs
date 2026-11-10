@@ -229,11 +229,6 @@ pub trait GuestOutput {
     ) -> Option<std::sync::Arc<dyn Fn() -> HostMemoryInfo + Send + Sync>> {
         None
     }
-    /// Host adapters opt in; bounded/iPad sessions retain guest-budget reports.
-    /// Queried only for memory/proc metadata, never on CPU/native byte access.
-    fn host_memory(&self) -> Option<HostMemoryInfo> {
-        None
-    }
 
     /// A connected embedding can supply external events when guest actors park.
     fn waits_for_host(&self) -> bool {
@@ -324,11 +319,6 @@ pub mod execution_io {
         ) -> Option<std::sync::Arc<dyn Fn() -> HostMemoryInfo + Send + Sync>> {
             None
         }
-        /// Host adapters opt in; bounded/iPad sessions retain guest-budget reports.
-        /// Queried only for memory/proc metadata, never on CPU/native byte access.
-        fn host_memory(&self) -> Option<HostMemoryInfo> {
-            None
-        }
 
         /// A connected embedding can supply external events when guest actors park.
         fn waits_for_host(&self) -> bool {
@@ -403,9 +393,6 @@ pub mod execution_io {
             &self,
         ) -> Option<std::sync::Arc<dyn Fn() -> HostMemoryInfo + Send + Sync>> {
             super::GuestOutput::host_memory_source(self)
-        }
-        fn host_memory(&self) -> Option<HostMemoryInfo> {
-            super::GuestOutput::host_memory(self)
         }
         fn waits_for_host(&self) -> bool {
             super::GuestOutput::waits_for_host(self)

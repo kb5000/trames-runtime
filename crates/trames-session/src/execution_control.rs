@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Execution admission and one-way session completion.
 //!
-//! A legacy handoff can suspend admission, but can never turn a closing session
-//! back into work for its caller. Physical CPU interruption is not guest dispatch.
+//! Production admission only runs or closes. Bounded interpreter fixtures alone
+//! can suspend. Physical CPU interruption never authorizes host guest dispatch.
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 const RUNNING: u8 = 0;
+#[cfg(all(test, trames_interpreter_conformance))]
 const HANDOFF: u8 = 1;
 const CLOSING: u8 = 2;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,10 +34,7 @@ impl Control {
             terminal_budget: terminal_budget && budget != u64::MAX,
         }
     }
-    /// The only production suspension carries a diagnosed missing resource.
-    pub(crate) fn missing_capability(&self, _: crate::process::lifecycle::dispatch_calls::Missing) {
-        self.suspend();
-    }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn suspend(&self) {
         let _ = self
             .phase

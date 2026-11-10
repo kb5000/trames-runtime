@@ -11,12 +11,13 @@ enum Source {
     Ignored,
     Invalid,
     Direct(DirectFd),
-    Owner(OfdIdentity),
+    Owner(OfdIdentity, trames_vfs::SharedFd),
 }
 impl Source {
     fn owner(vfs: &Vfs, fd: u32) -> Self {
-        vfs.open_description_identity(fd)
-            .map_or(Self::Invalid, Self::Owner)
+        vfs.poll_binding(fd).map_or(Self::Invalid, |file| {
+            Self::Owner(file.clone().retained().ofd_identity(), file)
+        })
     }
 }
 #[derive(Clone)]
@@ -30,14 +31,14 @@ impl Entry {
     fn native_wait_fds(&self, vfs: &Vfs) -> Vec<trames_vfs::HostFd> {
         match &self.source {
             Source::Direct(fd) => fd.native_wait_fds(),
-            Source::Owner(id) if vfs.matches_open_description(self.fd, id) => {
+            Source::Owner(id, _) if vfs.matches_open_description(self.fd, id) => {
                 vfs.native_wait_fds_for(self.fd)
             }
             _ => Vec::new(),
         }
     }
     fn waits_for_stdin(&self, vfs: &Vfs) -> bool {
-        matches!(&self.source, Source::Owner(id)
+        matches!(&self.source, Source::Owner(id, _)
             if vfs.matches_open_description(self.fd, id)
                 && vfs.fd_kind(self.fd).ok() == Some(trames_vfs::FdKind::Stdin))
     }
@@ -49,7 +50,7 @@ impl Entry {
         Ok(match &self.source {
             Source::Ignored => 0,
             Source::Invalid => 32,
-            Source::Owner(id) => owner(self.fd, id, self.events)?,
+            Source::Owner(id, _) => owner(self.fd, id, self.events)?,
             Source::Direct(fd) => fd.poll_ready(self.events).expect("pollable resource"),
         })
     }
@@ -204,7 +205,7 @@ impl RetainedPoll {
         self.0.entries.iter().all(|entry| match &entry.source {
             Source::Ignored | Source::Invalid => true,
             Source::Direct(_) => true,
-            Source::Owner(_) => false,
+            Source::Owner(_, _) => false,
         })
     }
     pub fn native_wait_fds(&self, vfs: &Vfs) -> Vec<trames_vfs::HostFd> {
@@ -245,7 +246,7 @@ impl RetainedPoll {
     }
     pub fn supports_worker(&self, vfs: &Vfs) -> bool {
         self.0.entries.iter().all(|entry| match &entry.source {
-            Source::Owner(id) => {
+            Source::Owner(id, _) => {
                 vfs.matches_open_description(entry.fd, id) && vfs.uring(entry.fd).is_ok()
             }
             _ => true,
@@ -256,7 +257,7 @@ impl RetainedPoll {
             .entries
             .iter()
             .filter_map(|entry| match &entry.source {
-                Source::Owner(id) => Some((entry.fd, id.clone())),
+                Source::Owner(id, _) => Some((entry.fd, id.clone())),
                 _ => None,
             })
             .collect()
@@ -276,11 +277,10 @@ impl RetainedPoll {
             .map(|mut entry| {
                 match &entry.source {
                     Source::Direct(fd) if fd.is_epoll() => {
-                        entry.source = Source::Direct(fd.refresh_epoll()?);
+                        entry.source = Source::Direct(fds.bind_poll(fd)?);
                     }
-                    Source::Owner(id) => {
-                        let fresh = fds.get(entry.fd).filter(|fd| &fd.ofd_identity() == id)?;
-                        entry.source = Source::Direct(fresh);
+                    Source::Owner(_, file) => {
+                        entry.source = Source::Direct(fds.poll_retained(file)?);
                     }
                     _ => {}
                 }
@@ -441,7 +441,7 @@ impl RetainedSelect {
     pub(crate) fn owner_controls(&self) -> Vec<(u32, OfdIdentity)> {
         self.entries()
             .filter_map(|e| {
-                if let Source::Owner(id) = &e.source {
+                if let Source::Owner(id, _) = &e.source {
                     Some((e.fd, id.clone()))
                 } else {
                     None
@@ -474,17 +474,12 @@ impl RetainedSelect {
                     .map(|mut e| {
                         if let Source::Direct(fd) = &e.source {
                             if fd.is_epoll() {
-                                e.source = Source::Direct(fd.refresh_epoll()?);
+                                e.source = Source::Direct(fds.bind_poll(fd)?);
                                 return Some(e);
                             }
                         }
-                        let id = match &e.source {
-                            Source::Owner(id) => Some(id.clone()),
-                            _ => None,
-                        };
-                        if let Some(id) = id {
-                            e.source =
-                                Source::Direct(fds.get(e.fd).filter(|fd| fd.ofd_identity() == id)?);
+                        if let Source::Owner(_, file) = &e.source {
+                            e.source = Source::Direct(fds.poll_retained(file)?);
                         }
                         Some(e)
                     })

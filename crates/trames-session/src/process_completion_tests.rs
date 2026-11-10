@@ -31,6 +31,26 @@ fn closing_is_one_way_even_when_legacy_handoff_races_completion() {
 }
 
 #[test]
+fn an_already_exited_root_uses_source_completion_without_a_host_retry_loop() {
+    let mut k = kernel();
+    let p = admitted_process(&k);
+    k.publish_task(1, &p);
+    k.processes.insert(1, p);
+    let mut root = k.processes.checkout(&1).unwrap();
+    k.exit(1, &mut root, 7 << 8);
+    k.processes.insert(1, root);
+    assert_eq!(
+        k.drive(&mut trames_linux::CapturedOutput::default(), 100000)
+            .unwrap()
+            .code,
+        7
+    );
+    assert!(k.source_completed);
+    assert_eq!(k.service_requests, 0);
+    assert!(k.cohort_return_syscalls.is_empty());
+}
+
+#[test]
 fn single_cpu_root_exit_is_completed_by_the_source_lifecycle() {
     for cpus in [1, 4, 12] {
         let mut k = kernel();
@@ -129,22 +149,27 @@ fn a_legacy_proc_ofd_uses_its_original_full_linux_body_without_a_host_join() {
 }
 
 #[test]
-fn a_missing_host_provider_never_dispatches_an_unrelated_accepted_call_on_the_host() {
+fn shared_host_statistics_and_an_accepted_peer_stay_on_their_original_executors() {
     struct Output {
         console: Arc<dyn trames_vfs::ConsoleIo>,
-        samples: std::cell::Cell<usize>,
+        samples: Arc<std::sync::Mutex<Vec<std::thread::ThreadId>>>,
     }
     impl GuestOutput for Output {
         fn source_console(&mut self) -> Arc<dyn trames_vfs::ConsoleIo> {
             self.console.clone()
         }
-        fn host_memory(&self) -> Option<trames_linux::HostMemoryInfo> {
-            self.samples.set(self.samples.get() + 1);
-            Some(trames_linux::HostMemoryInfo {
-                total: 1 << 30,
-                free: 1 << 29,
-                available: 1 << 29,
-            })
+        fn host_memory_source(
+            &self,
+        ) -> Option<Arc<dyn Fn() -> trames_linux::HostMemoryInfo + Send + Sync>> {
+            let samples = self.samples.clone();
+            Some(Arc::new(move || {
+                samples.lock().unwrap().push(std::thread::current().id());
+                trames_linux::HostMemoryInfo {
+                    total: 1 << 30,
+                    free: 1 << 29,
+                    available: 1 << 29,
+                }
+            }))
         }
         fn write(&mut self, _: trames_linux::OutputFd, _: &[u8]) -> std::io::Result<usize> {
             panic!("console bytes must use their original source provider")
@@ -167,7 +192,7 @@ fn a_missing_host_provider_never_dispatches_an_unrelated_accepted_call_on_the_ho
         ));
         let mut output = Output {
             console,
-            samples: std::cell::Cell::new(0),
+            samples: Arc::default(),
         };
         let mut k = kernel();
         k.cpu_count = cpus;
@@ -214,14 +239,18 @@ fn a_missing_host_provider_never_dispatches_an_unrelated_accepted_call_on_the_ho
             peer.seccomp
                 .entry_decision(64, 0x5004, [1, 0x1800, 4, 0, 0, 0]),
         );
-        k.install_proc_source(&root, None);
+        k.install_proc_source(&root, output.host_memory_source());
         k.publish_task(1, &root);
         k.processes.insert(1, root);
         k.processes.insert(2, peer);
         k.publish_io_tasks(None);
         let exit = k.drive(&mut output, 1000000).unwrap();
         assert_eq!(exit.code, 7);
-        assert!(output.samples.get() > 0);
+        let samples = output.samples.lock().unwrap();
+        assert!(!samples.is_empty());
+        assert!(samples.iter().all(|thread| *thread != host_thread));
+        assert_eq!(k.parallel_rounds, 1);
+        assert!(k.cohort_return_syscalls.is_empty());
         let writes = writes.lock().unwrap();
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].1, b"peer");

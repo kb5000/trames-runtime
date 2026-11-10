@@ -95,7 +95,6 @@ pub(super) struct Done<C: Cpu> {
     pub worker: usize,
     /// All retired instructions, including earlier uninterrupted local polls.
     pub instructions: u64,
-    pub missing: Option<crate::process::lifecycle::dispatch_calls::Missing>,
     pub chunks: u64,
     pub syscalls: u64,
     pub direct_syscalls: u64,

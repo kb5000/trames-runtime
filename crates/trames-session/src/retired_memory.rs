@@ -217,6 +217,7 @@ impl RetiredMemory {
             signal,
         }
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub fn is_empty(&self) -> bool {
         self.pending.lock().unwrap().is_empty()
     }

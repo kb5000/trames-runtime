@@ -209,9 +209,6 @@ impl<T: GuestOutput> GuestOutput for Adapter<'_, T> {
     fn host_memory_source(&self) -> Option<Arc<dyn Fn() -> HostMemoryInfo + Send + Sync>> {
         self.inner.host_memory_source()
     }
-    fn host_memory(&self) -> Option<HostMemoryInfo> {
-        self.inner.host_memory()
-    }
 
     fn waits_for_host(&self) -> bool {
         self.terminal.is_some() || self.inner.waits_for_host()

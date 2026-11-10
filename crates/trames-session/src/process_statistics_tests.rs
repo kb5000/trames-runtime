@@ -218,31 +218,47 @@ fn system_statistics_share_host_reports_and_preflight_before_host_sampling() {
 }
 
 #[test]
-fn valid_legacy_sysinfo_keeps_explicit_missing_provider_boundary() {
-    let mut k = kernel();
-    k.cpu_count = 2;
-    k.workers = crate::workers::Pool::new(2);
-    k.per_cpu = vec![Duration::ZERO; 2];
-    k.profile_syscalls = true;
-    for id in 1..=2 {
+fn standalone_sysinfo_binds_original_statistics_before_admission_without_a_host_return() {
+    for cpus in [1, 4, 12] {
+        let mut k = kernel();
+        k.cpu_count = cpus;
+        k.per_cpu = vec![Duration::ZERO; cpus];
+        k.profile_syscalls = true;
         let mut p = process();
-        p.tgid = id;
-        p.vm_id = id as u64;
-        p.signals.io.scheduling.set_affinity(1 << (id - 1));
-        p.memory
-            .write(0x4000, &0xd4000001u32.to_le_bytes())
-            .unwrap();
+        for (i, word) in [0xd4000001u32, 0xd28000e0, 0xd2800ba8, 0xd4000001]
+            .into_iter()
+            .enumerate()
+        {
+            p.memory
+                .write_array(0x4000 + i as u64 * 4, word.to_le_bytes())
+                .unwrap();
+        }
         p.memory
             .protect(0x4000, PAGE_SIZE, Permissions::RX)
             .unwrap();
         p.cpu.set_x(0, 0x1000);
         p.cpu.set_x(8, 179);
-        k.processes.insert(id, p);
+        k.publish_task(1, &p);
+        k.processes.insert(1, p);
+        assert!(k.proc_source.is_none());
+        assert_eq!(
+            k.drive(&mut trames_linux::CapturedOutput::default(), 100000)
+                .unwrap()
+                .code,
+            7
+        );
+        let p = k.processes.read(&1);
+        let total = p.memory.read_u64(0x1020).unwrap();
+        let free = p.memory.read_u64(0x1028).unwrap();
+        assert!(total > 0 && free <= total);
+        assert_eq!(
+            u16::from_le_bytes(p.memory.read_array::<2>(0x1050).unwrap()),
+            1
+        );
+        assert_eq!(k.parallel_rounds, 1);
+        assert!(k.cohort_return_syscalls.is_empty());
+        assert_eq!(k.service_requests, 0);
     }
-    assert!(k
-        .parallel_round(&mut trames_linux::CapturedOutput::default(), 1000)
-        .unwrap());
-    assert!(k.cohort_return_syscalls.contains_key(&179));
 }
 
 #[test]

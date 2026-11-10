@@ -126,7 +126,6 @@ fn mqueue_uring_paths_and_accepted_directory_fds_do_not_require_owner_maintenanc
                 u64::from_le_bytes(old[8..16].try_into().unwrap())
             );
         }
-        assert!(!l.uring_requires_owner());
         stat[1] = 0;
         stat[4..8].copy_from_slice(&((-100i32) as u32).to_le_bytes());
         stat[16..24].copy_from_slice(&0x2100u64.to_le_bytes());
@@ -142,7 +141,6 @@ fn mqueue_uring_paths_and_accepted_directory_fds_do_not_require_owner_maintenanc
             submit(&d, &mut m, fd, &ring, sqe(19, replacement, 6), &t),
             0
         );
-        assert!(!l.uring_requires_owner());
     }
 }
 #[test]
@@ -277,7 +275,6 @@ fn native_device_opens_and_bridge_requests_use_original_source_resources() {
             assert!(background.signal.ready());
             assert!(background.progress(&mut m).unwrap());
             assert!(!background.active());
-            assert!(!l.uring_requires_owner());
             assert_eq!(cq(&mut m, &ring).0, 172);
             assert_eq!(
                 l.vfs.read(fd, 1024),
@@ -337,7 +334,6 @@ fn mapped_layout_sqe_uses_source_resource_and_keeps_accepted_work_after_cancella
             enter(&d, ring_fd, 0, 0, &mut m, &t),
             IoAttempt::Complete(Ok(0))
         ));
-        assert!(!d.urings.actor().owner_required());
         let request = driver.take_ready().pop().unwrap();
         let request = layouts.try_submit(request).err().unwrap();
         layouts.restore(request);
@@ -363,7 +359,6 @@ fn mapped_layout_sqe_uses_source_resource_and_keeps_accepted_work_after_cancella
         assert_eq!(l.vfs.read(original, 32).unwrap(), [7]);
         assert!(!layouts.pending());
         assert!(receive.try_recv().is_err());
-        assert!(!d.urings.actor().owner_required());
         drop(d);
         assert!(epoch.finish().is_empty());
         files.finish();
@@ -638,7 +633,6 @@ fn solo_accepted_drain_keeps_source_context_across_worker_admission() {
     let (tag, opened) = cq(&mut m, &r);
     assert_eq!(tag, 2);
     assert!(opened >= 0 && l.vfs.stat_at(-100, b"/tmp/owner-to-source").is_ok());
-    assert!(!l.uring_requires_owner());
 
     // An ordinary truncate-open is a source file operation. Only an actual
     // live mapping layout would request scoped mm ownership.
@@ -650,7 +644,6 @@ fn solo_accepted_drain_keeps_source_context_across_worker_admission() {
         enter(&d, fd, 1, 0, &mut m, &t),
         IoAttempt::Complete(Ok(1))
     ));
-    assert!(!l.uring_requires_owner());
     let (tag, opened) = cq(&mut m, &r);
     assert_eq!(tag, 3);
     assert!(opened >= 0);
@@ -915,7 +908,6 @@ fn capability_less_embedding_defers_before_import_and_original_caller_can_comple
     );
     assert_eq!(cq(&mut m, &ring), (77, 8));
     assert_eq!(m.read_array::<8>(0x2200).unwrap(), *b"Linux ve");
-    assert!(!l.uring_requires_owner());
 }
 
 #[test]
@@ -1098,7 +1090,6 @@ fn fixed_file_size_failure_keeps_original_submitter_signal_when_another_context_
     assert_eq!(cq(&mut m, &r), (78, -27));
     assert_eq!(a.0.load(std::sync::atomic::Ordering::Relaxed), 1);
     assert_eq!(b.0.load(std::sync::atomic::Ordering::Relaxed), 1);
-    assert!(!pump.urings.actor().owner_required());
     drop((pump, l));
     files.finish();
     std::fs::remove_dir_all(directory).unwrap();
@@ -1230,7 +1221,6 @@ fn corrupt_cq_during_accepted_enter_returns_error_without_replay_or_owner_pump()
         assert!(!ring.state.lock().unwrap().waits.contains_key(&7));
         let mut background = d.uring_background(7, &Arc::downgrade(&t)).unwrap();
         assert!(background.progress(&mut m).unwrap());
-        assert!(!l.uring_requires_owner());
         m.write_array(0x10040, 0u32.to_le_bytes()).unwrap();
         if !complete_before_repair {
             l.vfs.write(writer, b"x").unwrap();
@@ -1306,7 +1296,6 @@ fn layout_completion_without_driver_waits_on_original_backing_and_cancels_cleanl
                 !background.external(),
                 "a backing publication is not a native disk completion"
             );
-            assert!(!l.uring_requires_owner());
             l.vfs.close(fd).unwrap();
             assert_eq!(l.vfs.eventfd(9, 0).unwrap(), fd);
             if cancel {
@@ -1350,7 +1339,6 @@ fn layout_completion_without_driver_waits_on_original_backing_and_cancels_cleanl
             );
             assert_eq!(l.vfs.read(fd, 8).unwrap(), 9u64.to_le_bytes());
             assert!(receive.try_recv().is_err(), "no replay or post-cancel job");
-            assert!(!l.uring_requires_owner());
         }
     }
 }
@@ -1384,6 +1372,5 @@ fn file_size_completion_without_mailbox_uses_original_task_flag_not_an_owner_mes
         !l.take_file_size_signal(),
         "standard signals coalesce and consume once"
     );
-    assert!(!l.uring_requires_owner());
     assert!(l.vfs.read(file, 1).unwrap().is_empty());
 }

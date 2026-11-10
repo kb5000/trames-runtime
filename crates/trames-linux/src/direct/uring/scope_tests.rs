@@ -124,10 +124,7 @@ fn original_body_completion_does_not_disable_another_submitters_live_maintenance
     assert!(other.signal.ready());
     assert!(other.progress(&mut m).unwrap());
     assert_eq!(cq(&mut m, &ring), (8, 8));
-    assert!(!l.uring_requires_owner_for(&m, 7));
-    assert!(!l.uring_requires_owner_for(&m, 8));
     assert_eq!(&m.read_array::<5>(0x2000 + 7 * 32).unwrap(), b"Linux");
-    assert!(!l.uring_requires_owner());
 }
 
 #[test]
@@ -216,7 +213,6 @@ fn linked_published_metadata_observes_original_updates_and_releases_on_cancel_or
             assert_eq!(m.read_array::<4>(0x2100).unwrap(), *b"0-5\n");
         }
         assert!(!background.active() && !other.active());
-        assert!(!l.uring_requires_owner());
         assert_eq!(l.vfs.read(published, 8).unwrap(), 99u64.to_le_bytes());
     }
 }
@@ -267,10 +263,8 @@ fn hubless_native_wait_uses_original_sources_without_escalating_any_submitter() 
             .uring_background(7, &Arc::downgrade(&target))
             .unwrap();
         assert!(native_wait.progress(&mut m).unwrap());
-        assert!(!l.uring_requires_owner_for(&m, 7));
         assert!(!native_wait.native_wait_interests().unwrap().is_empty());
         assert!(l.worker_uring_pending(&m, 8));
-        assert!(!l.uring_requires_owner_for(&m, 8));
         let mut local_wait = local.uring_background(8, &Arc::downgrade(&target)).unwrap();
         assert!(local_wait.progress(&mut m).unwrap());
         l.vfs.write(ordinary, &9u64.to_le_bytes()).unwrap();
@@ -300,7 +294,6 @@ fn hubless_native_wait_uses_original_sources_without_escalating_any_submitter() 
         }
         assert!(!native_wait.active() && !local_wait.active());
         assert!(native_wait.native_wait_interests().unwrap().is_empty());
-        assert!(!l.uring_requires_owner());
     }
 }
 

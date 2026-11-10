@@ -967,6 +967,24 @@ mod tests {
 mod accelerator_tests {
     use super::*;
     type Runtime = crate::Runtime<trames_cpu::Cpu>;
+    #[test]
+    fn missing_shared_host_accounting_fails_before_cpu_admission() {
+        for cpus in [1, 4, 12] {
+            let mut guest = runtime(8, Permissions::RW);
+            guest.cpu_count = cpus;
+            guest.memory_limits = MemoryLimits::host_managed();
+            let pc = guest.cpu.pc;
+            assert!(matches!(
+                guest.run(&mut trames_linux::CapturedOutput::default(), 1000),
+                Err(RuntimeError::Configuration(
+                    "host-managed memory requires a shared host memory source"
+                ))
+            ));
+            assert_eq!(guest.cpu.pc, pc);
+            assert_eq!(guest.memory.read_array::<8>(0x2000).unwrap(), [0; 8]);
+            assert_eq!(guest.metrics.parallel_rounds, 0);
+        }
+    }
     fn runtime(len: u64, permissions: Permissions) -> Runtime {
         let mut memory = Memory::default();
         memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();

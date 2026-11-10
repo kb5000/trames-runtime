@@ -236,6 +236,7 @@ enum ByteResource {
     SocketPoll(std::sync::Weak<NetSocket>),
     Mounts(Arc<mounts::watch::MountWatch>),
     Regular,
+    Bpf,
     SimpleDevice(simple_device::Kind),
     Device(pseudo::Device),
     UnixControl(std::sync::Weak<ipc::LocalResource>),
@@ -505,6 +506,9 @@ impl DirectFd {
     }
     /// Poll authority remains available while potentially blocking native bytes
     /// use the already bounded host-file executor instead of occupying a CPU.
+    pub(super) fn set_bpf_poll(&mut self) {
+        self.resource = ByteResource::Bpf;
+    }
     pub fn host_console(&self) -> bool {
         matches!(&self.resource,ByteResource::Console(console) if console.io.host_work())
     }
@@ -758,9 +762,10 @@ impl DirectFd {
             )],
             ByteResource::Mounts(watch) => vec![watch.subscribe(signal)],
             ByteResource::Cgroup(file, _) => vec![file.subscribe(signal)],
-            ByteResource::Regular | ByteResource::SimpleDevice(_) | ByteResource::Device(_) => {
-                Vec::new()
-            }
+            ByteResource::Bpf
+            | ByteResource::Regular
+            | ByteResource::SimpleDevice(_)
+            | ByteResource::Device(_) => Vec::new(),
             ByteResource::UnixControl(local) => local
                 .upgrade()
                 .map(|local| local.subscribe(signal))
@@ -933,6 +938,7 @@ impl DirectFd {
                 | ByteResource::TcpPoll(_)
                 | ByteResource::UnixControl(_)
                 | ByteResource::PollOnly(_)
+                | ByteResource::Bpf
                 | ByteResource::Regular
                 | ByteResource::Mounts(_)
         )
@@ -1221,6 +1227,7 @@ impl DirectFd {
                 )
             }),
             ByteResource::Mounts(watch) => watch.peek(events),
+            ByteResource::Bpf => (0, [0; 2]),
             ByteResource::Regular | ByteResource::SimpleDevice(_) | ByteResource::Device(_) => {
                 (events & 5, [0; 2])
             }
@@ -1507,6 +1514,7 @@ impl DirectFd {
             | ByteResource::TcpPoll(_)
             | ByteResource::SocketPoll(_)
             | ByteResource::PollOnly(_)
+            | ByteResource::Bpf
             | ByteResource::Regular
             | ByteResource::UnixControl(_)
             | ByteResource::Mounts(_) => Err(Errno(22)),
@@ -1613,6 +1621,7 @@ impl DirectFd {
             | ByteResource::TcpPoll(_)
             | ByteResource::SocketPoll(_)
             | ByteResource::PollOnly(_)
+            | ByteResource::Bpf
             | ByteResource::Regular
             | ByteResource::Timer(_)
             | ByteResource::Signal(..)
@@ -1661,6 +1670,18 @@ impl DirectFds {
     }
     pub fn has_membership(&self) -> bool {
         self.1.is_some()
+    }
+    /// Rebind only the caller's original signal/cgroup context. The accepted
+    /// OFD is retained; numeric descriptor reuse cannot select a replacement.
+    pub fn poll_retained(&self, file: &SharedFd) -> Option<DirectFd> {
+        DirectFd::source_poll(OpenHandle::Shared(file.open.clone()), self.2.as_ref())
+            .map(|fd| fd.bind_context(self.2.as_ref(), self.3.as_ref()))?
+            .refresh_epoll()
+    }
+    pub fn bind_poll(&self, fd: &DirectFd) -> Option<DirectFd> {
+        fd.clone()
+            .bind_context(self.2.as_ref(), self.3.as_ref())
+            .refresh_epoll()
     }
     pub(super) fn with_cgroup_access(mut self, access: cgroup::CgroupAccess) -> Self {
         self.3 = Some(access);
@@ -1911,6 +1932,13 @@ impl Vfs {
             self.signal_reader.borrow().clone(),
             Some(self.cgroup_access()),
         )
+    }
+    /// A cold poll admission retains the actual OFD before its caller-context
+    /// provider is attached. Rebinding never looks up its reused numeric FD.
+    pub fn poll_binding(&self, fd: u32) -> Result<SharedFd> {
+        Ok(SharedFd::new(
+            self.descriptor(fd)?.open.borrow().shared.clone(),
+        ))
     }
     pub fn direct_descriptors(&self) -> DirectFds {
         self.descriptor_snapshots()

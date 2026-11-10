@@ -1909,7 +1909,6 @@ mod tests {
         assert_eq!(m.read_array::<4>(0x10000).unwrap(), 1u32.to_le_bytes());
         assert_eq!(cq(&mut m, &r), (62, -95));
         assert_eq!(m.read_array::<1>(0x2000).unwrap(), [0]);
-        assert!(!l.uring_requires_owner());
         assert!(epoch.finish().is_empty());
         assert_eq!(r.cq_ready(), 0);
     }

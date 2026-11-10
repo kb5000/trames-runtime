@@ -155,7 +155,6 @@ fn solo_accepted_signalfd_keeps_original_reader_across_foreign_capture_and_sourc
                 }
             }
             assert_eq!(observer.queue.lock().unwrap().len(), 1);
-            assert!(!l.uring_requires_owner());
             // Later SQEs use their own submitter, not a permanent reader stored
             // on the signalfd or ring. Its fixed OFD mask is still the same one.
             entry[32..40].copy_from_slice(&122u64.to_le_bytes());

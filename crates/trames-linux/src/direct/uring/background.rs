@@ -2,6 +2,7 @@
 //! Event-driven maintenance on the source task's existing execution View.
 use super::poll::PollRingOps;
 use super::*;
+use trames_memory::Memory;
 pub struct UringBackground {
     actor: Arc<UringActor>,
     scope: Arc<actor::Scope>,
@@ -12,6 +13,7 @@ pub struct UringBackground {
     deadline: Option<Instant>,
     armed: bool,
     revision: u64,
+    original: bool,
 }
 impl UringBackground {
     /// Direct native sources when the caller supplies its own wait loop.
@@ -34,6 +36,9 @@ impl UringBackground {
         if !self.needs_progress() {
             return Ok(true);
         }
+        if self.original {
+            return Ok(!self.active());
+        }
         self.signal.reset();
         self.armed = true;
         self.revision = self.scope.revision();
@@ -54,7 +59,6 @@ impl UringBackground {
         match prepared {
             Ok(true) => {}
             Ok(false) => {
-                self.scope.require_owner();
                 return Ok(false);
             }
             Err(error) => {
@@ -69,7 +73,6 @@ impl UringBackground {
             .min();
         for ring in &rings {
             if !ring.poll_pump(self.owner, self.task, memory, &self.actor) {
-                self.scope.require_owner();
                 return Ok(false);
             }
             active |= ring
@@ -90,6 +93,63 @@ impl UringBackground {
             self.deadline = None;
         }
         Ok(true)
+    }
+    /// A cold original body still runs on its submitting task's executor.
+    /// Subscribe before the deciding full-resource pass, retaining request/CQ
+    /// state and native errors. No caller/coordinator authority is involved.
+    pub fn progress_original(
+        &mut self,
+        linux: &mut Linux,
+        memory: &mut Memory,
+    ) -> std::io::Result<()> {
+        self.original = true;
+        self.signal.reset();
+        self.armed = true;
+        let rings = self.actor.rings();
+        let before = rings
+            .iter()
+            .filter_map(|ring| ring.request_deadline(self.owner, self.task))
+            .min();
+        linux.progress_uring(memory, self.task);
+        self.revision = self.scope.revision();
+        self.sources.bind_original(linux.vfs.direct_descriptors());
+        if !self.sources.prepare(
+            &rings,
+            self.owner,
+            self.task,
+            &self.signal,
+            &self.actor,
+            memory,
+        )? {
+            return Err(std::io::Error::other(
+                "original io_uring wait graph is incomplete",
+            ));
+        }
+        linux.progress_uring(memory, self.task);
+        self.deadline = [before, self.sources.next_deadline()]
+            .into_iter()
+            .flatten()
+            .min();
+        let mut active = false;
+        for ring in &rings {
+            active |= ring
+                .state
+                .lock()
+                .unwrap()
+                .pending
+                .iter()
+                .any(|r| r.owner == self.owner && r.task == self.task);
+            self.deadline = [self.deadline, ring.request_deadline(self.owner, self.task)]
+                .into_iter()
+                .flatten()
+                .min();
+        }
+        if !active {
+            self.actor.finish_scope(&self.scope, self.revision);
+            self.sources = Default::default();
+            self.deadline = None;
+        }
+        Ok(())
     }
     pub fn active(&self) -> bool {
         self.scope.active()
@@ -140,6 +200,7 @@ impl DirectSyscalls {
             deadline: None,
             armed: false,
             revision: 0,
+            original: false,
         })
     }
 }

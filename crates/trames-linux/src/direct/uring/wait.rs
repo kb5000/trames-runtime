@@ -23,8 +23,12 @@ pub(super) struct WaitSources {
     local: BTreeMap<LocalSource, Subscription<Vec<trames_vfs::IoSubscription>>>,
     hosts: BTreeMap<(usize, bool, usize), Subscription<trames_vfs::IoSubscription>>,
     deadline: Option<Instant>,
+    original: Option<trames_vfs::DirectFds>,
 }
 impl WaitSources {
+    pub(super) fn bind_original(&mut self, fds: trames_vfs::DirectFds) {
+        self.original = Some(fds);
+    }
     fn local(
         &mut self,
         key: LocalSource,
@@ -89,7 +93,10 @@ impl WaitSources {
             // its interests. Their own change notification schedules this retry.
             self.local.remove(&key);
         }
-        let Some(fresh) = fd.refresh_epoll() else {
+        let Some(fresh) = fd
+            .refresh_epoll()
+            .or_else(|| self.original.as_ref()?.bind_poll(fd))
+        else {
             return false;
         };
         let revision = fresh.epoll_accepted_revision().unwrap_or(0);

@@ -42,27 +42,16 @@ impl Linux {
         self.uring_actor.get().is_some_and(|actor| {
             actor
                 .scope(memory.instruction_identity().0, task)
-                .is_some_and(|scope| scope.active() && !scope.owner_required())
+                .is_some_and(|scope| scope.active())
                 && (actor.event_wait(memory.instruction_identity().0, task)
                     || self.vfs.has_native_event_sources())
         })
-    }
-    pub fn uring_requires_owner(&self) -> bool {
-        self.uring_actor
-            .get()
-            .is_some_and(|actor| actor.owner_required())
-    }
-    pub fn uring_requires_owner_for(&self, memory: &Memory, task: u32) -> bool {
-        self.uring_actor
-            .get()
-            .and_then(|actor| actor.scope(memory.instruction_identity().0, task))
-            .is_some_and(|scope| scope.owner_required())
     }
     pub fn worker_uring_pending(&self, memory: &Memory, task: u32) -> bool {
         self.uring_actor
             .get()
             .and_then(|actor| actor.scope(memory.instruction_identity().0, task))
-            .is_some_and(|scope| scope.active() && !scope.owner_required())
+            .is_some_and(|scope| scope.active())
     }
     pub fn uring_actor_root(&self) -> std::sync::Arc<std::sync::OnceLock<Arc<crate::UringActor>>> {
         self.uring_actor.clone()
@@ -357,8 +346,6 @@ impl Linux {
                     .any(|r| r.owner == owner && r.task == task)
             }) {
                 actor.finish_scope(&scope, revision);
-            } else if changed {
-                scope.owner_progressed(revision);
             }
         }
         changed

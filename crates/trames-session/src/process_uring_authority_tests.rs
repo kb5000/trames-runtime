@@ -145,7 +145,6 @@ fn solo_signal_request_keeps_original_task_authority_while_guest_waits_in_a_live
             root.memory.read_array::<4>(0x100c).unwrap(),
             2u32.to_le_bytes()
         );
-        assert!(!root.linux.uring_requires_owner());
         assert_eq!(root.linux.vfs.read(signal, 8).unwrap(), 93u64.to_le_bytes());
     }
 }

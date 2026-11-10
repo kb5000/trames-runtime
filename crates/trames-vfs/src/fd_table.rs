@@ -626,6 +626,11 @@ impl SharedFd {
         // Named FIFO descriptions keep their pathname kind, but their poll
         // state and subscriptions still belong to the real pipe resource.
         let fd = DirectFd::shared_byte(&self.open).or_else(|| {
+            if matches!(self.open.control, Some(events::SharedControl::Bpf(_))) {
+                let mut fd = DirectFd::regular_poll(&self.open);
+                fd.set_bpf_poll();
+                return Some(fd);
+            }
             (self.open.native_image.is_some() || matches!(self.open.kind, FdKind::Node(_)))
                 .then(|| DirectFd::regular_poll(&self.open))
         })?;

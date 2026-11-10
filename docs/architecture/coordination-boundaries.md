@@ -1,31 +1,43 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 105, complete original-source
-execution dispatch, reviewed on 2026-11-10. The prior shared
-runtime baseline is `257914058941add91700ba25704f8433725eba8e`. Mac HVF and the iPad
+This is the consolidated implementation audit through stage 106, complete source-capability
+admission and final coordinator removal, reviewed on 2026-11-10. The prior shared
+runtime baseline is `365f858bc345280fd0ae7af616aef5b6aae89b1b`. Mac HVF and the iPad
 interpreter share this userspace Linux kernel. Historical stage paragraphs retain
 their prior counts; the authoritative current category inventory is below.
 
 ## Current status at a glance — 2026-11-10
 
-Stage 105 closes the final generic execution-dispatch category. Warm View and
-cold original Memory calls use one accepted dispatcher. A cold operation takes
-only its original task/mm custody and runs on an existing executor; it does not
-create a Kernel projection or a resource service. Initial frozen, blocked and
-sleeping actors remain original source jobs, so host polling cannot resume them
-by scanning a second task table. Unknown CPU yields requeue their original job;
-ordinary SVC/HLT exits cannot stop admission for host dispatch.
+Stage 106 closes the last missing-capability/resource category. The current
+production coordinator-dispatch category count is **zero**. The missing-resource
+return enum, its CPU-return payload, admission suspension methods and both
+io_uring owner-maintenance setters are deleted. Production admission only runs or
+closes through source completion. The alternative bounded execution mode and
+handoff helper exist only in interpreter fixtures, under test-only cfg.
 
-The remaining count is **one**: actual missing original capabilities/resources.
-A typed missing resource is attached to its exact accepted operation before
-admission can suspend. Other returned CPUs retain their accepted traps for source
-execution; one missing provider cannot authorize unrelated host syscall work.
-The two submitter-scoped io_uring maintenance escalation setters remain explicit.
-Normal physical interruption, affected-mm custody, one-way completion and actual
-object waits are not coordinator dispatch. The architecture gate rejects generic
-production handoffs instead of allowing a debt ceiling to grow. Bounded standalone
-interpreter tests alone retain the legacy handoff helper under test-only cfg.
-See the paired iPad repository's stage 105 record for final acceptance.
+Host-managed sessions must supply an original Send+Sync memory-accounting
+provider before any CPU admission. The synchronous host callback is removed;
+misconfigured embeddings fail at startup without executing guest instructions.
+Bounded sessions retain their actual guest-budget accounting. Standalone kernel
+admission publishes the original statistics graph before CPU entry. Available
+per-task observations still do not sample host-global memory.
+
+Cold bytes and poll/select operations bind the original accepted OFD, task reader,
+namespace and factory. Import, deadlines and accepted policy are retained across
+resource waits and descriptor reuse. A pending io_uring body can take original
+submitter task/mm custody on an existing executor and subscribe before its
+canonical deciding progress pass. This is source execution, not an owner flag,
+resource-service thread or a new global guest lock. Scope metadata now records
+only pending publication and its revision.
+
+The residual host retry/wait loop is deleted. Even an already exited initial root
+uses the existing source completion executor. The host can receive results,
+observe transports, bootstrap or cancel; no provider miss can authorize a guest
+syscall/native retry on that thread. Unsupported Linux/device APIs preserve their
+existing results; zero coordinator categories does not mean complete Linux API
+coverage. Actual object locks, backing leases, affected-mm quiescence and UI-thread
+affinity remain their own resource requirements. The architecture gate enforces
+this boundary for both products. See the paired product's stage 106 validation.
 
 Stage 104's bootstrap-only setup, live host interface and execution-worker CPU
 entry remain enforced, as does stage 103's one-way source terminal completion.
@@ -490,106 +502,56 @@ publication never pauses the cohort. Only actual policy installation and birth/
 exec credential publication synchronize on the original group; ordinary entry
 reads one immutable version without a lock or allocation.
 
-Stage 58's scoped memory and stage 57's task/image lifecycle remain source-owned.
-Actual missing resources can still end the current execution cohort. The
-table records supported source execution and explicit remaining boundaries; this
-is not a claim that all coordinator work is removed.
+## Current source coverage
 
-| Area | Normal scope now | Remaining owner dependency / actual escalation |
+This matrix summarizes the final execution contract. Historical stage sections
+retain the earlier migration boundaries and measurements.
+
+| Area | Execution and actual resource scope | Functional limits |
 | --- | --- | --- |
-| Admitted file/path/FD, Unix/TCP I/O, transfers, AIO and io_uring operations | Calling worker and original shared resources; resource waits return the execution slot | Excluded descriptor/path/SQE kinds, owner controls, missing pumps/subscriptions retain explicit boundaries; production mapped-layout effects now use original backing admission |
-| Futexes, clocks/timers, admitted poll/epoll/signalfd/child waits and caught signals | Calling workers and original readiness/mailboxes; preexisting Futex/Sleep actors are admitted without byte Views and prepare their original mm only on an actual event | Normal Kernel nonmember Futex/Sleep adoption no longer joins. Excluded wait resources and capability-less/standalone lifecycle embeddings retain their boundaries |
-| Guest terminals, sessions and job control | Original process/TTY/Files/namespace resources on the caller; source and solo share the ABI; only actual stops allocate readiness | Embedding terminal ID 0 uses original PTY resources and the shared ABI. Capability-less embeddings and unsupported tty controls/io_uring remain explicit |
-| Scheduling attributes and CPU affinity | Calling worker and original task atomics/authority; migration waits for only the original target's running lease and releases the caller's execution slot | Capability-less embeddings keep their boundary. Existing unsupported scheduling features return their original errno locally; no compatibility owner service is needed |
-| Individual/group/default-fatal exit, STOP/CONT, parent notification and vfork release | Original source task/group resources | Returned CPU/statistics and cold task cleanup use existing source workers; only the original live mm pauses when necessary. Outside-cohort/solo and capability-less embeddings retain their boundary |
-| fork/clone/vfork and execve/execveat | Existing workers handle pure and mixed mapping scopes, nonleader replacement and original old-mm retirement; existing disk pool prepares native images without a CPU slot | Affected actors still quiesce. Capability-less embeddings, solo and host invocation remain separate |
-| Structural VM edits, pins and mapped-file layout changes | Supported mapping/buffer-registration checkpoints publish on existing workers with original task/mm custody; additive anonymous mmap runs directly while peers continue | Proc/cold-mm checkpoints and supported mapped-file transactions now run on existing workers. Unsupported backing/lifetime/policy and capability-less embeddings retain explicit boundaries |
-| Descriptor ioctl discovery and control | Shared namespace type, virtual render discovery, implemented interface queries/link control and ordinary unsupported commands execute on the caller with one retained original OFD and the common solo ABI | Existing PTY/flag/async routes stay source-owned. Actual legacy OFDs or absent providers retain before-effects fallback; unsupported commands preserve their existing errno |
-| FD status, descriptor flags and memfd seals | Live NOATIME authority, original OFD status/async subscription, descriptor-local CLOEXEC, canonical unknown-command errors and original inode seals run on source; native seal flushes park on existing FileWork | Existing duplication, record locks and async-owner operations retain their source routes and actual resource requirements. A genuinely absent source capability still defers before effects; no unsupported fcntl feature is advertised |
-| Mapped-memory writeback | msync imports the original shared backing graph on its calling worker; existing FileLayouts admission and disk pool perform native sync without holding a CPU slot. Original range/key/error behavior is common with solo | Actual affected backing readers still quiesce. Anonymous/private/no-op mappings finish inline. Custom providers missing real original layout admission defer before effects; no msync-only supported-file join remains |
-| File-cache advice | readahead/fadvise64 use live original Files/stat metadata and common type/argument validation on the calling worker | No advice-only join or mapping checkpoint remains. Optional hints retain their existing policy without forced prefetch/eviction. Missing actual metadata bindings defer before effects |
-| Anonymous memory files | Validated owned memfd name/flags, original Files publication/inode allocation, native backing, sparse data, mapping, seals and aliases use original resources. Native creation returns the CPU slot; no pathname or mount-administration probe is required | No supported memfd_create-only join remains. Actual missing path/executor bindings keep their boundary; mapped writes/unmap retain necessary original-mm/backing scopes |
-| POSIX/OFD range locks and whole-file flock | Original shared OFD/inode arbitration and common source/solo ABI; contended range/flock requests park and subscribe before retry. Deadlocks use original shared wait relations; directory flock uses the actual full OFD | No supported blocking-lock-only join or process-map retry/scan remains. Genuine missing original lock/Files capabilities retain a before-effects boundary; solo dispatch runs on its existing caller |
-| Native libc/GPU/video/audio bodies, waits and before-effects mapping/entry checkpoints | Calling/shared-resource execution; exceptional access uses original task/mm custody on an existing executor, then retains resource waits | Capability-less embeddings and actual platform/host lifecycle retain their boundary. Single-CPU/solo calls use their existing caller. Local libc/DirectFile/HVF fallback alone is not an owner transition |
-| Read-only VM observations and implemented non-discard advice | Calling executor, original admitted mappings/reservations and per-page resident metadata; common source/solo ABI | No observation-only join or mm checkpoint. Genuine absent custom observation capabilities retain explicit before-effects fallback; actual discard/mapping mutation remains scoped |
-| Guest halt/poweroff | Calling executor and original root/caller group exit controls; common policy for source/solo | No supported power-control-only join. Missing original shutdown/exit capabilities keep explicit legacy execution. Unsupported restart/kexec and nested PID namespace power behavior retain their existing errno |
-| System statistics and live CPU accounting | sysinfo and proc consume original task/mm/host resources; original execution assignments publish live time | No supported-statistics-only join remains. Genuine absent statistics/host capabilities retain legacy execution; load remains a five-second observer-sampled approximation |
-| Dynamic proc/sys views and proc pathname/FD consumers | Original PID/mm/Files/fs/namespace resources on the calling worker; owner/solo queries use the same provider | First cross-mm byte export and invalidation now activate on an existing worker using only original task/mm custody. Published global metadata retains its original publication; numeric PID/mm paths without their actual provider and actual policy remain separate |
-| Mount topology administration | Calling worker and original namespace/fs_struct resources, with existing disk workers only for host-backed path work | Busy transactions park the caller on original readiness. Genuinely excluded path controls keep separate boundaries |
-| Task namespace membership and Files/fs detachment | Calling worker; supported unshare/setns and close_range update original per-task bindings and all future-call consumers; busy namespace transactions return the execution slot | Capability-less embeddings remain. Clone namespace creation retains creator-mm custody; unsupported user/time namespace semantics remain separate |
-| prctl task controls and per-thread comm | Source/solo share residual parent-death/subreaper/name/SME/error handling; existing credential/seccomp routes remain original-resource work. Proc and diagnostics observe the same original name | No production prctl-only join remains. Genuine missing parent/family providers keep before-effects fallback; absent backend SME support keeps its original EINVAL. Name publication/fork/exec retain actual task/image identity |
-| Credentials and capabilities | Supported UID/GID/fs-ID/groups, capget/capset and credential prctl run on the caller; original task credentials feed target permissions and observations | Capability-less embeddings retain their boundary; unsupported user namespaces and file capabilities are unchanged |
-| Memory barriers | Supported membarrier query/register/private/global/get-registrations run on source workers; original active execution leases acknowledge requested fences | Capability-less/solo embeddings keep their joined path. Unsupported sync-core/rseq/global-expedited commands remain unsupported. Ordinary memory accesses acquire no new synchronization |
-| Entropy and random devices | getrandom, original random/urandom OFDs and UUID resources run on the caller; unsupported random-device controls return locally on the accepted OFD | Absent descriptor capabilities retain their own route. Supported getrandom flags remain 0..3 and the existing transfer bound/fault behavior is retained; guest entropy credit/reseed controls remain unsupported |
-| BPF and cgroup device policy | Supported program load/identity/reopen and attachment controls use original registry/Files/hierarchy resources on the caller; cgroup target directories and control files resolve/open on workers | Existing unsupported BPF commands/types remain explicit errors; capability-less embeddings keep their boundaries. Device opens/mknod/PTY peer and proc reopening consume the same live rules |
-| Seccomp policy | Supported seccomp/prctl installation, TSYNC and entry results use original source task/group resources; busy installation releases the slot; proc and future entries observe live policy | Capability-less embeddings retain signal/exit handling; unsupported listener/logging/notification features remain unsupported. An allowed syscall may still encounter its own excluded resource or generic fallback |
-| Cold process observation and source ownership | Original body custody and current original PID identity; queue publication orders the exit observation | Cold snapshots are lookup hints, not accepted source capabilities. Source Handles and genuinely excluded actors retain their original routes |
-| Host process and native terminal lifecycle | Original process/group/PTY resources and existing execution/disk workers | Accepted launches survive cohort replacement; loading and custody waits release the CPU slot. One-time adapter setup and genuine missing/excluded providers remain explicit; terminal ID 0 transport no longer stops execution |
-| Init notification and graceful-stop supervision | Existing host adapter and original notification endpoint; original PID 1 policy/private inbox | No notification/handshake/root-signal join remains; initial VFS preparation and actual final teardown retain their own lifetime |
-| Mac host memory-pressure reclamation | Original physical registry/gates and retained byte-lease readiness, progressed by the existing host adapter | No pressure-only join remains. Refaults and physical granularity are backend work; actual cancellation/teardown retains its own lifetime |
-| Live host pause/resume | Original cohort flag, execution leases and queue; accepted backing/lifecycle completion uses existing workers | No live pause-only join remains. Initial/solo execution and legacy stopped hooks keep their separate route; guest STOP/CONT, freezer and mapping pause remain independent |
-| Host filesystem commands | Original namespace/inode/backing resources and the existing disk pool | Streaming import/export, conditional FileProvider saves and timezone updates no longer join. Only genuinely absent host-I/O bindings retain the legacy stopped command route; apply-on-return is the chosen admission policy |
-| Actual host/embedding administration | Explicit cancellation, admin/deadline and final shutdown handling | These actual events retain their boundary. Normal host terminal transport, accepted filesystem commands and live pause/resume are source/resource work |
-| SVC/HLT/fault continuation | One source dispatcher over warm View or cold original Memory; cold native calls retain original task/mm custody, yields requeue and guest faults retain source signal/exit semantics | Only diagnosed absent original capabilities can suspend for their provider. Generic CPU exits cannot request host dispatch; backend failures retain their real terminal cause |
-| Single-CPU/solo execution | Existing coordinated caller path | The owner may itself be the guest executor; this is not evidence of an extra cross-thread syscall RPC |
+| Files, shared/private storage, paths and descriptors | Calling source; cold full bodies bind original Files, namespace and OFDs. Existing disk workers retain native staging and layout work | Existing API/driver errors remain; no filesystem-kind owner fallback |
+| Unix/TCP messages, transfers, ancillary data and AIO | Calling source or original accepted resource wait. Imported operands, rights, endpoints and deadlines remain attached | Unsupported transport/API behavior is unchanged |
+| Poll/select/epoll and io_uring | Original interest graph and reader context, retained OFDs, event subscriptions and submitter-scoped cold progress | Backend failures retain their real cause. No missing-provider admission suspension or owner bit |
+| Signals, futexes, child waits and timers | Original task/group queues and object readiness; parked actors release execution slots | Existing unsupported signal/futex variants keep their original result |
+| Process/family creation, exec, exit, STOP/CONT and namespaces | Existing source workers use original task, family, Files/fs and namespace resources | Required original task/mm leases remain; no host process-table retry loop |
+| Mapping, backing, discard, pins and writeback | Original affected task/mm/backing custody; additive and observation paths retain their direct implementation | Physical users and byte leases still synchronize; this is not coordinator dispatch |
+| Credentials, limits, scheduling, security and guest shutdown | Original per-task/group or namespace authority on the executing source | Unsupported policy features retain their original behavior |
+| Statistics and proc/sys views | Original task/RSS/live-time graph; host-managed global reports require the actual shared provider at startup | A broken embedding fails configuration without executing a guest; task observations do not sample global memory |
+| Native libc, GPU, video, audio, Bridge and diagnostics | Same guest memory model and calling/existing execution workers, with original object locks and readiness | Real platform/backend errors and unsupported APIs remain explicit |
+| Host terminals, file commands, launches and cancellation | Bootstrap-only setup, original live resources and source execution/completion | App UI presentation retains platform UI-thread affinity; no stopped guest callback |
+| One CPU and initially idle/exited root | The same source execution/completion contract on existing pool workers | No caller CPU loop or host guest-retry path |
 
-Initial guest admission and exceptional legacy/control rescheduling still involve
-owner orchestration. Existing epoch members migrate, park and wake through the
-shared execution queue. That queue can now activate an original CPU-pool slot
-directly when live affinity requires it; this does not request an owner service
-or prestart every configured CPU. Scheduler, resource processing,
-communication and full-stop costs must be measured separately. UI-thread affinity
-and the native disk/device pools are not additional Linux coordinators.
-
-Stage 55 removes supported task namespace membership changes from joined
-dispatch, including Files/fs detachment and every captured resource consumer.
-The multi-CPU namespace compatibility fixture requests no owner service and has
-no unshare/setns/close_range cohort returns; its final console ioctl still returns.
-These are fixture-specific results, not prevalence in Firefox or all containers.
-
-Actual excluded control bodies, missing policy capabilities, exceptional native imports,
-host administration and generic unhandled dispatch remain separate boundaries. Source-owned control lifetime does not imply that
-every control operation itself has moved to a worker.
+Actual object locks, native device/disk pools, affected-domain CPU interruption
+and UI-thread affinity are resource requirements. They cannot authorize guest
+syscall/native dispatch on the waiting host.
 
 ## Execution model
 
 ```mermaid
 flowchart LR
     CPU[Mac HVF or iPad interpreter] --> Entry[Calling executor and original guest View]
-    Entry --> Shared[Original shared file, socket and native resources]
-    Entry --> Wait[Shared execution queue and readiness]
+    Entry --> Shared[Original file, socket and native resources]
+    Entry --> Wait[Shared execution queue and original readiness]
     Wait --> Entry
     Shared --> Disk[Existing bounded native disk pool]
     Disk --> Wait
-    Entry --> Scope[Affected mm or backing checkpoint]
-    Entry --> Join[Unhandled or explicit joined task/control exit]
-    Scope --> Lifecycle[Existing worker: lifecycle, proc, cold mm and backing layout]
-    Lifecycle --> Entry
-    Scope --> Owner[Existing Kernel owner: excluded scopes and legacy embeddings]
-    Join --> Owner
-    Owner --> Entry
+    Entry --> Scope[Affected task, mm or backing custody]
+    Scope --> Source[Existing worker: full original body and publication]
+    Source --> Entry
+    Entry --> Complete[One-way source completion]
+    Complete --> Host[Host receives result]
 ```
 
-The `Join` edge requires the current cohort to return its Views. `Scope`
-quiesces its actual mm/backing dependencies. There is no compatibility RPC edge.
+The source scope quiesces only its actual task/mm/backing dependencies. A short
+operation runs on its caller. A blocked operation releases its execution slot and
+resumes from original readiness. Cold resource binding and full Linux bodies use
+the same original graph. Native disk jobs publish directly to their source.
+There is no production join-to-owner dispatch edge.
 
-The host admits and collects execution cohorts and serves only explicitly missing
-embedding capabilities. Original task membership and supported structural publication are
-shared with existing executors. An admitted short operation runs on its calling
-worker. A blocked resource operation can return its execution slot and resume
-from original readiness without a syscall RPC to that owner. Native disk jobs own
-copied inputs and original resources, and publish results directly to the source.
-
-The relevant scopes are:
-
-- **Resource wait:** only the caller parks; other CPUs continue.
-- **Affected-domain checkpoint:** only the required mm/backing users quiesce;
-  an existing source executor publishes their structural change.
-- **Joined owner path:** the current cohort ends, its Views return, then the owner
-  serves the diagnosed missing provider. It cannot dispatch unrelated returned
-  SVC/HLT work. This is broader than one-resource wait.
-- **Local execution fallback:** a different implementation runs on the same worker;
-  the word `fallback` alone does not identify a coordinator transition.
+The remaining synchronization scopes are object waits, affected-domain custody,
+source completion and local implementation fallbacks. None authorizes a host
+syscall/native retry. Physical CPU interruption and UI-thread presentation do not
+change that contract.
 
 ## Remaining owner dependencies
 
@@ -644,30 +606,22 @@ Actual excluded policy effects and missing capabilities retain explicit boundari
 
 ### Current remaining categories
 
-The count is **one broad category**. Stages 103–105 remove production terminal
-completion, host embedding/initial execution orchestration and final generic
-execution dispatch respectively. Bootstrap has no live mutable callback. CPU
-interruptions and affected-resource scopes cannot request joined syscall work.
+The count is **zero broad coordinator-dispatch categories** after stage 106.
+No production missing-provider tag or generic handoff remains. The source-only
+execution mode cannot select a bounded compatibility route in a release build.
+Architecture gates reject reintroducing admission suspension, owner-maintenance
+setters, the synchronous statistics callback or the host guest-retry loop.
 
-| Remaining category | Actual trigger | Current scope / authoritative implementation |
-| --- | --- | --- |
-| Missing capabilities and excluded resources | A genuinely absent source provider, an excluded original FD/node graph, a genuinely absent native event capability or unsupported source request body | There is no filesystem-kind exclusion after stage 82. Published global proc/sys metadata no longer lacks a source provider merely because it uses set_runtime_info. Other node/provider admission still applies. io_uring has exactly two submitter-scoped `require_owner()` maintenance call sites: an actually unavailable typed wait graph provider and deferred original body progress. An absent HostEvents hub no longer triggers this boundary: actual native interests are retained with their read/write directions. Compatibility capture carries its own original execution resources; per-task memory observations do not require a host-global statistics callback. Actual missing global providers and host backend errors retain their own boundary/cause. They remain connected to actual accepted request lifetime, subscriptions and cancellation. See [path authority](../../crates/trames-vfs/src/path_queries.rs), [maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [wait sources](../../crates/trames-linux/src/direct/uring/wait.rs) and [actor](../../crates/trames-linux/src/direct/uring/actor.rs). |
+| Former category | Final disposition |
+| --- | --- |
+| Missing global statistics | Host-managed startup requires its real shared provider; bounded sessions publish original budget/task resources |
+| Missing byte/factory context | Cold source binding keeps the accepted OFD/message and actual caller resources |
+| Poll/select context and descriptor graph | Full accepted OFDs survive until their original reader binds, including close/reuse and modified guest arrays |
+| io_uring maintenance/body admission | Original submitter custody, canonical full-body progress and original readiness on existing executors; no owner-required status bit |
 
-The source return carries `HostStatistics`, `WaitGraph`, `ByteProvider` or
-`UringWaitGraph` on the original operation. This is an explicit capability class,
-not four newly counted architectural categories. Unsupported APIs preserve their
-existing result; a missing capability is not converted to a success or new errno.
-The common dispatcher and source continuation are in
-[syscall dispatch](../../crates/trames-session/src/syscall_dispatch.rs) and
-[original-memory continuation](../../crates/trames-session/src/process_lifecycle_dispatch.rs).
-
-
-Supported process/family lifecycle, signals and security policy, mount and task
-namespace administration, proc views, transfers, timers, event waits, terminals,
-native devices/Bridge, diagnostics, system statistics, guest power control and
-read-only memory observations are source-owned. An excluded underlying resource
-can still take the remaining category; this is not a claim that every custom
-embedding or unsupported API has acquired an implementation.
+These are dispositions of the final former class, not new outstanding category
+counts. Unsupported API coverage remains an implementation limit, with the same
+existing result or real backend cause, and cannot schedule coordinator dispatch.
 
 Actual mapping edits, discard, backing/layout changes and external byte leases
 still synchronize their affected original mm/backing closure. Existing workers
@@ -4651,3 +4605,26 @@ body on source. The unchanged dormant shared-futex hardware workload retains its
 exit and memory-marker assertions and now requires one cohort with zero returned
 syscalls, replacing its prior two cohorts and one returned read. A common
 one/four/twelve-CPU regression also checks the actual bytes and read count.
+
+
+## 106. Source capabilities and final coordinator removal — 2026-11-10
+
+This connected batch removes the final admission-suspension authority rather than
+renaming it. It includes the host statistics adapter contract, original byte and
+poll binding, accepted OFD lifetime, io_uring body/wait maintenance, the host retry
+loop and initial terminal completion. The common implementation is shared by Mac
+HVF and the iPad interpreter. It adds no unsafe memory model, global guest lock,
+resource service thread, polling bus or ordinary-memory fence.
+
+New regressions cover startup rejection before CPU entry, original statistics
+and source callback thread identity at one/four/twelve CPUs, an already exited
+root, cold packet binding, poll/select signal-reader binding, canonical BPF poll
+semantics and an actual unbound linked open SQE. They retain real inputs, bytes,
+CQ results, imported path/array state and close/reuse checks. The SQE test selects
+requests by identity because EAGAIN rotates the pending queue. Existing workload
+assertions remain; assertions for the deleted owner-status API are removed.
+
+English final acceptance and paired product pins are recorded in the iPad
+repository's source-capabilities validation record. Mac Dev alone is deployed;
+stable apps, business environments and physical iPad installs are unchanged.
+No controlled throughput or Firefox latency measurement is claimed.

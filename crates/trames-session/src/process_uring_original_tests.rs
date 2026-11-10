@@ -293,7 +293,6 @@ fn original_uring_body_keeps_accepted_resources_without_a_join_in_blocking_and_a
                 8u32.to_le_bytes()
             );
             assert_eq!(root.linux.vfs.read(file, 8).unwrap(), 99u64.to_le_bytes());
-            assert!(!root.linux.uring_requires_owner());
             assert!(k.cohort_return_syscalls.is_empty());
             assert_eq!(k.parallel_rounds, 1);
             assert_eq!(k.service_requests, 0);

@@ -4,16 +4,6 @@
 use super::*;
 use trames_linux::{FileBoundary, IoAttempt, OutputFd};
 
-/// A specific embedding capability absent from the source resource graph.
-/// This is not an unclassified syscall/native exit or a request to try an owner.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Missing {
-    HostStatistics,
-    WaitGraph,
-    ByteProvider,
-    UringWaitGraph,
-}
-
 impl<C: Cpu> Lifecycle<C> {
     pub(super) fn dispatch_calls(
         &self,
@@ -50,13 +40,14 @@ impl<C: Cpu> Lifecycle<C> {
                 continue;
             }
             if job.maintenance_scope {
-                p.linux.progress_uring(&mut p.memory, job.work.pid);
-                job.maintenance_scope = false;
-                if p.linux.uring_requires_owner_for(&p.memory, job.work.pid) {
-                    let job = checkpoint.jobs.swap_remove(index);
-                    epoch.missing_capability(*job, Missing::UringWaitGraph);
-                    continue;
+                if let Some(background) = &mut job.uring {
+                    background
+                        .progress_original(&mut p.linux, &mut p.memory)
+                        .map_err(|e| RuntimeError::Backend(e.to_string()))?;
+                } else {
+                    p.linux.progress_uring(&mut p.memory, job.work.pid);
                 }
+                job.maintenance_scope = false;
                 if !matches!(
                     job.checkpoint,
                     Some(SliceOutcome::Syscall { .. } | SliceOutcome::NativeCall { .. })
@@ -89,10 +80,10 @@ impl<C: Cpu> Lifecycle<C> {
                 cgroup.acknowledge();
             }
             match result {
-                Ok(None) => {
+                None => {
                     index += 1;
                 }
-                Ok(Some(exit)) => {
+                Some(exit) => {
                     let mut job = checkpoint.jobs.swap_remove(index);
                     let outcome = job.checkpoint.take();
                     let done = job.finish_retired(
@@ -101,10 +92,6 @@ impl<C: Cpu> Lifecycle<C> {
                         exit,
                     );
                     epoch.finish_checkpoint_retired(done);
-                }
-                Err(missing) => {
-                    let job = checkpoint.jobs.swap_remove(index);
-                    epoch.missing_capability(*job, missing);
                 }
             }
         }
@@ -118,7 +105,7 @@ impl<C: Cpu> Lifecycle<C> {
         p: &mut Process<C>,
         number: u32,
         args: [u64; 6],
-    ) -> Result<Result<Option<crate::worker_syscalls::Exit>, Missing>, RuntimeError> {
+    ) -> Result<Option<crate::worker_syscalls::Exit>, RuntimeError> {
         if job.retry.is_none() {
             let resumed = job.seccomp_entry.is_some();
             let step = crate::syscall_dispatch::execute(
@@ -131,7 +118,7 @@ impl<C: Cpu> Lifecycle<C> {
             );
             job.stats.syscalls += step.syscalls;
             if let Some(exit) = step.thread_exit {
-                return Ok(Ok(Some(exit)));
+                return Ok(Some(exit));
             }
             if step.outcome.is_none()
                 || step.maintenance
@@ -143,7 +130,7 @@ impl<C: Cpu> Lifecycle<C> {
                 job.seccomp_entry = None;
                 job.waiting = step.parked;
                 job.io = step.io;
-                return Ok(Ok(None));
+                return Ok(None);
             }
         }
         let snapshot = job
@@ -307,15 +294,64 @@ impl<C: Cpu> Lifecycle<C> {
                 job.io = Some(wait);
                 job.checkpoint = None;
                 job.seccomp_entry = None;
-                return Ok(Ok(None));
+                return Ok(None);
             }
             Some(IoAttempt::WaitCheckpoint(wait)) => {
-                job.retry = Some(crate::run_queue::IoCall::from_wait(wait));
-                return Ok(Err(Missing::WaitGraph));
+                let attempt = snapshot.direct.start_original_poll(
+                    wait,
+                    &mut p.linux,
+                    &mut p.memory,
+                    job.work.pid,
+                    &epoch.io_target,
+                );
+                match attempt {
+                    IoAttempt::Complete(value) => value,
+                    IoAttempt::Blocked(wait) => {
+                        if let Some(poll) = &wait.retained_poll {
+                            snapshot.begin_wait_mask(poll);
+                        }
+                        job.io = Some(wait);
+                        job.checkpoint = None;
+                        job.seccomp_entry = None;
+                        return Ok(None);
+                    }
+                    IoAttempt::HostError(error) => {
+                        return Err(RuntimeError::Backend(error.to_string()))
+                    }
+                    _ => {
+                        return Err(RuntimeError::Arguments(
+                            "original poll resource binding is incomplete",
+                        ))
+                    }
+                }
             }
             Some(IoAttempt::ByteCheckpoint(file)) => {
-                job.retry = Some(crate::run_queue::IoCall::from_byte(file, number, args));
-                return Ok(Err(Missing::ByteProvider));
+                let attempt = snapshot.direct.start_original_byte(
+                    file,
+                    number,
+                    args,
+                    &mut p.linux,
+                    &mut p.memory,
+                    job.work.pid,
+                    &epoch.io_target,
+                );
+                match attempt {
+                    IoAttempt::Complete(value) => value,
+                    IoAttempt::Blocked(wait) => {
+                        job.io = Some(wait);
+                        job.checkpoint = None;
+                        job.seccomp_entry = None;
+                        return Ok(None);
+                    }
+                    IoAttempt::HostError(error) => {
+                        return Err(RuntimeError::Backend(error.to_string()))
+                    }
+                    _ => {
+                        return Err(RuntimeError::Arguments(
+                            "original byte resource binding is incomplete",
+                        ))
+                    }
+                }
             }
             Some(
                 IoAttempt::FileCheckpoint(_)
@@ -330,7 +366,9 @@ impl<C: Cpu> Lifecycle<C> {
                 if let Some(value) = snapshot.invoke(&job.work.cpu, &mut p.memory) {
                     Ok(value)
                 } else if number == 179 {
-                    return Ok(Err(Missing::HostStatistics));
+                    return Err(RuntimeError::Configuration(
+                        "host-managed statistics require an original shared provider",
+                    ));
                 } else {
                     // Session recognition is conservative for shared numbers
                     // (for example terminal read versus an ordinary proc OFD).
@@ -374,7 +412,7 @@ impl<C: Cpu> Lifecycle<C> {
         job.stats.syscalls += 1;
         job.checkpoint = None;
         job.seccomp_entry = None;
-        Ok(Ok(None))
+        Ok(None)
     }
 
     fn file_boundary(
@@ -537,10 +575,10 @@ mod tests {
                         .dispatch_call(&epoch, &mut job, &mut p, number, args)
                         .unwrap_or_else(|error| panic!("syscall={number} args={args:?}: {error}"))
                     {
-                        Ok(None) => {}
+                        None => {}
                         other => panic!(
                             "syscall={number} args={args:?}: unexpected nonterminal result: {}",
-                            other.is_err()
+                            other.is_some()
                         ),
                     }
                     let Some(wait) = job.io.take() else {

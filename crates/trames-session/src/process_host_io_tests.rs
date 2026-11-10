@@ -179,7 +179,6 @@ fn native_backend_failure_drains_source_read_poll_and_uring_without_owner_replay
             assert_eq!(root.cpu.x(0), args[0]);
             assert_eq!(root.cpu.x(19), 0);
             assert_eq!(root.memory.read_array::<256>(0x1000).unwrap(), [0xa5; 256]);
-            assert!(!root.linux.uring_requires_owner());
             if let Some(ring) = ring {
                 assert!(ring.state.lock().unwrap().pending.is_empty());
                 assert_eq!(ring.cq_ready(), 1);

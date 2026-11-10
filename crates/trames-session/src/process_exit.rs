@@ -308,6 +308,7 @@ impl<C: Cpu> Kernel<C> {
         }
         Ok(())
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn exit_memory_pending(&self) -> bool {
         !self.exits.waits.is_empty() || !self.exits.memory.is_empty()
     }

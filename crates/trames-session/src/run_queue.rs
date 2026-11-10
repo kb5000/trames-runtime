@@ -748,7 +748,6 @@ impl Stats {
             after: self.after,
             worker: self.worker,
             instructions: self.instructions,
-            missing: None,
             chunks: self.chunks,
             syscalls: self.syscalls,
             direct_syscalls: self.direct_syscalls,
@@ -1296,14 +1295,14 @@ impl<C: Cpu> Epoch<C> {
     pub(crate) fn source_session(&self) -> bool {
         self.terminal.load(Ordering::Relaxed) && self.source_lifecycle()
     }
-    /// Joining cannot suspend a production session. Its source completion or
-    /// specific missing-capability return must already have ended admission.
+    /// Joining cannot suspend a production session. Source completion must
+    /// already have closed admission; it carries no guest operation to the host.
     pub fn join(&self) {
         let mut q = self.queues.lock().unwrap();
         if self.source_session() {
             assert!(
-                self.control.stopped(),
-                "only source completion or an explicit missing resource can stop admission"
+                self.control.closing(),
+                "production admission ends only through source completion"
             );
         } else {
             self.test_handoff();
@@ -1318,29 +1317,6 @@ impl<C: Cpu> Epoch<C> {
     }
     pub(crate) fn futex_target(&self) -> Weak<dyn crate::futex::Wake> {
         self.me.clone()
-    }
-    /// Only a diagnosed, unavailable embedding capability can return an
-    /// operation to its actual host provider. Ordinary CPU exits cannot.
-    pub(crate) fn missing_capability(
-        &self,
-        mut job: Job<C>,
-        missing: crate::process::lifecycle::dispatch_calls::Missing,
-    ) {
-        let outcome = job.checkpoint.take();
-        let mut done = job.finish(outcome, self.progress.load(Ordering::Relaxed));
-        done.missing = Some(missing);
-        let mut q = self.queues.lock().unwrap();
-        q.finished.push(done);
-        self.control.missing_capability(missing);
-        self.notify(&mut q);
-    }
-    pub(crate) fn has_missing_capability(&self) -> bool {
-        self.queues
-            .lock()
-            .unwrap()
-            .finished
-            .iter()
-            .any(|done| done.missing.is_some())
     }
     /// A source scope retired this original CPU. Its slot was already returned
     /// when the scope was taken, so there is no running-count decrement here.

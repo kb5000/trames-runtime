@@ -18,7 +18,7 @@ struct Entry {
 pub(crate) struct Scope {
     actor: Weak<UringActor>,
     identity: Identity,
-    // Low bits: pending, requires legacy body/capability. Remaining bits change
+    // Low bit: pending. Remaining bits change
     // only on new pending publication, so a concurrent issue wins over idling.
     status: AtomicU64,
 }
@@ -29,26 +29,12 @@ impl Scope {
     pub(crate) fn active(&self) -> bool {
         self.revision() & 1 != 0
     }
-    pub(crate) fn owner_required(&self) -> bool {
-        self.revision() & 2 != 0
-    }
-    pub(crate) fn require_owner(&self) {
-        self.status.fetch_or(2, Ordering::Relaxed);
-    }
-    pub(crate) fn owner_progressed(&self, observed: u64) {
-        let _ = self.status.compare_exchange(
-            observed,
-            observed & !2,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
-    }
     fn activate(&self) {
         // Original ring/resource locks publish actual request contents. These
         // bits report metadata and add no ordinary-memory ordering.
         self.status
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                Some(value.wrapping_add(4) | 1)
+                Some(value.wrapping_add(2) | 1)
             })
             .unwrap();
     }
@@ -111,7 +97,7 @@ impl UringActor {
             .status
             .compare_exchange(
                 observed,
-                observed & !3,
+                observed & !1,
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             )
@@ -136,35 +122,21 @@ impl UringActor {
         };
         drop(retired); // Scope cleanup cannot re-enter its registry lock.
     }
-    pub(crate) fn owner_required(&self) -> bool {
-        self.scopes
-            .first
-            .get()
-            .is_some_and(|first| first.owner_required())
-            || self.scopes.other.lock().unwrap().values().any(|entry| {
-                entry
-                    .pending
-                    .as_ref()
-                    .is_some_and(|scope| scope.owner_required())
-            })
-    }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn stale_idle_and_legacy_progress_cannot_erase_new_pending_publication() {
+    fn stale_idle_cannot_erase_new_pending_publication() {
         let actor = Arc::new(UringActor::default());
         actor.activate(1, 7);
         let scope = actor.scope(1, 7).unwrap();
-        scope.require_owner();
         let old = scope.revision();
         actor.activate(1, 7);
         actor.finish_scope(&scope, old);
-        scope.owner_progressed(old);
-        assert!(scope.active() && scope.owner_required());
+        assert!(scope.active());
         actor.finish_scope(&scope, scope.revision());
-        assert!(!scope.active() && !scope.owner_required());
+        assert!(!scope.active());
     }
     #[test]
     fn secondary_origins_are_canonical_until_last_drop_without_retaining_history() {

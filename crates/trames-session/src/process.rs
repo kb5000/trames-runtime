@@ -437,6 +437,7 @@ impl<C: Cpu> Process<C> {
             .supports_call(number, args)
             || matches!(number, 63..=66) && self.linux.vfs.direct_tcp_fd(args[0] as u32).is_some()
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn byte_wait_deadline(&self) -> Option<Instant> {
         if matches!(self.state, State::Blocked(..)) && (!self.stopped() || self.stop_held()) {
             self.byte_wait
@@ -630,6 +631,12 @@ impl trames_vfs::IoWake for JoinedByteWake {
     fn wake_io(&self, _: &Arc<trames_vfs::IoSignal>) {
         self.0.unpark();
     }
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExecutionMode {
+    Source,
+    #[cfg(all(test, trames_interpreter_conformance))]
+    Bounded,
 }
 pub(crate) struct Kernel<C: Cpu> {
     host_launches: Arc<host::Launches<C>>,
@@ -2199,7 +2206,7 @@ impl<C: Cpu> Kernel<C> {
                     // their existing original caller/host accounting resources.
                     let used = self.other_memory(vm_id) + caller.resident_bytes();
                     let memory = self.memory_limits.reported(used,
-                        self.memory_limits.is_host_managed().then(|| io.host_memory()).flatten());
+                        self.proc_source.as_ref().and_then(|source| source.host.as_ref().map(|host| host())));
                     Some(trames_linux::SystemInfo {
                         uptime: self.started.elapsed(),
                         load: self.load.lock().unwrap().sample(Instant::now(), self.processes.values().filter(|task| task.runnable()).count() + usize::from(runnable)),
@@ -2474,7 +2481,11 @@ impl<C: Cpu> Kernel<C> {
                 pid,
                 p,
                 (demand.host_memory() && self.memory_limits.is_host_managed())
-                    .then(|| io.host_memory())
+                    .then(|| {
+                        self.proc_source
+                            .as_ref()
+                            .and_then(|source| source.host.as_ref().map(|host| host()))
+                    })
                     .flatten(),
                 demand,
             );
@@ -2491,7 +2502,11 @@ impl<C: Cpu> Kernel<C> {
                     pid,
                     p,
                     (refined.host_memory() && self.memory_limits.is_host_managed())
-                        .then(|| io.host_memory())
+                        .then(|| {
+                            self.proc_source
+                                .as_ref()
+                                .and_then(|source| source.host.as_ref().map(|host| host()))
+                        })
                         .flatten(),
                     demand.merge(refined),
                 );
@@ -2883,6 +2898,7 @@ impl<C: Cpu> Kernel<C> {
         }
         p.publish_stop_hold(p.rekey.unwrap_or(pid));
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn waits_for_host_stdin(p: &Process<C>) -> bool {
         match p.state {
             State::Blocked(63 | 65, a) => {
@@ -3394,28 +3410,70 @@ impl<C: Cpu> Kernel<C> {
         limit: u64,
         persistent: bool,
     ) -> Result<bool, RuntimeError> {
-        self.execution_epoch(io, limit, persistent, false)
+        self.execution_epoch(io, limit, persistent, ExecutionMode::Bounded)
     }
     fn execution_epoch(
         &mut self,
         io: &mut impl GuestOutput,
         limit: u64,
         persistent: bool,
-        terminal: bool,
+        mode: ExecutionMode,
     ) -> Result<bool, RuntimeError> {
-        if self
-            .processes
-            .get(&1)
-            .is_some_and(|p| matches!(p.state, State::Zombie(_)))
-            && !self
-                .processes
-                .values()
-                .any(|p| p.tgid == 1 && !matches!(p.state, State::Zombie(_)))
-        {
-            return Ok(false);
+        let terminal = mode == ExecutionMode::Source;
+        let exited = self.processes.get(&1).and_then(|root| match root.state {
+            State::Zombie(status)
+                if !self
+                    .processes
+                    .values()
+                    .any(|p| p.tgid == 1 && !matches!(p.state, State::Zombie(_))) =>
+            {
+                Some(status)
+            }
+            _ => None,
+        });
+        if let Some(status) = exited {
+            if !terminal {
+                return Ok(false);
+            }
+            // A root already retired before admission still uses the existing
+            // source completion executor. The host receives only its result.
+            let control = Arc::new(crate::workers::Control::with_budget(u64::MAX, true));
+            let epoch =
+                crate::run_queue::Epoch::with_events(control.clone(), self.workers.events(), true);
+            epoch.bind_session(true);
+            epoch.bind_lifecycle(lifecycle::Lifecycle::capture(self));
+            control.close(crate::execution_control::End::Exited);
+            self.workers
+                .ensure(0)
+                .map_err(|_| RuntimeError::Arguments("cannot start source completion executor"))?;
+            self.workers
+                .finish_closed(epoch.clone())
+                .map_err(|_| RuntimeError::Arguments("source completion executor failed"))?;
+            if let Some(error) = epoch.collect_closed(self) {
+                return Err(error);
+            }
+            self.source_completed = true;
+            self.completed = Some(Exit {
+                code: if status & 127 == 0 {
+                    (status >> 8) as u8
+                } else {
+                    128 + (status & 127) as u8
+                },
+                instructions: self.instructions,
+            });
+            self.parallel_rounds += 1;
+            return Ok(true);
         }
         if !terminal && (self.cpu_count < 2 || !self.parallel_candidate(io.waits_for_host())) {
             return Ok(false);
+        }
+        // Standalone embeddings join the same original statistics/resource
+        // directory before admission. Keep any custom VFS provider intact.
+        if self.proc_source.is_none() {
+            self.proc_source = self
+                .processes
+                .get(&1)
+                .map(|root| self.make_proc_source(root.signals.io_directory.clone(), None));
         }
         let console = io.source_console();
         for p in self.processes.values() {
@@ -3453,9 +3511,7 @@ impl<C: Cpu> Kernel<C> {
                             }
                             _ => false,
                         };
-                    if p.linux.uring_requires_owner_for(&p.memory, id)
-                        || !local_ring && !p.linux.worker_uring_pending(&p.memory, id)
-                    {
+                    if !local_ring && !p.linux.worker_uring_pending(&p.memory, id) {
                         {
                             let task = &mut *p;
                             task.linux.progress_uring(&mut task.memory, id)
@@ -3863,9 +3919,9 @@ impl<C: Cpu> Kernel<C> {
         if checkpoint_error.is_some() {
             epoch.fail();
         }
-        if terminal && !control.closing() && !epoch.has_missing_capability() {
+        if terminal && !control.closing() {
             epoch.fail_execution(RuntimeError::Arguments(
-                "execution returned without a source completion or missing capability",
+                "execution returned without a source completion",
             ));
         }
         epoch.join();
@@ -3956,6 +4012,10 @@ impl<C: Cpu> Kernel<C> {
                 }
             }
         }
+        assert!(
+            !terminal,
+            "source execution cannot return guest work to the host"
+        );
         if let Some(error) = epoch.collect_lifecycle(self) {
             checkpoint_error = Some(error);
         }
@@ -3994,26 +4054,7 @@ impl<C: Cpu> Kernel<C> {
             if done.thread_exit.is_some() {
                 self.accept_source_return(done)?;
             } else {
-                let missing = done.missing;
-                let retained_io = done.io.is_some();
                 let (pid, _, outcome) = self.restore_worker_return(done);
-                if terminal
-                    && (missing.is_none()
-                        || missing == Some(lifecycle::dispatch_calls::Missing::UringWaitGraph))
-                {
-                    if matches!(
-                        outcome,
-                        SliceOutcome::Syscall { .. } | SliceOutcome::NativeCall { .. }
-                    ) && !retained_io
-                    {
-                        self.processes.get_mut(&pid).unwrap().pending_cpu = Some(outcome);
-                    }
-                    if missing == Some(lifecycle::dispatch_calls::Missing::UringWaitGraph) {
-                        let p = &mut *self.processes.get_mut(&pid).unwrap();
-                        p.linux.progress_uring(&mut p.memory, pid);
-                    }
-                    continue;
-                }
                 outcomes.push((pid, outcome));
             }
         }
@@ -4332,307 +4373,16 @@ impl<C: Cpu> Kernel<C> {
                 std::thread::park_timeout(Duration::from_millis(10));
                 continue;
             }
-            let mut progress = false;
             if let Some(root) = self.processes.get(&1) {
                 root.linux.vfs.dispatch_native_events();
             }
-            if self.execution_epoch(io, limit, true, true)? {
+            if self.execution_epoch(io, limit, true, ExecutionMode::Source)? {
                 continue;
             }
-            let ids: Vec<u32> = self.processes.keys().collect();
-            for id in ids {
-                let Some(mut p) = self.processes.checkout(&id) else {
-                    continue;
-                };
-                if !matches!(p.state, State::Zombie(_))
-                    && !p.frozen(id)
-                    && self.admit_owner_layouts(id, &mut p)?
-                {
-                    progress |= self.resume_gpu(id, &mut p);
-                    progress |= {
-                        let task = &mut *p;
-                        task.linux.progress_uring(&mut task.memory, id)
-                    };
-                    progress |= self.resume_event(&mut p);
-                    match self.deliver(id, &mut p) {
-                        Ok(changed) => progress |= changed,
-                        Err(_) => {
-                            self.exit(id, &mut p, 11);
-                            progress = true;
-                        }
-                    }
-                    // call/control/deliver publish resource changes immediately.
-                    p.publish_stop_hold(id);
-                    match p.state.clone() {
-                        State::Blocked(..) if p.stopped() && !p.stop_held() => {}
-                        State::Blocked(number, a) => {
-                            self.call(id, &mut p, number, a, io);
-                            progress |= !matches!(p.state, State::Blocked(..));
-                        }
-                        State::Sleep(deadline, _) if Instant::now() >= deadline => {
-                            p.state = State::Ready;
-                            p.cpu.set_x(0, 0);
-                            p.trace.record(0);
-                            progress = true;
-                        }
-                        _ => {}
-                    }
-                    if let Some(outcome) = p.pending_cpu.take() {
-                        self.finish_slice(id, &mut p, outcome, io, false);
-                        progress = true;
-                    }
-                    // Newly ready work is admitted by execution_epoch on the
-                    // next turn. The waiting host never executes guest CPUs.
-                    progress |= p.runnable();
-                }
-                let actual_id = p.rekey.take().unwrap_or(id);
-                if !p.auto_reap || actual_id == 1 {
-                    self.processes.insert(actual_id, p);
-                }
-                let root_status = self.processes.get(&1).and_then(|root| {
-                    if let State::Zombie(status) = root.state {
-                        root.family.status().map(|_| status)
-                    } else {
-                        None
-                    }
-                });
-                if let Some(status) = root_status {
-                    {
-                        // Session teardown is explicit: root exit cancels remaining virtual children.
-                        if let Some(root) = self.processes.get(&1) {
-                            root.linux.vfs.finish_network();
-                        }
-                        while !io
-                            .flush_output()
-                            .map_err(|_| RuntimeError::Arguments("terminal master output failed"))?
-                        {
-                            self.host_poll(io)?;
-                            self.poll_file_layouts();
-                            self.wait_external(io.control_poll_interval());
-                        }
-                        return Ok(Exit {
-                            code: if status & 127 == 0 {
-                                (status >> 8) as u8
-                            } else {
-                                128 + (status & 127) as u8
-                            },
-                            instructions: self.instructions,
-                        });
-                    }
-                }
-            }
-            if !progress {
-                let external = self.host_launches.pending() || self.exit_memory_pending() || self.layout_work.get().is_some_and(|l| l.pending()) || !self.proc_owner_waits.is_empty() || self.processes.values().any(|p| {
-                    p.exec_pending.is_some() || p.retained_file.is_some() || p.file_checkpoint.is_some() || p.linux.has_pending_mmap() || p.layout_wait.is_some() ||
-                    p.poll_deadline.is_some()
-                        || p.byte_wait_deadline().is_some()
-                        || matches!(p.state, State::Gpu { .. })
-                        || p.linux.vfs.next_timerfd_deadline().is_some()
-                        || p.linux.uring_pending()
-                        || p.uring_wait.as_ref().is_some_and(|(_, _, d)| d.is_some())
-                        || matches!(p.state, State::Futex { deadline: Some(_), .. } | State::Sigwait { deadline: Some(_), .. })
-                        || matches!(p.state, State::Sleep(..))
-                        || Self::waits_for_host_stdin(&p)
-                        || matches!(p.state, State::Blocked(number, a)
-                        if matches!(number, 63 | 64 | 65 | 66 | 202 | 203 | 242 | 206 | 207 | 211 | 212 | 269)
-                        && p.linux.vfs.fd_kind(a[0] as u32).ok() == Some(FdKind::Socket))
-                        || matches!(p.state,State::Blocked(76,a)if [a[0],a[2]].iter().any(|fd|p.linux.vfs.fd_kind(*fd as u32).ok()==Some(FdKind::Socket)))
-                        || (matches!(p.state, State::Blocked(22 | 72 | 73 | 441, _))
-                            && p.linux.vfs.live_sockets() != 0)
-                        || p.linux.vfs.has_bridge_descriptors()
-                        || p.linux.vfs.has_native_services()
-                        || p.linux.vfs.has_native_event_sources()
-                        || p.retained_socket.is_some()
-                        || p.byte_wait.as_ref().is_some_and(|wait|wait.external_wait())
-                        || !p.linux.uring_native_wait_fds().is_empty()
-                        || p.flock_wait.as_ref().is_some_and(|(r,_)| r.native_wait_fd().is_some())
-                }) || io.waits_for_host() || self.timers.next_deadline().is_some();
-                if !external {
-                    return Err(RuntimeError::Deadlock);
-                }
-                self.wait_external(io.control_poll_interval());
-            }
+            return Err(RuntimeError::Arguments(
+                "original source admission did not create a session",
+            ));
         }
-    }
-    fn wait_external(&mut self, interval: Duration) {
-        let began = Instant::now();
-        let mut sockets = Vec::new();
-        let mut native_fds = Vec::new();
-        let now = Instant::now();
-        let mut timeout = Duration::from_millis(20).min(interval);
-        if let Some(root) = self.processes.get(&1) {
-            native_fds.extend(root.linux.vfs.native_service_event_fd());
-        }
-        if let Some(d) = self.timers.next_deadline() {
-            timeout = timeout.min(d.saturating_duration_since(now));
-        }
-        for (id, p) in self.processes.iter() {
-            if p.frozen(id) {
-                continue;
-            }
-            if p.stopped() && !p.stop_held() {
-                native_fds.extend(p.linux.uring_native_wait_fds());
-                sockets.extend(p.linux.uring_sockets());
-                for d in [
-                    p.linux.uring_deadline(),
-                    p.uring_wait.as_ref().and_then(|(_, _, d)| *d),
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    timeout = timeout.min(d.saturating_duration_since(now));
-                }
-                continue;
-            }
-            // Only accepted pending interests can wake this wait. An unread
-            // event on an unrelated inotify FD must not keep the executor hot.
-            if let Some(wait) = &p.byte_wait {
-                native_fds.extend(wait.native_wait_fds());
-            }
-            if let Some(wait) = &p.retained_poll {
-                native_fds.extend(wait.native_wait_fds(&p.linux.vfs));
-            }
-            if p.retained_poll.is_none() {
-                if let State::Blocked(22 | 441, args) = p.state {
-                    native_fds.extend(p.linux.vfs.native_wait_fds_for(args[0] as u32));
-                }
-            }
-            native_fds.extend(p.linux.uring_native_wait_fds());
-            if let Some((request, _)) = &p.flock_wait {
-                native_fds.extend(request.native_wait_fd());
-            }
-            sockets.extend(p.linux.uring_sockets());
-            for deadline in [
-                p.linux.uring_deadline(),
-                p.uring_wait.as_ref().and_then(|(_, _, d)| *d),
-                p.byte_wait_deadline(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                timeout = timeout.min(deadline.saturating_duration_since(now));
-            }
-            if matches!(p.state, State::Gpu { .. }) {
-                timeout = timeout.min(Duration::from_millis(1));
-            }
-            if let Some(deadline) = p.linux.vfs.next_timerfd_deadline() {
-                timeout = timeout.min(deadline.saturating_duration_since(now));
-            }
-            if let State::Futex {
-                deadline: Some(d), ..
-            }
-            | State::Sigwait {
-                deadline: Some(d), ..
-            } = p.state
-            {
-                timeout = timeout.min(d.saturating_duration_since(now));
-            }
-            if let Some(deadline) = p.poll_deadline {
-                timeout = timeout.min(deadline.saturating_duration_since(now));
-            }
-            if matches!(p.state, State::Blocked(..)) {
-                if let Some(deadline) = p.socket_deadline {
-                    timeout = timeout.min(deadline.saturating_duration_since(now));
-                }
-            }
-            if let State::Sleep(deadline, _) = p.state {
-                timeout = timeout.min(deadline.saturating_duration_since(now));
-            }
-            let State::Blocked(number, a) = p.state else {
-                continue;
-            };
-            if let Some(call) = p.retained_socket.as_ref().or_else(|| {
-                p.byte_wait
-                    .as_ref()
-                    .and_then(|wait| wait.retained_socket.as_ref())
-            }) {
-                if let Some(socket) = call.socket_handle() {
-                    sockets.push((socket, call.events()));
-                }
-                continue;
-            }
-            let mut add = |fd, events| {
-                if let Ok(socket) = p.linux.vfs.socket_fd(fd) {
-                    sockets.push((socket, events));
-                }
-            };
-            match number {
-                63 | 65 | 202 | 242 | 207 | 212 => {
-                    add(a[0] as u32, 1);
-                    if p.linux.vfs.fd_kind(a[0] as u32).ok() == Some(FdKind::Stdin) {
-                        timeout = timeout.min(Duration::from_millis(1));
-                    }
-                }
-                76 => {
-                    add(a[0] as u32, 1);
-                    add(a[2] as u32, 4);
-                }
-                64 | 66 | 203 | 206 | 211 | 269 => add(a[0] as u32, 4),
-                73 => {
-                    for i in 0..a[1].min(256) {
-                        if let (Ok(fd), Ok(events)) = (
-                            read_u32(&p.memory, a[0] + i * 8),
-                            read_u32(&p.memory, a[0] + i * 8 + 4),
-                        ) {
-                            if fd < i32::MAX as u32 {
-                                add(fd, events as u16);
-                            }
-                            if p.linux.vfs.fd_kind(fd).ok() == Some(FdKind::Stdin) {
-                                timeout = timeout.min(Duration::from_millis(1));
-                            }
-                        }
-                    }
-                }
-                72 => {
-                    for (index, event) in [(1, 1), (2, 4), (3, 2)] {
-                        if a[index] == 0 {
-                            continue;
-                        }
-                        for fd in 0..a[0].min(256) as u32 {
-                            if let Ok(bits) = read_u64(&p.memory, a[index] + (fd as u64 / 64) * 8) {
-                                if bits & (1 << (fd % 64)) != 0 {
-                                    add(fd, event);
-                                    if p.linux.vfs.fd_kind(fd).ok() == Some(FdKind::Stdin) {
-                                        timeout = timeout.min(Duration::from_millis(1));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        if sockets.is_empty()
-            && native_fds.is_empty()
-            && (!self.proc_owner_waits.is_empty()
-                || self.processes.values().any(|p| {
-                    // Accepted image jobs complete through the existing disk
-                    // pool and retain this thread's unpark token. A returned
-                    // cohort may leave no runnable CPU, socket or timer.
-                    p.exec_pending.is_some()
-                        || p.linux.vfs.has_native_event_sources()
-                        || p.byte_wait
-                            .as_ref()
-                            .is_some_and(|wait| wait.notification_external())
-                }))
-        {
-            // Native completion retains an unpark token, including when it
-            // arrives after the last ready check but before this park.
-            std::thread::park_timeout(timeout);
-        } else if (sockets.is_empty() && native_fds.is_empty())
-            || timeout < Duration::from_millis(1)
-        {
-            std::thread::sleep(timeout.min(Duration::from_millis(1)));
-        } else {
-            use std::os::fd::AsFd;
-            let fds: Vec<_> = native_fds.iter().map(|fd| fd.as_fd()).collect();
-            if trames_net::wait_with_fds(&sockets, &fds, timeout).is_err() {
-                // Native adapter failures are surfaced by the next guest IO/poll.
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
-        self.idle += began.elapsed();
     }
 }
 pub(super) fn run<C: Cpu>(
@@ -4642,10 +4392,11 @@ pub(super) fn run<C: Cpu>(
     workers: crate::workers::Pool<C>,
 ) -> Result<Exit, RuntimeError> {
     runtime.memory_limits.validate()?;
+    let host_memory_source = io.host_memory_source();
     let host_memory = if runtime.memory_limits.is_host_managed() {
-        Some(io.host_memory().ok_or(RuntimeError::Configuration(
-            "host-managed memory requires a host memory adapter",
-        ))?)
+        Some(host_memory_source.as_ref().ok_or(
+            RuntimeError::Configuration("host-managed memory requires a shared host memory source"),
+        )?())
     } else {
         None
     };
@@ -4831,7 +4582,7 @@ pub(super) fn run<C: Cpu>(
     // that never touch /proc. Subsequent full snapshots are demand-driven.
     kernel.refresh_proc(1, &mut root, host_memory);
     kernel.proc_refreshes += 1;
-    kernel.install_proc_source(&root, io.host_memory_source());
+    kernel.install_proc_source(&root, host_memory_source);
     kernel.publish_task(1, &root);
     if let (Some(pair), Some(task)) = (
         root.linux.vfs.embedding_terminal(),

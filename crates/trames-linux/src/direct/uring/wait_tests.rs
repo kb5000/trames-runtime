@@ -72,7 +72,6 @@ fn failed_native_backend_keeps_accepted_request_until_source_completion_or_cance
         assert!(error
             .to_string()
             .contains("original native backend failure"));
-        assert!(!l.uring_requires_owner());
         assert_eq!(ring.state.lock().unwrap().pending.len(), 1);
         assert_eq!(m.read_array::<1>(0x2200).unwrap(), [0xa5]);
         if cancel {
@@ -95,7 +94,6 @@ fn failed_native_backend_keeps_accepted_request_until_source_completion_or_cance
         }
         assert!(!background.active());
         assert!(background.progress(&mut m).unwrap());
-        assert!(!l.uring_requires_owner());
         assert!(ring.state.lock().unwrap().pending.is_empty());
         assert_eq!(ring.state.lock().unwrap().tail, 1);
     }
@@ -479,7 +477,6 @@ fn ready_native_request_finishes_before_missing_event_capability_escalation() {
     assert!(ready.ready());
     assert!(background.progress(&mut m).unwrap());
     assert!(!background.active());
-    assert!(!l.uring_requires_owner());
     assert_eq!(cq(&mut m, &ring), (95, 1));
     assert_eq!(m.read_array::<1>(0x2200).unwrap(), *b"x");
 }

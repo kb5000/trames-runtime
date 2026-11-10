@@ -1646,7 +1646,6 @@ impl DirectSyscalls {
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
         let wait = accepted.borrow();
-        let revision = wait.epoll_accepted_revision();
         if !self.urings.poll_pump(&wait.poll_resources(), memory) {
             return IoAttempt::WaitCheckpoint(accepted.into());
         }
@@ -1657,34 +1656,110 @@ impl DirectSyscalls {
                 return self.complete(wait.number, wait.args, result);
             }
         }
+        let pending = self.event_pending(accepted.into(), pid, target);
+        self.resume(pending, memory)
+    }
+    fn event_pending(
+        &self,
+        wait: Arc<crate::RetainedWait>,
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+    ) -> PendingIo {
+        let revision = wait.epoll_accepted_revision();
         let signal = IoSignal::new(pid, target.clone());
         let subscriptions = wait.subscribe(&signal);
-        let wait = accepted.into();
-        self.resume(
-            PendingIo {
-                aio: None,
-                number: wait.number,
-                args: wait.args,
-                deadline: wait.deadline,
-                signal,
-                retained_poll: Some(wait),
-                epoll_revision: revision,
-                retained_socket: None,
-                retained_byte: None,
-                native_tcp: None,
-                flock: None,
-                record: None,
-                resource_deadline: None,
-                terminal_job: false,
-                _subscriptions: subscriptions,
-                socket_subscriptions: Vec::new(),
-                host_subscription: None,
-                uring: None,
-                poll_uring: None,
-                file: None,
-                target: target.clone(),
-            },
+        PendingIo {
+            aio: None,
+            number: wait.number,
+            args: wait.args,
+            deadline: wait.deadline,
+            signal,
+            retained_poll: Some(wait),
+            epoll_revision: revision,
+            retained_socket: None,
+            retained_byte: None,
+            native_tcp: None,
+            flock: None,
+            record: None,
+            resource_deadline: None,
+            terminal_job: false,
+            _subscriptions: subscriptions,
+            socket_subscriptions: Vec::new(),
+            host_subscription: None,
+            uring: None,
+            poll_uring: None,
+            file: None,
+            target: target.clone(),
+        }
+    }
+    /// Full original ring bodies and caller-context graph binding use the same
+    /// accepted wait. Imported arrays, OFDs, masks and deadlines are not reread.
+    pub fn start_original_poll(
+        &self,
+        wait: Arc<crate::RetainedWait>,
+        linux: &mut Linux,
+        memory: &mut trames_memory::Memory,
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+    ) -> IoAttempt {
+        linux.progress_uring(memory, pid);
+        let Some(wait) = wait.rearm(&linux.vfs.direct_descriptors()) else {
+            return IoAttempt::WaitCheckpoint(wait);
+        };
+        let pending = self.event_pending(wait.clone(), pid, target);
+        let host_error = pending
+            ._subscriptions
+            .iter()
+            .find_map(|s| s.rearm_host().err());
+        linux.progress_uring(memory, pid);
+        match wait.check(memory) {
+            Err(Errno(11)) => {
+                host_error.map_or_else(|| IoAttempt::Blocked(pending), IoAttempt::HostError)
+            }
+            result => self.complete(wait.number, wait.args, wait.finish(memory, result)),
+        }
+    }
+    /// Bind the actual original resources missing from a standalone fast-path
+    /// capture. Already prepared messages and accepted OFDs stay intact.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_original_byte(
+        &self,
+        file: RetainedByte,
+        number: u32,
+        args: [u64; 6],
+        linux: &mut Linux,
+        memory: &mut impl CpuMemory,
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+    ) -> IoAttempt {
+        let mut direct = Self::new(self.descriptors.clone())
+            .with_resources(linux.vfs.descriptor_factory())
+            .with_paths(linux.vfs.path_queries())
+            .with_terminal_task(
+                self.terminal_task
+                    .clone()
+                    .or_else(|| linux.vfs.terminal_task()),
+            );
+        direct.terminal = self.terminal;
+        direct.task_signal = self.task_signal.clone();
+        let file = if file.fd.is_unix() && file.message().is_none() {
+            match direct.prepare_packet_byte(&file, number, args, memory) {
+                Some(Ok(file)) => file,
+                Some(Err(error)) => return self.complete(number, args, Err(error)),
+                None => return IoAttempt::ByteCheckpoint(file),
+            }
+        } else {
+            file
+        };
+        direct.start_byte_in(
+            file,
+            number,
+            args,
             memory,
+            pid,
+            target,
+            false,
+            Some(&linux.vfs),
         )
     }
     /// Joined execution uses the same ABI and resource wait, but owns SIGPIPE

@@ -247,7 +247,7 @@ impl RetainedWait {
     pub fn rearm(self: &Arc<Self>, fds: &DirectFds) -> Option<Arc<Self>> {
         let sources = match &self.sources {
             Sources::Epoll(fd) => {
-                let fresh = fd.refresh_epoll()?;
+                let fresh = fds.bind_poll(fd)?;
                 if fresh.epoll_accepted_revision() == fd.epoll_accepted_revision() {
                     return Some(self.clone());
                 }
