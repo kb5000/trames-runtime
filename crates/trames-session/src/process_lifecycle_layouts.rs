@@ -70,7 +70,7 @@ impl<C: Cpu> Lifecycle<C> {
             Ok(pending) => pending,
             Err(error) => {
                 report.error = Some(error);
-                epoch.stop();
+                epoch.fail();
                 false
             }
         };
@@ -123,7 +123,7 @@ impl<C: Cpu> Lifecycle<C> {
             if let Err(error) = join_layout(&self.tasks, Some(epoch), &mut request) {
                 self.layouts.fail(request, 5);
                 self.report.lock().unwrap().error = Some(error.into());
-                epoch.stop();
+                epoch.fail();
                 continue;
             }
             if let Err(request) = self.layouts.try_submit(request) {

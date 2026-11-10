@@ -50,7 +50,7 @@ impl<C: Cpu> Lifecycle<C> {
                 p.cpu.clear_exclusive();
                 if let Err(error) = p.memory.commit_parallel() {
                     self.report.lock().unwrap().error = Some(error.into());
-                    epoch.stop();
+                    epoch.fail();
                     return;
                 }
                 assert!(p.memory.activate_proc_reads());

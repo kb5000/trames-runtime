@@ -374,7 +374,7 @@ impl<C: Cpu> Lifecycle<C> {
                 Err(error) => {
                     self.report.lock().unwrap().error = Some(error);
                     pending.push(work);
-                    epoch.stop();
+                    epoch.fail();
                 }
             }
         }
@@ -429,7 +429,7 @@ impl<C: Cpu> Lifecycle<C> {
                     self.report.lock().unwrap().error = Some(error);
                     work.wait = Some(Wait::Memory(id));
                     pending.push(work);
-                    epoch.stop();
+                    epoch.fail();
                 }
             }
         }
@@ -491,6 +491,7 @@ impl<C: Cpu> Lifecycle<C> {
             Kernel::<C>::log_worker_diagnostics(p, done);
             p.linux.vfs.sync_task_namespaces();
             p.cpu = std::mem::take(&mut done.cpu);
+            p.trace = std::mem::take(&mut done.trace);
             p.signals.finish_io();
             p.last_cpu = done.worker;
             p.cpu_time += done.elapsed;
@@ -600,7 +601,7 @@ impl<C: Cpu> Lifecycle<C> {
             if p.tgid == 1 {
                 // PID 1 group completion ends this session, just as the
                 // outside-epoch driver does. No owner retirement RPC is needed.
-                epoch.stop();
+                epoch.complete();
             }
         }
         self.tasks.restore(work.pid, work.pid, &custody);
@@ -608,6 +609,78 @@ impl<C: Cpu> Lifecycle<C> {
             self.report.lock().unwrap().workers.merge(done.take_stats());
         }
         Ok(None)
+    }
+    pub(super) fn retain_final_survivors(&self) {
+        let mut pending = self.retiring.lock().unwrap();
+        for (pid, task) in self.tasks.all() {
+            if pid == 1
+                || pending
+                    .iter()
+                    .any(|work| work.pid == pid && work.task.same(&task))
+            {
+                continue;
+            }
+            let original = task.read().signals.io.clone();
+            if !original.live() {
+                continue;
+            }
+            pending.push(Retiring {
+                pid,
+                task,
+                original: Some(original),
+                status: 9,
+                done: None,
+                wait: None,
+            });
+        }
+    }
+    pub(super) fn finish_retirements(&self, epoch: &Epoch<C>) -> Result<(), RuntimeError> {
+        struct Wake(std::thread::Thread);
+        impl trames_shared::IoWake for Wake {
+            fn wake_io(&self, _: &Arc<trames_shared::IoSignal>) {
+                self.0.unpark();
+            }
+        }
+        let target: Arc<dyn trames_shared::IoWake> = Arc::new(Wake(std::thread::current()));
+        let signal = trames_shared::IoSignal::new(0, Arc::downgrade(&target));
+        let _subscription = self.exit_groups.subscribe(&signal);
+        let owned = self
+            .tasks
+            .all()
+            .into_iter()
+            .map(|(_, task)| task.read().memory.coordinator_ownership().0)
+            .collect();
+        loop {
+            signal.reset();
+            let mut work = self.take_retirements(|_| true);
+            work.extend(self.terminal_tasks(epoch));
+            let mut pending = Vec::new();
+            for mut work in work {
+                // Every CPU View has drained; only actual foreign resource
+                // custody/borrowers can defer this final source operation.
+                if let Some(wait) = self.retire_task(epoch, &mut work, &owned)? {
+                    work.wait = Some(wait);
+                    pending.push(work);
+                }
+            }
+            if pending.is_empty() {
+                return Ok(());
+            }
+            self.publish_retirements(pending);
+            if !signal.ready() {
+                std::thread::park();
+            }
+        }
+    }
+    pub(super) fn retain_final_exit(&self, done: Done<C>) {
+        self.retiring.lock().unwrap().push(Retiring {
+            pid: done.pid,
+            task: done.task.as_ref().expect("original returned task").clone(),
+            original: None,
+            status: done.thread_exit.expect("source exit"),
+            done: Some(done),
+            wait: None,
+        });
     }
     pub(super) fn collect_retirements(&self, kernel: &mut Kernel<C>) {
         for work in std::mem::take(&mut *self.retiring.lock().unwrap()) {

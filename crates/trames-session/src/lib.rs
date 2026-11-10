@@ -9,6 +9,7 @@ use trames_linux::{GuestOutput, Linux};
 mod barrier;
 mod clock;
 mod devices;
+mod execution_control;
 mod exit_groups;
 mod futex;
 mod gpu;
@@ -172,6 +173,7 @@ impl From<MemoryError> for RuntimeError {
 
 pub use trames_vulkan::Display as VulkanDisplay;
 pub struct Runtime<C: Cpu> {
+    continuation: Option<trames_engine::SliceOutcome>,
     pub memory_limits: MemoryLimits,
     pub vulkan_display: VulkanDisplay,
     pub cpu: C,
@@ -181,7 +183,7 @@ pub struct Runtime<C: Cpu> {
     pub terminal: Option<terminal::Terminal>,
     pub metrics: RuntimeMetrics,
     pub profile_syscalls: bool,
-    /// Virtual CPU worker limit; 1 retains the existing local fast path.
+    /// Virtual CPU executor limit; single-CPU sessions use the same source lifecycle.
     pub cpu_count: usize,
 }
 /// Host monotonic timings; these are diagnostics, never guest clock values.
@@ -502,6 +504,7 @@ impl<C: Cpu> Runtime<C> {
         cpu.set_video_calls(options.video_accelerator);
         cpu.set_audio_calls(options.audio_output || options.audio_input);
         Ok(Self {
+            continuation: None,
             memory_limits: options.memory_limits,
             vulkan_display: VulkanDisplay::default(),
             cpu,
@@ -679,6 +682,7 @@ mod tests {
         let mut linux = Linux::new(0);
         linux.task_limit = 1024;
         let mut runtime = Runtime {
+            continuation: None,
             memory_limits: MemoryLimits::default(),
             vulkan_display: VulkanDisplay::default(),
             cpu: Cpu::new(0x1000, 0),
@@ -729,6 +733,7 @@ mod tests {
         let mut cpu = Cpu::new(0x1000, 0);
         cpu.set_x(1, 0x2100);
         let mut runtime = Runtime {
+            continuation: None,
             memory_limits: MemoryLimits::default(),
             cpu,
             engine: Default::default(),
@@ -849,6 +854,7 @@ mod tests {
         let mut cpu = Cpu::default();
         cpu.pc = 0x1000;
         let mut runtime = Runtime {
+            continuation: None,
             memory_limits: MemoryLimits::default(),
             cpu,
             engine: Default::default(),
@@ -904,6 +910,7 @@ mod accelerator_tests {
         cpu.set_x(30, 0x1020);
         cpu.tpidr_el0 = 0x9988;
         Runtime {
+            continuation: None,
             memory_limits: MemoryLimits::default(),
             cpu,
             engine: Default::default(),

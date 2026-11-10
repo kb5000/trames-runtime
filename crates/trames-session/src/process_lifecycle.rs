@@ -4,6 +4,8 @@
 use super::*;
 use crate::run_queue::{Checkpoint, Epoch, Job};
 use std::sync::Mutex;
+#[path = "process_lifecycle_completion.rs"]
+mod completion;
 #[path = "process_lifecycle_futex.rs"]
 mod futex;
 #[path = "process_lifecycle_host.rs"]
@@ -214,11 +216,20 @@ impl<C: Cpu> Lifecycle<C> {
             .reset();
         if let Err(error) = self.memory.pump() {
             self.report.lock().unwrap().error = Some(error.into());
-            epoch.stop();
+            epoch.fail();
         }
     }
     pub(crate) fn collect(&self, kernel: &mut Kernel<C>) -> Option<RuntimeError> {
         self.collect_retirements(kernel);
+        self.collect_report(kernel)
+    }
+    /// Completed source lifecycle publishes diagnostics only, never task work.
+    pub(crate) fn collect_closed(&self, kernel: &mut Kernel<C>) -> Option<RuntimeError> {
+        assert!(self.retiring.lock().unwrap().is_empty());
+        let error = self.collect_report(kernel);
+        error.or_else(|| kernel.backend_error.take().map(RuntimeError::Backend))
+    }
+    fn collect_report(&self, kernel: &mut Kernel<C>) -> Option<RuntimeError> {
         let report = std::mem::take(&mut *self.report.lock().unwrap());
         kernel.account_worker_stats(report.workers);
         for group in report.exit_groups {
@@ -349,7 +360,7 @@ impl<C: Cpu> Lifecycle<C> {
         report.memory = registry.metrics;
         if !matches!(result, Ok(true)) {
             report.error = result.err();
-            epoch.stop();
+            epoch.fail();
         }
         // Accounting is collected independently, after work has completed.
         // No task operation or queue notification runs under this mutex.

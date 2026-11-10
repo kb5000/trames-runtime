@@ -6,7 +6,7 @@
 //! No queue lock spans interpreter or native execution.
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc, Arc, Mutex,
     },
     thread,
@@ -18,45 +18,9 @@ use trames_memory::CpuMemory;
 
 /// Local interpreter polls, not scheduler quanta. Completing one of these does
 /// not send a message, wait for peers, or give up the CPU or memory view.
-const POLL_INSTRUCTIONS: u64 = 16_384;
+pub(crate) const POLL_INSTRUCTIONS: u64 = 16_384;
 
-pub(super) struct Control {
-    stop: AtomicBool,
-    remaining: AtomicU64,
-}
-impl Control {
-    pub fn new(budget: u64) -> Self {
-        Self {
-            stop: AtomicBool::new(false),
-            remaining: AtomicU64::new(budget),
-        }
-    }
-    pub fn stop(&self) {
-        self.stop.store(true, Ordering::Release);
-    }
-    pub fn stopped(&self) -> bool {
-        self.stop.load(Ordering::Acquire)
-    }
-    pub fn refund(&self, instructions: u64) {
-        self.remaining.fetch_add(instructions, Ordering::Relaxed);
-    }
-    fn claim(&self) -> Option<u64> {
-        if self.stop.load(Ordering::Acquire) {
-            return None;
-        }
-        match self
-            .remaining
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
-                (left != 0).then(|| left.saturating_sub(POLL_INSTRUCTIONS))
-            }) {
-            Ok(left) => Some(left.min(POLL_INSTRUCTIONS)),
-            Err(_) => {
-                self.stop();
-                None
-            }
-        }
-    }
-}
+pub(crate) use crate::execution_control::Control;
 
 pub(super) struct Work<C: Cpu> {
     /// Original task body, retained through every queue/checkpoint and return.
@@ -209,6 +173,7 @@ enum Command<C: Cpu> {
     #[cfg(all(test, trames_interpreter_conformance))]
     One(Box<Work<C>>),
     Epoch(Arc<crate::run_queue::Epoch<C>>),
+    Complete(Arc<crate::run_queue::Epoch<C>>, mpsc::Sender<()>),
 }
 struct Worker<C: Cpu> {
     send: mpsc::Sender<Command<C>>,
@@ -472,6 +437,25 @@ impl<C: Cpu> Pool<C> {
         }
         event
     }
+    /// Reuse a returned CPU executor; the reply has no guest-operation payload.
+    pub(crate) fn finish_closed(
+        &mut self,
+        epoch: Arc<crate::run_queue::Epoch<C>>,
+    ) -> Result<(), ()> {
+        let (send, receive) = mpsc::channel();
+        let slot = self
+            .workers
+            .iter()
+            .find_map(|slot| {
+                slot.lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|worker| worker.send.clone())
+            })
+            .ok_or(())?;
+        slot.send(Command::Complete(epoch, send)).map_err(|_| ())?;
+        receive.recv().map_err(|_| ())
+    }
     pub fn event_timeout(&mut self, timeout: Duration) -> Result<Option<Event<C>>, ()> {
         match self.receive.recv_timeout(timeout) {
             Ok(event) => Ok(Some(self.received(event))),
@@ -557,6 +541,11 @@ impl<C: Cpu> Starter<C> {
                         #[cfg(all(test, trames_interpreter_conformance))]
                         Command::<C>::One(work) => (None, Some(crate::run_queue::Job::<C>::new(*work, u64::MAX, index, None))),
                         Command::<C>::Epoch(epoch) => (Some(epoch), None),
+                        Command::<C>::Complete(epoch, reply) => {
+                            epoch.finish_closed();
+                            let _ = reply.send(());
+                            continue;
+                        }
                     };
                 loop {
                     let Some(mut job) = (if let Some(epoch) = &epoch { epoch.take_with_engine(index, &mut engine) } else { single.take() }) else { break };
@@ -592,7 +581,7 @@ impl<C: Cpu> Starter<C> {
                     let mut syscall_time = Duration::ZERO;
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         loop {
-                            if work.control.stop.load(Ordering::Acquire) {
+                            if work.control.stopped() {
                                 break SliceOutcome::Yield { instructions: 0 };
                             }
                             if execution_guard.as_ref().map_or_else(|| domain.as_ref().is_some_and(|domain|domain.interrupted()), |guard|guard.pending()) {
@@ -747,7 +736,7 @@ impl<C: Cpu> Starter<C> {
                                         Ok(true) => {},
                                         Ok(false) => {
                                             maintenance = true;
-                                            work.control.stop();
+                                            work.control.handoff();
                                             break SliceOutcome::Yield { instructions: 0 };
                                         }
                                         Err(error) => {
@@ -913,6 +902,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                 running = true;
                             }
                             let resumed_policy = matches!(job.pending_cpu,Some(SliceOutcome::Syscall {..})) && job.seccomp_entry.is_some();
+                            let already_accounted = job.pending_cpu.is_some() && std::mem::take(&mut job.pending_accounted);
                             let result = if let Some(pending) = job.pending_cpu.take() {
                                 pending
                             } else {
@@ -947,6 +937,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                 | SliceOutcome::Syscall { instructions }
                                 | SliceOutcome::NativeCall { instructions, .. } => *instructions,
                             };
+                            let retired = if already_accounted { 0 } else { retired };
                             instructions += retired;
                             credit -= retired;
                             if profile_native_overlap {
@@ -1740,7 +1731,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                         if let Some(ring) = &mut job.uring {
                             match ring.progress(work.memory.as_deref_mut().expect("source task View")) {
                                 Ok(true) => {},
-                                Ok(false) => work.control.stop(),
+                                Ok(false) => work.control.handoff(),
                                 Err(error) => epoch.fail_host_io(error),
                             }
                             if !ring.active() { job.uring = None; }
@@ -1759,7 +1750,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {for (i,value) in socket.ar
                     work.control.remaining.fetch_add(credit, Ordering::Relaxed);
                     // Syscall, deferred native, fault and yield request a checkpoint
                     // immediately, before the coordinator receives this message.
-                    if thread_exit.is_none() && !maintenance && parked.is_none() && parked_hardware.is_none() && parked_io.is_none() && parked_gpu.is_none() && !yielded && !vm_checkpoint { work.control.stop(); }
+                    if thread_exit.is_none() && !maintenance && parked.is_none() && parked_hardware.is_none() && parked_io.is_none() && parked_gpu.is_none() && !yielded && !vm_checkpoint { work.control.handoff(); }
                     let elapsed = began.elapsed();
                     let after = work.cpu.decode_stats();
                     if running && profile_native_overlap {
@@ -1858,10 +1849,10 @@ impl<C: Cpu> Drop for Pool<C> {
             .collect();
         for (control, epoch) in controls {
             if let Some(control) = control {
-                control.stop();
+                control.close(crate::execution_control::End::Cancelled);
             }
             if let Some(epoch) = epoch {
-                epoch.stop();
+                epoch.cancel();
             }
         }
         // Parked resource jobs retain their own completion and original View.
@@ -1899,6 +1890,7 @@ impl<C: Cpu> Drop for Pool<C> {
 
 #[cfg(all(test, trames_interpreter_conformance))]
 mod tests {
+    use std::sync::atomic::AtomicU64;
     use trames_cpu::Cpu;
     type Pool = crate::workers::Pool<Cpu>;
     type Work = crate::workers::Work<Cpu>;
@@ -5381,7 +5373,7 @@ mod tests {
             .complete_timeout(Duration::from_millis(10))
             .unwrap()
             .is_none());
-        control.stop();
+        control.close(crate::execution_control::End::Cancelled);
         let a = pool.complete().unwrap();
         let b = pool.complete().unwrap();
         assert!(a.instructions + b.instructions > 0);

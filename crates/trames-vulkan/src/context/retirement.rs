@@ -14,7 +14,8 @@ pub(super) struct Retirement {
     pending: AtomicBool,
     running: AtomicU8,
     closing: AtomicBool,
-    subscriptions: OnceLock<[Registration; 2]>,
+    unlock: OnceLock<Registration>,
+    completion: OnceLock<Registration>,
 }
 struct Registration {
     _wake: Arc<dyn IoWake>,
@@ -36,7 +37,7 @@ impl IoWake for Wake {
     }
 }
 impl Retirement {
-    pub(super) fn arm(context: &Arc<Inner>, backend: &mut OwnedBackend, closing: bool) {
+    fn acquire(context: &Arc<Inner>, closing: bool) -> Arc<Self> {
         let mut current = context.retirement.lock().unwrap();
         let retirement = current.get_or_insert_with(|| {
             let retirement = Arc::new(Self {
@@ -44,33 +45,48 @@ impl Retirement {
                 pending: AtomicBool::new(true),
                 running: AtomicU8::new(0),
                 closing: AtomicBool::new(closing),
-                subscriptions: OnceLock::new(),
+                unlock: OnceLock::new(),
+                completion: OnceLock::new(),
             });
-            let register = |completion| {
-                let wake: Arc<dyn IoWake> = Arc::new(Wake {
-                    retirement: Arc::downgrade(&retirement),
-                });
-                let signal = IoSignal::new(0, Arc::downgrade(&wake));
-                let subscription = if completion {
-                    backend.0.subscribe_completion(&signal)
-                } else {
-                    context.available.subscribe(&signal)
-                };
-                Registration {
-                    _wake: wake,
-                    _signal: signal,
-                    _subscription: subscription,
-                }
-            };
-            let _ = retirement
-                .subscriptions
-                .set([register(true), register(false)]);
+            let wake: Arc<dyn IoWake> = Arc::new(Wake {
+                retirement: Arc::downgrade(&retirement),
+            });
+            let signal = IoSignal::new(0, Arc::downgrade(&wake));
+            let subscription = context.available.subscribe(&signal);
+            let _ = retirement.unlock.set(Registration {
+                _wake: wake,
+                _signal: signal,
+                _subscription: subscription,
+            });
             retirement
         });
         if closing {
             retirement.closing.store(true, Ordering::Relaxed);
         }
         retirement.pending.store(true, Ordering::Relaxed);
+        retirement.clone()
+    }
+    fn bind_completion(self: &Arc<Self>, backend: &mut OwnedBackend) {
+        self.completion.get_or_init(|| {
+            let wake: Arc<dyn IoWake> = Arc::new(Wake {
+                retirement: Arc::downgrade(self),
+            });
+            let signal = IoSignal::new(0, Arc::downgrade(&wake));
+            let subscription = backend.0.subscribe_completion(&signal);
+            Registration {
+                _wake: wake,
+                _signal: signal,
+                _subscription: subscription,
+            }
+        });
+    }
+    pub(super) fn arm(context: &Arc<Inner>, backend: &mut OwnedBackend, closing: bool) {
+        Self::acquire(context, closing).bind_completion(backend);
+    }
+    /// The original resource retains itself until its active lease unlocks.
+    /// No CPU slot or host caller waits for an unrelated native invocation.
+    pub(super) fn close(context: &Arc<Inner>) {
+        Self::acquire(context, true).drain();
     }
     fn drain(self: &Arc<Self>) {
         if !self.pending.load(Ordering::Relaxed) {
@@ -117,11 +133,15 @@ impl Retirement {
                 self.running.store(0, Ordering::Release);
                 self.context
                     .available
-                    .notify_atomic_except(&self.subscriptions.get().unwrap()[1]._signal);
+                    .notify_atomic_except(&self.unlock.get().unwrap()._signal);
                 return;
             }
-            backend.0.reap_abandoned();
+            self.bind_completion(&mut backend);
             let closing = self.closing.load(Ordering::Relaxed);
+            if closing {
+                backend.0.retire_jobs();
+            }
+            backend.0.reap_abandoned();
             let done = !backend.0.has_abandoned() && (!closing || backend.0.retirement_ready());
             let released = if done { current.take() } else { None };
             drop(current);
@@ -130,7 +150,7 @@ impl Retirement {
             // unlock; the running state coalesces reentrant resource callbacks.
             self.context
                 .available
-                .notify_atomic_except(&self.subscriptions.get().unwrap()[1]._signal);
+                .notify_atomic_except(&self.unlock.get().unwrap()._signal);
             // Break the temporary keepalive cycle outside both object locks.
             drop(released);
             if done {

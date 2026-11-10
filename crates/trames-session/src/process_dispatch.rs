@@ -258,6 +258,8 @@ impl Dispatch {
             p.last_cpu,
             waiting,
         );
+        job.pending_cpu = p.pending_cpu.take();
+        job.pending_accounted = job.pending_cpu.is_some();
         if let State::Gpu {
             job: compile,
             pc,

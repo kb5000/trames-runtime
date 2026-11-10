@@ -187,12 +187,7 @@ impl Context {
     /// End an original mm's authority. Accepted native work retains the graph
     /// through its completion; no guest View or task slot waits for destruction.
     pub fn retire(&self) {
-        let mut lease = self.lock();
-        let backend = lease.backend.as_mut().unwrap();
-        backend.0.retire_jobs();
-        if backend.0.has_abandoned() || !backend.0.retirement_ready() {
-            retirement::Retirement::arm(&self.0, backend, true);
-        }
+        retirement::Retirement::close(&self.0);
     }
 }
 
@@ -210,6 +205,26 @@ mod tests {
             );
             self.1.send(()).unwrap();
         }
+    }
+    #[test]
+    fn retiring_a_busy_original_context_defers_to_its_lease_unlock_without_a_service_thread() {
+        let context = Context::new(Backend::new());
+        let lease = context.try_lock().unwrap();
+        let closing = context.clone();
+        let (send, receive) = mpsc::channel();
+        let closer = thread::spawn(move || {
+            closing.retire();
+            send.send(()).unwrap();
+        });
+        let result = receive.recv_timeout(Duration::from_secs(1));
+        assert!(context.0.retirement.lock().unwrap().is_some());
+        drop(lease);
+        closer.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "retirement waited for another native caller"
+        );
+        assert!(context.0.retirement.lock().unwrap().is_none());
     }
     #[test]
     fn nonblocking_lease_and_subscribe_retry_notify_only_after_unlock() {

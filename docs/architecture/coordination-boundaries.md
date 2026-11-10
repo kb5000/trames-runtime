@@ -1,11 +1,23 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 102, unified original task/mm structural dispatch, reviewed on 2026-11-10. The prior shared runtime
-baseline is `0894bef6642da29df58da8dea4cc71221068913e`.
-Mac HVF and the iPad interpreter share this userspace Linux kernel. Source
-resource work, scoped mapping admission and joined administration remain distinct.
+This is the consolidated implementation audit through stage 103, one-way source
+session completion, reviewed on 2026-11-10. The prior shared runtime baseline is
+`287fddcce660276c984b45f2d123562ddf1cccc5`. Mac HVF and the iPad interpreter share
+this userspace Linux kernel. Historical stage paragraphs retain their prior
+counts; the authoritative current category inventory is below.
 
 ## Current status at a glance — 2026-11-10
+
+Stage 103 closes the production terminal lifecycle category. Normal completion,
+explicit cancellation/deadline, budget exhaustion and source/backend failure use
+one-way completion on existing executors. The host cannot receive an unfinished
+guest-operation payload from this protocol. Task/mm/resource retirement and final
+network teardown are source work; a busy GPU lease defers its own retirement to
+actual resource notifications. Single-CPU product execution uses this same path.
+The remaining category count is three. Legacy mutable embedding hooks and generic
+execution handoff remain explicit debt, rather than a terminal completion route.
+Architecture checks prevent adding new compatibility handoffs or guest dispatch
+to terminal completion. See section 103.
 
 Stage 102 unifies the complete original task/mm structural control pipeline:
 worker admission, pinning preflight, scoped eligibility, clone/exec group work,
@@ -620,16 +632,17 @@ Actual excluded policy effects and missing capabilities retain explicit boundari
 
 ### Current remaining categories
 
-The count is **four broad categories**, not the number of historical subsystem
-rows. Stages 72–102 remove concrete triggers and close request-authority dependencies inside those categories; they do not
-prove that the final generic fallback is unreachable.
+The count is **three broad categories**. Stage 103 removes production terminal
+session lifecycle as a coordinator category: physical CPU interruption and object
+retirement confer no guest-execution authority on the waiting host. Initial/custom
+legacy embedding contracts remain explicitly tracked, and final generic fallback
+is not proven unreachable.
 
 | Remaining category | Actual trigger | Current scope / authoritative implementation |
 | --- | --- | --- |
-| Host cancellation and final teardown | Host cancel, deadline, shutdown, legacy stopped-hook requests, final CPU/backend drain and actual native-event backend failure | Pause/resume, original init notifications/signals, pressure reclaim, host filesystem commands and terminal/process admission no longer join. Actual terminal teardown and backend failure still stop their actors. Native-event failure returns its original HostIo cause after drain/cancellation, without an owner syscall retry. See [host control](../../crates/trames-session/src/process_vm.rs), [completion](../../crates/trames-session/src/process_exit.rs) and [workers](../../crates/trames-session/src/workers.rs). |
 | Missing capabilities and excluded resources | A genuinely absent source provider, an excluded original FD/node graph, a genuinely absent native event capability or unsupported source request body | There is no filesystem-kind exclusion after stage 82. Published global proc/sys metadata no longer lacks a source provider merely because it uses set_runtime_info. Other node/provider admission still applies. io_uring has exactly two submitter-scoped `require_owner()` maintenance call sites: an actually unavailable typed wait graph provider and deferred original body progress. An absent HostEvents hub no longer triggers this boundary: actual native interests are retained with their read/write directions. Compatibility capture carries its own original execution resources; per-task memory observations do not require a host-global statistics callback. Actual missing global providers and host backend errors retain their own boundary/cause. They remain connected to actual accepted request lifetime, subscriptions and cancellation. See [path authority](../../crates/trames-vfs/src/path_queries.rs), [maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [wait sources](../../crates/trames-linux/src/direct/uring/wait.rs) and [actor](../../crates/trames-linux/src/direct/uring/actor.rs). |
 | Final execution dispatch fallback | A returned SVC or cold HLT/resource operation not completed, parked or accepted by a source scope; host faults and capability-less embeddings retain their own explicit boundaries | The catch-all stops the current cohort for joined dispatch. Ordinary shared-FD ioctl discovery, residual prctl controls/errors, implemented time observations, FD status/NOATIME, inode seals, anonymous memory-file creation, mapped-memory msync/writeback, file-cache advice, canonical FD/error admission, the complete original epoll/poll/select graph and generic socket event sources, current-offset vector transports, blocking POSIX/OFD locks, directory flock and canonical unknown fcntl commands no longer use it. It remains an audit target even though admitted native calls, ordinary guest faults, generated ENOSYS and migrated syscalls have source completion. Recognized guest faults, caught handlers and signal-frame failures now complete/terminate on source. A backend error is not a software or full-Linux-VM fallback. See [worker dispatch](../../crates/trames-session/src/workers.rs) and [classification](../../crates/trames-session/src/worker_syscalls.rs). |
-| Initial and legacy orchestration | Initial admission, standalone/capability-less nonmember scheduling and other excluded embedding routes | Ordinary live members and preexisting Kernel Futex/Sleep actors migrate, park and wake on the original queue. Cold waiters have metadata only until an event prepares their original mm; child/exec admission and lazy CPU slots no longer require a joined owner. Unbound futex delivery now admits exact original cold waiters on existing executors; only standalone caller-side ready draining remains. Solo dispatch is on the caller, so its existence alone is not a cross-thread transition. See [admission](../../crates/trames-session/src/process.rs), [legacy wakes](../../crates/trames-session/src/futex.rs) and [queue](../../crates/trames-session/src/run_queue.rs). |
+| Initial and legacy orchestration | Initial admission, standalone/capability-less nonmember scheduling and other excluded embedding routes | Ordinary live members and preexisting Kernel Futex/Sleep actors migrate, park and wake on the original queue. Cold waiters have metadata only until an event prepares their original mm; child/exec admission and lazy CPU slots no longer require a joined owner. Unbound futex delivery now admits exact original cold waiters on existing executors; only standalone caller-side ready draining remains. Product single-CPU sessions use source executors and one-way completion. Backends without worker execution support and mutable legacy embedding hooks still use their explicit caller contract. See [admission](../../crates/trames-session/src/process.rs), [legacy wakes](../../crates/trames-session/src/futex.rs) and [queue](../../crates/trames-session/src/run_queue.rs). |
 
 Supported process/family lifecycle, signals and security policy, mount and task
 namespace administration, proc views, transfers, timers, event waits, terminals,
@@ -4483,3 +4496,36 @@ on the same original queue. See the [paired validation](https://github.com/kb500
 for exact source hashes and outcomes. This is not a controlled throughput claim.
 The four broad categories, both io_uring missing-provider/body guards and final
 generic-dispatch audit remain open; the overall objective is not declared done.
+
+
+## 103. One-way source session completion — 2026-11-10
+
+`execution_control::Control` distinguishes running, compatibility handoff and
+terminal completion. The first terminal cause is retained; a later handoff cannot
+reopen it. Budget exhaustion, original PID 1 completion, explicit host cancel and
+source/backend failures finish through this lifecycle. The production session
+path is shared by one and multiple CPU configurations. Bounded standalone test
+cohorts retain their existing nonterminal contract.
+
+After CPU acknowledgements, an existing executor receives a completion command
+whose reply is `Sender<()>`. It drains Views, publishes original CPU/trace/wait
+state, retires terminal task resources, releases discarded children, commits
+original mm metadata, cancels accepted requests where appropriate and shuts down
+root networking on normal completion. The caller collects diagnostics and flushes
+host output; it does not execute an unfinished SVC/native operation or perform
+source retirement. Budget continuations retain accepted CPU traps without
+re-accounting their retired instructions.
+
+The connected native ownership dependency is also removed: context retirement
+no longer blocks on an unrelated active GPU lease. The original resource keeps
+its retirement alive and completes on its unlock/completion notifications. There
+is no new service thread, polling bus, global guest-operation lock, ordinary
+memory fence or per-byte access check.
+
+`check-session-completion.py`, invoked by the existing architecture gate, freezes
+the outstanding compatibility-handoff call sites and rejects guest dispatch in
+terminal completion or an operation-bearing host reply. The two real io_uring
+missing-provider/body escalation sites and final generic dispatch remain under
+the three categories above. See the [paired validation](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/session-completion-20261110.json)
+for exact common, hardware and installed Dev outcomes. No throughput claim or
+stable deployment is implied by this architectural change.

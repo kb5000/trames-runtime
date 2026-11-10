@@ -227,6 +227,9 @@ impl<T: GuestOutput> GuestOutput for Adapter<'_, T> {
                 Duration::MAX
             })
     }
+    fn cancellation_requested(&self) -> bool {
+        self.inner.cancellation_requested()
+    }
     fn poll_control(&mut self, vfs: &Vfs) -> io::Result<bool> {
         let join = self.inner.poll_control(vfs)?;
         if !join {

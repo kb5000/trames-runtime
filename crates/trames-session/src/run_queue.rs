@@ -8,7 +8,7 @@ use crate::{
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Condvar, Mutex, OnceLock, Weak,
     },
     time::{Duration, Instant},
@@ -463,6 +463,7 @@ pub(super) struct Job<C: Cpu> {
     /// Guest code reached this exit during a bounded exclusive-mm window.
     /// Its syscall/native/fault handling still belongs to normal dispatch.
     pub pending_cpu: Option<SliceOutcome>,
+    pub pending_accounted: bool,
     /// A filtered syscall entry may defer before effects. Carry its
     /// decision to the owner instead of evaluating the same BPF entry twice.
     pub seccomp_entry: Option<crate::process::seccomp::EntryDecision>,
@@ -495,6 +496,7 @@ impl<C: Cpu> Job<C> {
             domain: None,
             checkpoint: None,
             pending_cpu: None,
+            pending_accounted: false,
             seccomp_entry: None,
             stats: Stats {
                 before,
@@ -824,6 +826,7 @@ pub(super) struct Epoch<C: Cpu> {
     pub progress: AtomicU64,
     pub local_vm: bool,
     persistent: bool,
+    terminal: AtomicBool,
 }
 impl<C: Cpu> Epoch<C> {
     pub fn memory_barrier(
@@ -883,6 +886,7 @@ impl<C: Cpu> Epoch<C> {
             progress: AtomicU64::new(0),
             local_vm: events.is_some(),
             persistent,
+            terminal: AtomicBool::new(false),
         })
     }
     pub fn with_events(
@@ -921,6 +925,9 @@ impl<C: Cpu> Epoch<C> {
             }
         }
     }
+    pub(crate) fn bind_session(&self, terminal: bool) {
+        self.terminal.store(terminal, Ordering::Relaxed);
+    }
     pub fn bind_lifecycle(&self, lifecycle: crate::process::lifecycle::Lifecycle<C>) {
         lifecycle.bind_memory(self.io_target.clone(), &self.control);
         assert!(self.lifecycle.set(lifecycle).is_ok());
@@ -939,6 +946,44 @@ impl<C: Cpu> Epoch<C> {
             .cloned()
             .map(crate::RuntimeError::HostIo)
             .or(lifecycle)
+    }
+    /// Run only on a returned executor. No mutable Kernel or host callback enters.
+    pub(crate) fn finish_closed(&self) {
+        assert!(self.control.closing());
+        let lifecycle = self.lifecycle.get().expect("source completion lifecycle");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            lifecycle.finish_closed(
+                self,
+                self.control.end() != Some(crate::execution_control::End::Budget),
+            )
+        }))
+        .unwrap_or(Err(crate::RuntimeError::Arguments(
+            "session completion panicked",
+        )));
+        if let Err(error) = result {
+            lifecycle.host_error(error);
+        }
+    }
+    pub(crate) fn collect_closed(
+        &self,
+        kernel: &mut crate::process::Kernel<C>,
+    ) -> Option<crate::RuntimeError> {
+        let lifecycle = self
+            .lifecycle
+            .get()
+            .expect("source completion lifecycle")
+            .collect_closed(kernel);
+        self.host_error
+            .get()
+            .cloned()
+            .map(crate::RuntimeError::HostIo)
+            .or(lifecycle)
+    }
+    pub(crate) fn drain_closed(&self) -> Vec<Done<C>> {
+        assert!(self.control.closing());
+        let done = self.drain();
+        self.queues.lock().unwrap().members.clear();
+        done
     }
     pub fn bind_starter(&self, starter: crate::workers::Starter<C>) {
         self.starter.get_or_init(|| starter);
@@ -959,7 +1004,7 @@ impl<C: Cpu> Epoch<C> {
         if let Err(error) = starter.start(slot, epoch) {
             self.active_slots.fetch_and(!bit, Ordering::Relaxed);
             self.activation_failed.store(true, Ordering::Relaxed);
-            self.control.stop();
+            self.control.close(crate::execution_control::End::Failed);
             return Err(error);
         }
         Ok(())
@@ -1245,16 +1290,40 @@ impl<C: Cpu> Epoch<C> {
             false
         }
     }
-    pub fn stop(&self) {
+    pub fn handoff(&self) {
         let mut q = self.queues.lock().unwrap();
-        self.control.stop();
+        self.control.handoff();
         self.notify(&mut q);
+    }
+    /// One-way session completion. The waiting host receives no guest work.
+    fn end(&self, reason: crate::execution_control::End) {
+        let mut q = self.queues.lock().unwrap();
+        self.control.close(reason);
+        q.domains.interrupt_host_pause();
+        self.notify(&mut q);
+    }
+    pub(crate) fn fail(&self) {
+        self.end(crate::execution_control::End::Failed);
+    }
+    pub(crate) fn cancel(&self) {
+        self.end(crate::execution_control::End::Cancelled);
+    }
+    pub(crate) fn complete(&self) {
+        if self.terminal.load(Ordering::Relaxed) {
+            self.end(crate::execution_control::End::Exited);
+        } else {
+            self.handoff();
+        }
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
+    pub(crate) fn stop(&self) {
+        self.handoff();
     }
     /// Terminal host failure. Keep the first cause and drain original actors;
     /// never reinterpret it as a missing guest operation or owner retry.
     pub fn fail_host_io(&self, error: std::io::Error) {
         let _ = self.host_error.set(Arc::new(error));
-        self.stop();
+        self.fail();
     }
     #[cfg(all(test, trames_interpreter_conformance))]
     pub(crate) fn reject_host_events(&self, error: std::io::Error) {
@@ -1598,7 +1667,7 @@ impl<C: Cpu> Epoch<C> {
                     drop(q);
                     if let Err(error) = lifecycle.pump_host(Some(self), slot) {
                         lifecycle.host_error(error);
-                        self.stop();
+                        self.fail();
                     }
                     q = self.queues.lock().unwrap();
                     q.completing -= 1;
@@ -1691,7 +1760,7 @@ impl<C: Cpu> Epoch<C> {
                     Ok(None) => unreachable!("original epoch provides native events"),
                     Err(error) => {
                         let _ = self.host_error.set(Arc::new(error));
-                        self.control.stop();
+                        self.control.close(crate::execution_control::End::Failed);
                         self.notify(&mut q);
                         continue;
                     }
@@ -1716,7 +1785,7 @@ impl<C: Cpu> Epoch<C> {
                 dispatched = true;
                 if let Err(error) = result {
                     let _ = self.host_error.set(Arc::new(error));
-                    self.control.stop();
+                    self.control.close(crate::execution_control::End::Failed);
                 }
                 self.notify(&mut q);
                 continue;
@@ -1765,7 +1834,7 @@ impl<C: Cpu> Epoch<C> {
                         }
                     }
                 } else {
-                    self.control.stop();
+                    self.control.handoff();
                     self.notify(&mut q);
                     return None;
                 }
@@ -1999,7 +2068,7 @@ impl<C: Cpu> Epoch<C> {
             }
         }
         if !exited {
-            self.control.stop();
+            self.control.handoff();
         }
         self.notify(&mut q);
         drop(q);

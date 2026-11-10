@@ -265,6 +265,9 @@ impl<C: Cpu> Directory<C> {
     pub fn handle(&self, id: &u32) -> Option<Handle<C>> {
         self.0.lock().tasks.get(id).cloned()
     }
+    pub fn all(&self) -> Vec<(u32, Handle<C>)> {
+        self.entries().iter().cloned().collect()
+    }
     fn entries(&self) -> Entries<C> {
         let mut members = self.0.lock();
         if let Some(snapshot) = &members.snapshot {

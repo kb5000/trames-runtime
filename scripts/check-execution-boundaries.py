@@ -3,6 +3,9 @@
 """Reject interpreter or platform dependencies in the common Linux runtime."""
 import json
 import subprocess
+from pathlib import Path
+
+subprocess.run(["python3", str(Path(__file__).with_name("check-session-completion.py"))], check=True)
 
 metadata = json.loads(subprocess.check_output(
     ['cargo', 'metadata', '--format-version', '1', '--locked'], text=True))

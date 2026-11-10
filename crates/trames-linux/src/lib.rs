@@ -231,6 +231,11 @@ pub trait GuestOutput {
         Ok(true)
     }
 
+    /// A terminal session request, distinct from compatibility resource work.
+    /// It enters source lifecycle completion; it never requests a stopped hook.
+    fn cancellation_requested(&self) -> bool {
+        false
+    }
     /// Poll host queues/original resources without touching guest bytes.
     /// True requests the stopped control hook.
     /// Legacy adapters conservatively retain their existing joined callback.

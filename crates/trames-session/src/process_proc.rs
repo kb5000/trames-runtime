@@ -559,15 +559,10 @@ mod tests {
                 assert!(!kernel.cohort_return_syscalls.contains_key(&number));
             }
             assert_eq!(
-                kernel.vm_checkpoint_groups,
-                u64::from(cpus != 1),
-                "one on-demand target activation"
+                kernel.vm_checkpoint_groups, 1,
+                "one source activation on both single and multiple CPU sessions"
             );
-            assert_eq!(
-                kernel.vm_checkpoint_spaces,
-                u64::from(cpus != 1),
-                "caller remains runnable"
-            );
+            assert_eq!(kernel.vm_checkpoint_spaces, 1, "caller remains runnable");
         }
     }
 

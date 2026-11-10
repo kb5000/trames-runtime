@@ -165,23 +165,19 @@ fn native_backend_failure_drains_source_read_poll_and_uring_without_owner_replay
                     _ => panic!("host error must stop actors without owner work: mode={mode}"),
                 }
             }
-            let error = epoch.collect_lifecycle(&mut k).unwrap();
+            k.workers.finish_closed(epoch.clone()).unwrap();
+            let error = epoch.collect_closed(&mut k).unwrap();
             assert!(
                 matches!(&error, RuntimeError::HostIo(error) if error.kind()==std::io::ErrorKind::PermissionDenied && error.to_string().contains("original native event failure"))
             );
-            let done = epoch.drain();
             file_epoch.finish();
             let _ = uring_epoch.finish();
-            let original = done.iter().find(|done| done.pid == 1).unwrap();
-            assert_eq!(original.cpu.x(0), args[0]);
-            assert_eq!(original.cpu.x(19), 0);
-            assert_eq!(original.syscalls, 0);
-            assert!(done
-                .iter()
-                .all(|done| done.serviced_syscalls == 0 && done.service_waits == 0));
-            k.cancel_host_io_requests();
+            assert_eq!(k.serviced_syscalls, 0);
+            assert_eq!(k.worker_service_waits, 0);
+            assert!(k.cohort_return_syscalls.is_empty());
             let mut root = k.processes.get_mut(&1).unwrap();
-            root.memory.commit_parallel().unwrap();
+            assert_eq!(root.cpu.x(0), args[0]);
+            assert_eq!(root.cpu.x(19), 0);
             assert_eq!(root.memory.read_array::<256>(0x1000).unwrap(), [0xa5; 256]);
             assert!(!root.linux.uring_requires_owner());
             if let Some(ring) = ring {

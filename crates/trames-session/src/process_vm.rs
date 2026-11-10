@@ -371,6 +371,12 @@ impl<C: Cpu> Kernel<C> {
             let join = io
                 .poll_control(&root.linux.vfs)
                 .map_err(|_| RuntimeError::Arguments("host session control failed"))?;
+            if io.cancellation_requested() {
+                if let Some(epoch) = epoch {
+                    epoch.cancel();
+                }
+                return Err(RuntimeError::Cancelled);
+            }
             if let Some(epoch) = epoch {
                 epoch.pause_host(io.paused());
             }
