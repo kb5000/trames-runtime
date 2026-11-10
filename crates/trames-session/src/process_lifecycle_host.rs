@@ -17,12 +17,8 @@ impl<C: Cpu> Lifecycle<C> {
     pub(crate) fn submit_host(&self, request: trames_linux::HostSpawn) {
         self.host_launches.submit(request);
     }
-    pub(crate) fn pump_host(
-        &self,
-        epoch: Option<&Epoch<C>>,
-        slot: usize,
-    ) -> Result<(), RuntimeError> {
-        let signal = epoch.and_then(|_| self.host_driver.get().map(|driver| &driver.signal));
+    pub(crate) fn pump_host(&self, epoch: &Epoch<C>, slot: usize) -> Result<(), RuntimeError> {
+        let signal = self.host_driver.get().map(|driver| &driver.signal);
         let mut pending = Vec::new();
         let mut ready = self.host_launches.take(signal).into_iter();
         while let Some(mut work) = ready.next() {
@@ -47,7 +43,7 @@ impl<C: Cpu> Lifecycle<C> {
     fn host_step(
         &self,
         work: &mut Launch<C>,
-        epoch: Option<&Epoch<C>>,
+        epoch: &Epoch<C>,
         slot: usize,
     ) -> Result<bool, RuntimeError> {
         let target: Arc<dyn trames_shared::IoWake> = self.host_launches.clone();
@@ -124,7 +120,7 @@ impl<C: Cpu> Lifecycle<C> {
                     // external PID. Cancellation then either wins publication,
                     // or addresses an already discoverable original group.
                     let _admission = task.try_admit().expect("unpublished host child");
-                    let admission = epoch.map(|epoch| epoch.reserve_host(id));
+                    let admission = epoch.reserve_host(id);
                     self.tasks.publish(id, task.clone());
                     if !work.process.publish(id) {
                         task.read().signals.io.lifecycle().request_exit(1);
@@ -148,9 +144,6 @@ impl<C: Cpu> Lifecycle<C> {
                     if !task.read().signals.io.live() {
                         return Ok(true);
                     }
-                    let Some(epoch) = epoch else {
-                        return Ok(true);
-                    };
                     if epoch.contains(id) {
                         return Ok(true);
                     }
@@ -238,15 +231,11 @@ mod tests {
         fn write(&mut self, _: OutputFd, bytes: &[u8]) -> std::io::Result<usize> {
             Ok(bytes.len())
         }
-        fn control(&mut self, _: &mut trames_vfs::Vfs) -> std::io::Result<bool> {
-            panic!("live host launch must not invoke the stopped hook")
+
+        fn poll_host(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<trames_linux::HostState> {
+            Ok(trames_linux::HostState::Running)
         }
-        fn poll_control(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<bool> {
-            Ok(false)
-        }
-        fn live_host_processes(&self) -> bool {
-            true
-        }
+
         fn host_spawn(&mut self) -> Option<trames_linux::HostSpawn> {
             self.0.take()
         }
@@ -314,6 +303,58 @@ mod tests {
         k.publish_task(1, &root);
         k.processes.insert(1, root);
         (k, output, process)
+    }
+    #[test]
+    fn cold_host_launch_runs_on_sources_when_no_guest_cpu_is_ready() {
+        struct Host {
+            output: Output,
+            process: Arc<trames_linux::HostProcess>,
+            deadline: Instant,
+        }
+        impl GuestOutput for Host {
+            fn source_console(&mut self) -> Arc<dyn trames_vfs::ConsoleIo> {
+                self.output.source_console()
+            }
+            fn write(&mut self, fd: OutputFd, bytes: &[u8]) -> std::io::Result<usize> {
+                self.output.write(fd, bytes)
+            }
+            fn host_spawn(&mut self) -> Option<trames_linux::HostSpawn> {
+                self.output.host_spawn()
+            }
+            fn control_poll_interval(&self) -> Duration {
+                Duration::from_millis(1)
+            }
+            fn poll_host(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<HostState> {
+                assert!(
+                    Instant::now() < self.deadline,
+                    "cold source host launch did not complete"
+                );
+                Ok(HostState::from_cancelled(
+                    self.process.status() != trames_linux::HOST_RUNNING,
+                ))
+            }
+        }
+        for cpus in [1, 4, 12] {
+            let (mut k, output, process) = setup(false);
+            k.cpu_count = cpus;
+            k.per_cpu.resize(cpus, Duration::ZERO);
+            k.processes.get_mut(&1).unwrap().state =
+                State::Sleep(Instant::now() + Duration::from_secs(30), 0);
+            let mut host = Host {
+                output,
+                process: process.clone(),
+                deadline: Instant::now() + Duration::from_secs(5),
+            };
+            assert!(matches!(
+                k.drive(&mut host, u64::MAX),
+                Err(RuntimeError::Cancelled)
+            ));
+            assert_eq!(process.status(), 42 << 8);
+            assert_eq!(k.parallel_rounds, 1);
+            assert!(k.worker_slices > 0);
+            assert!(k.cohort_return_syscalls.is_empty());
+            assert_eq!(k.service_requests, 0);
+        }
     }
     fn start(k: &mut Kernel<Cpu>, lifecycle: Lifecycle<Cpu>) -> Arc<Epoch<Cpu>> {
         let epoch = Epoch::with_events(

@@ -110,7 +110,6 @@ pub trait Cpu: Registers + Default + Clone + Send + 'static {
     fn feature_names() -> &'static str {
         Self::FEATURE_NAMES
     }
-    const PARALLEL: bool;
     const EXACT_INSTRUCTIONS: bool;
     fn new(pc: u64, sp: u64) -> Self;
     fn sp(&self) -> u64;
@@ -143,19 +142,6 @@ pub trait Cpu: Registers + Default + Clone + Send + 'static {
     fn fault_retired(&self) -> u64;
     fn decode_stats(&self) -> DecodeStats;
     fn run(&mut self, engine: &mut Self::Engine, memory: &mut Memory, budget: u64) -> SliceOutcome;
-    /// Session-owned registration domain, shared by serial and worker dispatch.
-    /// Interpreters keep their direct Memory path; hardware backends must avoid
-    /// replacing a VM's snapshot domain when its runnable CPU count changes.
-    fn run_coordinated(
-        &mut self,
-        engine: &mut Self::Engine,
-        memory: &mut Memory,
-        registry: &mut trames_memory::parallel::Registry,
-        budget: u64,
-    ) -> SliceOutcome {
-        let _ = registry;
-        self.run(engine, memory, budget)
-    }
     /// Optional bounded CPU run while the caller already exclusively owns
     /// this mm at a mapping checkpoint. No native operation is executed here;
     /// an exit is returned to the ordinary worker dispatch. Software engines

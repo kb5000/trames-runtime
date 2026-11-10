@@ -11,11 +11,7 @@ use trames_shared::{IoSignal, IoSubscription, IoWake};
 pub(super) enum Phase<C: Cpu> {
     Request(Box<trames_linux::HostSpawn>),
     Image(birth::HostChild<C>, exec::Preparation<C>),
-    Published(
-        u32,
-        tasks::Handle<C>,
-        Option<crate::run_queue::HostAdmission<C>>,
-    ),
+    Published(u32, tasks::Handle<C>, crate::run_queue::HostAdmission<C>),
     Taken,
 }
 pub(super) struct Launch<C: Cpu> {

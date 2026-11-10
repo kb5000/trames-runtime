@@ -516,7 +516,7 @@ impl<C: Cpu> Runtime<C> {
             profile_syscalls: false,
             cpu_count: std::thread::available_parallelism()
                 .map_or(1, |n| n.get())
-                .min(if C::PARALLEL { 32 } else { 1 }),
+                .min(32),
         })
     }
     pub fn load(bytes: &[u8], argv: &[String], envp: &[String]) -> Result<Self, RuntimeError> {
@@ -591,6 +591,9 @@ impl<C: Cpu> Runtime<C> {
                 "exact instruction budgets are unavailable for this execution backend",
             ));
         }
+        output
+            .initialize(&mut self.linux.vfs)
+            .map_err(|_| RuntimeError::Arguments("host session initialization failed"))?;
         let pair = self.terminal.take().map(|state| {
             let pair = self
                 .linux
@@ -600,7 +603,7 @@ impl<C: Cpu> Runtime<C> {
             *pair.terminal.borrow_mut() = state;
             pair
         });
-        let count = self.cpu_count.clamp(1, if C::PARALLEL { 32 } else { 1 });
+        let count = self.cpu_count.clamp(1, 32);
         let workers = workers::Pool::<C>::with_profiling(count, self.profile_syscalls);
         let mut adapter = terminal::Adapter::new(output, pair, workers.terminal_executor());
         let result = process::run(self, &mut adapter, instruction_limit, workers);
@@ -871,6 +874,91 @@ mod tests {
             runtime.run(&mut out, 17),
             Err(RuntimeError::BudgetExceeded(17))
         ));
+    }
+
+    #[test]
+    fn host_bootstrap_precedes_cpu_admission_and_errors_do_not_execute_guest() {
+        struct Host {
+            setups: usize,
+            fail: bool,
+        }
+        impl GuestOutput for Host {
+            fn initialize(&mut self, vfs: &mut trames_vfs::Vfs) -> std::io::Result<()> {
+                self.setups += 1;
+                vfs.set_umask(0o077);
+                if self.fail {
+                    Err(std::io::Error::other("bootstrap failed"))
+                } else {
+                    Ok(())
+                }
+            }
+            fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo> {
+                std::sync::Arc::new(trames_vfs::CapturedConsole::default())
+            }
+            fn poll_host(
+                &mut self,
+                vfs: &trames_vfs::Vfs,
+            ) -> std::io::Result<trames_linux::HostState> {
+                assert_eq!(self.setups, 1);
+                assert_eq!(vfs.umask(), 0o077);
+                Ok(trames_linux::HostState::Running)
+            }
+            fn write(&mut self, _: trames_linux::OutputFd, bytes: &[u8]) -> std::io::Result<usize> {
+                Ok(bytes.len())
+            }
+        }
+        for cpus in [1, 4, 12] {
+            for fail in [false, true] {
+                let mut memory = Memory::default();
+                memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+                // umask(0); exit(old_mask)
+                for (index, word) in [
+                    0xd2800000u32,
+                    0xd28014c8,
+                    0xd4000001,
+                    0xd2800ba8,
+                    0xd4000001,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    memory
+                        .write_array(0x1000 + index as u64 * 4, word.to_le_bytes())
+                        .unwrap();
+                }
+                memory.protect(0x1000, PAGE_SIZE, Permissions::RX).unwrap();
+                let mut runtime = Runtime {
+                    continuation: None,
+                    memory_limits: MemoryLimits::default(),
+                    cpu: Cpu::new(0x1000, 0),
+                    engine: Default::default(),
+                    memory,
+                    linux: Linux::new(0x2000),
+                    terminal: None,
+                    metrics: RuntimeMetrics::default(),
+                    profile_syscalls: false,
+                    cpu_count: cpus,
+                    vulkan_display: VulkanDisplay::default(),
+                };
+                let mut host = Host { setups: 0, fail };
+                let result = runtime.run(&mut host, 100);
+                assert_eq!(host.setups, 1);
+                if fail {
+                    assert!(matches!(
+                        result,
+                        Err(RuntimeError::Arguments(
+                            "host session initialization failed"
+                        ))
+                    ));
+                    assert_eq!(runtime.cpu.pc, 0x1000);
+                    assert_eq!(runtime.linux.vfs.umask(), 0o077);
+                } else {
+                    assert_eq!(result.unwrap().code, 0o077);
+                    assert_eq!(runtime.metrics.parallel_rounds, 1);
+                    assert!(runtime.metrics.worker_slices > 0);
+                }
+            }
+        }
     }
 }
 

@@ -19,7 +19,6 @@ impl<C: Cpu> Kernel<C> {
             }
         };
         let began = Instant::now();
-        let batch = !C::EXACT_INSTRUCTIONS && epoch.checkpoint_owns_all_jobs(&checkpoint);
         let wait = checkpoint
             .quiescent
             .saturating_duration_since(checkpoint.requested);
@@ -116,7 +115,6 @@ impl<C: Cpu> Kernel<C> {
             if !self.exec_checkpoint(epoch, &mut checkpoint, io, &mut created)? {
                 return Ok(false);
             }
-            let lease_deadline = Instant::now() + Duration::from_micros(250);
             for job in &mut checkpoint.jobs {
                 if job
                     .work
@@ -196,82 +194,22 @@ impl<C: Cpu> Kernel<C> {
                     self.processes.insert(pid, p);
                     continue;
                 }
-                let mut extra = false;
-                let mut used_window = false;
-                loop {
-                    let call = crate::structural::Call::from_cpu(&p.cpu)
-                        .and_then(|call| call.memory())
-                        .expect("original memory operation");
-                    let number = call.number();
-                    let args = std::array::from_fn(|i| p.cpu.x(i));
-                    let kind = call.index();
-                    self.vm_checkpoint_calls[kind] += 1;
-                    let call_began = Instant::now();
-                    p.trace = std::mem::take(&mut job.work.trace);
-                    self.call(pid, &mut p, number, args, io);
-                    job.work.trace = std::mem::take(&mut p.trace);
-                    self.vm_checkpoint_time[3] += call_began.elapsed();
-                    assert!(matches!(p.state, State::Ready), "mapping call cannot park");
-                    self.vm_local_syscalls += 1;
-                    self.vm_checkpoint_batch[2] += u64::from(extra);
-                    let remaining = lease_deadline.saturating_duration_since(Instant::now());
-                    if !batch
-                        || p.stopped()
-                        || p.frozen(pid)
-                        || p.seccomp.mode() != 0
-                        || remaining.is_zero()
-                        || epoch.control.stopped()
-                    {
-                        break;
-                    }
-                    let cpu_began = Instant::now();
-                    p.signals
-                        .io
-                        .proc_view
-                        .begin_accounting(cpu_began, job.stats.worker);
-                    let outcome = {
-                        let p = &mut *p;
-                        p.cpu.run_quiesced(
-                            &mut self.engine,
-                            &mut p.memory,
-                            &mut self.parallel_memory,
-                            // Share one deadline across all requesters; guest
-                            // computation cannot extend the exclusive window.
-                            remaining,
-                        )
-                    };
-                    let elapsed = outcome
-                        .as_ref()
-                        .map_or(Duration::ZERO, |_| cpu_began.elapsed());
-                    p.signals
-                        .io
-                        .proc_view
-                        .finish_accounting(cpu_began, elapsed, job.stats.worker);
-                    let Some(outcome) = outcome else {
-                        break;
-                    };
-                    p.cpu_time += elapsed;
-                    self.cpu_total += elapsed;
-                    self.per_cpu[job.stats.worker] += elapsed;
-                    self.vm_checkpoint_time[6] += elapsed;
-                    self.context_switches += 1;
-                    self.vm_checkpoint_batch[0] += u64::from(!used_window);
-                    self.vm_checkpoint_batch[1] += 1;
-                    used_window = true;
-                    if matches!(outcome, SliceOutcome::Syscall { .. })
-                        && crate::structural::Call::from_cpu(&p.cpu)
-                            .and_then(|call| call.memory())
-                            .is_some()
-                    {
-                        p.cpu.clear_exclusive();
-                        extra = true;
-                        continue;
-                    }
-                    if !matches!(outcome, SliceOutcome::Yield { .. }) {
-                        job.pending_cpu = Some(outcome);
-                    }
-                    break;
-                }
+                let call = crate::structural::Call::from_cpu(&p.cpu)
+                    .and_then(|call| call.memory())
+                    .expect("original memory operation");
+                let number = call.number();
+                let args = std::array::from_fn(|i| p.cpu.x(i));
+                self.vm_checkpoint_calls[call.index()] += 1;
+                let call_began = Instant::now();
+                p.trace = std::mem::take(&mut job.work.trace);
+                self.call(pid, &mut p, number, args, io);
+                job.work.trace = std::mem::take(&mut p.trace);
+                self.vm_checkpoint_time[3] += call_began.elapsed();
+                assert!(matches!(p.state, State::Ready), "mapping call cannot park");
+                self.vm_local_syscalls += 1;
+                // The compatibility handler can finish the accepted operation,
+                // but it cannot execute a subsequent guest instruction. Native
+                // batching exists only on the original execution worker.
                 job.work.cpu = std::mem::take(&mut p.cpu);
                 control.finish(job.stop_hold());
                 if let Some(task) = p.signals.io.cgroup() {
@@ -368,10 +306,10 @@ impl<C: Cpu> Kernel<C> {
     ) -> Result<bool, RuntimeError> {
         self.persistent_control_checks += 1;
         if let Some(root) = self.processes.get(&1) {
-            let join = io
-                .poll_control(&root.linux.vfs)
-                .map_err(|_| RuntimeError::Arguments("host session control failed"))?;
-            if io.cancellation_requested() {
+            let state = io
+                .poll_host(&root.linux.vfs)
+                .map_err(|_| RuntimeError::Arguments("host session poll failed"))?;
+            if state == HostState::Cancelled || io.cancellation_requested() {
                 if let Some(epoch) = epoch {
                     epoch.cancel();
                 }
@@ -382,39 +320,19 @@ impl<C: Cpu> Kernel<C> {
             }
             let directory = root.signals.io_directory.clone();
             let root_task = root.signals.io.clone();
-            let terminal = root
-                .linux
-                .vfs
-                .live_ptys()
-                .iter()
-                .filter(|pair| !pair.has_signal_route())
-                .any(|pair| {
-                    pair.host_resize_pending
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        || pair.host_signals.load(std::sync::atomic::Ordering::Relaxed) != 0
-                        || !pair.master_alive.load(std::sync::atomic::Ordering::Relaxed)
-                            && !pair
-                                .hangup_notified
-                                .load(std::sync::atomic::Ordering::Relaxed)
-                });
             drop(root);
-            // The accepted host event targets this original PID 1 task. It
-            // neither borrows its executing CPU nor signals unrelated jobs.
             if let Some(signal) = io.root_signal() {
                 root_task.host_signal(signal);
             }
-            if io.live_host_processes() {
+            while let Some(request) = io.host_spawn() {
                 if let Some(epoch) = epoch {
-                    while let Some(request) = io.host_spawn() {
-                        epoch.submit_host(request);
-                    }
-                    while let Some((group, signal)) = io.host_signal() {
-                        directory.host_signal_group(group, signal);
-                    }
+                    epoch.submit_host(request);
+                } else {
+                    self.host_launches.submit(request);
                 }
             }
-            if join || terminal {
-                return Ok(true);
+            while let Some((group, signal)) = io.host_signal() {
+                directory.host_signal_group(group, signal);
             }
         }
         let now = Instant::now();
@@ -751,12 +669,12 @@ mod tests {
             std::sync::Arc::new(trames_vfs::CapturedConsole::default())
         }
 
-        fn poll_control(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<bool> {
-            Ok(self.0.load(Ordering::Relaxed))
+        fn poll_host(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<trames_linux::HostState> {
+            Ok(trames_linux::HostState::from_cancelled(
+                self.0.load(Ordering::Relaxed),
+            ))
         }
-        fn control(&mut self, _: &mut trames_vfs::Vfs) -> std::io::Result<bool> {
-            Ok(!self.0.load(Ordering::Relaxed))
-        }
+
         fn write(&mut self, _: OutputFd, bytes: &[u8]) -> std::io::Result<usize> {
             Ok(bytes.len())
         }
@@ -773,13 +691,14 @@ mod tests {
                 std::sync::Arc::new(trames_vfs::CapturedConsole::default())
             }
 
-            fn control(&mut self, _: &mut trames_vfs::Vfs) -> std::io::Result<bool> {
-                Ok(!self.bytes.with_read(8, 8, |b| b == 17u64.to_le_bytes())
-                    && Instant::now() < self.deadline)
-            }
-            fn poll_control(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<bool> {
-                Ok(self.bytes.with_read(8, 8, |b| b == 17u64.to_le_bytes())
-                    || Instant::now() >= self.deadline)
+            fn poll_host(
+                &mut self,
+                _: &trames_vfs::Vfs,
+            ) -> std::io::Result<trames_linux::HostState> {
+                Ok(trames_linux::HostState::from_cancelled(
+                    self.bytes.with_read(8, 8, |b| b == 17u64.to_le_bytes())
+                        || Instant::now() >= self.deadline,
+                ))
             }
             fn write(&mut self, _: OutputFd, b: &[u8]) -> std::io::Result<usize> {
                 Ok(b.len())
@@ -1073,13 +992,14 @@ mod tests {
                 std::sync::Arc::new(trames_vfs::CapturedConsole::default())
             }
 
-            fn poll_control(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<bool> {
+            fn poll_host(
+                &mut self,
+                _: &trames_vfs::Vfs,
+            ) -> std::io::Result<trames_linux::HostState> {
                 self.0 += 1;
-                Ok(self.0 == 5)
+                Ok(trames_linux::HostState::from_cancelled(self.0 == 5))
             }
-            fn control(&mut self, _: &mut trames_vfs::Vfs) -> std::io::Result<bool> {
-                Ok(self.0 < 5)
-            }
+
             fn write(&mut self, _: OutputFd, bytes: &[u8]) -> std::io::Result<usize> {
                 Ok(bytes.len())
             }
@@ -1102,7 +1022,7 @@ mod tests {
             Err(RuntimeError::Cancelled)
         ));
         assert_eq!(polls.0, 5);
-        assert_eq!(k.persistent_control_checks, 5);
+        assert_eq!(k.persistent_control_checks, 4);
         assert_eq!(k.parallel_rounds, 1);
         assert_eq!(k.vm_checkpoint_groups, 0);
         assert_eq!(k.parallel_memory.metrics.full_rebuilds, 2);
@@ -1139,7 +1059,10 @@ mod tests {
             fn control_poll_interval(&self) -> Duration {
                 Duration::from_millis(1)
             }
-            fn poll_control(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<bool> {
+            fn poll_host(
+                &mut self,
+                _: &trames_vfs::Vfs,
+            ) -> std::io::Result<trames_linux::HostState> {
                 assert!(
                     Instant::now() < self.deadline,
                     "pause/resume failed to progress"
@@ -1165,17 +1088,15 @@ mod tests {
                 {
                     if self.cycles == 3 {
                         self.cancel = true;
-                        return Ok(true);
+                        return Ok(trames_linux::HostState::Cancelled);
                     }
                     self.previous = current;
                     self.paused = true;
                     self.since = Instant::now();
                 }
-                Ok(false)
+                Ok(trames_linux::HostState::Running)
             }
-            fn control(&mut self, _: &mut trames_vfs::Vfs) -> std::io::Result<bool> {
-                Ok(!self.cancel)
-            }
+
             fn write(&mut self, _: OutputFd, bytes: &[u8]) -> std::io::Result<usize> {
                 Ok(bytes.len())
             }
@@ -1278,7 +1199,10 @@ mod tests {
             fn source_console(&mut self) -> Arc<dyn trames_vfs::ConsoleIo> {
                 Arc::new(trames_vfs::CapturedConsole::default())
             }
-            fn poll_control(&mut self, vfs: &trames_vfs::Vfs) -> std::io::Result<bool> {
+            fn poll_host(
+                &mut self,
+                vfs: &trames_vfs::Vfs,
+            ) -> std::io::Result<trames_linux::HostState> {
                 self.checks += 1;
                 if self.checks >= 3 && !self.sent {
                     if let Some(info) = vfs
@@ -1299,11 +1223,11 @@ mod tests {
                         self.sent = true;
                     }
                 }
-                Ok(count(&self.done) != 0 || Instant::now() >= self.deadline)
+                Ok(trames_linux::HostState::from_cancelled(
+                    count(&self.done) != 0 || Instant::now() >= self.deadline,
+                ))
             }
-            fn control(&mut self, _: &mut trames_vfs::Vfs) -> std::io::Result<bool> {
-                Ok(count(&self.done) == 0 && Instant::now() < self.deadline)
-            }
+
             fn control_poll_interval(&self) -> Duration {
                 Duration::from_millis(1)
             }
@@ -1376,7 +1300,10 @@ mod tests {
                 std::sync::Arc::new(trames_vfs::CapturedConsole::default())
             }
 
-            fn poll_control(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<bool> {
+            fn poll_host(
+                &mut self,
+                _: &trames_vfs::Vfs,
+            ) -> std::io::Result<trames_linux::HostState> {
                 self.checks += 1;
                 if self.checks == 3 {
                     // wl_display.sync(new_id=2), sent after workers have parked.
@@ -1388,11 +1315,9 @@ mod tests {
                 }
                 self.finished = self.checks >= 8 && count(&self.completed) == 24
                     || Instant::now() >= self.deadline;
-                Ok(self.finished)
+                Ok(trames_linux::HostState::from_cancelled(self.finished))
             }
-            fn control(&mut self, _: &mut trames_vfs::Vfs) -> std::io::Result<bool> {
-                Ok(!self.finished && Instant::now() < self.deadline)
-            }
+
             fn write(&mut self, _: OutputFd, bytes: &[u8]) -> std::io::Result<usize> {
                 Ok(bytes.len())
             }
@@ -1525,7 +1450,10 @@ mod tests {
                 )
             }
 
-            fn poll_control(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<bool> {
+            fn poll_host(
+                &mut self,
+                _: &trames_vfs::Vfs,
+            ) -> std::io::Result<trames_linux::HostState> {
                 self.checks += 1;
                 if self.pause && self.checks == 2 {
                     self.paused = true;
@@ -1546,14 +1474,14 @@ mod tests {
                 let completed = self.completed.with_read(0, 16, |bytes| {
                     bytes[..8] == 1u64.to_le_bytes() && bytes[8..] == 1u64.to_le_bytes()
                 });
-                Ok(self.checks >= 12 && completed || Instant::now() >= self.deadline)
+                Ok(trames_linux::HostState::from_cancelled(
+                    self.checks >= 12 && completed || Instant::now() >= self.deadline,
+                ))
             }
             fn stdin_ready(&mut self) -> std::io::Result<bool> {
                 Ok(false)
             }
-            fn control(&mut self, _: &mut trames_vfs::Vfs) -> std::io::Result<bool> {
-                Ok(self.checks == 0)
-            }
+
             fn write(&mut self, _: OutputFd, bytes: &[u8]) -> std::io::Result<usize> {
                 Ok(bytes.len())
             }
@@ -1580,7 +1508,12 @@ mod tests {
                 completed: completed.clone(),
                 deadline: Instant::now() + Duration::from_secs(3),
             };
+            let mut results = Vec::new();
             for (id, mut p) in [(1, a), (2, b)] {
+                let result = Arc::new(SharedPage::new([0; PAGE_SIZE as usize]));
+                p.memory.unmap(0x1000, PAGE_SIZE).unwrap();
+                map(&mut p, 0x1000, result.clone(), None);
+                results.push(result);
                 map(&mut p, 0x2000, completed.clone(), None);
                 p.cpu.set_x(9, 0x2000 + (id as u64 - 1) * 8);
                 k.call(id, &mut p, 63, [reader as u64, 0x1000, 1, 0, 0, 0], &mut io);
@@ -1593,19 +1526,22 @@ mod tests {
                 k.drive(&mut io, u64::MAX),
                 Err(RuntimeError::Cancelled)
             ));
-            let mut bytes: Vec<_> = k
-                .processes
-                .values()
-                .map(|p| p.memory.read_array::<1>(0x1000).unwrap()[0])
+            let mut bytes: Vec<_> = results
+                .iter()
+                .map(|p| p.with_read(0, 1, |b| b[0]))
                 .collect();
             bytes.sort_unstable();
             assert_eq!(bytes, b"xy");
             assert_eq!(k.parallel_rounds, 1);
             assert_eq!(k.worker_direct_syscalls, 2);
             assert_eq!(k.service_requests, 0);
-            for mut p in k.processes.values_mut() {
+            for (id, mut p) in k.processes.iter_mut() {
                 assert!(p.retained_byte.is_none());
-                assert_eq!(p.linux.vfs.read(reader, 8).unwrap(), 9u64.to_le_bytes());
+                if id == 1 {
+                    assert_eq!(p.linux.vfs.read(reader, 8).unwrap(), 9u64.to_le_bytes());
+                } else {
+                    assert_eq!(p.linux.vfs.fd_kind(reader), Err(Errno(9)));
+                }
             }
         }
     }

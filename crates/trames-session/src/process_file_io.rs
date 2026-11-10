@@ -141,10 +141,17 @@ mod tests {
             fn paused(&self) -> bool {
                 self.paused
             }
-            fn poll_control(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<bool> {
+            fn poll_host(
+                &mut self,
+                _: &trames_vfs::Vfs,
+            ) -> std::io::Result<trames_linux::HostState> {
                 if self.work.is_some() {
                     match self.ready.read(1) {
-                        Err(trames_vfs::Errno(11)) => return Ok(Instant::now() > self.deadline),
+                        Err(trames_vfs::Errno(11)) => {
+                            return Ok(trames_linux::HostState::from_cancelled(
+                                Instant::now() > self.deadline,
+                            ))
+                        }
                         value => assert_eq!(
                             value,
                             Ok(vec![17]),
@@ -156,16 +163,11 @@ mod tests {
                 if let Some(work) = self.work.take() {
                     self.layouts.as_ref().unwrap().submit_host(work);
                 }
-                Ok(self.done.load(Ordering::Acquire) || Instant::now() > self.deadline)
+                Ok(trames_linux::HostState::from_cancelled(
+                    self.done.load(Ordering::Acquire) || Instant::now() > self.deadline,
+                ))
             }
-            fn control(&mut self, _: &mut trames_vfs::Vfs) -> std::io::Result<bool> {
-                if self.paused {
-                    if let Some(work) = self.work.take() {
-                        self.layouts.as_ref().unwrap().submit_host(work);
-                    }
-                }
-                Ok(!self.done.load(Ordering::Acquire) && Instant::now() <= self.deadline)
-            }
+
             fn control_poll_interval(&self) -> Duration {
                 Duration::from_millis(1)
             }

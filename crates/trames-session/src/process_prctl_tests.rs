@@ -55,12 +55,12 @@ fn residual_prctl_family_runs_without_join_and_proc_observes_name_before_drain()
         fn source_console(&mut self) -> Arc<dyn trames_vfs::ConsoleIo> {
             Arc::new(trames_vfs::CapturedConsole::default())
         }
-        fn poll_control(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<bool> {
+        fn poll_host(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<trames_linux::HostState> {
             self.seen |= self
                 .task
                 .observe(trames_vfs::ProcRefresh::Metadata, None)
                 .is_some_and(|p| p.command == b"worker-comm-len");
-            Ok(false)
+            Ok(trames_linux::HostState::Running)
         }
     }
     for (cpus, slots, filtered) in [(4, 4, false), (12, 12, false), (4, 1, false), (4, 1, true)] {

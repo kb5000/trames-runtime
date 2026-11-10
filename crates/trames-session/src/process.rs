@@ -34,7 +34,7 @@ pub(super) fn fault_info(fault: &trames_engine::CpuFault) -> Option<trames_kerne
     })
 }
 
-use trames_linux::{GuestOutput, Linux, SyscallOutcome};
+use trames_linux::{execution_io::Output as GuestOutput, HostState, Linux, SyscallOutcome};
 use trames_memory::{Access, Memory};
 use trames_vfs::capabilities;
 use trames_vfs::{Errno, FdKind, AT_FDCWD, MAX_FDS, O_NONBLOCK};
@@ -642,7 +642,6 @@ pub(crate) struct Kernel<C: Cpu> {
     cpu_count: usize,
     task_capacity: Arc<trames_kernel::task::Capacity>,
     workers: crate::workers::Pool<C>,
-    engine: C::Engine,
     backend_error: Option<String>,
     completed: Option<Exit>,
     source_completed: bool,
@@ -1040,34 +1039,22 @@ impl<C: Cpu> Kernel<C> {
         }
         spaces.values().sum()
     }
-    fn control(&mut self, io: &mut impl GuestOutput) -> Result<(), RuntimeError> {
-        let Some(mut root) = self.processes.get_mut(&1) else {
+    fn host_poll(&mut self, io: &mut impl GuestOutput) -> Result<(), RuntimeError> {
+        let Some(root) = self.processes.get(&1) else {
             return Ok(());
         };
-        let result = io.control(&mut root.linux.vfs);
-        match result {
-            Ok(true) => {
-                if let Some(signal @ 1..=64) = io.root_signal() {
-                    Self::queue_one(1, &mut root, signal, 0);
-                }
-            }
-            Ok(false) => return Err(RuntimeError::Cancelled),
-            Err(_) => return Err(RuntimeError::Arguments("host session control failed")),
+        let state = io
+            .poll_host(&root.linux.vfs)
+            .map_err(|_| RuntimeError::Arguments("host session poll failed"))?;
+        if state == HostState::Cancelled || io.cancellation_requested() {
+            return Err(RuntimeError::Cancelled);
+        }
+        if let Some(signal) = io.root_signal() {
+            root.signals.io.host_signal(signal);
         }
         drop(root);
-        if self.host_launches.pending() {
-            lifecycle::Lifecycle::capture(self).pump_host(None, 0)?;
-        }
         while let Some(request) = io.host_spawn() {
-            let process = request.process.clone();
-            match self.spawn_host(request) {
-                Ok(pid) => {
-                    if !process.publish(pid) {
-                        self.host_signal_group(pid, 1);
-                    }
-                }
-                Err(e) => process.fail(e.0),
-            }
+            self.host_launches.submit(request);
         }
         while let Some((group, signal)) = io.host_signal() {
             self.host_signal_group(group, signal);
@@ -1080,6 +1067,7 @@ impl<C: Cpu> Kernel<C> {
             root.signals.io_directory.host_signal_group(group, signal);
         }
     }
+    #[cfg(all(test, trames_interpreter_conformance))]
     fn spawn_host(&mut self, request: trames_linux::HostSpawn) -> Result<u32, Errno> {
         self.reap_waited();
         let root = self.processes.get(&1).ok_or(Errno(3))?;
@@ -3424,9 +3412,7 @@ impl<C: Cpu> Kernel<C> {
         {
             return Ok(false);
         }
-        if !C::PARALLEL
-            || !terminal && (self.cpu_count < 2 || !self.parallel_candidate(io.waits_for_host()))
-        {
+        if !terminal && (self.cpu_count < 2 || !self.parallel_candidate(io.waits_for_host())) {
             return Ok(false);
         }
         let console = io.source_console();
@@ -3524,8 +3510,8 @@ impl<C: Cpu> Kernel<C> {
                 || (p.linux.worker_uring_pending(&p.memory, id)
                     && !matches!(p.state, State::Ready | State::Zombie(_))
                     && !p.worker_gpu_candidate())
-                || (matches!(p.state, State::Futex { .. }) && vms.contains(&p.vm_id))
-                || (matches!(p.state, State::Sleep(..)) && vms.contains(&p.vm_id))
+                || (matches!(p.state, State::Futex { .. }) && (terminal || vms.contains(&p.vm_id)))
+                || (matches!(p.state, State::Sleep(..)) && (terminal || vms.contains(&p.vm_id)))
                 || (matches!(
                     p.state,
                     State::Sigwait { .. }
@@ -3584,8 +3570,17 @@ impl<C: Cpu> Kernel<C> {
             })
             .collect();
         let began = Instant::now();
-        let Some(mut views) = self.prepare_parallel_views(&members) else {
-            return Ok(false);
+        let mut views = self.prepare_parallel_views(&members).unwrap_or_default();
+        if let Some(error) = self.backend_error.take() {
+            return Err(RuntimeError::Backend(error));
+        }
+        // A busy original mm is admitted as metadata, not run on the host.
+        // Its existing release subscription wakes an execution worker to
+        // prepare the first byte View under original mm custody.
+        let deferred = if views.is_empty() {
+            members.clone()
+        } else {
+            Vec::new()
         };
         self.admit_private_views(&mut views);
         self.parallel_memory_time += began.elapsed();
@@ -3619,7 +3614,10 @@ impl<C: Cpu> Kernel<C> {
                 &mut network_epoch,
             ));
         }
-        for id in dormant {
+        for (id, _) in deferred
+            .into_iter()
+            .chain(dormant.into_iter().map(|id| (id, 0)))
+        {
             let memory = self.processes.read(&id).memory.instruction_identity().0;
             let job = self.capture_worker(
                 id,
@@ -3630,7 +3628,9 @@ impl<C: Cpu> Kernel<C> {
                 &mut network_epoch,
             );
             epoch.add_dormant(job, memory);
-            members.push((id, 0));
+            if !members.iter().any(|&(member, _)| member == id) {
+                members.push((id, 0));
+            }
         }
         // No cached connection/policy decision survives into guest execution.
         drop(network_epoch);
@@ -4216,23 +4216,10 @@ impl<C: Cpu> Kernel<C> {
         }
         timeout
     }
-    fn serial_quantum(&self) -> u64 {
-        // No runnable peer needs a turn. Keep a bounded CPU slice while
-        // amortizing control/PTY/timer and blocked-task checks. A syscall or
-        // native callback outcome still returns through finish_slice normally.
-        if self
-            .processes
-            .iter()
-            .any(|(id, p)| p.runnable() && !p.frozen(id))
-        {
-            4096
-        } else {
-            65536
-        }
-    }
+
     fn drive(&mut self, io: &mut impl GuestOutput, limit: u64) -> Result<Exit, RuntimeError> {
         io.bind_host_files(self.workers.file_executor(), self.file_layout_work());
-        'drive: loop {
+        loop {
             if let Some(exit) = self.completed.take() {
                 while !io
                     .flush_output()
@@ -4249,7 +4236,7 @@ impl<C: Cpu> Kernel<C> {
             }
             self.pump_guest_ptys();
             self.tick_timers();
-            self.control(io)?;
+            self.host_poll(io)?;
             self.poll_file_layouts();
             if io.paused() {
                 std::thread::park_timeout(Duration::from_millis(10));
@@ -4271,7 +4258,6 @@ impl<C: Cpu> Kernel<C> {
                     && !p.frozen(id)
                     && self.admit_owner_layouts(id, &mut p)?
                 {
-                    let was_parked = matches!(p.state, State::Sleep(..) | State::Blocked(..));
                     progress |= self.resume_gpu(id, &mut p);
                     progress |= {
                         let task = &mut *p;
@@ -4301,117 +4287,13 @@ impl<C: Cpu> Kernel<C> {
                         }
                         _ => {}
                     }
-                    // The first candidate check ran before this task woke. A
-                    // ring caller with a related peer should resume on workers,
-                    // rather than execute a whole owner quantum first. This is
-                    // a wake boundary check, never a normal instruction check.
-                    if was_parked
-                        && matches!(p.state, State::Ready)
-                        && self.cpu_count > 1
-                        && p.rekey.is_none()
-                        && !p.auto_reap
-                        && !p.linux.vfs.urings().is_empty()
-                    {
-                        self.processes.insert(id, p);
-                        if self.parallel_candidate(io.waits_for_host()) {
-                            continue 'drive;
-                        }
-                        p = self.processes.checkout(&id).expect("same joined task");
-                    }
                     if let Some(outcome) = p.pending_cpu.take() {
                         self.finish_slice(id, &mut p, outcome, io, false);
-                    }
-                    // Immediate native returns and pure queries keep the quantum.
-                    // No native borrow survives; blocking syscalls/faults still
-                    // return to the scheduler. Bound work/time between control,
-                    // signal and timer polls independently of guest retirement.
-                    let mut quantum = if p.runnable() {
-                        self.serial_quantum()
-                    } else {
-                        4096
-                    };
-                    let quantum_started = Instant::now();
-                    let mut immediate_returns = 0;
-                    let control = p
-                        .runnable()
-                        .then(|| p.signals.io.lifecycle().enter(&p.signals.io, id));
-                    if let Some(control) = &control {
-                        match C::execution_interrupt(&mut self.engine) {
-                            Ok(Some(interrupt)) => {
-                                control.bind_interrupt(interrupt);
-                            }
-                            Ok(None) => {}
-                            Err(error) => {
-                                self.processes.insert(id, p);
-                                return Err(RuntimeError::Backend(error.to_string()));
-                            }
-                        }
-                    }
-                    while p.runnable()
-                        && !p.frozen(id)
-                        && quantum != 0
-                        && self.admit_owner_layouts(id, &mut p)?
-                    {
-                        if self.instructions >= limit {
-                            self.processes.insert(id, p);
-                            return Err(RuntimeError::BudgetExceeded(limit));
-                        }
-                        let instructions_before = self.instructions;
-                        let began = Instant::now();
-                        let decode_before = p.cpu.decode_stats();
-                        p.signals.io.proc_view.dispatched(
-                            p.signals.io.scheduling.affinity().trailing_zeros() as usize,
-                        );
-                        let cpu = p.signals.io.scheduling.affinity().trailing_zeros() as usize;
-                        p.signals.io.proc_view.begin_accounting(began, cpu);
-                        let outcome = {
-                            let p = &mut *p;
-                            p.trace.flush();
-                            p.cpu.run_coordinated(
-                                &mut self.engine,
-                                &mut p.memory,
-                                &mut self.parallel_memory,
-                                (limit - self.instructions).min(quantum),
-                            )
-                        };
-                        let elapsed = began.elapsed();
-                        let decode_after = p.cpu.decode_stats();
-                        self.decode_lookups += decode_after.lookups - decode_before.lookups;
-                        self.decode_misses += decode_after.misses - decode_before.misses;
-                        self.instructions_decoded +=
-                            decode_after.instructions - decode_before.instructions;
-                        p.cpu_time += elapsed;
-                        self.cpu_total += elapsed;
-                        p.last_cpu = p.signals.io.scheduling.affinity().trailing_zeros() as usize;
-                        self.per_cpu[p.last_cpu] += elapsed;
-                        p.signals
-                            .io
-                            .proc_view
-                            .finish_accounting(began, elapsed, cpu);
-                        self.context_switches += 1;
-                        let immediate_return = self.finish_slice(id, &mut p, outcome, io, true);
-                        if let Some(error) = self.backend_error.take() {
-                            self.processes.insert(id, p);
-                            return Err(RuntimeError::Backend(error));
-                        }
-                        if immediate_return {
-                            immediate_returns += 1;
-                        }
                         progress = true;
-                        quantum = quantum.saturating_sub(self.instructions - instructions_before);
-                        if !immediate_return
-                            || immediate_returns >= 32
-                            || quantum_started.elapsed() >= Duration::from_millis(2)
-                        {
-                            break;
-                        }
                     }
-                    if let Some(control) = control {
-                        control.finish(Some(p.stop_held()));
-                    }
-                    if let Some(task) = p.signals.io.cgroup() {
-                        task.acknowledge();
-                    }
+                    // Newly ready work is admitted by execution_epoch on the
+                    // next turn. The waiting host never executes guest CPUs.
+                    progress |= p.runnable();
                 }
                 let actual_id = p.rekey.take().unwrap_or(id);
                 if !p.auto_reap || actual_id == 1 {
@@ -4434,7 +4316,7 @@ impl<C: Cpu> Kernel<C> {
                             .flush_output()
                             .map_err(|_| RuntimeError::Arguments("terminal master output failed"))?
                         {
-                            self.control(io)?;
+                            self.host_poll(io)?;
                             self.poll_file_layouts();
                             self.wait_external(io.control_poll_interval());
                         }
@@ -4760,7 +4642,7 @@ pub(super) fn run<C: Cpu>(
         .scheduling
         .set_affinity((1u64 << runtime.cpu_count.clamp(1, 32)) - 1);
     root.bind_signals();
-    let count = runtime.cpu_count.clamp(1, if C::PARALLEL { 32 } else { 1 });
+    let count = runtime.cpu_count.clamp(1, 32);
     let mut kernel = Kernel::<C> {
         host_launches: Default::default(),
         byte_target: Arc::new(JoinedByteWake(std::thread::current())),
@@ -4772,7 +4654,6 @@ pub(super) fn run<C: Cpu>(
         cpu_count: count,
         task_capacity,
         workers,
-        engine: std::mem::take(&mut runtime.engine),
         backend_error: None,
         completed: None,
         source_completed: false,
@@ -4959,7 +4840,6 @@ pub(super) fn run<C: Cpu>(
         runtime.memory = p.memory;
         runtime.linux = p.linux;
     }
-    runtime.engine = kernel.engine;
     result
 }
 
@@ -5104,8 +4984,11 @@ mod tests {
             fn root_signal(&mut self) -> Option<u32> {
                 self.0.take()
             }
-            fn poll_control(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<bool> {
-                Ok(false)
+            fn poll_host(
+                &mut self,
+                _: &trames_vfs::Vfs,
+            ) -> std::io::Result<trames_linux::HostState> {
+                Ok(trames_linux::HostState::Running)
             }
             fn write(&mut self, _: OutputFd, b: &[u8]) -> std::io::Result<usize> {
                 Ok(b.len())
@@ -5124,7 +5007,7 @@ mod tests {
                     .cohort_control(&[(1, 0), (2, 1)], &mut Control(Some(37)))
                     .unwrap());
             } else {
-                k.control(&mut Control(Some(37))).unwrap();
+                k.host_poll(&mut Control(Some(37))).unwrap();
             }
             assert_eq!(
                 k.processes.read(&1).next_signal(u64::MAX).map(|s| s.0),
@@ -5136,7 +5019,7 @@ mod tests {
                     .cohort_control(&[(1, 0), (2, 1)], &mut Control(Some(65)))
                     .unwrap());
             } else {
-                k.control(&mut Control(Some(65))).unwrap();
+                k.host_poll(&mut Control(Some(65))).unwrap();
             }
         }
     }
@@ -5252,58 +5135,13 @@ mod tests {
         child.tgid = 2;
         k.processes.insert(1, root);
         k.processes.insert(2, child);
-        k.control(&mut Signal(true)).unwrap();
+        k.host_poll(&mut Signal(true)).unwrap();
         assert_eq!(
             k.processes.read(&2).next_signal(u64::MAX).map(|s| s.0),
             Some(2)
         );
         assert!(k.processes.read(&1).next_signal(u64::MAX).is_none());
-        k.control(&mut Control).unwrap();
-    }
-    #[test]
-    fn host_control_publishes_partial_context_and_fd_changes_before_error() {
-        struct Control(u32);
-        impl GuestOutput for Control {
-            fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo> {
-                std::sync::Arc::new(trames_vfs::CapturedConsole::default())
-            }
-
-            fn control(&mut self, vfs: &mut trames_vfs::Vfs) -> std::io::Result<bool> {
-                vfs.close(self.0).unwrap();
-                vfs.set_umask(0o077);
-                Err(std::io::Error::other("after authorized mutation"))
-            }
-            fn write(&mut self, _: OutputFd, bytes: &[u8]) -> std::io::Result<usize> {
-                Ok(bytes.len())
-            }
-        }
-        let mut k = kernel();
-        let mut p = process();
-        let fd = p
-            .linux
-            .vfs
-            .open_at(AT_FDCWD, b"/file", 0x42, 0o600)
-            .unwrap();
-        k.processes.insert(
-            2,
-            p.fork_state(p.memory.clone(), true, true, true, Default::default()),
-        );
-        k.processes.insert(1, p);
-        assert!(k.control(&mut Control(fd)).is_err());
-        assert_eq!(k.processes.read(&2).linux.vfs.fd_kind(fd), Err(Errno(9)));
-        assert_eq!(k.processes.read(&2).linux.vfs.umask(), 0o077);
-    }
-
-    #[test]
-    fn solo_quantum_does_not_delay_a_runnable_peer() {
-        let mut k = kernel();
-        assert_eq!(k.serial_quantum(), 65536);
-        let mut blocked = process();
-        blocked.state = State::Blocked(260, [0; 6]);
-        k.processes.insert(2, blocked);
-        assert_eq!(k.serial_quantum(), 65536);
-        k.processes.get_mut(&2).unwrap().state = State::Ready;
-        assert_eq!(k.serial_quantum(), 4096);
+        k.host_poll(&mut Control).unwrap();
     }
     #[test]
     fn solo_cpu_with_unrelated_blocked_io_keeps_serial_mmu_but_connected_peer_can_handoff() {
@@ -6704,7 +6542,6 @@ mod tests {
             memory_limits: super::super::MemoryLimits::default(),
             cpu_count: 1,
             task_capacity: Arc::new(trames_kernel::task::Capacity::new(trames_vfs::MAX_TASKS)),
-            engine: Default::default(),
             backend_error: None,
             completed: None,
             source_completed: false,
@@ -7814,17 +7651,17 @@ mod tests {
         }
     }
     #[test]
-    fn pure_queries_keep_a_bounded_serial_quantum_with_blocked_peers() {
+    fn pure_queries_run_on_source_with_blocked_peers() {
         struct Polls(usize);
         impl GuestOutput for Polls {
+            fn poll_host(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<HostState> {
+                self.0 += 1;
+                Ok(HostState::Running)
+            }
             fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo> {
                 std::sync::Arc::new(trames_vfs::CapturedConsole::default())
             }
 
-            fn control(&mut self, _: &mut trames_vfs::Vfs) -> std::io::Result<bool> {
-                self.0 += 1;
-                Ok(true)
-            }
             fn write(&mut self, _: OutputFd, bytes: &[u8]) -> std::io::Result<usize> {
                 Ok(bytes.len())
             }
@@ -7964,14 +7801,14 @@ mod tests {
     fn continuous_peers_cancel_at_control_checkpoints_and_commit_the_exact_budget() {
         struct CancelAfterTwoPolls(usize);
         impl GuestOutput for CancelAfterTwoPolls {
+            fn poll_host(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<HostState> {
+                self.0 += 1;
+                Ok(HostState::from_cancelled(self.0 >= 3))
+            }
             fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo> {
                 std::sync::Arc::new(trames_vfs::CapturedConsole::default())
             }
 
-            fn control(&mut self, _: &mut trames_vfs::Vfs) -> std::io::Result<bool> {
-                self.0 += 1;
-                Ok(self.0 < 3)
-            }
             fn write(&mut self, _: OutputFd, bytes: &[u8]) -> std::io::Result<usize> {
                 Ok(bytes.len())
             }
@@ -8310,8 +8147,11 @@ mod tests {
                 )
             }
 
-            fn poll_control(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<bool> {
-                Ok(false)
+            fn poll_host(
+                &mut self,
+                _: &trames_vfs::Vfs,
+            ) -> std::io::Result<trames_linux::HostState> {
+                Ok(trames_linux::HostState::Running)
             }
             fn write(&mut self, _: OutputFd, bytes: &[u8]) -> std::io::Result<usize> {
                 if let Some(entered) = self.entered.lock().unwrap().take() {
@@ -9527,7 +9367,7 @@ mod boundary_tests {
     #[test]
     fn terminal_resize_event_is_scoped_to_the_foreground_group() {
         struct Events(Option<TerminalEvent>);
-        impl GuestOutput for Events {
+        impl trames_linux::GuestOutput for Events {
             fn source_console(&mut self) -> Arc<dyn trames_vfs::ConsoleIo> {
                 Arc::new(
                     trames_vfs::ConsoleCallbacks::new(
@@ -9580,9 +9420,7 @@ mod boundary_tests {
             Some(pair.clone()),
             k.workers.terminal_executor(),
         );
-        adapter
-            .control(&mut k.processes.get_mut(&1).unwrap().linux.vfs)
-            .unwrap();
+        adapter.poll_host(&k.processes.read(&1).linux.vfs).unwrap();
         assert_eq!(&pair.terminal.borrow().window[..4], &[40, 0, 120, 0]);
         assert!(k.processes.read(&1).pending_bits() & (1 << 27) != 0);
         assert!(k.processes.read(&2).pending_bits() & (1 << 27) == 0);

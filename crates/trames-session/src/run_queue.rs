@@ -1677,7 +1677,7 @@ impl<C: Cpu> Epoch<C> {
                 if lifecycle.host_ready() {
                     q.completing += 1;
                     drop(q);
-                    if let Err(error) = lifecycle.pump_host(Some(self), slot) {
+                    if let Err(error) = lifecycle.pump_host(self, slot) {
                         lifecycle.host_error(error);
                         self.fail();
                     }

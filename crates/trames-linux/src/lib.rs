@@ -189,7 +189,28 @@ impl HostProcess {
     }
 }
 
+/// Host state cannot request stopped execution or mutable guest callbacks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostState {
+    Running,
+    Cancelled,
+}
+impl HostState {
+    pub fn from_cancelled(cancelled: bool) -> Self {
+        if cancelled {
+            Self::Cancelled
+        } else {
+            Self::Running
+        }
+    }
+}
+
 pub trait GuestOutput {
+    /// One-time embedding setup, before any guest CPU can be admitted.
+    /// Execution code receives only execution_io::Output, which lacks this API.
+    fn initialize(&mut self, _vfs: &mut trames_vfs::Vfs) -> io::Result<()> {
+        Ok(())
+    }
     /// Bind the session's existing I/O pool and original backing driver before
     /// execution. Embedding jobs never create a resource-service thread.
     fn bind_host_files(
@@ -213,11 +234,7 @@ pub trait GuestOutput {
     fn host_memory(&self) -> Option<HostMemoryInfo> {
         None
     }
-    /// The adapter can prepare independent stdio/terminal resources while
-    /// executors run. Accepted spawn/signal work uses original session resources.
-    fn live_host_processes(&self) -> bool {
-        false
-    }
+
     /// A connected embedding can supply external events when guest actors park.
     fn waits_for_host(&self) -> bool {
         false
@@ -237,23 +254,16 @@ pub trait GuestOutput {
         false
     }
     /// Poll host queues/original resources without touching guest bytes.
-    /// True requests the stopped control hook.
-    /// Legacy adapters conservatively retain their existing joined callback.
-    fn poll_control(&mut self, _vfs: &trames_vfs::Vfs) -> io::Result<bool> {
-        Ok(true)
+    fn poll_host(&mut self, _vfs: &trames_vfs::Vfs) -> io::Result<HostState> {
+        Ok(HostState::Running)
     }
-    /// Embedding control at each scheduler round. Returning false cancels the
-    /// entire session. Host adapters may perform queued, authorized VFS work here.
-    fn control(&mut self, _vfs: &mut trames_vfs::Vfs) -> io::Result<bool> {
-        Ok(true)
-    }
+
     /// Explicit embedding pause stops guest execution, while original I/O and
     /// mapped-backing completion continue on the existing driver/workers.
     fn paused(&self) -> bool {
         false
     }
-    /// An accepted host launch. Opted-in adapters submit while executors run;
-    /// legacy embeddings consume it after the stopped control hook.
+    /// An accepted host launch, submitted to the existing execution workers.
     fn host_spawn(&mut self) -> Option<HostSpawn> {
         None
     }
@@ -262,7 +272,7 @@ pub trait GuestOutput {
         None
     }
     /// An authorized signal to the original guest PID 1 task. Live adapters may
-    /// publish it from poll_control; delivery does not require a cohort join.
+    /// publish it from poll_host; delivery does not require a cohort join.
     fn root_signal(&mut self) -> Option<u32> {
         None
     }
@@ -284,6 +294,164 @@ pub trait GuestOutput {
     }
 }
 
+// The execution-facing interface deliberately has no mutable bootstrap hook.
+// Keep it in its own module so full host implementations do not import both traits.
+pub mod execution_io {
+    use super::*;
+    /// Live execution cannot re-enter mutable host bootstrap.
+    ///
+    /// ```compile_fail
+    /// fn stopped_callback(io: &mut impl trames_linux::execution_io::Output, vfs: &mut trames_vfs::Vfs) {
+    ///     io.initialize(vfs).unwrap();
+    /// }
+    /// ```
+    pub trait Output {
+        /// Bind the session's existing I/O pool and original backing driver before
+        /// execution. Embedding jobs never create a resource-service thread.
+        fn bind_host_files(
+            &mut self,
+            _executor: std::sync::Arc<dyn FileExecutor>,
+            _layouts: std::sync::Arc<FileLayouts>,
+        ) {
+        }
+        /// Original byte resource, shared with execution workers. Lifecycle hooks
+        /// remain on the host; console bytes never call those hooks through RPC.
+        fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo>;
+        /// Read-only host accounting can run on the querying executor. Adapters
+        /// retain their actual provider, not a periodically copied memory hint.
+        fn host_memory_source(
+            &self,
+        ) -> Option<std::sync::Arc<dyn Fn() -> HostMemoryInfo + Send + Sync>> {
+            None
+        }
+        /// Host adapters opt in; bounded/iPad sessions retain guest-budget reports.
+        /// Queried only for memory/proc metadata, never on CPU/native byte access.
+        fn host_memory(&self) -> Option<HostMemoryInfo> {
+            None
+        }
+
+        /// A connected embedding can supply external events when guest actors park.
+        fn waits_for_host(&self) -> bool {
+            false
+        }
+        /// Maximum interval between actual embedding transport/control polls.
+        fn control_poll_interval(&self) -> std::time::Duration {
+            std::time::Duration::MAX
+        }
+        /// Complete accepted host output before normal session teardown.
+        fn flush_output(&mut self) -> io::Result<bool> {
+            Ok(true)
+        }
+
+        /// A terminal session request, distinct from compatibility resource work.
+        /// It enters source lifecycle completion; it never requests a stopped hook.
+        fn cancellation_requested(&self) -> bool {
+            false
+        }
+        /// Poll host queues/original resources without touching guest bytes.
+        fn poll_host(&mut self, _vfs: &trames_vfs::Vfs) -> io::Result<HostState> {
+            Ok(HostState::Running)
+        }
+
+        /// Explicit embedding pause stops guest execution, while original I/O and
+        /// mapped-backing completion continue on the existing driver/workers.
+        fn paused(&self) -> bool {
+            false
+        }
+        /// An accepted host launch, submitted to the existing execution workers.
+        fn host_spawn(&mut self) -> Option<HostSpawn> {
+            None
+        }
+        /// An explicitly authorized signal to one host-launched process group.
+        fn host_signal(&mut self) -> Option<(u32, u32)> {
+            None
+        }
+        /// An authorized signal to the original guest PID 1 task. Live adapters may
+        /// publish it from poll_host; delivery does not require a cohort join.
+        fn root_signal(&mut self) -> Option<u32> {
+            None
+        }
+        fn write(&mut self, fd: OutputFd, bytes: &[u8]) -> io::Result<usize>;
+        fn read_stdin(&mut self, _bytes: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+        /// Nonblocking input for the cooperative scheduler. Interactive adapters must
+        /// return WouldBlock until bytes or EOF are available.
+        fn poll_stdin(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.read_stdin(bytes)
+        }
+        fn stdin_ready(&mut self) -> io::Result<bool> {
+            Ok(true)
+        }
+        /// Events from the embedding application's PTY master, scoped to guest jobs.
+        fn terminal_event(&mut self) -> Option<TerminalEvent> {
+            None
+        }
+    }
+    impl<T: super::GuestOutput + ?Sized> Output for T {
+        fn bind_host_files(
+            &mut self,
+            executor: std::sync::Arc<dyn FileExecutor>,
+            layouts: std::sync::Arc<FileLayouts>,
+        ) {
+            super::GuestOutput::bind_host_files(self, executor, layouts)
+        }
+        fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo> {
+            super::GuestOutput::source_console(self)
+        }
+        fn host_memory_source(
+            &self,
+        ) -> Option<std::sync::Arc<dyn Fn() -> HostMemoryInfo + Send + Sync>> {
+            super::GuestOutput::host_memory_source(self)
+        }
+        fn host_memory(&self) -> Option<HostMemoryInfo> {
+            super::GuestOutput::host_memory(self)
+        }
+        fn waits_for_host(&self) -> bool {
+            super::GuestOutput::waits_for_host(self)
+        }
+        fn control_poll_interval(&self) -> std::time::Duration {
+            super::GuestOutput::control_poll_interval(self)
+        }
+        fn flush_output(&mut self) -> io::Result<bool> {
+            super::GuestOutput::flush_output(self)
+        }
+        fn cancellation_requested(&self) -> bool {
+            super::GuestOutput::cancellation_requested(self)
+        }
+        fn poll_host(&mut self, vfs: &trames_vfs::Vfs) -> io::Result<HostState> {
+            super::GuestOutput::poll_host(self, vfs)
+        }
+        fn paused(&self) -> bool {
+            super::GuestOutput::paused(self)
+        }
+        fn host_spawn(&mut self) -> Option<HostSpawn> {
+            super::GuestOutput::host_spawn(self)
+        }
+        fn host_signal(&mut self) -> Option<(u32, u32)> {
+            super::GuestOutput::host_signal(self)
+        }
+        fn root_signal(&mut self) -> Option<u32> {
+            super::GuestOutput::root_signal(self)
+        }
+        fn write(&mut self, fd: OutputFd, bytes: &[u8]) -> io::Result<usize> {
+            super::GuestOutput::write(self, fd, bytes)
+        }
+        fn read_stdin(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            super::GuestOutput::read_stdin(self, bytes)
+        }
+        fn poll_stdin(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            super::GuestOutput::poll_stdin(self, bytes)
+        }
+        fn stdin_ready(&mut self) -> io::Result<bool> {
+            super::GuestOutput::stdin_ready(self)
+        }
+        fn terminal_event(&mut self) -> Option<TerminalEvent> {
+            super::GuestOutput::terminal_event(self)
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct CapturedOutput {
     pub stdout: trames_vfs::CapturedBytes,
@@ -298,8 +466,8 @@ impl GuestOutput for CapturedOutput {
             error: self.stderr.clone(),
         })
     }
-    fn poll_control(&mut self, _: &trames_vfs::Vfs) -> io::Result<bool> {
-        Ok(false)
+    fn poll_host(&mut self, _vfs: &trames_vfs::Vfs) -> io::Result<HostState> {
+        Ok(HostState::Running)
     }
     fn read_stdin(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         let input = self.stdin.read(bytes.len());
@@ -340,7 +508,7 @@ fn io_errno(error: io::Error) -> u64 {
 pub fn dispatch(
     cpu: &mut impl Registers,
     memory: &Memory,
-    output: &mut impl GuestOutput,
+    output: &mut impl execution_io::Output,
 ) -> SyscallOutcome {
     let result = match cpu.x(8) {
         SYS_EXIT | SYS_EXIT_GROUP => return SyscallOutcome::Exit(cpu.x(0) as u8),

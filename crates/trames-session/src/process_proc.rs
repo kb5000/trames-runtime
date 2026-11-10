@@ -1050,8 +1050,11 @@ mod tests {
                 std::sync::Arc::new(trames_vfs::CapturedConsole::default())
             }
 
-            fn poll_control(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<bool> {
-                Ok(false)
+            fn poll_host(
+                &mut self,
+                _: &trames_vfs::Vfs,
+            ) -> std::io::Result<trames_linux::HostState> {
+                Ok(trames_linux::HostState::Running)
             }
             fn write(&mut self, _: OutputFd, bytes: &[u8]) -> std::io::Result<usize> {
                 Ok(bytes.len())

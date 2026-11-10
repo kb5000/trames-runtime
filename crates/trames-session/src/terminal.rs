@@ -212,9 +212,7 @@ impl<T: GuestOutput> GuestOutput for Adapter<'_, T> {
     fn host_memory(&self) -> Option<HostMemoryInfo> {
         self.inner.host_memory()
     }
-    fn live_host_processes(&self) -> bool {
-        self.inner.live_host_processes()
-    }
+
     fn waits_for_host(&self) -> bool {
         self.terminal.is_some() || self.inner.waits_for_host()
     }
@@ -230,20 +228,14 @@ impl<T: GuestOutput> GuestOutput for Adapter<'_, T> {
     fn cancellation_requested(&self) -> bool {
         self.inner.cancellation_requested()
     }
-    fn poll_control(&mut self, vfs: &Vfs) -> io::Result<bool> {
-        let join = self.inner.poll_control(vfs)?;
-        if !join {
+    fn poll_host(&mut self, vfs: &Vfs) -> io::Result<trames_linux::HostState> {
+        let state = self.inner.poll_host(vfs)?;
+        if state == trames_linux::HostState::Running {
             self.pump()?;
         }
-        Ok(join)
+        Ok(state)
     }
-    fn control(&mut self, vfs: &mut Vfs) -> io::Result<bool> {
-        let running = self.inner.control(vfs)?;
-        if running {
-            self.pump()?;
-        }
-        Ok(running)
-    }
+
     fn host_spawn(&mut self) -> Option<HostSpawn> {
         self.inner.host_spawn()
     }
@@ -315,8 +307,8 @@ mod tests {
         fn source_console(&mut self) -> Arc<dyn trames_vfs::ConsoleIo> {
             self.source.clone()
         }
-        fn poll_control(&mut self, _: &Vfs) -> io::Result<bool> {
-            Ok(false)
+        fn poll_host(&mut self, _: &Vfs) -> io::Result<trames_linux::HostState> {
+            Ok(trames_linux::HostState::Running)
         }
         fn write(&mut self, _: OutputFd, bytes: &[u8]) -> io::Result<usize> {
             assert!(
@@ -352,7 +344,7 @@ mod tests {
     }
     #[test]
     fn partial_host_output_survives_a_guest_flush_and_runtime_handoff_without_losing_new_bytes() {
-        let (mut vfs, pair) = terminal();
+        let (vfs, pair) = terminal();
         pair.terminal.borrow_mut().queue_output(b"abcd").unwrap();
         let mut host = Host {
             quota: 1,
@@ -360,7 +352,7 @@ mod tests {
             ..Host::default()
         };
         let mut adapter = Adapter::new(&mut host, Some(pair.clone()), Arc::new(Unused));
-        adapter.control(&mut vfs).unwrap();
+        adapter.poll_host(&vfs).unwrap();
         let saved = adapter.finish().unwrap();
         assert_eq!(host.output, b"a");
         assert_eq!(
@@ -380,13 +372,13 @@ mod tests {
     }
     #[test]
     fn host_input_eof_is_a_half_close_and_keeps_guest_output_alive() {
-        let (mut vfs, pair) = terminal();
+        let (vfs, pair) = terminal();
         let mut host = Host {
             eof: true,
             ..Host::default()
         };
         let mut adapter = Adapter::new(&mut host, Some(pair.clone()), Arc::new(Unused));
-        adapter.control(&mut vfs).unwrap();
+        adapter.poll_host(&vfs).unwrap();
         assert!(pair.terminal.borrow().eof);
         assert!(pair.master_alive.load(std::sync::atomic::Ordering::Relaxed));
         pair.terminal
@@ -399,27 +391,33 @@ mod tests {
     }
     #[test]
     fn xoff_and_xon_use_the_original_line_discipline_without_owner_pause() {
-        let (mut vfs, pair) = terminal();
+        let (vfs, pair) = terminal();
         let mut host = Host::default();
         let input = host.input.clone();
         input.lock().unwrap().push_back(19);
         pair.terminal.borrow_mut().queue_output(b"a").unwrap();
         let mut adapter = Adapter::new(&mut host, Some(pair.clone()), Arc::new(Unused));
-        assert!(!adapter.poll_control(&vfs).unwrap());
+        assert_eq!(
+            adapter.poll_host(&vfs).unwrap(),
+            trames_linux::HostState::Running
+        );
         assert!(pair.terminal.borrow().flow_stopped);
         assert!(!adapter.flush_output().unwrap());
         input.lock().unwrap().push_back(17);
-        assert!(!adapter.poll_control(&vfs).unwrap());
+        assert_eq!(
+            adapter.poll_host(&vfs).unwrap(),
+            trames_linux::HostState::Running
+        );
         assert!(!pair.terminal.borrow().flow_stopped);
         assert!(adapter.flush_output().unwrap());
-        adapter.control(&mut vfs).unwrap();
+        adapter.poll_host(&vfs).unwrap();
         adapter.finish();
         assert_eq!(host.output, b"a");
     }
     #[cfg(trames_interpreter_conformance)]
     #[test]
     fn blocking_native_output_keeps_host_control_and_original_input_live_on_the_existing_pool() {
-        let (mut vfs, pair) = terminal();
+        let (vfs, pair) = terminal();
         let (started, entered) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel();
         let released = Mutex::new(released);
@@ -451,10 +449,13 @@ mod tests {
         pair.terminal.borrow_mut().queue_output(b"native").unwrap();
         let pool = crate::workers::Pool::<trames_cpu::Cpu>::new(1);
         let mut adapter = Adapter::new(&mut host, Some(pair.clone()), pool.terminal_executor());
-        adapter.control(&mut vfs).unwrap();
+        adapter.poll_host(&vfs).unwrap();
         entered.recv_timeout(Duration::from_secs(2)).unwrap();
         input.lock().unwrap().extend(b"x\n");
-        assert!(!adapter.poll_control(&vfs).unwrap());
+        assert_eq!(
+            adapter.poll_host(&vfs).unwrap(),
+            trames_linux::HostState::Running
+        );
         assert_eq!(pair.terminal.borrow_mut().read(2).unwrap(), b"x\n");
         release.send(()).unwrap();
         drop(pool);

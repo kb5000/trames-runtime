@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use crate::state::Linux;
-use crate::{GuestOutput, MAX_WRITE};
+use crate::MAX_WRITE;
 use trames_memory::{Access, CpuMemory, Memory};
 use trames_vfs::{Errno, Vfs};
 type Result<T> = std::result::Result<T, Errno>;
@@ -173,7 +173,7 @@ impl Linux {
         number: u64,
         a: [u64; 6],
         memory: &mut Memory,
-        io: &mut impl GuestOutput,
+        io: &mut impl crate::execution_io::Output,
     ) -> Result<u64> {
         match number {
             213 | 223 => crate::file_advice::call(number as u32, a, self.vfs.stat_fd(a[0] as u32)),

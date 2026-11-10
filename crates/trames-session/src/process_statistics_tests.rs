@@ -265,7 +265,7 @@ fn sysinfo_and_live_cpu_statistics_keep_four_twelve_and_one_slot_cohorts() {
         fn control_poll_interval(&self) -> Duration {
             Duration::from_millis(1)
         }
-        fn poll_control(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<bool> {
+        fn poll_host(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<trames_linux::HostState> {
             let info = ProcSource::observe(
                 &*self.source,
                 ProcQuery::new(b"/proc/stat", ProcRefresh::Metadata, &self.namespace, 1),
@@ -276,10 +276,7 @@ fn sysinfo_and_live_cpu_statistics_keep_four_twelve_and_one_slot_cohorts() {
             }
             self.last = info.cpu_user_ticks;
             self.done = self.started.elapsed() >= Duration::from_millis(200);
-            Ok(self.done)
-        }
-        fn control(&mut self, _: &mut trames_vfs::Vfs) -> std::io::Result<bool> {
-            Ok(!self.done)
+            Ok(trames_linux::HostState::from_cancelled(self.done))
         }
     }
     for (cpus, slots) in [(4, 4), (12, 12), (4, 1)] {
@@ -347,14 +344,17 @@ fn sysinfo_and_live_cpu_statistics_keep_four_twelve_and_one_slot_cohorts() {
         assert_eq!(k.serviced_syscalls, 0);
         for (_, p) in k.processes.iter() {
             assert!(p.cpu.x(19) > 0, "every admitted task must execute");
-            assert_eq!(
-                p.memory.read_u64(0x1020).unwrap(),
-                k.memory_limits.total as u64
-            );
-            assert_eq!(
-                p.memory.read_array::<2>(0x1050).unwrap(),
-                (cpus as u16).to_le_bytes()
-            );
         }
+        // Terminal cancellation retires children; inspect the surviving root's
+        // bytes, and each completed CPU's counter above.
+        let root = k.processes.read(&1);
+        assert_eq!(
+            root.memory.read_u64(0x1020).unwrap(),
+            k.memory_limits.total as u64
+        );
+        assert_eq!(
+            root.memory.read_array::<2>(0x1050).unwrap(),
+            (cpus as u16).to_le_bytes()
+        );
     }
 }

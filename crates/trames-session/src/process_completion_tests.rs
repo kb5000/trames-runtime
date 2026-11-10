@@ -54,10 +54,104 @@ fn single_cpu_root_exit_is_completed_by_the_source_lifecycle() {
 }
 
 #[test]
+fn initial_busy_memory_is_admitted_without_host_cpu_execution() {
+    struct Backing(Arc<trames_memory::layout::Layout>);
+    impl trames_memory::PageBacking for Backing {
+        fn layout(&self) -> Option<Arc<trames_memory::layout::Layout>> {
+            Some(self.0.clone())
+        }
+        fn parallel_key(&self) -> Option<(u64, u64)> {
+            Some((self.0.identity(), 0))
+        }
+        fn check(&self, _: u64) -> Result<(), trames_memory::MemoryError> {
+            Ok(())
+        }
+        fn read(&self, _: usize, out: &mut [u8]) -> Result<(), trames_memory::MemoryError> {
+            out.fill(0);
+            Ok(())
+        }
+        fn write(&self, _: usize, _: &[u8]) -> Result<(), trames_memory::MemoryError> {
+            Ok(())
+        }
+        fn sync(&self) -> Result<(), trames_memory::MemoryError> {
+            Ok(())
+        }
+        fn version(&self) -> u64 {
+            0
+        }
+        fn writable(&self) -> bool {
+            true
+        }
+        fn next_page(
+            &self,
+            _: u64,
+        ) -> Result<Arc<dyn trames_memory::PageBacking>, trames_memory::MemoryError> {
+            Err(trames_memory::MemoryError::InvalidRange)
+        }
+    }
+    struct Host {
+        polls: usize,
+        release: Option<trames_memory::layout::LayoutWrite>,
+    }
+    impl GuestOutput for Host {
+        fn source_console(&mut self) -> Arc<dyn trames_vfs::ConsoleIo> {
+            Arc::new(trames_vfs::CapturedConsole::default())
+        }
+        fn poll_host(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<HostState> {
+            self.polls += 1;
+            if self.polls == 2 {
+                drop(self.release.take().unwrap());
+            }
+            assert!(
+                self.polls < 100,
+                "original memory release did not wake admission"
+            );
+            Ok(HostState::Running)
+        }
+        fn control_poll_interval(&self) -> Duration {
+            Duration::from_millis(1)
+        }
+        fn write(&mut self, _: trames_linux::OutputFd, bytes: &[u8]) -> std::io::Result<usize> {
+            Ok(bytes.len())
+        }
+    }
+    for cpus in [1, 4, 12] {
+        let mut k = kernel();
+        k.cpu_count = cpus;
+        k.per_cpu.resize(cpus, Duration::ZERO);
+        let mut root = admitted_process(&k);
+        executable(&mut root, &[0xd28000e0, 0xd2800ba8, 0xd4000001]);
+        let layout = Arc::<trames_memory::layout::Layout>::default();
+        root.memory
+            .map_backed(
+                0x10000,
+                vec![Arc::new(Backing(layout.clone()))],
+                true,
+                Permissions::RW,
+                false,
+            )
+            .unwrap();
+        let writer = layout.write();
+        assert!(!root.memory.admit_parallel_layouts());
+        k.publish_task(1, &root);
+        k.processes.insert(1, root);
+        let mut host = Host {
+            polls: 0,
+            release: Some(writer),
+        };
+        assert_eq!(k.drive(&mut host, 100000).unwrap().code, 7);
+        assert!(host.polls >= 2);
+        assert_eq!(k.parallel_rounds, 1);
+        assert!(k.worker_slices > 0);
+        assert!(k.cohort_return_syscalls.is_empty());
+    }
+}
+
+#[test]
 fn explicit_host_cancel_finishes_on_source_without_a_stopped_host_hook() {
     struct Output {
         cancel: bool,
-        controls: usize,
+        polls: usize,
     }
     impl GuestOutput for Output {
         fn source_console(&mut self) -> Arc<dyn trames_vfs::ConsoleIo> {
@@ -69,17 +163,13 @@ fn explicit_host_cancel_finishes_on_source_without_a_stopped_host_hook() {
         fn control_poll_interval(&self) -> Duration {
             Duration::from_millis(1)
         }
-        fn poll_control(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<bool> {
-            self.cancel = true;
-            Ok(false)
+        fn poll_host(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<trames_linux::HostState> {
+            self.polls += 1;
+            self.cancel = self.polls > 1;
+            Ok(trames_linux::HostState::Running)
         }
         fn cancellation_requested(&self) -> bool {
             self.cancel
-        }
-        fn control(&mut self, _: &mut trames_vfs::Vfs) -> std::io::Result<bool> {
-            self.controls += 1;
-            assert_eq!(self.controls, 1, "closing re-entered the stopped host hook");
-            Ok(true)
         }
     }
     for cpus in [1, 4, 12] {
@@ -92,13 +182,13 @@ fn explicit_host_cancel_finishes_on_source_without_a_stopped_host_hook() {
         k.processes.insert(1, root);
         let mut output = Output {
             cancel: false,
-            controls: 0,
+            polls: 0,
         };
         assert!(matches!(
             k.drive(&mut output, u64::MAX),
             Err(RuntimeError::Cancelled)
         ));
-        assert_eq!(output.controls, 1);
+        assert!(output.polls > 1);
         assert_eq!(
             k.processes.read(&1).memory.read_array::<4>(0x1000).unwrap(),
             42u32.to_le_bytes()

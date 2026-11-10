@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use super::{errno, io_errno, GuestOutput, OutputFd, SyscallOutcome, MAX_WRITE};
+use super::{errno, io_errno, OutputFd, SyscallOutcome, MAX_WRITE};
 use trames_execution::Registers;
 use trames_memory::{
     Access, CpuMemory, Memory, MemoryError, Permissions, ADDRESS_LIMIT, PAGE_SIZE,
@@ -233,7 +233,7 @@ impl Linux {
         &mut self,
         fd: u32,
         bytes: &[u8],
-        io: &mut impl GuestOutput,
+        io: &mut impl crate::execution_io::Output,
     ) -> Result<u64> {
         match self.vfs.fd_kind(fd)? {
             FdKind::Stdout | FdKind::Stderr => {
@@ -266,7 +266,7 @@ impl Linux {
         &mut self,
         a: [u64; 6],
         memory: &mut impl CpuMemory,
-        io: &mut impl GuestOutput,
+        io: &mut impl crate::execution_io::Output,
     ) -> Result<u64> {
         let fd = a[0] as u32;
         self.vfs.fd_kind(fd)?;
@@ -287,7 +287,12 @@ impl Linux {
         Self::check(memory, a[1], count, Access::Write)?;
         Ok(count)
     }
-    fn read_bytes(&mut self, fd: u32, count: usize, io: &mut impl GuestOutput) -> Result<Vec<u8>> {
+    fn read_bytes(
+        &mut self,
+        fd: u32,
+        count: usize,
+        io: &mut impl crate::execution_io::Output,
+    ) -> Result<Vec<u8>> {
         let kind = self.vfs.fd_kind(fd)?.clone();
         if matches!(kind, FdKind::Stdout | FdKind::Stderr) {
             return Err(Errno(9));
@@ -357,7 +362,7 @@ impl Linux {
         &mut self,
         a: [u64; 6],
         memory: &mut impl CpuMemory,
-        io: &mut impl GuestOutput,
+        io: &mut impl crate::execution_io::Output,
     ) -> Result<u64> {
         let records = self.vfs.readv_records(a[0] as u32)?;
         Self::readv_transport_mode(a, memory, records, |count| {
@@ -398,7 +403,7 @@ impl Linux {
         &mut self,
         a: [u64; 6],
         memory: &impl CpuMemory,
-        io: &mut impl GuestOutput,
+        io: &mut impl crate::execution_io::Output,
     ) -> Result<u64> {
         self.write_scratch(a, memory, io, &mut Vec::new())
     }
@@ -406,7 +411,7 @@ impl Linux {
         &mut self,
         a: [u64; 6],
         memory: &impl CpuMemory,
-        io: &mut impl GuestOutput,
+        io: &mut impl crate::execution_io::Output,
         bytes: &mut Vec<u8>,
     ) -> Result<u64> {
         self.vfs.fd_kind(a[0] as u32)?;
@@ -519,7 +524,7 @@ impl Linux {
         &mut self,
         a: [u64; 6],
         memory: &impl CpuMemory,
-        io: &mut impl GuestOutput,
+        io: &mut impl crate::execution_io::Output,
     ) -> Result<u64> {
         self.writev_scratch(a, memory, io, &mut Vec::new())
     }
@@ -527,7 +532,7 @@ impl Linux {
         &mut self,
         a: [u64; 6],
         memory: &impl CpuMemory,
-        io: &mut impl GuestOutput,
+        io: &mut impl crate::execution_io::Output,
         bytes: &mut Vec<u8>,
     ) -> Result<u64> {
         let records = self.vfs.is_eventfd(a[0] as u32)?;
@@ -1072,7 +1077,7 @@ impl Linux {
         &mut self,
         cpu: &mut impl Registers,
         memory: &mut Memory,
-        io: &mut impl GuestOutput,
+        io: &mut impl crate::execution_io::Output,
     ) -> SyscallOutcome {
         self.dispatch_with_trace(cpu, memory, io, self.trace)
     }
@@ -1081,7 +1086,7 @@ impl Linux {
         &mut self,
         cpu: &mut impl Registers,
         memory: &mut Memory,
-        io: &mut impl GuestOutput,
+        io: &mut impl crate::execution_io::Output,
     ) -> SyscallOutcome {
         self.dispatch_with_trace(cpu, memory, io, false)
     }
@@ -1089,7 +1094,7 @@ impl Linux {
         &mut self,
         cpu: &mut impl Registers,
         memory: &mut Memory,
-        io: &mut impl GuestOutput,
+        io: &mut impl crate::execution_io::Output,
         trace: bool,
     ) -> SyscallOutcome {
         let number = cpu.x(8) as u32 as u64;
@@ -1156,7 +1161,7 @@ impl Linux {
         number: u64,
         a: [u64; 6],
         memory: &mut Memory,
-        io: &mut impl GuestOutput,
+        io: &mut impl crate::execution_io::Output,
     ) -> Result<u64>;
         pub fn has_syscall;
         {
@@ -2021,7 +2026,7 @@ mod tests {
     #[test]
     fn partial_vectored_output_is_returned_without_retry() {
         struct Short(std::sync::Arc<std::sync::atomic::AtomicUsize>);
-        impl GuestOutput for Short {
+        impl crate::execution_io::Output for Short {
             fn source_console(&mut self) -> std::sync::Arc<dyn trames_vfs::ConsoleIo> {
                 let calls = self.0.clone();
                 std::sync::Arc::new(trames_vfs::ConsoleCallbacks::new(

@@ -1,23 +1,27 @@
 # Coordination and fallback boundaries
 
-This is the consolidated implementation audit through stage 103, one-way source
-session completion, reviewed on 2026-11-10. The prior shared runtime baseline is
-`287fddcce660276c984b45f2d123562ddf1cccc5`. Mac HVF and the iPad interpreter share
-this userspace Linux kernel. Historical stage paragraphs retain their prior
-counts; the authoritative current category inventory is below.
+This is the consolidated implementation audit through stage 104, host embedding
+and initial execution orchestration, reviewed on 2026-11-10. The prior shared
+runtime baseline is `bfa2cc071ed6f8142eceb8b98f9c5059bae64ecf`. Mac HVF and the iPad
+interpreter share this userspace Linux kernel. Historical stage paragraphs retain
+their prior counts; the authoritative current category inventory is below.
 
 ## Current status at a glance — 2026-11-10
 
-Stage 103 closes the production terminal lifecycle category. Normal completion,
-explicit cancellation/deadline, budget exhaustion and source/backend failure use
-one-way completion on existing executors. The host cannot receive an unfinished
-guest-operation payload from this protocol. Task/mm/resource retirement and final
-network teardown are source work; a busy GPU lease defers its own retirement to
-actual resource notifications. Single-CPU product execution uses this same path.
-The remaining category count is three. Legacy mutable embedding hooks and generic
-execution handoff remain explicit debt, rather than a terminal completion route.
-Architecture checks prevent adding new compatibility handoffs or guest dispatch
-to terminal completion. See section 103.
+Stage 104 closes the host embedding/initial execution orchestration category.
+Host setup runs before CPU admission and is absent from the execution-facing
+trait. Live polling cannot request a joined mutable callback. One/multiple CPU,
+initial backing waits, cold host launches and subsequent ready instructions all
+use existing execution workers. The Kernel has no CPU engine; its legacy mapping
+compatibility handler cannot execute guest instructions or native CPU batching.
+
+The remaining count is **two**: actual missing original capabilities/resources
+(including the two submitter-scoped io_uring maintenance escalation setters), and
+the final unfinished-operation compatibility dispatch. The latter still includes
+nonmember resource retries; it is not a host embedding contract or CPU runner.
+Stage 103's one-way source terminal completion remains in force. Architecture
+checks freeze compatibility handoffs and reject mutable host callbacks, setup
+from execution, backend opt-out flags and caller CPU loops. See section 104.
 
 Stage 102 unifies the complete original task/mm structural control pipeline:
 worker admission, pinning preflight, scoped eligibility, clone/exec group work,
@@ -632,17 +636,16 @@ Actual excluded policy effects and missing capabilities retain explicit boundari
 
 ### Current remaining categories
 
-The count is **three broad categories**. Stage 103 removes production terminal
-session lifecycle as a coordinator category: physical CPU interruption and object
-retirement confer no guest-execution authority on the waiting host. Initial/custom
-legacy embedding contracts remain explicitly tracked, and final generic fallback
-is not proven unreachable.
+The count is **two broad categories**. Stage 103 removes production terminal
+completion, and stage 104 removes host embedding/initial execution orchestration.
+The final unfinished-operation dispatcher remains reachable; it cannot run guest
+instructions. Bootstrap is completed before admission and has no live callback.
 
 | Remaining category | Actual trigger | Current scope / authoritative implementation |
 | --- | --- | --- |
 | Missing capabilities and excluded resources | A genuinely absent source provider, an excluded original FD/node graph, a genuinely absent native event capability or unsupported source request body | There is no filesystem-kind exclusion after stage 82. Published global proc/sys metadata no longer lacks a source provider merely because it uses set_runtime_info. Other node/provider admission still applies. io_uring has exactly two submitter-scoped `require_owner()` maintenance call sites: an actually unavailable typed wait graph provider and deferred original body progress. An absent HostEvents hub no longer triggers this boundary: actual native interests are retained with their read/write directions. Compatibility capture carries its own original execution resources; per-task memory observations do not require a host-global statistics callback. Actual missing global providers and host backend errors retain their own boundary/cause. They remain connected to actual accepted request lifetime, subscriptions and cancellation. See [path authority](../../crates/trames-vfs/src/path_queries.rs), [maintenance](../../crates/trames-linux/src/direct/uring/background.rs), [wait sources](../../crates/trames-linux/src/direct/uring/wait.rs) and [actor](../../crates/trames-linux/src/direct/uring/actor.rs). |
-| Final execution dispatch fallback | A returned SVC or cold HLT/resource operation not completed, parked or accepted by a source scope; host faults and capability-less embeddings retain their own explicit boundaries | The catch-all stops the current cohort for joined dispatch. Ordinary shared-FD ioctl discovery, residual prctl controls/errors, implemented time observations, FD status/NOATIME, inode seals, anonymous memory-file creation, mapped-memory msync/writeback, file-cache advice, canonical FD/error admission, the complete original epoll/poll/select graph and generic socket event sources, current-offset vector transports, blocking POSIX/OFD locks, directory flock and canonical unknown fcntl commands no longer use it. It remains an audit target even though admitted native calls, ordinary guest faults, generated ENOSYS and migrated syscalls have source completion. Recognized guest faults, caught handlers and signal-frame failures now complete/terminate on source. A backend error is not a software or full-Linux-VM fallback. See [worker dispatch](../../crates/trames-session/src/workers.rs) and [classification](../../crates/trames-session/src/worker_syscalls.rs). |
-| Initial and legacy orchestration | Initial admission, standalone/capability-less nonmember scheduling and other excluded embedding routes | Ordinary live members and preexisting Kernel Futex/Sleep actors migrate, park and wake on the original queue. Cold waiters have metadata only until an event prepares their original mm; child/exec admission and lazy CPU slots no longer require a joined owner. Unbound futex delivery now admits exact original cold waiters on existing executors; only standalone caller-side ready draining remains. Product single-CPU sessions use source executors and one-way completion. Backends without worker execution support and mutable legacy embedding hooks still use their explicit caller contract. See [admission](../../crates/trames-session/src/process.rs), [legacy wakes](../../crates/trames-session/src/futex.rs) and [queue](../../crates/trames-session/src/run_queue.rs). |
+| Final execution dispatch fallback | A returned SVC or cold HLT/resource operation not completed, parked or accepted by a source scope, including nonmember resource retries | The catch-all stops the current cohort for joined dispatch. Ordinary shared-FD ioctl discovery, residual prctl controls/errors, implemented time observations, FD status/NOATIME, inode seals, anonymous memory-file creation, mapped-memory msync/writeback, file-cache advice, canonical FD/error admission, the complete original epoll/poll/select graph and generic socket event sources, current-offset vector transports, blocking POSIX/OFD locks, directory flock and canonical unknown fcntl commands no longer use it. It remains an audit target even though admitted native calls, ordinary guest faults, generated ENOSYS and migrated syscalls have source completion. Recognized guest faults, caught handlers and signal-frame failures now complete/terminate on source. A backend error is not a software or full-Linux-VM fallback. See [worker dispatch](../../crates/trames-session/src/workers.rs) and [classification](../../crates/trames-session/src/worker_syscalls.rs). |
+
 
 Supported process/family lifecycle, signals and security policy, mount and task
 namespace administration, proc views, transfers, timers, event waits, terminals,
@@ -668,9 +671,10 @@ interpreter's permission, ownership and hardware memory model.
 - HVF's mapping diagnostic `Fallback` means delta-range history was unavailable;
   it compares persistent coarse mapping stamps and changed chunks. It does not
   switch to an interpreter or a Linux-kernel VM.
-- Single-CPU/solo execution or failed parallel View admission can choose the
-  existing coordinated caller path. Mac still executes instructions through HVF;
-  iPad still uses its interpreter. A recorded backend failure is surfaced.
+- Single-CPU execution uses existing execution workers, with Mac HVF or the iPad
+  interpreter. Busy first View admission retains metadata-only source work and
+  original readiness; it cannot select a caller-side CPU loop. A recorded backend
+  failure is surfaced.
 - Unsupported syscall/driver functionality can return its existing errno or API
   result. This is not evidence of a successful compatibility fallback.
 - AppKit/UIKit presentation has its own UI-thread affinity. Ordinary window input,
@@ -4557,3 +4561,36 @@ are published before returning that assignment. Terminal budget completion waits
 until no CPU or scoped executor owns such work. Unlimited sessions bypass the
 additional atomic credit probe. A deterministic reservation/refund regression
 covers the boundary without relying on thread timing or a joined caller retry.
+
+## 104. Host embedding and initial execution orchestration — 2026-11-10
+
+The public embedding contract has one mutable `initialize(&mut Vfs)` hook before
+`Runtime::run` creates its Kernel or admits CPUs. Execution receives only
+`execution_io::Output`, whose type has no initialization API. Its `poll_host()`
+returns `HostState::{Running, Cancelled}`; there is no boolean join request,
+stopped mutable control hook or live-host opt-in. The blanket forwarding
+implementation is statically dispatched. A compile-fail example and
+`check-host-execution.py` enforce the boundary alongside the existing checks.
+
+Host launches and image admission require an actual epoch and run on existing
+CPU/disk executors. An initially sleeping or futex-blocked root can form this
+source session without any ready CPU. A busy first backing publication retains
+metadata-only jobs; the original layout notification wakes execution to prepare
+its first View. FFI initializes multi-terminal endpoints before admission and
+uses original PTY routes thereafter. Its host file commands require the bound
+original file executor; the stopped synchronous fallback is removed. Mac, iPad,
+CLI and graphical acceptance adapters use the same contract.
+
+`Cpu::PARALLEL`, `run_coordinated`, the host's serial quantum and the legacy
+mapping handler's bounded CPU window are deleted. No Kernel owns a CPU engine.
+Source mapping batching still uses the current execution worker's engine and
+original affected mm. No resource-service thread, polling bus, global guest
+algorithm lock, additional byte access check or ordinary memory fence is added.
+
+Terminal cancel uses source retirement for children; tests retain result pages
+or query original live statistics rather than reading discarded address spaces.
+Actual missing capabilities and the generic unfinished-operation handoff remain
+explicit, rather than being converted into guest errors or terminal cancellation.
+See the [paired validation](https://github.com/kb5000/trames-ipad/blob/main/docs/validation/host-orchestration-20261110.json)
+for common, Linux, iPad SDK, signed native and installed Dev results. Stable and
+physical iPad deployment are outside this batch. No throughput gain is inferred.
