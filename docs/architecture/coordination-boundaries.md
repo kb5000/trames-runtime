@@ -4642,3 +4642,12 @@ thread. The existing concurrent filtered proc-open test covers the lock inversio
 The paired product record includes macOS/ARM64 Linux runtime CI, both iPad SDKs,
 Mac product gates, signed hardware and installed Dev acceptance. Stable apps and
 physical iPad installations are outside this batch. No throughput gain is inferred.
+
+The hardware audit additionally covers a conservative ABI-recognition overlap:
+read/write numbers can name either a terminal session handler or a full Linux
+OFD body. Recognition alone cannot reject the latter. An original legacy proc
+OFD without the optimized query provider now reads through its actual full VFS
+body on source. The unchanged dormant shared-futex hardware workload retains its
+exit and memory-marker assertions and now requires one cohort with zero returned
+syscalls, replacing its prior two cohorts and one returned read. A common
+one/four/twelve-CPU regression also checks the actual bytes and read count.

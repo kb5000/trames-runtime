@@ -77,6 +77,58 @@ fn an_unclassified_cpu_yield_requeues_the_original_job_without_host_dispatch() {
 }
 
 #[test]
+fn a_legacy_proc_ofd_uses_its_original_full_linux_body_without_a_host_join() {
+    struct Unavailable;
+    impl trames_vfs::ProcSource for Unavailable {
+        fn available(&self, _: trames_vfs::ProcRefresh) -> bool {
+            false
+        }
+        fn observe(&self, _: trames_vfs::ProcQuery<'_>) -> trames_vfs::RuntimeInfo {
+            panic!("the unavailable query fast path was invoked")
+        }
+    }
+    for cpus in [1, 4, 12] {
+        let mut k = kernel();
+        k.cpu_count = cpus;
+        k.per_cpu.resize(cpus, Duration::ZERO);
+        k.profile_syscalls = true;
+        let mut p = admitted_process(&k);
+        p.linux.vfs.set_runtime_info(1, Default::default());
+        p.linux.vfs.set_proc_source(Arc::new(Unavailable));
+        let fd = p.linux.vfs.open_at(-100, b"/proc/version", 0, 0).unwrap();
+        let expected = p.linux.vfs.pread(fd, 8, 0).unwrap();
+        assert_eq!(expected.len(), 8);
+        executable(
+            &mut p,
+            &[
+                0xd4000001, 0xd2840009, 0xf9000120, 0xd28000e0, 0xd2800ba8, 0xd4000001,
+            ],
+        );
+        for (i, value) in [fd as u64, 0x1800, 8, 0, 0, 0].into_iter().enumerate() {
+            p.cpu.set_x(i, value);
+        }
+        p.cpu.set_x(8, 63);
+        k.publish_task(1, &p);
+        k.processes.insert(1, p);
+        assert_eq!(
+            k.drive(&mut trames_linux::CapturedOutput::default(), 100000)
+                .unwrap()
+                .code,
+            7
+        );
+        let p = k.processes.read(&1);
+        assert_eq!(p.memory.read_u64(0x2000).unwrap(), 8);
+        assert_eq!(
+            p.memory.read_array::<8>(0x1800).unwrap().as_slice(),
+            expected
+        );
+        assert_eq!(k.parallel_rounds, 1);
+        assert!(k.cohort_return_syscalls.is_empty());
+        assert_eq!(k.service_requests, 0);
+    }
+}
+
+#[test]
 fn a_missing_host_provider_never_dispatches_an_unrelated_accepted_call_on_the_host() {
     struct Output {
         console: Arc<dyn trames_vfs::ConsoleIo>,

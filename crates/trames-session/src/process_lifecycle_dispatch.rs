@@ -332,7 +332,12 @@ impl<C: Cpu> Lifecycle<C> {
                 } else if number == 179 {
                     return Ok(Err(Missing::HostStatistics));
                 } else {
-                    if super::super::Kernel::<C>::has_session_syscall(number, args) {
+                    // Session recognition is conservative for shared numbers
+                    // (for example terminal read versus an ordinary proc OFD).
+                    // The original full Linux body still owns those calls.
+                    if super::super::Kernel::<C>::has_session_syscall(number, args)
+                        && !trames_linux::Linux::has_syscall(number, args)
+                    {
                         return Err(RuntimeError::Arguments(
                             "session operation escaped the shared source dispatcher",
                         ));
