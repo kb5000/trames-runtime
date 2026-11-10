@@ -4436,6 +4436,8 @@ impl<C: Cpu> Kernel<C> {
         timeout
     }
 
+    // Bootstrap, actual host events and final output drain only. Guest execution
+    // and resource progress belong to source workers; keep that boundary intact.
     fn drive(&mut self, io: &mut impl GuestOutput, limit: u64) -> Result<Exit, RuntimeError> {
         io.bind_host_files(self.workers.file_executor(), self.file_layout_work());
         let mut wait =

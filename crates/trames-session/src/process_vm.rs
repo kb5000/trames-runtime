@@ -283,6 +283,11 @@ impl<C: Cpu> Kernel<C> {
         result
     }
 
+    // ARCHITECTURE: this caller waits for embedding events and source completion.
+    // Guest progress must stay on existing execution/I/O workers and original
+    // task/mm/OFD resources. Never add guest checkpoint dispatch, task/deadline
+    // scans, periodic retries or a fallback that stops every CPU here. Bind the
+    // actual resource and its readiness when a new operation needs worker support.
     pub(super) fn wait_source(
         &mut self,
         epoch: &crate::run_queue::Epoch<C>,

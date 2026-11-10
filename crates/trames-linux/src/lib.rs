@@ -212,6 +212,17 @@ impl HostState {
     }
 }
 
+/// Host embedding boundary shared by Mac and iPad.
+///
+/// Callbacks may bootstrap, handle actual transport readiness, submit work to
+/// existing executors, apply explicit host pause/cancel and drain final output.
+/// Guest CPU execution, syscall retries, task lifecycle, mapping/backing work
+/// and guest deadlines belong to existing workers and original resources.
+///
+/// Extend guest functionality through original resource admission/readiness and
+/// a worker's canonical body, including fast-path misses. Do not implement it
+/// in host callbacks, scan the task table, copy Kernel/task state, stop all CPUs
+/// for host dispatch, or add periodic retries or coordinator/service threads.
 pub trait GuestOutput {
     /// One-time embedding setup, before any guest CPU can be admitted.
     /// Execution code receives only execution_io::Output, which lacks this API.
@@ -311,6 +322,8 @@ pub mod execution_io {
     ///     io.initialize(vfs).unwrap();
     /// }
     /// ```
+    /// Retains GuestOutput's host embedding boundary; new guest semantics stay
+    /// on existing workers and original resources, not in these callbacks.
     pub trait Output {
         /// Bind the session's existing I/O pool and original backing driver before
         /// execution. Embedding jobs never create a resource-service thread.
