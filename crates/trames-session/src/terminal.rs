@@ -241,14 +241,24 @@ impl<T: GuestOutput> GuestOutput for Adapter<'_, T> {
                     let tty = pair.terminal.borrow();
                     !tty.eof && tty.input_capacity() != 0
                 };
+                // Ready regular/device input needs no native event filter.
+                // Register only a blocked transport, then retry before sleep.
                 if input {
-                    for fd in console.native_wait_fds(trames_vfs::ConsoleStream::Input) {
-                        wait.watch_owned(fd, false)?;
+                    if console.poll(trames_vfs::ConsoleStream::Input, 1).0 != 0 {
+                        wait.wake().notify();
+                    } else {
+                        for fd in console.native_wait_fds(trames_vfs::ConsoleStream::Input) {
+                            wait.watch_owned(fd, false)?;
+                        }
                     }
                 }
                 if self.pending.is_none() && self.consumed != self.output.len() {
-                    for fd in console.native_wait_fds(trames_vfs::ConsoleStream::Output) {
-                        wait.watch_owned(fd, true)?;
+                    if console.poll(trames_vfs::ConsoleStream::Output, 4).0 != 0 {
+                        wait.wake().notify();
+                    } else {
+                        for fd in console.native_wait_fds(trames_vfs::ConsoleStream::Output) {
+                            wait.watch_owned(fd, true)?;
+                        }
                     }
                 }
             }
@@ -289,6 +299,9 @@ impl<T: GuestOutput> GuestOutput for Adapter<'_, T> {
     }
     fn terminal_event(&mut self) -> Option<TerminalEvent> {
         self.inner.terminal_event()
+    }
+    fn finish_host(&mut self) {
+        self.inner.finish_host();
     }
     fn flush_output(&mut self) -> io::Result<bool> {
         self.pump()?;
@@ -498,8 +511,8 @@ mod tests {
         os::fd::AsFd,
         time::{Duration, Instant},
     };
-    struct ClosedInput(std::os::unix::net::UnixStream);
-    impl trames_vfs::ConsoleIo for ClosedInput {
+    struct ClosedInput<F: AsFd + Send + Sync>(F);
+    impl<F: AsFd + Send + Sync> trames_vfs::ConsoleIo for ClosedInput<F> {
         fn read(&self, _: usize) -> Result<Vec<u8>, Errno> {
             Ok(Vec::new())
         }
@@ -546,5 +559,37 @@ mod tests {
             Instant::now() >= at,
             "closed stdin caused an immediate wake"
         );
+    }
+    #[test]
+    fn immediately_ready_device_input_does_not_require_native_registration() {
+        let (vfs, pair) = terminal();
+        let mut host = Host {
+            source: Arc::new(ClosedInput(std::fs::File::open("/dev/null").unwrap())),
+            eof: true,
+            ..Host::default()
+        };
+        let mut adapter = Adapter::new(&mut host, Some(pair.clone()), Arc::new(NoWrites));
+        let mut wait = trames_linux::HostWait::new().unwrap();
+        wait.begin();
+        // macOS rejects EVFILT_READ on /dev/null; a ready nonblocking read
+        // needs no native wait registration on either host.
+        adapter.host_interest(&mut wait).unwrap();
+        adapter.poll_host(&vfs).unwrap();
+        assert!(pair.terminal.borrow().eof);
+        wait.wait().unwrap();
+        let at = Instant::now() + Duration::from_millis(20);
+        // An already queued coalesced wake is allowed. EOF must not keep
+        // producing readiness indefinitely after that event is consumed.
+        for _ in 0..4 {
+            wait.begin();
+            adapter.host_interest(&mut wait).unwrap();
+            adapter.poll_host(&vfs).unwrap();
+            wait.until(at);
+            wait.wait().unwrap();
+            if Instant::now() >= at {
+                return;
+            }
+        }
+        panic!("ready device EOF kept the native event loop active");
     }
 }

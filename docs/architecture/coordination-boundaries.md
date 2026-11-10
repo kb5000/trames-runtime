@@ -55,6 +55,12 @@ coverage. Actual object locks, backing leases, affected-mm quiescence and UI-thr
 affinity remain their own resource requirements. The architecture gate enforces
 this boundary for both products. See the paired product's stage 106 validation.
 
+Ready console operations do not register a native wait filter. This preserves
+regular/device input such as `/dev/null`, whose read is already ready but whose
+native kqueue registration is unsupported. Permanent EOF removes read interest.
+On normal source closure the embedding rejects unadmitted commands before
+output draining; already admitted native work retains its real completion.
+
 Stage 104's bootstrap-only setup, live host interface and execution-worker CPU
 entry remain enforced, as does stage 103's one-way source terminal completion.
 

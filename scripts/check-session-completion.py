@@ -14,7 +14,7 @@ for path in source.rglob('*.rs'):
     if path.name.startswith('.') or path.name.endswith('_tests.rs'):
         continue
     text = production(path.read_text())
-    assert not re.search(r'\.(?:handoff|missing_capability)\(|\bMissing\b', text), path
+    assert not re.search(r'\.(?:handoff|missing_capability|bind_owner)\(|\bMissing\b', text), path
 control = production((source / 'execution_control.rs').read_text())
 assert not re.search(r'fn (?:suspend|handoff|missing_capability)\b|\bHANDOFF\b', control)
 queue = production((source / 'run_queue.rs').read_text())
@@ -63,3 +63,6 @@ host = production((source / 'process_vm.rs').read_text()).split('fn wait_source(
 assert 'wait.wait()' in host
 assert not re.search(r'event_timeout|processes|vm_checkpoint|parallel_timeout|finish_slice', host)
 print('Host wait verified: native events, no release checkpoint receiver, task scans or periodic control timer')
+
+assert drive.count('io.finish_host()') == 1
+assert drive.index('self.completed.take()') < drive.index('io.finish_host()') < re.search(r'\.flush_output\(', drive).start()

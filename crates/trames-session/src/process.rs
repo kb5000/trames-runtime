@@ -4446,6 +4446,7 @@ impl<C: Cpu> Kernel<C> {
             io.host_interest(&mut wait)
                 .map_err(|e| RuntimeError::HostIo(Arc::new(e)))?;
             if let Some(exit) = self.completed.take() {
+                io.finish_host();
                 loop {
                     if io
                         .flush_output()

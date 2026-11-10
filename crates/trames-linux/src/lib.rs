@@ -247,6 +247,8 @@ pub trait GuestOutput {
     }
     /// Producers retain this notification, never the guest dispatcher.
     fn bind_host_wake(&mut self, _wake: std::sync::Arc<HostWake>) {}
+    /// Source execution has closed; reject new embedding work before draining.
+    fn finish_host(&mut self) {}
     /// Complete accepted host output before normal session teardown.
     fn flush_output(&mut self) -> io::Result<bool> {
         Ok(true)
@@ -339,6 +341,8 @@ pub mod execution_io {
         }
         /// Producers retain this notification, never the guest dispatcher.
         fn bind_host_wake(&mut self, _wake: std::sync::Arc<HostWake>) {}
+        /// Source execution has closed; reject new embedding work before draining.
+        fn finish_host(&mut self) {}
         /// Complete accepted host output before normal session teardown.
         fn flush_output(&mut self) -> io::Result<bool> {
             Ok(true)
@@ -413,6 +417,9 @@ pub mod execution_io {
         }
         fn bind_host_wake(&mut self, wake: std::sync::Arc<HostWake>) {
             super::GuestOutput::bind_host_wake(self, wake)
+        }
+        fn finish_host(&mut self) {
+            super::GuestOutput::finish_host(self)
         }
         fn flush_output(&mut self) -> io::Result<bool> {
             super::GuestOutput::flush_output(self)
