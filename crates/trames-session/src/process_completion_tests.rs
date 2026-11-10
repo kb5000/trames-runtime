@@ -221,3 +221,32 @@ fn source_backend_fault_closes_without_returning_to_generic_dispatch() {
     assert!(k.cohort_return_syscalls.is_empty());
     assert_eq!(k.serviced_syscalls, 0);
 }
+
+#[test]
+fn single_cpu_bootstrap_opens_original_embedding_terminal_zero_without_owner_return() {
+    let mut k = kernel();
+    k.profile_syscalls = true;
+    let mut root = admitted_process(&k);
+    root.linux.vfs.enable_terminal().unwrap();
+    root.memory.write(0x1000, b"/dev/tty\0").unwrap();
+    root.cpu.set_x(0, (-100i64) as u64);
+    root.cpu.set_x(1, 0x1000);
+    root.cpu.set_x(2, 0x20002);
+    root.cpu.set_x(8, 56);
+    executable(
+        &mut root,
+        &[0xd4000001, 0xaa0003f3, 0xd2800000, 0xd2800ba8, 0xd4000001],
+    );
+    k.publish_task(1, &root);
+    k.processes.insert(1, root);
+    assert_eq!(
+        k.drive(&mut trames_linux::CapturedOutput::default(), 100000)
+            .unwrap()
+            .code,
+        0
+    );
+    assert!((3..trames_vfs::MAX_FDS as u64).contains(&k.processes.read(&1).cpu.x(19)));
+    assert_eq!(k.parallel_rounds, 1);
+    assert!(k.cohort_return_syscalls.is_empty());
+    assert_eq!(k.serviced_syscalls, 0);
+}

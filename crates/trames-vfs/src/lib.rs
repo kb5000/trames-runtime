@@ -2421,8 +2421,7 @@ impl Vfs {
                             _ => false,
                         };
                     let controlling_tty = matches!(n.content, Content::Terminal)
-                        && self.terminal_task.get().is_some()
-                        && self.controlling_terminal() != Some(0);
+                        && self.terminal_task.get().is_some();
                     if !query.original
                         && !pty
                         && !controlling_tty

@@ -4542,3 +4542,10 @@ original caller/namespace context. Inode identity remains shared; no global
 resolver lock, owner handoff or ordinary file-byte check is added. The unchanged
 native proc workload failed within four repetitions before the fix and passes
 100 consecutive four/twelve-CPU repetitions after it.
+
+Single-CPU admission also exposed an obsolete controlling-terminal exception for
+embedding PTY ID 0. Its original terminal task and pair already exist, so zero is
+not an absent capability. `/dev/tty` now uses the same original source open body
+for embedding and ordinary PTYs. The existing twelve-CPU host lifecycle test
+retains its one-cohort/zero-return requirement; no bootstrap boundary is hidden
+or removed from the accounting.

@@ -1648,10 +1648,7 @@ impl Vfs {
         if let Some(content) = simple_device::builtin(path) {
             return Ok(Some(content));
         }
-        if path == b"/dev/tty"
-            && self.terminal_task.get().is_some()
-            && self.controlling_terminal() != Some(0)
-        {
+        if path == b"/dev/tty" && self.terminal_task.get().is_some() {
             return Ok(Some((Content::Terminal, 0o20666)));
         }
         if path == b"/dev" || path.starts_with(b"/dev/") {
