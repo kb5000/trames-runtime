@@ -22,6 +22,7 @@ impl State {
         handle.create_global::<Self, wl_compositor::WlCompositor, _>(6, ());
         handle.create_global::<Self, wl_shm::WlShm, _>(1, ());
         self.ensure_output(handle, 1);
+        crate::viewport::globals(handle);
         crate::shell::globals(handle);
         crate::input::globals(handle);
         crate::selection::globals(handle);
@@ -78,6 +79,7 @@ impl State {
             || pending.damaged
             || pending.scale != s.scale
             || pending.transform != s.transform
+            || pending.viewport != s.viewport
             || pending.input.is_some()
             || pending.offset.is_some()
             || pending.geometry.is_some();
@@ -93,6 +95,15 @@ impl State {
         }
         s.scale = pending.scale;
         s.transform = pending.transform;
+        s.viewport = pending.viewport;
+        if s.current.is_none() {
+            if let Err((code, message)) = s.viewport.validate_size() {
+                if let Some(resource) = &s.viewport_resource {
+                    resource.post_error(code, message);
+                }
+                return;
+            }
+        }
         if let Some(input) = pending.input {
             s.input = input;
         }
@@ -114,10 +125,9 @@ impl State {
                     .post_error(2u32, "buffer dimensions must be a multiple of scale");
                 return;
             }
-            s.size = s
-                .geometry
-                .map(|(_, _, w, h)| (w, h))
-                .unwrap_or((w / s.scale as u32, h / s.scale as u32));
+            if !s.update_size((bw, bh)) {
+                return;
+            }
         }
         // A frame callback requests scheduling, not new image content. Reuse
         // the displayed content revision so the existing pacer can deliver it

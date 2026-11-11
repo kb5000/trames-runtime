@@ -71,10 +71,9 @@ impl State {
             if !w.is_multiple_of(s.scale as u32) || !h.is_multiple_of(s.scale as u32) {
                 continue;
             }
-            s.size = s
-                .geometry
-                .map(|(_, _, w, h)| (w, h))
-                .unwrap_or((w / s.scale as u32, h / s.scale as u32));
+            if !s.update_size(image.dimensions()) {
+                continue;
+            }
             s.current = Some(crate::scene::ImageBuffer::Gpu(image));
             s.gpu_presented = false;
             self.revision = self.revision.wrapping_add(1);

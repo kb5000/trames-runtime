@@ -427,16 +427,11 @@ impl State {
             .find(|w| w.id == window && w.mode != WindowMode::Minimized)?;
         for image in window.scene.iter().rev() {
             let (lx, ly) = (x - f64::from(image.x), y - f64::from(image.y));
-            let (bw, bh) = image.buffer.dimensions();
-            let (width, height) = if image.transform & 1 != 0 {
-                (bh, bw)
-            } else {
-                (bw, bh)
-            };
+            let (width, height) = image.destination;
             if lx >= 0.0
                 && ly >= 0.0
-                && lx < f64::from(width) / f64::from(image.scale)
-                && ly < f64::from(height) / f64::from(image.scale)
+                && lx < f64::from(width)
+                && ly < f64::from(height)
                 && self
                     .surfaces
                     .get(&image.surface)

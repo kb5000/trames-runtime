@@ -49,18 +49,12 @@ impl WindowSnapshot {
         let (mut x, mut y, mut r, mut b) =
             (0i64, 0i64, i64::from(self.width), i64::from(self.height));
         for image in &self.scene {
-            let (w, h) = image.buffer.dimensions();
-            let (w, h) = if image.transform & 1 != 0 {
-                (h, w)
-            } else {
-                (w, h)
-            };
-            let scale = i64::from(image.scale.max(1));
+            let (w, h) = image.destination;
             let (ix, iy) = (i64::from(image.x), i64::from(image.y));
             x = x.min(ix);
             y = y.min(iy);
-            r = r.max(ix + i64::from(w) / scale);
-            b = b.max(iy + i64::from(h) / scale);
+            r = r.max(ix + i64::from(w));
+            b = b.max(iy + i64::from(h));
         }
         let x = x.clamp(-4096, 4096);
         let y = y.clamp(-4096, 4096);
@@ -76,6 +70,10 @@ pub struct SurfaceImage {
     pub y: i32,
     pub scale: i32,
     pub transform: u32,
+    /// Surface-local destination size and crop in normalized transformed UVs.
+    /// Both presenters consume these metadata without copying/resizing storage.
+    pub destination: (u32, u32),
+    pub source: [f32; 4],
     pub buffer: ImageBuffer,
 }
 #[derive(Clone)]
@@ -155,6 +153,7 @@ pub(crate) struct CachedCommit {
     pub offset: Option<(i32, i32)>,
     pub transform: u32,
     pub input: Option<Option<Region>>,
+    pub viewport: crate::viewport::Viewport,
 }
 impl CachedCommit {
     pub fn merge(&mut self, mut next: Self) {
@@ -165,6 +164,7 @@ impl CachedCommit {
         self.damaged |= next.damaged;
         self.scale = next.scale;
         self.transform = next.transform;
+        self.viewport = next.viewport;
         if let Some((x, y)) = next.offset {
             let (a, b) = self.offset.unwrap_or_default();
             self.offset = Some((a.saturating_add(x), b.saturating_add(y)));
@@ -211,6 +211,12 @@ pub(crate) struct Surface {
     pub resource: WlSurface,
     pub connection: u64,
     pub preferred_scale: i32,
+    pub viewport_resource:
+        Option<wayland_protocols::wp::viewporter::server::wp_viewport::WpViewport>,
+    pub viewport: crate::viewport::Viewport,
+    pub pending_viewport: crate::viewport::Viewport,
+    pub destination: (u32, u32),
+    pub source: [f32; 4],
     pub xdg: Option<XdgSurface>,
     pub top: Option<XdgToplevel>,
     pub popup: Option<XdgPopup>,
@@ -255,6 +261,30 @@ pub(crate) struct Surface {
     pub pending_input: Option<Option<Region>>,
 }
 impl Surface {
+    pub fn buffer_size(&self, (w, h): (u32, u32)) -> (u32, u32) {
+        let (w, h) = if self.transform & 1 != 0 {
+            (h, w)
+        } else {
+            (w, h)
+        };
+        (w / self.scale as u32, h / self.scale as u32)
+    }
+    pub fn update_size(&mut self, buffer: (u32, u32)) -> bool {
+        match self.viewport.size(self.buffer_size(buffer)) {
+            Ok(size) => {
+                self.size = self.geometry.map(|(_, _, w, h)| (w, h)).unwrap_or(size);
+                self.destination = size;
+                self.source = self.viewport.normalized_source(self.buffer_size(buffer));
+                true
+            }
+            Err((code, message)) => {
+                if let Some(resource) = &self.viewport_resource {
+                    resource.post_error(code, message);
+                }
+                false
+            }
+        }
+    }
     pub fn is_toplevel(&self) -> bool {
         self.top.is_some() || (self.x11.is_some() && self.parent.is_none())
     }
@@ -271,6 +301,7 @@ impl Surface {
             offset: self.pending_offset.take(),
             transform: self.pending_transform,
             input: self.pending_input.take(),
+            viewport: self.pending_viewport,
         }
     }
     pub fn new(resource: WlSurface, connection: u64) -> Self {
@@ -281,6 +312,11 @@ impl Surface {
             resource,
             connection,
             preferred_scale: 0,
+            viewport_resource: None,
+            viewport: Default::default(),
+            pending_viewport: Default::default(),
+            destination: (0, 0),
+            source: [0.0, 0.0, 1.0, 1.0],
             role: Role::None,
             dismissed: false,
             xdg: None,
@@ -350,6 +386,8 @@ pub(crate) fn snapshot(surfaces: &BTreeMap<u64, Surface>) -> Vec<WindowSnapshot>
                         y,
                         scale: s.scale,
                         transform: s.transform,
+                        destination: s.destination,
+                        source: s.source,
                         buffer: buffer.clone(),
                     });
                 }

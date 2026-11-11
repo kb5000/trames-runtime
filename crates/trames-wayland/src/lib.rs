@@ -7,6 +7,7 @@ mod gpu;
 mod input;
 mod output;
 mod selection;
+mod viewport;
 mod wsi;
 pub use selection::HostClipboard;
 pub use wsi::WsiConnection;

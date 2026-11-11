@@ -11,6 +11,106 @@ use trames_wayland::{InputEvent, Server, WindowMode};
 
 #[test]
 #[ignore = "build original C client with scripts/test-wayland.sh"]
+fn original_c_viewporter_crop_transform_reset_and_protocol_errors() {
+    let client =
+        std::env::var("TRAMES_WAYLAND_VIEWPORT_CLIENT").expect("original viewport fixture");
+    for mode in [
+        "valid",
+        "bad-size",
+        "out-of-buffer",
+        "duplicate",
+        "no-surface",
+        "bad-value",
+    ] {
+        let server = Server::new().unwrap();
+        let (_, socket) = server.connect(8, 1000, 1000).unwrap();
+        let fd = socket.as_raw_fd();
+        let mut command = Command::new(&client);
+        command
+            .arg(mode)
+            .env("WAYLAND_SOCKET", fd.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // SAFETY: child-only fcntl on the live inherited test connection.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        drop(socket);
+        let began = Instant::now();
+        let mut stages = [false; 3];
+        loop {
+            let snapshot = server.snapshot();
+            if mode == "valid" {
+                for window in &snapshot.windows {
+                    let image = &window.scene[0];
+                    assert_eq!(image.buffer.dimensions(), (8, 4));
+                    match (window.width, window.height) {
+                        (12, 6) => {
+                            assert_eq!(image.source, [0.25, 0.0, 0.5, 1.0]);
+                            assert_eq!(image.destination, (12, 6));
+                            stages[0] = true;
+                        }
+                        (3, 5) => {
+                            assert_eq!(image.transform, 1);
+                            assert_eq!(image.source, [0.0, 0.0, 1.0, 1.0]);
+                            assert_eq!(image.destination, (3, 5));
+                            stages[1] = true;
+                        }
+                        (4, 2) => {
+                            assert_eq!(image.transform, 0);
+                            assert_eq!(image.scale, 2);
+                            assert_eq!(image.destination, (4, 2));
+                            assert_eq!(image.source, [0.0, 0.0, 1.0, 1.0]);
+                            stages[2] = true;
+                        }
+                        size => panic!("unexpected viewport size {size:?}"),
+                    }
+                    server
+                        .presented(
+                            window.id,
+                            snapshot.revision,
+                            began.elapsed().as_millis() as u32,
+                        )
+                        .unwrap();
+                }
+            }
+            if child.try_wait().unwrap().is_some() {
+                let output = child.wait_with_output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "mode {mode}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let text = String::from_utf8_lossy(&output.stdout);
+                if mode == "valid" {
+                    assert_eq!(stages, [true; 3]);
+                    assert!(text.contains("viewport-client-ok"));
+                } else {
+                    assert!(text.contains("viewport-error-ok"), "{text}");
+                }
+                break;
+            }
+            if began.elapsed() > Duration::from_secs(5) {
+                child.kill().unwrap();
+                panic!(
+                    "viewport client timed out: {mode}: {:?}",
+                    child.wait_with_output().unwrap()
+                );
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+#[test]
+#[ignore = "build original C client with scripts/test-wayland.sh"]
 fn original_c_client_two_windows_resize_frames_and_native_close() {
     let client = std::env::var("TRAMES_WAYLAND_C_CLIENT").expect("original C fixture path");
     for (close, density, legacy) in [
