@@ -947,7 +947,7 @@ impl Backend {
     pub fn reap_abandoned(&mut self) {
         self.compiles
             .retain(|_, c| !c.abandoned || matches!(c.task.poll(), Ok(None)));
-        if self.teardown_ready() {
+        if self.teardowns.values().any(|job| job.abandoned) && self.teardown_ready() {
             let jobs = self
                 .teardowns
                 .iter()
@@ -981,7 +981,9 @@ impl Backend {
         if trace {
             eprintln!("trames-vulkan op={operation} args={a:x?}");
         }
-        self.collect();
+        if !core_commands::records_only(operation) {
+            self.collect();
+        }
         if operation == 17
             && a[5] == shared_memory::MAP_SHARED
             && !memory.can_import_mapping()

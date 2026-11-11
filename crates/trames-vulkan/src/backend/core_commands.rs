@@ -2,6 +2,19 @@
 //! Small core commands forward directly to the original driver on this context.
 use super::*;
 
+/// These calls only append to an already-recording buffer. Its begin/reset
+/// boundary has already retired previous execution; recording neither observes
+/// GPU completion nor releases pending submissions. Keep driver fence polling
+/// at control/lifetime boundaries, not between every bind/draw/state command.
+/// ExecuteCommands (219) still collects because it observes secondary buffers
+/// which may have finished their previous execution since primary recording began.
+pub(super) fn records_only(op: u64) -> bool {
+    matches!(op,
+        41..=47 | 71..=76 | 94..=97 | 114 | 123..=124 | 132 | 134..=136 |
+        140 | 142..=149 | 151 | 203..=205 | 210..=211 | 213 | 215 | 218 |
+        225..=227 | 235..=236)
+}
+
 impl Backend {
     pub(super) fn core_command(
         &mut self,
