@@ -2346,3 +2346,20 @@ I/O handle cannot extend PID visibility. This common implementation applies to H
 This change does not yet move task exit, group-stop acknowledgement, reparenting
 or final resource destruction onto workers; those connected lifecycle
 prerequisites remain documented in `coordination-boundaries.md`.
+
+## Parked scheduling indexes (2026-11-12)
+
+The original run queue owns parked jobs and exact deadline/native-interest/GPU
+membership in one wrapper. Insert, removal, replacement and queue drain maintain
+these indexes together; callers have read-only map access. Dispatch consults the
+first deadline and only rechecks expired jobs instead of walking every sleeper
+under the shared queue mutex. Resource timers still own their actual rearm state.
+Producer, interest and STOP/CONT changes notify the original task signal, remove
+its parked entry, and rearm that task before insertion. No native FD handles are
+cached by this index. Late native producers, socket timeout/readiness, GPU timeout,
+wake-before-park, cancellation and VM checkpoints keep their existing protocol.
+
+This removes dispatch-time full parked-map scans, not the queue mutex itself.
+Affinity selection and explicit whole-domain pause/drain operations still inspect
+the jobs relevant to those operations. It introduces no owner RPC, timer thread,
+resource service or polling bus.

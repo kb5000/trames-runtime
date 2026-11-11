@@ -251,6 +251,7 @@ pub struct Memory {
     limit: usize,
     account: std::sync::Arc<Account>,
     report_cache: RefCell<Option<(u64, MemoryReport, std::sync::Arc<report::ReportOwner>)>>,
+    region_layout: Arc<report::RegionLayout>,
     image_ranges: Option<ImageRanges>,
     revision: u64,
     code_revision: u64,
@@ -331,6 +332,7 @@ impl Memory {
             limit: self.limit,
             account,
             report_cache: RefCell::new(None),
+            region_layout: self.region_layout.clone(),
             image_ranges: self.image_ranges,
             revision: self.revision,
             code_revision: self.code_revision,
@@ -471,6 +473,7 @@ impl Memory {
             limit,
             account: Account::new(limit),
             report_cache: RefCell::new(None),
+            region_layout: Arc::default(),
             image_ranges: None,
             revision: 0,
             code_revision: 0,
@@ -507,6 +510,13 @@ impl Memory {
         if let Some(shared) = &self.shared {
             return shared.borrow().regions();
         }
+        self.region_layout.ranges.clone()
+    }
+
+    // Independent oracle for compact layout tests; production reports never
+    // walk materialized descriptors to rediscover virtual ownership.
+    #[cfg(test)]
+    fn regions_from_pages(&self) -> Vec<(u64, u64, Permissions)> {
         let mut pages = self
             .pages
             .iter()
@@ -772,7 +782,8 @@ impl Memory {
         }
     }
 
-    fn advance_mapping_revision(&mut self) {
+    fn advance_mapping_revision(&mut self, start: u64, end: u64, permissions: Option<Permissions>) {
+        Arc::make_mut(&mut self.region_layout).replace(start, end, permissions);
         self.advance_code_revision();
         self.layout_revision = self.layout_revision.wrapping_add(1);
         if self.layout_revision == 0 {
@@ -869,7 +880,7 @@ impl Memory {
             self.free_frames.push(frame);
         }
         self.revision = self.revision.wrapping_add(1);
-        self.advance_mapping_revision();
+        self.advance_mapping_revision(address, end, None);
         self.refresh_mapping_mmu(address, len);
         self.invalidate_translations();
         self.reclaim_unused();
@@ -920,7 +931,7 @@ impl Memory {
             return Err(MemoryError::Limit);
         }
         self.invalidate_proc_reads(address, end);
-        self.advance_mapping_revision();
+        self.advance_mapping_revision(address, end, Some(permissions));
         self.anonymous.insert(
             address,
             end,
@@ -972,7 +983,7 @@ impl Memory {
         self.check_reservation_split(address, end, 0)?;
         self.invalidate_proc_reads(address, end);
         self.retire_sparse(address, end);
-        self.advance_mapping_revision();
+        self.advance_mapping_revision(address, end, Some(permissions));
         let mut reserved: Vec<_> = self
             .reservations
             .range(address..end)

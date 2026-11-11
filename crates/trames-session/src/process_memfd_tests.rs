@@ -100,8 +100,15 @@ fn guest_memfd_creation_sparse_mapping_seals_aliases_and_reuse_stay_on_source() 
         peer.cpu.set_pc(0x6000);
         k.processes.insert(1, root);
         k.processes.insert(2, peer);
+        // Complete the accepted cohort up to its actual futex idle state.
+        // A bounded 10 ms round can return before the stores under host load;
+        // that host scheduling cutoff is not the behavior this fixture checks.
         assert!(k
-            .parallel_round(&mut trames_linux::CapturedOutput::default(), 1_000_000)
+            .parallel_epoch(
+                &mut trames_linux::CapturedOutput::default(),
+                1_000_000,
+                true
+            )
             .unwrap());
         eprintln!(
             "memfd CPUs={cpus} slots={slots} filter={filtered} cohorts={} returned={:?} scopes={}",
@@ -115,7 +122,10 @@ fn guest_memfd_creation_sparse_mapping_seals_aliases_and_reuse_stay_on_source() 
                     .memory
                     .read_array::<4>(0x2800)
                     .unwrap(),
-                1u32.to_le_bytes()
+                1u32.to_le_bytes(),
+                "pid={pid}, pc={:#x}, instructions={}",
+                k.processes.read(&pid).cpu.pc,
+                k.instructions,
             );
         }
         let root = k.processes.get_mut(&1).unwrap();

@@ -2051,6 +2051,51 @@ impl View {
         self.mark_hardware_frame(frame);
         Ok(())
     }
+    /// Publish the executing CPU's current writable shared bindings in compact
+    /// root-frame words. Mapping synchronization retires stale membership first.
+    /// Preserve the original before-run metadata timing; no deferred bytes or
+    /// whole-VM historical set. Host bounds/permissions still reject bad groups.
+    pub fn mark_hardware_write_word(&self, word: usize, bits: u64) -> Result<(), MemoryError> {
+        let dirty = self
+            .snapshot
+            .dirty_pages
+            .get(word)
+            .ok_or(MemoryError::InvalidRange)?;
+        struct Published<'a>(&'a AtomicU64, u64);
+        impl Drop for Published<'_> {
+            fn drop(&mut self) {
+                // Also retain an accepted prefix if a later member faults.
+                self.0.fetch_or(self.1, Ordering::Relaxed);
+            }
+        }
+        let mut published = Published(dirty, 0);
+        let mut remaining = bits;
+        while remaining != 0 {
+            let bit = remaining.trailing_zeros() as usize;
+            let position = self
+                .snapshot
+                .positions
+                .get(word * 64 + bit)
+                .copied()
+                .flatten()
+                .ok_or(MemoryError::InvalidRange)?;
+            let frame = &self.snapshot.frames[position];
+            if !frame.permissions.write || !frame.hardware_track_writes {
+                return Err(MemoryError::InvalidRange);
+            }
+            if let Some(error) = &frame.error {
+                return Err(error.clone());
+            }
+            frame.bytes.dirty.store(u64::MAX, Ordering::Relaxed);
+            frame.bytes.version().fetch_add(1, Ordering::Relaxed);
+            if frame.permissions.execute {
+                frame.bytes.code_epoch.fetch_add(1, Ordering::Release);
+            }
+            published.1 |= 1 << bit;
+            remaining &= remaining - 1;
+        }
+        Ok(())
+    }
     pub fn hardware_page_info(&self, address: u64) -> Result<HardwarePageInfo, MemoryError> {
         if !address.is_multiple_of(PAGE_SIZE) {
             return Err(MemoryError::InvalidRange);

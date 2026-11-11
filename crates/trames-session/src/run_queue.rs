@@ -15,6 +15,7 @@ use std::{
 };
 use trames_engine::{Cpu, DecodeStats, SliceOutcome};
 mod domains;
+mod parked;
 pub(super) use domains::{Checkpoint, Domain};
 
 #[derive(Clone)]
@@ -784,7 +785,7 @@ impl Stats {
 #[derive(Default)]
 struct Queues<C: Cpu> {
     ready: VecDeque<Box<Job<C>>>,
-    parked: BTreeMap<u32, Box<Job<C>>>,
+    parked: parked::Parked<C>,
     members: BTreeSet<u32>,
     host_admissions: BTreeSet<u32>,
     running: usize,
@@ -1172,11 +1173,13 @@ impl<C: Cpu> Epoch<C> {
             q = self.changed.wait_timeout(q, left).unwrap().0;
         }
         let deadline = Instant::now();
-        let io = q.parked.get_mut(&pid).unwrap().io.as_mut().unwrap();
-        io.deadline = Some(deadline);
-        if let Some(wait) = io.retained_poll.as_mut() {
-            Arc::make_mut(wait).deadline = Some(deadline);
-        }
+        q.parked.update(pid, |job| {
+            let io = job.io.as_mut().unwrap();
+            io.deadline = Some(deadline);
+            if let Some(wait) = io.retained_poll.as_mut() {
+                Arc::make_mut(wait).deadline = Some(deadline);
+            }
+        });
         self.publish_deadline(Some(deadline));
         self.notify(&mut q);
     }
@@ -1694,13 +1697,7 @@ impl<C: Cpu> Epoch<C> {
                 q = self.queues.lock().unwrap();
             }
             let now = Instant::now();
-            let expired: Vec<_> = q
-                .parked
-                .iter()
-                .filter_map(|(&pid, job)| {
-                    (job.wake_deadline().is_some_and(|d| d <= now)).then_some(pid)
-                })
-                .collect();
+            let expired = q.parked.expired(now);
             for pid in expired {
                 // The first dormant wake may already hold expired siblings of
                 // the same mm in its preparation scope.
@@ -1795,8 +1792,8 @@ impl<C: Cpu> Epoch<C> {
             }
             let deadline = q
                 .parked
-                .values()
-                .filter_map(|j| j.wake_deadline())
+                .next_deadline()
+                .into_iter()
                 .chain(self.timers.get().and_then(|t| t.next_deadline()))
                 .min();
             self.next_deadline.store(
@@ -1818,10 +1815,7 @@ impl<C: Cpu> Epoch<C> {
                 })
             })
             .flatten();
-            let external = q.parked.values().any(|j| {
-                j.io.as_ref().is_some_and(|io| io.external_wait())
-                    || j.uring.as_ref().is_some_and(|ring| ring.external())
-            });
+            let external = q.parked.external();
             if external && !q.host_waiting && (available.is_none() || !dispatched) {
                 // A parked eventfd can acquire its first native producer on
                 // another worker. Its resource metadata wakes us; initialize
@@ -1887,7 +1881,7 @@ impl<C: Cpu> Epoch<C> {
                 && q.completing == 0
                 && q.ready.is_empty()
                 && deadline.is_none()
-                && !q.parked.values().any(|j| j.gpu_pending.is_some())
+                && !q.parked.gpu_pending()
                 && !external
                 && !q.domains.any_paused()
                 && self.lifecycle.get().is_none_or(|lifecycle| {
@@ -2102,11 +2096,7 @@ impl<C: Cpu> Epoch<C> {
             self.ready(&mut q, job);
         } else {
             assert!(q.parked.insert(job.work.pid, job).is_none());
-            let count = q
-                .parked
-                .values()
-                .filter(|j| j.gpu_pending.as_ref().is_some_and(|p| p.compile.is_some()))
-                .count();
+            let count = q.parked.compile_count();
             q.gpu_peak_pending = q.gpu_peak_pending.max(count);
         }
         self.notify(&mut q);
@@ -2590,6 +2580,105 @@ mod tests {
             0,
             None,
         )
+    }
+    #[test]
+    fn parked_deadline_index_replaces_cancels_and_expires_original_jobs_once() {
+        let epoch = Epoch::new(Arc::new(Control::new(1000)));
+        let now = Instant::now();
+        let mut parked = parked::Parked::default();
+        let sleeper = |pid, seconds| {
+            let mut item = job(pid, &epoch);
+            item.waiting = Some(WaitState::Sleep {
+                deadline: now + Duration::from_secs(seconds),
+                remaining: 0,
+            });
+            item
+        };
+        parked.insert(1, sleeper(1, 30));
+        parked.insert(2, sleeper(2, 10));
+        parked.insert(3, job(3, &epoch));
+        assert_eq!(parked.next_deadline(), Some(now + Duration::from_secs(10)));
+        assert!(parked.expired(now + Duration::from_secs(9)).is_empty());
+        parked.remove(&2).unwrap();
+        assert_eq!(parked.next_deadline(), Some(now + Duration::from_secs(30)));
+        assert!(parked.insert(1, sleeper(1, 40)).is_some());
+        assert!(parked.expired(now + Duration::from_secs(35)).is_empty());
+        assert_eq!(parked.expired(now + Duration::from_secs(41)), vec![1]);
+        parked.remove(&1).unwrap();
+        assert!(parked.expired(now + Duration::from_secs(42)).is_empty());
+        assert!(parked.next_deadline().is_none());
+        assert_eq!(
+            std::mem::take(&mut parked)
+                .into_values()
+                .map(|j| j.work.pid)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert!(parked.is_empty());
+    }
+    #[test]
+    fn parked_deadline_index_tracks_early_rearms_and_gpu_wait_lifetime() {
+        let epoch = Epoch::new(Arc::new(Control::new(1000)));
+        let now = Instant::now();
+        let mut parked = parked::Parked::default();
+        let mut item = job(1, &epoch);
+        item.gpu_pending = Some(crate::gpu::Pending::timed_for_test(
+            now + Duration::from_secs(60),
+            1,
+            &epoch.io_target,
+        ));
+        parked.insert(1, item);
+        assert!(parked.gpu_pending());
+        assert_eq!(parked.compile_count(), 0);
+        parked.update(1, |j| {
+            j.waiting = Some(WaitState::Sleep {
+                deadline: now + Duration::from_secs(2),
+                remaining: 0,
+            })
+        });
+        assert_eq!(parked.next_deadline(), Some(now + Duration::from_secs(2)));
+        assert_eq!(parked.expired(now + Duration::from_secs(3)), vec![1]);
+        parked.remove(&1).unwrap();
+        assert!(!parked.gpu_pending());
+        assert!(!parked.external());
+        assert!(parked.next_deadline().is_none());
+    }
+    #[test]
+    #[ignore = "parked scheduling timing; run with --release --nocapture"]
+    fn parked_dispatch_benchmark() {
+        let epoch = Epoch::new(Arc::new(Control::new(1000)));
+        let now = Instant::now();
+        let mut parked = parked::Parked::default();
+        for pid in 1..=512 {
+            let mut item = job(pid, &epoch);
+            item.waiting = Some(WaitState::Sleep {
+                deadline: now + Duration::from_secs(60),
+                remaining: 0,
+            });
+            parked.insert(pid, item);
+        }
+        for legacy in [true, false] {
+            let began = Instant::now();
+            for _ in 0..10_000 {
+                let (expired, next) = if legacy {
+                    (
+                        parked
+                            .values()
+                            .filter(|j| j.wake_deadline().is_some_and(|d| d <= now))
+                            .count(),
+                        parked.values().filter_map(|j| j.wake_deadline()).min(),
+                    )
+                } else {
+                    (parked.expired(now).len(), parked.next_deadline())
+                };
+                assert_eq!(std::hint::black_box(expired), 0);
+                assert_eq!(next, Some(now + Duration::from_secs(60)));
+            }
+            println!(
+                "parked scheduling legacy={legacy}: 512 sleepers, 10000 dispatches, {} us",
+                began.elapsed().as_micros()
+            );
+        }
     }
     #[test]
     fn targeted_wakes_preserve_pinned_affinity_and_stop_every_waiting_slot() {

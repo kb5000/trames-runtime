@@ -167,6 +167,258 @@ mod tests {
         bytes: Box<UnsafeCell<[u8; PAGE_SIZE as usize]>>,
         borrows: AtomicUsize,
     }
+    struct PublishedPage {
+        bytes: Arc<SharedPage>,
+        identity: u64,
+        published: AtomicUsize,
+    }
+    impl PublishedPage {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                bytes: Arc::new(SharedPage::new([0; PAGE_SIZE as usize])),
+                identity: crate::new_backing_identity(),
+                published: AtomicUsize::new(0),
+            })
+        }
+    }
+    impl crate::PageBacking for PublishedPage {
+        fn shared_page(&self) -> Option<Arc<SharedPage>> {
+            Some(self.bytes.clone())
+        }
+        fn parallel_key(&self) -> Option<(u64, u64)> {
+            Some((self.identity, 0))
+        }
+        fn parallel_versioned(&self) -> bool {
+            true
+        }
+        fn parallel_change_domain(&self) -> Option<(u64, u64)> {
+            Some((self.identity, self.version()))
+        }
+        fn parallel_metadata_domain(&self) -> Option<(u64, u64)> {
+            Some((self.identity, 0))
+        }
+        fn parallel_metadata_changes_since(&self, _: u64) -> Option<Vec<std::ops::Range<u64>>> {
+            Some(Vec::new())
+        }
+        fn publish_write(&self, _: usize, _: usize) -> Result<(), crate::MemoryError> {
+            self.published.fetch_add(1, Ordering::Relaxed);
+            crate::backing_changed();
+            Ok(())
+        }
+        fn check(&self, _: u64) -> Result<(), crate::MemoryError> {
+            Ok(())
+        }
+        fn read(&self, offset: usize, out: &mut [u8]) -> Result<(), crate::MemoryError> {
+            out.copy_from_slice(self.bytes.lock(offset, out.len()).read(offset, out.len()));
+            Ok(())
+        }
+        fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), crate::MemoryError> {
+            self.bytes
+                .lock(offset, bytes.len())
+                .write(offset, bytes.len())
+                .copy_from_slice(bytes);
+            self.publish_write(offset, bytes.len())
+        }
+        fn sync(&self) -> Result<(), crate::MemoryError> {
+            Ok(())
+        }
+        fn version(&self) -> u64 {
+            self.published.load(Ordering::Relaxed) as u64
+        }
+        fn writable(&self) -> bool {
+            true
+        }
+        fn next_page(&self, _: u64) -> Result<Arc<dyn crate::PageBacking>, crate::MemoryError> {
+            Err(crate::MemoryError::InvalidRange)
+        }
+    }
+
+    #[test]
+    fn hardware_write_words_preserve_provider_publication_and_mapping_lifetime() {
+        use crate::{CpuMemory, Memory, Permissions};
+        let first = PublishedPage::new();
+        let second = PublishedPage::new();
+        let mut memory = Memory::default();
+        memory
+            .map_backed(
+                0x1000,
+                vec![first.clone(), second.clone()],
+                true,
+                Permissions::RW,
+                false,
+            )
+            .unwrap();
+        let mut registry = crate::parallel::Registry::default();
+        registry.use_hardware();
+        let mut view = memory.parallel_view(&mut registry).unwrap();
+        view.enable_hardware();
+        view.write_array(0x1000, [73]).unwrap();
+        let token = view.hardware_write_frame(0x1000).unwrap();
+        let publication = token.publication_word().unwrap();
+        // Merely reading a second writable page does not bind it for HW writes.
+        assert_eq!(view.read_array::<1>(0x2000).unwrap(), [0]);
+        drop(view);
+        memory.commit_parallel().unwrap();
+        let before = first.published.load(Ordering::Relaxed);
+        let mut view = memory.parallel_view(&mut registry).unwrap();
+        view.enable_hardware();
+        std::thread::scope(|scope| {
+            for _ in 0..12 {
+                let peer = view.clone();
+                scope.spawn(move || {
+                    for _ in 0..16 {
+                        peer.mark_hardware_write_word(publication.0, publication.1)
+                            .unwrap();
+                    }
+                });
+            }
+        });
+        drop(view);
+        memory.commit_parallel().unwrap();
+        assert_eq!(first.published.load(Ordering::Relaxed), before + 1);
+        assert_eq!(second.published.load(Ordering::Relaxed), 0);
+        assert_eq!(memory.read_array::<1>(0x1000).unwrap(), [73]);
+
+        let mut retained = memory.parallel_view(&mut registry).unwrap();
+        retained.enable_hardware();
+        retained.hardware_write_frame(0x1000).unwrap();
+        crate::backing_changed(); // replacement snapshot while old View is retained
+        let next = memory.parallel_view(&mut registry).unwrap();
+        retained
+            .mark_hardware_write_word(publication.0, publication.1)
+            .unwrap();
+        drop(next);
+        drop(retained);
+        memory.commit_parallel().unwrap();
+        assert_eq!(first.published.load(Ordering::Relaxed), before + 2);
+
+        memory.protect(0x1000, PAGE_SIZE, Permissions::R).unwrap();
+        memory.unmap(0x2000, PAGE_SIZE).unwrap();
+        memory.map(0x2000, PAGE_SIZE, Permissions::RW).unwrap();
+        let mut view = memory.parallel_view(&mut registry).unwrap();
+        view.enable_hardware();
+        assert!(view
+            .mark_hardware_write_word(publication.0, publication.1)
+            .is_err());
+        drop(view);
+        memory.commit_parallel().unwrap();
+        assert_eq!(first.published.load(Ordering::Relaxed), before + 2);
+        assert_eq!(second.published.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn hardware_write_word_preserves_an_accepted_prefix_when_a_later_member_faults() {
+        use crate::{CpuMemory, Memory, Permissions};
+        let first = PublishedPage::new();
+        let second = PublishedPage::new();
+        let mut memory = Memory::default();
+        memory
+            .map_backed(
+                0x1000,
+                vec![first.clone(), second.clone()],
+                true,
+                Permissions::RW,
+                false,
+            )
+            .unwrap();
+        let mut registry = crate::parallel::Registry::default();
+        registry.use_hardware();
+        let mut view = memory.parallel_view(&mut registry).unwrap();
+        view.enable_hardware();
+        view.write_array(0x1000, [17]).unwrap();
+        view.write_array(0x2000, [29]).unwrap();
+        let one = view
+            .hardware_write_frame(0x1000)
+            .unwrap()
+            .publication_word()
+            .unwrap();
+        let two = view
+            .hardware_write_frame(0x2000)
+            .unwrap()
+            .publication_word()
+            .unwrap();
+        assert_eq!(one.0, two.0);
+        assert!(one.1 < two.1);
+        drop(view);
+        memory.commit_parallel().unwrap();
+        let before = first.published.load(Ordering::Relaxed);
+        let untouched = second.published.load(Ordering::Relaxed);
+        memory.protect(0x2000, PAGE_SIZE, Permissions::R).unwrap();
+        let mut view = memory.parallel_view(&mut registry).unwrap();
+        view.enable_hardware();
+        view.hardware_write_frame(0x1000).unwrap();
+        assert!(view.mark_hardware_write_word(one.0, one.1 | two.1).is_err());
+        drop(view);
+        memory.commit_parallel().unwrap();
+        assert_eq!(first.published.load(Ordering::Relaxed), before + 1);
+        assert_eq!(second.published.load(Ordering::Relaxed), untouched);
+        assert_eq!(memory.read_array::<1>(0x1000).unwrap(), [17]);
+    }
+
+    #[test]
+    #[ignore = "hardware publication timing; run with --release --nocapture"]
+    fn hardware_publication_benchmark() {
+        use crate::{CpuMemory, Memory, Permissions};
+        for legacy in [true, false] {
+            let pages: Vec<_> = (0..512).map(|_| PublishedPage::new()).collect();
+            let mut memory = Memory::default();
+            memory
+                .map_backed(
+                    0x1000,
+                    pages
+                        .iter()
+                        .map(|p| p.clone() as Arc<dyn crate::PageBacking>)
+                        .collect(),
+                    true,
+                    Permissions::RW,
+                    false,
+                )
+                .unwrap();
+            let mut registry = crate::parallel::Registry::default();
+            registry.use_hardware();
+            let mut view = memory.parallel_view(&mut registry).unwrap();
+            view.enable_hardware();
+            let mut tokens = Vec::new();
+            for page in 0..512 {
+                let address = 0x1000 + page * PAGE_SIZE;
+                view.write_array(address, [1]).unwrap();
+                tokens.push(view.hardware_write_frame(address).unwrap());
+            }
+            let mut words = std::collections::BTreeMap::new();
+            for &token in &tokens {
+                let (word, bit) = token.publication_word().unwrap();
+                *words.entry(word).or_insert(0) |= bit;
+            }
+            drop(view);
+            memory.commit_parallel().unwrap();
+            let initial = pages[0].published.load(Ordering::Relaxed);
+            let began = std::time::Instant::now();
+            for _ in 0..128 {
+                let mut view = memory.parallel_view(&mut registry).unwrap();
+                view.enable_hardware();
+                for _ in 0..12 {
+                    if legacy {
+                        for &token in &tokens {
+                            view.mark_hardware_frame_write(token).unwrap();
+                        }
+                    } else {
+                        for (&word, &bits) in &words {
+                            view.mark_hardware_write_word(word, bits).unwrap();
+                        }
+                    }
+                }
+                drop(view);
+                memory.commit_parallel().unwrap();
+            }
+            println!(
+                "hardware publication legacy={legacy}: 12 CPUs, 512 pages, 128 joins, {} us",
+                began.elapsed().as_micros()
+            );
+            assert!(pages
+                .iter()
+                .all(|p| p.published.load(Ordering::Relaxed) == initial + 128));
+        }
+    }
     // SAFETY: tests grant bytes only through the page's existing region locks.
     unsafe impl Sync for Storage {}
     unsafe impl HardwareStorage for Storage {

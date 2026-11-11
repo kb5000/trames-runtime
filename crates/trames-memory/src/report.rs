@@ -33,9 +33,51 @@ impl Drop for ReportOwner {
 }
 struct Layout {
     virtual_bytes: u64,
-    regions: Vec<(u64, u64, Permissions)>,
+    regions: Arc<RegionLayout>,
     account: Arc<Account>,
     maps: OnceLock<Arc<[u8]>>,
+}
+
+/// Immutable proc metadata, separate from resident pages and their ownership.
+/// Actual virtual edits replace only their interval. A published report/fork
+/// retains the previous compact value; it never retains a page or execution View.
+#[derive(Clone, Default)]
+pub(super) struct RegionLayout {
+    pub(super) ranges: Vec<(u64, u64, Permissions)>,
+}
+impl RegionLayout {
+    pub(super) fn replace(&mut self, start: u64, end: u64, permissions: Option<Permissions>) {
+        let first = self.ranges.partition_point(|r| r.1 <= start);
+        let last = self.ranges.partition_point(|r| r.0 < end);
+        let mut replacement = Vec::with_capacity(5);
+        if first > 0 {
+            replacement.push(self.ranges[first - 1]);
+        }
+        if first < last && self.ranges[first].0 < start {
+            replacement.push((self.ranges[first].0, start, self.ranges[first].2));
+        }
+        if let Some(p) = permissions {
+            replacement.push((start, end, p));
+        }
+        if first < last && self.ranges[last - 1].1 > end {
+            replacement.push((end, self.ranges[last - 1].1, self.ranges[last - 1].2));
+        }
+        if last < self.ranges.len() {
+            replacement.push(self.ranges[last]);
+        }
+        let mut merged: Vec<(u64, u64, Permissions)> = Vec::with_capacity(replacement.len());
+        for r in replacement {
+            if let Some(previous) = merged.last_mut() {
+                if previous.1 == r.0 && previous.2 == r.2 {
+                    previous.1 = r.1;
+                    continue;
+                }
+            }
+            merged.push(r);
+        }
+        let stop = (last + 1).min(self.ranges.len());
+        self.ranges.splice(first.saturating_sub(1)..stop, merged);
+    }
 }
 impl Memory {
     /// Match an already-published original mm without rebuilding unrelated
@@ -109,7 +151,7 @@ impl Memory {
         }
         let layout = Arc::new(Layout {
             virtual_bytes: self.virtual_bytes(),
-            regions: self.regions(),
+            regions: self.region_layout.clone(),
             account: self.account.clone(),
             maps: OnceLock::new(),
         });
@@ -188,7 +230,7 @@ impl MemoryReport {
             .get_or_init(|| {
                 use std::fmt::Write;
                 let mut maps = String::new();
-                for &(start, end, access) in &layout.regions {
+                for &(start, end, access) in &layout.regions.ranges {
                     let _ = writeln!(
                         maps,
                         "{start:012x}-{end:012x} {}{}{}p 00000000 00:00 0",
@@ -209,6 +251,113 @@ impl MemoryReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn compact_layout_matches_page_and_reservation_oracle_across_virtual_edits() {
+        let mut memory = Memory::default();
+        let report = memory.memory_report();
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        for _ in 0..3000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let base = (1 + (seed >> 3) % 64) * PAGE_SIZE;
+            let len = (1 + (seed >> 12) % 7) * PAGE_SIZE;
+            let permissions = [
+                Permissions::NONE,
+                Permissions::R,
+                Permissions::RW,
+                Permissions::RX,
+            ][(seed >> 20) as usize & 3];
+            let _ = match seed & 7 {
+                0 => memory.map(base, len, permissions),
+                1 => memory.map_fixed(base, len, permissions),
+                2 => memory.protect(base, len, permissions),
+                3 => memory.reserve(base, len, true),
+                4 => memory.unmap(base, len),
+                5 => memory.discard(base, len),
+                6 => memory.remap(base, PAGE_SIZE, 0x100000 + base, PAGE_SIZE, true),
+                _ => {
+                    let mut fork = memory.clone();
+                    fork.map_fixed(base, len, permissions).unwrap();
+                    assert_eq!(fork.regions(), fork.regions_from_pages());
+                    Ok(())
+                }
+            };
+            let expected = memory.regions_from_pages();
+            assert_eq!(memory.regions(), expected);
+            memory.memory_report();
+            let layout = report.0.state.read().unwrap().clone();
+            assert_eq!(layout.regions.ranges, expected);
+            assert_eq!(
+                report.virtual_bytes(),
+                expected.iter().map(|r| r.1 - r.0).sum::<u64>()
+            );
+        }
+    }
+
+    #[test]
+    fn published_layout_retains_compact_value_across_materialization_fork_and_failed_edits() {
+        let mut memory = Memory::default();
+        let huge = PAGE_SIZE * 1_048_576;
+        memory.map(0x1000, huge, Permissions::RW).unwrap();
+        let report = memory.memory_report();
+        let original = report.0.state.read().unwrap().clone();
+        let maps = report.maps();
+        let regions = memory.region_layout.clone();
+        memory.write(0x1000, b"x").unwrap();
+        memory.discard(0x1000, PAGE_SIZE).unwrap();
+        memory.memory_report();
+        assert!(Arc::ptr_eq(&regions, &memory.region_layout));
+        assert!(Arc::ptr_eq(&maps, &report.maps()));
+        assert_eq!(
+            memory.protect(huge, PAGE_SIZE * 2, Permissions::R),
+            Err(MemoryError::Unmapped(huge + PAGE_SIZE))
+        );
+        assert!(Arc::ptr_eq(&regions, &memory.region_layout));
+        let mut fork = memory.clone();
+        fork.protect(0x1000, PAGE_SIZE, Permissions::R).unwrap();
+        assert_eq!(
+            memory.regions(),
+            vec![(0x1000, 0x1000 + huge, Permissions::RW)]
+        );
+        memory.reserve(0x1000, PAGE_SIZE, true).unwrap();
+        memory.memory_report();
+        assert_eq!(
+            original.regions.ranges,
+            vec![(0x1000, 0x1000 + huge, Permissions::RW)]
+        );
+        assert_eq!(report.virtual_bytes(), huge);
+        assert_eq!(memory.regions(), memory.regions_from_pages());
+    }
+    #[test]
+    #[ignore = "layout publication timing; run with --release --nocapture"]
+    fn mapping_report_publication_benchmark() {
+        let mut memory = Memory::default();
+        let pages = 65_536;
+        memory
+            .map(0x10000, PAGE_SIZE * pages, Permissions::R)
+            .unwrap();
+        // Same descriptor population as a large file mapping, without reading
+        // or allocating its bytes. Each tiny edit must publish current proc maps.
+        memory.materialize_descriptors(0x10000, (PAGE_SIZE * pages) as usize);
+        let report = memory.memory_report();
+        let began = std::time::Instant::now();
+        for _ in 0..200 {
+            memory.map(0x20000000, PAGE_SIZE, Permissions::RW).unwrap();
+            memory.memory_report();
+            assert_eq!(report.virtual_bytes(), (pages + 1) * PAGE_SIZE);
+            memory.unmap(0x20000000, PAGE_SIZE).unwrap();
+            memory.memory_report();
+        }
+        println!(
+            "layout publication: 400 edits, {pages} page descriptors, {} us",
+            began.elapsed().as_micros()
+        );
+        assert_eq!(
+            memory.regions(),
+            vec![(0x10000, 0x10000 + pages * PAGE_SIZE, Permissions::R)]
+        );
+    }
     #[test]
     fn jit_writes_and_residency_preserve_published_layout_until_mapping_changes() {
         let mut memory = Memory::default();

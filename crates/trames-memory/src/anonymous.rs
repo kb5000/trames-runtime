@@ -437,7 +437,7 @@ impl Memory {
             return Err(MemoryError::Limit);
         }
         self.invalidate_proc_reads(address, end);
-        self.advance_mapping_revision();
+        self.advance_mapping_revision(address, end, Some(Permissions::RW));
         self.anonymous.insert(
             address,
             end,

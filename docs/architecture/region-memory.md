@@ -1236,3 +1236,23 @@ When a layout is needed, merge the existing ordered page, anonymous-range and
 reservation indexes directly, coalescing contiguous equal permissions without
 allocating and sorting a tuple per resident page. No coordinator, additional
 guest-byte synchronization or per-access metadata scan is involved.
+
+## Indexed layout and hardware publication metadata (2026-11-12)
+
+The immutable `MemoryReport` layout retains a compact interval value separately
+from resident page descriptors. Successful map/unmap/protect/reservation edits
+replace the affected interval and coalesce its neighbors. Publishing a proc
+report clones that value; it no longer walks every materialized page. Existing
+layout snapshots and forks preserve their previous value; live report handles
+receive the next published layout as before. Page-in, discard and byte writes
+do not manufacture virtual mappings or retain pages through reporting. The
+independent test-only page walker checks randomized edits against the index.
+
+Mac writable shared hardware bindings are grouped by root-frame bitmap word.
+The executor maintains membership when it installs, refreshes or retires actual
+bindings and publishes those same current bindings at the original before-run
+boundary. A word publication updates each original frame's dirty/version/code
+metadata and merges the bitmap once; a later member error preserves an accepted
+prefix. Private write publication, provider commits and hardware byte ownership
+are unchanged. This is not deferred whole-VM dirty tracking, and does not put an
+extra synchronization step on ordinary guest loads or stores.

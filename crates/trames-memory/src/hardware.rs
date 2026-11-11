@@ -20,6 +20,12 @@ impl HardwareWriteFrame {
     pub fn needs_publication(self) -> bool {
         self.publication
     }
+    /// Compact publication membership, retained only while the executor's
+    /// original mapping validation keeps this writable binding current.
+    pub fn publication_word(self) -> Option<(usize, u64)> {
+        self.publication
+            .then(|| (self.root / 64, 1 << (self.root % 64)))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
