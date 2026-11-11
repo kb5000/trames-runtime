@@ -1224,3 +1224,15 @@ unmap/FD close and continue referring to old bytes, while a replacement guest VA
 uses its new allocation. Child private COW keeps the parent's registered storage.
 Owner mapping changes still require all execution Views to join. Tests cover pin
 access before/after hardware export, balanced host borrows and unmap/remap identity.
+
+### Mapping reports and instruction epochs (2026-11-11)
+
+Read-only proc/layout reports publish on virtual mapping or permission changes.
+Their epoch is independent of instruction invalidation: JIT writes, dirty-byte
+commit, demand population and residency updates do not rebuild layout metadata.
+Residency remains a live query of the original account. Mapping-generation wrap
+keeps the same original report owner and invalidates only its cached layout.
+When a layout is needed, merge the existing ordered page, anonymous-range and
+reservation indexes directly, coalescing contiguous equal permissions without
+allocating and sorting a tuple per resident page. No coordinator, additional
+guest-byte synchronization or per-access metadata scan is involved.

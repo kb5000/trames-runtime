@@ -141,7 +141,7 @@ impl Memory {
             self.parallel_reservations_dirty = true;
         }
         self.revision = self.revision.wrapping_add(1);
-        self.advance_code_revision();
+        self.advance_mapping_revision();
         Ok(())
     }
 }

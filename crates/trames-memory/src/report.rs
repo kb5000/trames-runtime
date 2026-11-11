@@ -101,7 +101,7 @@ impl Memory {
         }
         let mut cache = self.report_cache.borrow_mut();
         if let Some((generation, report, _)) = &*cache {
-            if *generation == self.code_revision
+            if *generation == self.layout_revision
                 && Arc::ptr_eq(&report.0.state.read().unwrap().account, &self.account)
             {
                 return report.clone();
@@ -132,7 +132,7 @@ impl Memory {
             }))
         };
         owner.0.get_or_init(|| Arc::downgrade(&report.0));
-        *cache = Some((self.code_revision, report.clone(), owner));
+        *cache = Some((self.layout_revision, report.clone(), owner));
         report
     }
     /// The last logical mm owner has exited or exec'd. Physical custody may
@@ -209,6 +209,66 @@ impl MemoryReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn jit_writes_and_residency_preserve_published_layout_until_mapping_changes() {
+        let mut memory = Memory::default();
+        memory
+            .map(
+                0x1000,
+                PAGE_SIZE,
+                Permissions {
+                    read: true,
+                    write: true,
+                    execute: true,
+                },
+            )
+            .unwrap();
+        memory.map(0x3000, PAGE_SIZE * 32, Permissions::RW).unwrap();
+        let report = memory.memory_report();
+        let original = report.0.state.read().unwrap().clone();
+        let maps = report.maps();
+        let code = memory.instruction_revision();
+        for value in 0..64 {
+            memory.write(0x1000, &[value]).unwrap();
+            memory.write(0x3000 + value as u64, &[value]).unwrap();
+            memory.memory_report();
+        }
+        let mut registry = Default::default();
+        let mut view = memory.parallel_view(&mut registry).unwrap();
+        view.write(0x1000, &[99]).unwrap();
+        drop(view);
+        memory.commit_parallel().unwrap();
+        memory.memory_report();
+        assert_ne!(memory.instruction_revision(), code);
+        assert!(Arc::ptr_eq(&original, &report.0.state.read().unwrap()));
+        assert!(Arc::ptr_eq(&maps, &report.maps()));
+        assert_eq!(report.resident_bytes(), PAGE_SIZE as usize * 2);
+
+        memory.protect(0x1000, PAGE_SIZE, Permissions::RX).unwrap();
+        memory.memory_report();
+        assert!(!Arc::ptr_eq(&original, &report.0.state.read().unwrap()));
+        assert!(String::from_utf8_lossy(&report.maps()).contains("r-xp"));
+        memory.unmap(0x3000, PAGE_SIZE * 32).unwrap();
+        memory.memory_report();
+        assert_eq!(report.virtual_bytes(), PAGE_SIZE);
+        memory.map_anonymous_live(0x50000, PAGE_SIZE).unwrap();
+        memory.memory_report();
+        assert_eq!(report.virtual_bytes(), PAGE_SIZE * 2);
+    }
+
+    #[test]
+    fn mapping_generation_wrap_keeps_original_observers_and_updates_layout() {
+        let mut memory = Memory::default();
+        let report = memory.memory_report();
+        memory.layout_revision = u64::MAX;
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        let current = memory.memory_report();
+        assert!(current.same_resource(&report));
+        assert!(report.alive());
+        assert_eq!(report.virtual_bytes(), PAGE_SIZE);
+        assert!(String::from_utf8_lossy(&report.maps()).contains("rw-p"));
+    }
+
     #[test]
     fn rerunning_an_exited_image_does_not_revive_its_original_report() {
         let mut memory = Memory::default();

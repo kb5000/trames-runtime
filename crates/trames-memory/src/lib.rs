@@ -254,6 +254,9 @@ pub struct Memory {
     image_ranges: Option<ImageRanges>,
     revision: u64,
     code_revision: u64,
+    // Proc/layout observers follow virtual ownership and permissions, not JIT
+    // writes or physical-page materialization. Keep their publication separate.
+    layout_revision: u64,
     identity: u64,
     original_identity: u64,
     shared: Option<Arc<Root<Memory>>>,
@@ -331,6 +334,7 @@ impl Memory {
             image_ranges: self.image_ranges,
             revision: self.revision,
             code_revision: self.code_revision,
+            layout_revision: self.layout_revision,
             identity,
             original_identity: identity,
             shared: None,
@@ -470,6 +474,7 @@ impl Memory {
             image_ranges: None,
             revision: 0,
             code_revision: 0,
+            layout_revision: 0,
             identity,
             original_identity: identity,
             shared: None,
@@ -502,7 +507,7 @@ impl Memory {
         if let Some(shared) = &self.shared {
             return shared.borrow().regions();
         }
-        let mut parts: Vec<_> = self
+        let mut pages = self
             .pages
             .iter()
             .map(|(&a, &i)| {
@@ -512,21 +517,34 @@ impl Memory {
                     self.frames[i].as_ref().unwrap().permissions,
                 )
             })
-            .collect();
-        parts.extend(
-            self.anonymous
-                .ranges
-                .iter()
-                .map(|(&a, r)| (a, r.end, r.page.permissions)),
-        );
-        parts.extend(
-            self.reservations
-                .iter()
-                .map(|(&a, &b)| (a, b, Permissions::NONE)),
-        );
-        parts.sort_unstable_by_key(|r| r.0);
+            .peekable();
+        let mut anonymous = self
+            .anonymous
+            .ranges
+            .iter()
+            .map(|(&a, r)| (a, r.end, r.page.permissions))
+            .peekable();
+        let mut reservations = self
+            .reservations
+            .iter()
+            .map(|(&a, &b)| (a, b, Permissions::NONE))
+            .peekable();
+        // These original indexes are already ordered and disjoint. Merge and
+        // coalesce directly; do not allocate/sort one tuple per resident page.
         let mut out: Vec<(u64, u64, Permissions)> = Vec::new();
-        for (a, b, p) in parts {
+        loop {
+            let source = [pages.peek(), anonymous.peek(), reservations.peek()]
+                .into_iter()
+                .enumerate()
+                .filter_map(|(source, range)| range.map(|range| (source, range.0)))
+                .min_by_key(|(_, address)| *address);
+            let Some((source, _)) = source else { break };
+            let (a, b, p) = match source {
+                0 => pages.next(),
+                1 => anonymous.next(),
+                _ => reservations.next(),
+            }
+            .expect("selected original mapping");
             if let Some(last) = out.last_mut() {
                 if last.1 == a && last.2 == p {
                     last.1 = b;
@@ -754,6 +772,16 @@ impl Memory {
         }
     }
 
+    fn advance_mapping_revision(&mut self) {
+        self.advance_code_revision();
+        self.layout_revision = self.layout_revision.wrapping_add(1);
+        if self.layout_revision == 0 {
+            if let Some((generation, _, _)) = &mut *self.report_cache.borrow_mut() {
+                *generation = u64::MAX;
+            }
+        }
+    }
+
     pub fn is_free(&self, address: u64, len: u64) -> bool {
         if let Some(shared) = &self.shared {
             return shared.borrow().is_free(address, len);
@@ -841,7 +869,7 @@ impl Memory {
             self.free_frames.push(frame);
         }
         self.revision = self.revision.wrapping_add(1);
-        self.advance_code_revision();
+        self.advance_mapping_revision();
         self.refresh_mapping_mmu(address, len);
         self.invalidate_translations();
         self.reclaim_unused();
@@ -892,7 +920,7 @@ impl Memory {
             return Err(MemoryError::Limit);
         }
         self.invalidate_proc_reads(address, end);
-        self.advance_code_revision();
+        self.advance_mapping_revision();
         self.anonymous.insert(
             address,
             end,
@@ -944,7 +972,7 @@ impl Memory {
         self.check_reservation_split(address, end, 0)?;
         self.invalidate_proc_reads(address, end);
         self.retire_sparse(address, end);
-        self.advance_code_revision();
+        self.advance_mapping_revision();
         let mut reserved: Vec<_> = self
             .reservations
             .range(address..end)
