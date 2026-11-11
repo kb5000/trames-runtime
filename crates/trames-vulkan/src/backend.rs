@@ -2356,6 +2356,7 @@ impl Backend {
                 }
             }
             33 => self.write_descriptors(m, a)?,
+            250 => self.descriptor_batch(m, a)?,
             216 => self.copy_descriptors(m, a)?,
             218..=219 => self.command_control(m, op, a)?,
             220..=229 | 232..=233 | 237..=239 => self.sync_call(m, op, a)?,
@@ -3225,6 +3226,32 @@ mod tests {
         assert!(b.invoke(&mut memory, 1, 0, 128).is_err());
         assert!(b.instance.is_none());
         assert!(b.objects.is_empty());
+    }
+    #[test]
+    fn descriptor_batch_rejects_foreign_devices_and_non_descriptor_operations() {
+        let mut b = Backend::new();
+        let mut memory = Memory::new(PAGE_SIZE as usize);
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        let mut args = [0; 16];
+        args[0] = 7;
+        args[1] = 0x1000;
+        args[2] = 1;
+        for record in [
+            [33, 8, 0, 0, 0, 0, 0, 0, 0],
+            [216, 8, 0, 0, 0, 0, 0, 0, 0],
+            [250, 7, 0, 0, 0, 0, 0, 0, 0],
+            [1, 7, 0, 0, 0, 0, 0, 0, 0],
+        ] {
+            write_words(&mut memory, 0x1000, &record, 72).unwrap();
+            assert!(b.descriptor_batch(&mut memory, args).is_err());
+        }
+        args[2] = 33;
+        assert!(b.descriptor_batch(&mut memory, args).is_err());
+        args[2] = 32;
+        args[1] = 0x1ff0; // packet crosses into an unmapped page
+        assert!(b.descriptor_batch(&mut memory, args).is_err());
+        assert!(b.objects.is_empty());
+        assert!(b.instance.is_none());
     }
     #[test]
     fn unknown_object_domains_and_uninitialized_driver_never_become_host_handles() {

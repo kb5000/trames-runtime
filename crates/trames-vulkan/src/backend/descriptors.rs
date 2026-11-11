@@ -3,6 +3,30 @@
 //! sparse and follow their live set, including after command recording.
 use super::*;
 
+pub(super) const BATCH_CAPABILITY: u64 = 16384;
+
+impl Backend {
+    /// One synchronous guest update, with the same original resource checks and
+    /// ordering as individual writes/copies. No deferred guest pointers, queue
+    /// or service thread: all payloads live through this NativeCall on its worker.
+    pub(super) fn descriptor_batch(&mut self, m: &mut impl CpuMemory, a: [u64; 16]) -> Result<()> {
+        let records = words64(m, a[1], bounded(a[2], 32)? * 9)?;
+        for record in records.chunks_exact(9) {
+            if record[1] != a[0] || !matches!(record[0], 33 | 216) {
+                return invalid();
+            }
+            let mut args = [0; 16];
+            args[..8].copy_from_slice(&record[1..]);
+            match record[0] {
+                33 => self.write_descriptors(m, args)?,
+                216 => self.copy_descriptors(m, args)?,
+                _ => unreachable!(),
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Binding {
     pub ty: u32,
