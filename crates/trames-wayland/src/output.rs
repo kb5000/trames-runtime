@@ -83,7 +83,11 @@ impl GlobalDispatch<wl_output::WlOutput, i32> for State {
         let output = init.init(output, *scale);
         let (w, h) = state.viewport;
         output.geometry(
-            0,
+            // Density groups are distinct virtual outputs. Give them disjoint
+            // logical origins: GTK/Firefox also match monitor configuration by
+            // origin, so overlapping groups can turn 2x back into a false 1x
+            // fractional scale. Surface-local geometry and input stay unchanged.
+            (*scale - 1) * w as i32,
             0,
             260,
             195,
