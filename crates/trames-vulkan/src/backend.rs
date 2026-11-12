@@ -707,44 +707,34 @@ impl Backend {
         let wire = if op == 52 {
             vec![0, 0, 0, a[2], a[3], 0, 0]
         } else {
-            words64(m, a[2], bounded(a[3], 64)? * stride)?
+            descriptors::words(m, a[2], a[3], stride)?
         };
         let mut batches = Vec::new();
         let mut commands = Vec::new();
         let mut semaphores = Vec::new();
         let mut semaphore_states = BTreeMap::new();
         let mut timeline_completion = Vec::new();
-        let (mut total_waits, mut total_commands, mut total_signals) = (0, 0, 0);
         for record in wire.chunks_exact(stride) {
             timeline_completion.clear();
-            let waits = bounded(record[1], 64)?;
-            let count = bounded(record[4], 64)?;
-            let signals = bounded(record[6], 64)?;
-            total_waits += waits;
-            total_commands += count;
-            total_signals += signals;
-            if total_waits > 64 || total_commands > 64 || total_signals > 64 {
-                return unsupported();
-            }
+            // Keep native batch boundaries and allocation policy, as submit2
+            // already does. The shared readers validate/copy the actual ranges.
+            let waits = descriptors::words(m, record[0], record[1], 1)?;
+            let signals = descriptors::words(m, record[5], record[6], 1)?;
             let wait_values = if op == 120 {
-                words64(m, record[7], waits)?
+                descriptors::words(m, record[7], record[1], 1)?
             } else {
-                vec![0; waits]
+                vec![0; waits.len()]
             };
             let mut batch = SubmitBatch {
                 signal_values: if op == 120 {
-                    words64(m, record[8], signals)?
+                    descriptors::words(m, record[8], record[6], 1)?
                 } else {
-                    vec![0; signals]
+                    vec![0; signals.len()]
                 },
                 ..Default::default()
             };
-            let stages = words32(m, record[2], waits)?;
-            for (i, (id, stage)) in words64(m, record[0], waits)?
-                .into_iter()
-                .zip(stages)
-                .enumerate()
-            {
+            let stages = descriptors::words32(m, record[2], record[1])?;
+            for (i, (id, stage)) in waits.into_iter().zip(stages).enumerate() {
                 let semaphore = self.object(id, Kind::Semaphore)?;
                 let state = semaphore_states.entry(id).or_insert(semaphore.state.get());
                 // A binary wait consumes its already-submitted signal, even
@@ -774,7 +764,7 @@ impl Backend {
                 }
                 semaphores.push((id, semaphore));
             }
-            for id in words64(m, record[3], count)? {
+            for id in descriptors::words(m, record[3], record[4], 1)? {
                 let command = self.object(id, Kind::CommandBuffer)?;
                 if command.flags != 0 {
                     return invalid();
@@ -790,7 +780,7 @@ impl Backend {
                     .push(vk::CommandBuffer::from_raw(command.raw));
                 commands.push(command);
             }
-            for (i, id) in words64(m, record[5], signals)?.into_iter().enumerate() {
+            for (i, id) in signals.into_iter().enumerate() {
                 let semaphore = self.object(id, Kind::Semaphore)?;
                 let state = semaphore_states.entry(id).or_insert(semaphore.state.get());
                 if semaphore.flags == 0 && *state != 0 {
