@@ -38,6 +38,13 @@ pub(super) struct Wait {
     any: bool,
 }
 impl Wait {
+    fn needs_download(&self) -> bool {
+        self.values.is_some()
+            || self
+                .objects
+                .iter()
+                .any(|object| object.state.get() != HOST_SIGNALED)
+    }
     fn ready(&self) -> Result<bool> {
         let mut ready = !self.any;
         for (i, object) in self.objects.iter().enumerate() {
@@ -123,7 +130,9 @@ impl Backend {
         };
         if wait.ready()? {
             self.collect();
-            self.coherent_download(m)?;
+            if wait.needs_download() {
+                self.coherent_download(m)?;
+            }
             return Ok(Invocation::Complete(0));
         }
         if timeout == 0 {
@@ -149,10 +158,13 @@ impl Backend {
             Ok(false) => return Ok(None),
             Err(error) => Err(error),
         };
+        let needs_download = wait.needs_download();
         self.waits.remove(&job);
         if result.as_ref().is_ok_and(|&value| value == 0) {
             self.collect();
-            self.coherent_download(m)?;
+            if needs_download {
+                self.coherent_download(m)?;
+            }
         }
         result.map(Some)
     }

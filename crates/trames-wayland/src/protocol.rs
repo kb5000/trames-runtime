@@ -315,7 +315,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceKey> for State {
                     p.children.retain(|id| *id != key.0);
                 }
             }
-            for child in s.children {
+            for &child in &s.children {
                 if let Some(c) = state.surfaces.get_mut(&child) {
                     c.parent = None;
                     if let Some(p) = &c.popup {

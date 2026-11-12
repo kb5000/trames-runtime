@@ -42,7 +42,14 @@ pub struct Lease<'a> {
 }
 impl Drop for Lease<'_> {
     fn drop(&mut self) {
+        let completion = self
+            .backend
+            .as_mut()
+            .and_then(|backend| backend.0.take_completion_notice());
         drop(self.backend.take());
+        if let Some(completion) = completion {
+            completion.notify_atomic();
+        }
         // Unlock before entering a scheduler callback. This RMW pairs with the
         // subscribe/retry handshake, including a failed try_lock on weak ARM.
         self.available.notify_atomic();
@@ -101,7 +108,7 @@ impl Lease<'_> {
         &self,
         job: u64,
         signal: &Arc<trames_shared::IoSignal>,
-    ) -> Option<trames_shared::IoSubscription> {
+    ) -> Option<crate::JobSubscription> {
         self.backend.as_ref().unwrap().0.subscribe_job(job, signal)
     }
 }

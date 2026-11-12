@@ -182,6 +182,16 @@ impl Server {
     ) -> trames_shared::IoSubscription {
         self.0.command_space.subscribe(signal)
     }
+    /// Resolve just the requested protocol object; never clone the UI scene.
+    pub fn surface_info(&self, connection: u64, protocol: u32) -> Option<SurfaceInfo> {
+        self.0
+            .snapshot
+            .lock()
+            .unwrap()
+            .surfaces
+            .get(&(connection, protocol))
+            .cloned()
+    }
     pub fn snapshot(&self) -> Snapshot {
         self.0
             .snapshot

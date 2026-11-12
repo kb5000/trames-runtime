@@ -453,3 +453,9 @@ pub(crate) fn snapshot(surfaces: &BTreeMap<u64, Surface>) -> Vec<WindowSnapshot>
         })
         .collect()
 }
+
+impl Drop for Surface {
+    fn drop(&mut self) {
+        self.gpu_budget.close();
+    }
+}

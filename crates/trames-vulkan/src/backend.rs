@@ -143,6 +143,10 @@ enum Kind {
     QueryPool,
     Event,
 }
+// A CPU-owned WSI image is available only after all producer/UI leases end.
+// Its acquisition signal needs no native GPU work. Native signals remain 1;
+// the existing indeterminate/poisoned state 2 is not treated as signaled.
+const HOST_SIGNALED: u8 = 3;
 type DescriptorResources = BTreeMap<(u32, u32), Vec<Rc<Object>>>;
 // Object Rc ownership stays on the backend's owner thread. Count each actual
 // lifetime once, including dependencies retained after the guest destroys its
@@ -439,6 +443,8 @@ pub struct Backend {
     image_files: Option<Arc<dyn trames_graphics::ImageFds>>,
     completion: Arc<trames_shared::Readiness>,
     waits: BTreeMap<u64, completion::Wait>,
+    acquires: BTreeMap<u64, wayland::Acquire>,
+    completion_notice: bool,
     budget: crate::Budget,
     domain: u64,
     next: u64,
@@ -498,6 +504,8 @@ impl Backend {
             mappings: BTreeMap::new(),
             completion: Arc::default(),
             waits: BTreeMap::new(),
+            acquires: BTreeMap::new(),
+            completion_notice: false,
             coherent_pending: Default::default(),
             submissions: Vec::new(),
             compiles: BTreeMap::new(),
@@ -667,12 +675,12 @@ impl Backend {
             if total_waits > 64 || total_commands > 64 || total_signals > 64 {
                 return unsupported();
             }
+            let wait_values = if op == 120 {
+                words64(m, record[7], waits)?
+            } else {
+                vec![0; waits]
+            };
             let mut batch = SubmitBatch {
-                wait_values: if op == 120 {
-                    words64(m, record[7], waits)?
-                } else {
-                    vec![0; waits]
-                },
                 signal_values: if op == 120 {
                     words64(m, record[8], signals)?
                 } else {
@@ -690,9 +698,10 @@ impl Backend {
                 let state = semaphore_states.entry(id).or_insert(semaphore.state.get());
                 // There is one queue. A wait consumes an earlier signal, even
                 // if the driver has not completed it yet. Commit only on success.
-                if semaphore.flags == 0 && *state != 1 {
+                if semaphore.flags == 0 && !matches!(*state, 1 | HOST_SIGNALED) {
                     return invalid();
                 }
+                let host_ready = semaphore.flags == 0 && *state == HOST_SIGNALED;
                 if semaphore.flags == 0 {
                     *state = 0;
                 } else if op != 120 || !dev.timeline {
@@ -702,11 +711,16 @@ impl Backend {
                 // pre-poll here prevents the submitting guest thread from
                 // reaching its later host signal and defeats Vulkan 1.2's
                 // out-of-order submission model.
-                if semaphore.flags == 0 {
-                    batch.wait_values[i] = 0;
+                let stage = dev.stage(stage)?;
+                if !host_ready {
+                    batch.wait_values.push(if semaphore.flags == 0 {
+                        0
+                    } else {
+                        wait_values[i]
+                    });
+                    batch.stages.push(stage);
+                    batch.waits.push(vk::Semaphore::from_raw(semaphore.raw));
                 }
-                batch.stages.push(dev.stage(stage)?);
-                batch.waits.push(vk::Semaphore::from_raw(semaphore.raw));
                 semaphores.push((id, semaphore));
             }
             for id in words64(m, record[3], count)? {
@@ -750,7 +764,7 @@ impl Backend {
         let fence = if a[4] != 0 {
             let f = self.object(a[4], Kind::Fence)?;
             if f.acquisition.borrow().is_some()
-                || unsafe { d.get_fence_status(vk::Fence::from_raw(f.raw)) }?
+                || Self::fence_ready(&f)?
                 || self.submissions.iter().any(|s| Rc::ptr_eq(&s.fence, &f))
             {
                 return invalid();
@@ -834,6 +848,9 @@ impl Backend {
         Ok(())
     }
     fn fence_ready(fence: &Object) -> Result<bool> {
+        if fence.state.get() == HOST_SIGNALED {
+            return Ok(true);
+        }
         let binding = fence.acquisition.borrow();
         let native = binding.as_deref().unwrap_or(fence);
         Ok(unsafe {
@@ -842,6 +859,9 @@ impl Backend {
                 .native
                 .get_fence_status(vk::Fence::from_raw(native.raw))
         }?)
+    }
+    pub(crate) fn take_completion_notice(&mut self) -> Option<Arc<trames_shared::Readiness>> {
+        std::mem::take(&mut self.completion_notice).then(|| self.completion.clone())
     }
     fn private_fence(&self, device: Arc<Device>) -> Result<Rc<Object>> {
         let d = &device.native;
@@ -929,6 +949,7 @@ impl Backend {
     }
     pub(crate) fn retire_jobs(&mut self) {
         self.waits.clear();
+        self.acquires.clear();
         for task in self.compiles.values_mut() {
             task.abandoned = true;
         }
@@ -996,6 +1017,8 @@ impl Backend {
         }
         let result = if matches!(operation, 2 | 9) {
             self.start_teardown(operation, a[0])
+        } else if operation == 251 {
+            self.start_acquire(memory, a)
         } else if matches!(operation, 201 | 202) {
             self.start_wait(memory, operation, a)
         } else if operation == 27 {
@@ -1118,6 +1141,7 @@ impl Backend {
     }
     pub fn abandon(&mut self, job: u64) {
         self.waits.remove(&job);
+        self.acquires.remove(&job);
         if let Some(teardown) = self.teardowns.get_mut(&job) {
             teardown.abandoned = true;
         }
@@ -1129,15 +1153,25 @@ impl Backend {
         &self,
         job: u64,
         signal: &Arc<trames_shared::IoSignal>,
-    ) -> Option<trames_shared::IoSubscription> {
-        if self.waits.contains_key(&job) || self.teardowns.contains_key(&job) {
-            Some(self.completion.subscribe(signal))
+    ) -> Option<crate::JobSubscription> {
+        if let Some(acquire) = self.acquires.get(&job) {
+            Some((
+                acquire.subscribe(signal),
+                Some(self.completion.subscribe(signal)),
+            ))
+        } else if self.waits.contains_key(&job) || self.teardowns.contains_key(&job) {
+            Some((self.completion.subscribe(signal), None))
         } else {
-            self.compiles.get(&job).map(|c| c.task.subscribe(signal))
+            self.compiles
+                .get(&job)
+                .map(|c| (c.task.subscribe(signal), None))
         }
     }
     pub(crate) fn job_deadline(&self, job: u64) -> Option<std::time::Instant> {
-        self.waits.get(&job).and_then(|w| w.deadline)
+        self.acquires
+            .get(&job)
+            .and_then(|w| w.deadline)
+            .or_else(|| self.waits.get(&job).and_then(|w| w.deadline))
     }
     pub(crate) fn is_compile(&self, job: u64) -> bool {
         self.compiles.contains_key(&job)
@@ -1147,6 +1181,13 @@ impl Backend {
         m: &mut impl CpuMemory,
         job: u64,
     ) -> std::result::Result<Option<u64>, MemoryError> {
+        if self.acquires.contains_key(&job) {
+            return match self.poll_acquire(m, job) {
+                Ok(value) => Ok(value),
+                Err(Failure::Vk(e)) => Ok(Some(e.as_raw() as i64 as u64)),
+                Err(Failure::Memory(e)) => Err(e),
+            };
+        }
         if self.teardowns.contains_key(&job) {
             return match self.poll_teardown(job) {
                 Ok(value) => Ok(value),
@@ -1751,6 +1792,7 @@ impl Backend {
         self.wsi.clear_device();
         self.mappings.clear();
         self.waits.clear();
+        self.acquires.clear();
         self.coherent_pending = Default::default();
         self.address_resources.clear();
         self.objects.clear();
@@ -1853,7 +1895,9 @@ impl Backend {
             200 => write(
                 m,
                 a[1],
-                &(u64::from(dev.host_alignment != 0) | (u64::from(completion::available()) << 1))
+                &(u64::from(dev.host_alignment != 0)
+                    | (u64::from(completion::available()) << 1)
+                    | (u64::from(self.virtual_wsi && completion::available()) << 2))
                     .to_le_bytes(),
             )?,
             11 => {
@@ -2730,8 +2774,11 @@ impl Backend {
                 if f.acquisition.borrow().is_some() && !Self::fence_ready(&f)? {
                     return invalid();
                 }
-                unsafe { d.reset_fences(&[vk::Fence::from_raw(f.raw)]) }?;
+                if f.state.get() != HOST_SIGNALED {
+                    unsafe { d.reset_fences(&[vk::Fence::from_raw(f.raw)]) }?;
+                }
                 *f.acquisition.borrow_mut() = None;
+                f.state.set(0);
             }
             51 => {
                 let f = self.object(a[1], Kind::Fence)?;
@@ -2745,7 +2792,11 @@ impl Backend {
                         submission.complete_commands();
                     }
                 }
-                self.coherent_download(m)?;
+                // Acquisition grants an already idle image, not completion of
+                // unrelated GPU buffer producers. It needs no mapped readback.
+                if f.state.get() != HOST_SIGNALED {
+                    self.coherent_download(m)?;
+                }
             }
             52 | 56 | 120 => self.submit(m, op, a, dev.clone())?,
             54 => {

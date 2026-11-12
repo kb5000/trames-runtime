@@ -11,3 +11,9 @@ mod display;
 mod task;
 pub use budget::Budget;
 pub use display::Display;
+
+/// A GPU job may await both producer completion and its original image pool.
+pub type JobSubscription = (
+    trames_shared::IoSubscription,
+    Option<trames_shared::IoSubscription>,
+);

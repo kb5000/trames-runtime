@@ -85,12 +85,42 @@ impl State {
 
 /// Queue/current/UI leases share this per-surface bound across swapchain
 /// replacement. The producer reserves before consuming Vulkan wait semaphores.
-#[derive(Clone, Default, Debug)]
-pub struct GpuBudget(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+#[derive(Default)]
+struct BudgetState {
+    count: std::sync::atomic::AtomicUsize,
+    closed: std::sync::atomic::AtomicBool,
+    changed: std::sync::Arc<trames_shared::Readiness>,
+}
+#[derive(Clone, Default)]
+pub struct GpuBudget(std::sync::Arc<BudgetState>);
+impl std::fmt::Debug for GpuBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuBudget").finish_non_exhaustive()
+    }
+}
 pub struct GpuPermit(GpuBudget);
 impl GpuBudget {
+    pub fn is_live(&self) -> bool {
+        !self.0.closed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub(crate) fn close(&self) {
+        self.0
+            .closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.notify();
+    }
+    pub fn notify(&self) {
+        self.0.changed.notify_atomic();
+    }
+    pub fn subscribe(
+        &self,
+        signal: &std::sync::Arc<trames_shared::IoSignal>,
+    ) -> trames_shared::IoSubscription {
+        self.0.changed.subscribe(signal)
+    }
     pub fn reserve(&self) -> Option<GpuPermit> {
         self.0
+            .count
             .try_update(
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Acquire,
@@ -102,6 +132,46 @@ impl GpuBudget {
 }
 impl Drop for GpuPermit {
     fn drop(&mut self) {
-        self.0 .0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.0
+             .0
+            .count
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.0.notify();
+    }
+}
+
+#[cfg(test)]
+mod acquisition_tests {
+    use super::*;
+    use std::sync::{mpsc, Arc};
+    struct Wake(mpsc::Sender<()>);
+    impl trames_shared::IoWake for Wake {
+        fn wake_io(&self, _: &Arc<trames_shared::IoSignal>) {
+            self.0.send(()).unwrap();
+        }
+    }
+    #[test]
+    fn original_surface_release_and_destruction_wake_acquisition_waiters() {
+        let budget = GpuBudget::default();
+        let other = GpuBudget::default();
+        let permit = budget.reserve().unwrap();
+        let (send, recv) = mpsc::channel();
+        let target: Arc<dyn trames_shared::IoWake> = Arc::new(Wake(send));
+        let signal = trames_shared::IoSignal::new(7, Arc::downgrade(&target));
+        let subscription = budget.subscribe(&signal);
+        drop(other.reserve());
+        assert!(recv.try_recv().is_err());
+        drop(permit);
+        recv.recv().unwrap();
+        signal.reset();
+        assert!(budget.is_live());
+        budget.close();
+        recv.recv().unwrap();
+        assert!(!budget.is_live());
+        assert!(other.is_live());
+        drop(subscription);
+        signal.reset();
+        budget.notify();
+        assert!(recv.try_recv().is_err());
     }
 }

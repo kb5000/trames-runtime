@@ -46,7 +46,7 @@ pub(super) struct Pending {
     pub compile: Option<Compile>,
     signal: Option<Arc<IoSignal>>,
     context_subscription: Option<IoSubscription>,
-    task_subscription: Option<IoSubscription>,
+    task_subscription: Option<trames_vulkan::JobSubscription>,
     peer_started: u64,
     deadline: Option<Instant>,
 }

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Standard guest Wayland WSI over owned native GPU images. Native fence polling
-//! never blocks the VM coordinator, and presentation transports no pixel bytes.
+//! Standard guest Wayland WSI over owned native GPU images. Resource readiness
+//! parks the original task without a service thread; presentation copies no pixels.
 use super::*;
 use std::{
     io,
@@ -25,13 +25,18 @@ pub(super) struct Surface {
     gpu_budget: trames_wayland::GpuBudget,
 }
 impl Surface {
+    fn check_live(&self) -> Result<()> {
+        if self.gpu_budget.is_live() {
+            Ok(())
+        } else {
+            Err(vk::Result::ERROR_SURFACE_LOST_KHR.into())
+        }
+    }
     fn info(&self) -> Result<SurfaceInfo> {
+        self.check_live()?;
         self.server
-            .snapshot()
-            .surfaces
-            .get(&(self.connection, self.protocol))
+            .surface_info(self.connection, self.protocol)
             .filter(|i| i.id == self.id)
-            .cloned()
             .ok_or(Failure::Vk(vk::Result::ERROR_SURFACE_LOST_KHR))
     }
 }
@@ -139,7 +144,30 @@ struct Chain {
     retired: bool,
     mailbox: bool,
 }
+// Retain the original swapchain generation, sync objects and destination. A
+// pending acquisition contains no guest byte borrow, native submit or thread.
+pub(super) struct Acquire {
+    pool: Rc<Pool>,
+    chain: u64,
+    semaphore: Option<Rc<Object>>,
+    fence: Option<Rc<Object>>,
+    output: u64,
+    pub(super) deadline: Option<std::time::Instant>,
+}
+impl Acquire {
+    pub(super) fn subscribe(
+        &self,
+        signal: &Arc<trames_shared::IoSignal>,
+    ) -> trames_shared::IoSubscription {
+        self.pool.surface.gpu_budget.subscribe(signal)
+    }
+}
 impl Wayland {
+    fn retire(&mut self, id: u64) {
+        let chain = self.chains.get_mut(&id).unwrap();
+        chain.retired = true;
+        chain.pool.surface.gpu_budget.notify();
+    }
     pub(super) fn idle(&self) -> bool {
         self.pending
             .iter()
@@ -189,10 +217,8 @@ impl Backend {
             }
             output(m, a[3], 8)?;
             self.room(self.wayland.surfaces.len() + 1)?;
-            let snapshot = server.snapshot();
-            let info = snapshot
-                .surfaces
-                .get(&(connection, a[2] as u32))
+            let info = server
+                .surface_info(connection, a[2] as u32)
                 .ok_or(Failure::Vk(vk::Result::NOT_READY))?;
             let surface = Rc::new(Surface {
                 server,
@@ -519,7 +545,7 @@ impl Backend {
                     token: owner,
                 };
                 if a[8] != 0 {
-                    self.wayland.chains.get_mut(&a[8]).unwrap().retired = true;
+                    self.wayland.retire(a[8]);
                 }
                 let mut images = Vec::new();
                 for _ in 0..a[2] {
@@ -556,7 +582,7 @@ impl Backend {
                     ids.push(id);
                 }
                 if a[8] != 0 {
-                    self.wayland.chains.get_mut(&a[8]).unwrap().retired = true;
+                    self.wayland.retire(a[8]);
                 }
                 self.wayland.chains.insert(
                     owner,
@@ -594,97 +620,9 @@ impl Backend {
                 }
             }
             90 => {
-                output(m, a[4], 4)?;
-                let chain = &self.wayland.chains[&a[1]];
-                if chain.retired {
-                    return Err(vk::Result::ERROR_OUT_OF_DATE_KHR.into());
-                }
-                chain.pool.surface.info()?;
-                let semaphore = if a[2] == 0 {
-                    None
-                } else {
-                    Some({
-                        let semaphore = self.object(a[2], Kind::Semaphore)?;
-                        if semaphore.flags != 0 {
-                            return invalid();
-                        }
-                        semaphore
-                    })
-                };
-                let fence = if a[3] == 0 {
-                    None
-                } else {
-                    Some(self.object(a[3], Kind::Fence)?)
-                };
-                if semaphore.is_none() && fence.is_none()
-                    || semaphore.as_ref().is_some_and(|s| s.state.get() != 0)
-                {
-                    return invalid();
-                }
-                if let Some(f) = &fence {
-                    if f.acquisition.borrow().is_some()
-                        || Self::fence_ready(f)?
-                        || self.submissions.iter().any(|s| Rc::ptr_eq(&s.fence, f))
-                    {
-                        return invalid();
-                    }
-                }
-                let index = chain
-                    .pool
-                    .images
-                    .iter()
-                    .position(|image| {
-                        image
-                            .state
-                            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-                            .is_ok()
-                    })
-                    .ok_or(Failure::Vk(vk::Result::NOT_READY))?;
-                let image = chain.pool.images[index].clone();
-                let object = self.objects[&chain.images[index]].clone();
-                let fence = match fence {
-                    Some(f) => f,
-                    None => match self.private_fence(device.clone()) {
-                        Ok(f) => f,
-                        Err(e) => {
-                            image.state.store(0, Ordering::Release);
-                            return Err(e);
-                        }
-                    },
-                };
-                let signals = semaphore
-                    .as_ref()
-                    .map(|s| vk::Semaphore::from_raw(s.raw))
-                    .into_iter()
-                    .collect::<Vec<_>>();
-                let info = vk::SubmitInfo::default().signal_semaphores(&signals);
-                if let Err(e) = unsafe {
-                    device
-                        .native
-                        .queue_submit(self.queue, &[info], vk::Fence::from_raw(fence.raw))
-                } {
-                    image.state.store(0, Ordering::Release);
-                    return Err(e.into());
-                }
-                let mut resources = vec![object];
-                if let Some(s) = semaphore {
-                    s.state.set(1);
-                    resources.push(s);
-                }
-                self.submissions.push(Submission {
-                    fence,
-                    commands: vec![],
-                    resource_ids: Default::default(),
-                    descriptor_sets: Vec::new(),
-                    _resources: resources,
-                    timeline_completion: Vec::new(),
-                    commands_complete: false,
-                    coherent_scope: Default::default(),
-                });
-                self.wayland.chains.get_mut(&a[1]).unwrap().acquired[index] = true;
-                if let Err(e) = write(m, a[4], &(index as u32).to_le_bytes()) {
-                    self.wayland.chains.get_mut(&a[1]).unwrap().retired = true;
-                    return Err(e);
+                let acquire = self.prepare_acquire(m, a, 0)?;
+                if !self.acquire_image(m, &acquire)? {
+                    return Err(vk::Result::NOT_READY.into());
                 }
             }
             91 => {
@@ -701,7 +639,7 @@ impl Backend {
                 {
                     return invalid();
                 }
-                chain.pool.surface.info()?;
+                chain.pool.surface.check_live()?;
                 let mut dependencies = Vec::new();
                 let mut waits = Vec::new();
                 for id in words64(m, a[4], bounded(a[5], 64)?)? {
@@ -709,10 +647,14 @@ impl Backend {
                     if s.flags != 0 {
                         return invalid();
                     }
-                    if s.state.get() != 1 || dependencies.iter().any(|x| Rc::ptr_eq(x, &s)) {
+                    if !matches!(s.state.get(), 1 | HOST_SIGNALED)
+                        || dependencies.iter().any(|x| Rc::ptr_eq(x, &s))
+                    {
                         return invalid();
                     }
-                    waits.push(vk::Semaphore::from_raw(s.raw));
+                    if s.state.get() != HOST_SIGNALED {
+                        waits.push(vk::Semaphore::from_raw(s.raw));
+                    }
                     dependencies.push(s);
                 }
                 let permit = chain
@@ -738,7 +680,7 @@ impl Backend {
                         .native
                         .queue_submit(self.queue, &[submit], completion.fence)
                 } {
-                    self.wayland.chains.get_mut(&a[2]).unwrap().retired = true;
+                    self.wayland.retire(a[2]);
                     return Err(e.into());
                 }
                 self.observe_raw_fence(completion.fence.as_raw());
@@ -764,7 +706,7 @@ impl Backend {
                 let surface = chain.pool.surface.id;
                 self.wayland.chains.get_mut(&a[2]).unwrap().acquired[a[3] as usize] = false;
                 if server.present_gpu(surface, frame).is_err() {
-                    self.wayland.chains.get_mut(&a[2]).unwrap().retired = true;
+                    self.wayland.retire(a[2]);
                     return Err(vk::Result::ERROR_SURFACE_LOST_KHR.into());
                 }
             }
@@ -774,9 +716,143 @@ impl Backend {
     }
     fn drop_wayland_chain(&mut self, id: u64) {
         if let Some(chain) = self.wayland.chains.remove(&id) {
+            chain.pool.surface.gpu_budget.notify();
             for id in chain.images {
                 self.objects.remove(&id);
             }
         }
     }
 }
+
+impl Backend {
+    fn prepare_acquire(
+        &self,
+        m: &mut impl CpuMemory,
+        a: [u64; 16],
+        timeout: u64,
+    ) -> Result<Acquire> {
+        self.device(a[0])?;
+        output(m, a[4], 4)?;
+        let chain = self
+            .wayland
+            .chains
+            .get(&a[1])
+            .ok_or(Failure::Vk(vk::Result::ERROR_OUT_OF_DATE_KHR))?;
+        Ok(Acquire {
+            pool: chain.pool.clone(),
+            chain: a[1],
+            semaphore: if a[2] == 0 {
+                None
+            } else {
+                Some(self.object(a[2], Kind::Semaphore)?)
+            },
+            fence: if a[3] == 0 {
+                None
+            } else {
+                Some(self.object(a[3], Kind::Fence)?)
+            },
+            output: a[4],
+            deadline: if timeout == u64::MAX {
+                None
+            } else {
+                std::time::Instant::now().checked_add(std::time::Duration::from_nanos(timeout))
+            },
+        })
+    }
+    fn acquire_image(&mut self, m: &mut impl CpuMemory, a: &Acquire) -> Result<bool> {
+        let chain = self
+            .wayland
+            .chains
+            .get(&a.chain)
+            .ok_or(Failure::Vk(vk::Result::ERROR_OUT_OF_DATE_KHR))?;
+        if chain.retired {
+            return Err(vk::Result::ERROR_OUT_OF_DATE_KHR.into());
+        }
+        a.pool.surface.check_live()?;
+        if a.semaphore.is_none() && a.fence.is_none()
+            || a.semaphore
+                .as_ref()
+                .is_some_and(|s| s.flags != 0 || s.state.get() != 0)
+        {
+            return invalid();
+        }
+        if let Some(f) = &a.fence {
+            if f.acquisition.borrow().is_some()
+                || Self::fence_ready(f)?
+                || self.submissions.iter().any(|s| Rc::ptr_eq(&s.fence, f))
+            {
+                return invalid();
+            }
+        }
+        let Some(index) = a.pool.images.iter().position(|image| {
+            image
+                .state
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        }) else {
+            return Ok(false);
+        };
+        // State 0 is published only after native producer completion and final
+        // UI reads. Availability is therefore already proved on the host. Do
+        // not enqueue empty GPU work merely to signal an acquisition primitive.
+        if let Some(s) = &a.semaphore {
+            s.state.set(HOST_SIGNALED);
+        }
+        if let Some(f) = &a.fence {
+            f.state.set(HOST_SIGNALED);
+            self.completion_notice = true;
+        }
+        self.wayland.chains.get_mut(&a.chain).unwrap().acquired[index] = true;
+        if let Err(e) = write(m, a.output, &(index as u32).to_le_bytes()) {
+            self.wayland.retire(a.chain);
+            return Err(e);
+        }
+        Ok(true)
+    }
+    pub(super) fn start_acquire(
+        &mut self,
+        m: &mut impl CpuMemory,
+        a: [u64; 16],
+    ) -> Result<Invocation> {
+        if !completion::available() {
+            return unsupported();
+        }
+        let acquire = self.prepare_acquire(m, a, a[5])?;
+        if self.acquire_image(m, &acquire)? {
+            return Ok(Invocation::Complete(0));
+        }
+        if a[5] == 0 {
+            return Ok(Invocation::Complete(
+                vk::Result::NOT_READY.as_raw() as i64 as u64
+            ));
+        }
+        if self.acquires.len() >= LIMIT {
+            return Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY.into());
+        }
+        let id = self.id();
+        self.acquires.insert(id, acquire);
+        Ok(Invocation::Pending(id))
+    }
+    pub(super) fn poll_acquire(&mut self, m: &mut impl CpuMemory, id: u64) -> Result<Option<u64>> {
+        // A producer fence may finish before its UI/queue leases disappear.
+        // Drain that completed producer lease on its native notification too;
+        // otherwise waiting only for final image release could deadlock.
+        self.collect();
+        let acquire = self.acquires.remove(&id).unwrap();
+        if self.acquire_image(m, &acquire)? {
+            return Ok(Some(0));
+        }
+        if acquire
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            return Ok(Some(vk::Result::TIMEOUT.as_raw() as i64 as u64));
+        }
+        self.acquires.insert(id, acquire);
+        Ok(None)
+    }
+}
+
+#[cfg(all(test, target_vendor = "apple"))]
+#[path = "wayland_tests.rs"]
+mod tests;

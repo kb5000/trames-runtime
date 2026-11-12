@@ -455,7 +455,7 @@ impl Backend {
                 }
                 if let Some(f) = &fence {
                     if f.acquisition.borrow().is_some()
-                        || unsafe { device.native.get_fence_status(vk::Fence::from_raw(f.raw)) }?
+                        || Self::fence_ready(f)?
                         || self.submissions.iter().any(|s| Rc::ptr_eq(&s.fence, f))
                     {
                         return invalid();
@@ -548,7 +548,9 @@ impl Backend {
                     if s.flags != 0 {
                         return invalid();
                     }
-                    if s.state.get() != 1 || dependencies.iter().any(|x| Rc::ptr_eq(x, &s)) {
+                    if !matches!(s.state.get(), 1 | HOST_SIGNALED)
+                        || dependencies.iter().any(|x| Rc::ptr_eq(x, &s))
+                    {
                         return invalid();
                     }
                     semaphores.push(vk::Semaphore::from_raw(s.raw));
