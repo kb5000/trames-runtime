@@ -292,7 +292,6 @@ impl Socket {
         }
         if self.kind == 3 {
             let mut i = self.network.0.fabric.0.borrow_mut();
-            i.reserve(1)?;
             let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
             let mut s = icmp::Socket::new(
                 icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 16], vec![0; BUFFER]),
@@ -305,7 +304,6 @@ impl Socket {
         }
         if self.kind == 4 {
             let mut i = self.network.0.fabric.0.borrow_mut();
-            i.reserve(1)?;
             let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
             let socket = raw::Socket::new(
                 if self.family == 2 {
@@ -326,7 +324,6 @@ impl Socket {
         if self.kind == 2 {
             let addresses = self.addresses(a);
             let mut i = self.network.0.fabric.0.borrow_mut();
-            i.reserve(addresses.len())?;
             let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
             let mut handles = Vec::new();
             for address in addresses {
@@ -344,7 +341,7 @@ impl Socket {
         self.state.borrow_mut().bound = Some(a);
         Ok(())
     }
-    pub(crate) fn preflight_listen(&self, backlog: u32) -> Result<()> {
+    pub(crate) fn preflight_listen(&self, _backlog: u32) -> Result<()> {
         if self.kind != 1 {
             return Err(NetError(95));
         }
@@ -355,14 +352,8 @@ impl Socket {
         if state.connection != Connection::Idle {
             return Err(NetError(22));
         }
-        let bound = state.bound.ok_or(NetError(22))?;
-        drop(state);
-        self.network
-            .0
-            .fabric
-            .0
-            .borrow()
-            .reserve(self.addresses(bound).len() * backlog.clamp(1, 8) as usize)
+        state.bound.ok_or(NetError(22))?;
+        Ok(())
     }
     pub fn listen(&self, backlog: u32) -> Result<()> {
         if self.kind != 1 {
@@ -380,7 +371,6 @@ impl Socket {
         let addresses = self.addresses(bound);
         let backlog = backlog.clamp(1, 8) as usize;
         let mut i = self.network.0.fabric.0.borrow_mut();
-        i.reserve(addresses.len() * backlog)?;
         let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
         let mut state = self.state.borrow_mut();
         for a in addresses {
@@ -399,7 +389,6 @@ impl Socket {
         self.fabric().tick();
         let reservation = self.network.reserve()?;
         let mut i = self.network.0.fabric.0.borrow_mut();
-        i.reserve(1)?;
         let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
         let mut state = self.state.borrow_mut();
         if state.connection != Connection::Listening {
@@ -507,7 +496,6 @@ impl Socket {
             return Err(NetError(99));
         }
         let mut i = self.network.0.fabric.0.borrow_mut();
-        i.reserve(1)?;
         let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
         let mut s = tcp_socket();
         s.connect(n.iface.context(), endpoint(a), endpoint(bound))

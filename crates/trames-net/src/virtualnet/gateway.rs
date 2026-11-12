@@ -183,7 +183,6 @@ impl Gateway {
         h: &packet::Header,
         nodes: &BTreeMap<u64, Node>,
         now: smoltcp::time::Instant,
-        can_add: bool,
     ) -> bool {
         let Some(ns) = nodes.get(&key).and_then(|n| n.owner.upgrade()) else {
             return false;
@@ -207,7 +206,7 @@ impl Gateway {
                 return false;
             }
             if !self.tcp.iter().any(|f| f.node == key && f.tuple == tuple) && t.syn() && !t.ack() {
-                if !can_add || self.flow_count() >= FLOWS {
+                if self.flow_count() >= FLOWS {
                     return false;
                 }
                 let owner = self.owner(nodes, key, tuple, 1);
@@ -255,7 +254,7 @@ impl Gateway {
             self.node.port.receive_packet(p)
         } else if h.protocol == 17 {
             if h.first && !self.udp_handles.contains_key(&dest) {
-                if !can_add || self.udp_handles.len() >= FLOWS {
+                if self.udp_handles.len() >= FLOWS {
                     return false;
                 }
                 let mut u = udp_socket();

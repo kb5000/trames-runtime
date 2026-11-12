@@ -26,7 +26,6 @@ use std::{
 };
 type Result<T> = std::result::Result<T, NetError>;
 const BUFFER: usize = 65536;
-const MAX_HANDLES: usize = 256;
 const MAX_ENVIRONMENTS: usize = 16;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NetworkInfo {
@@ -79,7 +78,6 @@ struct Node {
     detached: Vec<(SocketHandle, Instant)>,
     resets: Vec<(Weak<SocketMeta>, Connection)>,
     links: [LinkStats; 2],
-    configuration_pending: bool,
     configuration_revision: u64,
     configuration_lo: bool,
 }
@@ -233,7 +231,6 @@ fn make_node(id: u8, now: smoltcp::time::Instant) -> Result<Node> {
         detached: Vec::new(),
         resets: Vec::new(),
         links: [LinkStats::default(); 2],
-        configuration_pending: false,
         configuration_revision: u64::MAX,
         configuration_lo: false,
     })
@@ -363,7 +360,7 @@ impl Fabric {
         });
         node.owner = Arc::downgrade(&ns.data);
         node.iface.set_any_ip(true);
-        node.configure_dynamic(&mut 0);
+        node.configure_dynamic();
         i.nodes.insert(key, node);
         Ok(Network(ns))
     }
@@ -399,6 +396,8 @@ impl Inner {
             self.started.elapsed().as_millis().min(i64::MAX as u128) as i64,
         )
     }
+    // Statistics only: live descriptors and protocol closing states have
+    // independent lifetimes. Counting both must never gate a new connection.
     fn handles(&self) -> usize {
         self.nodes
             .values()
@@ -407,19 +406,11 @@ impl Inner {
             + self.gateway.node.sockets.iter().count()
             + self.gateway.pending_handles()
     }
-    fn reserve(&self, n: usize) -> Result<()> {
-        if self.handles() + n > MAX_HANDLES {
-            Err(NetError(105))
-        } else {
-            Ok(())
-        }
-    }
     fn tick(&mut self) {
         let now = self.now();
         let time = Instant::now();
-        let mut spare = MAX_HANDLES.saturating_sub(self.handles());
         for node in self.nodes.values_mut() {
-            node.configure_dynamic(&mut spare);
+            node.configure_dynamic();
             node.registry.retain(|s| s.strong_count() != 0);
             for (_, socket) in node.sockets.iter_mut() {
                 if let smoltcp::socket::Socket::Tcp(t) = socket {
@@ -572,16 +563,7 @@ impl Inner {
                                 route.input,
                             );
                         let h = packet::header(&p).unwrap();
-                        if !ok
-                            || !self.gateway.ingress(
-                                source,
-                                p,
-                                &h,
-                                &self.nodes,
-                                now,
-                                self.handles() < MAX_HANDLES,
-                            )
-                        {
+                        if !ok || !self.gateway.ingress(source, p, &h, &self.nodes, now) {
                             self.stats.dropped += 1;
                         }
                         continue;
@@ -680,14 +662,7 @@ impl Inner {
                     && dynamic.is_none()
                     && (!private_ip(dst) || dst == IpAddr::V4(v4(1)) || dst == IpAddr::V6(v6(1)))
                 {
-                    if !self.gateway.ingress(
-                        source,
-                        p,
-                        &h,
-                        &self.nodes,
-                        now,
-                        self.handles() < MAX_HANDLES,
-                    ) {
+                    if !self.gateway.ingress(source, p, &h, &self.nodes, now) {
                         self.stats.dropped += 1;
                     }
                 } else {
@@ -735,14 +710,13 @@ impl Inner {
     }
 }
 impl Node {
-    fn configure_dynamic(&mut self, spare: &mut usize) {
+    fn configure_dynamic(&mut self) {
         let Some(owner) = self.owner.upgrade() else {
             return;
         };
         let Some(view) = &owner.routing else { return };
         let revision = view.graph.read().unwrap().revision();
-        if !self.configuration_pending
-            && self.configuration_revision == revision
+        if self.configuration_revision == revision
             && self.configuration_lo == owner.loopback_up.get()
         {
             return;
@@ -751,8 +725,7 @@ impl Node {
         self.configuration_lo = owner.loopback_up.get();
         let addresses = view.addresses(true);
         let old = self.iface.ip_addrs();
-        if !self.configuration_pending
-            && old.len() == addresses.len()
+        if old.len() == addresses.len()
             && old
                 .iter()
                 .zip(&addresses)
@@ -760,7 +733,6 @@ impl Node {
         {
             return;
         }
-        self.configuration_pending = false;
         self.iface.update_ip_addrs(|out| {
             out.clear();
             for a in &addresses {
@@ -828,7 +800,6 @@ impl Node {
                         true
                     } else {
                         self.sockets.remove(h);
-                        *spare += 1;
                         false
                     }
                 } else {
@@ -852,10 +823,6 @@ impl Node {
                     .count();
                 let needed = if socket.kind == 2 { 1 } else { state.backlog };
                 for _ in count..needed {
-                    if *spare == 0 {
-                        self.configuration_pending = true;
-                        break;
-                    }
                     let ep = SocketAddr::new(*a, bound.port());
                     let handle = if socket.kind == 2 {
                         let mut u = udp_socket();
@@ -872,7 +839,6 @@ impl Node {
                         }
                         self.sockets.add(t)
                     };
-                    *spare -= 1;
                     state.handles.push(handle);
                 }
             }
@@ -1031,6 +997,50 @@ impl Drop for Socket {
 #[cfg(test)]
 mod shared_lifetime_tests {
     use super::*;
+    #[test]
+    fn closed_tcp_protocol_states_do_not_exhaust_later_accepts() {
+        let fabric = Fabric::new().unwrap();
+        let clients = fabric.environment(2, NetworkMode::Full).unwrap();
+        let servers = fabric.environment(3, NetworkMode::Full).unwrap();
+        let listener = servers.socket(2, 1, 0).unwrap();
+        let address = "10.0.0.3:34001".parse().unwrap();
+        listener.bind(address).unwrap();
+        listener.listen(2).unwrap();
+        for sequence in 0u32..384 {
+            let client = clients.socket(2, 1, 0).unwrap();
+            client
+                .bind(SocketAddr::new(v4(2).into(), 35000 + sequence as u16))
+                .unwrap();
+            assert_eq!(
+                client.connect(address),
+                Err(NetError(115)),
+                "connect {sequence}"
+            );
+            let mut connected = false;
+            for _ in 0..100 {
+                if client.connect_complete().unwrap() {
+                    connected = true;
+                    break;
+                }
+            }
+            assert!(connected, "connect {sequence}");
+            let (accepted, _) = listener
+                .accept()
+                .unwrap_or_else(|e| panic!("accept {sequence}: {e:?}"));
+            assert_eq!(client.send(&sequence.to_le_bytes(), 0, None), Ok(4));
+            assert_eq!(accepted.recv(4, 0).unwrap().data, sequence.to_le_bytes());
+            drop(client);
+            drop(accepted);
+            fabric.0.borrow_mut().tick();
+        }
+        assert!(
+            fabric.stats().stack_sockets > 256,
+            "protocol close states are retained until their actual deadlines"
+        );
+        assert_eq!(clients.0.live.live(), 0);
+        assert_eq!(servers.0.live.live(), 1);
+    }
+
     #[test]
     fn packet_observers_never_own_socket_or_namespace_close_callbacks() {
         let fabric = Fabric::new().unwrap();

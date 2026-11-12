@@ -143,7 +143,7 @@ fn policy_quota_teardown_and_reused_environment_id() {
     assert_eq!(s.send(b"x", 0, None), Err(NetError(107)));
     let anew = net(&f, 2);
     assert_eq!(anew.live_sockets(), 0);
-    assert!(f.stats().stack_sockets <= 256);
+    assert_eq!(f.stats().environments, 3);
 }
 #[test]
 fn native_gateway_tcp_and_udp_both_families() {
@@ -369,26 +369,35 @@ fn namespace_finish_resets_peer_and_preserves_other_namespace() {
     assert_eq!(x.recv(100, 0).unwrap().data, b"new namespace");
 }
 #[test]
-fn aggregate_stack_quota_rejects_listener_before_partial_allocation() {
+fn dual_stack_listener_backlogs_do_not_share_a_fixed_protocol_handle_ceiling() {
     let f = Fabric::new().unwrap();
+    let baseline = f.stats().stack_sockets;
     let n = net(&f, 2);
+    let peer = net(&f, 3);
     let mut listeners = Vec::new();
-    for port in 10000..10007 {
+    for port in 10000..10016 {
         let s = socket(&n, true, true);
         s.set_option(41, 26, 0).unwrap();
         s.bind(parse(&format!("[::]:{port}"))).unwrap();
         s.listen(8).unwrap();
         listeners.push(s);
     }
-    let s = socket(&n, true, true);
-    s.set_option(41, 26, 0).unwrap();
-    s.bind(parse("[::]:10007")).unwrap();
-    let before = f.stats().stack_sockets;
-    assert_eq!(s.listen(8), Err(NetError(105)));
-    assert_eq!(f.stats().stack_sockets, before);
-    assert!(before <= 256);
-    drop(listeners);
-    s.listen(8).unwrap();
+    assert!(f.stats().stack_sockets > 256);
+    assert_eq!(n.live_sockets(), 16);
+    let listener = listeners.last().unwrap();
+    for (v6, address) in [(false, "10.0.0.2:10015"), (true, "[fd00::2]:10015")] {
+        let client = socket(&peer, v6, true);
+        connect(&client, parse(address));
+        let (accepted, _) = until(listener, || listener.accept());
+        assert_eq!(client.send(b"beyond old stack ceiling", 0, None), Ok(24));
+        assert_eq!(
+            until(&accepted, || accepted.recv(64, 0)).data,
+            b"beyond old stack ceiling"
+        );
+    }
+    n.finish();
+    peer.finish();
+    assert_eq!(f.stats().stack_sockets, baseline);
 }
 
 #[test]
