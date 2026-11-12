@@ -799,6 +799,9 @@ struct Queues<C: Cpu> {
     custody_waits: Vec<CustodyWait<C>>,
     retired: Vec<(Box<Job<C>>, Option<SliceOutcome>)>,
     idle_notified: bool,
+    /// Changes only for a terminal idle probe; ready publication already clears
+    /// idle_notified. Ordinary dispatch needs no new counter or atomic update.
+    idle_probe: u64,
     sleeping_slots: u64,
 }
 struct CustodyWait<C: Cpu> {
@@ -955,6 +958,10 @@ impl<C: Cpu> Epoch<C> {
             .cloned()
             .map(crate::RuntimeError::HostIo)
             .or(lifecycle)
+            .or_else(|| {
+                (self.control.end() == Some(crate::execution_control::End::Deadlocked))
+                    .then_some(crate::RuntimeError::Deadlock)
+            })
     }
     /// Run only on a returned executor. No mutable Kernel or host callback enters.
     pub(crate) fn finish_closed(&self) {
@@ -987,6 +994,10 @@ impl<C: Cpu> Epoch<C> {
             .cloned()
             .map(crate::RuntimeError::HostIo)
             .or(lifecycle)
+            .or_else(|| {
+                (self.control.end() == Some(crate::execution_control::End::Deadlocked))
+                    .then_some(crate::RuntimeError::Deadlock)
+            })
     }
     pub(crate) fn drain_closed(&self) -> Vec<Done<C>> {
         assert!(self.control.closing());
@@ -1605,6 +1616,9 @@ impl<C: Cpu> Epoch<C> {
     pub fn checkpoint_owns_all_jobs(&self, checkpoint: &Checkpoint<C>) -> bool {
         checkpoint.jobs.len() == self.queues.lock().unwrap().members.len()
     }
+    // Bounded interpreter fixtures may observe an empty queue. Production
+    // terminal decisions must use the stronger locked protocol below.
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub fn idle(&self) -> bool {
         let q = self.queues.lock().unwrap();
         if self.host_pause.load(Ordering::Relaxed) {
@@ -1619,6 +1633,60 @@ impl<C: Cpu> Epoch<C> {
                     && !lifecycle.layouts_pending()
                     && !lifecycle.host_pending()
             })
+    }
+    /// Terminal quiescence is stronger than a momentarily empty ready queue.
+    /// Both observations use this same predicate; no producer may be omitted
+    /// after the native-service probe releases and reacquires the queue lock.
+    fn terminal_idle(&self, q: &Queues<C>) -> bool {
+        !self.control.closing()
+            && !self.host_pause.load(Ordering::Relaxed)
+            && !self.host_external.load(Ordering::Relaxed)
+            && q.running == 0
+            && q.completing == 0
+            && q.ready.is_empty()
+            && q.host_admissions.is_empty()
+            && !q.host_waiting
+            && !q.retirement_notified
+            && q.parked.next_deadline().is_none()
+            && self
+                .timers
+                .get()
+                .and_then(|timers| timers.next_deadline())
+                .is_none()
+            && !q.parked.gpu_pending()
+            && !q.parked.external()
+            && !q.domains.any_paused()
+            && self.lifecycle.get().is_none_or(|lifecycle| {
+                !lifecycle.retirements_pending()
+                    && !lifecycle.layouts_pending()
+                    && !lifecycle.host_pending()
+                    && !lifecycle.futex_pending()
+                    && !lifecycle.host_ready()
+                    && !lifecycle.layouts_ready()
+                    && !lifecycle.retirement_ready()
+                    && !lifecycle.futex_ready()
+                    && !lifecycle.proc_ready()
+                    && !lifecycle.memory_ready()
+            })
+    }
+    fn close_idle(&self, q: &mut Queues<C>, observed: u64, native: bool) -> bool {
+        // Ready publication invalidates this probe even if that task has
+        // already parked again. A later observer cannot revive an old probe.
+        if !q.idle_notified || q.idle_probe != observed || !self.terminal_idle(q) {
+            return false;
+        }
+        if native {
+            return true; // Keep the lock until the atomic condition-variable wait.
+        }
+        // Publication and admission closure share the original queue mutex.
+        // No wake/return can enter between the final check and this decision.
+        // Keep the cause in that same one-way transition, without taking a
+        // lifecycle/report mutex under the queue lock.
+        self.control
+            .close(crate::execution_control::End::Deadlocked);
+        q.domains.interrupt_host_pause();
+        self.notify(q);
+        true
     }
     pub fn restore_checkpoint(&self, checkpoint: Checkpoint<C>, resume: bool) {
         let mut q = self.queues.lock().unwrap();
@@ -1892,19 +1960,19 @@ impl<C: Cpu> Epoch<C> {
                 })
             {
                 if self.source_session() {
-                    if !self.host_external.load(Ordering::Relaxed)
-                        && !self.host_pause.load(Ordering::Relaxed)
-                    {
+                    if self.terminal_idle(&q) {
+                        q.idle_probe = q.idle_probe.wrapping_add(1);
+                        let observed = q.idle_probe;
+                        q.idle_notified = true;
                         drop(q);
                         let native = self
                             .lifecycle
                             .get()
                             .is_some_and(|lifecycle| lifecycle.has_native_services());
-                        if !native && self.idle() {
-                            self.fail_execution(crate::RuntimeError::Deadlock);
-                        }
                         q = self.queues.lock().unwrap();
-                        if self.control.closing() {
+                        if !self.close_idle(&mut q, observed, native) || self.control.closing() {
+                            // Recompute runnable work/deadlines and process
+                            // source readiness before deciding to sleep again.
                             continue;
                         }
                     }
@@ -2376,6 +2444,83 @@ mod tests {
 
     use super::*;
     use trames_memory::{CpuMemory, Memory, Permissions, PAGE_SIZE};
+    #[test]
+    fn terminal_idle_probe_rechecks_new_waits_returns_and_admissions() {
+        for transition in 0..6 {
+            let epoch = Epoch::new(Arc::new(Control::new(1000)));
+            let mut q = epoch.queues.lock().unwrap();
+            assert!(epoch.terminal_idle(&q));
+            q.idle_probe = 1;
+            q.idle_notified = true;
+            drop(q); // native-service inspection releases this same mutex
+            let mut q = epoch.queues.lock().unwrap();
+            match transition {
+                0 => {
+                    let mut sleeper = job(1, &epoch);
+                    sleeper.waiting = Some(WaitState::Sleep {
+                        deadline: Instant::now() + Duration::from_secs(30),
+                        remaining: 0,
+                    });
+                    q.parked.insert(1, sleeper);
+                }
+                1 => {
+                    q.retirement_notified = true;
+                }
+                2 => {
+                    q.host_admissions.insert(1);
+                }
+                3 => {
+                    q.host_waiting = true;
+                }
+                4 => {
+                    epoch.host_external.store(true, Ordering::Relaxed);
+                }
+                _ => {
+                    epoch.control.close(crate::execution_control::End::Exited);
+                }
+            }
+            assert!(!epoch.close_idle(&mut q, 1, false));
+            assert_ne!(
+                epoch.control.end(),
+                Some(crate::execution_control::End::Deadlocked)
+            );
+        }
+    }
+    #[test]
+    fn ready_then_repark_cannot_revive_an_older_terminal_probe() {
+        let epoch = Epoch::new(Arc::new(Control::new(1000)));
+        {
+            let mut q = epoch.queues.lock().unwrap();
+            q.idle_probe = 1;
+            q.idle_notified = true;
+        }
+        let producer = epoch.clone();
+        std::thread::spawn(move || {
+            producer.add(job(1, &producer));
+            let current = producer.take(0).unwrap();
+            producer.park(current, Some(WaitState::OwnerEvent));
+        })
+        .join()
+        .unwrap();
+        let mut q = epoch.queues.lock().unwrap();
+        // The queues look idle again, but their original ready publication
+        // invalidated the service observation made before that task ran.
+        assert!(epoch.terminal_idle(&q));
+        assert!(!epoch.close_idle(&mut q, 1, false));
+        q.idle_probe = 2;
+        q.idle_notified = true;
+        assert!(!epoch.close_idle(&mut q, 1, false));
+        assert!(epoch.close_idle(&mut q, 2, true));
+        assert!(
+            !epoch.control.closing(),
+            "native event source parks rather than spins or closes"
+        );
+        assert!(epoch.close_idle(&mut q, 2, false));
+        assert_eq!(
+            epoch.control.end(),
+            Some(crate::execution_control::End::Deadlocked)
+        );
+    }
     #[test]
     fn ready_affinity_starts_only_the_required_cold_cpu_without_an_owner_request() {
         for pause in [false, true] {

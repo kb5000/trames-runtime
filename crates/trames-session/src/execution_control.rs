@@ -16,6 +16,7 @@ pub(crate) enum End {
     Cancelled = 3,
     Exited = 4,
     Failed = 5,
+    Deadlocked = 6,
 }
 pub(crate) struct Control {
     phase: AtomicU8,
@@ -72,6 +73,7 @@ impl Control {
             3 => Some(End::Cancelled),
             4 => Some(End::Exited),
             5 => Some(End::Failed),
+            6 => Some(End::Deadlocked),
             _ => unreachable!(),
         }
     }

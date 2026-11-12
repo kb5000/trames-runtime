@@ -16,7 +16,13 @@ fn executable(p: &mut Process<trames_cpu::Cpu>, words: &[u32]) {
 
 #[test]
 fn closing_is_one_way_even_when_legacy_handoff_races_completion() {
-    for reason in [End::Budget, End::Cancelled, End::Exited, End::Failed] {
+    for reason in [
+        End::Budget,
+        End::Cancelled,
+        End::Exited,
+        End::Failed,
+        End::Deadlocked,
+    ] {
         let control = Arc::new(Control::new(10));
         control.close(reason);
         std::thread::scope(|scope| {
@@ -28,6 +34,23 @@ fn closing_is_one_way_even_when_legacy_handoff_races_completion() {
         assert_eq!(control.end(), Some(reason));
         assert!(control.claim().is_none());
     }
+}
+
+#[test]
+fn a_genuine_futex_deadlock_still_reports_its_original_terminal_cause() {
+    let mut k = kernel();
+    let mut p = admitted_process(&k);
+    executable(&mut p, &[0xd4000001, 0x14000000]);
+    for (register, value) in [(0, 0x3000), (1, 128), (2, 0), (3, 0), (8, 98)] {
+        p.cpu.set_x(register, value);
+    }
+    k.publish_task(1, &p);
+    k.processes.insert(1, p);
+    assert!(matches!(
+        k.drive(&mut trames_linux::CapturedOutput::default(), 100000),
+        Err(RuntimeError::Deadlock)
+    ));
+    assert!(k.source_completed);
 }
 
 #[test]
