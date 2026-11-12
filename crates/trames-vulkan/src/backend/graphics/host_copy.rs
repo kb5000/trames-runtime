@@ -578,11 +578,11 @@ mod tests {
         call(&mut b, &mut m, 2, &[instance]);
     }
     #[test]
-    #[ignore = "requires original aligned native Vulkan host mapping"]
-    fn hardware_original_native_mapping_outlives_logical_handles_without_importing_memory() {
-        let (mut b, mut m, instance, physical) = setup();
+    #[ignore = "requires original native fence completion and mapped memory"]
+    fn hardware_async_poll_reports_readback_delta_without_recounting_mapping() {
+        let (mut b, mut m, _, physical) = setup();
         let device = call(&mut b, &mut m, 8, &[physical, 0, OUT]);
-        let length = 1u64 << 20;
+        let length = trames_memory::PAGE_SIZE;
         let guest = 0x80000;
         m.map(guest, length, Permissions::RW).unwrap();
         let buffer = call(&mut b, &mut m, 11, &[device, length, 3, OUT]);
@@ -606,47 +606,214 @@ mod tests {
             })
             .unwrap();
         let memory = call(&mut b, &mut m, 14, &[device, size, ty as u64, OUT]);
-        assert!(
-            b.objects[&memory].host_allocation.borrow().is_none(),
-            "generic allocations retain their original native backing"
-        );
         call(&mut b, &mut m, 16, &[device, buffer, memory, 0]);
-        call(
-            &mut b,
-            &mut m,
-            17,
-            &[device, memory, 0, length, guest, shared_memory::MAP_SHARED],
-        );
-        assert!(b.mappings[&memory].direct);
-        {
-            let object = &b.objects[&memory];
-            let owner = object.host_allocation.borrow();
-            let owner = owner.as_ref().unwrap();
-            assert!(owner.owns_native());
-            // SAFETY: this test synchronously owns the original mapped native bytes.
-            unsafe {
-                owner.pointer().cast::<u64>().write(0x0123456789abcdef);
-            }
+        // An original client without the optional shared-map bridge keeps the
+        // correct shadow path; its async readback must still appear in metrics.
+        call(&mut b, &mut m, 17, &[device, memory, 0, length, guest]);
+        assert!(b.mappings[&memory].coherent.is_some());
+        let expected = m.read_u64(guest).unwrap() ^ u64::MAX;
+        unsafe { (b.objects[&memory].mapped.get() as *mut u64).write(expected) };
+        b.coherent_pending
+            .extend(&coherent::Scope::resources(&[b.objects[&buffer].clone()]));
+        let fence = call(&mut b, &mut m, 48, &[device, 0, OUT]);
+        m.write_array(0x3000, fence.to_le_bytes()).unwrap();
+        let mut args = [0; 16];
+        args[..6].copy_from_slice(&[device, 0x3000, 1, 1, u64::MAX, 0]);
+        let Invocation::Pending(job) = b.invoke_graph(&mut m, 201, args).unwrap() else {
+            panic!("unsignaled original fence must return a pending wait")
+        };
+        let native = &b.objects[&fence].device.native;
+        let raw = vk::Fence::from_raw(b.objects[&fence].raw);
+        unsafe {
+            native.queue_submit(b.queue, &[], raw).unwrap();
+            native.wait_for_fences(&[raw], true, u64::MAX).unwrap();
         }
-        assert_eq!(m.read_u64(guest).unwrap(), 0x0123456789abcdef);
-        call(&mut b, &mut m, 18, &[device, memory]);
-        call(
-            &mut b,
-            &mut m,
-            17,
-            &[device, memory, 0, length, guest, shared_memory::MAP_SHARED],
-        );
-        assert!(b.mappings[&memory].direct);
-        assert_eq!(m.read_u64(guest).unwrap(), 0x0123456789abcdef);
-        call(&mut b, &mut m, 18, &[device, memory]);
-        call(&mut b, &mut m, 12, &[device, buffer]);
-        call(&mut b, &mut m, 15, &[device, memory]);
-        call(&mut b, &mut m, 9, &[device]);
-        call(&mut b, &mut m, 2, &[instance]);
-        assert_eq!(b.live_objects.get(), 0);
-        assert!(b.budget.used() >= length);
-        assert_eq!(m.read_u64(guest).unwrap(), 0x0123456789abcdef);
-        m.unmap(guest, length).unwrap();
-        assert_eq!(b.budget.used(), 0);
+        let context = crate::Context::new(b);
+        let (result, transfers) = context.try_lock().unwrap().poll_with_transfers(&mut m, job);
+        assert_eq!(result.unwrap(), Some(0));
+        assert_eq!(m.read_u64(guest).unwrap(), expected);
+        assert_eq!(transfers.coherent_download_scanned_bytes, length);
+        assert_eq!(transfers.download_bytes, 8);
+        assert_eq!(transfers.upload_bytes, 0);
+        assert_eq!(transfers.shared_maps, 0);
+    }
+    #[test]
+    #[ignore = "requires original aligned native Vulkan host mapping"]
+    fn hardware_original_native_mapping_outlives_logical_handles_without_importing_memory() {
+        for length in [1u64 << 20, (1u64 << 20) + trames_memory::PAGE_SIZE] {
+            let (mut b, mut m, instance, physical) = setup();
+            let device = call(&mut b, &mut m, 8, &[physical, 0, OUT]);
+            let guest = 0x80000;
+            m.map(guest, length, Permissions::RW).unwrap();
+            let buffer = call(&mut b, &mut m, 11, &[device, length, 3, OUT]);
+            call(&mut b, &mut m, 13, &[device, buffer, OUT]);
+            let size = m.read_u64(OUT).unwrap();
+            let bits = read32(&m, OUT + 16).unwrap();
+            let props = unsafe {
+                b.instance
+                    .as_ref()
+                    .unwrap()
+                    .native
+                    .get_physical_device_memory_properties(b.physical)
+            };
+            let ty = (0..props.memory_type_count)
+                .find(|i| {
+                    bits & (1 << i) != 0
+                        && props.memory_types[*i as usize].property_flags.contains(
+                            vk::MemoryPropertyFlags::HOST_VISIBLE
+                                | vk::MemoryPropertyFlags::HOST_COHERENT,
+                        )
+                })
+                .unwrap();
+            let requested = size.max(length);
+            let memory = call(&mut b, &mut m, 14, &[device, requested, ty as u64, OUT]);
+            let charged = requested.next_multiple_of(trames_memory::host_mapping_granule() as u64);
+            assert_eq!(b.objects[&memory].size, requested);
+            assert_eq!(b.objects[&memory].allocation_size.get(), charged);
+            assert!(
+                b.objects[&memory].host_allocation.borrow().is_none(),
+                "generic allocations retain their original native backing"
+            );
+            let too_large = call(
+                &mut b,
+                &mut m,
+                11,
+                &[device, requested + trames_memory::PAGE_SIZE, 3, OUT],
+            );
+            let mut args = [0; 16];
+            args[..4].copy_from_slice(&[device, too_large, memory, 0]);
+            assert!(
+                matches!(b.invoke_graph(&mut m, 16, args).unwrap(), Invocation::Complete(value) if (value as i64) < 0)
+            );
+            call(&mut b, &mut m, 12, &[device, too_large]);
+            // Native generic allocations keep image/buffer aliasing; they are not
+            // converted to buffer-only external imports or dedicated allocations.
+            let native = &b.objects[&memory].device.native;
+            let image_info = vk::ImageCreateInfo::default()
+                .flags(vk::ImageCreateFlags::ALIAS)
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::R8G8B8A8_UNORM)
+                .extent(vk::Extent3D {
+                    width: 4,
+                    height: 4,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::LINEAR)
+                .usage(vk::ImageUsageFlags::TRANSFER_DST);
+            let image = unsafe { native.create_image(&image_info, None).unwrap() };
+            let image_requirements = unsafe { native.get_image_memory_requirements(image) };
+            assert_ne!(image_requirements.memory_type_bits & (1 << ty), 0);
+            assert!(image_requirements.size <= requested);
+            unsafe {
+                native
+                    .bind_image_memory(image, vk::DeviceMemory::from_raw(b.objects[&memory].raw), 0)
+                    .unwrap()
+            };
+            call(&mut b, &mut m, 16, &[device, buffer, memory, 0]);
+            let mut args = [0; 16];
+            args[..6].copy_from_slice(&[
+                device,
+                memory,
+                0,
+                requested + trames_memory::PAGE_SIZE,
+                guest,
+                shared_memory::MAP_SHARED,
+            ]);
+            assert!(
+                matches!(b.invoke_graph(&mut m, 17, args).unwrap(), Invocation::Complete(value) if (value as i64) < 0)
+            );
+            call(
+                &mut b,
+                &mut m,
+                17,
+                &[device, memory, 0, length, guest, shared_memory::MAP_SHARED],
+            );
+            assert!(b.mappings[&memory].direct);
+            {
+                let object = &b.objects[&memory];
+                let owner = object.host_allocation.borrow();
+                let owner = owner.as_ref().unwrap();
+                assert!(owner.owns_native());
+                // SAFETY: this test synchronously owns the original mapped native bytes.
+                unsafe {
+                    owner.pointer().cast::<u64>().write(0x0123456789abcdef);
+                }
+            }
+            assert_eq!(m.read_u64(guest).unwrap(), 0x0123456789abcdef);
+            call(&mut b, &mut m, 18, &[device, memory]);
+            let partial = 0x300000;
+            let page = trames_memory::PAGE_SIZE;
+            m.map(partial, 3 * page, Permissions::RW).unwrap();
+            call(
+                &mut b,
+                &mut m,
+                17,
+                &[
+                    device,
+                    memory,
+                    page,
+                    3 * page,
+                    partial,
+                    shared_memory::MAP_SHARED,
+                ],
+            );
+            assert!(b.mappings[&memory].direct);
+            m.write_array(partial, 0xfedcba9876543210u64.to_le_bytes())
+                .unwrap();
+            assert_eq!(m.read_u64(guest + page).unwrap(), 0xfedcba9876543210);
+            call(&mut b, &mut m, 18, &[device, memory]);
+            let tail = 0x400000;
+            m.map(tail, page, Permissions::RW).unwrap();
+            call(
+                &mut b,
+                &mut m,
+                17,
+                &[
+                    device,
+                    memory,
+                    length - page,
+                    page,
+                    tail,
+                    shared_memory::MAP_SHARED,
+                ],
+            );
+            assert!(b.mappings[&memory].direct);
+            m.write_array(tail, 0x1122334455667788u64.to_le_bytes())
+                .unwrap();
+            assert_eq!(
+                m.read_u64(guest + length - page).unwrap(),
+                0x1122334455667788
+            );
+            call(&mut b, &mut m, 18, &[device, memory]);
+            call(
+                &mut b,
+                &mut m,
+                17,
+                &[device, memory, 0, length, guest, shared_memory::MAP_SHARED],
+            );
+            assert!(b.mappings[&memory].direct);
+            assert_eq!(m.read_u64(guest).unwrap(), 0x0123456789abcdef);
+            call(&mut b, &mut m, 18, &[device, memory]);
+            unsafe { b.objects[&memory].device.native.destroy_image(image, None) };
+            call(&mut b, &mut m, 12, &[device, buffer]);
+            call(&mut b, &mut m, 15, &[device, memory]);
+            call(&mut b, &mut m, 9, &[device]);
+            call(&mut b, &mut m, 2, &[instance]);
+            assert_eq!(b.live_objects.get(), 0);
+            assert_eq!(b.budget.used(), charged);
+            assert_eq!(m.read_u64(guest).unwrap(), 0x0123456789abcdef);
+            m.unmap(guest, length).unwrap();
+            assert_eq!(
+                b.budget.used(),
+                charged,
+                "partial guest views retain the real owner"
+            );
+            m.unmap(partial, 3 * page).unwrap();
+            m.unmap(tail, page).unwrap();
+            assert_eq!(b.budget.used(), 0);
+        }
     }
 }

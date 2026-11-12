@@ -105,6 +105,18 @@ impl Lease<'_> {
     ) -> Result<Option<u64>, MemoryError> {
         self.backend.as_mut().unwrap().0.poll(memory, job)
     }
+    /// Async completion may perform coherent readback. Return that same call's
+    /// delta instead of losing it between successive synchronous invocations.
+    pub fn poll_with_transfers(
+        &mut self,
+        memory: &mut impl CpuMemory,
+        job: u64,
+    ) -> (Result<Option<u64>, MemoryError>, TransferMetrics) {
+        let backend = &mut self.backend.as_mut().unwrap().0;
+        let before = backend.transfers;
+        let result = backend.poll(memory, job);
+        (result, backend.transfers.since(before))
+    }
     pub fn subscribe_compile(
         &self,
         job: u64,

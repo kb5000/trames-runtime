@@ -6,6 +6,27 @@ use super::*;
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 pub(super) const MAP_SHARED: u64 = 0x5348_4152_4544;
 
+/// Only generic coherent driver allocations can acquire implementation padding.
+/// Guest binding/map bounds remain the original request; native byte ownership
+/// and its budget charge include the complete mapping granules. Dedicated and
+/// external allocations retain their original native allocation contract.
+pub(super) fn native_size(
+    size: u64,
+    flags: vk::MemoryPropertyFlags,
+    dedicated: bool,
+) -> Result<u64> {
+    if !dedicated
+        && flags.contains(
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+    {
+        size.checked_next_multiple_of(trames_memory::host_mapping_granule() as u64)
+            .ok_or_else(|| vk::Result::ERROR_OUT_OF_DEVICE_MEMORY.into())
+    } else {
+        Ok(size)
+    }
+}
+
 pub(super) struct Allocation {
     pub(super) revision: Arc<AtomicU64>,
     pointer: usize,
@@ -157,5 +178,26 @@ impl Backend {
             let raw = unsafe { dev.native.allocate_memory(&info, None) }?;
             Ok((raw, owner))
         })())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn generic_padding_owns_whole_granules_without_changing_other_contracts() {
+        let flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let granule = trames_memory::host_mapping_granule() as u64;
+        assert_eq!(native_size(granule, flags, false).unwrap(), granule);
+        assert_eq!(native_size(granule + 1, flags, false).unwrap(), granule * 2);
+        assert_eq!(native_size(granule + 1, flags, true).unwrap(), granule + 1);
+        assert_eq!(
+            native_size(granule + 1, vk::MemoryPropertyFlags::HOST_VISIBLE, false).unwrap(),
+            granule + 1
+        );
+        assert!(matches!(
+            native_size(u64::MAX, flags, false),
+            Err(Failure::Vk(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY))
+        ));
     }
 }

@@ -185,6 +185,9 @@ struct Object {
     descriptor_epoch: Cell<u64>,
     push_ranges: RefCell<Vec<(u32, u32, u32)>>,
     size: u64,
+    // Guest-visible size stays exact. Native coherent backing may own padding
+    // so an original mapping covers complete host granules without a shadow.
+    allocation_size: Cell<u64>,
     flags: u32,
     state: Cell<u8>,
     command_usage: Cell<u32>,
@@ -282,7 +285,7 @@ impl Drop for Object {
                     }
                     d.free_memory(vk::DeviceMemory::from_raw(self.raw), None);
                     if self.host_allocation.borrow().is_none() {
-                        self.budget.release(self.size);
+                        self.budget.release(self.allocation_size.get());
                     }
                 }
                 Kind::Shader => d.destroy_shader_module(vk::ShaderModule::from_raw(self.raw), None),
@@ -640,6 +643,7 @@ impl Backend {
             descriptor_epoch: Cell::new(0),
             push_ranges: RefCell::new(Vec::new()),
             size,
+            allocation_size: Cell::new(size),
             flags,
             state: Cell::new(0),
             command_usage: Cell::new(0),
@@ -952,6 +956,7 @@ impl Backend {
             descriptor_epoch: Cell::new(0),
             push_ranges: RefCell::new(Vec::new()),
             size: 0,
+            allocation_size: Cell::new(0),
             flags: 0,
             state: Cell::new(0),
             command_usage: Cell::new(0),
@@ -1109,7 +1114,8 @@ impl Backend {
                         == (vk::MemoryPropertyFlags::HOST_VISIBLE
                             | vk::MemoryPropertyFlags::HOST_COHERENT)
                             .as_raw()
-                        && o.size
+                        && o.allocation_size
+                            .get()
                             .is_multiple_of(trames_memory::host_mapping_granule() as u64)
             })
         {
@@ -2194,13 +2200,15 @@ impl Backend {
                         return Ok(());
                     }
                 }
-                if !self.budget.reserve(a[1]) {
+                let allocation_size = shared_memory::native_size(a[1], flags, a[5] != 0)?;
+                info.allocation_size = allocation_size;
+                if !self.budget.reserve(allocation_size) {
                     return Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY.into());
                 }
                 let raw = match unsafe { d.allocate_memory(&info, None) } {
                     Ok(raw) => raw,
                     Err(e) => {
-                        self.budget.release(a[1]);
+                        self.budget.release(allocation_size);
                         return Err(e.into());
                     }
                 };
@@ -2213,6 +2221,7 @@ impl Backend {
                 );
                 self.objects[&id].state.set(a[2] as u8);
                 self.objects[&id].allocation_flags.set(a[4] as u32);
+                self.objects[&id].allocation_size.set(allocation_size);
                 write(m, a[3], &id.to_le_bytes())?;
             }
             15 => {
@@ -2288,7 +2297,7 @@ impl Backend {
                 if a[5] == shared_memory::MAP_SHARED
                     && owner.is_none()
                     && mem.flags & vk::MemoryPropertyFlags::HOST_COHERENT.as_raw() != 0
-                    && mem.size.is_multiple_of(granule as u64)
+                    && mem.allocation_size.get().is_multiple_of(granule as u64)
                     && (ptr as usize).is_multiple_of(granule)
                 {
                     // SAFETY: the original whole-allocation mapping covers only
@@ -2297,7 +2306,7 @@ impl Backend {
                     *mem.host_allocation.borrow_mut() = Some(unsafe {
                         shared_memory::Allocation::native(
                             ptr.cast(),
-                            mem.size as usize,
+                            mem.allocation_size.get() as usize,
                             vk::DeviceMemory::from_raw(mem.raw),
                             mem.device.clone(),
                             &self.budget,

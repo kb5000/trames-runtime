@@ -193,7 +193,8 @@ impl Pending {
         // Subscription and the deciding result check share the same context
         // lease; publish/disconnect also wakes on panic or owner cancellation.
         self.task_subscription = lease.subscribe_compile(compile.job, self.signal());
-        let value = lease.poll(memory, compile.job);
+        let (value, transfers) = lease.poll_with_transfers(memory, compile.job);
+        stats.transfers.merge(transfers);
         match value {
             Ok(None) => Attempt::Blocked(self),
             value => {
