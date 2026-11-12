@@ -99,6 +99,7 @@ struct NamespaceData {
     info: NetworkInfo,
     mode: NetworkMode,
     live: Arc<Quota>,
+    ephemeral_port: Cell<u16>,
     binding: parking_lot::Mutex<()>,
     finished: Cell<bool>,
     isolated: Cell<bool>,
@@ -311,6 +312,7 @@ impl Fabric {
                 info,
                 mode,
                 live: Arc::new(Quota::default()),
+                ephemeral_port: Cell::new(0),
                 binding: parking_lot::Mutex::new(()),
                 finished: Cell::new(false),
                 isolated: Cell::new(false),
@@ -351,6 +353,7 @@ impl Fabric {
                 },
                 mode,
                 live: Arc::new(Quota::default()),
+                ephemeral_port: Cell::new(0),
                 binding: parking_lot::Mutex::new(()),
                 finished: Cell::new(false),
                 isolated: Cell::new(true),
@@ -1039,6 +1042,111 @@ mod shared_lifetime_tests {
         );
         assert_eq!(clients.0.live.live(), 0);
         assert_eq!(servers.0.live.live(), 1);
+    }
+
+    #[test]
+    fn concurrent_short_connections_progress_with_closing_peers() {
+        let fabric = Fabric::new().unwrap();
+        let clients = fabric.environment(2, NetworkMode::Full).unwrap();
+        let servers = fabric.environment(3, NetworkMode::Full).unwrap();
+        let listener = servers.socket(2, 1, 0).unwrap();
+        let address = "10.0.0.3:34003".parse().unwrap();
+        listener.bind(address).unwrap();
+        listener.listen(8).unwrap();
+        for _ in 0..64 {
+            let batch: Vec<_> = (0..8)
+                .map(|_| {
+                    let socket = clients.socket(2, 1, 0).unwrap();
+                    assert_eq!(socket.connect(address), Err(NetError(115)));
+                    socket
+                })
+                .collect();
+            for client in &batch {
+                let mut connected = false;
+                for _ in 0..100 {
+                    if client.connect_complete().unwrap() {
+                        connected = true;
+                        break;
+                    }
+                }
+                assert!(connected);
+            }
+            for _ in 0..8 {
+                let (accepted, peer) = listener.accept().unwrap();
+                let client = batch
+                    .iter()
+                    .find(|c| c.local_addr().unwrap() == peer)
+                    .unwrap();
+                assert_eq!(client.send(b"short", 0, None), Ok(5));
+                let mut received = None;
+                for _ in 0..100 {
+                    match accepted.recv(5, 0) {
+                        Ok(message) => {
+                            received = Some(message.data);
+                            break;
+                        }
+                        Err(NetError(11)) => {}
+                        Err(error) => panic!("{error:?}"),
+                    }
+                }
+                assert_eq!(received.as_deref(), Some(b"short".as_slice()));
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_port_cursor_wraps_skips_live_bindings_and_survives_fd_close() {
+        let fabric = Fabric::new().unwrap();
+        let network = fabric.environment(2, NetworkMode::Full).unwrap();
+        let busy = network.socket(2, 2, 0).unwrap();
+        busy.bind("10.0.0.2:49152".parse().unwrap()).unwrap();
+        network.0.ephemeral_port.set(65535);
+        for expected in [65535, 49153, 49154] {
+            let socket = network.socket(2, 2, 0).unwrap();
+            socket.bind("10.0.0.2:0".parse().unwrap()).unwrap();
+            assert_eq!(socket.local_addr().unwrap().port(), expected);
+        }
+    }
+
+    #[test]
+    fn closing_tcp_ports_remain_bound_until_protocol_retirement() {
+        for (family, address, local) in [
+            (2, "10.0.0.3:34002", "10.0.0.2:35000"),
+            (10, "[fd00::3]:34002", "[fd00::2]:35000"),
+        ] {
+            let fabric = Fabric::new().unwrap();
+            let clients = fabric.environment(2, NetworkMode::Full).unwrap();
+            let servers = fabric.environment(3, NetworkMode::Full).unwrap();
+            let listener = servers.socket(family, 1, 0).unwrap();
+            listener.bind(address.parse().unwrap()).unwrap();
+            listener.listen(1).unwrap();
+            let client = clients.socket(family, 1, 0).unwrap();
+            client.bind(local.parse().unwrap()).unwrap();
+            assert_eq!(client.connect(address.parse().unwrap()), Err(NetError(115)));
+            for _ in 0..100 {
+                if client.connect_complete().unwrap() {
+                    break;
+                }
+            }
+            let (accepted, _) = listener.accept().unwrap();
+            drop(client);
+            drop(accepted);
+            fabric.tick();
+            let next = clients.socket(family, 1, 0).unwrap();
+            assert_eq!(next.bind(local.parse().unwrap()), Err(NetError(98)));
+            // Expiring the original protocol lease, rather than another FD's
+            // close, makes this port available again. No wall-clock sleep.
+            {
+                let mut inner = fabric.0.borrow_mut();
+                let node = inner.nodes.get_mut(&clients.0.key).unwrap();
+                assert!(!node.detached.is_empty());
+                for (_, deadline) in &mut node.detached {
+                    *deadline = Instant::now();
+                }
+            }
+            fabric.tick();
+            next.bind(local.parse().unwrap()).unwrap();
+        }
     }
 
     #[test]

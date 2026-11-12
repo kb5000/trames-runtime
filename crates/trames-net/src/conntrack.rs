@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Namespace-local bounded connection tracking and reversible packet NAT.
+//! Namespace-local connection tracking and reversible packet NAT.
 #[path = "conntrack_icmp.rs"]
 mod icmp;
 use crate::virtualnet::packet::{self, Tuple};
@@ -229,9 +229,6 @@ impl State {
                 t.status |= 2;
             }
             return Some(t);
-        }
-        if self.entries.len() >= 512 {
-            return None;
         }
         if !matches!(k.protocol, 1 | 6 | 17 | 58) {
             return Some(Track::untracked(k, zone));
@@ -636,27 +633,42 @@ mod tests {
         }
     }
     #[test]
-    fn quota_expiry_close_and_teardown_are_bounded() {
-        let (s, d, _, _) = endpoints(false);
-        let mut state = State::default();
-        for i in 0..512 {
-            let mut a = s;
-            a.set_port(i + 1000);
-            let p = message(a, d, 6, 2, b"");
-            let t = state.begin(&p, 0).unwrap();
+    fn flows_grow_on_demand_preserving_nat_expiry_close_and_teardown() {
+        for v6 in [false, true] {
+            let (s, d, public, _) = endpoints(v6);
+            let mut state = State::default();
+            for i in 0..1024 {
+                let mut a = s;
+                a.set_port(i + 1000);
+                let mut p = message(a, d, 6, 2, b"");
+                let original = key(&p).unwrap();
+                let t = state.begin(&p, 0).unwrap();
+                let mut translated = t;
+                assert!(state.nat(&mut translated, &mut p, true, Some(public), None));
+                state.finish(translated, true);
+                let wire = key(&p).unwrap();
+                let mut reply = message(wire.tuple.destination, wire.tuple.source, 6, 18, b"");
+                let reverse = state.begin(&reply, 0).unwrap();
+                assert_eq!(reverse.id, t.id);
+                assert!(reverse.reply);
+                let mut reverse = reverse;
+                assert!(state.existing_nat(&mut reverse, &mut reply, false));
+                assert_eq!(key(&reply), Some(original.reverse()));
+                assert!(packet::valid_transport(&reply));
+                state.finish(reverse, true);
+            }
+            assert_eq!(state.records().len(), 1024);
+            for e in state.entries.values_mut() {
+                e.expires = Instant::now() - Duration::from_secs(1);
+            }
+            state.next_sweep = None;
+            let fin = message(s, d, 6, 1, b"");
+            let t = state.begin(&fin, 0).unwrap();
             state.finish(t, true);
+            assert_eq!(state.records().len(), 1);
+            assert!(state.records()[0].1 <= 10);
+            state.delete(t.id);
+            assert!(state.index.is_empty());
         }
-        assert!(state.begin(&message(s, d, 6, 2, b""), 0).is_none());
-        for e in state.entries.values_mut() {
-            e.expires = Instant::now() - Duration::from_secs(1);
-        }
-        state.next_sweep = None;
-        let fin = message(s, d, 6, 1, b"");
-        let t = state.begin(&fin, 0).unwrap();
-        state.finish(t, true);
-        assert_eq!(state.records().len(), 1);
-        assert!(state.records()[0].1 <= 10);
-        state.delete(t.id);
-        assert!(state.index.is_empty());
     }
 }

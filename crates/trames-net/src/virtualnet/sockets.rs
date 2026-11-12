@@ -229,7 +229,9 @@ impl Socket {
         let Some(n) = i.nodes.get(&self.network.0.key) else {
             return false;
         };
-        n.registry
+        let dual = self.family == 10 && !self.state.borrow().v6_only;
+        let free = n
+            .registry
             .iter()
             .filter_map(Weak::upgrade)
             .filter(|s| !std::ptr::eq(s.as_ref(), self.meta.as_ref()) && s.kind == self.kind)
@@ -241,20 +243,48 @@ impl Socket {
                 if a.port() != b.port() {
                     return true;
                 }
-                let same_family = a.is_ipv4() == b.is_ipv4()
-                    || (self.family == 10 && !self.state.borrow().v6_only)
-                    || (s.family == 10 && !state.v6_only);
+                let same_family =
+                    a.is_ipv4() == b.is_ipv4() || dual || (s.family == 10 && !state.v6_only);
                 !same_family
                     || (!a.ip().is_unspecified() && !b.ip().is_unspecified() && a.ip() != b.ip())
-            })
+            });
+        if !free || self.kind != 1 {
+            return free;
+        }
+        // Closing TCP endpoints still own their local port after guest FD
+        // retirement. Reusing it here can deliver a new SYN to old TIME_WAIT
+        // state. The original protocol deadline, not FD lifetime, releases it.
+        n.detached.iter().all(|(handle, _)| {
+            let socket = n.sockets.get::<tcp::Socket>(*handle);
+            socket.state() == tcp::State::Closed
+                || socket.local_endpoint().is_none_or(|endpoint| {
+                    let b = address(endpoint);
+                    a.port() != b.port()
+                        || (a.is_ipv4() != b.is_ipv4() && !dual)
+                        || (!a.ip().is_unspecified() && a.ip() != b.ip())
+                })
+        })
     }
     fn choose_port(&self, ip: IpAddr) -> Result<u16> {
-        let mut seed = [0; 2];
-        getrandom::fill(&mut seed).map_err(|_| NetError(5))?;
-        let first = u16::from_ne_bytes(seed) % 16384;
+        // Randomize once per original namespace, then visit the range before
+        // reuse. A fresh random choice per connection collides with a remote
+        // peer's TIME_WAIT even after our local endpoint has fully closed.
+        // The namespace binding lock already serializes port selection.
+        let cursor = self.network.0.ephemeral_port.get();
+        let first = if cursor == 0 {
+            let mut seed = [0; 2];
+            getrandom::fill(&mut seed).map_err(|_| NetError(5))?;
+            u16::from_ne_bytes(seed) % 16384
+        } else {
+            cursor - 49152
+        };
         for n in 0..16384u32 {
             let p = 49152 + ((first as u32 + n) % 16384) as u16;
             if self.port_free(SocketAddr::new(ip, p)) {
+                self.network
+                    .0
+                    .ephemeral_port
+                    .set(49152 + ((u32::from(p) - 49152 + 1) % 16384) as u16);
                 return Ok(p);
             }
         }

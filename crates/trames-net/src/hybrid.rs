@@ -324,8 +324,8 @@ impl Socket {
             Path::Both => {
                 let guest = self.guest()?;
                 guest.preflight_listen(backlog)?;
-                // No other guest operation can change the handle budget in
-                // between; commit the BSD listener only after preflight.
+                // Validate the original guest endpoint before committing its
+                // paired BSD listener.
                 self.native()?.listen(backlog)?;
                 guest.listen(backlog)?;
             }
