@@ -355,6 +355,7 @@ impl Anonymous {
                 direct: true,
                 hardware_shared_export: true,
                 hardware_track_writes: false,
+                hardware_write_epoch: None,
                 backed: false,
                 dynamic_code: r.permissions.execute && r.permissions.write,
                 private_access: 0,

@@ -6,6 +6,7 @@ pub(super) const CAPABILITY: u64 = 8192;
 pub(super) struct ImageLayout {
     pub pitch: u64,
     pub offset: u64,
+    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     pub families: Vec<u32>,
 }
 pub(super) enum Resource {

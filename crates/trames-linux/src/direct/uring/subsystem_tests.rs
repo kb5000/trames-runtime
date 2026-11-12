@@ -1374,3 +1374,62 @@ fn file_size_completion_without_mailbox_uses_original_task_flag_not_an_owner_mes
     );
     assert!(l.vfs.read(file, 1).unwrap().is_empty());
 }
+
+#[test]
+fn fifo_open_sqes_wait_for_original_peer_and_cancel_the_hidden_descriptor() {
+    for opcode in [18, 28] {
+        for cancel in [false, true] {
+            let (mut l, mut m, fd, ring) = setup(16);
+            l.vfs.mknod_at(-100, b"/fifo", 0o10666, 0).unwrap();
+            m.write(0x2100, b"/fifo\0").unwrap();
+            m.write(0x2200, &[0; 24]).unwrap();
+            let caps = trames_vfs::FileEpoch::default().capture(&l.vfs, true);
+            let d = direct(&l, &m, &mut UringEpoch::default(), &caps);
+            let t = target();
+            let mut open = scalar(
+                opcode,
+                (-100i32) as u32,
+                0x2100,
+                if opcode == 28 { 24 } else { 0 },
+                911,
+            );
+            if opcode == 28 {
+                open[8..16].copy_from_slice(&0x2200u64.to_le_bytes());
+            }
+            add(&mut m, &ring, open);
+            assert!(matches!(
+                enter(&d, fd, 1, 0, &mut m, &t),
+                IoAttempt::Complete(Ok(1))
+            ));
+            if cancel {
+                let mut cancel = sqe(14, 0, 912);
+                cancel[16..24].copy_from_slice(&911u64.to_le_bytes());
+                add(&mut m, &ring, cancel);
+                assert!(matches!(
+                    enter(&d, fd, 1, 0, &mut m, &t),
+                    IoAttempt::Complete(Ok(1))
+                ));
+                let a = cq(&mut m, &ring);
+                let b = cq(&mut m, &ring);
+                assert!(a == (911, -125) || b == (911, -125));
+                assert!(a == (912, 0) || b == (912, 0));
+            } else {
+                let writer = l
+                    .vfs
+                    .open_at(-100, b"/fifo", 1 | trames_vfs::O_NONBLOCK, 0)
+                    .unwrap();
+                l.vfs.write(writer, b"peer").unwrap();
+                l.vfs.close(writer).unwrap();
+                assert!(matches!(
+                    enter(&d, fd, 0, 1, &mut m, &t),
+                    IoAttempt::Complete(Ok(0))
+                ));
+                let (tag, reader) = cq(&mut m, &ring);
+                assert_eq!(tag, 911);
+                assert!(reader >= 0);
+                assert_eq!(l.vfs.read(reader as u32, 4).unwrap(), b"peer");
+                l.vfs.close(reader as u32).unwrap();
+            }
+        }
+    }
+}

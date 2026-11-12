@@ -485,6 +485,7 @@ impl DirectSyscalls {
             uring: None,
             poll_uring: None,
             file: None,
+            fifo_open: None,
             target: target.clone(),
         }
     }

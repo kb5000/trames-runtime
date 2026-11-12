@@ -237,6 +237,9 @@ impl Vfs {
     }
 }
 impl PathQueries {
+    pub fn pending_fifo_open(&self, fd: u32) -> Option<crate::FifoOpen> {
+        self.view.borrow().shared_files().pending_fifo_open(fd)
+    }
     /// Short descriptor controls use one original shared OFD, without pathname
     /// or byte-provider admission. No guest-visible descriptor is installed.
     pub fn fd_control<T>(

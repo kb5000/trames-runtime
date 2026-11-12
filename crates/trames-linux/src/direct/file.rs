@@ -232,6 +232,7 @@ pub(super) struct PreparedFileCall {
     action: PreparedAction,
 }
 enum PreparedAction {
+    Fifo(trames_vfs::FifoOpen),
     Byte(RetainedByte),
     Socket(RetainedSocket),
     Owner {
@@ -252,6 +253,19 @@ enum PreparedAction {
     },
 }
 impl DirectSyscalls {
+    fn fifo_reply(
+        &self,
+        number: u32,
+        reply: &trames_vfs::FileReply,
+    ) -> Option<trames_vfs::FifoOpen> {
+        if !matches!(number, 56 | 437) {
+            return None;
+        }
+        let Ok(trames_vfs::FileValue::Count(fd)) = &reply.result else {
+            return None;
+        };
+        self.paths.as_ref()?.pending_fifo_open(*fd as u32)
+    }
     pub fn file_call(number: u32) -> bool {
         namespace::supported(number)
             || crate::file_advice::entry(number)
@@ -313,6 +327,66 @@ impl DirectSyscalls {
         }
         None
     }
+    pub(super) fn prepare_fifo_open(
+        &self,
+        number: u32,
+        args: [u64; 6],
+        open: trames_vfs::FifoOpen,
+    ) {
+        *self.file_prepared.borrow_mut() = Some(PreparedFileCall {
+            number,
+            args,
+            action: PreparedAction::Fifo(open),
+        });
+    }
+    fn start_fifo_open(
+        &self,
+        open: trames_vfs::FifoOpen,
+        number: u32,
+        args: [u64; 6],
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+    ) -> IoAttempt {
+        let pending = PendingIo {
+            aio: None,
+            number,
+            args,
+            deadline: None,
+            signal: IoSignal::new(pid, target.clone()),
+            flock: None,
+            record: None,
+            retained_byte: None,
+            retained_socket: None,
+            native_tcp: None,
+            resource_deadline: None,
+            retained_poll: None,
+            epoll_revision: None,
+            terminal_job: false,
+            _subscriptions: Vec::new(),
+            host_subscription: None,
+            socket_subscriptions: Vec::new(),
+            uring: None,
+            poll_uring: None,
+            file: None,
+            fifo_open: Some(open),
+            target: target.clone(),
+        };
+        self.resume_fifo_open(pending)
+    }
+    pub(super) fn resume_fifo_open(&self, mut pending: PendingIo) -> IoAttempt {
+        pending.signal.reset();
+        pending._subscriptions.clear();
+        let open = pending.fifo_open.as_mut().unwrap();
+        // Subscribe before deciding, so peer open/close cannot lose its wake.
+        pending._subscriptions.push(open.subscribe(&pending.signal));
+        match open.finish() {
+            Some(value) => {
+                self.file_completed.set(self.file_completed.get() + 1);
+                self.complete(pending.number, pending.args, value.map(u64::from))
+            }
+            None => IoAttempt::Blocked(pending),
+        }
+    }
     pub(super) fn prepare_open_work(
         &self,
         number: u32,
@@ -337,6 +411,10 @@ impl DirectSyscalls {
                 trames_vfs::FileOutcome::Complete(reply)
                     if !reply.file_size_signal || self.task_signal.is_some() =>
                 {
+                    if let Some(open) = self.fifo_reply(number, &reply) {
+                        self.prepare_fifo_open(number, args, open);
+                        return None;
+                    }
                     return Some(self.finish_file_reply(reply, output, memory));
                 }
                 trames_vfs::FileOutcome::Complete(reply) => PreparedAction::Reply { reply, output },
@@ -456,6 +534,7 @@ impl DirectSyscalls {
         }
         let accepted = self.file_prepared.borrow_mut().take().unwrap();
         Some(match accepted.action {
+            PreparedAction::Fifo(open) => self.start_fifo_open(open, number, args, pid, target),
             PreparedAction::Socket(call) => self.start_retained_socket(call, memory, pid, target),
             PreparedAction::Byte(file) => {
                 self.start_retained_byte(file, number, args, memory, pid, target)
@@ -467,6 +546,9 @@ impl DirectSyscalls {
                 self.queue_layout(work, pending, number, args, signal, subscriptions, target)
             }
             PreparedAction::Reply { reply, output } => {
+                if let Some(open) = self.fifo_reply(number, &reply) {
+                    return Some(self.start_fifo_open(open, number, args, pid, target));
+                }
                 self.complete_file_attempt(reply, output, memory)
             }
             PreparedAction::Owner { work, output } => {
@@ -617,7 +699,13 @@ impl DirectSyscalls {
                 Err(error) => return Some(IoAttempt::Complete(Err(error))),
             };
             match paths.open_at_resolve(args[0] as i32, &path, flags, mode, policy, &self.files) {
-                Some(result) => return Some(IoAttempt::Complete(result.map(u64::from))),
+                Some(Ok(fd)) => {
+                    if let Some(open) = paths.pending_fifo_open(fd) {
+                        return Some(self.start_fifo_open(open, number, args, pid, target));
+                    }
+                    return Some(IoAttempt::Complete(Ok(u64::from(fd))));
+                }
+                Some(Err(error)) => return Some(IoAttempt::Complete(Err(error))),
                 None => {
                     let work = paths.take_open_work()?;
                     return match self.prepare_open_work(number, args, work, memory) {
@@ -764,6 +852,9 @@ impl DirectSyscalls {
                 self.park_file(pending, work, number, args, signal, memory, target)
             }
             Some(trames_vfs::FileOutcome::Complete(reply)) => {
+                if let Some(open) = self.fifo_reply(number, &reply) {
+                    return self.start_fifo_open(open, number, args, signal.pid, target);
+                }
                 self.complete_file_attempt(reply, pending.output, memory)
             }
             Some(trames_vfs::FileOutcome::Owner(work)) => {
@@ -831,6 +922,7 @@ impl DirectSyscalls {
             uring: None,
             poll_uring: None,
             file: Some(pending),
+            fifo_open: None,
             target: target.clone(),
         })
     }
@@ -895,6 +987,7 @@ impl DirectSyscalls {
             uring: None,
             poll_uring: None,
             file: Some(pending),
+            fifo_open: None,
             target: target.clone(),
         })
     }

@@ -1151,6 +1151,7 @@ impl UringSnapshot {
                 host_subscription: None,
                 poll_uring: None,
                 file: None,
+                fifo_open: None,
                 target: target.clone(),
                 uring: Some(Box::new(Wait {
                     ring,

@@ -22,6 +22,7 @@ pub(crate) struct Execution {
     signal: Option<Arc<dyn trames_vfs::TaskSignal>>,
 }
 struct Accepted {
+    fifo_open: Option<trames_vfs::FifoOpen>,
     context: Arc<Execution>,
     owner: u64,
     task: u32,
@@ -358,6 +359,7 @@ impl UringActor {
                 retained,
                 socket: None,
                 file: None,
+                fifo_open: None,
             },
         );
         request.execution = Some(Arc::new(Lease {
@@ -426,6 +428,9 @@ impl UringActor {
         let socket = {
             let accepted = self.accepted.lock().unwrap();
             let call = accepted.get(&(ring as *const Uring as usize, sequence))?;
+            if let Some(open) = &call.fifo_open {
+                return Some(vec![open.subscribe(signal)]);
+            }
             if let Some(file) = &call.file {
                 return Some(file.subscribe(signal));
             }

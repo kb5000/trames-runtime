@@ -62,6 +62,7 @@ pub struct PendingIo {
     poll_uring: Option<Box<uring::PollWait>>,
     target: Weak<dyn IoWake>,
     file: Option<FilePending>,
+    fifo_open: Option<trames_vfs::FifoOpen>,
 }
 /// Authority accepted for one byte syscall. The complete OFD lease, rather
 /// than its numeric table slot or a copied pipe counter, owns the endpoint.
@@ -609,7 +610,14 @@ impl DirectSyscalls {
                         policy,
                         &self.files,
                     ) {
-                        Some(result) => result.map(u64::from),
+                        Some(Ok(fd)) => {
+                            if let Some(open) = paths.pending_fifo_open(fd) {
+                                self.prepare_fifo_open(number, a, open);
+                                return None;
+                            }
+                            Ok(u64::from(fd))
+                        }
+                        Some(Err(error)) => Err(error),
                         None => {
                             return self.prepare_open_work(
                                 number,
@@ -1110,6 +1118,7 @@ impl DirectSyscalls {
                 uring: None,
                 poll_uring: None,
                 file: None,
+                fifo_open: None,
                 target: target.clone(),
             },
             memory,
@@ -1561,6 +1570,7 @@ impl DirectSyscalls {
                 uring: None,
                 poll_uring: None,
                 file: None,
+                fifo_open: None,
                 target: target.clone(),
             },
             memory,
@@ -1689,6 +1699,7 @@ impl DirectSyscalls {
             uring: None,
             poll_uring: None,
             file: None,
+            fifo_open: None,
             target: target.clone(),
         }
     }
@@ -1919,6 +1930,7 @@ impl DirectSyscalls {
                 uring: None,
                 poll_uring: None,
                 file: None,
+                fifo_open: None,
                 target: target.clone(),
             },
             memory,
@@ -1964,6 +1976,7 @@ impl DirectSyscalls {
                 uring: None,
                 poll_uring: None,
                 file: None,
+                fifo_open: None,
                 target: target.clone(),
             },
             memory,
@@ -2008,6 +2021,9 @@ impl DirectSyscalls {
         original_paths: Option<&trames_vfs::Vfs>,
     ) -> IoAttempt {
         self.terminal_stop.set(false);
+        if pending.fifo_open.is_some() {
+            return self.resume_fifo_open(pending);
+        }
         if Self::aio_call(pending.number) {
             return self.start_retained_aio(
                 pending.aio.take().expect("accepted AIO"),
@@ -4018,6 +4034,50 @@ mod tests {
         match attempt {
             IoAttempt::Complete(result) => result,
             _ => panic!("expected completed I/O"),
+        }
+    }
+    #[test]
+    fn fifo_open_waits_on_original_endpoint_and_cancellation_releases_hidden_fd() {
+        for number in [56, 437] {
+            let mut v = Vfs::default();
+            v.mknod_at(-100, b"/rendezvous", 0o10666, 0).unwrap();
+            let d = DirectSyscalls::new(v.direct_descriptors())
+                .with_resources(v.descriptor_factory())
+                .with_paths(v.path_queries());
+            let t: Arc<dyn IoWake> = Arc::new(Target);
+            let mut m = memory();
+            m.write(0x1100, b"/rendezvous\0").unwrap();
+            m.write(0x1800, &[0; 24]).unwrap();
+            let args = if number == 56 {
+                [(-100i64) as u64, 0x1100, 0, 0, 0, 0]
+            } else {
+                [(-100i64) as u64, 0x1100, 0x1800, 24, 0, 0]
+            };
+            let wait = pending(
+                d.start_file_call(number, args, &mut m, 1, &Arc::downgrade(&t))
+                    .unwrap(),
+            );
+            assert!(!wait.signal.ready());
+            assert!(matches!(v.shared_files().lookup(3), Some(Err(Errno(9)))));
+            let writer = v
+                .open_at(-100, b"/rendezvous", 1 | trames_vfs::O_NONBLOCK, 0)
+                .unwrap();
+            v.write(writer, b"ready").unwrap();
+            v.close(writer).unwrap();
+            assert!(wait.signal.ready());
+            let reader = complete(d.resume(wait, &mut m)).unwrap() as u32;
+            assert_eq!(v.read(reader, 5).unwrap(), b"ready");
+            assert_eq!(v.read(reader, 1).unwrap(), b"");
+            v.close(reader).unwrap();
+            let wait = pending(
+                d.start_file_call(number, args, &mut m, 1, &Arc::downgrade(&t))
+                    .unwrap(),
+            );
+            v.close_range(reader, reader, 0).unwrap();
+            let replacement = v.open_at(-100, b"/replacement", 0x42, 0o600).unwrap();
+            assert_eq!(replacement, reader);
+            drop(wait);
+            assert_eq!(v.write(replacement, b"still open").unwrap(), 10);
         }
     }
     #[test]

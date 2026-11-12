@@ -342,6 +342,18 @@ mod tests {
 
     #[test]
     fn private_cow_reader_revalidates_truncate_and_regrowth_without_unmapping() {
+        // This test controls the process-wide backing revision. Unrelated
+        // parallel tests may legitimately invalidate its freshly activated read.
+        // Isolate the timing assertions instead of changing production semantics.
+        const CHILD: &str = "TRAMES_PRIVATE_COW_READ_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "read_export::tests::private_cow_reader_revalidates_truncate_and_regrowth_without_unmapping"])
+                .env(CHILD, "1")
+                .status().unwrap();
+            assert!(status.success(), "isolated private COW read: {status}");
+            return;
+        }
         struct Backing {
             valid: std::sync::atomic::AtomicBool,
         }

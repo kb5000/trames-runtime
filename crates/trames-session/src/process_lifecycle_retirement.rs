@@ -575,6 +575,7 @@ impl<C: Cpu> Lifecycle<C> {
             p.memory.commit_parallel()?;
         }
         if work.pid != 1 {
+            p.linux.vfs.retire_task_namespace();
             p.memory = Memory::default();
         }
         p.state = State::Zombie(work.status);

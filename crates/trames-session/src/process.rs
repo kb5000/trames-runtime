@@ -1356,6 +1356,7 @@ impl<C: Cpu> Kernel<C> {
             p.memory.retire_memory_report();
         }
         if pid != 1 {
+            p.linux.vfs.retire_task_namespace();
             p.memory = Memory::default();
         }
         p.state = State::Zombie(status);

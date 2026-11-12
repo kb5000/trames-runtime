@@ -34,6 +34,9 @@ impl PageBacking for ImportedPage {
     fn native_resident(&self) -> bool {
         true
     }
+    fn hardware_write_epoch(&self) -> Option<Arc<std::sync::atomic::AtomicU64>> {
+        self.0.external_write_epoch()
+    }
     fn publish_write(&self, _: usize, _: usize) -> Result<(), MemoryError> {
         backing_changed();
         Ok(())
@@ -250,6 +253,61 @@ mod tests {
         let view = memory.parallel_view(&mut registry).unwrap();
         assert_eq!(view.fetch_u32(0x10000).unwrap(), 0xd503201f);
         assert!(registry.metrics.backing_page_checks > before);
+    }
+    #[test]
+    fn hardware_data_publication_uses_one_allocation_epoch_and_preserves_reservations() {
+        let revision = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mapping =
+            mapping(Arc::new(AtomicUsize::new(0))).with_external_revision(revision.clone());
+        let mut memory = Memory::default();
+        memory.map(0x10000, PAGE_SIZE, Permissions::RW).unwrap();
+        memory
+            .import_mapping(0x10000, PAGE_SIZE, mapping.clone())
+            .unwrap();
+        memory.map(0x20000, PAGE_SIZE, Permissions::RW).unwrap();
+        memory.import_mapping(0x20000, PAGE_SIZE, mapping).unwrap();
+        let mut registry = crate::parallel::Registry::default();
+        registry.use_hardware();
+        let mut view = memory.parallel_view(&mut registry).unwrap();
+        view.enable_hardware();
+        view.write_array(0x10000, [0; 8]).unwrap();
+        view.read_array::<1>(0x20000).unwrap();
+        let first = view.hardware_write_frame(0x10000).unwrap();
+        let alias = view.hardware_write_frame(0x20000).unwrap();
+        assert!(first.needs_publication());
+        assert!(first.publication_word().is_none());
+        assert!(Arc::ptr_eq(first.publication_epoch().unwrap(), &revision));
+        assert!(Arc::ptr_eq(alias.publication_epoch().unwrap(), &revision));
+        let mut bytes = [0; 8];
+        let reservation = view.exclusive_read(0x20000, &mut bytes).unwrap();
+        view.mark_hardware_frame_write(first).unwrap();
+        assert_eq!(revision.load(Ordering::Relaxed), 1);
+        assert!(!view
+            .exclusive_write(0x20000, &bytes, Some(reservation))
+            .unwrap());
+        view.write_array(0x10000, [37]).unwrap();
+        assert_eq!(view.read_array::<1>(0x20000).unwrap(), [37]);
+        drop(view);
+        memory.commit_parallel().unwrap();
+        assert_eq!(memory.read_array::<1>(0x10000).unwrap(), [37]);
+        memory
+            .protect(
+                0x10000,
+                PAGE_SIZE,
+                Permissions {
+                    execute: true,
+                    ..Permissions::RW
+                },
+            )
+            .unwrap();
+        let mut view = memory.parallel_view(&mut registry).unwrap();
+        view.enable_hardware();
+        let code = view.hardware_write_frame(0x10000).unwrap();
+        assert!(code.publication_epoch().is_none());
+        assert!(code.publication_word().is_some());
+        let before = view.instruction_page_identity(0x10000).unwrap();
+        view.mark_hardware_frame_write(code).unwrap();
+        assert_ne!(view.instruction_page_identity(0x10000).unwrap(), before);
     }
     #[test]
     fn external_publication_invalidates_serial_worker_code_and_exclusive_tokens() {

@@ -288,6 +288,7 @@ pub(super) struct Frame {
     direct: bool,
     hardware_shared_export: bool,
     hardware_track_writes: bool,
+    hardware_write_epoch: Option<Arc<AtomicU64>>,
     backed: bool,
     dynamic_code: bool,
     // Bit 0: unique private storage. Bit 1: also immutable for this snapshot.
@@ -543,6 +544,9 @@ fn prepare_frame(
         && bytes
             .mutable()
             .is_some_and(|bytes| Arc::strong_count(bytes) == 2);
+    let hardware_write_epoch = (!page.permissions.execute && direct)
+        .then(|| page.backing.as_ref()?.object.hardware_write_epoch())
+        .flatten();
     Some(Frame {
         base,
         root_frame,
@@ -582,7 +586,9 @@ fn prepare_frame(
         // Guest IC/DC maintenance handles guest stores; actual host writes
         // publish their range at the producer. Executability alone must not
         // invent a write and rebuild code metadata after every joined epoch.
-        hardware_track_writes: !direct || page.backing.as_ref().is_some_and(|b| b.shared),
+        hardware_track_writes: hardware_write_epoch.is_none()
+            && (!direct || page.backing.as_ref().is_some_and(|b| b.shared)),
+        hardware_write_epoch,
         dynamic_code: page.permissions.execute
             && (page.permissions.write
                 || page
@@ -2015,6 +2021,7 @@ impl View {
             root: frame.root_frame,
             storage: frame.bytes.identity,
             publication: frame.hardware_track_writes,
+            epoch: frame.hardware_write_epoch.clone(),
         })
     }
     pub fn mark_hardware_frame_write(
@@ -2148,6 +2155,11 @@ impl View {
             .store(true, Ordering::Relaxed);
     }
     fn mark_hardware_frame(&self, frame: &Frame) {
+        if let Some(epoch) = &frame.hardware_write_epoch {
+            epoch.fetch_add(1, Ordering::Relaxed);
+            self.mark_hardware_private_writes();
+            return;
+        }
         if !frame.hardware_track_writes {
             self.mark_hardware_private_writes();
             return;

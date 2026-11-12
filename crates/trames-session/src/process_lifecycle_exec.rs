@@ -222,6 +222,7 @@ impl<C: Cpu> Lifecycle<C> {
                 }
                 t.state = State::Zombie(0);
                 Kernel::clear_exit_resources(t);
+                t.linux.vfs.retire_task_namespace();
                 self.memory.retire(std::mem::take(&mut t.memory))?;
                 self.tasks.retire(*peer, original);
             }

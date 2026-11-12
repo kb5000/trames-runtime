@@ -9,13 +9,15 @@ pub struct FsOwner(Arc<TaskFs>);
 struct TaskFs {
     users: Arc<AtomicUsize>,
     active: AtomicBool,
+    paths: std::sync::Weak<SharedCell<SharedPaths>>,
 }
 impl FsOwner {
-    fn new(users: &Arc<AtomicUsize>) -> Self {
-        users.fetch_add(1, Ordering::Relaxed);
+    fn new(paths: &PathStore) -> Self {
+        paths.users.fetch_add(1, Ordering::Relaxed);
         Self(Arc::new(TaskFs {
-            users: users.clone(),
+            users: paths.users.clone(),
             active: AtomicBool::new(true),
+            paths: Arc::downgrade(&paths.shared),
         }))
     }
     pub(super) fn same(&self, other: &Self) -> bool {
@@ -27,8 +29,20 @@ impl FsOwner {
 }
 impl TaskFs {
     fn retire(&self) {
-        if self.active.swap(false, Ordering::Relaxed) {
-            self.users.fetch_sub(1, Ordering::Relaxed);
+        if self.active.swap(false, Ordering::Relaxed)
+            && self.users.fetch_sub(1, Ordering::Relaxed) == 1
+        {
+            let Some(paths) = self.paths.upgrade() else {
+                return;
+            };
+            // Observers retain inode/mount identity after the last original
+            // fs_struct member exits, never directory use.
+            let paths = &mut *paths.borrow_mut();
+            paths.retired = true;
+            paths._cwd_pin = None;
+            paths._root_pin = None;
+            paths._cwd_use = None;
+            paths._root_use = None;
         }
     }
 }
@@ -72,6 +86,9 @@ pub(super) struct Paths {
 // belong to the one original shared fs_struct.
 #[derive(Default)]
 struct SharedPaths {
+    // Last task retirement ends path use even when metadata observers remain.
+    // Later pivot/query writes must not recreate leases on this dead fs_struct.
+    retired: bool,
     #[cfg(all(feature = "hostfs", unix))]
     host_cwd: Option<Arc<hostfs::OpenFile>>,
     cwd_node: Option<NodeRef>,
@@ -113,21 +130,30 @@ impl SharedPaths {
             directory(&self.root_mount, &self.root_node),
         )
     }
-    fn from_paths(paths: &Paths) -> Self {
+    fn from_paths(paths: &Paths, retired: bool) -> Self {
         let cwd_mount = paths.cwd_mount.as_ref().map(|m| m.shared.clone());
         let root_mount = paths.root_mount.as_ref().map(|m| m.shared.clone());
         Self {
+            retired,
             #[cfg(all(feature = "hostfs", unix))]
             host_cwd: paths.host_cwd.clone(),
             cwd_node: paths.cwd_node.clone(),
             root_node: paths.root_node.clone(),
-            _cwd_pin: cwd_mount.clone().map(mounts::DirectoryPin::new),
-            _root_pin: root_mount.clone().map(mounts::DirectoryPin::new),
+            _cwd_pin: cwd_mount
+                .clone()
+                .filter(|_| !retired)
+                .map(mounts::DirectoryPin::new),
+            _root_pin: root_mount
+                .clone()
+                .filter(|_| !retired)
+                .map(mounts::DirectoryPin::new),
             _cwd_use: cwd_mount
                 .as_ref()
+                .filter(|_| !retired)
                 .map(|m| mounts::MountUse::new(m.identity.clone())),
             _root_use: root_mount
                 .as_ref()
+                .filter(|_| !retired)
                 .map(|m| mounts::MountUse::new(m.identity.clone())),
             cwd_mount,
             root_mount,
@@ -267,7 +293,7 @@ impl PathStore {
         let mut contexts = self.contexts.lock().unwrap();
         let paths = self.borrow();
         let result = Self {
-            shared: Arc::new(SharedCell::new(SharedPaths::from_paths(&paths))),
+            shared: Arc::new(SharedCell::new(SharedPaths::from_paths(&paths, false))),
             users: Arc::default(),
             projections: RefCell::default(),
             registry: self.registry.clone(),
@@ -286,6 +312,9 @@ impl PathStore {
                 return false;
             };
             let mut paths = context.borrow_mut();
+            if paths.retired {
+                return true;
+            }
             let matches = |mount: &Option<Arc<mounts::MountData>>, node: &Option<NodeRef>| {
                 mount.as_ref().is_some_and(|m| Arc::ptr_eq(m, previous))
                     && node.as_ref().is_none_or(|n| Arc::ptr_eq(n, &previous.root))
@@ -331,7 +360,7 @@ impl std::ops::DerefMut for PathsWrite<'_> {
 }
 impl Drop for PathsWrite<'_> {
     fn drop(&mut self) {
-        *self.state = SharedPaths::from_paths(&self.paths);
+        *self.state = SharedPaths::from_paths(&self.paths, self.state.retired);
         self.store.remember(&self.paths);
     }
 }
@@ -388,7 +417,7 @@ impl Default for FsContext {
     fn default() -> Self {
         let paths = PathStore::default();
         Self {
-            owner: Some(FsOwner::new(&paths.users)),
+            owner: Some(FsOwner::new(&paths)),
             paths,
             mask: Umask::default(),
         }
@@ -428,7 +457,7 @@ impl FsContext {
         Self {
             paths: self.paths.shared(),
             mask: self.mask.clone(),
-            owner: Some(FsOwner::new(&self.paths.users)),
+            owner: Some(FsOwner::new(&self.paths)),
         }
     }
 }
@@ -443,7 +472,7 @@ impl Clone for FsContext {
     fn clone(&self) -> Self {
         let paths = self.paths.fork();
         Self {
-            owner: Some(FsOwner::new(&paths.users)),
+            owner: Some(FsOwner::new(&paths)),
             paths,
             mask: self.mask.fork(),
         }
@@ -463,6 +492,14 @@ impl Vfs {
         if let Some(owner) = &self.context.owner {
             owner.retire();
         }
+    }
+    /// Completed non-root tasks keep their credential/proc metadata, but no
+    /// longer own a mount namespace or cached mutable traversal projections.
+    /// Real nsfs/directory/file opens retain their own original resources.
+    pub fn retire_task_namespace(&mut self) {
+        self.retire_context();
+        self.context.paths.projections.borrow_mut().clear();
+        self.mounts = None;
     }
     pub fn context_shared(&self) -> bool {
         self.context.paths.users.load(Ordering::Relaxed) > 1
@@ -516,6 +553,57 @@ mod tests {
         old.retire();
         assert!(!peer.context_shared(), "duplicate retirement is idempotent");
         drop((queries, retained));
+    }
+
+    #[test]
+    fn pivot_and_late_query_writes_never_reactivate_retired_fs_structs() {
+        let mut task = Vfs::default();
+        task.mkdir_at(AT_FDCWD, b"/next", 0o755).unwrap();
+        task.mount(None, b"/next", Some(b"tmpfs"), 0, None).unwrap();
+        let retired = task.clone();
+        let observer = retired.path_queries();
+        let old = task
+            .context
+            .paths
+            .borrow()
+            .root_mount
+            .unwrap()
+            .shared
+            .clone();
+        let new = task
+            .resolve(AT_FDCWD, b"/next")
+            .unwrap()
+            .mount
+            .unwrap()
+            .shared
+            .clone();
+        retired.retire_context();
+        task.context.paths.pivot(&old, &new);
+        assert!(
+            Arc::ptr_eq(
+                &task
+                    .context
+                    .paths
+                    .shared
+                    .borrow()
+                    .root_mount
+                    .clone()
+                    .unwrap(),
+                &new
+            ),
+            "live fs_structs follow the pivot"
+        );
+        let paths = retired.context.paths.shared.borrow();
+        assert!(paths.retired);
+        assert!(paths._root_use.is_none() && paths._cwd_use.is_none());
+        assert!(Arc::ptr_eq(paths.root_mount.as_ref().unwrap(), &old));
+        drop(paths);
+        // A previously accepted resolver may still finish a path mutation.
+        observer.view.borrow().context.paths.borrow_mut().root_node = Some(old.root.clone());
+        let paths = retired.context.paths.shared.borrow();
+        assert!(paths.retired);
+        assert!(paths._root_use.is_none() && paths._cwd_use.is_none());
+        assert!(paths._root_pin.is_none() && paths._cwd_pin.is_none());
     }
 
     #[test]

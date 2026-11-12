@@ -115,6 +115,7 @@ impl DirectSyscalls {
                 poll_uring: None,
                 target: target.clone(),
                 file: None,
+                fifo_open: None,
             },
             memory,
         )

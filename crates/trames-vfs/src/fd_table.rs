@@ -553,6 +553,76 @@ impl SharedFiles {
 pub struct SharedFd {
     pub(super) open: Arc<SharedOpenDescription>,
 }
+/// One accepted blocking FIFO open. Its descriptor stays hidden until the
+/// original endpoint rendezvous completes; cancellation removes only that OFD.
+pub struct FifoOpen {
+    files: SharedFiles,
+    fd: u32,
+    open: Arc<SharedOpenDescription>,
+    complete: bool,
+}
+impl SharedFiles {
+    pub fn pending_fifo_open(&self, fd: u32) -> Option<FifoOpen> {
+        let open = {
+            let entries = self.0.entries.lock().unwrap();
+            let SlotOpen::Shared(open) = &entries.get(&fd)?.open else {
+                return None;
+            };
+            open.clone()
+        };
+        if !open.pipe.as_ref()?.has_waiter() {
+            return None;
+        }
+        Some(FifoOpen {
+            files: self.clone(),
+            fd,
+            open,
+            complete: false,
+        })
+    }
+}
+impl FifoOpen {
+    pub fn subscribe(&self, signal: &Arc<IoSignal>) -> IoSubscription {
+        self.open
+            .pipe
+            .as_ref()
+            .unwrap()
+            .data
+            .readiness
+            .subscribe(signal)
+    }
+    pub fn finish(&mut self) -> Option<Result<u32>> {
+        if !self.open.pipe.as_ref().unwrap().open_ready() {
+            return None;
+        }
+        let mut entries = self.files.0.entries.lock().unwrap();
+        let present = entries.get(&self.fd).is_some_and(
+            |slot| matches!(&slot.open, SlotOpen::Shared(open) if Arc::ptr_eq(open, &self.open)),
+        );
+        self.complete = true;
+        if present {
+            self.files.changed(&mut entries);
+        }
+        Some(if present { Ok(self.fd) } else { Err(Errno(9)) })
+    }
+}
+impl Drop for FifoOpen {
+    fn drop(&mut self) {
+        if self.complete {
+            return;
+        }
+        let removed = {
+            let mut entries = self.files.0.entries.lock().unwrap();
+            if !entries.get(&self.fd).is_some_and(|slot| {
+                matches!(&slot.open, SlotOpen::Shared(open) if Arc::ptr_eq(open, &self.open))
+            }) { return; }
+            let removed = entries.remove(&self.fd);
+            self.files.changed(&mut entries);
+            removed
+        };
+        drop(removed);
+    }
+}
 impl SharedFd {
     pub fn uring(&self) -> Option<Arc<Uring>> {
         match &self.open.control {

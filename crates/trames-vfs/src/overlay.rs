@@ -1034,6 +1034,54 @@ mod tests {
         assert!(resource.upgrade().is_none());
     }
     #[test]
+    fn exited_namespace_releases_layers_after_accepted_queries_and_files_complete() {
+        let mut v = Vfs::default();
+        dirs(&mut v);
+        write(&mut v, b"/lower/file", b"data");
+        mount(&mut v);
+        let mut child = v.clone();
+        child.unshare_mounts().unwrap();
+        child.chdir(b"/merged").unwrap();
+        let observed = child.path_queries();
+        let fd = child.open_at(AT_FDCWD, b"file", 0, 0).unwrap();
+        let accepted = child.shared_files().lookup(fd).unwrap().unwrap();
+        child.close(fd).unwrap();
+        v.umount(b"/merged", 2).unwrap();
+        assert_eq!(
+            v.mount(
+                None,
+                b"/merged",
+                Some(b"overlay"),
+                0,
+                Some(b"lowerdir=/lower,upperdir=/upper,workdir=/work")
+            ),
+            Err(Errno(16))
+        );
+        child.retire_task_namespace();
+        assert_eq!(
+            v.mount(
+                None,
+                b"/merged",
+                Some(b"overlay"),
+                0,
+                Some(b"lowerdir=/lower,upperdir=/upper,workdir=/work")
+            ),
+            Err(Errno(16)),
+            "actual accepted OFD still owns its layer use"
+        );
+        drop(accepted);
+        // An accepted operation retains its original namespace until it completes.
+        let stat = observed.stat_at(-100, b"file", false).unwrap().unwrap();
+        assert_eq!(
+            u32::from_le_bytes(stat[16..20].try_into().unwrap()) & 0o170000,
+            0o100000
+        );
+        drop(observed);
+        mount(&mut v);
+        assert_eq!(read(&mut v, b"/merged/file"), b"data");
+        drop(child);
+    }
+    #[test]
     fn retained_metadata_does_not_pin_overlay_layers_but_an_open_file_does() {
         let mut v = Vfs::default();
         dirs(&mut v);

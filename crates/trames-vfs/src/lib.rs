@@ -28,6 +28,7 @@ pub use fd_status::DescriptorControl;
 use fd_status::{CloseOnExec, DescriptorFlags, StatusFlags};
 mod pipe;
 mod stream_transfer;
+pub use fd_table::FifoOpen;
 pub use pipe::PipeEndpoint;
 use pipe::{Pipe, PipeEnd};
 pub use stream_transfer::{StreamTransfer, TransferWait};
@@ -2426,6 +2427,7 @@ impl Vfs {
                     if !query.original
                         && !pty
                         && !controlling_tty
+                        && !matches!(n.content, Content::Fifo(_))
                         && node.simple_device.is_none()
                         && !matches!(n.content, Content::Device(device) if device.source_open())
                         && !(matches!(n.content, Content::Directory)

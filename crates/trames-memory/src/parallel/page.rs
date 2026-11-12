@@ -359,6 +359,9 @@ impl MutablePage {
     pub(crate) fn has_external_revision(&self) -> bool {
         self.external_revision.is_some()
     }
+    pub(crate) fn external_write_epoch(&self) -> Option<std::sync::Arc<AtomicU64>> {
+        self.external_revision.clone()
+    }
     pub(crate) fn snapshot(&self) -> [u8; PAGE] {
         let mut bytes = [0; PAGE];
         self.copy_read(0, &mut bytes);

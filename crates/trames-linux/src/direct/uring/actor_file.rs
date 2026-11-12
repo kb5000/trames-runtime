@@ -339,11 +339,18 @@ pub(super) fn open(
     mode: u32,
     policy: u64,
 ) -> Option<Result<(i32, bool)>> {
+    if let Some(open) = &mut call.fifo_open {
+        return Some(
+            open.finish()
+                .map_or(Err(Errno(11)), |result| result.map(|fd| (fd as i32, true))),
+        );
+    }
     if let Some(io) = &mut call.file {
-        return Some(match io.take_outcome(execution) {
+        let result = match io.take_outcome(execution) {
             Some(outcome) => io.finish(outcome, request, memory, actor, execution),
             None => Err(Errno(11)),
-        });
+        };
+        return Some(finish_open(execution, call, result));
     }
     let work = {
         let paths = execution.paths.lock().unwrap();
@@ -356,7 +363,17 @@ pub(super) fn open(
             policy,
             &execution.files,
         ) {
-            Some(result) => return Some(result.map(|fd| (fd as i32, true))),
+            Some(Ok(fd)) => {
+                if let Some(mut open) = paths.pending_fifo_open(fd) {
+                    if let Some(result) = open.finish() {
+                        return Some(result.map(|fd| (fd as i32, true)));
+                    }
+                    call.fifo_open = Some(open);
+                    return Some(Err(Errno(11)));
+                }
+                return Some(Ok((fd as i32, true)));
+            }
+            Some(Err(error)) => return Some(Err(error)),
             None => paths.take_open_work()?,
         }
     };
@@ -379,5 +396,21 @@ pub(super) fn open(
     if layout {
         call.file = Some(io);
     }
-    Some(result)
+    Some(finish_open(execution, call, result))
+}
+
+fn finish_open(
+    execution: &Execution,
+    call: &mut Accepted,
+    result: Result<(i32, bool)>,
+) -> Result<(i32, bool)> {
+    let (fd, complete) = result?;
+    if let Some(mut open) = execution.paths.lock().unwrap().pending_fifo_open(fd as u32) {
+        if let Some(result) = open.finish() {
+            return result.map(|fd| (fd as i32, complete));
+        }
+        call.fifo_open = Some(open);
+        return Err(Errno(11));
+    }
+    Ok((fd, complete))
 }

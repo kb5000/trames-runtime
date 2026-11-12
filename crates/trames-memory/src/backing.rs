@@ -157,6 +157,15 @@ pub trait PageBacking: Send + Sync {
     fn publish_write(&self, _offset: usize, _len: usize) -> Result<(), MemoryError> {
         Err(MemoryError::BackingIo(95))
     }
+    /// Canonical external data with no dirty-range/persistence work may publish
+    /// hardware writes once per original allocation through its existing epoch.
+    /// Every exported page's version and software reservation must include that
+    /// epoch. No byte/storage/check change may require a per-page commit hook.
+    /// Executable mappings never use this optimization. Other providers retain
+    /// their original dirty-page publication, including file writeback.
+    fn hardware_write_epoch(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicU64>> {
+        None
+    }
     fn check(&self, address: u64) -> Result<(), MemoryError>;
     fn read(&self, offset: usize, out: &mut [u8]) -> Result<(), MemoryError>;
     fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), MemoryError>;

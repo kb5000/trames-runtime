@@ -385,7 +385,7 @@ mod tests {
                 tokens.push(view.hardware_write_frame(address).unwrap());
             }
             let mut words = std::collections::BTreeMap::new();
-            for &token in &tokens {
+            for token in &tokens {
                 let (word, bit) = token.publication_word().unwrap();
                 *words.entry(word).or_insert(0) |= bit;
             }
@@ -398,8 +398,8 @@ mod tests {
                 view.enable_hardware();
                 for _ in 0..12 {
                     if legacy {
-                        for &token in &tokens {
-                            view.mark_hardware_frame_write(token).unwrap();
+                        for token in &tokens {
+                            view.mark_hardware_frame_write(token.clone()).unwrap();
                         }
                     } else {
                         for (&word, &bits) in &words {
@@ -761,7 +761,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [0x1000]
         );
-        assert!(view.mark_hardware_frame_write(token).is_err());
+        assert!(view.mark_hardware_frame_write(token.clone()).is_err());
         drop(view);
         for round in 0..40 {
             memory
@@ -788,7 +788,7 @@ mod tests {
         let mut view = memory.parallel_view(&mut registry).unwrap();
         view.enable_hardware();
         view.write_array(0x1000, [2]).unwrap();
-        assert!(view.mark_hardware_frame_write(token).is_err());
+        assert!(view.mark_hardware_frame_write(token.clone()).is_err());
         let current = view.hardware_write_frame(0x1000).unwrap();
         view.mark_hardware_frame_write(current).unwrap();
     }
@@ -894,7 +894,7 @@ mod tests {
         unsafe {
             storage.pointer().cast::<u64>().write(713);
         }
-        view.mark_hardware_frame_write(token).unwrap();
+        view.mark_hardware_frame_write(token.clone()).unwrap();
         assert!(!token.needs_publication());
         drop(view);
         memory.commit_parallel().unwrap();
@@ -944,7 +944,7 @@ mod tests {
         for _ in 0..8 {
             let token = view.hardware_write_frame(0x1000).unwrap();
             assert!(!token.needs_publication());
-            view.mark_hardware_frame_write(token).unwrap();
+            view.mark_hardware_frame_write(token.clone()).unwrap();
             drop(view);
             memory.commit_parallel().unwrap();
             view = memory.parallel_view(&mut registry).unwrap();

@@ -6,25 +6,31 @@ use std::sync::Arc;
 
 /// A checked metadata index. It owns no guest bytes and cannot pin physical RAM.
 /// Reuse verifies VM, virtual/physical identity and current frame membership.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct HardwareWriteFrame {
     pub(crate) vm: u64,
     pub(crate) base: u64,
     pub(crate) root: usize,
     pub(crate) storage: u64,
     pub(crate) publication: bool,
+    pub(crate) epoch: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 impl HardwareWriteFrame {
     /// Canonical private RAM needs no joined provider/instruction publication.
     /// Host code writers publish at the producer; guest code uses IC/DC.
-    pub fn needs_publication(self) -> bool {
-        self.publication
+    pub fn needs_publication(&self) -> bool {
+        self.publication || self.epoch.is_some()
     }
     /// Compact publication membership, retained only while the executor's
     /// original mapping validation keeps this writable binding current.
-    pub fn publication_word(self) -> Option<(usize, u64)> {
+    pub fn publication_word(&self) -> Option<(usize, u64)> {
         self.publication
             .then(|| (self.root / 64, 1 << (self.root % 64)))
+    }
+    /// Existing allocation epoch, not byte ownership. Retain membership only
+    /// while the executor's original mapping validation keeps this binding live.
+    pub fn publication_epoch(&self) -> Option<&Arc<std::sync::atomic::AtomicU64>> {
+        self.epoch.as_ref()
     }
 }
 
