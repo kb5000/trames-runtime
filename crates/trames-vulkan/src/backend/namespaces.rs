@@ -254,7 +254,80 @@ mod tests {
         ok(&mut b, &mut m, 120, &[d, q1, 0x2648, 1, 0]);
         unsafe { b.device.as_ref().unwrap().native.device_wait_idle() }.unwrap();
         assert!(Backend::fence_ready(&b.objects[&fence]).unwrap());
-        ok(&mut b, &mut m, 34, &[d, 1, 0, OUT]);
+        let pool = ok(&mut b, &mut m, 34, &[d, 1, 0, OUT]);
+        let command = ok(&mut b, &mut m, 36, &[d, pool, OUT, 0]);
+        m.write(
+            0x2700,
+            &[0u32, 1]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let buffer = ok(&mut b, &mut m, 11, &[d, 256, 3, OUT, 1, 0x2700, 2]);
+        ok(&mut b, &mut m, 13, &[d, buffer, OUT]);
+        let extra = [0u64, 0, 0, 0, 0, 0, 0, 0, 0x2700, 2];
+        m.write(
+            0x2800,
+            &extra
+                .into_iter()
+                .flat_map(u64::to_le_bytes)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        for shared in [false, true] {
+            let image = ok(
+                &mut b,
+                &mut m,
+                60,
+                &[
+                    d,
+                    37,
+                    4,
+                    4,
+                    3,
+                    OUT,
+                    0,
+                    if shared { 0x2800 } else { 0 },
+                    if shared { u64::MAX - 2 } else { 0 },
+                    0,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    0,
+                ],
+            );
+            ok(&mut b, &mut m, 62, &[d, image, OUT]);
+            let size = m.read_u64(OUT).unwrap();
+            let bits = read32(&m, OUT + 16).unwrap();
+            let memory = ok(
+                &mut b,
+                &mut m,
+                14,
+                &[d, size, u64::from(bits.trailing_zeros()), OUT],
+            );
+            ok(&mut b, &mut m, 63, &[d, image, memory, 0]);
+            let families = if shared {
+                [u64::from(vk::QUEUE_FAMILY_IGNORED); 2]
+            } else {
+                [0, 1]
+            };
+            let wire = [image, 0, 0, 0, 1, 1, 0, 1, 0, 1, families[0], families[1]];
+            m.write(
+                0x2900,
+                &wire
+                    .into_iter()
+                    .flat_map(u64::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let command = b.objects[&command].clone();
+            let native = b.image_barriers(&m, &command, 0x2900, 1, 12).unwrap();
+            assert_eq!(native[0].src_queue_family_index, families[0] as u32);
+            assert_eq!(native[0].dst_queue_family_index, families[1] as u32);
+        }
         ok(&mut b, &mut m, 9, &[d]);
         ok(&mut b, &mut m, 2, &[i]);
     }

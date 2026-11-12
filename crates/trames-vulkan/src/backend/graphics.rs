@@ -653,7 +653,9 @@ impl Backend {
         {
             return Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED.into());
         }
-        let extra = if a[8] == u64::MAX - 1 {
+        let extra = if a[8] == u64::MAX - 2 {
+            words64(m, a[7], 10)?
+        } else if a[8] == u64::MAX - 1 {
             words64(m, a[7], 8)?
         } else if a[8] == u64::MAX {
             words64(m, a[7], 3)?
@@ -1288,7 +1290,11 @@ impl Backend {
             if stride == 12 {
                 for &family in &b[10..12] {
                     if family != u64::from(vk::QUEUE_FAMILY_IGNORED)
-                        && family != u64::from(self.family)
+                        && !command
+                            .device
+                            .queue_families
+                            .iter()
+                            .any(|f| family == u64::from(*f))
                         && !(image.external.borrow().is_some()
                             && matches!(family, 0xfffffffd | 0xfffffffe))
                     {
@@ -1312,6 +1318,18 @@ impl Backend {
             {
                 return unsupported();
             }
+            // Ordinary queue-family transfers belong to original Vulkan. The
+            // native-texture FD adapter uses Metal leases instead of Vulkan
+            // external-memory ownership, so only its foreign indices elide.
+            let families = if stride == 12
+                && !b[10..12]
+                    .iter()
+                    .any(|f| matches!(*f, 0xfffffffd | 0xfffffffe))
+            {
+                [b[10] as u32, b[11] as u32]
+            } else {
+                [vk::QUEUE_FAMILY_IGNORED; 2]
+            };
             barriers.push(
                 vk::ImageMemoryBarrier::default()
                     .image(vk::Image::from_raw(image.raw))
@@ -1319,8 +1337,8 @@ impl Backend {
                     .dst_access_mask(vk::AccessFlags::from_raw(b[2] as u32))
                     .old_layout(self.native_layout(b[3], true)?)
                     .new_layout(self.native_layout(b[4], false)?)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .src_queue_family_index(families[0])
+                    .dst_queue_family_index(families[1])
                     .subresource_range(range),
             );
             dependencies.push(image);
@@ -1385,7 +1403,9 @@ impl Backend {
                 {
                     return unsupported();
                 }
-                let extra = if a[8] == u64::MAX - 1 {
+                let extra = if a[8] == u64::MAX - 2 {
+                    words64(m, a[7], 10)?
+                } else if a[8] == u64::MAX - 1 {
                     words64(m, a[7], 8)?
                 } else if a[8] == u64::MAX {
                     words64(m, a[7], 3)?
@@ -1399,7 +1419,7 @@ impl Backend {
                 if !formats.is_empty() && !device.format_list {
                     return unsupported();
                 }
-                let external = extra.len() == 8 && extra[3] != 0;
+                let external = extra.len() >= 8 && extra[3] != 0;
                 if external
                     && (device.metal_device == 0
                         || extra[3] != 512
@@ -1454,6 +1474,11 @@ impl Backend {
                 }
                 let mut stencil = vk::ImageStencilUsageCreateInfo::default()
                     .stencil_usage(vk::ImageUsageFlags::from_raw(extra[2] as u32));
+                let families = if extra.len() == 10 {
+                    words32(m, extra[8], bounded(extra[9], 64)?)?
+                } else {
+                    Vec::new()
+                };
                 let mut info = vk::ImageCreateInfo::default()
                     .flags(vk::ImageCreateFlags::from_raw(a[9] as u32))
                     .image_type(s.ty)
@@ -1468,12 +1493,12 @@ impl Backend {
                     .samples(s.samples)
                     .tiling(host_tiling)
                     .usage(u)
-                    .sharing_mode(if device.queue_families.len() > 1 {
+                    .sharing_mode(if extra.len() == 10 {
                         vk::SharingMode::CONCURRENT
                     } else {
                         vk::SharingMode::EXCLUSIVE
                     })
-                    .queue_family_indices(&device.queue_families)
+                    .queue_family_indices(&families)
                     .initial_layout(match a[6] {
                         0 => vk::ImageLayout::UNDEFINED,
                         8 => vk::ImageLayout::PREINITIALIZED,
@@ -1493,6 +1518,7 @@ impl Backend {
                         Some(Box::new(external::Resource::Image(external::ImageLayout {
                             pitch: extra[5],
                             offset: extra[6],
+                            families,
                         })));
                 }
                 self.objects[&id].image_flags.set(a[9] as u32);

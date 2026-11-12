@@ -332,12 +332,7 @@ impl Backend {
                     })
                     .image_array_layers(1)
                     .image_usage(vk::ImageUsageFlags::from_raw(a[7] as u32))
-                    .image_sharing_mode(if device.queue_families.len() > 1 {
-                        vk::SharingMode::CONCURRENT
-                    } else {
-                        vk::SharingMode::EXCLUSIVE
-                    })
-                    .queue_family_indices(&device.queue_families)
+                    .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
                     .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
                     .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
                     .present_mode(vk::PresentModeKHR::FIFO)

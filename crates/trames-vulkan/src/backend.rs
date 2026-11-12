@@ -2043,18 +2043,20 @@ impl Backend {
                 if a[2] == 0 || a[2] & !(allowed.as_raw() as u64) != 0 {
                     return unsupported();
                 }
-                // Native concurrent backing across enabled families also implements
-                // valid guest exclusive ownership transfers. Single-family devices
-                // keep the original exclusive path and its native performance.
+                // Preserve the application's original native sharing/ownership
+                // contract. Do not turn exclusive resources into shared backing.
+                let families = if a[4] == vk::SharingMode::CONCURRENT.as_raw() as u64 {
+                    words32(m, a[5], bounded(a[6], 64)?)?
+                } else if a[4] == 0 {
+                    Vec::new()
+                } else {
+                    return unsupported();
+                };
                 let info = vk::BufferCreateInfo::default()
                     .size(a[1])
                     .usage(vk::BufferUsageFlags::from_raw(a[2] as u32))
-                    .sharing_mode(if dev.queue_families.len() > 1 {
-                        vk::SharingMode::CONCURRENT
-                    } else {
-                        vk::SharingMode::EXCLUSIVE
-                    })
-                    .queue_family_indices(&dev.queue_families);
+                    .sharing_mode(vk::SharingMode::from_raw(a[4] as i32))
+                    .queue_family_indices(&families);
                 let raw = unsafe { d.create_buffer(&info, None) }?;
                 let id = self.put(Kind::Buffer, raw.as_raw(), vec![], a[1], a[2] as u32);
                 write(m, a[3], &id.to_le_bytes())?;

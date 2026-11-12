@@ -384,12 +384,7 @@ impl NativeImage {
             // The host compositor samples this same exported texture. This is
             // an internal producer requirement, independent of guest usage.
             .usage(vk::ImageUsageFlags::from_raw(usage) | vk::ImageUsageFlags::SAMPLED)
-            .sharing_mode(if device.queue_families.len() > 1 {
-                vk::SharingMode::CONCURRENT
-            } else {
-                vk::SharingMode::EXCLUSIVE
-            })
-            .queue_family_indices(&device.queue_families)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
         #[cfg(target_vendor = "apple")]
         let mut export = vk::ExportMetalObjectCreateInfoEXT::default()

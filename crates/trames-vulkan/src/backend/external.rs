@@ -2,10 +2,11 @@
 //! Imported guest FD image planes, backed directly by retained native textures.
 use super::*;
 pub(super) const CAPABILITY: u64 = 8192;
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct ImageLayout {
     pub pitch: u64,
     pub offset: u64,
+    pub families: Vec<u32>,
 }
 pub(super) enum Resource {
     Image(ImageLayout),
@@ -116,7 +117,7 @@ impl Backend {
         let layout = {
             let extra = object.external.borrow();
             match extra.as_deref() {
-                Some(Resource::Image(layout)) => *layout,
+                Some(Resource::Image(layout)) => layout.clone(),
                 _ => return Err(vk::Result::ERROR_INVALID_EXTERNAL_HANDLE.into()),
             }
         };
@@ -159,6 +160,12 @@ impl Backend {
                 .samples(vk::SampleCountFlags::TYPE_1)
                 .tiling(vk::ImageTiling::OPTIMAL)
                 .usage(vk::ImageUsageFlags::from_raw(object.flags))
+                .sharing_mode(if layout.families.is_empty() {
+                    vk::SharingMode::EXCLUSIVE
+                } else {
+                    vk::SharingMode::CONCURRENT
+                })
+                .queue_family_indices(&layout.families)
                 .flags(vk::ImageCreateFlags::from_raw(object.image_flags.get()));
             // Mutable color views retain their ordinary Vulkan creation flags.
             if object.image_flags.get() & vk::ImageCreateFlags::MUTABLE_FORMAT.as_raw() != 0 {
