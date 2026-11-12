@@ -749,9 +749,6 @@ impl Backend {
         let pipeline_layout = self.object(a[1], Kind::PipelineLayout)?;
         let vertex = self.object(a[2], Kind::Shader)?;
         let fragment = if a[3] == 0 {
-            if a[14] & 65536 == 0 {
-                return invalid();
-            }
             None
         } else {
             Some(self.object(a[3], Kind::Shader)?)
@@ -839,9 +836,31 @@ impl Backend {
         .limits;
         // Extended graphics state is copied before the asynchronous native
         // compiler starts; no guest pointers enter that worker.
-        if config[0] & !65535 != 0 {
+        if config[0] & !262143 != 0 {
             return unsupported();
         }
+        let creation_flags = if config[0] & 65536 != 0 {
+            words64(m, a[15] + 102 * 8, 1)?[0]
+        } else {
+            0
+        };
+        let mut specializations = Vec::new();
+        for stage in 0..2 {
+            let s = if config[0] & 131072 != 0 {
+                words64(m, a[15] + (103 + stage * 4) * 8, 4)?
+            } else {
+                vec![0; 4]
+            };
+            let wire = words64(m, s[0], bounded(s[1], 64)? * 3)?;
+            let size = bounded(s[3], 65536)?;
+            let entries = specialization_entries(&wire, size)?;
+            let mut bytes = vec![0; size];
+            if size != 0 {
+                m.read(s[2], &mut bytes)?;
+            }
+            specializations.push((entries, bytes));
+        }
+        let creation_flags = pipeline_creation_flags(&device, creation_flags, false)?;
         let sample_mask = if config[0] & 4096 != 0 {
             u32::try_from(config[11]).map_err(|_| Failure::Vk(vk::Result::ERROR_UNKNOWN))?
         } else {
@@ -899,7 +918,11 @@ impl Backend {
         }
         let front = stencil_state(&stencil[1..8])?;
         let back = stencil_state(&stencil[8..15])?;
-        let blend_wire = if config[0] & 512 != 0 {
+        // With no color attachments Vulkan ignores color-blend attachment
+        // state, even when the application supplies a nonempty default array.
+        let blend_wire = if subpass.color_count == 0 {
+            Vec::new()
+        } else if config[0] & 512 != 0 {
             let count = words64(m, a[15] + 22 * 8, 1)?[0];
             words64(m, a[15] + 23 * 8, bounded(count, MAX_COLORS)? * 8)?
         } else {
@@ -1088,13 +1111,23 @@ impl Backend {
         let completion = Some(self.completion.clone());
         let task = crate::task::Task::spawn_notifying(completion, move || {
             let _permit = permit;
+            let specialization = specializations
+                .iter()
+                .map(|(entries, bytes)| {
+                    vk::SpecializationInfo::default()
+                        .map_entries(entries)
+                        .data(bytes)
+                })
+                .collect::<Vec<_>>();
             let mut stages = vec![vk::PipelineShaderStageCreateInfo::default()
+                .specialization_info(&specialization[0])
                 .stage(vk::ShaderStageFlags::VERTEX)
                 .module(raw_vertex)
                 .name(&vertex_name)];
             if let Some((module, name)) = raw_fragment.zip(fragment_name.as_ref()) {
                 stages.push(
                     vk::PipelineShaderStageCreateInfo::default()
+                        .specialization_info(&specialization[1])
                         .stage(vk::ShaderStageFlags::FRAGMENT)
                         .module(module)
                         .name(name),
@@ -1171,6 +1204,7 @@ impl Backend {
             let dynamic =
                 vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
             let info = [vk::GraphicsPipelineCreateInfo::default()
+                .flags(creation_flags)
                 .stages(&stages)
                 .vertex_input_state(&vertex)
                 .input_assembly_state(&assembly)
@@ -1434,7 +1468,12 @@ impl Backend {
                     .samples(s.samples)
                     .tiling(host_tiling)
                     .usage(u)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                    .sharing_mode(if device.queue_families.len() > 1 {
+                        vk::SharingMode::CONCURRENT
+                    } else {
+                        vk::SharingMode::EXCLUSIVE
+                    })
+                    .queue_family_indices(&device.queue_families)
                     .initial_layout(match a[6] {
                         0 => vk::ImageLayout::UNDEFINED,
                         8 => vk::ImageLayout::PREINITIALIZED,

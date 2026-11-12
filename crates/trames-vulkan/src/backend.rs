@@ -23,6 +23,7 @@ mod descriptors;
 mod external;
 mod feedback;
 mod graphics;
+mod namespaces;
 mod shared_memory;
 mod sync;
 mod textures;
@@ -82,6 +83,7 @@ impl Drop for Instance {
     }
 }
 struct Device {
+    queue_families: Vec<u32>,
     metal_device: usize,
     external_image_memory_types: u32,
     host_alignment: u64,
@@ -447,6 +449,10 @@ pub struct Backend {
     completion_notice: bool,
     budget: crate::Budget,
     domain: u64,
+    // Additional original instance/device graphs. Common single-device calls
+    // stay local; graph IDs never alias another instance or recycled handle.
+    graphs: BTreeMap<u64, Box<Backend>>,
+    device_graph: bool,
     next: u64,
     instance: Option<Arc<Instance>>,
     physical: vk::PhysicalDevice,
@@ -457,6 +463,7 @@ pub struct Backend {
     queue_id: u64,
     device: Option<Arc<Device>>,
     queue: vk::Queue,
+    queues: BTreeMap<u64, (vk::Queue, u32, u32)>,
     family: u32,
     objects: BTreeMap<u64, Rc<Object>>,
     live_objects: ObjectCount,
@@ -488,6 +495,8 @@ impl Backend {
             native_images: false,
             image_files: None,
             domain: DOMAIN.fetch_add(1, Ordering::Relaxed),
+            graphs: BTreeMap::new(),
+            device_graph: false,
             next: 1,
             instance: None,
             physical: vk::PhysicalDevice::null(),
@@ -498,6 +507,7 @@ impl Backend {
             queue_id: 0,
             device: None,
             queue: vk::Queue::null(),
+            queues: BTreeMap::new(),
             family: 0,
             objects: BTreeMap::new(),
             live_objects: ObjectCount::default(),
@@ -637,6 +647,15 @@ impl Backend {
         self.objects.remove(&id);
         Ok(())
     }
+    fn queue(&self, id: u64) -> Result<vk::Queue> {
+        if id == self.queue_id && id != 0 {
+            return Ok(self.queue);
+        }
+        self.queues
+            .get(&id)
+            .map(|q| q.0)
+            .ok_or(Failure::Vk(vk::Result::ERROR_UNKNOWN))
+    }
     fn submit(
         &mut self,
         m: &mut impl CpuMemory,
@@ -644,9 +663,7 @@ impl Backend {
         a: [u64; 16],
         dev: Arc<Device>,
     ) -> Result<()> {
-        if a[1] != self.queue_id {
-            return invalid();
-        }
+        let queue = self.queue(a[1])?;
         if self.submissions.len() >= 64 {
             return Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY.into());
         }
@@ -696,7 +713,7 @@ impl Backend {
             {
                 let semaphore = self.object(id, Kind::Semaphore)?;
                 let state = semaphore_states.entry(id).or_insert(semaphore.state.get());
-                // There is one queue. A wait consumes an earlier signal, even
+                // A binary wait consumes its already-submitted signal, even
                 // if the driver has not completed it yet. Commit only on success.
                 if semaphore.flags == 0 && !matches!(*state, 1 | HOST_SIGNALED) {
                     return invalid();
@@ -819,7 +836,7 @@ impl Backend {
             .collect();
         let coherent_scope = coherent::Scope::resources(&resources);
         self.coherent_sync_scope(m, &coherent_scope, true)?;
-        unsafe { d.queue_submit(self.queue, &infos, vk::Fence::from_raw(fence.raw)) }?;
+        unsafe { d.queue_submit(queue, &infos, vk::Fence::from_raw(fence.raw)) }?;
         for c in &commands {
             c.state.set(3);
             c.pending_submissions.set(c.pending_submissions.get() + 1);
@@ -945,9 +962,14 @@ impl Backend {
         self.completion.subscribe(signal)
     }
     pub(crate) fn has_abandoned(&self) -> bool {
-        self.compiles.values().any(|c| c.abandoned) || self.teardowns.values().any(|t| t.abandoned)
+        self.compiles.values().any(|c| c.abandoned)
+            || self.teardowns.values().any(|t| t.abandoned)
+            || self.graphs.values().any(|graph| graph.has_abandoned())
     }
     pub(crate) fn retire_jobs(&mut self) {
+        for graph in self.graphs.values_mut() {
+            graph.retire_jobs();
+        }
         self.waits.clear();
         self.acquires.clear();
         for task in self.compiles.values_mut() {
@@ -958,7 +980,8 @@ impl Backend {
         self.teardowns.clear();
     }
     pub(crate) fn retirement_ready(&self) -> bool {
-        self.compiles.is_empty()
+        self.graphs.values().all(|graph| graph.retirement_ready())
+            && self.compiles.is_empty()
             && (!completion::available()
                 || self
                     .submissions
@@ -966,6 +989,10 @@ impl Backend {
                     .all(|s| !matches!(Self::fence_ready(&s.fence), Ok(false))))
     }
     pub fn reap_abandoned(&mut self) {
+        self.graphs.retain(|_, graph| {
+            graph.reap_abandoned();
+            !graph.finished_graph()
+        });
         self.compiles
             .retain(|_, c| !c.abandoned || matches!(c.task.poll(), Ok(None)));
         if self.teardowns.values().any(|job| job.abandoned) && self.teardown_ready() {
@@ -997,6 +1024,14 @@ impl Backend {
         let a: [u64; 16] = std::array::from_fn(|i| {
             u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap())
         });
+        self.invoke_graph(memory, operation, a)
+    }
+    fn execute(
+        &mut self,
+        memory: &mut impl CpuMemory,
+        operation: u64,
+        a: [u64; 16],
+    ) -> std::result::Result<Invocation, MemoryError> {
         static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let trace = *TRACE.get_or_init(|| std::env::var_os("TRAMES_VULKAN_TRACE").is_some());
         if trace {
@@ -1060,9 +1095,7 @@ impl Backend {
         if data_size != 0 {
             m.read(a[7], &mut data)?;
         }
-        if a[10] & !(vk::PipelineCreateFlags::DISPATCH_BASE.as_raw() as u64) != 0 {
-            return unsupported();
-        }
+        let creation_flags = pipeline_creation_flags(&device, a[10], true)?;
         let permit = self
             .budget
             .compile()
@@ -1098,7 +1131,7 @@ impl Backend {
                 stage = stage.push_next(&mut subgroup);
             }
             let info = [vk::ComputePipelineCreateInfo::default()
-                .flags(vk::PipelineCreateFlags::from_raw(a[10] as u32))
+                .flags(creation_flags)
                 .stage(stage)
                 .layout(raw_layout)];
             match unsafe {
@@ -1140,6 +1173,10 @@ impl Backend {
         Ok(job)
     }
     pub fn abandon(&mut self, job: u64) {
+        if let Some(graph) = self.graphs.get_mut(&(job >> 32)) {
+            graph.abandon(job);
+            return;
+        }
         self.waits.remove(&job);
         self.acquires.remove(&job);
         if let Some(teardown) = self.teardowns.get_mut(&job) {
@@ -1154,6 +1191,9 @@ impl Backend {
         job: u64,
         signal: &Arc<trames_shared::IoSignal>,
     ) -> Option<crate::JobSubscription> {
+        if let Some(graph) = self.graphs.get(&(job >> 32)) {
+            return graph.subscribe_job(job, signal);
+        }
         if let Some(acquire) = self.acquires.get(&job) {
             Some((
                 acquire.subscribe(signal),
@@ -1168,19 +1208,36 @@ impl Backend {
         }
     }
     pub(crate) fn job_deadline(&self, job: u64) -> Option<std::time::Instant> {
+        if let Some(graph) = self.graphs.get(&(job >> 32)) {
+            return graph.job_deadline(job);
+        }
         self.acquires
             .get(&job)
             .and_then(|w| w.deadline)
             .or_else(|| self.waits.get(&job).and_then(|w| w.deadline))
     }
     pub(crate) fn is_compile(&self, job: u64) -> bool {
-        self.compiles.contains_key(&job)
+        self.graphs.get(&(job >> 32)).map_or_else(
+            || self.compiles.contains_key(&job),
+            |graph| graph.is_compile(job),
+        )
     }
     pub fn poll(
         &mut self,
         m: &mut impl CpuMemory,
         job: u64,
     ) -> std::result::Result<Option<u64>, MemoryError> {
+        let domain = job >> 32;
+        if let Some(graph) = self.graphs.get_mut(&domain) {
+            let before = graph.transfers;
+            let result = graph.poll(m, job);
+            self.transfers.merge(graph.transfers.since(before));
+            self.completion_notice |= std::mem::take(&mut graph.completion_notice);
+            if graph.finished_graph() {
+                self.graphs.remove(&domain);
+            }
+            return result;
+        }
         if self.acquires.contains_key(&job) {
             return match self.poll_acquire(m, job) {
                 Ok(value) => Ok(value),
@@ -1466,6 +1523,9 @@ impl Backend {
                 // Bound the implemented MRT profile by the real native limit.
                 let properties =
                     unsafe { &mut *b.as_mut_ptr().cast::<vk::PhysicalDeviceProperties>() };
+                core_features::normalize_properties(properties, unsafe {
+                    instance.native.get_physical_device_features(self.physical)
+                });
                 properties.limits.max_color_attachments = properties
                     .limits
                     .max_color_attachments
@@ -1563,7 +1623,7 @@ impl Backend {
                                     | vk::QueueFlags::COMPUTE
                                     | vk::QueueFlags::TRANSFER)
                                     .as_raw(),
-                            q.queue_count.min(1),
+                            q.queue_count,
                             q.timestamp_valid_bits,
                             q.min_image_transfer_granularity.width,
                             q.min_image_transfer_granularity.height,
@@ -1600,16 +1660,53 @@ impl Backend {
                         .native
                         .get_physical_device_queue_family_properties(self.physical)
                 };
-                if !queues
-                    .get(a[1] as usize)
-                    .is_some_and(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
-                {
-                    return unsupported();
+                // Queue descriptions and priorities are owned before native creation;
+                // every published family/index retains its original native queue.
+                let requested = if a[10] == 0 {
+                    vec![a[1], 1, 0]
+                } else {
+                    words64(m, a[9], bounded(a[10], 64)? * 3)?
+                };
+                let mut families = Vec::new();
+                let mut priorities = Vec::new();
+                for q in requested.chunks_exact(3) {
+                    let family = u32::try_from(q[0])
+                        .map_err(|_| Failure::Vk(vk::Result::ERROR_FEATURE_NOT_PRESENT))?;
+                    let count = bounded(q[1], 64)?;
+                    if count == 0
+                        || families.contains(&family)
+                        || !queues
+                            .get(family as usize)
+                            .is_some_and(|native| count <= native.queue_count as usize)
+                    {
+                        return unsupported();
+                    }
+                    let values = if a[10] == 0 {
+                        vec![1.0]
+                    } else {
+                        words32(m, q[2], count)?
+                            .into_iter()
+                            .map(f32::from_bits)
+                            .collect::<Vec<_>>()
+                    };
+                    if values.iter().any(|v| !(0.0..=1.0).contains(v)) {
+                        return invalid();
+                    }
+                    families.push(family);
+                    priorities.push(values);
                 }
-                let priorities = [1.0];
-                let queue = [vk::DeviceQueueCreateInfo::default()
-                    .queue_family_index(a[1] as u32)
-                    .queue_priorities(&priorities)];
+                if families.is_empty() {
+                    return invalid();
+                }
+                let queue = families
+                    .iter()
+                    .zip(&priorities)
+                    .map(|(family, priorities)| {
+                        vk::DeviceQueueCreateInfo::default()
+                            .queue_family_index(*family)
+                            .queue_priorities(priorities)
+                    })
+                    .collect::<Vec<_>>();
                 let ext = unsafe {
                     instance
                         .native
@@ -1718,8 +1815,16 @@ impl Backend {
                             == vk::MemoryPropertyFlags::DEVICE_LOCAL
                     })
                     .fold(0, |bits, i| bits | (1 << i));
-                self.queue = unsafe { native.get_device_queue(a[1] as u32, 0) };
-                self.family = a[1] as u32;
+                self.family = families[0];
+                self.queue = unsafe { native.get_device_queue(self.family, 0) };
+                self.queues.clear();
+                for (family, priorities) in families.iter().zip(&priorities) {
+                    for index in 0..priorities.len() as u32 {
+                        let raw = unsafe { native.get_device_queue(*family, index) };
+                        let id = self.id();
+                        self.queues.insert(id, (raw, *family, index));
+                    }
+                }
                 let limits = unsafe {
                     instance
                         .native
@@ -1727,6 +1832,7 @@ impl Backend {
                 }
                 .limits;
                 self.device = Some(Arc::new(Device {
+                    queue_families: families,
                     metal_device,
                     external_image_memory_types,
                     host_alignment,
@@ -1761,16 +1867,19 @@ impl Backend {
                     compute_features: a[7] as u128 | ((a[8] as u128) << 64),
                 }));
                 self.device_id = self.id();
-                self.queue_id = self.id();
+                self.queue_id = *self.queues.first_key_value().unwrap().0;
                 write(m, a[2], &self.device_id.to_le_bytes())?;
             }
             9 => self.finish_teardown(op, a[0])?,
             10 => {
                 self.device(a[0])?;
-                if a[1] != self.family as u64 || a[2] != 0 {
-                    return invalid();
-                }
-                write(m, a[3], &self.queue_id.to_le_bytes())?;
+                let id = self
+                    .queues
+                    .iter()
+                    .find(|(_, q)| u64::from(q.1) == a[1] && u64::from(q.2) == a[2])
+                    .map(|(id, _)| *id)
+                    .ok_or(Failure::Vk(vk::Result::ERROR_UNKNOWN))?;
+                write(m, a[3], &id.to_le_bytes())?;
             }
             58..=59 => self.format_query(m, op, a)?,
             _ => {
@@ -1799,6 +1908,7 @@ impl Backend {
         self.device = None;
         self.device_id = 0;
         self.queue_id = 0;
+        self.queues.clear();
     }
     fn device_call(&mut self, m: &mut impl CpuMemory, op: u64, a: [u64; 16]) -> Result<()> {
         let dev = self.device.as_ref().unwrap().clone();
@@ -1813,7 +1923,15 @@ impl Backend {
                 if size != 0 {
                     m.read(a[2], &mut data)?;
                 }
-                let info = vk::PipelineCacheCreateInfo::default().initial_data(&data);
+                if a[4] & !1 != 0
+                    || a[4] != 0
+                        && dev.compute_features & compute::PIPELINE_CREATION_CACHE_CONTROL == 0
+                {
+                    return unsupported();
+                }
+                let info = vk::PipelineCacheCreateInfo::default()
+                    .initial_data(&data)
+                    .flags(vk::PipelineCacheCreateFlags::from_raw(a[4] as u32));
                 let raw = unsafe { d.create_pipeline_cache(&info, None) }?;
                 let id = self.put(Kind::PipelineCache, raw.as_raw(), vec![], 0, 0);
                 self.publish(m, a[1], id)?;
@@ -1925,9 +2043,18 @@ impl Backend {
                 if a[2] == 0 || a[2] & !(allowed.as_raw() as u64) != 0 {
                     return unsupported();
                 }
+                // Native concurrent backing across enabled families also implements
+                // valid guest exclusive ownership transfers. Single-family devices
+                // keep the original exclusive path and its native performance.
                 let info = vk::BufferCreateInfo::default()
                     .size(a[1])
-                    .usage(vk::BufferUsageFlags::from_raw(a[2] as u32));
+                    .usage(vk::BufferUsageFlags::from_raw(a[2] as u32))
+                    .sharing_mode(if dev.queue_families.len() > 1 {
+                        vk::SharingMode::CONCURRENT
+                    } else {
+                        vk::SharingMode::EXCLUSIVE
+                    })
+                    .queue_family_indices(&dev.queue_families);
                 let raw = unsafe { d.create_buffer(&info, None) }?;
                 let id = self.put(Kind::Buffer, raw.as_raw(), vec![], a[1], a[2] as u32);
                 write(m, a[3], &id.to_le_bytes())?;
@@ -2411,11 +2538,11 @@ impl Backend {
             34 => {
                 self.room(1)?;
                 output(m, a[3], 8)?;
-                if a[1] != self.family as u64 || a[2] & !3 != 0 {
+                if !dev.queue_families.iter().any(|f| u64::from(*f) == a[1]) || a[2] & !3 != 0 {
                     return unsupported();
                 }
                 let info = vk::CommandPoolCreateInfo::default()
-                    .queue_family_index(self.family)
+                    .queue_family_index(a[1] as u32)
                     .flags(vk::CommandPoolCreateFlags::from_raw(a[2] as u32));
                 let raw = unsafe { d.create_command_pool(&info, None) }?;
                 let id = self.put(Kind::CommandPool, raw.as_raw(), vec![], 0, a[2] as u32);
@@ -2939,6 +3066,28 @@ unsafe fn transfer_pages(
         offset += n;
     }
     Ok(transferred)
+}
+fn pipeline_creation_flags(
+    device: &Device,
+    flags: u64,
+    compute: bool,
+) -> Result<vk::PipelineCreateFlags> {
+    let mut allowed = vk::PipelineCreateFlags::DISABLE_OPTIMIZATION
+        | vk::PipelineCreateFlags::ALLOW_DERIVATIVES
+        | vk::PipelineCreateFlags::DERIVATIVE;
+    if compute {
+        allowed |= vk::PipelineCreateFlags::DISPATCH_BASE;
+    }
+    if device.compute_features & compute::PIPELINE_CREATION_CACHE_CONTROL != 0 {
+        allowed |= vk::PipelineCreateFlags::FAIL_ON_PIPELINE_COMPILE_REQUIRED
+            | vk::PipelineCreateFlags::EARLY_RETURN_ON_FAILURE;
+    }
+    if flags & !(allowed.as_raw() as u64) != 0 {
+        return unsupported();
+    }
+    // Derivative pipelines are valid independently compiled pipelines too.
+    // No native base handle/index is retained by this transport.
+    Ok(vk::PipelineCreateFlags::from_raw(flags as u32) & !vk::PipelineCreateFlags::DERIVATIVE)
 }
 fn visibility_stages(raw: u64) -> Result<vk::ShaderStageFlags> {
     // Visibility may name disabled stages (ALL_GRAPHICS/ALL); it does not

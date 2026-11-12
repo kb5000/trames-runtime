@@ -1,5 +1,5 @@
 {
-  "wire_revision": 13,
+  "wire_revision": 17,
   "extensions": [
     {"index": 0, "name": "storage_class", "extension": "VK_KHR_storage_buffer_storage_class", "minimum_api": 0, "promoted": 11},
     {"index": 1, "name": "storage16", "extension": "VK_KHR_16bit_storage", "minimum_api": 0, "promoted": 11},
@@ -33,7 +33,8 @@
     {"index": 29, "name": "draw_count", "extension": "VK_KHR_draw_indirect_count", "minimum_api": 12, "promoted": 12},
     {"index": 30, "name": "stencil_usage", "extension": "VK_EXT_separate_stencil_usage", "minimum_api": 12, "promoted": 12},
     {"index": 31, "name": "dedicated", "extension": "VK_KHR_dedicated_allocation", "minimum_api": 11, "promoted": 11},
-    {"index": 32, "name": "viewport_layer", "extension": "VK_EXT_shader_viewport_index_layer", "minimum_api": 12, "promoted": 12}
+    {"index": 32, "name": "viewport_layer", "extension": "VK_EXT_shader_viewport_index_layer", "minimum_api": 12, "promoted": 12},
+    {"index": 33, "name": "pipeline_cache_control", "extension": "VK_EXT_pipeline_creation_cache_control", "minimum_api": 0, "promoted": 13}
   ],
   "features": [
     {
@@ -262,7 +263,22 @@
       ]
     },
     {"extension": 27, "name": "ycbcr", "type": "PhysicalDeviceSamplerYcbcrConversionFeatures", "structure_type": "PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES", "bit": 70, "fields": [{"c": "samplerYcbcrConversion", "rust": "sampler_ycbcr_conversion", "kind": "Bool32", "expose": true}]},
-    {"extension": 28, "name": "atomic64", "type": "PhysicalDeviceShaderAtomicInt64Features", "structure_type": "PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES", "bit": 71, "fields": [{"c": "shaderBufferInt64Atomics", "rust": "shader_buffer_int64_atomics", "kind": "Bool32"}, {"c": "shaderSharedInt64Atomics", "rust": "shader_shared_int64_atomics", "kind": "Bool32"}]}
+    {"extension": 28, "name": "atomic64", "type": "PhysicalDeviceShaderAtomicInt64Features", "structure_type": "PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES", "bit": 71, "fields": [{"c": "shaderBufferInt64Atomics", "rust": "shader_buffer_int64_atomics", "kind": "Bool32"}, {"c": "shaderSharedInt64Atomics", "rust": "shader_shared_int64_atomics", "kind": "Bool32"}]},
+    {
+      "extension": 33,
+      "name": "pipeline_cache_control",
+      "type": "PhysicalDevicePipelineCreationCacheControlFeatures",
+      "structure_type": "PHYSICAL_DEVICE_PIPELINE_CREATION_CACHE_CONTROL_FEATURES",
+      "bit": 73,
+      "fields": [
+        {
+          "c": "pipelineCreationCacheControl",
+          "rust": "pipeline_creation_cache_control",
+          "kind": "Bool32",
+          "expose": true
+        }
+      ]
+    }
   ],
   "properties": [
     {

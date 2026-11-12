@@ -227,15 +227,13 @@ impl Backend {
                     // Stream zero only: geometryStreams is not exposed. Core
                     // begin/end and indexed entrypoints share this state.
                     if ty == vk::QueryType::TIMESTAMP
-                        || a[4] != 0
+                        || a[4] & !1 != 0
+                        || ty != vk::QueryType::OCCLUSION && a[4] != 0
                         || a[5] != 0
                         || a[6] > 1
                         || a[6] != 0 && !dev.feedback_extension
                     {
                         return unsupported();
-                    }
-                    if ty == vk::QueryType::OCCLUSION && c.recording.borrow().pass.is_none() {
-                        return invalid();
                     }
                     let key = (ty.as_raw(), 0);
                     let mut r = c.recording.borrow_mut();
@@ -273,7 +271,7 @@ impl Backend {
                                     raw,
                                     native,
                                     a[3] as u32,
-                                    vk::QueryControlFlags::empty(),
+                                    vk::QueryControlFlags::from_raw(a[4] as u32),
                                 );
                             } else {
                                 d.cmd_end_query(raw, native, a[3] as u32);

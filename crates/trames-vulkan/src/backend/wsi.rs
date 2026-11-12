@@ -332,7 +332,12 @@ impl Backend {
                     })
                     .image_array_layers(1)
                     .image_usage(vk::ImageUsageFlags::from_raw(a[7] as u32))
-                    .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+                    .image_sharing_mode(if device.queue_families.len() > 1 {
+                        vk::SharingMode::CONCURRENT
+                    } else {
+                        vk::SharingMode::EXCLUSIVE
+                    })
+                    .queue_family_indices(&device.queue_families)
                     .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
                     .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
                     .present_mode(vk::PresentModeKHR::FIFO)
@@ -523,9 +528,7 @@ impl Backend {
                 }
             }
             91 => {
-                if a[1] != self.queue_id {
-                    return invalid();
-                }
+                let queue = self.queue(a[1])?;
                 let chain = self
                     .wsi
                     .swapchains
@@ -562,7 +565,7 @@ impl Backend {
                     .wait_semaphores(&semaphores)
                     .swapchains(&chains)
                     .image_indices(&indices);
-                let suboptimal = match unsafe { loader.queue_present(self.queue, &info) } {
+                let suboptimal = match unsafe { loader.queue_present(queue, &info) } {
                     Ok(suboptimal) => suboptimal,
                     Err(error) => {
                         // Consumption of native waits on a failed present is driver

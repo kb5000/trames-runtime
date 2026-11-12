@@ -3,7 +3,7 @@
 //! No tensor data, shader rewriting or extra CPU/GPU synchronization lives here.
 use super::*;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(super) struct Capabilities {
     pub extensions: u64,
     pub features: u128,

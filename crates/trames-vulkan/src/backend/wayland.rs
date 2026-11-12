@@ -384,7 +384,12 @@ impl NativeImage {
             // The host compositor samples this same exported texture. This is
             // an internal producer requirement, independent of guest usage.
             .usage(vk::ImageUsageFlags::from_raw(usage) | vk::ImageUsageFlags::SAMPLED)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .sharing_mode(if device.queue_families.len() > 1 {
+                vk::SharingMode::CONCURRENT
+            } else {
+                vk::SharingMode::EXCLUSIVE
+            })
+            .queue_family_indices(&device.queue_families)
             .initial_layout(vk::ImageLayout::UNDEFINED);
         #[cfg(target_vendor = "apple")]
         let mut export = vk::ExportMetalObjectCreateInfoEXT::default()
@@ -626,9 +631,7 @@ impl Backend {
                 }
             }
             91 => {
-                if a[1] != self.queue_id {
-                    return invalid();
-                }
+                let queue = self.queue(a[1])?;
                 if self.wayland.pending.len() >= 64 {
                     return Err(vk::Result::NOT_READY.into());
                 }
@@ -678,7 +681,7 @@ impl Backend {
                 if let Err(e) = unsafe {
                     device
                         .native
-                        .queue_submit(self.queue, &[submit], completion.fence)
+                        .queue_submit(queue, &[submit], completion.fence)
                 } {
                     self.wayland.retire(a[2]);
                     return Err(e.into());

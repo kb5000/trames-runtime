@@ -10,6 +10,9 @@ macro_rules! core_features {
             bytes[offset..offset + 4].copy_from_slice(&native.$field.to_le_bytes());)+
             bytes
         }
+        pub(super) fn supported(native: vk::PhysicalDeviceFeatures) -> vk::PhysicalDeviceFeatures {
+            vk::PhysicalDeviceFeatures { $($field: native.$field,)+ ..Default::default() }
+        }
         pub(super) fn select(native: vk::PhysicalDeviceFeatures, bits: u64) -> Result<vk::PhysicalDeviceFeatures> {
             const MASK: u64 = 0 $(| (1 << $bit))+;
             if bits & !MASK != 0 { return unsupported(); }
@@ -51,11 +54,107 @@ core_features! {
     24 => alpha_to_one,
     25 => robust_buffer_access,
     26 => full_draw_index_uint32,
+    27 => occlusion_query_precise,
+}
+
+// Limits describe this executable profile, including disabled optional stages.
+// Native limits for a disabled feature must not contradict its feature bit.
+pub(super) fn normalize_properties(
+    p: &mut vk::PhysicalDeviceProperties,
+    native: vk::PhysicalDeviceFeatures,
+) {
+    let f = supported(native);
+    let l = &mut p.limits;
+    if f.geometry_shader == 0 {
+        l.max_geometry_shader_invocations = 0;
+        l.max_geometry_input_components = 0;
+        l.max_geometry_output_components = 0;
+        l.max_geometry_output_vertices = 0;
+        l.max_geometry_total_output_components = 0;
+    }
+    if f.tessellation_shader == 0 {
+        l.max_tessellation_generation_level = 0;
+        l.max_tessellation_patch_size = 0;
+        l.max_tessellation_control_per_vertex_input_components = 0;
+        l.max_tessellation_control_per_vertex_output_components = 0;
+        l.max_tessellation_control_per_patch_output_components = 0;
+        l.max_tessellation_control_total_output_components = 0;
+        l.max_tessellation_evaluation_input_components = 0;
+        l.max_tessellation_evaluation_output_components = 0;
+    }
+    if f.sparse_binding == 0 {
+        l.sparse_address_space_size = 0;
+    }
+    if f.large_points == 0 {
+        l.point_size_range = [1.0; 2];
+        l.point_size_granularity = 0.0;
+    }
+    if f.wide_lines == 0 {
+        l.line_width_range = [1.0; 2];
+        l.line_width_granularity = 0.0;
+    }
+    if f.multi_viewport == 0 {
+        l.max_viewports = 1;
+    }
+    if f.sampler_anisotropy == 0 {
+        l.max_sampler_anisotropy = 1.0;
+    }
+    if f.shader_image_gather_extended == 0 {
+        l.min_texel_gather_offset = 0;
+        l.max_texel_gather_offset = 0;
+    }
+    if f.sample_rate_shading == 0 {
+        l.min_interpolation_offset = 0.0;
+        l.max_interpolation_offset = 0.0;
+        l.sub_pixel_interpolation_offset_bits = 0;
+    }
+    if f.shader_storage_image_multisample == 0 {
+        l.storage_image_sample_counts = vk::SampleCountFlags::TYPE_1;
+    }
+    if f.shader_clip_distance == 0 {
+        l.max_clip_distances = 0;
+    }
+    if f.shader_cull_distance == 0 {
+        l.max_cull_distances = 0;
+    }
+    l.max_combined_clip_and_cull_distances = l
+        .max_combined_clip_and_cull_distances
+        .min(l.max_clip_distances + l.max_cull_distances);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn feature_dependent_limits_describe_the_executable_profile() {
+        let mut p = vk::PhysicalDeviceProperties::default();
+        p.limits.point_size_range = [1.0, 64.0];
+        p.limits.point_size_granularity = 0.125;
+        p.limits.line_width_range = [1.0, 8.0];
+        p.limits.line_width_granularity = 0.25;
+        p.limits.max_geometry_output_vertices = 256;
+        p.limits.max_clip_distances = 8;
+        p.limits.max_cull_distances = 8;
+        p.limits.max_combined_clip_and_cull_distances = 8;
+        p.limits.max_sampler_anisotropy = 16.0;
+        normalize_properties(
+            &mut p,
+            vk::PhysicalDeviceFeatures::default()
+                .large_points(true)
+                .geometry_shader(true)
+                .shader_clip_distance(true)
+                .sampler_anisotropy(true),
+        );
+        assert_eq!(p.limits.point_size_range, [1.0; 2]);
+        assert_eq!(p.limits.point_size_granularity, 0.0);
+        assert_eq!(p.limits.line_width_range, [1.0; 2]);
+        assert_eq!(p.limits.line_width_granularity, 0.0);
+        assert_eq!(p.limits.max_geometry_output_vertices, 0);
+        assert_eq!(p.limits.max_clip_distances, 8);
+        assert_eq!(p.limits.max_cull_distances, 0);
+        assert_eq!(p.limits.max_combined_clip_and_cull_distances, 8);
+        assert_eq!(p.limits.max_sampler_anisotropy, 16.0);
+    }
     #[test]
     fn selected_features_preserve_legacy_bits_and_require_native_support() {
         let native = vk::PhysicalDeviceFeatures::default()

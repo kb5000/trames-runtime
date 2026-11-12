@@ -96,7 +96,6 @@ impl Backend {
             || a[7] > 5
             || lod.iter().any(|x| !x.is_finite())
             || lod[0].abs() > limits.max_sampler_lod_bias
-            || lod[1] < 0.0
             || lod[2] < lod[1]
         {
             return unsupported();
@@ -109,16 +108,19 @@ impl Backend {
             return unsupported();
         }
         let anisotropy = f32::from_bits(a[11] as u32);
+        let compare = a[12] & 0xffffffff;
+        let unnormalized = a[12] >> 32;
         // This profile uses mutable descriptors, not immutable samplers. A
         // portability device must explicitly allow comparison samplers there.
-        if a[12] != 0
+        if compare != 0
             && device
                 .portability
                 .is_some_and(|p| p.mutable_comparison_samplers == 0)
         {
             return unsupported();
         }
-        if a[12] > 1
+        if unnormalized > 1
+            || compare > 1
             || a[13] > 7
             || a[10] > 1
             || a[10] != 0
@@ -131,7 +133,7 @@ impl Backend {
         }
         if a[14] > 2
             || a[14] != 0
-                && (device.compute_features & compute::SAMPLER_FILTER_MINMAX == 0 || a[12] != 0)
+                && (device.compute_features & compute::SAMPLER_FILTER_MINMAX == 0 || compare != 0)
         {
             return unsupported();
         }
@@ -150,7 +152,8 @@ impl Backend {
             .mip_lod_bias(lod[0])
             .min_lod(lod[1])
             .max_lod(lod[2])
-            .compare_enable(a[12] != 0)
+            .unnormalized_coordinates(unnormalized != 0)
+            .compare_enable(compare != 0)
             .compare_op(vk::CompareOp::from_raw(a[13] as i32));
         if a[14] != 0 {
             info = info.push_next(&mut reduction);

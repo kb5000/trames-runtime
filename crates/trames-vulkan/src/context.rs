@@ -7,7 +7,8 @@ mod retirement;
 
 // Backend deliberately remains !Send/!Sync. Its private Rc/RefCell graph never
 // escapes through its public interface. Only this consuming envelope may move
-// that whole graph, and all entry/teardown access is behind the context mutex.
+// the aggregate of original instance/device graphs, including their shared
+// Rc surface dependencies. All entry/teardown access is behind the context mutex.
 struct OwnedBackend(Backend);
 // SAFETY: no Rc<Object>/Weak/Object borrow leaves Backend or its private child
 // modules. Pending compilers retain Rc dependencies inside Backend; their host

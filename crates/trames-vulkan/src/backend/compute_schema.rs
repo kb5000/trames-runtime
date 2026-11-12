@@ -34,6 +34,7 @@ pub(super) const EXTENSIONS: &[(u64, &std::ffi::CStr, u32)] = &[
     (1 << 30, c"VK_EXT_separate_stencil_usage", vk::API_VERSION_1_2),
     (1 << 31, c"VK_KHR_dedicated_allocation", vk::API_VERSION_1_1),
     (1 << 32, c"VK_EXT_shader_viewport_index_layer", vk::API_VERSION_1_2),
+    (1 << 33, c"VK_EXT_pipeline_creation_cache_control", vk::API_VERSION_1_0),
 ];
 pub(super) const EXT_STORAGE_CLASS: u64 = 1 << 0;
 pub(super) const EXT_MAINTENANCE3: u64 = 1 << 16;
@@ -58,6 +59,7 @@ compute_features! {
     separate_depth_stencil: PhysicalDeviceSeparateDepthStencilLayoutsFeatures, 25, 12 => [65 => separate_depth_stencil_layouts : true];
     ycbcr: PhysicalDeviceSamplerYcbcrConversionFeatures, 27, 11 => [70 => sampler_ycbcr_conversion : true];
     atomic64: PhysicalDeviceShaderAtomicInt64Features, 28, 12 => [71 => shader_buffer_int64_atomics : true, 72 => shader_shared_int64_atomics : true];
+    pipeline_cache_control: PhysicalDevicePipelineCreationCacheControlFeatures, 33, 13 => [73 => pipeline_creation_cache_control : true];
 }
 pub(super) const SHADER_SHARED_FLOAT32_ATOMICS: u128 = 1 << 13;
 pub(super) const SHADER_SHARED_FLOAT32_ATOMIC_ADD: u128 = 1 << 14;
@@ -77,6 +79,7 @@ pub(super) const DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT: u128 = 1 << 60;
 pub(super) const MULTIVIEW: u128 = 1 << 62;
 pub(super) const SEPARATE_DEPTH_STENCIL_LAYOUTS: u128 = 1 << 65;
 pub(super) const SAMPLER_YCBCR_CONVERSION: u128 = 1 << 70;
+pub(super) const PIPELINE_CREATION_CACHE_CONTROL: u128 = 1 << 73;
 pub(super) const SUBGROUP_BROADCAST_DYNAMIC_ID: u128 = 1 << 39;
 pub(super) const SAMPLER_MIRROR_CLAMP_TO_EDGE: u128 = 1 << 40;
 pub(super) const SAMPLER_FILTER_MINMAX: u128 = 1 << 41;

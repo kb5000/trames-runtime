@@ -23,7 +23,7 @@ pub(super) struct Divisor {
     pub zero: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(super) struct Capabilities {
     pub bits: u64,
     pub compute: compute::Capabilities,
@@ -47,7 +47,7 @@ impl Capabilities {
                 .any(|e| unsafe { std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) == name })
         };
         let mut result = Self {
-            bits: descriptors::BATCH_CAPABILITY,
+            bits: descriptors::BATCH_CAPABILITY | (1 << 15),
             compute: compute::Capabilities::query(instance, physical, &ext),
             ..Self::default()
         };
@@ -219,7 +219,7 @@ impl Capabilities {
         };
         let values = [
             p.constant_alpha_color_blend_factors,
-            0,
+            p.events,
             0,
             p.image_view_format_swizzle,
             p.image_view2_d_on3_d_image,
