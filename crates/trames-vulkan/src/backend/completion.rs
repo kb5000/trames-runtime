@@ -36,6 +36,8 @@ pub(super) struct Wait {
     objects: Vec<Rc<Object>>,
     values: Option<Vec<u64>>,
     any: bool,
+    #[cfg(trames_moltenvk)]
+    _observations: Vec<trames_graphics::completion::EventObservation>,
 }
 impl Wait {
     fn needs_download(&self) -> bool {
@@ -127,6 +129,8 @@ impl Backend {
             } else {
                 None
             },
+            #[cfg(trames_moltenvk)]
+            _observations: Vec::new(),
         };
         if wait.ready()? {
             self.collect();
@@ -140,6 +144,35 @@ impl Backend {
                 vk::Result::TIMEOUT.as_raw() as i64 as u64
             ));
         }
+        #[cfg(trames_moltenvk)]
+        let wait = {
+            let mut wait = wait;
+            if let Some(values) = &wait.values {
+                let api = ash::ext::metal_objects::Device::new(&dev.instance.native, &dev.native);
+                for (object, &value) in wait.objects.iter().zip(values) {
+                    let mut event = vk::ExportMetalSharedEventInfoEXT::default()
+                        .semaphore(vk::Semaphore::from_raw(object.raw));
+                    let mut export = vk::ExportMetalObjectsInfoEXT::default().push_next(&mut event);
+                    let data = Box::into_raw(Box::new(Arc::downgrade(&self.completion)));
+                    // SAFETY: the wait retains the native semaphore. The native
+                    // listener holds only a cancelable weak readiness capability,
+                    // never guest bytes, an execution slot or a backend borrow.
+                    unsafe {
+                        (api.fp().export_metal_objects_ext)(dev.native.handle(), &mut export);
+                        let observation = trames_graphics::completion::EventObservation::register(
+                            event.mtl_shared_event.cast(),
+                            value,
+                            notify,
+                            data.cast(),
+                            dispose,
+                        )
+                        .ok_or(Failure::Vk(vk::Result::ERROR_FEATURE_NOT_PRESENT))?;
+                        wait._observations.push(observation);
+                    }
+                }
+            }
+            wait
+        };
         let id = self.id();
         self.waits.insert(id, wait);
         Ok(Invocation::Pending(id))

@@ -13,13 +13,21 @@ impl Backend {
         let d = &device.native;
         match op {
             220 => {
-                if a[1] != 0 {
+                if a[1] & !(vk::EventCreateFlags::DEVICE_ONLY.as_raw() as u64) != 0
+                    || a[1] != 0 && device.compute_features & compute::SYNCHRONIZATION2 == 0
+                {
                     return unsupported();
                 }
                 self.room(1)?;
                 output(m, a[2], 8)?;
-                let event = unsafe { d.create_event(&vk::EventCreateInfo::default(), None) }?;
-                let id = self.put(Kind::Event, event.as_raw(), Vec::new(), 0, 0);
+                let event = unsafe {
+                    d.create_event(
+                        &vk::EventCreateInfo::default()
+                            .flags(vk::EventCreateFlags::from_raw(a[1] as u32)),
+                        None,
+                    )
+                }?;
+                let id = self.put(Kind::Event, event.as_raw(), Vec::new(), 0, a[1] as u32);
                 self.publish(m, a[2], id)?;
             }
             221 => self.remove(a[1], Kind::Event)?,

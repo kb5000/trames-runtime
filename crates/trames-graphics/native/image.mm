@@ -4,6 +4,7 @@
 #import <IOSurface/IOSurfaceRef.h>
 #import <Metal/Metal.h>
 #include <algorithm>
+#include <memory>
 struct Image {CVPixelBufferRef buffer;unsigned plane;};
 struct Cache {CVMetalTextureCacheRef cache;id<MTLDevice> device;};
 static unsigned format(Image* image) {
@@ -62,3 +63,21 @@ extern "C" void* trames_graphics_texture(void* pointer,void* cache) { @autorelea
 } }
 extern "C" void* trames_graphics_texture_handle(void* texture) {return (__bridge void*)CVMetalTextureGetTexture((CVMetalTextureRef)texture);}
 extern "C" void trames_graphics_texture_free(void* texture) {CFRelease(texture);}
+
+struct EventCompletion {
+    void (*notify)(void*);void* data;void (*dispose)(void*);
+    ~EventCompletion(){dispose(data);}
+};
+using EventObservation=std::shared_ptr<EventCompletion>;
+extern "C" void* trames_graphics_observe_event(void* pointer,uint64_t value,void (*notify)(void*),void* data,void (*dispose)(void*)) { @autoreleasepool {
+    if(!pointer){dispose(data);return nullptr;}
+    auto owner=std::make_shared<EventCompletion>();owner->notify=notify;owner->data=data;owner->dispose=dispose;
+    std::weak_ptr<EventCompletion> weak=owner;
+    // Use the existing system dispatch pool, without a Trames service thread.
+    static MTLSharedEventListener* listener=[[MTLSharedEventListener alloc] initWithDispatchQueue:dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0)];
+    [(__bridge id<MTLSharedEvent>)pointer notifyListener:listener atValue:value block:^(id<MTLSharedEvent>,uint64_t){
+        if(auto completion=weak.lock())completion->notify(completion->data);
+    }];
+    return new EventObservation(std::move(owner));
+} }
+extern "C" void trames_graphics_cancel_event(void* observation) {delete (EventObservation*)observation;}

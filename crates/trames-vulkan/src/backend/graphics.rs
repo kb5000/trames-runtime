@@ -10,7 +10,9 @@ mod native_commands;
 pub(super) use native_commands::NativeCommands;
 mod render_graph;
 mod render_pass;
+mod sync2;
 mod ycbcr;
+pub(super) use sync2::stage2;
 
 // Keep query, creation and imageless attachment flags on the same profile.
 const IMAGE_CREATE_FLAGS: u64 =
@@ -92,7 +94,9 @@ impl ImageShape {
             .layer_count(r.layer_count))
     }
     fn attachment(self) -> bool {
-        self.ty == vk::ImageType::TYPE_2D && self.mips == 1
+        // Framebuffers accept native 1D views too. A 2D slice of a 3D image
+        // has already been normalized when its image view was created.
+        self.ty != vk::ImageType::TYPE_3D && self.mips == 1
     }
 }
 #[derive(Clone, Debug)]
@@ -305,12 +309,17 @@ fn layout(raw: u64, initial: bool) -> Result<vk::ImageLayout> {
         1000241000..=1000241003 => Ok(vk::ImageLayout::from_raw(raw as i32)),
         1000117000 | 1000117001 => Ok(vk::ImageLayout::from_raw(raw as i32)),
         1000001002 => Ok(vk::ImageLayout::PRESENT_SRC_KHR),
+        1000314000..=1000314001 => Ok(vk::ImageLayout::from_raw(raw as i32)),
         _ => unsupported(),
     }
 }
 fn attachment_reference_layout(raw: u64, depth: bool) -> Result<vk::ImageLayout> {
     let value = layout(raw, false)?;
     if value == vk::ImageLayout::GENERAL
+        || matches!(
+            value,
+            vk::ImageLayout::READ_ONLY_OPTIMAL | vk::ImageLayout::ATTACHMENT_OPTIMAL
+        )
         || !depth && value == vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
         || depth
             && matches!(
@@ -527,6 +536,16 @@ impl Backend {
     }
     pub(super) fn native_layout(&self, raw: u64, initial: bool) -> Result<vk::ImageLayout> {
         let value = layout(raw, initial)?;
+        if matches!(
+            value,
+            vk::ImageLayout::READ_ONLY_OPTIMAL | vk::ImageLayout::ATTACHMENT_OPTIMAL
+        ) && self
+            .device
+            .as_ref()
+            .is_none_or(|d| d.compute_features & compute::SYNCHRONIZATION2 == 0)
+        {
+            return unsupported();
+        }
         if (1000241000..=1000241003).contains(&value.as_raw())
             && self
                 .device
@@ -877,9 +896,9 @@ impl Backend {
         let depth_test = a[14] & 1 != 0;
         let depth_write = a[14] & 2 != 0;
         let compare = ((a[14] >> 4) & 7) as i32;
-        if rendering.is_none() && (depth_test || depth_write) && subpass.depth.is_none() {
-            return invalid();
-        }
+        // The native driver ignores depth/stencil pipeline state when the
+        // subpass has no corresponding attachment. Keep that Vulkan contract
+        // rather than rejecting a reusable application state structure here.
         let cache = if a[13] == 0 {
             None
         } else {
@@ -1405,7 +1424,7 @@ impl Backend {
                 return invalid();
             }
             let s = shape(&image)?;
-            if stride == 12 {
+            if stride == 12 && b[10] != b[11] {
                 for &family in &b[10..12] {
                     if family != u64::from(vk::QUEUE_FAMILY_IGNORED)
                         && !command
@@ -1440,9 +1459,10 @@ impl Backend {
             // native-texture FD adapter uses Metal leases instead of Vulkan
             // external-memory ownership, so only its foreign indices elide.
             let families = if stride == 12
-                && !b[10..12]
-                    .iter()
-                    .any(|f| matches!(*f, 0xfffffffd | 0xfffffffe))
+                && (b[10] == b[11]
+                    || !b[10..12]
+                        .iter()
+                        .any(|f| matches!(*f, 0xfffffffd | 0xfffffffe)))
             {
                 [b[10] as u32, b[11] as u32]
             } else {

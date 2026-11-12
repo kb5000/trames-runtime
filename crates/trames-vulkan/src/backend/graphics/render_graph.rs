@@ -309,25 +309,49 @@ impl Backend {
             }
             subpasses.push(native);
         }
+        let stride = match a[4] {
+            0 | 8 => 8,
+            9 => 9,
+            _ => return unsupported(),
+        };
+        let wire = descriptors::words(m, h[5], h[4], stride)?;
+        let mut sync2 = if stride == 9 {
+            vec![vk::MemoryBarrier2::default(); wire.len() / stride]
+        } else {
+            Vec::new()
+        };
         let mut deps = Vec::new();
-        for r in descriptors::words(m, h[5], h[4], 8)?.chunks_exact(8) {
+        for (i, r) in wire.chunks_exact(stride).enumerate() {
             if r[0] != vk::SUBPASS_EXTERNAL as u64 && r[0] >= subpass_count as u64
                 || r[1] != vk::SUBPASS_EXTERNAL as u64 && r[1] >= subpass_count as u64
                 || r[6] & !7 != 0
             {
                 return invalid();
             }
-            deps.push(
-                vk::SubpassDependency2::default()
-                    .src_subpass(r[0] as u32)
-                    .dst_subpass(r[1] as u32)
+            let overrides = stride == 9 && r[8] != 0;
+            let mut dependency = vk::SubpassDependency2::default()
+                .src_subpass(r[0] as u32)
+                .dst_subpass(r[1] as u32)
+                .dependency_flags(vk::DependencyFlags::from_raw(r[6] as u32))
+                .view_offset(r[7] as i32);
+            if overrides {
+                if device.compute_features & compute::SYNCHRONIZATION2 == 0 {
+                    return unsupported();
+                }
+                sync2[i] = vk::MemoryBarrier2::default()
+                    .src_stage_mask(super::stage2(&device, r[2])?)
+                    .dst_stage_mask(super::stage2(&device, r[3])?)
+                    .src_access_mask(vk::AccessFlags2::from_raw(r[4]))
+                    .dst_access_mask(vk::AccessFlags2::from_raw(r[5]));
+                dependency.p_next = (&sync2[i] as *const vk::MemoryBarrier2).cast();
+            } else {
+                dependency = dependency
                     .src_stage_mask(device.stage(r[2] as u32)?)
                     .dst_stage_mask(device.stage(r[3] as u32)?)
                     .src_access_mask(vk::AccessFlags::from_raw(r[4] as u32))
-                    .dst_access_mask(vk::AccessFlags::from_raw(r[5] as u32))
-                    .dependency_flags(vk::DependencyFlags::from_raw(r[6] as u32))
-                    .view_offset(r[7] as i32),
-            );
+                    .dst_access_mask(vk::AccessFlags::from_raw(r[5] as u32));
+            }
+            deps.push(dependency);
         }
         let correlations = descriptors::words32(m, h[7], h[6])?;
         let info = vk::RenderPassCreateInfo2::default()

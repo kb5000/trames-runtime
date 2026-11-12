@@ -1,5 +1,5 @@
 {
-  "wire_revision": 19,
+  "wire_revision": 20,
   "extensions": [
     {"index": 0, "name": "storage_class", "extension": "VK_KHR_storage_buffer_storage_class", "minimum_api": 0, "promoted": 11},
     {"index": 1, "name": "storage16", "extension": "VK_KHR_16bit_storage", "minimum_api": 0, "promoted": 11},
@@ -44,7 +44,8 @@
     {"index": 40, "name": "copy_commands2", "extension": "VK_KHR_copy_commands2", "minimum_api": 12, "promoted": 13},
     {"index": 41, "name": "format_feature_flags2", "extension": "VK_KHR_format_feature_flags2", "minimum_api": 12, "promoted": 13},
     {"index": 42, "name": "line_rasterization", "extension": "VK_EXT_line_rasterization", "minimum_api": 11, "promoted": 0},
-    {"index": 43, "name": "sample_locations", "extension": "VK_EXT_sample_locations", "minimum_api": 11, "promoted": 0}
+    {"index": 43, "name": "sample_locations", "extension": "VK_EXT_sample_locations", "minimum_api": 11, "promoted": 0},
+    {"index": 44, "name": "synchronization2", "extension": "VK_KHR_synchronization2", "minimum_api": 11, "promoted": 13}
   ],
   "features": [
     {
@@ -389,6 +390,16 @@
         {"c": "stippledRectangularLines", "rust": "stippled_rectangular_lines", "kind": "Bool32", "expose": true},
         {"c": "stippledBresenhamLines", "rust": "stippled_bresenham_lines", "kind": "Bool32", "expose": true},
         {"c": "stippledSmoothLines", "rust": "stippled_smooth_lines", "kind": "Bool32", "expose": true}
+      ]
+    },
+    {
+      "extension": 44,
+      "name": "synchronization2",
+      "type": "PhysicalDeviceSynchronization2Features",
+      "structure_type": "PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES",
+      "bit": 117,
+      "fields": [
+        {"c": "synchronization2", "rust": "synchronization2", "kind": "Bool32", "expose": true}
       ]
     }
   ],

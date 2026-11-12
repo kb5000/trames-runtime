@@ -9,6 +9,7 @@ pub(in crate::backend) struct NativeCommands {
     pub samples: ext::sample_locations::Device,
     pub lines: ext::line_rasterization::Device,
     pub host_copy: ext::host_image_copy::Device,
+    pub sync2: khr::synchronization2::Device,
     pub rendering: khr::dynamic_rendering::Device,
 }
 impl NativeCommands {
@@ -20,6 +21,7 @@ impl NativeCommands {
             samples: ext::sample_locations::Device::new(instance, device),
             lines: ext::line_rasterization::Device::new(instance, device),
             host_copy: ext::host_image_copy::Device::new(instance, device),
+            sync2: khr::synchronization2::Device::new(instance, device),
             rendering: khr::dynamic_rendering::Device::new(instance, device),
         }
     }

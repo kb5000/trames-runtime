@@ -346,6 +346,12 @@ fn resource_graph(
     }
     (resources, seen)
 }
+struct SubmitResources {
+    commands: Vec<Rc<Object>>,
+    semaphores: Vec<(u64, Rc<Object>)>,
+    states: BTreeMap<u64, u8>,
+    timeline_completion: Vec<(Rc<Object>, u64)>,
+}
 struct Submission {
     fence: Rc<Object>,
     commands: Vec<Rc<Object>>,
@@ -694,11 +700,7 @@ impl Backend {
         dev: Arc<Device>,
     ) -> Result<()> {
         let queue = self.queue(a[1])?;
-        // Host-managed sessions retain the native queue's own resource policy.
-        // A fast CPU must not turn 64 unfinished bookkeeping fences into OOM.
-        if self.budget.limit() != u64::MAX && self.submissions.len() >= 64 {
-            return Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY.into());
-        }
+        self.submission_capacity()?;
         // Keep operation 52 readable for the initial ICD. Operation 56 retains
         // each VkSubmitInfo boundary instead of merging semaphore dependencies.
         let stride = if op == 120 { 9 } else { 7 };
@@ -810,18 +812,6 @@ impl Backend {
             batches.push(batch);
         }
         let d = &dev.native;
-        let fence = if a[4] != 0 {
-            let f = self.object(a[4], Kind::Fence)?;
-            if f.acquisition.borrow().is_some()
-                || Self::fence_ready(&f)?
-                || self.submissions.iter().any(|s| Rc::ptr_eq(&s.fence, &f))
-            {
-                return invalid();
-            }
-            f
-        } else {
-            self.private_fence(dev.clone())?
-        };
         let mut timelines: Vec<_> = batches
             .iter()
             .map(|batch| {
@@ -845,6 +835,50 @@ impl Backend {
                 info
             })
             .collect();
+        let resources = SubmitResources {
+            commands,
+            semaphores,
+            states: semaphore_states,
+            timeline_completion,
+        };
+        self.submit_native(m, a[4], dev.clone(), resources, |fence| unsafe {
+            d.queue_submit(queue, &infos, fence)
+        })
+    }
+    fn submission_capacity(&self) -> Result<()> {
+        // Host-managed sessions retain the native queue's own resource policy.
+        // A fast CPU must not turn 64 unfinished bookkeeping fences into OOM.
+        if self.budget.limit() != u64::MAX && self.submissions.len() >= 64 {
+            return Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY.into());
+        }
+        Ok(())
+    }
+    fn submit_native(
+        &mut self,
+        m: &mut impl CpuMemory,
+        fence_id: u64,
+        dev: Arc<Device>,
+        resources: SubmitResources,
+        native_submit: impl FnOnce(vk::Fence) -> std::result::Result<(), vk::Result>,
+    ) -> Result<()> {
+        let SubmitResources {
+            commands,
+            semaphores,
+            states,
+            timeline_completion,
+        } = resources;
+        let fence = if fence_id != 0 {
+            let f = self.object(fence_id, Kind::Fence)?;
+            if f.acquisition.borrow().is_some()
+                || Self::fence_ready(&f)?
+                || self.submissions.iter().any(|s| Rc::ptr_eq(&s.fence, &f))
+            {
+                return invalid();
+            }
+            f
+        } else {
+            self.private_fence(dev.clone())?
+        };
         let mut roots = commands.clone();
         roots.extend(semaphores.iter().map(|(_, s)| s.clone()));
         self.address_resources.retain(|_, weak| {
@@ -868,20 +902,20 @@ impl Backend {
             .collect();
         let coherent_scope = coherent::Scope::resources(&resources);
         self.coherent_sync_scope(m, &coherent_scope, true)?;
-        unsafe { d.queue_submit(queue, &infos, vk::Fence::from_raw(fence.raw)) }?;
+        native_submit(vk::Fence::from_raw(fence.raw))?;
         for c in &commands {
             c.state.set(3);
             c.pending_submissions.set(c.pending_submissions.get() + 1);
         }
         for (id, semaphore) in &semaphores {
-            semaphore.state.set(semaphore_states[id]);
+            semaphore.state.set(states[id]);
         }
         for set in &descriptor_sets {
             set.pending_submissions
                 .set(set.pending_submissions.get() + 1);
         }
         self.coherent_submitted(&coherent_scope);
-        if a[4] != 0 {
+        if fence_id != 0 {
             self.observe_fence(&fence);
         }
         self.submissions.push(Submission {
@@ -1742,7 +1776,11 @@ impl Backend {
                 if a[3] != 0 && !self.virtual_wsi {
                     names.push(ash::khr::swapchain::NAME.as_ptr());
                 }
-                if (self.virtual_wsi || self.capabilities.bits & external::CAPABILITY != 0)
+                // Timeline scheduling exports the original shared event even
+                // in a headless session with native image import disabled.
+                if (self.virtual_wsi
+                    || self.capabilities.bits & external::CAPABILITY != 0
+                    || cfg!(trames_moltenvk) && a[5] & 2 != 0)
                     && cfg!(target_vendor = "apple")
                 {
                     if !ext.iter().any(|e|unsafe {std::ffi::CStr::from_ptr(e.extension_name.as_ptr())}==ash::ext::metal_objects::NAME){return unsupported();}
@@ -1937,6 +1975,8 @@ impl Backend {
             240..=242 => self.image_fd_call(m, op, a)?,
             253..=254 => self.dynamic_rendering(m, op, a)?,
             255 => self.extended_state(m, a)?,
+            266..=270 => self.sync2_command(m, op, a)?,
+            271 => self.submit2(m, a, dev.clone())?,
             259..=263 => self.host_image_call(m, op, a)?,
             112 => {
                 self.room(1)?;
@@ -3002,6 +3042,13 @@ impl Backend {
                 let mut info = vk::SemaphoreCreateInfo::default();
                 if a[2] != 0 {
                     info = info.push_next(&mut ty);
+                }
+                #[cfg(trames_moltenvk)]
+                let mut metal = vk::ExportMetalObjectCreateInfoEXT::default()
+                    .export_object_type(vk::ExportMetalObjectTypeFlagsEXT::METAL_SHARED_EVENT);
+                #[cfg(trames_moltenvk)]
+                if a[2] != 0 {
+                    info = info.push_next(&mut metal);
                 }
                 let raw = unsafe { d.create_semaphore(&info, None) }?;
                 let id = self.put(Kind::Semaphore, raw.as_raw(), vec![], 0, a[2] as u32);

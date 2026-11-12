@@ -5,6 +5,10 @@ use super::*;
 
 impl Device {
     pub(super) fn stage(&self, raw: u32) -> Result<vk::PipelineStageFlags> {
+        // Enabling sync2 also permits NONE in the legacy mask-taking APIs.
+        if raw == 0 && self.compute_features & compute::SYNCHRONIZATION2 != 0 {
+            return Ok(vk::PipelineStageFlags::empty());
+        }
         let stage = compute_stage(raw)?;
         if stage.contains(vk::PipelineStageFlags::TRANSFORM_FEEDBACK_EXT) && self.feedback.is_none()
         {

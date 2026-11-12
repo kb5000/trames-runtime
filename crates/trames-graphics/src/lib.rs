@@ -79,3 +79,5 @@ pub trait ImageFds: Send + Sync {
 }
 mod native;
 pub use native::Context;
+#[cfg(target_vendor = "apple")]
+pub mod completion;
