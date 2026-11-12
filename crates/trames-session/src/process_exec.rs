@@ -202,6 +202,9 @@ impl<C: Cpu> Kernel<C> {
                 t.linux.vfs.release_descriptors();
                 t.linux.vfs.retire_context();
                 t.space.retire();
+                if id != p.tgid {
+                    t.signals.presence.visibility().reap();
+                }
                 Self::release_vfork(&mut t);
                 self.retire_detached_memory(std::mem::take(&mut t.memory))?;
             }
@@ -224,7 +227,9 @@ impl<C: Cpu> Kernel<C> {
         if pid == p.tgid {
             self.publish_task(pid, p);
         }
-        drop(old_presence);
+        if let Some(previous) = old_presence {
+            previous.visibility().reap();
+        }
         self.retire_detached_memory(old_memory)?;
         Ok(())
     }
@@ -873,7 +878,19 @@ mod tests {
                         child.cpu.set_pc(if mode >= 4 { 0x4400 } else { 0x4000 });
                         root.cpu.set_pc(if mode >= 4 { 0x4300 } else { 0x4380 });
                     }
+                    if mode >= 3 {
+                        k.syscall(
+                            1,
+                            &mut root,
+                            220,
+                            [0x10900, 0, 0, 0, 0, 0],
+                            &mut trames_linux::CapturedOutput::default(),
+                        )
+                        .unwrap();
+                        k.processes.get_mut(&3).unwrap().cpu.set_pc(0x4380);
+                    }
                     k.processes.insert(1, root);
+                    let original_peer = (mode >= 3).then(|| k.processes.handle(&3).unwrap());
                     let evaluations = policy.evaluations();
                     let original = k.processes.handle(&1).unwrap();
                     let replacement = k.processes.handle(&if mode >= 3 { 2 } else { 1 }).unwrap();
@@ -882,7 +899,7 @@ mod tests {
                     let epoch = Epoch::with_events(control.clone(), k.workers.events(), true);
                     epoch.bind_lifecycle(Lifecycle::capture(&k));
                     let members = if mode >= 3 {
-                        vec![(1, 0), (2, 0)]
+                        vec![(1, 0), (2, 0), (3, 0)]
                     } else {
                         vec![(1, 0)]
                     };
@@ -957,6 +974,20 @@ mod tests {
                     if mode >= 3 {
                         assert!(!k.processes.directory().contains_original(1, &original));
                         assert!(!k.processes.contains_key(&2));
+                        assert!(
+                            !original.read().signals.presence.present(),
+                            "replaced leader must disappear even with retained original custody"
+                        );
+                        assert!(
+                            !original_peer
+                                .as_ref()
+                                .unwrap()
+                                .read()
+                                .signals
+                                .presence
+                                .present(),
+                            "exec peers must disappear before their old bodies are dropped"
+                        );
                     }
                     assert!(epoch.collect_lifecycle(&mut k).is_none());
                     assert_eq!(k.vm_checkpoint_groups, 1);

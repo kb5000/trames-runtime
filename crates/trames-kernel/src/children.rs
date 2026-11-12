@@ -285,6 +285,28 @@ impl Children {
         }
         !found
     }
+    /// A terminating PID-namespace init consumes its own exited children after
+    /// all original namespace victims have completed. Outer parents' queues
+    /// are separate and retain their real wait rights. No callback runs here.
+    pub(crate) fn reap_exited(self: &Arc<Self>) -> Option<Notice> {
+        let entries = self.entries.lock().unwrap();
+        let mut changed = false;
+        for child in entries.values().filter_map(Weak::upgrade) {
+            let mut state = child.0.lock().unwrap();
+            if !state.reaped && state.exited && Weak::ptr_eq(&state.parent, &Arc::downgrade(self)) {
+                state.reaped = true;
+                state.event = None;
+                state.presence.reap();
+                changed = true;
+            }
+        }
+        if changed {
+            self.reaped.store(true, Ordering::Relaxed);
+            Some(Notice(Some(self.clone()), Weak::new()))
+        } else {
+            None
+        }
+    }
     pub fn wait(
         self: &Arc<Self>,
         request: Wait,

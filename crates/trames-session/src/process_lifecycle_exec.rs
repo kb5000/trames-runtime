@@ -220,6 +220,12 @@ impl<C: Cpu> Lifecycle<C> {
                     t.space.retire();
                     Kernel::release_vfork(t);
                 }
+                // Old peer identities end here, independently of retained
+                // custody/proc metadata. Keep the old leader visible until its
+                // replacement has been published below.
+                if *peer != actual {
+                    t.signals.presence.visibility().reap();
+                }
                 t.state = State::Zombie(0);
                 Kernel::clear_exit_resources(t);
                 t.linux.vfs.retire_task_namespace();
@@ -239,7 +245,9 @@ impl<C: Cpu> Lifecycle<C> {
             p.publish_stop_hold(actual);
             control.finish(Some(p.stop_held()));
             self.tasks.restore(pid, actual, &custody);
-            drop(old_presence);
+            if let Some(previous) = old_presence {
+                previous.visibility().reap();
+            }
             self.memory.retire(old_memory)?;
             epoch.forget_checkpoint_member(pid);
             let elapsed = began.elapsed();

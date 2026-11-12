@@ -430,7 +430,7 @@ impl Families {
     /// its actual shutdown victims complete. Dependencies are original family
     /// references, not a Process scan or a retry on an owner thread.
     pub fn complete(&self, family: &Arc<Family>, status: i32) -> bool {
-        let (exits, reaped, host_notices) = {
+        let (exits, reaped, host_notices, reap_notices) = {
             let mut state = self.0.lock().unwrap();
             let Some(_) = state.original(family) else {
                 return false;
@@ -445,6 +445,7 @@ impl Families {
             let mut ready = vec![family.clone()];
             let mut exits = Vec::new();
             let mut host_notices = Vec::new();
+            let mut reap_notices = Vec::new();
             while let Some(current) = ready.pop() {
                 let Some(entry) = state.original(&current) else {
                     continue;
@@ -459,6 +460,14 @@ impl Families {
                     .parent_of(&current)
                     .and_then(|f| state.original(&f))
                     .is_some_and(|e| e.binding.control.auto_reap_children());
+                if entry.binding.namespace.is_nested()
+                    && entry.binding.namespace.init() == entry.binding.id
+                {
+                    // Like zap_pid_ns_processes: all original victims finished,
+                    // so init can consume its adopted/direct zombies before
+                    // publishing its own exit to its outer parent.
+                    reap_notices.extend(entry.binding.children.reap_exited());
+                }
                 current
                     .status
                     .set(status)
@@ -501,8 +510,12 @@ impl Families {
                 exits,
                 state.entries[&id].binding.child.reaped(),
                 host_notices,
+                reap_notices,
             )
         };
+        for notice in reap_notices {
+            notice.notify();
+        }
         for ready in host_notices {
             ready.notify_locked();
         }
@@ -775,6 +788,52 @@ mod tests {
         families.complete(&leaf.family, 0);
         assert_eq!(outside.wait(&root), Err(Errno(10)));
     }
+    #[test]
+    fn namespace_init_reaps_owned_zombies_but_outer_parents_keep_their_wait_rights() {
+        for child_exits_first in [false, true] {
+            let families = Arc::new(Families::default());
+            let parents = Parents::default();
+            let mut vfs = Vfs::default();
+            let root = vfs.pid_namespace().clone();
+            let outside_init = Process::new(&families, &parents, &root, 1, 0);
+            let outside_parent = Process::new(&families, &parents, &root, 40, 1);
+            vfs.unshare_pid().unwrap();
+            vfs.activate_child_pid(10).unwrap();
+            let nested = vfs.pid_namespace().clone();
+            let init = Process::new(&families, &parents, &nested, 10, 1);
+            let parent = Process::new(&families, &parents, &nested, 20, 10);
+            let leaf = Process::new(&families, &parents, &nested, 30, 20);
+            let foreign = Process::new(&families, &parents, &nested, 50, 40);
+            if child_exits_first {
+                families.retire(&leaf.family, &parents);
+                families.complete(&leaf.family, 9);
+            }
+            assert_eq!(families.retire(&init.family, &parents).victims.len(), 3);
+            families.complete(&init.family, 7 << 8);
+            assert_eq!(init.family.status(), None);
+            for p in [&parent, &leaf, &foreign] {
+                families.retire(&p.family, &parents);
+                families.complete(&p.family, 9);
+            }
+            assert_eq!(init.family.status(), Some(7 << 8));
+            assert!(
+                !parent.signals.presence.present(),
+                "dead namespace init reaps its direct children"
+            );
+            assert!(
+                !leaf.signals.presence.present(),
+                "orphaned and already-exited children are reaped too"
+            );
+            assert!(
+                foreign.signals.presence.present(),
+                "an outer parent retains the real zombie and wait status"
+            );
+            assert_eq!(outside_parent.wait(&root), Ok(Some(50)));
+            assert_eq!(outside_init.wait(&root), Ok(Some(10)));
+            assert_eq!(outside_parent.wait(&root), Err(Errno(10)));
+        }
+    }
+
     #[test]
     fn nonleader_exec_replaces_presence_without_losing_original_family_or_children() {
         let families = Arc::new(Families::default());
