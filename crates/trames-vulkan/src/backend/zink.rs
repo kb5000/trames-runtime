@@ -362,12 +362,12 @@ impl Backend {
         }
         let api = ash::khr::timeline_semaphore::Device::new(&dev.instance.native, d);
         if op == 119 {
-            let count = bounded(a[3], 64)?;
+            let count = a[3];
             if count == 0 || a[4] & !1 != 0 {
                 return invalid();
             }
-            let values = words64(m, a[2], count)?;
-            let objects: Vec<_> = words64(m, a[1], count)?
+            let values = descriptors::words(m, a[2], count, 1)?;
+            let objects: Vec<_> = descriptors::words(m, a[1], count, 1)?
                 .into_iter()
                 .map(|id| self.object(id, Kind::Semaphore))
                 .collect::<Result<_>>()?;

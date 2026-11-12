@@ -105,11 +105,10 @@ impl Backend {
             }
             (a[3], a[4] & 1 != 0, a[5], Kind::Semaphore)
         };
-        let count = bounded(count, 64)?;
         if count == 0 || self.waits.len() >= LIMIT {
             return invalid();
         }
-        let objects = words64(m, a[1], count)?
+        let objects = descriptors::words(m, a[1], count, 1)?
             .into_iter()
             .map(|id| self.object(id, kind))
             .collect::<Result<Vec<_>>>()?;
@@ -125,7 +124,7 @@ impl Backend {
             objects,
             any,
             values: if op == 202 {
-                Some(words64(m, a[2], count)?)
+                Some(descriptors::words(m, a[2], count, 1)?)
             } else {
                 None
             },

@@ -414,6 +414,18 @@ mod tests {
                 );
             }
         }
+        // Vulkan does not limit a host wait to a smoke-test-sized fixed array.
+        // Exercise both the scheduler wait and the original polling adapter.
+        let many: Vec<_> = (0..100)
+            .map(|_| call(&mut b, &mut m, 54, &[device, OUT, 1, 1]))
+            .collect();
+        words(&mut m, 0x3000, &many);
+        words(&mut m, 0x4000, &[1; 100]);
+        for op in [119, 202] {
+            for any in [0, 1] {
+                call(&mut b, &mut m, op, &[device, 0x3000, 0x4000, 100, any, 0]);
+            }
+        }
     }
     #[test]
     #[ignore = "requires original native synchronization2"]
