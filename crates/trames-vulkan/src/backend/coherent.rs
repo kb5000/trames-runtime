@@ -288,6 +288,36 @@ impl Backend {
     }
     /// Keep touched coherent ranges until a successful host readback. Producers
     /// still in flight keep their ranges dirty even if an earlier wait succeeds.
+    /// A synchronous original-image host access has no in-flight producer.
+    /// Synchronize only that image's mapped binding, without observing unrelated
+    /// submissions or adding a queue/device wait. Direct imports need only the
+    /// existing external-write revision notification.
+    pub(super) fn coherent_host_image(
+        &mut self,
+        m: &mut impl CpuMemory,
+        image: &Rc<Object>,
+        up: bool,
+    ) -> Result<()> {
+        if self.mappings.is_empty() || image.memory_binding.get().is_none() {
+            return Ok(());
+        }
+        let scope = Scope::resources(std::slice::from_ref(image));
+        if !up {
+            let mut external = false;
+            for memory in scope.0.keys() {
+                if let Some(map) = self.mappings.get(memory).filter(|map| map.direct) {
+                    if let Some(allocation) = map.memory.host_allocation.borrow().as_ref() {
+                        allocation.revision.fetch_add(1, Ordering::Relaxed);
+                        external = true;
+                    }
+                }
+            }
+            if external {
+                trames_memory::external_memory_changed();
+            }
+        }
+        self.coherent_sync_scope(m, &scope, up)
+    }
     pub(super) fn coherent_submitted(&mut self, scope: &Scope) {
         for (&memory, ranges) in &scope.0 {
             if let Some(map) = self

@@ -1,5 +1,5 @@
 {
-  "wire_revision": 18,
+  "wire_revision": 19,
   "extensions": [
     {"index": 0, "name": "storage_class", "extension": "VK_KHR_storage_buffer_storage_class", "minimum_api": 0, "promoted": 11},
     {"index": 1, "name": "storage16", "extension": "VK_KHR_16bit_storage", "minimum_api": 0, "promoted": 11},
@@ -36,7 +36,15 @@
     {"index": 32, "name": "viewport_layer", "extension": "VK_EXT_shader_viewport_index_layer", "minimum_api": 12, "promoted": 12},
     {"index": 33, "name": "pipeline_cache_control", "extension": "VK_EXT_pipeline_creation_cache_control", "minimum_api": 0, "promoted": 13},
     {"index": 34, "name": "dynamic_rendering", "extension": "VK_KHR_dynamic_rendering", "minimum_api": 12, "promoted": 13},
-    {"index": 35, "name": "memory_budget", "extension": "VK_EXT_memory_budget", "minimum_api": 11, "promoted": 0}
+    {"index": 35, "name": "memory_budget", "extension": "VK_EXT_memory_budget", "minimum_api": 11, "promoted": 0},
+    {"index": 36, "name": "extended_dynamic_state", "extension": "VK_EXT_extended_dynamic_state", "minimum_api": 11, "promoted": 13},
+    {"index": 37, "name": "extended_dynamic_state2", "extension": "VK_EXT_extended_dynamic_state2", "minimum_api": 11, "promoted": 13},
+    {"index": 38, "name": "extended_dynamic_state3", "extension": "VK_EXT_extended_dynamic_state3", "minimum_api": 11, "promoted": 0},
+    {"index": 39, "name": "host_image_copy", "extension": "VK_EXT_host_image_copy", "minimum_api": 12, "promoted": 14},
+    {"index": 40, "name": "copy_commands2", "extension": "VK_KHR_copy_commands2", "minimum_api": 12, "promoted": 13},
+    {"index": 41, "name": "format_feature_flags2", "extension": "VK_KHR_format_feature_flags2", "minimum_api": 12, "promoted": 13},
+    {"index": 42, "name": "line_rasterization", "extension": "VK_EXT_line_rasterization", "minimum_api": 11, "promoted": 0},
+    {"index": 43, "name": "sample_locations", "extension": "VK_EXT_sample_locations", "minimum_api": 11, "promoted": 0}
   ],
   "features": [
     {
@@ -295,6 +303,93 @@
           "expose": true
         }
       ]
+    },
+    {
+      "extension": 36,
+      "name": "extended_dynamic_state",
+      "type": "PhysicalDeviceExtendedDynamicStateFeaturesEXT",
+      "structure_type": "PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT",
+      "bit": 75,
+      "fields": [
+        {"c": "extendedDynamicState", "rust": "extended_dynamic_state", "kind": "Bool32", "expose": true}
+      ]
+    },
+    {
+      "extension": 37,
+      "name": "extended_dynamic_state2",
+      "type": "PhysicalDeviceExtendedDynamicState2FeaturesEXT",
+      "structure_type": "PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT",
+      "bit": 76,
+      "fields": [
+        {"c": "extendedDynamicState2", "rust": "extended_dynamic_state2", "kind": "Bool32", "expose": true},
+        {"c": "extendedDynamicState2LogicOp", "rust": "extended_dynamic_state2_logic_op", "kind": "Bool32", "expose": true},
+        {"c": "extendedDynamicState2PatchControlPoints", "rust": "extended_dynamic_state2_patch_control_points", "kind": "Bool32", "expose": true}
+      ]
+    },
+    {
+      "extension": 38,
+      "name": "extended_dynamic_state3",
+      "type": "PhysicalDeviceExtendedDynamicState3FeaturesEXT",
+      "structure_type": "PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT",
+      "bit": 79,
+      "fields": [
+        {"c": "extendedDynamicState3TessellationDomainOrigin", "rust": "extended_dynamic_state3_tessellation_domain_origin", "kind": "Bool32", "expose": false},
+        {"c": "extendedDynamicState3DepthClampEnable", "rust": "extended_dynamic_state3_depth_clamp_enable", "kind": "Bool32", "expose": true},
+        {"c": "extendedDynamicState3PolygonMode", "rust": "extended_dynamic_state3_polygon_mode", "kind": "Bool32", "expose": true},
+        {"c": "extendedDynamicState3RasterizationSamples", "rust": "extended_dynamic_state3_rasterization_samples", "kind": "Bool32", "expose": false},
+        {"c": "extendedDynamicState3SampleMask", "rust": "extended_dynamic_state3_sample_mask", "kind": "Bool32", "expose": false},
+        {"c": "extendedDynamicState3AlphaToCoverageEnable", "rust": "extended_dynamic_state3_alpha_to_coverage_enable", "kind": "Bool32", "expose": false},
+        {"c": "extendedDynamicState3AlphaToOneEnable", "rust": "extended_dynamic_state3_alpha_to_one_enable", "kind": "Bool32", "expose": false},
+        {"c": "extendedDynamicState3LogicOpEnable", "rust": "extended_dynamic_state3_logic_op_enable", "kind": "Bool32", "expose": false},
+        {"c": "extendedDynamicState3ColorBlendEnable", "rust": "extended_dynamic_state3_color_blend_enable", "kind": "Bool32", "expose": false},
+        {"c": "extendedDynamicState3ColorBlendEquation", "rust": "extended_dynamic_state3_color_blend_equation", "kind": "Bool32", "expose": false},
+        {"c": "extendedDynamicState3ColorWriteMask", "rust": "extended_dynamic_state3_color_write_mask", "kind": "Bool32", "expose": false},
+        {"c": "extendedDynamicState3RasterizationStream", "rust": "extended_dynamic_state3_rasterization_stream", "kind": "Bool32", "expose": false},
+        {"c": "extendedDynamicState3ConservativeRasterizationMode", "rust": "extended_dynamic_state3_conservative_rasterization_mode", "kind": "Bool32", "expose": false},
+        {"c": "extendedDynamicState3ExtraPrimitiveOverestimationSize", "rust": "extended_dynamic_state3_extra_primitive_overestimation_size", "kind": "Bool32", "expose": false},
+        {"c": "extendedDynamicState3DepthClipEnable", "rust": "extended_dynamic_state3_depth_clip_enable", "kind": "Bool32", "expose": false},
+        {"c": "extendedDynamicState3SampleLocationsEnable", "rust": "extended_dynamic_state3_sample_locations_enable", "kind": "Bool32", "expose": true},
+        {"c": "extendedDynamicState3ColorBlendAdvanced", "rust": "extended_dynamic_state3_color_blend_advanced", "kind": "Bool32", "expose": false},
+        {"c": "extendedDynamicState3ProvokingVertexMode", "rust": "extended_dynamic_state3_provoking_vertex_mode", "kind": "Bool32", "expose": false},
+        {"c": "extendedDynamicState3LineRasterizationMode", "rust": "extended_dynamic_state3_line_rasterization_mode", "kind": "Bool32", "expose": true},
+        {"c": "extendedDynamicState3LineStippleEnable", "rust": "extended_dynamic_state3_line_stipple_enable", "kind": "Bool32", "expose": false},
+        {"c": "extendedDynamicState3DepthClipNegativeOneToOne", "rust": "extended_dynamic_state3_depth_clip_negative_one_to_one", "kind": "Bool32", "expose": false},
+        {"c": "extendedDynamicState3ViewportWScalingEnable", "rust": "extended_dynamic_state3_viewport_w_scaling_enable", "kind": "Bool32", "expose": false},
+        {"c": "extendedDynamicState3ViewportSwizzle", "rust": "extended_dynamic_state3_viewport_swizzle", "kind": "Bool32", "expose": false},
+        {"c": "extendedDynamicState3CoverageToColorEnable", "rust": "extended_dynamic_state3_coverage_to_color_enable", "kind": "Bool32", "expose": false},
+        {"c": "extendedDynamicState3CoverageToColorLocation", "rust": "extended_dynamic_state3_coverage_to_color_location", "kind": "Bool32", "expose": false},
+        {"c": "extendedDynamicState3CoverageModulationMode", "rust": "extended_dynamic_state3_coverage_modulation_mode", "kind": "Bool32", "expose": false},
+        {"c": "extendedDynamicState3CoverageModulationTableEnable", "rust": "extended_dynamic_state3_coverage_modulation_table_enable", "kind": "Bool32", "expose": false},
+        {"c": "extendedDynamicState3CoverageModulationTable", "rust": "extended_dynamic_state3_coverage_modulation_table", "kind": "Bool32", "expose": false},
+        {"c": "extendedDynamicState3CoverageReductionMode", "rust": "extended_dynamic_state3_coverage_reduction_mode", "kind": "Bool32", "expose": false},
+        {"c": "extendedDynamicState3RepresentativeFragmentTestEnable", "rust": "extended_dynamic_state3_representative_fragment_test_enable", "kind": "Bool32", "expose": false},
+        {"c": "extendedDynamicState3ShadingRateImageEnable", "rust": "extended_dynamic_state3_shading_rate_image_enable", "kind": "Bool32", "expose": false}
+      ]
+    },
+    {
+      "extension": 39,
+      "name": "host_image_copy",
+      "type": "PhysicalDeviceHostImageCopyFeaturesEXT",
+      "structure_type": "PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT",
+      "bit": 110,
+      "fields": [
+        {"c": "hostImageCopy", "rust": "host_image_copy", "kind": "Bool32", "expose": true}
+      ]
+    },
+    {
+      "extension": 42,
+      "name": "line_rasterization",
+      "type": "PhysicalDeviceLineRasterizationFeaturesEXT",
+      "structure_type": "PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES_EXT",
+      "bit": 111,
+      "fields": [
+        {"c": "rectangularLines", "rust": "rectangular_lines", "kind": "Bool32", "expose": true},
+        {"c": "bresenhamLines", "rust": "bresenham_lines", "kind": "Bool32", "expose": true},
+        {"c": "smoothLines", "rust": "smooth_lines", "kind": "Bool32", "expose": true},
+        {"c": "stippledRectangularLines", "rust": "stippled_rectangular_lines", "kind": "Bool32", "expose": true},
+        {"c": "stippledBresenhamLines", "rust": "stippled_bresenham_lines", "kind": "Bool32", "expose": true},
+        {"c": "stippledSmoothLines", "rust": "stippled_smooth_lines", "kind": "Bool32", "expose": true}
+      ]
     }
   ],
   "properties": [
@@ -429,6 +524,22 @@
         {"c": "supportedStencilResolveModes", "rust": "supported_stencil_resolve_modes", "kind": "ResolveModeFlags"},
         {"c": "independentResolveNone", "rust": "independent_resolve_none", "kind": "Bool32"},
         {"c": "independentResolve", "rust": "independent_resolve", "kind": "Bool32"}
+      ]
+    },
+    {
+      "type": "PhysicalDeviceExtendedDynamicState3PropertiesEXT",
+      "structure_type": "PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_PROPERTIES_EXT",
+      "extension": 38,
+      "fields": [
+        {"c": "dynamicPrimitiveTopologyUnrestricted", "rust": "dynamic_primitive_topology_unrestricted", "kind": "Bool32"}
+      ]
+    },
+    {
+      "type": "PhysicalDeviceLineRasterizationPropertiesEXT",
+      "structure_type": "PHYSICAL_DEVICE_LINE_RASTERIZATION_PROPERTIES_EXT",
+      "extension": 42,
+      "fields": [
+        {"c": "lineSubPixelPrecisionBits", "rust": "line_sub_pixel_precision_bits", "kind": "u32"}
       ]
     }
   ],

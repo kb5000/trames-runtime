@@ -307,8 +307,6 @@ impl Backend {
                 .as_ref()
                 .ok_or(Failure::Vk(vk::Result::ERROR_UNKNOWN))?;
             if !pass.compatible_pipeline(p, r.subpass)
-                || !r.viewport && p.static_states.get() & 1 == 0
-                || !r.scissor && p.static_states.get() & 2 == 0
                 || [a[2], a[3], a[6], a[7]]
                     .iter()
                     .any(|&n| n > u32::MAX as u64)

@@ -99,6 +99,7 @@ struct Device {
     feedback_extension: bool,
     divisor: Option<zink::Divisor>,
     portability: Option<vk::PhysicalDevicePortabilitySubsetFeaturesKHR<'static>>,
+    commands: graphics::NativeCommands,
     native: ash::Device,
     instance: Arc<Instance>,
     atom: u64,
@@ -109,6 +110,7 @@ struct Device {
     max_color_attachments: u32,
     compute_workgroup_count: [u32; 3],
     compute_features: u128,
+    compute_extensions: u64,
 }
 impl Drop for Device {
     fn drop(&mut self) {
@@ -212,6 +214,21 @@ struct Object {
     _count: Option<ObjectLease>,
 }
 impl Object {
+    fn unmap_native(&self) {
+        if !self
+            .host_allocation
+            .borrow()
+            .as_ref()
+            .is_some_and(|o| o.owns_native())
+        {
+            unsafe {
+                self.device
+                    .native
+                    .unmap_memory(vk::DeviceMemory::from_raw(self.raw));
+            }
+        }
+        self.mapped.set(0);
+    }
     fn retain(&self, other: Rc<Object>) {
         let mut deps = self.deps.borrow_mut();
         if !deps.iter().any(|x| Rc::ptr_eq(x, &other)) {
@@ -248,6 +265,16 @@ impl Drop for Object {
                         self.external.get_mut().as_deref(),
                         Some(external::Resource::Memory { .. })
                     ) {
+                        return;
+                    }
+                    if self
+                        .host_allocation
+                        .get_mut()
+                        .as_ref()
+                        .is_some_and(|o| o.owns_native())
+                    {
+                        // Its original native memory/device belongs to the last
+                        // guest mapping lease, not this logical handle table.
                         return;
                     }
                     if self.mapped.get() != 0 {
@@ -667,7 +694,9 @@ impl Backend {
         dev: Arc<Device>,
     ) -> Result<()> {
         let queue = self.queue(a[1])?;
-        if self.submissions.len() >= 64 {
+        // Host-managed sessions retain the native queue's own resource policy.
+        // A fast CPU must not turn 64 unfinished bookkeeping fences into OOM.
+        if self.budget.limit() != u64::MAX && self.submissions.len() >= 64 {
             return Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY.into());
         }
         // Keep operation 52 readable for the initial ICD. Operation 56 retains
@@ -1040,16 +1069,25 @@ impl Backend {
         if trace {
             eprintln!("trames-vulkan op={operation} args={a:x?}");
         }
-        if !core_commands::records_only(operation) {
+        // Synchronous original-image host access needs no unrelated GPU poll.
+        if !core_commands::records_only(operation) && !(259..=263).contains(&operation) {
             self.collect();
         }
         if operation == 17
             && a[5] == shared_memory::MAP_SHARED
             && !memory.can_import_mapping()
-            && self
-                .objects
-                .get(&a[1])
-                .is_some_and(|o| o.host_allocation.borrow().is_some())
+            && self.objects.get(&a[1]).is_some_and(|o| {
+                o.host_allocation.borrow().is_some()
+                    || o.flags
+                        & (vk::MemoryPropertyFlags::HOST_VISIBLE
+                            | vk::MemoryPropertyFlags::HOST_COHERENT)
+                            .as_raw()
+                        == (vk::MemoryPropertyFlags::HOST_VISIBLE
+                            | vk::MemoryPropertyFlags::HOST_COHERENT)
+                            .as_raw()
+                        && o.size
+                            .is_multiple_of(trames_memory::host_mapping_granule() as u64)
+            })
         {
             return Ok(Invocation::Checkpoint);
         }
@@ -1456,7 +1494,9 @@ impl Backend {
             || op == 150
             || op == 206
             || op == 207
-            || op == 252)
+            || op == 252
+            || (256..=258).contains(&op)
+            || (264..=265).contains(&op))
             && a[0]
                 != if op == 3 {
                     self.instance_id
@@ -1468,6 +1508,8 @@ impl Backend {
         }
         match op {
             252 => self.memory_budget(m, a)?,
+            256..=258 => self.host_image_query(m, op, a)?,
+            264..=265 => self.sample_locations_query(m, op, a)?,
             206 => {
                 let c = &self.capabilities.compute;
                 let words = [
@@ -1831,6 +1873,7 @@ impl Backend {
                             ..p
                         }),
                     portability: self.capabilities.portability,
+                    commands: graphics::NativeCommands::new(&instance.native, &native),
                     native,
                     instance,
                     atom: limits.non_coherent_atom_size,
@@ -1840,6 +1883,7 @@ impl Backend {
                     max_indirect_draw_count: limits.max_draw_indirect_count,
                     max_color_attachments: limits.max_color_attachments,
                     compute_workgroup_count: limits.max_compute_work_group_count,
+                    compute_extensions: a[6],
                     compute_features: a[7] as u128 | ((a[8] as u128) << 64),
                 }));
                 self.device_id = self.id();
@@ -1892,6 +1936,8 @@ impl Backend {
         match op {
             240..=242 => self.image_fd_call(m, op, a)?,
             253..=254 => self.dynamic_rendering(m, op, a)?,
+            255 => self.extended_state(m, a)?,
+            259..=263 => self.host_image_call(m, op, a)?,
             112 => {
                 self.room(1)?;
                 output(m, a[1], 8)?;
@@ -2141,10 +2187,7 @@ impl Backend {
             }
             15 => {
                 if let Some(map) = self.mappings.remove(&a[1]) {
-                    unsafe {
-                        d.unmap_memory(vk::DeviceMemory::from_raw(map.memory.raw));
-                    }
-                    map.memory.mapped.set(0);
+                    map.memory.unmap_native();
                 }
                 self.coherent_pending.remove(a[1]);
                 self.remove(a[1], Kind::Memory)?;
@@ -2198,12 +2241,47 @@ impl Backend {
                     return invalid();
                 }
                 output(m, a[4], len as usize)?;
-                let shared = if a[5] == shared_memory::MAP_SHARED {
-                    mem.host_allocation.borrow().clone()
+                let owner = mem.host_allocation.borrow().clone();
+                let ptr = if let Some(owner) = owner.as_ref().filter(|o| o.owns_native()) {
+                    owner.pointer().cast()
                 } else {
-                    None
+                    unsafe {
+                        d.map_memory(
+                            vk::DeviceMemory::from_raw(mem.raw),
+                            0,
+                            vk::WHOLE_SIZE,
+                            vk::MemoryMapFlags::empty(),
+                        )
+                    }?
                 };
-                let direct = if let Some(owner) = shared {
+                let granule = trames_memory::host_mapping_granule();
+                if a[5] == shared_memory::MAP_SHARED
+                    && owner.is_none()
+                    && mem.flags & vk::MemoryPropertyFlags::HOST_COHERENT.as_raw() != 0
+                    && mem.size.is_multiple_of(granule as u64)
+                    && (ptr as usize).is_multiple_of(granule)
+                {
+                    // SAFETY: the original whole-allocation mapping covers only
+                    // owned complete granules. Ownership and its live budget
+                    // charge transfer before any fallible guest-map operation.
+                    *mem.host_allocation.borrow_mut() = Some(unsafe {
+                        shared_memory::Allocation::native(
+                            ptr.cast(),
+                            mem.size as usize,
+                            vk::DeviceMemory::from_raw(mem.raw),
+                            mem.device.clone(),
+                            &self.budget,
+                        )
+                    });
+                }
+                mem.mapped.set(ptr as usize);
+                let direct = (|| -> Result<bool> {
+                    if a[5] != shared_memory::MAP_SHARED {
+                        return Ok(false);
+                    }
+                    let Some(owner) = mem.host_allocation.borrow().clone() else {
+                        return Ok(false);
+                    };
                     let page = trames_memory::PAGE_SIZE;
                     let padding = a[2] % page;
                     if a[4] % page != padding {
@@ -2212,25 +2290,28 @@ impl Backend {
                     let length = (padding + len)
                         .checked_next_multiple_of(page)
                         .ok_or(Failure::Vk(vk::Result::ERROR_MEMORY_MAP_FAILED))?;
+                    let offset = a[2] - padding;
+                    if offset
+                        .checked_add(length)
+                        .is_none_or(|end| end > owner.len() as u64)
+                    {
+                        return Ok(false);
+                    }
                     let mapping = owner
-                        .mapping((a[2] - padding) as usize)
+                        .mapping(offset as usize)
                         .ok_or(Failure::Vk(vk::Result::ERROR_MEMORY_MAP_FAILED))?;
                     m.import_mapping(a[4] - padding, length, mapping)?;
                     self.transfers.shared_maps += 1;
                     self.transfers.shared_map_bytes += len;
-                    true
-                } else {
-                    false
+                    Ok(true)
+                })();
+                let direct = match direct {
+                    Ok(v) => v,
+                    Err(e) => {
+                        mem.unmap_native();
+                        return Err(e);
+                    }
                 };
-                let ptr = unsafe {
-                    d.map_memory(
-                        vk::DeviceMemory::from_raw(mem.raw),
-                        0,
-                        vk::WHOLE_SIZE,
-                        vk::MemoryMapFlags::empty(),
-                    )
-                }?;
-                mem.mapped.set(ptr as usize);
                 let initialized = (|| -> Result<Option<coherent::CoherentBytes>> {
                     if direct || mem.flags & vk::MemoryPropertyFlags::HOST_COHERENT.as_raw() == 0 {
                         return Ok(None);
@@ -2254,10 +2335,7 @@ impl Backend {
                 let coherent = match initialized {
                     Ok(v) => v,
                     Err(e) => {
-                        unsafe {
-                            d.unmap_memory(vk::DeviceMemory::from_raw(mem.raw));
-                        }
-                        mem.mapped.set(0);
+                        mem.unmap_native();
                         return Err(e);
                     }
                 };
@@ -2283,10 +2361,7 @@ impl Backend {
                 self.record_transfer(t);
                 let map = self.mappings.remove(&a[1]).unwrap();
                 self.coherent_pending.remove(a[1]);
-                unsafe {
-                    d.unmap_memory(vk::DeviceMemory::from_raw(map.memory.raw));
-                }
-                map.memory.mapped.set(0);
+                map.memory.unmap_native();
             }
             19 | 20 => {
                 let map = self

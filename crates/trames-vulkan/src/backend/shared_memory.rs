@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Stable host-visible allocations imported by both the driver and guest MMU.
+//! Stable caller-owned buffer imports and original native allocation mappings.
+//! Generic Vulkan memory stays driver-owned so image/buffer aliases keep their
+//! original layout and storage. Guest views retain the actual native owner.
 use super::*;
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 pub(super) const MAP_SHARED: u64 = 0x5348_4152_4544;
@@ -7,8 +9,16 @@ pub(super) const MAP_SHARED: u64 = 0x5348_4152_4544;
 pub(super) struct Allocation {
     pub(super) revision: Arc<AtomicU64>,
     pointer: usize,
-    layout: Layout,
+    length: usize,
+    storage: Storage,
     budget: crate::Budget,
+}
+enum Storage {
+    Host(Layout),
+    Native {
+        memory: vk::DeviceMemory,
+        device: Arc<Device>,
+    },
 }
 impl Allocation {
     pub(super) fn new(size: u64, alignment: u64, budget: &crate::Budget) -> Result<Arc<Self>> {
@@ -34,15 +44,41 @@ impl Allocation {
         Ok(Arc::new(Self {
             revision: Arc::default(),
             pointer,
-            layout,
+            length: layout.size(),
+            storage: Storage::Host(layout),
             budget: budget.clone(),
         }))
+    }
+    /// Transfer the original allocation/mapping and its existing budget charge.
+    ///
+    /// # Safety
+    /// The whole allocation is mapped at pointer, initialized foreign storage,
+    /// and its complete page granules are owned exclusively by this allocation.
+    /// The caller immediately publishes this owner, then never unmaps/frees the
+    /// native memory itself. The retained original device outlives that free.
+    pub(super) unsafe fn native(
+        pointer: *mut u8,
+        size: usize,
+        memory: vk::DeviceMemory,
+        device: Arc<Device>,
+        budget: &crate::Budget,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            revision: Arc::default(),
+            pointer: pointer as usize,
+            length: size,
+            storage: Storage::Native { memory, device },
+            budget: budget.clone(),
+        })
+    }
+    pub(super) fn owns_native(&self) -> bool {
+        matches!(self.storage, Storage::Native { .. })
     }
     pub(super) fn pointer(&self) -> *mut u8 {
         self.pointer as *mut u8
     }
     pub(super) fn len(&self) -> usize {
-        self.layout.size()
+        self.length
     }
     pub(super) fn mapping(self: &Arc<Self>, offset: usize) -> Option<trames_memory::SharedMapping> {
         // SAFETY: the allocation is initialized stable host storage. Both native
@@ -57,9 +93,18 @@ impl Allocation {
 }
 impl Drop for Allocation {
     fn drop(&mut self) {
-        // SAFETY: final native/mapping owner releases the exact original layout.
-        unsafe { dealloc(self.pointer(), self.layout) };
-        self.budget.release(self.layout.size() as u64);
+        // SAFETY: final guest/native owner releases its exact original storage.
+        // Native mappings keep both device and instance alive until this point.
+        unsafe {
+            match &self.storage {
+                Storage::Host(layout) => dealloc(self.pointer(), *layout),
+                Storage::Native { memory, device } => {
+                    device.native.unmap_memory(*memory);
+                    device.native.free_memory(*memory, None);
+                }
+            }
+        }
+        self.budget.release(self.length as u64);
     }
 }
 
@@ -72,7 +117,9 @@ impl Backend {
         flags: u32,
         mut dedicated: vk::MemoryDedicatedAllocateInfo<'_>,
     ) -> Option<Result<(vk::DeviceMemory, Arc<Allocation>)>> {
-        if dev.host_alignment == 0 {
+        // Only an explicit dedicated-buffer contract excludes future image
+        // bindings. Generic allocations must retain native image/buffer aliases.
+        if dev.host_alignment == 0 || dedicated.buffer.is_null() {
             return None;
         }
         Some((|| {

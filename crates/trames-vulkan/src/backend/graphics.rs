@@ -4,9 +4,17 @@
 use super::*;
 mod commands;
 mod dynamic;
+mod extended;
+mod host_copy;
+mod native_commands;
+pub(super) use native_commands::NativeCommands;
 mod render_graph;
 mod render_pass;
 mod ycbcr;
+
+// Keep query, creation and imageless attachment flags on the same profile.
+const IMAGE_CREATE_FLAGS: u64 =
+    0x138 | vk::ImageCreateFlags::SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_EXT.as_raw() as u64;
 
 #[derive(Clone, Copy)]
 pub(super) struct ImageShape {
@@ -178,9 +186,8 @@ pub(super) struct Recording {
     pass2: bool,
     pub compute_pipeline: Option<Rc<Object>>,
     pub vertices: BTreeMap<u32, (Rc<Object>, u64)>,
+    pub vertex_strides: BTreeMap<u32, u64>,
     index: Option<(Rc<Object>, u64, u32)>,
-    pub viewport: bool,
-    pub scissor: bool,
     pub feedback_active: bool,
     pub feedback_buffers: BTreeMap<u32, (Rc<Object>, u64, u64)>,
     pub queries: BTreeMap<(i32, u32), (Rc<Object>, u32)>,
@@ -274,7 +281,8 @@ fn usage(raw: u64) -> Result<vk::ImageUsageFlags> {
         | vk::ImageUsageFlags::STORAGE
         | vk::ImageUsageFlags::TRANSIENT_ATTACHMENT
         | vk::ImageUsageFlags::INPUT_ATTACHMENT
-        | vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT;
+        | vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+        | vk::ImageUsageFlags::HOST_TRANSFER_EXT;
     if raw == 0 || raw & !(allowed.as_raw() as u64) != 0 {
         return unsupported();
     }
@@ -452,8 +460,6 @@ impl Backend {
             if pipeline.flags != vk::PipelineBindPoint::GRAPHICS.as_raw() as u32
                 || pipeline.size as usize != recording.subpass
                 || !pass.compatible_pipeline(pipeline, recording.subpass)
-                || !recording.viewport && pipeline.static_states.get() & 1 == 0
-                || !recording.scissor && pipeline.static_states.get() & 2 == 0
                 || indexed && recording.index.is_none()
                 || pipeline
                     .vertex_inputs
@@ -645,7 +651,7 @@ impl Backend {
         output(m, a[6], 32)?;
         let ty = image_type(a[2])?;
         if a[3] > vk::ImageTiling::LINEAR.as_raw() as u64
-            || a[5] & !0x138 != 0
+            || a[5] & !IMAGE_CREATE_FLAGS != 0
             || a[5] & 16 != 0 && ty != vk::ImageType::TYPE_2D
             || a[5] & 32 != 0
                 && (ty != vk::ImageType::TYPE_3D
@@ -780,6 +786,32 @@ impl Backend {
         if std::env::var_os("TRAMES_VULKAN_TRACE").is_some() {
             eprintln!("trames-vulkan graphics-config={config:x?}");
         }
+        let extended = if config[0] & 524288 != 0 {
+            extended::pipeline_states(m, a[15] + 116 * 8, &device)?
+        } else {
+            Vec::new()
+        };
+        let dynamic_stride = extended.contains(&vk::DynamicState::VERTEX_INPUT_BINDING_STRIDE);
+        let raster_values = if config[0] & 2097152 != 0 {
+            words64(m, a[15] + 128 * 8, 4)?
+                .into_iter()
+                .map(|x| f32::from_bits(x as u32))
+                .collect::<Vec<_>>()
+        } else {
+            vec![1.0, 0.0, 0.0, 0.0]
+        };
+
+        let extra = if config[0] & 1048576 != 0 {
+            words64(m, a[15] + 118 * 8, 10)?
+        } else {
+            vec![0; 10]
+        };
+        let owned_sample_locations = extended::sample_locations(
+            m,
+            extra[4] != 0 || extended.contains(&vk::DynamicState::SAMPLE_LOCATIONS_ENABLE_EXT),
+            &extra[5..10],
+        )?;
+
         let rendering = if state[0] == 0 {
             if device.compute_features & compute::DYNAMIC_RENDERING == 0 || config[0] & 262144 == 0
             {
@@ -824,11 +856,11 @@ impl Backend {
         if state[1] == 5 && device.portability.is_some_and(|p| p.triangle_fans == 0) {
             return unsupported();
         }
-        if a[12] > 1 || a[12] != 0 && !matches!(state[1], 2 | 4 | 5) {
-            return unsupported();
+        if a[12] > 1 {
+            return invalid();
         }
         let restart = a[12] != 0;
-        if a[14] & !0x3f773 != 0 {
+        if a[14] & !0x7f773 != 0 {
             return unsupported();
         }
         let polygon = ((a[14] >> 8) & 3) as i32;
@@ -839,9 +871,8 @@ impl Backend {
         {
             return unsupported();
         }
-        if polygon == 2 && device.portability.is_some_and(|p| p.point_polygons == 0) {
-            return unsupported();
-        }
+        // Native pipeline creation owns portability-dependent polygon modes.
+        // An unused static pipeline must not constrain a later dynamic pipeline.
         let logic_op = ((a[14] >> 12) & 15) as i32;
         let depth_test = a[14] & 1 != 0;
         let depth_write = a[14] & 2 != 0;
@@ -866,7 +897,7 @@ impl Backend {
         .limits;
         // Extended graphics state is copied before the asynchronous native
         // compiler starts; no guest pointers enter that worker.
-        if config[0] & !524287 != 0 {
+        if config[0] & !4194303 != 0 {
             return unsupported();
         }
         let creation_flags = if config[0] & 65536 != 0 {
@@ -999,7 +1030,7 @@ impl Backend {
                     .color_write_mask(vk::ColorComponentFlags::from_raw(v[7] as u32)),
             );
         }
-        let static_states = (!config[0] & 3) as u8;
+        let static_states = (!config[0] & 3) as u8 | if dynamic_stride { 4 } else { 0 };
         let mut static_viewports = Vec::new();
         let mut static_scissors = Vec::new();
         if static_states & 1 != 0 {
@@ -1116,6 +1147,7 @@ impl Backend {
             if device
                 .portability
                 .is_some_and(|p| p.vertex_attribute_access_beyond_stride == 0)
+                && !dynamic_stride
                 && x[3] + size as u64 > input.stride as u64
             {
                 return unsupported();
@@ -1194,13 +1226,31 @@ impl Backend {
             if !static_scissors.is_empty() {
                 viewport = viewport.scissors(&static_scissors);
             }
-            let raster = vk::PipelineRasterizationStateCreateInfo::default()
+            if extended.contains(&vk::DynamicState::VIEWPORT_WITH_COUNT) {
+                viewport.viewport_count = 0;
+            }
+            if extended.contains(&vk::DynamicState::SCISSOR_WITH_COUNT) {
+                viewport.scissor_count = 0;
+            }
+            let mut raster = vk::PipelineRasterizationStateCreateInfo::default()
                 .rasterizer_discard_enable(a[14] & 65536 != 0)
+                .depth_clamp_enable(a[14] & 262144 != 0)
                 .depth_bias_enable(a[14] & 131072 != 0)
                 .polygon_mode(vk::PolygonMode::from_raw(polygon))
                 .cull_mode(vk::CullModeFlags::from_raw(state[2] as u32))
                 .front_face(vk::FrontFace::from_raw(state[3] as i32))
-                .line_width(1.0);
+                .line_width(raster_values[0])
+                .depth_bias_constant_factor(raster_values[1])
+                .depth_bias_clamp(raster_values[2])
+                .depth_bias_slope_factor(raster_values[3]);
+            let mut line = vk::PipelineRasterizationLineStateCreateInfoEXT::default()
+                .line_rasterization_mode(vk::LineRasterizationModeEXT::from_raw(extra[0] as i32))
+                .stippled_line_enable(extra[1] != 0)
+                .line_stipple_factor(extra[2] as u32)
+                .line_stipple_pattern(extra[3] as u16);
+            if device.compute_extensions & compute::EXT_LINE_RASTERIZATION != 0 {
+                raster = raster.push_next(&mut line);
+            }
             let multisample = vk::PipelineMultisampleStateCreateInfo::default()
                 .rasterization_samples(samples)
                 .alpha_to_coverage_enable(alpha_coverage)
@@ -1215,7 +1265,20 @@ impl Backend {
                     u32::MAX
                 },
             ];
-            let multisample = multisample.sample_mask(&sample_masks);
+            let mut multisample = multisample.sample_mask(&sample_masks);
+            let sample_info = vk::SampleLocationsInfoEXT::default()
+                .sample_locations_per_pixel(vk::SampleCountFlags::from_raw(extra[5] as u32))
+                .sample_location_grid_size(vk::Extent2D {
+                    width: extra[6] as u32,
+                    height: extra[7] as u32,
+                })
+                .sample_locations(&owned_sample_locations);
+            let mut sample_state = vk::PipelineSampleLocationsStateCreateInfoEXT::default()
+                .sample_locations_enable(extra[4] != 0)
+                .sample_locations_info(sample_info);
+            if device.compute_extensions & compute::EXT_SAMPLE_LOCATIONS != 0 {
+                multisample = multisample.push_next(&mut sample_state);
+            }
             let depth = vk::PipelineDepthStencilStateCreateInfo::default()
                 .depth_test_enable(depth_test)
                 .depth_write_enable(depth_write)
@@ -1231,10 +1294,11 @@ impl Backend {
                     f32::from_bits(config[18 + i] as u32)
                 }));
             let mut dynamic_states = Vec::new();
-            if static_states & 1 == 0 {
+            if static_states & 1 == 0 && !extended.contains(&vk::DynamicState::VIEWPORT_WITH_COUNT)
+            {
                 dynamic_states.push(vk::DynamicState::VIEWPORT);
             }
-            if static_states & 2 == 0 {
+            if static_states & 2 == 0 && !extended.contains(&vk::DynamicState::SCISSOR_WITH_COUNT) {
                 dynamic_states.push(vk::DynamicState::SCISSOR);
             }
             for state in 2..=8 {
@@ -1242,6 +1306,7 @@ impl Backend {
                     dynamic_states.push(vk::DynamicState::from_raw(state));
                 }
             }
+            dynamic_states.extend_from_slice(&extended);
             let dynamic =
                 vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
             let mut rendering_info = vk::PipelineRenderingCreateInfo::default();
@@ -1416,6 +1481,11 @@ impl Backend {
                 output(m, a[5], 8)?;
                 let f = format(a[1])?;
                 let u = format_usage(f, a[4])?;
+                if u.contains(vk::ImageUsageFlags::HOST_TRANSFER_EXT)
+                    && device.compute_features & compute::HOST_IMAGE_COPY == 0
+                {
+                    return unsupported();
+                }
                 // a[11] != 0 identifies the extended shape, preserving the old
                 // 2D one-level wire used by existing native-call clients.
                 let s = if a[11] == 0 {
@@ -1519,7 +1589,7 @@ impl Backend {
                     return invalid();
                 }
                 let mut list = vk::ImageFormatListCreateInfo::default().view_formats(&formats);
-                if a[9] & !0x138 != 0
+                if a[9] & !IMAGE_CREATE_FLAGS != 0
                     || a[9] & 256 != 0 && !device.maintenance2
                     || a[9] & 32 != 0 && !device.maintenance1
                 {
@@ -2172,7 +2242,7 @@ impl Backend {
                         .into_iter()
                         .map(view_format)
                         .collect::<Result<_>>()?;
-                    if x[0] & !0x138 != 0
+                    if x[0] & !IMAGE_CREATE_FLAGS != 0
                         || !u.contains(required)
                         || x[2] < a[2]
                         || x[3] < a[3]
@@ -2709,8 +2779,6 @@ impl Backend {
                             .as_ref()
                             .ok_or(Failure::Vk(vk::Result::ERROR_UNKNOWN))?;
                         if p.flags != vk::PipelineBindPoint::GRAPHICS.as_raw() as u32
-                            || (!r.viewport && p.static_states.get() & 1 == 0)
-                            || (!r.scissor && p.static_states.get() & 2 == 0)
                             || p.size as usize != r.subpass
                             || !pass.compatible_pipeline(p, r.subpass)
                             || a[2..5].iter().any(|&x| x > u32::MAX as u64)
@@ -2721,6 +2789,8 @@ impl Backend {
                         {
                             return invalid();
                         }
+                        // The original driver owns dynamic viewport/scissor and
+                        // rasterizer-discard state. Do not mirror validity here.
                         let active = a[2] != 0 && a[3] != 0;
                         let first_instance = if op == 97 { a[6] } else { a[5] };
                         instance_base(&p.vertex_inputs.borrow(), first_instance)?;
@@ -2742,7 +2812,13 @@ impl Backend {
                             };
                             if active
                                 && last
-                                    .checked_mul(input.stride as u64)
+                                    .checked_mul(if p.static_states.get() & 4 != 0 {
+                                        *r.vertex_strides
+                                            .get(&input.binding)
+                                            .ok_or(Failure::Vk(vk::Result::ERROR_UNKNOWN))?
+                                    } else {
+                                        input.stride as u64
+                                    })
                                     .and_then(|n| n.checked_add(*offset))
                                     .and_then(|n| n.checked_add(input.extent as u64))
                                     .is_none_or(|n| n > buffer.size)
@@ -2940,7 +3016,6 @@ impl Backend {
                         unsafe {
                             d.cmd_set_viewport(raw, 0, &viewport);
                         }
-                        c.recording.borrow_mut().viewport = true;
                     }
                     76 => {
                         if a[4] == 0
@@ -2963,7 +3038,6 @@ impl Backend {
                         unsafe {
                             d.cmd_set_scissor(raw, 0, &rect);
                         }
-                        c.recording.borrow_mut().scissor = true;
                     }
                     _ => unreachable!(),
                 }
@@ -3037,7 +3111,7 @@ fn validate_shape(s: ImageShape, flags: u64) -> Result<()> {
         || s.ty == vk::ImageType::TYPE_1D && (s.height != 1 || s.depth != 1)
         || s.ty == vk::ImageType::TYPE_2D && s.depth != 1
         || s.ty == vk::ImageType::TYPE_3D && s.layers != 1
-        || flags & !0x138 != 0
+        || flags & !IMAGE_CREATE_FLAGS != 0
         || flags & 32 != 0 && s.ty != vk::ImageType::TYPE_3D
         || flags & 16 != 0
             && (s.ty != vk::ImageType::TYPE_2D || s.width != s.height || s.layers < 6)
@@ -3172,7 +3246,7 @@ fn checked_copy(x: &[u64], image: ImageShape, buffer_size: u64) -> Result<()> {
     let _ = checked_region(image, &x[3..7], &x[7..10], &x[10..13])?;
     if x[1] != 0 && x[1] < x[10]
         || x[2] != 0 && x[2] < x[11]
-        || !x[0].is_multiple_of(4)
+        || is_depth_stencil(image.format) && !x[0].is_multiple_of(4)
         || !x[0].is_multiple_of(bytes)
         || x[1] > u32::MAX as u64
         || x[2] > u32::MAX as u64
@@ -3207,19 +3281,57 @@ fn checked_copy(x: &[u64], image: ImageShape, buffer_size: u64) -> Result<()> {
 }
 fn checked_image_copy(x: &[u64], src: ImageShape, dst: ImageShape) -> Result<vk::ImageCopy> {
     let depth = is_depth_stencil(src.format);
+    let block = |s: ImageShape, aspect| {
+        block_layout(ycbcr::transfer_format(s.format, aspect)?.as_raw() as u64)
+            .ok_or(Failure::Vk(vk::Result::ERROR_FORMAT_NOT_SUPPORTED))
+    };
+    let sb = block(src, x[0])?;
+    let db = block(dst, x[7])?;
     if depth != is_depth_stencil(dst.format)
         || depth && src.format != dst.format
-        || block_layout(ycbcr::transfer_format(src.format, x[0])?.as_raw() as u64)
-            != block_layout(ycbcr::transfer_format(dst.format, x[7])?.as_raw() as u64)
-        || (src.ty == vk::ImageType::TYPE_3D) != (dst.ty == vk::ImageType::TYPE_3D)
+        || sb.2 != db.2
+        || compressed_block(src.format.as_raw() as u64).is_some()
+            && compressed_block(dst.format.as_raw() as u64).is_some()
+            && (sb.0, sb.1) != (db.0, db.1)
+        || src.ty != dst.ty
+            && !matches!(
+                (src.ty, dst.ty),
+                (vk::ImageType::TYPE_2D, vk::ImageType::TYPE_3D)
+                    | (vk::ImageType::TYPE_3D, vk::ImageType::TYPE_2D)
+            )
     {
         return unsupported();
     }
-    let src_sub = checked_region(src, &x[..4], &x[4..7], &x[14..17])?;
-    let dst_sub = checked_region(dst, &x[7..11], &x[11..14], &x[14..17])?;
-    checked_blocks(src, x[1], &x[4..7], &x[14..17])?;
-    checked_blocks(dst, x[8], &x[11..14], &x[14..17])?;
-    if src_sub.layer_count != dst_sub.layer_count
+    // The wire/native extent always describes source texels. Only bounds use
+    // the destination's size-compatible block extent and 2D slice depth.
+    let mut se = [x[14], x[15], x[16]];
+    let mut de = se;
+    for (axis, a, b) in [(0, sb.0, db.0), (1, sb.1, db.1)] {
+        if a != b {
+            de[axis] = se[axis]
+                .div_ceil(a)
+                .checked_mul(b)
+                .ok_or(Failure::Vk(vk::Result::ERROR_UNKNOWN))?;
+        }
+    }
+    if src.ty != dst.ty {
+        if src.ty == vk::ImageType::TYPE_2D {
+            se[2] = 1;
+        } else {
+            de[2] = 1;
+        }
+    }
+    let src_sub = checked_region(src, &x[..4], &x[4..7], &se)?;
+    let dst_sub = checked_region(dst, &x[7..11], &x[11..14], &de)?;
+    checked_blocks(src, x[1], &x[4..7], &se)?;
+    checked_blocks(dst, x[8], &x[11..14], &de)?;
+    if (src.ty == dst.ty && src_sub.layer_count != dst_sub.layer_count)
+        || (src.ty != dst.ty
+            && if src.ty == vk::ImageType::TYPE_2D {
+                src_sub.layer_count as u64 != x[16]
+            } else {
+                dst_sub.layer_count as u64 != x[16]
+            })
         || depth && src_sub.aspect_mask != dst_sub.aspect_mask
     {
         return invalid();
@@ -3775,6 +3887,23 @@ mod tests {
             ..depth
         };
         assert!(checked_image_copy(&copy, depth, other).is_err());
+        let array = ImageShape { layers: 4, ..image };
+        let volume = ImageShape {
+            ty: vk::ImageType::TYPE_3D,
+            depth: 4,
+            ..image
+        };
+        let mut slices = [1, 0, 0, 4, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 8, 8, 4];
+        assert!(checked_image_copy(&slices, array, volume).is_ok());
+        slices[3] = 3;
+        assert!(checked_image_copy(&slices, array, volume).is_err());
+        let compressed = ImageShape::d2(32, 32, vk::Format::BC5_UNORM_BLOCK);
+        let texels = ImageShape::d2(8, 8, vk::Format::R32G32B32A32_UINT);
+        let blocks = [1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 32, 32, 1];
+        assert!(checked_image_copy(&blocks, compressed, texels).is_ok());
+        let mut outside = blocks;
+        outside[11] = 1;
+        assert!(checked_image_copy(&outside, compressed, texels).is_err());
     }
     #[test]
     fn viewports_may_extend_outside_the_framebuffer() {
@@ -3820,6 +3949,10 @@ mod tests {
         let bytes = 16 + (31 * 80 + 64) * 4;
         assert!(checked_copy(&valid, s, bytes).is_ok());
         assert!(checked_copy(&valid, s, bytes - 1).is_err());
+        let r8 = ImageShape::d2(64, 32, vk::Format::R8_UNORM);
+        let mut unaligned = valid;
+        unaligned[0] = 1;
+        assert!(checked_copy(&unaligned, r8, 1 + 31 * 80 + 64).is_ok());
         for (at, value) in [
             (0, 3),
             (1, 63),

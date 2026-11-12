@@ -55,6 +55,7 @@ core_features! {
     25 => robust_buffer_access,
     26 => full_draw_index_uint32,
     27 => occlusion_query_precise,
+    28 => depth_clamp,
 }
 
 // Limits describe this executable profile, including disabled optional stages.

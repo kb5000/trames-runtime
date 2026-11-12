@@ -440,15 +440,11 @@ impl Backend {
         unsafe {
             match a[2] {
                 2 => {
-                    if f[0] != 1.0 {
-                        return unsupported();
-                    }
+                    // Original native state may be overwritten/unused before
+                    // drawing. Do not impose a second state-validity machine.
                     d.cmd_set_line_width(raw, f[0]);
                 }
                 3 => {
-                    if f[1] != 0.0 {
-                        return unsupported();
-                    }
                     d.cmd_set_depth_bias(raw, f[0], f[1], f[2]);
                 }
                 4 => d.cmd_set_blend_constants(raw, &f.try_into().unwrap()),

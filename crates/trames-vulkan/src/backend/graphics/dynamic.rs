@@ -165,7 +165,7 @@ impl Backend {
             return invalid();
         }
         let raw = vk::CommandBuffer::from_raw(c.raw);
-        let api = ash::khr::dynamic_rendering::Device::new(&device.instance.native, &device.native);
+        let api = &device.commands.rendering;
         if op == 254 {
             let mut r = c.recording.borrow_mut();
             if !matches!(r.pass, Some(RenderScope::Rendering(_))) || r.feedback_active {
