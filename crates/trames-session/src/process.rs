@@ -201,8 +201,8 @@ impl<C: Cpu> Process<C> {
             || self
                 .byte_wait
                 .as_ref()
-                .and_then(trames_linux::PendingIo::file_pending)
-                .is_some_and(|f| !f.interruptible())
+                .and_then(trames_linux::PendingIo::interruptible_file_wait)
+                .is_some_and(|interruptible| !interruptible)
     }
     fn control_candidate(&self, id: u32) -> bool {
         matches!(
@@ -1745,8 +1745,7 @@ impl<C: Cpu> Kernel<C> {
                         .or_else(|| {
                             p.byte_wait
                                 .as_ref()
-                                .and_then(trames_linux::PendingIo::file_pending)
-                                .map(|f| f.interruptible())
+                                .and_then(trames_linux::PendingIo::interruptible_file_wait)
                         })
                         .unwrap_or(false)
                 || matches!(p.state, State::Blocked(2, _)))
@@ -8433,15 +8432,20 @@ mod tests {
         p.linux.vfs.mknod_at(-100, b"/fifo", 0o10600, 0).unwrap();
         p.memory.write(0x1000, b"/fifo\0").unwrap();
         let args = [(-100i64) as u64, 0x1000, 0, 0, 0, 0];
+        let hidden = p.linux.vfs.open_at(-100, b"/dev/null", 0, 0).unwrap();
+        p.linux.vfs.close(hidden).unwrap();
         k.call(1, &mut p, 56, args, &mut io);
         assert!(matches!(p.state, State::Blocked(56, _)));
-        let hidden = p.pending_open.unwrap();
         assert!(p.linux.vfs.fd_kind(hidden).is_err());
         p.signals.actions.set_handler(10, 0x4000);
         Kernel::queue_one(1, &mut p, 10, 1);
         assert!(k.deliver(1, &mut p).unwrap());
-        assert!(p.pending_open.is_none());
         assert!(p.linux.vfs.fifo_open_ready(hidden).is_err());
+        // Interrupted source opens release the reserved lowest descriptor,
+        // regardless of which original-resource continuation owns the wait.
+        let reused = p.linux.vfs.open_at(-100, b"/dev/null", 0, 0).unwrap();
+        assert_eq!(reused, hidden);
+        p.linux.vfs.close(reused).unwrap();
         // The handler's saved ucontext contains EINTR, not a reserved fd/EBADF.
         let mut result = [0; 8];
         p.memory.read(p.cpu.sp + 312, &mut result).unwrap();
@@ -9041,6 +9045,56 @@ mod boundary_tests {
                     .all(|value| value == "300")
         }));
     }
+    #[test]
+    fn joined_threads_do_not_replace_the_process_wait_events_reap_target() {
+        let mut k = kernel();
+        let mut root = admitted_process(&k);
+        let mut output = CapturedOutput::default();
+        k.syscall(1, &mut root, 220, [17, 0, 0, 0, 0, 0], &mut output)
+            .unwrap();
+        let mut leader = k.processes.remove(&2).unwrap();
+        let original = leader.signals.presence.clone();
+        for id in 3..=10 {
+            k.syscall(2, &mut leader, 220, [0x10f00, 0, 0, 0, 0, 0], &mut output)
+                .unwrap();
+            let mut thread = k.processes.remove(&id).unwrap();
+            k.exit_one(id, &mut thread, 0);
+            thread.signals.io.reap_thread_presence();
+            assert!(
+                original.present(),
+                "thread exit preserves process visibility"
+            );
+            k.processes.insert(id, thread);
+        }
+        k.exit_one(2, &mut leader, 7 << 8);
+        k.processes.insert(2, leader);
+        assert!(original.present(), "unreaped leader remains visible");
+        let wait = trames_kernel::children::Wait::prepare(260, [2, 0, 0, 0, 0, 0]).unwrap();
+        assert_eq!(
+            root.children.wait(
+                wait,
+                root.linux.vfs.pid_namespace(),
+                root.group(),
+                &mut root.memory
+            ),
+            Ok(Some(2))
+        );
+        assert!(
+            !original.present(),
+            "wait reaps the original leader, even while its body is retained"
+        );
+        assert!(k.processes.contains_key(&2));
+        assert_eq!(
+            root.children.wait(
+                wait,
+                root.linux.vfs.pid_namespace(),
+                root.group(),
+                &mut root.memory
+            ),
+            Err(Errno(10))
+        );
+    }
+
     #[test]
     fn birth_capacity_rolls_back_failures_and_releases_at_source_wait() {
         let mut k = kernel();

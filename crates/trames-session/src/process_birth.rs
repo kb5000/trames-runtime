@@ -354,7 +354,11 @@ impl Birth {
         if a[0] & 0x80000 != 0 {
             child.cpu.set_tls(a[3]);
         }
-        child.wait_event.bind_presence(&child.signals.presence);
+        // CLONE_THREAD shares the process wait event. Its reap target must
+        // remain the leader; a departing worker owns only its thread presence.
+        if !threaded {
+            child.wait_event.bind_presence(&child.signals.presence);
+        }
         // Source callers already admitted this resource without blocking their
         // executor. Joined/bootstrap callers use the same short transaction.
         let policy_group = p.seccomp.birth_group();

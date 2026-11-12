@@ -167,6 +167,15 @@ impl PendingIo {
     pub fn file_pending(&self) -> Option<FilePending> {
         self.file.clone()
     }
+    /// A FIFO rendezvous remains interruptible before descriptor publication,
+    /// independently of submitted native file work and its copyout lifetime.
+    pub fn interruptible_file_wait(&self) -> Option<bool> {
+        if self.fifo_open.is_some() {
+            Some(true)
+        } else {
+            self.file.as_ref().map(FilePending::interruptible)
+        }
+    }
     pub fn external_wait(&self) -> bool {
         if self.file.as_ref().is_some_and(|p| !p.interruptible())
             || DirectSyscalls::aio_call(self.number)
