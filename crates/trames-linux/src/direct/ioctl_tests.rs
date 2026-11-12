@@ -47,6 +47,36 @@ fn setup(kind: u8) -> (Linux, Memory, u32) {
 }
 
 #[test]
+fn musl_signed_render_ioctl_and_high_register_bits_use_the_same_u32_command() {
+    let mut expected = None;
+    for request in [0xc0406400, 0xffffffffc0406400, 0x12345678c0406400] {
+        for source in [false, true] {
+            let (mut linux, mut m, fd) = setup(2);
+            m.write(0x1000, &[0; 64]).unwrap();
+            m.write_array(0x1010, 16u64.to_le_bytes()).unwrap();
+            m.write_array(0x1018, 0x2000u64.to_le_bytes()).unwrap();
+            let args = [fd as u64, request, 0x1000, 0, 0, 0];
+            let result = if source {
+                capture(&linux).invoke(29, args, &mut m).unwrap()
+            } else {
+                linux.syscall(29, args, &mut m, &mut crate::CapturedOutput::default())
+            };
+            assert_eq!(result, Ok(0));
+            assert_eq!(m.read_array::<6>(0x2000).unwrap(), *b"trames");
+            let actual = (
+                m.read_array::<64>(0x1000).unwrap(),
+                m.read_array::<16>(0x2000).unwrap(),
+            );
+            if let Some(expected) = &expected {
+                assert_eq!(&actual, expected);
+            } else {
+                expected = Some(actual);
+            }
+        }
+    }
+}
+
+#[test]
 fn descriptor_discovery_and_unsupported_ioctl_share_the_complete_source_solo_abi() {
     for (kind, request) in [
         (0, 0x1234),

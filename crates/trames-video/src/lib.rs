@@ -77,7 +77,7 @@ mod tests {
         assert_eq!(native::capabilities() & 1, 1);
         for cancel in [false, true] {
             let (sender, receiver) = mpsc::channel();
-            let mut decoder = native::Decoder::new(32, 32).unwrap();
+            let mut decoder = native::Decoder::with_codec(32, 32, 0).unwrap();
             for i in 0..17 {
                 let dropped = Dropped(sender.clone());
                 let notify: Notify = Arc::new(move || {
@@ -100,6 +100,72 @@ mod tests {
                     receiver.recv_timeout(Duration::from_secs(5)).unwrap();
                 }
                 drop(decoder);
+            }
+        }
+    }
+    #[test]
+    #[ignore = "requires an authorized hardware VideoToolbox decoder"]
+    fn valid_codec_configuration_with_corrupt_packet_completes_and_drains() {
+        // Parameter sets from synthetic 1920x1080 libx265 / SVT-AV1 fixtures.
+        const HEVC: &[u8] = &[
+            0, 0, 0, 24, 64, 1, 12, 1, 255, 255, 1, 96, 0, 0, 3, 0, 144, 0, 0, 3, 0, 0, 3, 0, 120,
+            149, 148, 9, 0, 0, 0, 44, 66, 1, 1, 1, 96, 0, 0, 3, 0, 144, 0, 0, 3, 0, 0, 3, 0, 120,
+            160, 3, 192, 128, 17, 7, 203, 150, 86, 84, 164, 194, 240, 22, 156, 32, 0, 0, 3, 0, 32,
+            0, 0, 3, 3, 193, 0, 0, 0, 6, 68, 1, 192, 115, 193, 137,
+        ];
+        const AV1: &[u8] = &[
+            129, 8, 13, 0, 10, 11, 0, 0, 0, 66, 171, 191, 195, 112, 11, 224, 9,
+        ];
+        for (codec, height, configuration) in [(1, 1088, HEVC), (2, 1080, AV1)] {
+            if native::capabilities() & (1 << codec) == 0 {
+                continue;
+            }
+            let (sender, receiver) = mpsc::channel();
+            let mut decoder = native::Decoder::with_codec(1920, height, codec).unwrap();
+            let mut jobs = Vec::new();
+            for _ in 0..4 {
+                let sender = sender.clone();
+                let job = Arc::new(Job {
+                    result: Mutex::new(None),
+                    notify: Arc::new(move || {
+                        sender.send(()).unwrap();
+                    }),
+                    graphics: Default::default(),
+                });
+                decoder.submit_bitstream(configuration, vec![0], job.clone());
+                jobs.push(job);
+            }
+            drop(decoder);
+            for job in jobs {
+                receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(job.result.lock().unwrap().as_ref().unwrap().is_err());
+            }
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+    #[test]
+    #[ignore = "requires an authorized hardware VideoToolbox decoder"]
+    fn invalid_complete_bitstreams_release_every_owned_job() {
+        for codec in [1, 2] {
+            if native::capabilities() & (1 << codec) == 0 {
+                continue;
+            }
+            let (sender, receiver) = mpsc::channel();
+            let mut decoder = native::Decoder::with_codec(32, 32, codec).unwrap();
+            for _ in 0..17 {
+                let dropped = Dropped(sender.clone());
+                let job = Arc::new(Job {
+                    result: Mutex::new(None),
+                    notify: Arc::new(move || {
+                        let _ = &dropped;
+                    }),
+                    graphics: Default::default(),
+                });
+                decoder.submit_bitstream(&[0], vec![0], job);
+            }
+            drop(decoder);
+            for _ in 0..17 {
+                receiver.recv_timeout(Duration::from_secs(5)).unwrap();
             }
         }
     }
@@ -203,7 +269,10 @@ impl Context {
                 if a[0] == 0 || a[1] == 0 || a[0] > u32::MAX as u64 || a[1] > u32::MAX as u64 {
                     return Ok(INVALID as u64);
                 }
-                match native::Decoder::new(a[0] as u32, a[1] as u32) {
+                if a[2] > 2 {
+                    return Ok(INVALID as u64);
+                }
+                match native::Decoder::with_codec(a[0] as u32, a[1] as u32, a[2] as u32) {
                     Ok(decoder) => {
                         let id = self.id();
                         self.0
@@ -260,7 +329,7 @@ impl Context {
                     MISSING
                 }
             }
-            5 => {
+            5 | 9 => {
                 let (decoder, surface) = {
                     let objects = self.0.objects.lock().unwrap();
                     (
@@ -281,18 +350,22 @@ impl Context {
                 };
                 // Parameter-set NAL units have bounded H.264 syntax. Compressed
                 // frame size itself follows guest address-space/usize limits.
-                if a[3] > 65536
-                    || a[5] > 65536
-                    || a[3] == 0
-                    || a[5] == 0
-                    || a[7] == 0
-                    || a[7] > isize::MAX as u64
-                {
+                let (configuration, pps, data) = if op == 5 {
+                    if a[3] == 0
+                        || a[3] > 65536
+                        || a[5] == 0
+                        || a[5] > 65536
+                        || a[7] == 0
+                        || a[7] > isize::MAX as u64
+                    {
+                        return Ok(INVALID as u64);
+                    }
+                    (read(a[2], a[3])?, read(a[4], a[5])?, read(a[6], a[7])?)
+                } else if a[3] == 0 || a[3] > 65536 || a[5] == 0 || a[5] > isize::MAX as u64 {
                     return Ok(INVALID as u64);
-                }
-                let sps = read(a[2], a[3])?;
-                let pps = read(a[4], a[5])?;
-                let data = read(a[6], a[7])?;
+                } else {
+                    (read(a[2], a[3])?, Vec::new(), read(a[4], a[5])?)
+                };
                 let job = Arc::new(Job {
                     result: Mutex::new(None),
                     notify: surface.notify.clone(),
@@ -308,7 +381,17 @@ impl Context {
                     }
                     *slot = Some(job.clone());
                 }
-                decoder.lock().unwrap().submit(&sps, &pps, data, job);
+                if op == 5 {
+                    decoder
+                        .lock()
+                        .unwrap()
+                        .submit(&configuration, &pps, data, job);
+                } else {
+                    decoder
+                        .lock()
+                        .unwrap()
+                        .submit_bitstream(&configuration, data, job);
+                }
                 0
             }
             6 => {

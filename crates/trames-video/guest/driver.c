@@ -8,6 +8,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +16,7 @@
 #include <sys/eventfd.h>
 #include <unistd.h>
 #include "h264.h"
+#include "bitstream.h"
 
 struct native_result {uint64_t value,fallback;};
 extern struct native_result trames_video_call(uint64_t,const uint64_t*,size_t);
@@ -27,7 +29,7 @@ static int64_t call(unsigned op,const uint64_t args[16]) {
 #define CALL(op,...) call(op,(uint64_t[16]){__VA_ARGS__})
 enum Kind {CONFIG=1,SURFACE,CONTEXT,BUFFER,IMAGE};
 typedef struct {enum Kind kind;void* object;uint32_t next_free;} Entry;
-typedef struct {pthread_mutex_t lock;Entry* entries;uint32_t count,capacity,free_head;} Driver;
+typedef struct {pthread_mutex_t lock;Entry* entries;uint32_t count,capacity,free_head;atomic_uint bitstream;} Driver;
 typedef struct {VAProfile profile;} Config;
 typedef struct {uint64_t key;int fd;unsigned width,height;} Surface;
 typedef struct {VABufferType type;unsigned size,count;size_t capacity;uint8_t* data;} Buffer;
@@ -38,6 +40,7 @@ typedef struct {
     int has_picture,has_matrix;
     VASliceParameterBufferH264* slices;size_t slice_count;
     uint8_t* bytes;size_t length,capacity;TramesH264 h264;
+    uint8_t* configuration;size_t configuration_size;
 } Context;
 static Driver* driver(VADriverContextP ctx){return ctx->pDriverData;}
 static uint32_t add(VADriverContextP ctx,enum Kind kind,void* object) {
@@ -73,24 +76,39 @@ static VAStatus failed(int64_t r) {
     if(r==-ENOSYS || r==-ENOTSUP)return VA_STATUS_ERROR_UNIMPLEMENTED;
     return VA_STATUS_ERROR_DECODING_ERROR;
 }
-static int profile_ok(VAProfile p){return p==VAProfileH264ConstrainedBaseline || p==VAProfileH264Main || p==VAProfileH264High;}
+static unsigned codec(VAProfile p){return p==VAProfileHEVCMain?1:p==VAProfileAV1Profile0?2:0;}
+static int profile_ok(VADriverContextP ctx,VAProfile p){
+    if(p==VAProfileH264ConstrainedBaseline || p==VAProfileH264Main || p==VAProfileH264High)return (CALL(0,0)&1)!=0;
+    return (p==VAProfileHEVCMain || p==VAProfileAV1Profile0) &&
+        atomic_load_explicit(&driver(ctx)->bitstream,memory_order_relaxed) && (CALL(0,0)&(1u<<codec(p)));
+}
+// libva resolves this explicitly through vaGetLibFunc. A patched client opts
+// into original-bitstream profiles on this display before querying them.
+__attribute__((visibility("default"))) int trames_vaapi_bitstream_v1(VADisplay display,unsigned version) {
+    VADisplayContextP dpy=display;
+    if(version!=TRAMES_VIDEO_BITSTREAM_VERSION || !dpy || dpy->vadpy_magic!=VA_DISPLAY_MAGIC ||
+       !dpy->pDriverContext || !dpy->pDriverContext->pDriverData)return 0;
+    atomic_store_explicit(&driver(dpy->pDriverContext)->bitstream,1,memory_order_relaxed);
+    return (int)(CALL(0,0)&6);
+}
 static VAStatus query_profiles(VADriverContextP ctx,VAProfile* out,int* count) {
-    (void)ctx;
-    if(!(CALL(0,0)&1)){*count=0;return VA_STATUS_SUCCESS;}
-    out[0]=VAProfileH264ConstrainedBaseline;out[1]=VAProfileH264Main;out[2]=VAProfileH264High;*count=3;return VA_STATUS_SUCCESS;
+    *count=0;
+    VAProfile profiles[]={VAProfileH264ConstrainedBaseline,VAProfileH264Main,VAProfileH264High,VAProfileHEVCMain,VAProfileAV1Profile0};
+    for(unsigned i=0;i<sizeof(profiles)/sizeof(*profiles);i++)if(profile_ok(ctx,profiles[i]))out[(*count)++]=profiles[i];
+    return VA_STATUS_SUCCESS;
 }
 static VAStatus query_entrypoints(VADriverContextP ctx,VAProfile profile,VAEntrypoint* out,int* count) {
-    (void)ctx;*count=0;if(!profile_ok(profile))return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
+    *count=0;if(!profile_ok(ctx,profile))return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
     out[0]=VAEntrypointVLD;*count=1;return VA_STATUS_SUCCESS;
 }
 static VAStatus config_attributes(VADriverContextP ctx,VAProfile profile,VAEntrypoint entry,VAConfigAttrib* attributes,int count) {
-    (void)ctx;if(!profile_ok(profile))return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
+    if(!profile_ok(ctx,profile))return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
     if(entry!=VAEntrypointVLD)return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
     for(int i=0;i<count;i++)attributes[i].value=attributes[i].type==VAConfigAttribRTFormat?VA_RT_FORMAT_YUV420:VA_ATTRIB_NOT_SUPPORTED;
     return VA_STATUS_SUCCESS;
 }
 static VAStatus create_config(VADriverContextP ctx,VAProfile profile,VAEntrypoint entry,VAConfigAttrib* attributes,int count,VAConfigID* id) {
-    if(!profile_ok(profile))return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
+    if(!profile_ok(ctx,profile))return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
     if(entry!=VAEntrypointVLD)return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
     for(int i=0;i<count;i++)if(attributes[i].type!=VAConfigAttribRTFormat || attributes[i].value!=VA_RT_FORMAT_YUV420)return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
     Config* c=malloc(sizeof(*c));if(!c)return VA_STATUS_ERROR_ALLOCATION_FAILED;c->profile=profile;
@@ -141,13 +159,13 @@ static VAStatus create_context(VADriverContextP ctx,VAConfigID config,int width,
     (void)flags;(void)targets;(void)count;Config* c=get(ctx,config,CONFIG);if(!c)return VA_STATUS_ERROR_INVALID_CONFIG;
     if(width<=0 || height<=0 || width%2 || height%2)return VA_STATUS_ERROR_INVALID_PARAMETER;
     Context* context=calloc(1,sizeof(*context));if(!context)return VA_STATUS_ERROR_ALLOCATION_FAILED;
-    int64_t key=CALL(1,width,height);if(key<0){free(context);return failed(key);}
+    int64_t key=CALL(1,width,height,codec(c->profile));if(key<0){free(context);return failed(key);}
     context->key=key;context->profile=c->profile;context->width=width;context->height=height;context->target=VA_INVALID_ID;
     *id=add(ctx,CONTEXT,context);if(*id==VA_INVALID_ID){CALL(2,key);free(context);return VA_STATUS_ERROR_ALLOCATION_FAILED;}return VA_STATUS_SUCCESS;
 }
 static VAStatus destroy_context(VADriverContextP ctx,VAContextID id) {
     Context* c=get(ctx,id,CONTEXT);if(!c)return VA_STATUS_ERROR_INVALID_CONTEXT;
-    CALL(2,c->key);forget(ctx,id);free(c->slices);free(c->bytes);free(c);return VA_STATUS_SUCCESS;
+    CALL(2,c->key);forget(ctx,id);free(c->slices);free(c->bytes);free(c->configuration);free(c);return VA_STATUS_SUCCESS;
 }
 static VAStatus create_buffer(VADriverContextP ctx,VAContextID context,VABufferType type,unsigned size,unsigned count,void* data,VABufferID* id) {
     (void)context;
@@ -192,12 +210,34 @@ static VAStatus begin_picture(VADriverContextP ctx,VAContextID id,VASurfaceID ta
     uint64_t previous;while(read(s->fd,&previous,sizeof(previous))<0 && errno==EINTR){}
     c->target=target;c->length=0;c->slice_count=0;c->has_picture=c->has_matrix=0;return VA_STATUS_SUCCESS;
 }
+static VAStatus append_packet(Context* c,const uint8_t* bytes,size_t size,int nal) {
+    size_t prefix=nal?4:0;
+    if(size>UINT32_MAX || c->length>SIZE_MAX-prefix-size)return VA_STATUS_ERROR_INVALID_PARAMETER;
+    size_t need=c->length+prefix+size;
+    if(need>c->capacity) {
+        uint8_t* data=realloc(c->bytes,need);if(!data)return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        c->bytes=data;c->capacity=need;
+    }
+    if(nal){c->bytes[c->length++]=size>>24;c->bytes[c->length++]=size>>16;c->bytes[c->length++]=size>>8;c->bytes[c->length++]=size;}
+    if(size)memcpy(c->bytes+c->length,bytes,size);c->length+=size;
+    return VA_STATUS_SUCCESS;
+}
 static VAStatus render_picture(VADriverContextP ctx,VAContextID id,VABufferID* ids,int count) {
     Context* c=get(ctx,id,CONTEXT);if(!c)return VA_STATUS_ERROR_INVALID_CONTEXT;
     if(c->target==VA_INVALID_ID)return VA_STATUS_ERROR_INVALID_SURFACE;
     for(int i=0;i<count;i++) {
         Buffer* b=get(ctx,ids[i],BUFFER);if(!b)return VA_STATUS_ERROR_INVALID_BUFFER;
         size_t size=(size_t)b->size*b->count;
+        if(codec(c->profile)) {
+            if(b->type==TRAMES_VIDEO_CONFIGURATION_BUFFER) {
+                if(size<5 || size>65540 || b->data[0] || b->data[1] || b->data[2] || b->data[3]!=codec(c->profile))return VA_STATUS_ERROR_INVALID_PARAMETER;
+                uint8_t* data=realloc(c->configuration,size-4);if(!data)return VA_STATUS_ERROR_ALLOCATION_FAILED;
+                c->configuration=data;c->configuration_size=size-4;memcpy(data,b->data+4,size-4);c->has_picture=1;
+            } else if(b->type==TRAMES_VIDEO_PACKET_BUFFER || (codec(c->profile)==1 && b->type==VASliceDataBufferType)) {
+                VAStatus status=append_packet(c,b->data,size,codec(c->profile)==1);if(status)return status;
+            } else if(!(codec(c->profile)==1 && b->type==VASliceParameterBufferType))return VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE;
+            continue;
+        }
         switch(b->type) {
         case VAPictureParameterBufferType:
             if(size<sizeof(c->picture))return VA_STATUS_ERROR_INVALID_PARAMETER;
@@ -237,6 +277,11 @@ static VAStatus render_picture(VADriverContextP ctx,VAContextID id,VABufferID* i
 static VAStatus end_picture(VADriverContextP ctx,VAContextID id) {
     Context* c=get(ctx,id,CONTEXT);if(!c)return VA_STATUS_ERROR_INVALID_CONTEXT;
     Surface* s=get(ctx,c->target,SURFACE);if(!s)return VA_STATUS_ERROR_INVALID_SURFACE;
+    if(codec(c->profile)) {
+        if(!c->has_picture || !c->configuration_size || !c->length)return VA_STATUS_ERROR_INVALID_PARAMETER;
+        int64_t r=CALL(9,c->key,s->key,PTR(c->configuration),c->configuration_size,PTR(c->bytes),c->length);
+        c->target=VA_INVALID_ID;return failed(r);
+    }
     if(!c->has_picture || !c->has_matrix || !c->length || c->slice_count)return VA_STATUS_ERROR_INVALID_PARAMETER;
     if(trames_h264_parameters(&c->h264,c->profile,c->width,c->height,&c->picture,&c->matrix))return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
     int64_t r=CALL(5,c->key,s->key,PTR(c->h264.sps),c->h264.sps_size,PTR(c->h264.pps),c->h264.pps_size,PTR(c->bytes),c->length);
@@ -271,10 +316,23 @@ static VAStatus get_image(VADriverContextP ctx,VASurfaceID surface,int x,int y,u
     size_t capacity=(size_t)s->width*s->height*3/2;uint8_t* bytes=malloc(capacity);if(!bytes)return VA_STATUS_ERROR_ALLOCATION_FAILED;
     uint64_t actual[2]={0};int64_t r=CALL(7,s->key,PTR(bytes),capacity,PTR(actual));
     if(r>=0) {
-        if(actual[0]<width || actual[1]<height || actual[0]>s->width || actual[1]>s->height)r=-EINVAL;
+        if(!actual[0] || !actual[1] || width>s->width || height>s->height || actual[0]>s->width || actual[1]>s->height)r=-EINVAL;
         else {
-            for(unsigned row=0;row<height;row++)memcpy(buffer->data+(size_t)row*width,bytes+(size_t)row*actual[0],width);
-            for(unsigned row=0;row<height/2;row++)memcpy(buffer->data+(size_t)width*height+(size_t)row*width,bytes+actual[0]*actual[1]+row*actual[0],width);
+            // VT may omit the codec's conformance-window padding (e.g. HEVC
+            // 1088 coded / 1080 visible). VA images describe the coded extent;
+            // fill its unused padding without reading past the native picture.
+            unsigned columns=width<actual[0]?width:(unsigned)actual[0];
+            unsigned rows=height<actual[1]?height:(unsigned)actual[1];
+            for(unsigned row=0;row<rows;row++)memcpy(buffer->data+(size_t)row*width,bytes+(size_t)row*actual[0],columns);
+            for(unsigned row=0;row<rows/2;row++)memcpy(buffer->data+(size_t)width*height+(size_t)row*width,bytes+actual[0]*actual[1]+row*actual[0],columns);
+            if(columns<width) {
+                for(unsigned row=0;row<rows;row++)memset(buffer->data+(size_t)row*width+columns,0,width-columns);
+                for(unsigned row=0;row<rows/2;row++)memset(buffer->data+(size_t)width*height+(size_t)row*width+columns,128,width-columns);
+            }
+            if(rows<height) {
+                memset(buffer->data+(size_t)rows*width,0,(size_t)(height-rows)*width);
+                memset(buffer->data+(size_t)width*height+(size_t)rows/2*width,128,(size_t)(height-rows)/2*width);
+            }
         }
     }
     free(bytes);return failed(r);
@@ -345,10 +403,14 @@ __attribute__((visibility("default"))) VAStatus __vaDriverInit_1_0(VADriverConte
     if(getauxval(0x54520009UL)!=0x10007UL)return VA_STATUS_ERROR_OPERATION_FAILED;
     Driver* d=calloc(1,sizeof(*d));if(!d)return VA_STATUS_ERROR_ALLOCATION_FAILED;
     d->free_head=VA_INVALID_ID;pthread_mutex_init(&d->lock,NULL);ctx->pDriverData=d;
+    // Only the verified paired Firefox/FFmpeg launcher sets this for Firefox's
+    // direct profile probe. Generic clients negotiate via vaGetLibFunc instead.
+    const char* paired=getenv("TRAMES_VIDEO_BITSTREAM_V1");
+    atomic_init(&d->bitstream,paired && !strcmp(paired,"1"));
     ctx->version_major=VA_MAJOR_VERSION;ctx->version_minor=VA_MINOR_VERSION;
-    ctx->max_profiles=3;ctx->max_entrypoints=1;ctx->max_attributes=1;
+    ctx->max_profiles=5;ctx->max_entrypoints=1;ctx->max_attributes=1;
     ctx->max_image_formats=1;ctx->max_subpic_formats=1;ctx->max_display_attributes=0;
-    ctx->str_vendor="Trames VideoToolbox H.264 decode";
+    ctx->str_vendor="Trames VideoToolbox; original-bitstream v1";
     struct VADriverVTable* v=ctx->vtable;
     v->vaTerminate=terminate;v->vaQueryConfigProfiles=query_profiles;v->vaQueryConfigEntrypoints=query_entrypoints;
     v->vaGetConfigAttributes=config_attributes;v->vaCreateConfig=create_config;v->vaDestroyConfig=destroy_config;v->vaQueryConfigAttributes=query_config;

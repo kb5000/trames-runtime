@@ -20,9 +20,13 @@ python3 - "$output" <<'PY'
 import hashlib,json,sys,subprocess
 from pathlib import Path
 p=Path(sys.argv[1]);driver=p/'trames_drv_video.so'
-v={'profile':65543,'auxv_key':'0x54520009','wire_revision':1,
+v={'profile':65543,'auxv_key':'0x54520009','wire_revision':2,
    'driver_init':'__vaDriverInit_1_0','experimental':True,
    'decode':'progressive H.264 8-bit 4:2:0; POC types 0/2',
+   'original_bitstream_v1':{'profiles':['HEVC Main 8-bit 4:2:0','AV1 Profile 0 8-bit 4:2:0'],
+      'negotiation':'vaGetLibFunc(trames_vaapi_bitstream_v1)',
+      'firefox_probe':'TRAMES_VIDEO_BITSTREAM_V1=1; verified paired FFmpeg required',
+      'ffmpeg':'7.1.1 with patches/ffmpeg/0001-vaapi-original-bitstream-v1.patch'},
    'host_backend':'VideoToolbox hardware-required',
    'completion':'per-surface guest eventfd; blocking guest poll',
    'frame_export':{'operation':8,'memory_type':'DRM_PRIME_2','access':'read-only','planes':['R8','GR88'],'modifier':'LINEAR','fd_ownership':'guest files_struct'},'sha256':hashlib.sha256(driver.read_bytes()).hexdigest(),

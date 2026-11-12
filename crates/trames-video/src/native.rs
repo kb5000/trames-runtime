@@ -9,7 +9,7 @@ mod apple {
     use std::ffi::c_void;
     unsafe extern "C" {
         fn trames_video_caps() -> u64;
-        fn trames_video_decoder_new(width: u32, height: u32) -> *mut c_void;
+        fn trames_video_decoder_new(width: u32, height: u32, codec: u32) -> *mut c_void;
         fn trames_video_decoder_free(decoder: *mut c_void);
         fn trames_video_submit(
             decoder: *mut c_void,
@@ -17,6 +17,15 @@ mod apple {
             sps_len: usize,
             pps: *const u8,
             pps_len: usize,
+            bytes: *const u8,
+            len: usize,
+            data: *mut c_void,
+            job: *mut c_void,
+        );
+        fn trames_video_submit_bitstream(
+            decoder: *mut c_void,
+            configuration: *const u8,
+            configuration_len: usize,
             bytes: *const u8,
             len: usize,
             data: *mut c_void,
@@ -32,9 +41,12 @@ mod apple {
     // mutex. VT callbacks own Jobs and CVPixelBuffers, never this Decoder.
     unsafe impl Send for Decoder {}
     impl Decoder {
-        pub fn new(w: u32, h: u32) -> Result<Self, i64> {
+        pub fn with_codec(w: u32, h: u32, codec: u32) -> Result<Self, i64> {
+            if codec > 2 || capabilities() & (1 << codec) == 0 {
+                return Err(-95);
+            }
             // SAFETY: scalar dimensions; native allocation is uniquely owned.
-            let p = unsafe { trames_video_decoder_new(w, h) };
+            let p = unsafe { trames_video_decoder_new(w, h, codec) };
             if p.is_null() {
                 Err(-12)
             } else {
@@ -55,6 +67,29 @@ mod apple {
                     sps.len(),
                     pps.as_ptr(),
                     pps.len(),
+                    pointer,
+                    len,
+                    Box::into_raw(data).cast(),
+                    Box::into_raw(Box::new(job)).cast(),
+                )
+            };
+        }
+        pub(crate) fn submit_bitstream(
+            &mut self,
+            configuration: &[u8],
+            bytes: Vec<u8>,
+            job: Arc<Job>,
+        ) {
+            let data = Box::new(bytes);
+            let pointer = data.as_ptr();
+            let len = data.len();
+            // SAFETY: native submission copies the configuration synchronously
+            // and takes both owned allocations on every completion/error path.
+            unsafe {
+                trames_video_submit_bitstream(
+                    self.0,
+                    configuration.as_ptr(),
+                    configuration.len(),
                     pointer,
                     len,
                     Box::into_raw(data).cast(),
@@ -134,10 +169,13 @@ mod unavailable {
     use super::*;
     pub struct Decoder;
     impl Decoder {
-        pub fn new(_: u32, _: u32) -> Result<Self, i64> {
+        pub fn with_codec(_: u32, _: u32, _: u32) -> Result<Self, i64> {
             Err(-95)
         }
         pub(crate) fn submit(&mut self, _: &[u8], _: &[u8], _: Vec<u8>, job: Arc<Job>) {
+            job.finish(Err(-95));
+        }
+        pub(crate) fn submit_bitstream(&mut self, _: &[u8], _: Vec<u8>, job: Arc<Job>) {
             job.finish(Err(-95));
         }
     }

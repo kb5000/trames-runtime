@@ -5,6 +5,10 @@ use trames_memory::CpuMemory;
 use trames_vfs::{Errno, FdKind, Vfs};
 
 pub(crate) fn call(vfs: &mut Vfs, a: [u64; 6], memory: &mut impl CpuMemory) -> Result<u64, Errno> {
+    // Linux's cmd is unsigned int. musl may sign-extend its int ioctl request
+    // into the syscall register; upper register bits are not part of the ABI.
+    let mut a = a;
+    a[1] = u64::from(a[1] as u32);
     if vfs.flags(a[0] as u32)? & trames_vfs::O_PATH != 0 {
         return Err(Errno(9));
     }

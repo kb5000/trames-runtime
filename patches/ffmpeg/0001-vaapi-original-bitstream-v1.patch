@@ -1,0 +1,355 @@
+--- a/libavcodec/vaapi_decode.h
++++ b/libavcodec/vaapi_decode.h
+@@ -60,9 +60,17 @@
+     enum AVPixelFormat    surface_format;
+     int                   surface_count;
+ 
++    // Explicit driver negotiation; no change for other VA implementations.
++    int                   trames_bitstream;
++
+     VASurfaceAttrib       pixel_format_attribute;
+ } VAAPIDecodeContext;
+ 
++
++int ff_vaapi_trames_configuration(AVCodecContext *avctx, VAAPIDecodePicture *pic,
++                                  unsigned codec, const uint8_t *data, size_t size);
++int ff_vaapi_av1_trames_show_existing(AVCodecContext *avctx,
++                                      const uint8_t *buffer, uint32_t size);
+ 
+ int ff_vaapi_decode_make_param_buffer(AVCodecContext *avctx,
+                                       VAAPIDecodePicture *pic,
+--- a/libavcodec/vaapi_decode.c
++++ b/libavcodec/vaapi_decode.c
+@@ -29,7 +29,31 @@
+ #include "internal.h"
+ #include "vaapi_decode.h"
+ #include "vaapi_hevc.h"
+-
++#include "libavutil/intreadwrite.h"
++
++
++// libva's private-function entry point keeps unmodified clients on standard VA.
++static int trames_bitstream_caps(VADisplay display)
++{
++    typedef int (*Negotiate)(VADisplay, unsigned);
++    Negotiate negotiate = (Negotiate)vaGetLibFunc(display, "trames_vaapi_bitstream_v1");
++    return negotiate ? negotiate(display, 1) : 0;
++}
++
++int ff_vaapi_trames_configuration(AVCodecContext *avctx, VAAPIDecodePicture *pic,
++                                  unsigned codec, const uint8_t *data, size_t size)
++{
++    uint8_t *buffer;
++    int ret;
++    if (!size || size > 65536) return AVERROR_INVALIDDATA;
++    buffer = av_malloc(size + 4);
++    if (!buffer) return AVERROR(ENOMEM);
++    AV_WB32(buffer, codec);
++    memcpy(buffer + 4, data, size);
++    ret = ff_vaapi_decode_make_param_buffer(avctx, pic, 0x54520001, buffer, size + 4);
++    av_free(buffer);
++    return ret;
++}
+ 
+ int ff_vaapi_decode_make_param_buffer(AVCodecContext *avctx,
+                                       VAAPIDecodePicture *pic,
+@@ -158,7 +182,7 @@
+     VAStatus vas;
+     int err;
+ 
+-    if (pic->nb_slices <= 0) {
++    if (pic->nb_slices <= 0 && !(ctx->trames_bitstream & 4 && avctx->codec_id == AV_CODEC_ID_AV1)) {
+         err = AVERROR(EINVAL);
+         goto fail;
+     }
+@@ -184,8 +208,8 @@
+         goto fail_with_picture;
+     }
+ 
+-    vas = vaRenderPicture(ctx->hwctx->display, ctx->va_context,
+-                          pic->slice_buffers, 2 * pic->nb_slices);
++    vas = pic->nb_slices ? vaRenderPicture(ctx->hwctx->display, ctx->va_context,
++                          pic->slice_buffers, 2 * pic->nb_slices) : VA_STATUS_SUCCESS;
+     if (vas != VA_STATUS_SUCCESS) {
+         av_log(avctx, AV_LOG_ERROR, "Failed to upload slices: "
+                "%d (%s).\n", vas, vaErrorStr(vas));
+@@ -478,6 +502,7 @@
+         goto fail;
+     }
+ 
++    trames_bitstream_caps(hwctx->display);
+     profile_count = vaMaxNumProfiles(hwctx->display);
+     profile_list  = av_malloc_array(profile_count,
+                                     sizeof(VAProfile));
+@@ -686,6 +711,7 @@
+     ctx->hwfc   = ctx->frames->hwctx;
+     ctx->device = ctx->frames->device_ctx;
+     ctx->hwctx  = ctx->device->hwctx;
++    ctx->trames_bitstream = trames_bitstream_caps(ctx->hwctx->display);
+ 
+     err = vaapi_decode_make_config(avctx, ctx->frames->device_ref,
+                                    &ctx->va_config, NULL);
+--- a/libavcodec/vaapi_hevc.c
++++ b/libavcodec/vaapi_hevc.c
+@@ -30,6 +30,9 @@
+ #include "h265_profile_level.h"
+ 
+ #include "hevc/hevcdec.h"
++#include "libavutil/intreadwrite.h"
++#include "internal.h"
++#include "libavutil/mem.h"
+ 
+ typedef struct VAAPIDecodePictureHEVC {
+ #if VA_CHECK_VERSION(1, 2, 0)
+@@ -121,6 +124,51 @@
+     }
+ }
+ 
++// Preserve the original unescaped parser parameter sets, including fields that
++// stateless VAPictureParameterBufferHEVC does not retain. This uses the same
++// RBSP escaping rule as FFmpeg's native VideoToolbox parameter-set path.
++static size_t trames_hevc_escape(uint8_t *out, const uint8_t *data, size_t size)
++{
++    size_t n = 0;
++    for (size_t i = 0; i < size; i++) {
++        if (i + 2 < size && !data[i] && !data[i+1] && data[i+2] <= 3) {
++            if (out) { out[n] = 0; out[n+1] = 0; out[n+2] = 3; }
++            n += 3; i++;
++        } else {
++            if (out) out[n] = data[i];
++            n++;
++        }
++    }
++    return n;
++}
++static int trames_hevc_configuration(AVCodecContext *avctx, VAAPIDecodePicture *pic)
++{
++    const HEVCContext *h = avctx->priv_data;
++    const HEVCPPS *pps = h->pps;
++    const HEVCSPS *sps = pps->sps;
++    const HEVCVPS *vps = sps->vps;
++    const uint8_t *sets[] = {vps->data, sps->data, pps->data};
++    size_t sizes[] = {vps->data_size, sps->data_size, pps->data_size};
++    size_t total = 12, lengths[3], offset = 0;
++    uint8_t *data;
++    int ret;
++    for (int i = 0; i < 3; i++) {
++        if (sizes[i] < 2 || sizes[i] > 65536) return AVERROR_INVALIDDATA;
++        lengths[i] = trames_hevc_escape(NULL, sets[i], sizes[i]);
++        total += lengths[i];
++    }
++    if (total > 65536) return AVERROR_INVALIDDATA;
++    data = av_malloc(total);
++    if (!data) return AVERROR(ENOMEM);
++    for (int i = 0; i < 3; i++) {
++        AV_WB32(data + offset, lengths[i]); offset += 4;
++        offset += trames_hevc_escape(data + offset, sets[i], sizes[i]);
++    }
++    ret = ff_vaapi_trames_configuration(avctx, pic, 1, data, total);
++    av_free(data);
++    return ret;
++}
++
+ static int vaapi_hevc_start_frame(AVCodecContext          *avctx,
+                                   av_unused const uint8_t *buffer,
+                                   av_unused uint32_t       size)
+@@ -141,6 +189,8 @@
+     VAPictureParameterBufferHEVC *pic_param = (VAPictureParameterBufferHEVC *)&pic->pic_param;
+ 
+     pic->pic.output_surface = ff_vaapi_get_surface_id(h->cur_frame->f);
++    if (((VAAPIDecodeContext *)avctx->internal->hwaccel_priv_data)->trames_bitstream & 2)
++        return trames_hevc_configuration(avctx, &pic->pic);
+ 
+     *pic_param = (VAPictureParameterBufferHEVC) {
+         .pic_width_in_luma_samples                    = sps->width,
+@@ -353,6 +403,8 @@
+     int slice_param_size = avctx->profile >= AV_PROFILE_HEVC_REXT ?
+                             sizeof(pic->last_slice_param) : sizeof(VASliceParameterBufferHEVC);
+ 
++    if (((VAAPIDecodeContext *)avctx->internal->hwaccel_priv_data)->trames_bitstream & 2)
++        return ff_vaapi_decode_issue(avctx, &pic->pic);
+     if (pic->last_size) {
+         last_slice_param->LongSliceFlags.fields.LastSliceOfPic = 1;
+         ret = ff_vaapi_decode_make_slice_buffer(avctx, &pic->pic,
+@@ -472,6 +524,11 @@
+ 
+     int err, i, list_idx;
+ 
++    if (((VAAPIDecodeContext *)avctx->internal->hwaccel_priv_data)->trames_bitstream & 2) {
++        const uint32_t unused = 0;
++        return ff_vaapi_decode_make_slice_buffer(avctx, &pic->pic, &unused, 1,
++                                                  sizeof(unused), buffer, size);
++    }
+     if (!sh->first_slice_in_pic_flag) {
+         err = ff_vaapi_decode_make_slice_buffer(avctx, &pic->pic,
+                                                 &pic->last_slice_param, 1, slice_param_size,
+--- a/libavcodec/vaapi_av1.c
++++ b/libavcodec/vaapi_av1.c
+@@ -25,6 +25,7 @@
+ #include "internal.h"
+ #include "av1dec.h"
+ #include "thread.h"
++#include "libavutil/intreadwrite.h"
+ 
+ typedef struct VAAPIAV1FrameRef {
+     AVFrame *frame;
+@@ -43,6 +44,8 @@
+     */
+     VAAPIAV1FrameRef ref_tab[AV1_NUM_REF_FRAMES];
+     AVFrame *tmp_frame;
++
++    int trames_start_unit, trames_end_unit;
+ 
+     int nb_slice_params;
+     VASliceParameterBufferAV1 *slice_params;
+@@ -126,6 +129,18 @@
+     uint8_t segmentation_feature_max[AV1_SEG_LVL_MAX] = {255, AV1_MAX_LOOP_FILTER,
+         AV1_MAX_LOOP_FILTER, AV1_MAX_LOOP_FILTER, AV1_MAX_LOOP_FILTER, 7 , 0 , 0 };
+ 
++    if (ctx->base.trames_bitstream & 4) {
++        if (seq->seq_profile || seq->color_config.high_bitdepth || seq->color_config.mono_chrome)
++            return AVERROR(ENOSYS);
++        pic->output_surface = ff_vaapi_get_surface_id(s->cur_frame.f);
++        for (int i = 0; i < s->current_obu.nb_units; i++) {
++            if (s->current_obu.units[i].data == buffer) {
++                ctx->trames_start_unit = ctx->trames_end_unit = i;
++                return 0;
++            }
++        }
++        return AVERROR_INVALIDDATA;
++    }
+     bit_depth_idx = vaapi_av1_get_bit_depth_idx(avctx);
+     if (bit_depth_idx < 0)
+         goto fail;
+@@ -360,6 +375,52 @@
+     return err;
+ }
+ 
++// av1C packing follows FFmpeg's upstream VideoToolbox AV1 path (Jan Ekstrom,
++// Ruslan Chernenko, Martin Storsjo, LGPL-2.1-or-later). Keep original sequence
++// and complete frame OBUs; stateless VA tile data cannot reconstruct them.
++static int trames_av1_issue(AVCodecContext *avctx)
++{
++    const AV1DecContext *s = avctx->priv_data;
++    const AV1RawSequenceHeader *seq = s->raw_seq;
++    VAAPIAV1DecContext *ctx = avctx->internal->hwaccel_priv_data;
++    VAAPIDecodePicture *pic = s->cur_frame.hwaccel_picture_private;
++    uint8_t *configuration, *data;
++    size_t size = 0, offset = 0;
++    int ret;
++    if (!s->seq_data_ref || s->seq_data_ref->size > 65532) return AVERROR_INVALIDDATA;
++    configuration = av_malloc(s->seq_data_ref->size + 4);
++    if (!configuration) return AVERROR(ENOMEM);
++    configuration[0] = 0x81;
++    configuration[1] = seq->seq_profile << 5 | seq->seq_level_idx[0];
++    configuration[2] = seq->seq_tier[0] << 7 | seq->color_config.high_bitdepth << 6 |
++        seq->color_config.twelve_bit << 5 | seq->color_config.mono_chrome << 4 |
++        seq->color_config.subsampling_x << 3 | seq->color_config.subsampling_y << 2 |
++        seq->color_config.chroma_sample_position;
++    configuration[3] = seq->initial_display_delay_present_flag && seq->initial_display_delay_present_for_this_op[0] ?
++        0x10 | seq->initial_display_delay_minus_1[0] : 0;
++    memcpy(configuration + 4, s->seq_data_ref->data, s->seq_data_ref->size);
++    ret = ff_vaapi_trames_configuration(avctx, pic, 2, configuration, s->seq_data_ref->size + 4);
++    av_free(configuration);
++    if (ret < 0) goto fail;
++    for (int i = ctx->trames_start_unit; i <= ctx->trames_end_unit; i++) {
++        size += s->current_obu.units[i].data_size;
++        if (size > INT_MAX) { ret = AVERROR_INVALIDDATA; goto fail; }
++    }
++    data = av_malloc(size);
++    if (!data) { ret = AVERROR(ENOMEM); goto fail; }
++    for (int i = ctx->trames_start_unit; i <= ctx->trames_end_unit; i++) {
++        const CodedBitstreamUnit *unit = &s->current_obu.units[i];
++        memcpy(data + offset, unit->data, unit->data_size); offset += unit->data_size;
++    }
++    ret = ff_vaapi_decode_make_param_buffer(avctx, pic, 0x54520002, data, size);
++    av_free(data);
++    if (ret < 0) goto fail;
++    return ff_vaapi_decode_issue(avctx, pic);
++fail:
++    ff_vaapi_decode_cancel(avctx, pic);
++    return ret;
++}
++
+ static int vaapi_av1_end_frame(AVCodecContext *avctx)
+ {
+     const AV1DecContext *s = avctx->priv_data;
+@@ -370,6 +431,8 @@
+ 
+     int apply_grain = !(avctx->export_side_data & AV_CODEC_EXPORT_DATA_FILM_GRAIN) && film_grain->apply_grain;
+     int ret;
++    if (ctx->base.trames_bitstream & 4)
++        return trames_av1_issue(avctx);
+     ret = ff_vaapi_decode_issue(avctx, pic);
+     if (ret < 0)
+         return ret;
+@@ -402,6 +465,19 @@
+     VAAPIAV1DecContext *ctx = avctx->internal->hwaccel_priv_data;
+     int err, nb_params;
+ 
++    if (ctx->base.trames_bitstream & 4) {
++        uintptr_t begin = (uintptr_t)buffer;
++        for (int i = ctx->trames_start_unit; i < s->current_obu.nb_units; i++) {
++            const CodedBitstreamUnit *unit = &s->current_obu.units[i];
++            uintptr_t base = (uintptr_t)unit->data;
++            if (begin >= base && begin - base <= unit->data_size &&
++                size <= unit->data_size - (begin - base)) {
++                ctx->trames_end_unit = i;
++                return 0;
++            }
++        }
++        return AVERROR_INVALIDDATA;
++    }
+     nb_params = s->tg_end - s->tg_start + 1;
+     if (ctx->nb_slice_params < nb_params) {
+         VASliceParameterBufferAV1 *tmp = av_realloc_array(ctx->slice_params,
+@@ -440,6 +516,25 @@
+ fail:
+     ff_vaapi_decode_cancel(avctx, pic);
+     return err;
++}
++
++int ff_vaapi_av1_trames_show_existing(AVCodecContext *avctx,
++                                      const uint8_t *buffer, uint32_t size)
++{
++    const AV1DecContext *s = avctx->priv_data;
++    VAAPIAV1DecContext *ctx;
++    int ret;
++    if (!s->cur_frame.f || s->cur_frame.f->format != AV_PIX_FMT_VAAPI) return 0;
++    if (!avctx->hwaccel || !avctx->internal->hwaccel_priv_data) return 0;
++    if (!s->cur_frame.hwaccel_picture_private) return AVERROR_INVALIDDATA;
++    ctx = avctx->internal->hwaccel_priv_data;
++    if (!(ctx->base.trames_bitstream & 4)) return 0;
++    // Ordinary show_existing only displays a retained surface. Re-submit only
++    // a KEY reference, whose show_existing refreshes the native DPB entries.
++    if (!s->cur_frame.raw_frame_header ||
++        s->cur_frame.raw_frame_header->frame_type != AV1_FRAME_KEY) return 0;
++    ret = vaapi_av1_start_frame(avctx, buffer, size);
++    return ret < 0 ? ret : trames_av1_issue(avctx);
+ }
+ 
+ const FFHWAccel ff_av1_vaapi_hwaccel = {
+--- a/libavcodec/av1dec.c
++++ b/libavcodec/av1dec.c
+@@ -29,6 +29,9 @@
+ #include "avcodec.h"
+ #include "av1_parse.h"
+ #include "av1dec.h"
++#if CONFIG_AV1_VAAPI_HWACCEL
++#include "vaapi_decode.h"
++#endif
+ #include "atsc_a53.h"
+ #include "bytestream.h"
+ #include "codec_internal.h"
+@@ -1339,6 +1342,11 @@
+                 update_reference_list(avctx);
+ 
+                 if (s->cur_frame.f) {
++#if CONFIG_AV1_VAAPI_HWACCEL
++                    // show_existing may refresh the native decoder DPB too.
++                    ret = ff_vaapi_av1_trames_show_existing(avctx, unit->data, unit->data_size);
++                    if (ret < 0) goto end;
++#endif
+                     ret = set_output_frame(avctx, frame);
+                     if (ret < 0) {
+                         av_log(avctx, AV_LOG_ERROR, "Set output frame error.\n");
