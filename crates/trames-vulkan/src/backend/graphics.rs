@@ -3,6 +3,7 @@
 //! handed to the driver; all arrays are decoded to scoped native records.
 use super::*;
 mod commands;
+mod dynamic;
 mod render_graph;
 mod render_pass;
 mod ycbcr;
@@ -91,6 +92,7 @@ pub(super) struct SubpassInfo {
     colors: [vk::Format; MAX_COLORS],
     color_count: usize,
     depth: Option<vk::Format>,
+    stencil: Option<vk::Format>,
     samples: vk::SampleCountFlags,
     view_mask: u32,
     inputs: Vec<(vk::Format, vk::SampleCountFlags)>,
@@ -103,6 +105,7 @@ impl SubpassInfo {
             colors: [vk::Format::UNDEFINED; MAX_COLORS],
             color_count,
             depth: None,
+            stencil: None,
             samples: vk::SampleCountFlags::empty(),
             view_mask: 0,
             inputs: Vec::new(),
@@ -167,7 +170,7 @@ pub(super) struct AttachmentSpec {
 }
 #[derive(Default)]
 pub(super) struct Recording {
-    pub pass: Option<Rc<Object>>,
+    pub pass: Option<dynamic::RenderScope>,
     render_area: Option<vk::Rect2D>,
     layers: u32,
     pub subpass: usize,
@@ -448,7 +451,7 @@ impl Backend {
                 .ok_or(Failure::Vk(vk::Result::ERROR_UNKNOWN))?;
             if pipeline.flags != vk::PipelineBindPoint::GRAPHICS.as_raw() as u32
                 || pipeline.size as usize != recording.subpass
-                || !compatible_pass(&pipeline.deps.borrow()[1], pass)
+                || !pass.compatible_pipeline(pipeline, recording.subpass)
                 || !recording.viewport && pipeline.static_states.get() & 1 == 0
                 || !recording.scissor && pipeline.static_states.get() & 2 == 0
                 || indexed && recording.index.is_none()
@@ -777,19 +780,44 @@ impl Backend {
         if std::env::var_os("TRAMES_VULKAN_TRACE").is_some() {
             eprintln!("trames-vulkan graphics-config={config:x?}");
         }
-        let pass = self.object(state[0], Kind::RenderPass)?;
-        let subpass_index = if config[0] & 32768 != 0 {
+        let rendering = if state[0] == 0 {
+            if device.compute_features & compute::DYNAMIC_RENDERING == 0 || config[0] & 262144 == 0
+            {
+                return unsupported();
+            }
+            let samples = if config[0] & 16384 != 0 {
+                sample_count(config[13])?
+            } else {
+                vk::SampleCountFlags::TYPE_1
+            };
+            Some(dynamic::pipeline_info(dynamic::formats(
+                m,
+                a[15] + 111 * 8,
+                samples,
+            )?))
+        } else {
+            None
+        };
+        let pass = if state[0] != 0 {
+            Some(self.object(state[0], Kind::RenderPass)?)
+        } else {
+            None
+        };
+        let subpass_index = if rendering.is_none() && config[0] & 32768 != 0 {
             words64(m, a[6] + 40, 1)?[0] as usize
         } else {
             0
         };
-        let subpass = pass
-            .pass
-            .get()
-            .unwrap()
-            .subpasses
-            .get(subpass_index)
-            .ok_or(Failure::Vk(vk::Result::ERROR_UNKNOWN))?;
+        let subpass = match &pass {
+            Some(pass) => pass
+                .pass
+                .get()
+                .unwrap()
+                .subpasses
+                .get(subpass_index)
+                .ok_or(Failure::Vk(vk::Result::ERROR_UNKNOWN))?,
+            None => &rendering.as_ref().unwrap().subpasses[0],
+        };
         if !matches!(state[1], 0..=5) || state[2] & !3 != 0 || state[3] > 1 || state[4] & !15 != 0 {
             return unsupported();
         }
@@ -818,7 +846,7 @@ impl Backend {
         let depth_test = a[14] & 1 != 0;
         let depth_write = a[14] & 2 != 0;
         let compare = ((a[14] >> 4) & 7) as i32;
-        if (depth_test || depth_write) && subpass.depth.is_none() {
+        if rendering.is_none() && (depth_test || depth_write) && subpass.depth.is_none() {
             return invalid();
         }
         let cache = if a[13] == 0 {
@@ -838,7 +866,7 @@ impl Backend {
         .limits;
         // Extended graphics state is copied before the asynchronous native
         // compiler starts; no guest pointers enter that worker.
-        if config[0] & !262143 != 0 {
+        if config[0] & !524287 != 0 {
             return unsupported();
         }
         let creation_flags = if config[0] & 65536 != 0 {
@@ -874,11 +902,12 @@ impl Backend {
             vk::SampleCountFlags::TYPE_1
         };
         let pass_samples = subpass.samples;
-        if !pass_samples.is_empty() && pass_samples != samples
-            || pass_samples.is_empty()
-                && !limits
-                    .framebuffer_no_attachments_sample_counts
-                    .contains(samples)
+        if a[14] & 65536 == 0
+            && (!pass_samples.is_empty() && pass_samples != samples
+                || pass_samples.is_empty()
+                    && !limits
+                        .framebuffer_no_attachments_sample_counts
+                        .contains(samples))
         {
             return invalid();
         }
@@ -922,7 +951,7 @@ impl Backend {
         let back = stencil_state(&stencil[8..15])?;
         // With no color attachments Vulkan ignores color-blend attachment
         // state, even when the application supplies a nonempty default array.
-        let blend_wire = if subpass.color_count == 0 {
+        let blend_wire = if subpass.color_count == 0 || a[14] & 65536 != 0 {
             Vec::new()
         } else if config[0] & 512 != 0 {
             let count = words64(m, a[15] + 22 * 8, 1)?[0];
@@ -932,7 +961,7 @@ impl Backend {
             wire.push(state[4]);
             wire
         };
-        if blend_wire.len() / 8 != subpass.color_count {
+        if a[14] & 65536 == 0 && blend_wire.len() / 8 != subpass.color_count {
             return invalid();
         }
         if device.features.independent_blend == 0
@@ -1104,8 +1133,18 @@ impl Backend {
             vk::PipelineLayout::from_raw(pipeline_layout.raw),
             vk::ShaderModule::from_raw(vertex.raw),
             fragment.as_ref().map(|f| vk::ShaderModule::from_raw(f.raw)),
-            vk::RenderPass::from_raw(pass.raw),
+            pass.as_ref()
+                .map_or(vk::RenderPass::null(), |p| vk::RenderPass::from_raw(p.raw)),
         );
+        let rendering_formats = rendering.as_ref().map(|p| {
+            let p = &p.subpasses[0];
+            (
+                p.view_mask,
+                p.colors[..p.color_count].to_vec(),
+                p.depth.unwrap_or(vk::Format::UNDEFINED),
+                p.stencil.unwrap_or(vk::Format::UNDEFINED),
+            )
+        });
         let permit = self
             .budget
             .compile()
@@ -1205,7 +1244,15 @@ impl Backend {
             }
             let dynamic =
                 vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
-            let info = [vk::GraphicsPipelineCreateInfo::default()
+            let mut rendering_info = vk::PipelineRenderingCreateInfo::default();
+            if let Some((mask, colors, depth, stencil)) = &rendering_formats {
+                rendering_info = rendering_info
+                    .view_mask(*mask)
+                    .color_attachment_formats(colors)
+                    .depth_attachment_format(*depth)
+                    .stencil_attachment_format(*stencil);
+            }
+            let mut info = vk::GraphicsPipelineCreateInfo::default()
                 .flags(creation_flags)
                 .stages(&stages)
                 .vertex_input_state(&vertex)
@@ -1218,11 +1265,14 @@ impl Backend {
                 .dynamic_state(&dynamic)
                 .layout(raw_layout)
                 .render_pass(raw_pass)
-                .subpass(subpass_index as u32)];
+                .subpass(subpass_index as u32);
+            if rendering_formats.is_some() {
+                info = info.push_next(&mut rendering_info);
+            }
             match unsafe {
                 device
                     .native
-                    .create_graphics_pipelines(raw_cache, &info, None)
+                    .create_graphics_pipelines(raw_cache, &[info], None)
             } {
                 Ok(p) => Ok(CompiledPipeline { device, raw: p[0] }),
                 Err((pipelines, error)) => {
@@ -1242,11 +1292,14 @@ impl Backend {
             Compile {
                 task,
                 dependencies: {
-                    let mut d = vec![pipeline_layout, pass, vertex];
+                    let mut d = vec![pipeline_layout];
+                    d.extend(pass);
+                    d.push(vertex);
                     d.extend(fragment);
                     d.extend(cache);
                     d
                 },
+                rendering,
                 bind_point: vk::PipelineBindPoint::GRAPHICS,
                 creation_flags: 0,
                 subpass: subpass_index as u32,
@@ -2184,7 +2237,7 @@ impl Backend {
                             .pass
                             .as_ref()
                             .ok_or(Failure::Vk(vk::Result::ERROR_UNKNOWN))?;
-                        let info = &pass.pass.get().unwrap().subpasses[recording.subpass];
+                        let info = pass.info(recording.subpass)?;
                         let area = recording
                             .render_area
                             .ok_or(Failure::Vk(vk::Result::ERROR_UNKNOWN))?;
@@ -2610,7 +2663,7 @@ impl Backend {
                         c.recording.borrow_mut().pass2 = op == 123;
                         c.recording.borrow_mut().render_area = Some(info.render_area);
                         c.recording.borrow_mut().layers = s.layers;
-                        c.recording.borrow_mut().pass = Some(pass);
+                        c.recording.borrow_mut().pass = Some(dynamic::RenderScope::Pass(pass));
                         c.retain(fb);
                     }
                     72 | 124 => {
@@ -2618,18 +2671,10 @@ impl Backend {
                             return unsupported();
                         }
                         if c.flags != 0
-                            || c.recording.borrow().pass.is_none()
-                            || c.recording.borrow().subpass + 1
-                                != c.recording
-                                    .borrow()
-                                    .pass
-                                    .as_ref()
-                                    .unwrap()
-                                    .pass
-                                    .get()
-                                    .unwrap()
-                                    .subpasses
-                                    .len()
+                            || c.recording.borrow().pass.as_ref().is_none_or(|p| {
+                                p.legacy().is_none()
+                                    || c.recording.borrow().subpass + 1 != p.subpass_count()
+                            })
                             || c.recording.borrow().feedback_active
                             || c.recording
                                 .borrow()
@@ -2667,7 +2712,7 @@ impl Backend {
                             || (!r.viewport && p.static_states.get() & 1 == 0)
                             || (!r.scissor && p.static_states.get() & 2 == 0)
                             || p.size as usize != r.subpass
-                            || !compatible_pass(&p.deps.borrow()[1], pass)
+                            || !pass.compatible_pipeline(p, r.subpass)
                             || a[2..5].iter().any(|&x| x > u32::MAX as u64)
                             || (op == 73 && a[5] > u32::MAX as u64)
                             || (op == 97
@@ -3294,6 +3339,7 @@ fn clear_attachment(pass: &SubpassInfo, wire: &[u64]) -> Result<vk::ClearAttachm
         }
     } else if pass
         .depth
+        .or(pass.stencil)
         .is_none_or(|f| !format_aspects(f).contains(aspect))
     {
         return invalid();

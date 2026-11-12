@@ -1,5 +1,5 @@
 {
-  "wire_revision": 17,
+  "wire_revision": 18,
   "extensions": [
     {"index": 0, "name": "storage_class", "extension": "VK_KHR_storage_buffer_storage_class", "minimum_api": 0, "promoted": 11},
     {"index": 1, "name": "storage16", "extension": "VK_KHR_16bit_storage", "minimum_api": 0, "promoted": 11},
@@ -34,7 +34,9 @@
     {"index": 30, "name": "stencil_usage", "extension": "VK_EXT_separate_stencil_usage", "minimum_api": 12, "promoted": 12},
     {"index": 31, "name": "dedicated", "extension": "VK_KHR_dedicated_allocation", "minimum_api": 11, "promoted": 11},
     {"index": 32, "name": "viewport_layer", "extension": "VK_EXT_shader_viewport_index_layer", "minimum_api": 12, "promoted": 12},
-    {"index": 33, "name": "pipeline_cache_control", "extension": "VK_EXT_pipeline_creation_cache_control", "minimum_api": 0, "promoted": 13}
+    {"index": 33, "name": "pipeline_cache_control", "extension": "VK_EXT_pipeline_creation_cache_control", "minimum_api": 0, "promoted": 13},
+    {"index": 34, "name": "dynamic_rendering", "extension": "VK_KHR_dynamic_rendering", "minimum_api": 12, "promoted": 13},
+    {"index": 35, "name": "memory_budget", "extension": "VK_EXT_memory_budget", "minimum_api": 11, "promoted": 0}
   ],
   "features": [
     {
@@ -274,6 +276,21 @@
         {
           "c": "pipelineCreationCacheControl",
           "rust": "pipeline_creation_cache_control",
+          "kind": "Bool32",
+          "expose": true
+        }
+      ]
+    },
+    {
+      "extension": 34,
+      "name": "dynamic_rendering",
+      "type": "PhysicalDeviceDynamicRenderingFeatures",
+      "structure_type": "PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES",
+      "bit": 74,
+      "fields": [
+        {
+          "c": "dynamicRendering",
+          "rust": "dynamic_rendering",
           "kind": "Bool32",
           "expose": true
         }

@@ -195,6 +195,8 @@ struct Object {
     image_flags: Cell<u32>,
     stencil_usage: Cell<u32>,
     // Large immutable attachment tables belong only to render-pass objects.
+    // Dynamic pipelines store just their format signature here, with empty
+    // attachment tables; they never own or fabricate a native render pass.
     pass: std::cell::OnceCell<Box<PassInfo>>,
     attachment_specs: RefCell<Vec<graphics::AttachmentSpec>>,
     recording: RefCell<Recording>,
@@ -431,6 +433,7 @@ struct Compile {
     // Task drops first: it must finish before these Rc-owned dependencies drop.
     task: crate::task::Task<std::result::Result<CompiledPipeline, vk::Result>>,
     dependencies: Vec<Rc<Object>>,
+    rendering: Option<Box<PassInfo>>,
     bind_point: vk::PipelineBindPoint,
     creation_flags: u32,
     subpass: u32,
@@ -1161,6 +1164,7 @@ impl Backend {
                     d.extend(cache);
                     d
                 },
+                rendering: None,
                 bind_point: vk::PipelineBindPoint::COMPUTE,
                 creation_flags: a[10] as u32,
                 subpass: 0,
@@ -1287,16 +1291,21 @@ impl Backend {
             // shader modules against the context's retained-object budget.
             c.dependencies
                 .iter()
-                .take(if c.bind_point == vk::PipelineBindPoint::GRAPHICS {
-                    2
-                } else {
-                    1
-                })
+                .take(
+                    if c.bind_point == vk::PipelineBindPoint::GRAPHICS && c.rendering.is_none() {
+                        2
+                    } else {
+                        1
+                    },
+                )
                 .cloned()
                 .collect(),
             c.subpass as u64,
             c.bind_point.as_raw() as u32,
         );
+        if let Some(info) = c.rendering {
+            self.objects[&id].pass.set(info).ok().unwrap();
+        }
         self.objects[&id].pipeline_flags.set(c.creation_flags);
         *self.objects[&id].vertex_inputs.borrow_mut() = c.vertex_inputs;
         self.objects[&id].static_states.set(c.static_states);
@@ -1446,7 +1455,8 @@ impl Backend {
             || op == 137
             || op == 150
             || op == 206
-            || op == 207)
+            || op == 207
+            || op == 252)
             && a[0]
                 != if op == 3 {
                     self.instance_id
@@ -1457,6 +1467,7 @@ impl Backend {
             return invalid();
         }
         match op {
+            252 => self.memory_budget(m, a)?,
             206 => {
                 let c = &self.capabilities.compute;
                 let words = [
@@ -1563,47 +1574,12 @@ impl Backend {
                 )?;
             }
             5 => {
-                let mut b = vec![
-                    0u64;
-                    std::mem::size_of::<vk::PhysicalDeviceMemoryProperties>()
-                        .div_ceil(8)
-                ];
-                output(
-                    m,
-                    a[1],
-                    std::mem::size_of::<vk::PhysicalDeviceMemoryProperties>(),
-                )?;
-                unsafe {
-                    (instance
+                let properties = unsafe {
+                    instance
                         .native
-                        .fp_v1_0()
-                        .get_physical_device_memory_properties)(
-                        self.physical,
-                        b.as_mut_ptr().cast(),
-                    );
-                }
-                // Explicitly capped sessions expose their native quota. Host-
-                // managed sessions retain the original driver's heap sizes.
-                // Contexts and coherent baselines share live accounting.
-                // SAFETY: u64 storage provides the native struct's alignment;
-                // the original Vulkan driver initialized this complete value.
-                let properties =
-                    unsafe { &mut *b.as_mut_ptr().cast::<vk::PhysicalDeviceMemoryProperties>() };
-                for heap in properties
-                    .memory_heaps
-                    .iter_mut()
-                    .take(properties.memory_heap_count as usize)
-                {
-                    heap.size = heap.size.min(self.budget.limit());
-                }
-                // Native coherent types are mirrored at queue submission and
-                // exposed host completion boundaries, with per-byte ownership.
-                write_words(
-                    m,
-                    a[1],
-                    &b,
-                    std::mem::size_of::<vk::PhysicalDeviceMemoryProperties>(),
-                )?;
+                        .get_physical_device_memory_properties(self.physical)
+                };
+                self.write_memory_properties(m, a[1], &properties)?;
             }
             6 => {
                 let props = unsafe {
@@ -1915,6 +1891,7 @@ impl Backend {
         let d = &dev.native;
         match op {
             240..=242 => self.image_fd_call(m, op, a)?,
+            253..=254 => self.dynamic_rendering(m, op, a)?,
             112 => {
                 self.room(1)?;
                 output(m, a[1], 8)?;
@@ -2591,7 +2568,8 @@ impl Backend {
                 unsafe {
                     if op == 39 {
                         if c.state.get() != 1
-                            || c.flags == 0 && c.recording.borrow().pass.is_some()
+                            || (c.flags == 0 || c.command_usage.get() & 2 == 0)
+                                && c.recording.borrow().pass.is_some()
                             || c.recording.borrow().feedback_active
                             || !c.recording.borrow().queries.is_empty()
                         {
@@ -2754,6 +2732,15 @@ impl Backend {
                         if a[9] & !7 != 0 {
                             return unsupported();
                         }
+                        // Preserve the native empty dependency mask at barrier
+                        // ingress, without accepting it as a queue-wait stage.
+                        let stage = |value| {
+                            if value == 0 {
+                                Ok(vk::PipelineStageFlags::empty())
+                            } else {
+                                dev.stage(value)
+                            }
+                        };
                         let images = self.image_barriers(m, &c, a[6], a[7], a[8])?;
                         let buffers = self.buffer_barriers(m, &c, a[10], a[11])?;
                         let barriers = [vk::MemoryBarrier::default()
@@ -2762,8 +2749,8 @@ impl Backend {
                         unsafe {
                             d.cmd_pipeline_barrier(
                                 raw,
-                                dev.stage(a[2] as u32)?,
-                                dev.stage(a[3] as u32)?,
+                                stage(a[2] as u32)?,
+                                stage(a[3] as u32)?,
                                 vk::DependencyFlags::from_raw(a[9] as u32),
                                 &barriers,
                                 &buffers,

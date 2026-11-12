@@ -15,6 +15,9 @@ impl Backend {
         let mut info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::from_raw(a[2] as u32));
         let mut inheritance = vk::CommandBufferInheritanceInfo::default();
+        let mut rendering = vk::CommandBufferInheritanceRenderingInfo::default();
+        let rendering_formats;
+
         let mut resources = Vec::new();
         let mut recording = Recording::default();
         if c.flags == 1 {
@@ -28,39 +31,73 @@ impl Backend {
                 .query_flags(vk::QueryControlFlags::from_raw(v[4] as u32))
                 .pipeline_statistics(vk::QueryPipelineStatisticFlags::from_raw(v[5] as u32));
             if a[2] & 2 != 0 {
-                let pass = self.object(v[0], Kind::RenderPass)?;
-                if v[1] >= pass.pass.get().unwrap().subpasses.len() as u64 {
-                    return invalid();
-                }
-                inheritance = inheritance.render_pass(vk::RenderPass::from_raw(pass.raw));
-                recording.subpass = v[1] as usize;
-                recording.layers = 1;
-                recording.render_area = Some(vk::Rect2D {
-                    offset: vk::Offset2D::default(),
-                    extent: vk::Extent2D {
-                        width: DIMENSION,
-                        height: DIMENSION,
-                    },
-                });
-                if v[2] != 0 {
-                    let fb = self.object(v[2], Kind::Framebuffer)?;
-                    if !compatible_pass(&fb.deps.borrow()[0], &pass) {
-                        return invalid();
+                if v[0] == 0 {
+                    if c.device.compute_features & compute::DYNAMIC_RENDERING == 0 || a[4] == 0 {
+                        return unsupported();
                     }
-                    let shape = shape(&fb)?;
-                    recording.layers = shape.layers;
+                    let sample = words64(m, a[4] + 40, 1)?[0];
+                    let signature = dynamic::formats(m, a[4], sample_count(sample)?)?;
+                    rendering_formats = signature.colors[..signature.color_count].to_vec();
+                    rendering = rendering
+                        .flags(vk::RenderingFlags::from_raw(a[5] as u32))
+                        .view_mask(signature.view_mask)
+                        .color_attachment_formats(&rendering_formats)
+                        .depth_attachment_format(signature.depth.unwrap_or(vk::Format::UNDEFINED))
+                        .stencil_attachment_format(
+                            signature.stencil.unwrap_or(vk::Format::UNDEFINED),
+                        )
+                        .rasterization_samples(signature.samples);
+                    recording.layers = if signature.view_mask != 0 {
+                        1
+                    } else {
+                        u32::MAX
+                    };
+                    inheritance = inheritance.push_next(&mut rendering);
+                    recording.pass = Some(dynamic::RenderScope::Rendering(Box::new(
+                        dynamic::Rendering { info: signature },
+                    )));
                     recording.render_area = Some(vk::Rect2D {
                         offset: vk::Offset2D::default(),
                         extent: vk::Extent2D {
-                            width: shape.width,
-                            height: shape.height,
+                            width: DIMENSION,
+                            height: DIMENSION,
                         },
                     });
-                    inheritance = inheritance.framebuffer(vk::Framebuffer::from_raw(fb.raw));
-                    resources.push(fb);
+                } else {
+                    let pass = self.object(v[0], Kind::RenderPass)?;
+                    if v[1] >= pass.pass.get().unwrap().subpasses.len() as u64 {
+                        return invalid();
+                    }
+                    inheritance = inheritance.render_pass(vk::RenderPass::from_raw(pass.raw));
+                    recording.subpass = v[1] as usize;
+                    recording.layers = 1;
+                    recording.render_area = Some(vk::Rect2D {
+                        offset: vk::Offset2D::default(),
+                        extent: vk::Extent2D {
+                            width: DIMENSION,
+                            height: DIMENSION,
+                        },
+                    });
+                    if v[2] != 0 {
+                        let fb = self.object(v[2], Kind::Framebuffer)?;
+                        if !compatible_pass(&fb.deps.borrow()[0], &pass) {
+                            return invalid();
+                        }
+                        let shape = shape(&fb)?;
+                        recording.layers = shape.layers;
+                        recording.render_area = Some(vk::Rect2D {
+                            offset: vk::Offset2D::default(),
+                            extent: vk::Extent2D {
+                                width: shape.width,
+                                height: shape.height,
+                            },
+                        });
+                        inheritance = inheritance.framebuffer(vk::Framebuffer::from_raw(fb.raw));
+                        resources.push(fb);
+                    }
+                    recording.pass = Some(dynamic::RenderScope::Pass(pass.clone()));
+                    resources.push(pass);
                 }
-                recording.pass = Some(pass.clone());
-                resources.push(pass);
             }
             info = info.inheritance_info(&inheritance);
         } else if a[2] & 2 != 0 {
@@ -100,7 +137,7 @@ impl Backend {
                 .pass
                 .as_ref()
                 .ok_or(Failure::Vk(vk::Result::ERROR_UNKNOWN))?;
-            if recording.subpass + 1 >= pass.pass.get().unwrap().subpasses.len() {
+            if pass.legacy().is_none() || recording.subpass + 1 >= pass.subpass_count() {
                 return invalid();
             }
             unsafe {
@@ -136,7 +173,7 @@ impl Backend {
                 let inherited = secondary.recording.borrow();
                 match recording.pass.as_ref().zip(inherited.pass.as_ref()) {
                     Some((actual, expected))
-                        if compatible_pass(actual, expected)
+                        if actual.compatible_scope(expected)
                             && recording.subpass == inherited.subpass => {}
                     None if recording.pass.is_none() && inherited.pass.is_none() => {}
                     _ => return invalid(),

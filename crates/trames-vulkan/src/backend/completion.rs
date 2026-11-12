@@ -271,6 +271,7 @@ mod tests {
             Compile {
                 task,
                 dependencies: Vec::new(),
+                rendering: None,
                 bind_point: vk::PipelineBindPoint::COMPUTE,
                 creation_flags: 0,
                 subpass: 0,
@@ -335,6 +336,7 @@ mod retirement_tests {
             Compile {
                 task,
                 dependencies: Vec::new(),
+                rendering: None,
                 bind_point: vk::PipelineBindPoint::COMPUTE,
                 creation_flags: 0,
                 subpass: 0,
@@ -447,6 +449,7 @@ mod retirement_unlock_tests {
             Compile {
                 task,
                 dependencies: Vec::new(),
+                rendering: None,
                 bind_point: vk::PipelineBindPoint::COMPUTE,
                 creation_flags: 0,
                 subpass: 0,
