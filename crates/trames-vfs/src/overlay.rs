@@ -635,6 +635,12 @@ impl Vfs {
                 .filter_map(std::sync::Weak::upgrade)
             {
                 if let Some(o) = &m.fs.borrow().overlay {
+                    // Proc/query projections retain identity and bytes, not
+                    // writable-layer ownership. Mounted topology and actual
+                    // fd/fs/image users already publish the original lease.
+                    if o.layer_uses.lock().unwrap().strong_count() == 0 {
+                        continue;
+                    }
                     if [&o.upper, &o.work]
                         .into_iter()
                         .flatten()
@@ -1050,6 +1056,42 @@ mod tests {
         v.umount(b"/lower", 0).unwrap();
         let old = String::from_utf8(mounts::table_text(&observed.namespaces, true)).unwrap();
         assert!(old.contains(" /merged ") && old.contains(" /lower "));
+    }
+    #[test]
+    fn detached_overlay_can_remount_after_real_use_ends_despite_proc_observers() {
+        let mut v = Vfs::default();
+        dirs(&mut v);
+        write(&mut v, b"/lower/file", b"data");
+        mount(&mut v);
+        let source = v.proc_resources();
+        let mut observed = ProcessInfo::default();
+        source.observe(&mut observed, ProcRefresh::Namespaces);
+        let fd = v.open_at(AT_FDCWD, b"/merged/file", 0, 0).unwrap();
+        let accepted = v.shared_files().lookup(fd).unwrap().unwrap();
+        v.close(fd).unwrap();
+        v.umount(b"/merged", 2).unwrap();
+        assert_eq!(
+            v.mount(
+                Some(b"overlay"),
+                b"/merged",
+                Some(b"overlay"),
+                0,
+                Some(b"lowerdir=/lower:/lower2,upperdir=/upper,workdir=/work,index=off"),
+            ),
+            Err(Errno(16)),
+            "an accepted open file still owns the old writable layers"
+        );
+        std::thread::spawn(move || drop(accepted)).join().unwrap();
+        mount(&mut v);
+        assert_eq!(read(&mut v, b"/merged/file"), b"data");
+        write(&mut v, b"/merged/file", b"new");
+        v.sync().unwrap();
+        assert_eq!(read(&mut v, b"/upper/file"), b"new");
+        let old = String::from_utf8(mounts::table_text(&observed.namespaces, true)).unwrap();
+        assert!(
+            old.contains(" /merged "),
+            "old proc metadata remains readable"
+        );
     }
     fn write(v: &mut Vfs, path: &[u8], data: &[u8]) {
         let fd = v.open_at(AT_FDCWD, path, 0x242, 0o644).unwrap();
