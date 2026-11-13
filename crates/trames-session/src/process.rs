@@ -2241,6 +2241,7 @@ impl<C: Cpu> Kernel<C> {
                 a[1],
                 self.started,
                 Some(p.linux.boot_clock()),
+                Some(&p.signals.io.proc_view),
             )
             .map(Some),
             179 => {

@@ -37,10 +37,11 @@ pub fn clock_read(
     address: u64,
     started: Instant,
     boot: Option<crate::Boottime>,
+    task: Option<&trames_vfs::ProcessView>,
 ) -> Result<u64, Errno> {
     // clockid_t is a signed 32-bit Linux ABI argument, including raw SVCs.
     let id = id as u32;
-    if !matches!(id, 0 | 1 | 4..=9) {
+    if !matches!(id, 0 | 1 | 3..=9) {
         return Err(Errno(22));
     }
     if number == 114 && address == 0 {
@@ -54,7 +55,15 @@ pub fn clock_read(
     } else {
         // Realtime/coarse realtime retain Unix time; all monotonic variants
         // retain the session epoch. Boottime includes actual host suspension.
-        let elapsed = if matches!(id, 0 | 5 | 8) {
+        let elapsed = if id == 3 {
+            // Original guest-task accounting follows execution-slot migration
+            // and freezes while parked. Read it only for the requested clock;
+            // host worker/process clocks would charge unrelated guest tasks.
+            // This is charged assignment time, as in /proc, including host
+            // preemption during an assignment. Process-wide CPU clocks still
+            // need live plus retired thread accounting; do not fake wall time.
+            task.ok_or(Errno(22))?.elapsed()
+        } else if matches!(id, 0 | 5 | 8) {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|_| Errno(5))?
@@ -76,6 +85,91 @@ pub fn clock_read(
 mod tests {
     use super::*;
     use trames_memory::{Memory, Permissions, PAGE_SIZE};
+
+    #[test]
+    fn thread_clock_uses_original_task_accounting_across_slots_and_parking() {
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        let started = Instant::now();
+        let task = trames_vfs::ProcessView::default();
+        let other = trames_vfs::ProcessView::default();
+        task.account(std::time::Duration::new(2, 123), 0);
+        other.account(std::time::Duration::from_secs(19), 1);
+        let mut read = |task: &trames_vfs::ProcessView| {
+            assert_eq!(
+                clock_read(
+                    &mut memory,
+                    113,
+                    0xffff_ffff_0000_0003,
+                    0x1000,
+                    started,
+                    None,
+                    Some(task)
+                ),
+                Ok(0)
+            );
+            (
+                u64::from_le_bytes(memory.read_array::<8>(0x1000).unwrap()),
+                u64::from_le_bytes(memory.read_array::<8>(0x1008).unwrap()),
+            )
+        };
+        assert_eq!(read(&task), (2, 123));
+        assert_eq!(read(&other), (19, 0));
+        // Parking leaves this total frozen; subsequent execution on another
+        // slot resumes the same task rather than that worker's lifetime.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert_eq!(read(&task), (2, 123));
+        let began = Instant::now();
+        task.begin_accounting(began, 2);
+        assert!(read(&task) >= (2, 123));
+        task.finish_accounting(began, std::time::Duration::from_millis(5), 2);
+        assert_eq!(read(&task), (2, 5_000_123));
+        assert_eq!(read(&other), (19, 0));
+    }
+
+    #[test]
+    fn thread_clock_resolution_and_fault_abi() {
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        let started = Instant::now();
+        let task = trames_vfs::ProcessView::default();
+        assert_eq!(
+            clock_read(&mut memory, 114, 3, 0, started, None, None),
+            Ok(0)
+        );
+        assert_eq!(
+            clock_read(&mut memory, 114, 3, 0x1000, started, None, None),
+            Ok(0)
+        );
+        assert_eq!(
+            memory.read_array::<16>(0x1000).unwrap(),
+            [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]
+        );
+        memory.write(0x1000, &[0xa7; 16]).unwrap();
+        for number in [113, 114] {
+            assert_eq!(
+                clock_read(&mut memory, number, 3, 0x1ff8, started, None, Some(&task)),
+                Err(Errno(14))
+            );
+            assert_eq!(memory.read_array::<16>(0x1000).unwrap(), [0xa7; 16]);
+        }
+        assert_eq!(
+            clock_read(&mut memory, 113, 3, 0, started, None, Some(&task)),
+            Err(Errno(14))
+        );
+        assert_eq!(
+            clock_read(&mut memory, 113, 3, 0x1000, started, None, None),
+            Err(Errno(22))
+        );
+        assert_eq!(
+            clock_read(&mut memory, 113, 2, 0x1000, started, None, Some(&task)),
+            Err(Errno(22))
+        );
+        assert_eq!(
+            clock_read(&mut memory, 114, u64::MAX, 0, started, None, Some(&task)),
+            Err(Errno(22))
+        );
+    }
 
     #[test]
     fn realtime_preflights_both_buffers_and_preserves_overlap_and_null_abi() {

@@ -242,7 +242,7 @@ pub(super) fn clock(
     address: u64,
     started: Instant,
 ) -> Result<u64, Errno> {
-    trames_linux::clock_read(memory, number, id, address, started, None)
+    trames_linux::clock_read(memory, number, id, address, started, None, None)
 }
 /// Shared owner/worker sleep ABI. Deadline ownership survives checkpoints;
 /// normal expiry never writes rem, while the owner retains signal/EINTR effects.
@@ -1025,6 +1025,7 @@ impl Snapshot {
                 cpu.x(1),
                 self.started,
                 self.direct.boot_clock(),
+                Some(&self.io_signals.proc_view),
             ),
             168 => (|| {
                 let cpu_address = cpu.x(0);
