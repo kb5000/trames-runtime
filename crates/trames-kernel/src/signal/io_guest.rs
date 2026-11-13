@@ -79,6 +79,73 @@ impl IoTask {
 impl IoRoutes {
     /// Guest and resource senders use the same original queues and group control.
     pub fn send(&self, source: &IoTask, number: u32, a: [u64; 6]) -> Option<Result<u64, Errno>> {
+        self.send_info(source, number, a, None)
+    }
+    /// Queued signals retain the copied siginfo, original target permission and
+    /// original task/group queues. No owner-thread projection is needed.
+    pub fn send_queued(
+        &self,
+        source: &IoTask,
+        number: u32,
+        a: [u64; 6],
+        memory: &impl CpuMemory,
+    ) -> Option<Result<u64, Errno>> {
+        let (route, args, address) = if number == 138 {
+            (129, a, a[2])
+        } else {
+            (131, a, a[3])
+        };
+        let user = match memory.read_array::<48>(address) {
+            Ok(bytes) => bytes,
+            Err(_) => return Some(Err(Errno(14))),
+        };
+        if number == 240 && (a[0] as i32 <= 0 || a[1] as i32 <= 0) {
+            return Some(Err(Errno(22)));
+        }
+        let code = i32::from_le_bytes(user[8..12].try_into().unwrap());
+        let sig = a[if number == 240 { 2 } else { 1 }] as u32;
+        let limit = match sig {
+            4 => 11,
+            5 => 6,
+            7 => 5,
+            8 => 15,
+            11 => 10,
+            17 | 29 => 6,
+            31 => 2,
+            _ => 6,
+        };
+        let known =
+            (-7..=0).contains(&code) || code == -60 || code == 128 || code > 0 && code <= limit;
+        if !known {
+            let expansion = match address
+                .checked_add(48)
+                .and_then(|at| memory.read_array::<80>(at).ok())
+            {
+                Some(bytes) => bytes,
+                None => return Some(Err(Errno(14))),
+            };
+            if expansion.iter().any(|b| *b != 0) {
+                return Some(Err(Errno(7)));
+            }
+        }
+        let target = a[if number == 240 { 1 } else { 0 }] as u32;
+        if (code >= 0 || code == -6)
+            && self.namespace.local(trames_vfs::ProcTask::pid(source)) != target
+        {
+            return Some(Err(Errno(1)));
+        }
+        if number == 138 && a[0] as i32 <= 0 {
+            return Some(Err(Errno(3)));
+        }
+        self.send_info(source, route, args, Some(user))
+    }
+    fn send_info(
+        &self,
+        source: &IoTask,
+        number: u32,
+        a: [u64; 6],
+        user: Option<[u8; 48]>,
+    ) -> Option<Result<u64, Errno>> {
         let sig = a[if number == 131 { 2 } else { 1 }] as u32;
         Some((|| {
             if sig > 64 {
@@ -178,9 +245,12 @@ impl IoRoutes {
                         sig,
                         !thread,
                         Info {
+                            user,
                             sender: source.tgid(),
                             uid: self.uid,
-                            code: if thread { -6 } else { 0 },
+                            code: user.map_or(if thread { -6 } else { 0 }, |bytes| {
+                                i32::from_le_bytes(bytes[8..12].try_into().unwrap())
+                            }),
                             ..Default::default()
                         },
                         target.ancestor_sender(source.tgid()),
@@ -210,9 +280,12 @@ impl IoRoutes {
                         queue.enqueue_quiet(
                             sig,
                             Info {
+                                user,
                                 sender: source.tgid(),
                                 uid: self.uid,
-                                code: if thread { -6 } else { 0 },
+                                code: user.map_or(if thread { -6 } else { 0 }, |bytes| {
+                                    i32::from_le_bytes(bytes[8..12].try_into().unwrap())
+                                }),
                                 ..Info::default()
                             },
                         )
@@ -331,6 +404,58 @@ mod tests {
             );
             target.io.set_session(42);
         }
+    }
+    #[test]
+    fn queued_signals_retain_payload_and_enforce_kernel_code_permissions() {
+        use trames_memory::{Memory, Permissions, PAGE_SIZE};
+        let directory = Arc::new(IoDirectory::default());
+        let source = publish(&directory, 42, 42, 1000, 1000);
+        let target = publish(&directory, 77, 77, 1000, 1000);
+        let routes = IoRoutes {
+            directory,
+            uid: 1000,
+            euid: 1000,
+            ..Default::default()
+        };
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        let mut user = [0; 48];
+        user[8..12].copy_from_slice(&(-1i32).to_le_bytes());
+        user[16..20].copy_from_slice(&42u32.to_le_bytes());
+        user[20..24].copy_from_slice(&1000u32.to_le_bytes());
+        user[24..32].copy_from_slice(&0x12345678abcdef01u64.to_le_bytes());
+        for number in [138, 240] {
+            memory.write_array(0x1000, user).unwrap();
+            let args = if number == 138 {
+                [77, 10, 0x1000, 0, 0, 0]
+            } else {
+                [77, 77, 10, 0x1000, 0, 0]
+            };
+            assert_eq!(
+                routes.send_queued(&source.io, number, args, &memory),
+                Some(Ok(0))
+            );
+            let (sig, info) = target.io.dequeue(1 << 9).unwrap();
+            let mut out = [0; 128];
+            write_siginfo(&mut out, sig, *info);
+            user[..4].copy_from_slice(&10u32.to_le_bytes());
+            assert_eq!(&out[..48], &user);
+            assert_eq!(&out[48..], &[0; 80]);
+            let fd = write_signalfd(sig, *info);
+            assert_eq!(&fd[48..56], &user[24..32]);
+            assert_eq!(&fd[12..16], &42u32.to_le_bytes());
+            user[8..12].copy_from_slice(&0i32.to_le_bytes());
+            memory.write_array(0x1000, user).unwrap();
+            assert_eq!(
+                routes.send_queued(&source.io, number, args, &memory),
+                Some(Err(Errno(1)))
+            );
+            user[8..12].copy_from_slice(&(-1i32).to_le_bytes());
+        }
+        assert_eq!(
+            routes.send_queued(&source.io, 138, [77, 10, 0x9000, 0, 0, 0], &memory),
+            Some(Err(Errno(14)))
+        );
     }
     #[test]
     fn guest_routes_preserve_permissions_zombies_and_reaped_pid_incarnations() {

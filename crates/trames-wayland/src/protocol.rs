@@ -30,6 +30,7 @@ impl State {
         crate::subsurface::globals(handle);
         crate::xwayland::globals(handle, xwayland);
         crate::wsi::globals(handle);
+        crate::android::globals(handle);
     }
     pub fn id(&mut self) -> u64 {
         let id = self.next;
@@ -90,7 +91,7 @@ impl State {
                 }
                 return;
             }
-            s.current = attachment.map(ImageBuffer::Shm);
+            s.current = attachment;
             s.gpu_pending.clear();
         }
         s.scale = pending.scale;

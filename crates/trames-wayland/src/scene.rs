@@ -145,7 +145,7 @@ pub(crate) struct Subsurface {
     pub pending_stack: Option<(u64, bool)>,
 }
 pub(crate) struct CachedCommit {
-    pub buffer: Option<Option<Arc<BufferLease>>>,
+    pub buffer: Option<Option<ImageBuffer>>,
     pub damaged: bool,
     pub callbacks: Vec<WlCallback>,
     pub scale: i32,
@@ -291,10 +291,12 @@ impl Surface {
     pub fn take_pending(&mut self) -> CachedCommit {
         CachedCommit {
             damaged: std::mem::take(&mut self.pending_damage),
-            buffer: self
-                .pending_buffer
-                .take()
-                .map(|b| b.and_then(BufferLease::acquire)),
+            buffer: self.pending_buffer.take().map(|b| {
+                b.and_then(|buffer| {
+                    crate::android::acquire(&buffer)
+                        .or_else(|| BufferLease::acquire(buffer).map(ImageBuffer::Shm))
+                })
+            }),
             callbacks: std::mem::take(&mut self.pending_callbacks),
             scale: self.pending_scale,
             geometry: self.pending_geometry.take(),

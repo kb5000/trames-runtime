@@ -254,6 +254,9 @@ pub(super) struct ReservedFd {
     pending: bool,
 }
 impl ReservedFd {
+    pub(super) fn number(&self) -> u32 {
+        self.fd
+    }
     pub(super) fn publish(
         mut self,
         descriptor: Descriptor,
@@ -650,7 +653,7 @@ impl SharedFd {
         }
     }
     pub(super) fn native_image(&self) -> Option<Arc<dyn trames_graphics::Image>> {
-        self.open.native_image.clone()
+        self.open.native_image.as_ref().map(|file| file.image())
     }
     pub(super) fn new(open: Arc<SharedOpenDescription>) -> Self {
         Self { open }

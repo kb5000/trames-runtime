@@ -7,6 +7,9 @@ pub struct TaskReader {
     pub namespace: trames_vfs::PidNamespace,
 }
 impl trames_vfs::SignalReader for TaskReader {
+    fn global_tid(&self) -> Option<u32> {
+        Some(trames_vfs::ProcTask::pid(&*self.task))
+    }
     fn task_signal(&self) -> Option<Arc<dyn trames_vfs::TaskSignal>> {
         Some(self.task.clone())
     }
@@ -18,7 +21,7 @@ impl trames_vfs::SignalReader for TaskReader {
     }
     fn take(&self, mask: u64) -> Option<[u8; 128]> {
         let (sig, mut info) = self.task.dequeue(mask & !UNBLOCKABLE)?;
-        if info.fault.is_none() && info.poll.is_none() {
+        if info.user.is_none() && info.fault.is_none() && info.poll.is_none() {
             info.sender = self.namespace.local(info.sender);
         }
         Some(write_signalfd(sig, *info))

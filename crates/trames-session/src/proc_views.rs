@@ -379,7 +379,11 @@ impl ProcSource for Source {
             if path == b"/proc/meminfo" {
                 continue;
             }
-            if let Some(info) = task.observe(fields, bytes) {
+            if let Some(mut info) = task.observe(fields, bytes) {
+                info.start_stack = memory
+                    .as_ref()
+                    .and_then(|m| m.image_ranges())
+                    .map_or(0, |r| r.start_stack);
                 processes.push(info);
             }
         }
@@ -405,6 +409,7 @@ impl ProcSource for Source {
             processes,
             uptime: at.saturating_duration_since(self.started),
             boot_time: self.boot_time,
+            monotonic_origin: Some(self.started),
             context_switches: self.counters.switches.load(Ordering::Relaxed),
             idle: self.idle(at, &times),
             memory_limit: memory.total,

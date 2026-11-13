@@ -10,7 +10,7 @@ use trames_vfs::{
 };
 type Pair = (u64, u64);
 pub struct Limits {
-    values: Mutex<[Pair; 3]>, // FSIZE, CORE, NOFILE; updated with their enforcement fields.
+    values: Mutex<[Pair; 4]>, // FSIZE, CORE, NOFILE, NICE; original process authority.
     file_size: FileSizeLimit,
     nofile: DescriptorLimit,
 }
@@ -21,6 +21,7 @@ impl Limits {
                 (vfs.file_size_limit_handle().get(), u64::MAX),
                 (0, u64::MAX),
                 (vfs.descriptor_limit() as u64, trames_vfs::MAX_FDS as u64),
+                (0, 0),
             ]),
             file_size: vfs.file_size_limit_handle(),
             nofile: vfs.descriptor_limit_handle(),
@@ -29,7 +30,7 @@ impl Limits {
     pub fn fork(&self, vfs: &Vfs) -> Arc<Self> {
         let values = *self.values.lock().unwrap();
         let child = Self::new(vfs);
-        for (resource, value) in [1, 4, 7].into_iter().zip(values) {
+        for (resource, value) in [1, 4, 7, 13].into_iter().zip(values) {
             child.set(resource, value);
         }
         child
@@ -42,6 +43,7 @@ impl Limits {
             1 => Some(0),
             4 => Some(1),
             7 => Some(2),
+            13 => Some(3),
             _ => None,
         }
     }
@@ -137,7 +139,8 @@ impl Fixed {
             0 | 1 | 10 | 15 => u64::MAX,
             2 | 5 | 9 => self.address_space,
             3 => self.stack,
-            4 | 8 | 12 | 13 | 14 => 0,
+            4 | 8 | 12 | 14 => 0,
+            13 => 40,
             6 => self.tasks,
             7 => trames_vfs::MAX_FDS as u64,
             11 => 64,

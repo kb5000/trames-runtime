@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Bounded inode attributes. File capabilities and ACLs require separate policy.
+//! Persistent inode attributes, including the original guest POSIX ACL policy.
 use super::*;
 type AttributeNode = (NodeRef, FsHandle);
 pub(super) const XATTR_BUDGET: usize = 1024 * 1024;
@@ -63,6 +63,21 @@ impl Vfs {
         if name.len() > 255 {
             return Err(Errno(34));
         }
+        if acl::name(name) {
+            if matches!(node.content, Content::Symlink(_)) {
+                return Err(Errno(95));
+            }
+            if name == acl::DEFAULT && !matches!(node.content, Content::Directory) {
+                return Err(Errno(if write { 13 } else { 61 }));
+            }
+            if write
+                && self.credentials.fsuid != node.uid
+                && !self.credentials.has_cap(capabilities::FOWNER)
+            {
+                return Err(Errno(1));
+            }
+            return Ok(());
+        }
         if name.starts_with(b"trusted.") {
             if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
                 return Err(Errno(if write { 1 } else { 61 }));
@@ -92,8 +107,7 @@ impl Vfs {
             return Ok(());
         }
         if !write && (name.starts_with(b"security.") || name.starts_with(b"system.")) {
-            // These attributes cannot be installed: no file-capability or ACL
-            // metadata exists. Queries report absence, not invented policies.
+            // Unimplemented security/system policies report absence.
             return Err(Errno(61));
         }
         Err(Errno(95))
@@ -153,8 +167,29 @@ impl Vfs {
             return Err(Errno(61));
         }
         let old_times = n.times;
-        if let Some(value) = value {
-            n.xattrs.insert(name.to_vec(), value.to_vec());
+        let old_mode = n.mode;
+        let mut next = value.map(<[u8]>::to_vec);
+        if acl::name(name) {
+            if let Some(value) = &mut next {
+                acl::validate(value)?;
+                acl::normalize(value);
+                if value.len() == 4 {
+                    next = None;
+                } else if name == acl::ACCESS {
+                    n.mode = acl::mode(value, n.mode);
+                    if !self.credentials.has_cap(capabilities::FSETID)
+                        && !self.credentials.in_group(n.gid)
+                    {
+                        n.mode &= !0o2000;
+                    }
+                    if !acl::extended(value) {
+                        next = None;
+                    }
+                }
+            }
+        }
+        if let Some(value) = next {
+            n.xattrs.insert(name.to_vec(), value);
         } else {
             n.xattrs.remove(name);
         }
@@ -183,6 +218,7 @@ impl Vfs {
                 n.xattrs.remove(name);
             }
             n.times = old_times;
+            n.mode = old_mode;
             return Err(e);
         }
         inotify::notify(&node, inotify::ATTRIB, None);

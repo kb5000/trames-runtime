@@ -370,6 +370,8 @@ pub struct Socket {
 pub struct Received {
     /// Non-IP source identity, retained with the individual netlink datagram.
     pub(crate) netlink_address: Option<[u8; 12]>,
+    /// Sender credentials requested on an original guest-kernel netlink socket.
+    pub credentials: Option<[u32; 3]>,
     pub packet_info: Option<crate::PacketInfo>,
     pub data: Vec<u8>,
     pub address: Option<SocketAddr>,
@@ -969,6 +971,7 @@ impl Socket {
                 }
                 return Ok(Received {
                     netlink_address: None,
+                    credentials: None,
                     packet_info: None,
                     data: Vec::new(),
                     address: None,
@@ -979,6 +982,7 @@ impl Socket {
             if count == 0 {
                 return Ok(Received {
                     netlink_address: None,
+                    credentials: None,
                     packet_info: None,
                     data: Vec::new(),
                     address: None,
@@ -1026,6 +1030,7 @@ impl Socket {
         data.truncate(length.min(count));
         Ok(Received {
             netlink_address: None,
+            credentials: None,
             packet_info,
             data,
             address,

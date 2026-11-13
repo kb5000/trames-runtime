@@ -80,6 +80,7 @@ pub use trames_shared::{HostEvents, HostFd, HostSubscription, Readiness, Readine
 mod epoll;
 mod epoll_graph;
 mod events;
+pub mod sync_file;
 mod uring;
 pub use uring::{
     RetainedFd, Uring, UringBufferGroup, UringBufferSource, UringExecutionLease, UringFile,
@@ -122,6 +123,7 @@ pub use task_namespace::{
 };
 mod pid_namespace;
 pub use pid_namespace::{PidNamespace, PidReference, CLONE_NEWPID};
+mod acl;
 mod namespace;
 mod xattr;
 pub use linux_namespace::{
@@ -257,7 +259,7 @@ struct SharedOpenDescription {
     _disk_file: Option<Arc<std::fs::File>>,
     #[cfg(all(feature = "hostfs", unix))]
     host_file: Option<Arc<hostfs::OpenFile>>,
-    native_image: Option<Arc<dyn trames_graphics::Image>>,
+    native_image: Option<Arc<native_images::ImageFile>>,
     mount_resource: std::sync::OnceLock<Arc<mounts::MountData>>,
     mount_use: std::sync::OnceLock<mounts::MountUse>,
     directory_mount: std::sync::OnceLock<mounts::DirectoryPin>,
@@ -1253,8 +1255,18 @@ impl Vfs {
             return if o.flags.get() & O_PATH != 0 {
                 32
             } else {
-                process.poll(events).0
+                process
+                    .poll_for(
+                        reader
+                            .and_then(|r| r.global_tid())
+                            .unwrap_or(process.owner()),
+                        events,
+                    )
+                    .0
             };
+        }
+        if let Some(events::SharedControl::Sync(file)) = &o.control {
+            return file.poll(events).0;
         }
         if let Some(file) = &o.mount_file {
             return file.watch.poll(events).0;
@@ -1398,7 +1410,12 @@ impl Vfs {
         let _namespace = filesystem.namespace.lock().unwrap();
         #[cfg(all(feature = "hostfs", unix))]
         if let Some(host) = &filesystem.host {
-            let node = host.create(&filesystem, &path.key, &content, mode)?;
+            let host_mode = if exclusive && !matches!(content, Content::Symlink(_)) {
+                mode & !self.umask()
+            } else {
+                mode
+            };
+            let node = host.create(&filesystem, &path.key, &content, host_mode)?;
             self.notification_link(&path, &node, true);
             self.notification_entry(
                 &path,
@@ -1422,6 +1439,13 @@ impl Vfs {
             }
             Some(parent)
         };
+        let xattrs = acl::inherit(
+            parent.as_ref().map(|p| p.borrow()).as_deref(),
+            &content,
+            &mut mode,
+            self.umask(),
+            exclusive,
+        );
         let inherited = parent.as_ref().and_then(|p| {
             let p = p.borrow();
             (p.mode & 0o2000 != 0).then_some(p.gid)
@@ -1475,7 +1499,7 @@ impl Vfs {
             inode,
             links: 1,
             times: [storage::Timestamp::now(); 3],
-            xattrs: BTreeMap::new(),
+            xattrs,
             seals: None,
         }));
         fs.track_inode(&node)?;
@@ -2139,12 +2163,7 @@ impl Vfs {
             return self.cgroup_mkdir(&p, mode);
         }
         self.check_parent_write(&p)?;
-        self.insert_entry(
-            p,
-            Content::Directory,
-            0o40000 | (mode & 0o7777 & !self.umask()),
-            true,
-        )
+        self.insert_entry(p, Content::Directory, 0o40000 | (mode & 0o7777), true)
     }
     pub fn mknod_at(&mut self, dirfd: i32, path: &[u8], mode: u32, device: u64) -> Result<()> {
         let type_ = mode & 0o170000;
@@ -2171,7 +2190,7 @@ impl Vfs {
             _ => Content::File(self.empty_data_at(&p)?),
         };
         let type_ = if type_ == 0 { 0o100000 } else { type_ };
-        self.insert_entry(p, content, type_ | (mode & 0o7777 & !self.umask()), true)
+        self.insert_entry(p, content, type_ | (mode & 0o7777), true)
     }
     pub fn unlink_at(&mut self, dirfd: i32, path: &[u8], directory: bool) -> Result<()> {
         let p = self.resolve_final(dirfd, path, false)?;
@@ -2494,7 +2513,7 @@ impl Vfs {
                 match self.insert_entry(
                     p.clone(),
                     Content::File(self.empty_data_at(&p)?),
-                    0o100000 | (mode & 0o7777 & !self.umask()),
+                    0o100000 | (mode & 0o7777),
                     true,
                 ) {
                     Err(Errno(17)) if flags & 0x80 == 0 => existed = true,
@@ -2666,6 +2685,15 @@ impl Vfs {
                         device as usize,
                         self.lock_owner,
                         self.credentials.euid,
+                    )))
+                }
+                Content::Device(pseudo::Device::SwSync) => {
+                    Some(events::SharedControl::Sync(sync_file::File::timeline(
+                        self.pseudo
+                            .borrow()
+                            .runtime
+                            .monotonic_origin
+                            .unwrap_or_else(std::time::Instant::now),
                     )))
                 }
                 _ => None,

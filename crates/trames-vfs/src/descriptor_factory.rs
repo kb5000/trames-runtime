@@ -320,9 +320,10 @@ impl DescriptorFactory {
         self.anonymous(flags, events::Anonymous::Epoll(shared))
     }
     pub fn timerfd(&self, clock: u32, flags: u32) -> Result<u32> {
-        if !matches!(clock, 0 | 1 | 7) || flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
+        if !matches!(clock, 0 | 1 | 7 | 8 | 9) || flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
             return Err(Errno(22));
         }
+        TimerFd::check_alarm(clock, self.local_credentials())?;
         self.anonymous(flags, events::Anonymous::Timer(TimerFd::new(clock)))
     }
     pub fn inotify_init(&self, flags: u32) -> Result<u32> {

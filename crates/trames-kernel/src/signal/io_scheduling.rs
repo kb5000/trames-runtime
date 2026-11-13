@@ -141,7 +141,14 @@ impl IoRoutes {
                 let auth = target.scheduling.authority();
                 if !caller.privileged && caller.euid != auth.uid && caller.euid != auth.euid {
                     error = Some(Errno(1));
-                } else if !caller.privileged && nice < target.scheduling.nice() {
+                } else if !caller.privileged
+                    && nice < target.scheduling.nice()
+                    && (20 - nice) as u64
+                        > target
+                            .proc_limits
+                            .get()
+                            .map_or(0, |limits| limits.get(13).0)
+                {
                     error = Some(Errno(13));
                 } else {
                     target.scheduling.set_nice(nice);
@@ -316,6 +323,50 @@ mod tests {
         );
         child.io.scheduling.set_nice(9);
         assert_eq!(source.io.scheduling.nice(), 7);
+    }
+    #[test]
+    fn inherited_nice_limit_authorizes_only_original_guest_priority_range() {
+        let routes = IoRoutes::default();
+        let source = task(&routes.directory, 10, 10, 1000);
+        let mut vfs = trames_vfs::Vfs::default();
+        let limits = crate::limits::Limits::new(&vfs);
+        limits.set(13, (28, 40));
+        source.io.bind_proc_limits(&limits);
+        let mut memory = memory();
+        assert_eq!(
+            routes.scheduling(
+                &source.io,
+                4,
+                140,
+                [0, 0, (-8i32) as u32 as u64, 0, 0, 0],
+                &mut memory
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            routes.scheduling(
+                &source.io,
+                4,
+                140,
+                [0, 0, (-9i32) as u32 as u64, 0, 0, 0],
+                &mut memory
+            ),
+            Err(Errno(13))
+        );
+        let child = limits.fork(&vfs);
+        limits.set(13, (40, 40));
+        assert_eq!(child.get(13), (28, 40));
+        limits.bind(&mut vfs);
+        assert_eq!(
+            routes.scheduling(
+                &source.io,
+                4,
+                140,
+                [0, 0, (-20i32) as u32 as u64, 0, 0, 0],
+                &mut memory
+            ),
+            Ok(0)
+        );
     }
     #[test]
     fn namespace_selection_retirement_and_rekey_cannot_retarget_old_task_objects() {

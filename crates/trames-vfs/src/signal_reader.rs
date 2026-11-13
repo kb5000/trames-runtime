@@ -4,6 +4,10 @@
 use crate::{IoSignal, IoSubscription};
 use std::sync::Arc;
 pub trait SignalReader: Send + Sync {
+    /// Original task identity for per-thread file readiness (not a PID lookup).
+    fn global_tid(&self) -> Option<u32> {
+        None
+    }
     /// Original reading/submitting task, retained by accepted asynchronous work.
     fn task_signal(&self) -> Option<Arc<dyn crate::TaskSignal>> {
         None

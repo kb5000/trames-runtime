@@ -297,7 +297,11 @@ pub(super) fn control(
     let t = target.borrow();
     let resource_control = matches!(
         t.control,
-        Some(events::SharedControl::Cgroup(_) | events::SharedControl::Binder(_))
+        Some(
+            events::SharedControl::Cgroup(_)
+                | events::SharedControl::Binder(_)
+                | events::SharedControl::Sync(_)
+        )
     );
     if t.namespace.is_some()
         || matches!(t.kind, FdKind::Node(_))

@@ -288,6 +288,7 @@ fn proc_image_reads_use_original_mm_for_fixed_fds_vectors_and_registered_buffers
                         image.write(0x3ff8, b"changed-title\0").unwrap();
                     }
                     image.set_image_ranges(trames_memory::ImageRanges {
+                        start_stack: 0,
                         arguments: (0x3ff8, 0x3ffc),
                         environment: (0x3ffc, 0x4004),
                     });

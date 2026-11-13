@@ -68,29 +68,24 @@ pub(super) fn control(
         }),
         208 => {
             if a[1] == 1 && matches!(a[2], 20 | 21 | 66 | 67) {
-                if (a[4] as u32) < 4 || (a[4] as u32) > i32::MAX as u32 || a[4] < 16 {
-                    return Err(Errno(22));
-                }
-                Linux::check(memory, a[3], 16, Access::Read)?;
-                let seconds = u64_at(memory, a[3])? as i64;
-                let micros = u64_at(memory, a[3] + 8)? as i64;
-                if !(0..1_000_000).contains(&micros) {
-                    return Err(Errno(33));
-                }
-                let timeout = if seconds < 0 {
-                    Some(std::time::Duration::ZERO)
-                } else if seconds == 0 && micros == 0 {
-                    None
-                } else {
-                    Some(std::time::Duration::new(
-                        seconds as u64,
-                        micros as u32 * 1000,
-                    ))
-                };
+                let timeout = timeout_option(memory, a)?;
                 socket.set_io_timeout(matches!(a[2], 20 | 66), timeout);
                 return Ok(0);
             }
             write_option(memory, a, |value| {
+                if socket.is_netlink() && a[1] as u32 == 1 && matches!(a[2] as u32, 32 | 33) {
+                    if !factory
+                        .local_credentials()
+                        .has_cap(trames_vfs::capabilities::NET_ADMIN)
+                    {
+                        return Err(Errno(1));
+                    }
+                    // These affect the guest queue only. Never grant a native
+                    // host socket a force-buffer option using guest authority.
+                    return socket
+                        .set_option_bytes(1, a[2] as u32 - 25, value)
+                        .map_err(net);
+                }
                 socket
                     .set_option_bytes(a[1] as u32, a[2] as u32, value)
                     .map_err(net)
@@ -121,6 +116,35 @@ pub(super) fn control(
         }
         _ => unreachable!("socket control number"),
     })())
+}
+
+fn timeout_option(memory: &impl CpuMemory, a: [u64; 6]) -> Result<Option<std::time::Duration>> {
+    if (a[4] as u32) < 16 || (a[4] as u32) > i32::MAX as u32 {
+        return Err(Errno(22));
+    }
+    let bytes = memory.read_array::<16>(a[3]).map_err(|_| Errno(14))?;
+    let seconds = i64::from_le_bytes(bytes[..8].try_into().unwrap());
+    let micros = i64::from_le_bytes(bytes[8..].try_into().unwrap());
+    if !(0..1_000_000).contains(&micros) {
+        return Err(Errno(33));
+    }
+    Ok(if seconds < 0 {
+        Some(std::time::Duration::ZERO)
+    } else if seconds == 0 && micros == 0 {
+        None
+    } else {
+        Some(std::time::Duration::new(
+            seconds as u64,
+            micros as u32 * 1000,
+        ))
+    })
+}
+fn timeout_bytes(timeout: Option<std::time::Duration>) -> [u8; 16] {
+    let duration = timeout.unwrap_or_default();
+    let mut bytes = [0; 16];
+    bytes[..8].copy_from_slice(&duration.as_secs().to_le_bytes());
+    bytes[8..].copy_from_slice(&(duration.subsec_micros() as u64).to_le_bytes());
+    bytes
 }
 
 fn net(error: NetError) -> Errno {

@@ -16,6 +16,7 @@ pub struct Ioctl {
     tid: u32,
     address: u64,
     header: [u8; 48],
+    process_work: Option<bool>,
 }
 fn read(memory: &impl CpuMemory, address: u64, len: usize) -> Result<Vec<u8>> {
     if len == 0 {
@@ -141,6 +142,7 @@ impl Ioctl {
                     tid,
                     address,
                     header,
+                    process_work: None,
                 };
                 let result = request.write(memory);
                 request.publish(memory)?;
@@ -181,11 +183,13 @@ impl Ioctl {
             put(&mut self.header, 8, consumed as u64);
             match cmd {
                 TRANSACTION | REPLY | TRANSACTION_SG | REPLY_SG => {
-                    let packet = self.import(&argument, memory);
                     let reply = matches!(cmd, REPLY | REPLY_SG);
                     let identity = [self.process.owner, self.factory.local_credentials().euid];
-                    let result = packet
-                        .and_then(|packet| self.process.submit(self.tid, packet, reply, identity));
+                    let result = match self.import(&argument, memory) {
+                        Ok(packet) => self.process.submit(self.tid, packet, reply, identity),
+                        Err(_) if reply => self.process.reject_reply(self.tid, BR_FAILED_REPLY),
+                        Err(error) => Err(error),
+                    };
                     if let Err(error) = result {
                         let response = if matches!(error.0, 3 | 111) {
                             BR_DEAD_REPLY
@@ -197,15 +201,27 @@ impl Ioctl {
                         self.process.bytes(self.tid, response);
                     }
                 }
-                FREE_BUFFER => self.process.free_buffer(word(&argument, 0))?,
+                FREE_BUFFER => {
+                    let _ = self.process.free_buffer(word(&argument, 0));
+                }
                 INCREFS | ACQUIRE | RELEASE | DECREFS => {
                     self.process.ref_command(cmd, dword(&argument, 0))?
                 }
                 INCREFS_DONE | ACQUIRE_DONE => {
-                    let state = self.process.state.lock().unwrap();
-                    let node = state.nodes.get(&word(&argument, 0)).ok_or(Errno(22))?;
-                    if node.cookie != word(&argument, 8) {
-                        return Err(Errno(22));
+                    let node = self
+                        .process
+                        .state
+                        .lock()
+                        .unwrap()
+                        .nodes
+                        .get(&word(&argument, 0))
+                        .cloned();
+                    if let Some(node) = node {
+                        if node.cookie == word(&argument, 8) {
+                            // Driver user errors do not abort the enclosing
+                            // write/read and kill an otherwise healthy server.
+                            let _ = node.acknowledge(cmd);
+                        }
                     }
                 }
                 REGISTER_LOOPER | ENTER_LOOPER | EXIT_LOOPER => {
@@ -287,22 +303,27 @@ impl Ioctl {
             previous_end = offset + object_size;
             match kind {
                 TYPE_BINDER | TYPE_WEAK_BINDER | TYPE_HANDLE | TYPE_WEAK_HANDLE => {
-                    let node = if matches!(kind, TYPE_BINDER | TYPE_WEAK_BINDER) {
-                        self.process.owned_node(
-                            word(object, 8),
-                            word(object, 16),
-                            dword(object, 4),
-                            self.tid,
-                        )?
+                    let (node, lease) = if matches!(kind, TYPE_BINDER | TYPE_WEAK_BINDER) {
+                        (
+                            self.process.owned_node(
+                                word(object, 8),
+                                word(object, 16),
+                                dword(object, 4),
+                                self.tid,
+                            )?,
+                            None,
+                        )
                     } else if kind == TYPE_HANDLE {
-                        self.process.strong_target(dword(object, 8))?
+                        let lease = self.process.strong_target(dword(object, 8))?;
+                        (lease.0.clone(), Some(lease))
                     } else {
-                        self.process.target(dword(object, 8))?
+                        (self.process.target(dword(object, 8))?, None)
                     };
                     packet.objects.push(Object::Node {
                         offset,
                         node,
                         strong: matches!(kind, TYPE_BINDER | TYPE_HANDLE),
+                        _lease: lease,
                     });
                 }
                 TYPE_FD => {
@@ -406,6 +427,14 @@ impl Ioctl {
             return Ok(Some(0));
         }
         let read_base = word(&self.header, 40);
+        // Linux decides this once for the read, before draining thread work.
+        // Recomputing after COMPLETE lets an unrelated process transaction run
+        // inside a non-server caller's waitForResponse and its application locks.
+        let process_work = *self.process_work.get_or_insert_with(|| {
+            let mut state = self.process.state.lock().unwrap();
+            let thread = state.threads.entry(self.tid).or_default();
+            thread.stack.is_empty() && thread.queue.is_empty()
+        });
         let mut written = false;
         while capacity - consumed >= 4 {
             let work = {
@@ -415,10 +444,7 @@ impl Ioctl {
                 }
                 let thread = state.threads.entry(self.tid).or_default();
                 thread.waiting = false;
-                // Like Linux, an idle non-looper can drain process/death work.
-                // Looper registration governs thread-pool growth, not this
-                // eligibility check (otherwise a plain caller can wait forever).
-                let process_work = thread.stack.is_empty() && thread.queue.is_empty();
+                let process_queue = thread.queue.is_empty();
                 let candidate = if let Some(work) = thread.queue.front() {
                     Some(work)
                 } else if process_work {
@@ -435,7 +461,7 @@ impl Ioctl {
                 memory
                     .check(address, candidate.size() + prefix, Access::Write)
                     .map_err(|_| Errno(14))?;
-                if process_work {
+                if process_queue {
                     state.queue.pop_front().unwrap()
                 } else {
                     state
@@ -456,13 +482,19 @@ impl Ioctl {
             if let Work::Reply(_, call) = &work {
                 self.pop_call(call);
             }
+            let notice = if let Work::Node(node) = &work {
+                Some(node.clone())
+            } else {
+                None
+            };
             let (out, stop) = match work {
-                Work::Bytes(out) | Work::Node(out) => (out, false),
+                Work::Bytes(out) => (out, false),
+                Work::Node(node) => (node.notices(), false),
                 Work::Death(cookie) => (command(BR_DEAD_BINDER, &cookie.to_le_bytes()), true),
                 Work::ClearDeath(cookie) => (command(BR_CLEAR_DEATH, &cookie.to_le_bytes()), false),
-                Work::Dead(call) => {
+                Work::Dead(call, error) => {
                     self.pop_call(&call);
-                    (command(BR_DEAD_REPLY, &[]), true)
+                    (command(error, &[]), true)
                 }
                 Work::Transaction(buffer) | Work::Reply(buffer, _) => {
                     let reply = buffer.node.is_none();
@@ -505,6 +537,9 @@ impl Ioctl {
             memory
                 .write(read_base + consumed as u64, &out)
                 .map_err(|_| Errno(14))?;
+            if let Some(node) = notice {
+                node.notice_delivered();
+            }
             consumed += out.len();
             written = true;
             if stop {
@@ -518,7 +553,12 @@ impl Ioctl {
                 let mut state = self.process.state.lock().unwrap();
                 let looper = state.threads.get(&self.tid).is_some_and(|t| t.looper);
                 let registered = state.threads.values().filter(|t| t.registered).count() as u32;
-                let waiting = state.threads.values().any(|t| t.waiting);
+                // Only an idle pool looper can take process work. A thread
+                // blocked on a synchronous reply is not spare server capacity.
+                let waiting = state
+                    .threads
+                    .values()
+                    .any(|t| t.waiting && t.stack.is_empty() && t.queue.is_empty());
                 let spawn = looper
                     && !waiting
                     && state.requested_threads == 0
@@ -545,7 +585,7 @@ impl Ioctl {
             .threads
             .entry(self.tid)
             .or_default()
-            .waiting = true;
+            .waiting = process_work;
         Ok(None)
     }
     fn pop_call(&self, call: &Arc<Call>) {

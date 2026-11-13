@@ -566,6 +566,12 @@ impl Connection {
                                 if open.flags.get() & 3 == 1 {
                                     return Err(Errno(9));
                                 }
+                                if let Some(image) = &open.native_image {
+                                    return image
+                                        .export()
+                                        .map(|(fd, lease)| (fd, Some(lease)))
+                                        .map_err(io_errno);
+                                }
                                 let node = open.node.as_ref().ok_or(Errno(95))?.borrow();
                                 let Content::File(data) = &node.content else {
                                     return Err(Errno(95));

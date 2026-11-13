@@ -5,6 +5,29 @@ use crate::fd_table::{Slot, SlotOpen};
 use std::io;
 use trames_graphics::{Image, ImageFds};
 static NEXT_IMAGE_OFD: AtomicU64 = AtomicU64::new(1u64 << 60);
+pub(super) struct ImageFile {
+    image: Arc<dyn Image>,
+    export: std::sync::OnceLock<trames_shared::SharedFile>,
+}
+impl std::ops::Deref for ImageFile {
+    type Target = dyn Image;
+    fn deref(&self) -> &Self::Target {
+        self.image.as_ref()
+    }
+}
+impl ImageFile {
+    pub(super) fn image(&self) -> Arc<dyn Image> {
+        self.image.clone()
+    }
+    pub(super) fn export(&self) -> io::Result<(std::os::fd::OwnedFd, trames_shared::ExportLease)> {
+        if self.export.get().is_none() {
+            let marker = trames_shared::SharedFile::anonymous()?;
+            marker.attach(trames_graphics::ImageAttachment(self.image.clone()))?;
+            let _ = self.export.set(marker);
+        }
+        self.export.get().unwrap().export()
+    }
+}
 struct Images {
     files: SharedFiles,
     owner: (u32, u32),
@@ -38,7 +61,10 @@ impl ImageFds for Images {
             _disk_file: None,
             #[cfg(all(feature = "hostfs", unix))]
             host_file: None,
-            native_image: Some(image),
+            native_image: Some(Arc::new(ImageFile {
+                image,
+                export: std::sync::OnceLock::new(),
+            })),
             mount_resource: Default::default(),
             mount_use: Default::default(),
             directory_mount: Default::default(),
@@ -50,7 +76,7 @@ impl ImageFds for Images {
             id: NEXT_IMAGE_OFD.fetch_add(1, Ordering::Relaxed),
             owner: self.owner,
             kind: FdKind::Anonymous,
-            flags: (0).into(),
+            flags: (2).into(),
             file_position: Arc::default(),
             flock: Default::default(),
             ofd_records: Default::default(),
@@ -102,6 +128,40 @@ mod tests {
         unsafe fn metal_texture(&self, _: usize) -> io::Result<Arc<trames_graphics::Texture>> {
             Err(io::Error::from_raw_os_error(95))
         }
+    }
+    #[test]
+    fn native_image_bridge_marker_retains_the_original_plane_until_import_releases() {
+        let mut vfs = Vfs::default();
+        let image = Arc::new(TestImage);
+        let weak = Arc::downgrade(&image);
+        let fd = vfs.image_fds().insert(image.clone()).unwrap();
+        drop(image);
+        let original = vfs.shared_files().lookup(fd).unwrap().unwrap();
+        let (marker, lease) = original
+            .open
+            .native_image
+            .as_ref()
+            .unwrap()
+            .export()
+            .unwrap();
+        vfs.close(fd).unwrap();
+        drop(original);
+        assert!(weak.upgrade().is_some());
+        let received = trames_shared::SharedFile::import(marker).unwrap();
+        assert!(lease.claimed());
+        let plane = received
+            .attachment::<trames_graphics::ImageAttachment>()
+            .unwrap();
+        assert_eq!(plane.0.info().width, 8);
+        assert_eq!(
+            received.len(),
+            0,
+            "the bridge marker contains no pixel copy"
+        );
+        drop(lease);
+        assert!(weak.upgrade().is_some());
+        drop(received);
+        assert!(weak.upgrade().is_none());
     }
     #[test]
     fn native_image_publication_observes_the_live_task_fd_limit() {

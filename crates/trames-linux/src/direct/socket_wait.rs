@@ -418,7 +418,9 @@ impl DirectSyscalls {
                 Control::Network(socket) => socket
                     .io_timeout(matches!(number, 202 | 242 | 207 | 212))
                     .and_then(|d| Instant::now().checked_add(d)),
-                Control::Unix { .. } => None,
+                Control::Unix { socket, .. } => socket
+                    .io_timeout(matches!(number, 202 | 242 | 207 | 212))
+                    .and_then(|d| Instant::now().checked_add(d)),
             };
             let message = match &socket {
                 Control::Network(socket) if ip_message::number(number) => {

@@ -139,6 +139,7 @@ struct Inner {
     budget: SharedBudget,
     resize: Mutex<()>,
     mappings: Mutex<BTreeMap<(usize, usize), Weak<Region>>>,
+    attachment: OnceLock<Arc<dyn std::any::Any + Send + Sync>>,
 }
 impl Drop for Inner {
     fn drop(&mut self) {
@@ -227,6 +228,7 @@ impl SharedFile {
             budget,
             resize: Mutex::default(),
             mappings: Mutex::default(),
+            attachment: OnceLock::new(),
         });
         registry.insert(
             key,
@@ -260,6 +262,17 @@ impl SharedFile {
     }
     pub fn key(&self) -> Key {
         self.0.key
+    }
+    /// Cold native-resource metadata follows this exact inode through the
+    /// existing export/import lease. Ordinary byte IO never consults it.
+    pub fn attach<T: Send + Sync + 'static>(&self, value: T) -> io::Result<()> {
+        self.0
+            .attachment
+            .set(Arc::new(value))
+            .map_err(|_| io::Error::from(io::ErrorKind::AlreadyExists))
+    }
+    pub fn attachment<T: Send + Sync + 'static>(&self) -> Option<&T> {
+        self.0.attachment.get()?.downcast_ref()
     }
     pub fn len(&self) -> usize {
         self.0.logical.load(Ordering::Acquire)

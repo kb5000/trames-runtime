@@ -40,7 +40,7 @@ pub fn clock_read(
 ) -> Result<u64, Errno> {
     // clockid_t is a signed 32-bit Linux ABI argument, including raw SVCs.
     let id = id as u32;
-    if !matches!(id, 0 | 1 | 4..=7) {
+    if !matches!(id, 0 | 1 | 4..=9) {
         return Err(Errno(22));
     }
     if number == 114 && address == 0 {
@@ -54,11 +54,11 @@ pub fn clock_read(
     } else {
         // Realtime/coarse realtime retain Unix time; all monotonic variants
         // retain the session epoch. Boottime includes actual host suspension.
-        let elapsed = if matches!(id, 0 | 5) {
+        let elapsed = if matches!(id, 0 | 5 | 8) {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|_| Errno(5))?
-        } else if id == 7 {
+        } else if matches!(id, 7 | 9) {
             boot.map_or_else(|| started.elapsed(), |b| b.elapsed())
         } else {
             started.elapsed()

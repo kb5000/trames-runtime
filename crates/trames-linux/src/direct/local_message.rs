@@ -399,6 +399,52 @@ mod tests {
         DirectSyscalls::new(v.direct_descriptors()).with_resources(v.descriptor_factory())
     }
     #[test]
+    fn unix_receive_timeouts_park_on_original_socket_and_expire_after_fd_reuse() {
+        for kind in [1, 2, 5] {
+            let mut v = Vfs::default();
+            let [_tx, rx] = v.socketpair(1, kind, 0).unwrap();
+            let d = direct(&v);
+            let mut m = memory();
+            m.write_array(0x1400, 0u64.to_le_bytes()).unwrap();
+            m.write_array(0x1408, 20_000u64.to_le_bytes()).unwrap();
+            assert_eq!(
+                d.invoke_socket_control(208, [rx as u64, 1, 20, 0x1400, 16, 0], &mut m),
+                Some(Ok(0))
+            );
+            m.write_array(0x1500, 16u32.to_le_bytes()).unwrap();
+            assert_eq!(
+                d.invoke_socket_control(209, [rx as u64, 1, 20, 0x1480, 0x1500, 0], &mut m),
+                Some(Ok(0))
+            );
+            assert_eq!(
+                m.read_array::<16>(0x1480).unwrap(),
+                m.read_array::<16>(0x1400).unwrap()
+            );
+            let target: Arc<dyn IoWake> = Arc::new(Target);
+            let mut wait = blocked(
+                d.start_local_transfer(
+                    None,
+                    63,
+                    [rx as u64, 0x1200, 4, 0, 0, 0],
+                    &v,
+                    &mut m,
+                    1,
+                    &Arc::downgrade(&target),
+                )
+                .unwrap(),
+            );
+            assert!(wait.deadline.is_some());
+            v.close(rx).unwrap();
+            let [replacement, _] = v.socketpair(1, kind, 0).unwrap();
+            assert_eq!(replacement, rx);
+            wait.deadline = Some(Instant::now());
+            assert!(matches!(
+                d.resume_owned_byte(wait, &mut m),
+                IoAttempt::Complete(Err(Errno(11)))
+            ));
+        }
+    }
+    #[test]
     fn unix_owning_rights_preserve_fault_before_dequeue_and_original_fd_after_reuse() {
         let mut v = Vfs::default();
         let [tx, rx] = v.socketpair(1, 1, 0).unwrap();

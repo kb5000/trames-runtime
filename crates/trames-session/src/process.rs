@@ -923,7 +923,7 @@ impl<C: Cpu> Kernel<C> {
         } else {
             None
         };
-        let images = matches!(a[0], 14 | 240..=242).then(|| p.linux.vfs.image_fds());
+        let images = matches!(a[0], 14 | 240..=242 | 272..=275).then(|| p.linux.vfs.image_fds());
         let (value, transfers) = lease.invoke_with_images(
             &mut p.memory,
             a[0],
@@ -1251,6 +1251,7 @@ impl<C: Cpu> Kernel<C> {
                 cpu_features: C::feature_names(),
                 processes,
                 uptime: self.started.elapsed(),
+                monotonic_origin: Some(self.started),
                 boot_time: self.boot_time,
                 context_switches: self.context_switches,
                 cpu_user_ticks: (self.cpu_total.as_millis() / 10) as u64,
@@ -1486,6 +1487,7 @@ impl<C: Cpu> Kernel<C> {
             let _ = p.signals.io.inbox.enqueue(
                 sig,
                 Info {
+                    user: None,
                     sender,
                     uid: 0,
                     status: 0,
@@ -1570,6 +1572,7 @@ impl<C: Cpu> Kernel<C> {
             target.signals.io.inbox.enqueue(
                 sig,
                 Info {
+                    user: None,
                     sender,
                     uid,
                     status: 0,
@@ -1665,6 +1668,7 @@ impl<C: Cpu> Kernel<C> {
                 other.signals.io.process().enqueue(
                     sig,
                     Info {
+                        user: None,
                         sender,
                         uid,
                         status: 0,
@@ -2123,6 +2127,12 @@ impl<C: Cpu> Kernel<C> {
                 }
                 Ok(Some(0))
             },
+            number @ (270 | 271) => {
+                if a[0] as u32 == p.linux.vfs.visible_pid(p.tgid)
+                    || a[0] as u32 == p.linux.vfs.visible_pid(pid) {
+                    trames_linux::process_vm_local(number, a, &mut p.memory).map(Some)
+                } else { Err(Errno(38)) }
+            },
             172 => Ok(Some(p.linux.vfs.visible_pid(p.tgid) as u64)),
             178 => Ok(Some(p.linux.vfs.visible_pid(pid) as u64)),
             173 => Ok(Some(p.linux.vfs.visible_pid(p.family.parent()) as u64)),
@@ -2399,6 +2409,22 @@ impl<C: Cpu> Kernel<C> {
         io: &mut impl GuestOutput,
     ) {
         self.call_with(pid, p, number, a, io, |kernel, pid, p, io| {
+            // The legacy conformance oracle predates queued signals. Exercise
+            // their canonical resource implementation here too; production
+            // calls stay on their original worker through WorkerSnapshot.
+            if matches!(number, 138 | 240) {
+                kernel.publish_io_tasks(Some((pid, p)));
+                let routes = trames_kernel::signal::IoRoutes {
+                    directory: p.signals.io_directory.clone(),
+                    namespace: p.linux.vfs.pid_namespace().clone(),
+                    uid: p.linux.vfs.credentials.uid,
+                    euid: p.linux.vfs.credentials.euid,
+                };
+                return routes
+                    .send_queued(&p.signals.io, number, a, &p.memory)
+                    .expect("queued signal route")
+                    .map(Some);
+            }
             kernel.syscall(pid, p, number, a, io)
         });
         self.proc_after_call(pid, p, number, a);
@@ -6988,6 +7014,7 @@ mod tests {
         let mut k = kernel();
         let mut p = process();
         p.memory.set_image_ranges(trames_memory::ImageRanges {
+            start_stack: 0,
             arguments: (0x2000, 0x2008),
             environment: (0x2008, 0x200e),
         });

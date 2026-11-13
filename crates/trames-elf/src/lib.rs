@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Checked ELF64/AArch64 loading; the guest interpreter performs dynamic relocation.
 use std::fmt;
+
+// Keep the low 4 GiB available for runtimes with compressed heap/image pointers
+// (notably ART). This is a guest virtual address, not reserved resident memory.
+pub const INTERPRETER_BASE: u64 = 0x7000_0000_0000;
 use trames_memory::{Memory, MemoryError, Permissions, ADDRESS_LIMIT, PAGE_SIZE};
 
 const EH_SIZE: usize = 64;
@@ -92,7 +96,7 @@ pub fn load_with_interpreter(
     let main = map_image(bytes, &mut memory, 0x4000_0000)?;
     let (start_entry, interpreter_base) = if let Some(path) = &main.interpreter {
         let interpreter = resolve(path)?;
-        let loader = map_image(&interpreter, &mut memory, 0x7000_0000)?;
+        let loader = map_image(&interpreter, &mut memory, INTERPRETER_BASE)?;
         if loader.interpreter.is_some() {
             return Err(ElfError::Invalid("nested PT_INTERP"));
         }
@@ -385,16 +389,22 @@ mod tests {
         main[192..192 + path.len()].copy_from_slice(path);
         let mut loader = image();
         loader[16..18].copy_from_slice(&3u16.to_le_bytes());
-        let e = load_with_interpreter(&main, 8192, |p| {
+        let mut e = load_with_interpreter(&main, 12288, |p| {
             assert_eq!(p, &path[..path.len() - 1]);
             Ok(loader.clone())
         })
         .unwrap();
         assert_eq!(e.entry, 0x400010b0);
-        assert_eq!(e.start_entry, 0x70001078);
-        assert_eq!(e.interpreter_base, 0x70000000);
+        assert_eq!(e.start_entry, INTERPRETER_BASE + 0x1078);
+        assert_eq!(e.interpreter_base, INTERPRETER_BASE);
         assert_eq!(e.phdr, Some(0x40001040));
         assert_eq!(e.brk_base, 0x40002000);
+        // ART boot images and compressed-reference heaps may occupy this range.
+        e.memory
+            .map(0x7000_1000, PAGE_SIZE, Permissions::RW)
+            .unwrap();
+        e.memory.write(0x7000_1078, &42u64.to_le_bytes()).unwrap();
+        assert_eq!(e.memory.read_u64(0x7000_1078).unwrap(), 42);
         main[192] = b'x';
         assert!(load_with_interpreter(&main, 8192, |_| Ok(loader.clone())).is_err());
     }

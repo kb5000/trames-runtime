@@ -153,22 +153,34 @@ mod tests {
                 .as_nanos()
         ))
         .unwrap();
-        let watch = ClockWatch::register(&name).unwrap();
-        let raw = watch.fd.as_raw_fd();
-        assert!(!watch.changed());
-        let timer = crate::TimerFd::new(0);
-        timer.state.lock().unwrap().cancel = Some(watch);
-        assert_eq!(unsafe { notify_post(name.as_ptr()) }, 0);
-        let mut fd = libc::pollfd {
-            fd: raw,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        assert_eq!(unsafe { libc::poll(&mut fd, 1, 1000) }, 1);
-        assert_eq!(timer.poll(1).0, 1);
-        assert_eq!(timer.read(8), Err(Errno(125)));
-        assert_eq!(timer.read(8), Err(Errno(11)));
-        timer.update(Some((std::time::Duration::ZERO, None)));
-        assert!(timer.native_fd().is_none());
+        for clock in [0, 8] {
+            let watch = ClockWatch::register(&name).unwrap();
+            let raw = watch.fd.as_raw_fd();
+            assert!(!watch.changed());
+            let timer = crate::TimerFd::new(clock);
+            timer.update(Some((
+                std::time::Duration::ZERO,
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(60)),
+            )));
+            timer.state.lock().unwrap().absolute = Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    + std::time::Duration::from_secs(60),
+            );
+            timer.state.lock().unwrap().cancel = Some(watch);
+            assert_eq!(unsafe { notify_post(name.as_ptr()) }, 0);
+            let mut fd = libc::pollfd {
+                fd: raw,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert_eq!(unsafe { libc::poll(&mut fd, 1, 1000) }, 1);
+            assert_eq!(timer.poll(1).0, 1);
+            assert_eq!(timer.read(8), Err(Errno(125)));
+            assert_eq!(timer.read(8), Err(Errno(11)));
+            timer.update(Some((std::time::Duration::ZERO, None)));
+            assert!(timer.native_fds().is_empty());
+        }
     }
 }

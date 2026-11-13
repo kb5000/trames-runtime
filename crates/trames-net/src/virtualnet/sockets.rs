@@ -755,6 +755,7 @@ impl Socket {
         if state.read_closed || self.kind == 1 && count == 0 {
             return Ok(Received {
                 netlink_address: None,
+                credentials: None,
                 packet_info: None,
                 data: Vec::new(),
                 address: None,
@@ -766,6 +767,7 @@ impl Socket {
             if matches!(state.connection, Connection::Failed(_)) && !state.blocking_failed {
                 return Ok(Received {
                     netlink_address: None,
+                    credentials: None,
                     packet_info: None,
                     data: Vec::new(),
                     address: None,
@@ -784,6 +786,7 @@ impl Socket {
                 }
                 return Ok(Received {
                     netlink_address: None,
+                    credentials: None,
                     packet_info: None,
                     data: Vec::new(),
                     address: None,
@@ -804,6 +807,7 @@ impl Socket {
             self.fabric().tick();
             Ok(Received {
                 netlink_address: None,
+                credentials: None,
                 packet_info: None,
                 data: bytes,
                 address: None,
@@ -851,6 +855,7 @@ impl Socket {
                     }
                     return Ok(Received {
                         netlink_address: None,
+                        credentials: None,
                         packet_info,
                         data: bytes,
                         address: Some(self.presented(source)),
@@ -1213,6 +1218,7 @@ impl Socket {
         if state.read_closed {
             return Ok(Received {
                 netlink_address: None,
+                credentials: None,
                 packet_info: None,
                 data: Vec::new(),
                 address: None,
@@ -1272,6 +1278,7 @@ impl Socket {
         let length = data.len();
         let received = Received {
             netlink_address: None,
+            credentials: None,
             packet_info: None,
             data: data[..count.min(length)].to_vec(),
             address: Some(SocketAddr::new(*peer, 0)),
@@ -1348,6 +1355,7 @@ impl Socket {
         if state.read_closed {
             return Ok(Received {
                 netlink_address: None,
+                credentials: None,
                 packet_info: None,
                 data: Vec::new(),
                 address: None,
@@ -1381,6 +1389,7 @@ impl Socket {
         let length = data.len();
         let received = Received {
             netlink_address: None,
+            credentials: None,
             packet_info: None,
             data: data[..count.min(length)].to_vec(),
             address: Some(SocketAddr::new(*peer, 0)),

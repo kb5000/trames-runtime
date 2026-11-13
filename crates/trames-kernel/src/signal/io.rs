@@ -44,7 +44,12 @@ impl Inbox {
         }
     }
     fn retain_sender(&self, info: Info) -> Option<trames_vfs::PidReference> {
-        if info.sender == 0 || info.timer.is_some() || info.fault.is_some() || info.poll.is_some() {
+        if info.user.is_some()
+            || info.sender == 0
+            || info.timer.is_some()
+            || info.fault.is_some()
+            || info.poll.is_some()
+        {
             return None;
         }
         self.namespace.get()?.retain(info.sender)

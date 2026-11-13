@@ -3,6 +3,22 @@ use super::*;
 use std::sync::atomic::AtomicUsize;
 
 #[test]
+fn shared_namespace_socket_count_is_not_an_extra_process_file_limit() {
+    let mut v = Vfs::default();
+    v.set_descriptor_limit(1029);
+    let pairs: Vec<_> = (0..513).map(|_| v.socketpair(1, 1, 0).unwrap()).collect();
+    assert_eq!(v.socketpair(1, 1, 0), Err(Errno(24)));
+    let [tx, rx] = *pairs.last().unwrap();
+    v.write(tx, b"beyond namespace quota").unwrap();
+    assert_eq!(v.read(rx, 64).unwrap(), b"beyond namespace quota");
+    for [a, b] in pairs {
+        v.close(a).unwrap();
+        v.close(b).unwrap();
+    }
+    assert!(v.socketpair(1, 1, 0).is_ok());
+}
+
+#[test]
 fn owning_rights_include_unaccepted_listener_children_without_a_connect_graph_lock() {
     let mut v = Vfs::default();
     let listener = v.local_create(1, 0).unwrap();

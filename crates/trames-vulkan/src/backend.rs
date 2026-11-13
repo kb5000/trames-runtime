@@ -1388,6 +1388,9 @@ impl Backend {
         Ok(Some(0))
     }
     fn call(&mut self, m: &mut impl CpuMemory, op: u64, a: [u64; 16]) -> Result<()> {
+        if (272..=274).contains(&op) {
+            return self.android_image(m, op, a);
+        }
         if (109..=111).contains(&op) {
             return self.wayland_entry(m, op, a);
         }
@@ -1969,6 +1972,7 @@ impl Backend {
         let d = &dev.native;
         match op {
             240..=242 => self.image_fd_call(m, op, a)?,
+            275 => self.android_image_layout(a)?,
             253..=254 => self.dynamic_rendering(m, op, a)?,
             255 => self.extended_state(m, a)?,
             266..=270 => self.sync2_command(m, op, a)?,

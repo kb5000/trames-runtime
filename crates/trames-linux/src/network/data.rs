@@ -264,6 +264,11 @@ impl Prepared {
                             .map_err(|_| Errno(14))?;
                     }
                     let mut ancillary = Vec::new();
+                    if let Some(credentials) = received.credentials {
+                        let payload: Vec<_> =
+                            credentials.into_iter().flat_map(u32::to_le_bytes).collect();
+                        push_control(&mut ancillary, 1, 2, &payload);
+                    }
                     if let Some((level, kind, hop)) = socket.ancillary_hop() {
                         push_control(&mut ancillary, level, kind, &(hop as u32).to_le_bytes());
                     }

@@ -51,6 +51,7 @@ impl LocalConnection {
         )?;
         self.client.credentials.set(self.identity);
         *accepted.name.borrow_mut() = peer.name.borrow().clone();
+        *accepted.timeouts.borrow_mut() = *peer.timeouts.borrow();
         accepted.set_reuse(16, peer.reuse(16))?;
         let timestamp = peer.timestamp.load(Ordering::Relaxed);
         if timestamp != 0 {

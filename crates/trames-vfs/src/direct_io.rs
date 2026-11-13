@@ -106,6 +106,7 @@ impl EventCounter {
 
 pub(super) struct PipeData {
     pub bytes: VecDeque<u8>,
+    pub capacity: usize,
     pub readers: u32,
     pub writers: u32,
     pub read_epoch: u64,
@@ -118,6 +119,7 @@ impl PipeData {
     pub(super) fn new() -> Self {
         Self {
             bytes: VecDeque::new(),
+            capacity: PIPE_CAPACITY,
             readers: 0,
             writers: 0,
             read_epoch: 0,
@@ -128,7 +130,7 @@ impl PipeData {
         }
     }
     pub(super) fn write_room(&self) -> usize {
-        PIPE_CAPACITY - self.bytes.len() - self.write_reserved
+        self.capacity - self.bytes.len() - self.write_reserved
     }
     pub(super) fn readable(&self) -> bool {
         !self.read_reserved && !self.bytes.is_empty()
@@ -221,6 +223,9 @@ impl Drop for PipeGuard<'_> {
 
 /// A frozen poll-only capability; no FD table, Rc or guest memory is retained.
 pub trait DirectPoll: Send + Sync {
+    fn bind_task(&self, _tid: u32) -> Option<Arc<dyn DirectPoll>> {
+        None
+    }
     fn into_uring(self: Arc<Self>) -> Option<Arc<Uring>> {
         None
     }
@@ -404,6 +409,14 @@ impl DirectFd {
         match &mut self.resource {
             ByteResource::Epoll(epoll) => epoll.signal_reader = reader.cloned(),
             ByteResource::Cgroup(_, caller) => *caller = cgroups.cloned(),
+            ByteResource::PollOnly(poll) => {
+                if let Some(bound) = reader
+                    .and_then(|r| r.global_tid())
+                    .and_then(|tid| poll.bind_task(tid))
+                {
+                    *poll = bound;
+                }
+            }
             _ => {}
         }
         self
@@ -539,6 +552,9 @@ impl DirectFd {
             }
         } else {
             match &open.control {
+                Some(events::SharedControl::Sync(file)) => {
+                    ByteResource::PollOnly(file.poll_handle())
+                }
                 Some(events::SharedControl::Binder(process)) => {
                     ByteResource::PollOnly(process.poll_handle())
                 }
@@ -718,7 +734,7 @@ impl DirectFd {
                 .map_or_else(Vec::new, |(fds, _)| {
                     fds.into_iter().map(Into::into).collect()
                 }),
-            ByteResource::Timer(timer) => timer.native_fd().into_iter().collect(),
+            ByteResource::Timer(timer) => timer.native_fds(),
             #[cfg(all(feature = "hostfs", unix))]
             ByteResource::Inotify(queue) => queue.native_fd().map(Into::into).into_iter().collect(),
             ByteResource::Epoll(epoll) => {
@@ -782,7 +798,7 @@ impl DirectFd {
                 .collect(),
             ByteResource::PollOnly(poll) => vec![poll.subscribe(signal)],
             ByteResource::Event(counter) => vec![counter.readiness.subscribe(signal)],
-            ByteResource::Timer(timer) => vec![timer.subscribe(signal)],
+            ByteResource::Timer(timer) => timer.subscribe(signal),
             ByteResource::Signal(mask, reader) => {
                 let mut subs = reader.subscribe(signal);
                 subs.push(mask.changed.subscribe(signal));
@@ -1953,7 +1969,7 @@ impl Vfs {
 
 fn native_wait_open(open: &OpenDescription) -> Vec<HostFd> {
     match &open.anonymous {
-        Some(events::Anonymous::Timer(timer)) => timer.native_fd().into_iter().collect(),
+        Some(events::Anonymous::Timer(timer)) => timer.native_fds(),
         #[cfg(all(feature = "hostfs", unix))]
         Some(events::Anonymous::Inotify(instance)) => instance
             .queue

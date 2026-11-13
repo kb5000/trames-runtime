@@ -76,6 +76,31 @@ impl DescriptorControl {
             return Err(Errno(9));
         }
         match command {
+            1031 | 1032 => {
+                let pipe = open.shared.pipe.as_ref().ok_or(Errno(9))?;
+                let mut data = pipe.pipe.data.lock().unwrap();
+                if command == 1031 {
+                    let requested = argument as u32;
+                    if requested > i32::MAX as u32 {
+                        return Err(Errno(22));
+                    }
+                    let size = requested
+                        .max(4096)
+                        .checked_next_power_of_two()
+                        .ok_or(Errno(22))? as usize;
+                    if size > 1024 * 1024 && !credentials.has_cap(capabilities::SYS_RESOURCE) {
+                        return Err(Errno(1));
+                    }
+                    if size < data.bytes.len() + data.write_reserved {
+                        return Err(Errno(16));
+                    }
+                    if size != data.capacity {
+                        data.capacity = size;
+                        data.io_epoch[1] = data.io_epoch[1].wrapping_add(1);
+                    }
+                }
+                Ok(data.capacity as u64)
+            }
             1 | 3 => query_fd_flags(
                 flags.get() | if self.0.cloexec.get() { O_CLOEXEC } else { 0 },
                 command,
@@ -261,6 +286,33 @@ impl FdFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pipe_capacity_is_shared_and_resizing_preserves_queued_bytes() {
+        let mut v = Vfs::default();
+        let [read, write] = v.pipe(O_NONBLOCK).unwrap();
+        let alias = v.dup(write, 0, false).unwrap();
+        let control = v.descriptor_control(alias).unwrap();
+        let user = Credentials::user(1000, 1000);
+        assert_eq!(control.short(alias, 1031, 70000, &user), Ok(131072));
+        assert_eq!(
+            v.descriptor_control(read)
+                .unwrap()
+                .short(read, 1032, 0, &user),
+            Ok(131072)
+        );
+        assert_eq!(v.write(write, &vec![3; 70000]), Ok(70000));
+        assert_eq!(control.short(alias, 1031, 4096, &user), Err(Errno(16)));
+        assert_eq!(v.read(read, 70000).unwrap(), vec![3; 70000]);
+        assert_eq!(control.short(alias, 1031, 0, &user), Ok(4096));
+        assert_eq!(
+            control.short(alias, 1031, 2 * 1024 * 1024, &user),
+            Err(Errno(1))
+        );
+        assert_eq!(
+            control.short(alias, 1031, u32::MAX as u64, &user),
+            Err(Errno(22))
+        );
+    }
     #[test]
     fn accepted_status_control_uses_live_inode_permission_and_survives_fd_reuse() {
         let mut v = Vfs::default();

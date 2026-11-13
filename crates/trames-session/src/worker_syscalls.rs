@@ -750,7 +750,7 @@ impl Snapshot {
         )
     }
     pub fn signal_send<C: Cpu>(&self, cpu: &C) -> bool {
-        matches!(cpu.x(8) as u32, 129..=131)
+        matches!(cpu.x(8) as u32, 129..=131 | 138 | 240)
     }
     pub fn admit<C: Cpu>(&self, cpu: &C) -> bool {
         if self.seccomp.mode() == 0 {
@@ -784,7 +784,7 @@ impl Snapshot {
         // futex/epoll checkpoint. Ordinary unfiltered calls keep the old path.
         if !matches!(
             cpu.x(8) as u32,
-            25 | 92 | 98 | 101 | 113..=115 | 124 | 139 | 154..=157 | 163 | 164 | 261 | 166 | 168 | 169 | 172..=179 | 278
+            25 | 92 | 98 | 101 | 113..=115 | 124 | 139 | 154..=157 | 163 | 164 | 261 | 166 | 168 | 169 | 172..=179 | 270 | 271 | 278
         ) && !(cpu.x(8) as u32 == 29 && matches!(cpu.x(1) as u32, 0x5421 | 0x5452))
             && !(matches!(cpu.x(8) as u32, 160..=162) && self.uts.is_some())
             && !(cpu.x(8) as u32 == 32 && (cpu.x(1) as u32 & 4 != 0 || cpu.x(1) as u32 == 8))
@@ -839,6 +839,15 @@ impl Snapshot {
             }
         }
         let result = match cpu.x(8) as u32 {
+            number @ (270 | 271)
+                if cpu.x(0) as u32 as u64 == self.identities[0]
+                    || cpu.x(0) as u32 as u64 == self.identities[6] =>
+            {
+                trames_linux::process_vm_local(number, std::array::from_fn(|i| cpu.x(i)), memory)
+            }
+            // Cross-mm access has no retained target-mm admission yet. Keep
+            // its unsupported result terminal on this source, without fallback.
+            270 | 271 => Err(Errno(38)),
             number @ 154..=157 => self.io_routes.job_call(
                 &self.io_signals,
                 number,
@@ -856,6 +865,12 @@ impl Snapshot {
                 self.io_signals.thread_addresses()?.set_clear_tid(cpu.x(0));
                 Ok(self.identities[6])
             }
+            number @ (138 | 240) => self.io_routes.send_queued(
+                &self.io_signals,
+                number,
+                std::array::from_fn(|i| cpu.x(i)),
+                memory,
+            )?,
             number @ 129..=131 => {
                 self.io_routes
                     .send(&self.io_signals, number, std::array::from_fn(|i| cpu.x(i)))?

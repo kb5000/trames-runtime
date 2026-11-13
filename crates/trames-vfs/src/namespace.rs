@@ -158,6 +158,7 @@ impl Vfs {
         }
         let old_mode = n.mode;
         let old_time = n.times[2];
+        let old_acl = n.xattrs.get(acl::ACCESS).cloned();
         #[cfg(all(feature = "hostfs", unix))]
         {
             drop(n);
@@ -170,6 +171,10 @@ impl Vfs {
         if !self.credentials.has_cap(capabilities::FSETID) && !self.credentials.in_group(n.gid) {
             n.mode &= !0o2000;
         }
+        let acl_mode = n.mode;
+        if let Some(value) = n.xattrs.get_mut(acl::ACCESS) {
+            acl::chmod(value, acl_mode, false);
+        }
         n.times[2] = storage::Timestamp::now();
         drop(n);
         if let Err(e) = if persistent && !node.borrow().volatile && node.borrow().links != 0 {
@@ -180,6 +185,9 @@ impl Vfs {
             let mut n = node.borrow_mut();
             n.mode = old_mode;
             n.times[2] = old_time;
+            if let Some(value) = old_acl {
+                n.xattrs.insert(acl::ACCESS.to_vec(), value);
+            }
             return Err(e);
         }
         inotify::notify(&node, inotify::ATTRIB, None);

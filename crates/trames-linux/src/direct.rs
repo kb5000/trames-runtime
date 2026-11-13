@@ -899,6 +899,9 @@ impl DirectSyscalls {
                     return vfs.inotify_remove(alias, args[1] as i32).map(|()| 0);
                 }
                 let timer = vfs.timerfd_resource(alias)?;
+                if number == 86 {
+                    trames_vfs::TimerFd::check_alarm(timer.clock, &vfs.credentials)?;
+                }
                 crate::timer::timerfd_control_with_boot(
                     &timer,
                     number,
@@ -1163,6 +1166,16 @@ impl DirectSyscalls {
         self.terminal_stop.set(false);
         if !Self::supports_fd_call(number, args, fd) {
             return None;
+        }
+        if number == 86 {
+            if let Some(timer) = fd.timer() {
+                if matches!(timer.clock, 8 | 9) {
+                    let credentials = self.resources.as_ref()?.local_credentials();
+                    if let Err(error) = trames_vfs::TimerFd::check_alarm(timer.clock, credentials) {
+                        return Some(Err(error));
+                    }
+                }
+            }
         }
         if number == 29 {
             if let Some(error) = Self::terminal_probe(args, fd) {
@@ -1938,7 +1951,11 @@ impl DirectSyscalls {
         }
         let signal = IoSignal::new(pid, target.clone());
         let subscriptions = file.subscribe(&signal);
-        let deadline = if let ByteOperation::Tcp(tcp) = &file.operation {
+        let deadline = if let Some(socket) = file.fd.local_operation() {
+            socket
+                .io_timeout(matches!(number, 63 | 65 | 207 | 212 | 286))
+                .and_then(|timeout| Instant::now().checked_add(timeout))
+        } else if let ByteOperation::Tcp(tcp) = &file.operation {
             tcp.timeouts[usize::from(matches!(number, 63 | 65 | 286))]
                 .and_then(|timeout| Instant::now().checked_add(timeout))
         } else {
@@ -2224,8 +2241,7 @@ impl DirectSyscalls {
                             },
                             |file| file.fd.nonblocking(),
                         ))
-                        || pending.external_wait()
-                            && pending.deadline.is_some_and(|d| Instant::now() >= d))
+                        || pending.deadline.is_some_and(|d| Instant::now() >= d))
                 {
                     return self.complete_pending(&pending, Err(Errno(11)), memory);
                 }

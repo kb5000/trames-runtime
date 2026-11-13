@@ -1420,7 +1420,14 @@ impl Backend {
             {
                 return invalid();
             }
-            if image.kind != Kind::SwapchainImage && (b[3] == 1000001002 || b[4] == 1000001002) {
+            let native_plane = matches!(
+                image.external.borrow().as_deref(),
+                Some(external::Resource::Image(_))
+            );
+            if image.kind != Kind::SwapchainImage
+                && !native_plane
+                && (b[3] == 1000001002 || b[4] == 1000001002)
+            {
                 return invalid();
             }
             let s = shape(&image)?;
@@ -1473,8 +1480,16 @@ impl Backend {
                     .image(vk::Image::from_raw(image.raw))
                     .src_access_mask(vk::AccessFlags::from_raw(b[1] as u32))
                     .dst_access_mask(vk::AccessFlags::from_raw(b[2] as u32))
-                    .old_layout(self.native_layout(b[3], true)?)
-                    .new_layout(self.native_layout(b[4], false)?)
+                    .old_layout(if native_plane && b[3] == 1000001002 {
+                        vk::ImageLayout::GENERAL
+                    } else {
+                        self.native_layout(b[3], true)?
+                    })
+                    .new_layout(if native_plane && b[4] == 1000001002 {
+                        vk::ImageLayout::GENERAL
+                    } else {
+                        self.native_layout(b[4], false)?
+                    })
                     .src_queue_family_index(families[0])
                     .dst_queue_family_index(families[1])
                     .subresource_range(range),

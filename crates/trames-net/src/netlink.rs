@@ -170,6 +170,8 @@ pub(super) struct Socket {
     buffers: Cell<i32>,
     ext_ack: Cell<bool>,
     strict: Cell<bool>,
+    pass_credentials: Cell<bool>,
+    timestamp: Cell<u32>,
 }
 struct Datagram {
     data: Vec<u8>,
@@ -282,7 +284,7 @@ impl Socket {
         kind: u32,
         protocol: u32,
     ) -> Result<Arc<Self>> {
-        if !matches!(protocol, 0 | 12) {
+        if !matches!(protocol, 0 | 12 | 15) {
             return Err(NetError(93));
         }
         if !matches!(kind, 2 | 3) {
@@ -303,6 +305,8 @@ impl Socket {
             buffers: Cell::new(65536),
             ext_ack: Cell::new(false),
             strict: Cell::new(false),
+            pass_credentials: Cell::new(false),
+            timestamp: Cell::new(0),
         });
         namespace
             .listeners
@@ -312,10 +316,16 @@ impl Socket {
         Ok(s)
     }
     fn supported_groups(&self) -> u32 {
-        if self.protocol == 0 {
-            1 | 0x10 | 0x40 | 0x100 | 0x400
-        } else {
-            0
+        match self.protocol {
+            // ND_USEROPT is a valid subscription too. This guest network has
+            // no router-advertisement producer, so it remains quiet until one
+            // exists, like a Linux interface receiving no advertisements.
+            0 => 1 | 0x10 | 0x40 | 0x100 | 0x400 | (1 << 19),
+            // Container devices are provisioned before listeners start. This
+            // is the guest's actual quiet uevent channel, not the host's device
+            // stream. Device injection and synthetic broadcasts are unsupported.
+            15 => u32::MAX,
+            _ => 0,
         }
     }
     fn autobind(&self) -> Result<()> {
@@ -370,7 +380,7 @@ impl Socket {
         Ok(())
     }
     pub fn local_bytes(&self) -> Result<Vec<u8>> {
-        Ok(address(self.port.get()))
+        Ok(source(self.port.get(), self.groups.get()).to_vec())
     }
     pub fn peer_bytes(&self) -> Result<Vec<u8>> {
         if self.connected.get() {
@@ -426,6 +436,9 @@ impl Socket {
         }
         if bytes.len() > MAX_TRANSFER {
             return Err(NetError(90));
+        }
+        if self.protocol == 15 {
+            return Err(NetError(95));
         }
         let mut group = 0;
         if let Some(destination) = destination {
@@ -613,6 +626,7 @@ impl Socket {
         let result = Received {
             packet_info: None,
             netlink_address: Some(packet.source),
+            credentials: self.pass_credentials.get().then_some([0, 0, 0]),
             data: bytes[..bytes.len().min(count)].to_vec(),
             length: bytes.len(),
             truncated: count < bytes.len(),
@@ -637,6 +651,8 @@ impl Socket {
     }
     pub fn set_option(&self, level: u32, name: u32, value: i32) -> Result<()> {
         match (level, name) {
+            (1, 16) => self.pass_credentials.set(value != 0),
+            (1, 29 | 35 | 63 | 64) => self.timestamp.set(if value != 0 { name } else { 0 }),
             (1, 7 | 8) if value > 0 => self.buffers.set(value.clamp(4096, MAX_BUFFER as i32)),
             (270, 1 | 2) if (1..=32).contains(&value) => {
                 let group = 1u32 << (value - 1);
@@ -657,6 +673,8 @@ impl Socket {
     }
     pub fn get_option(&self, level: u32, name: u32) -> Result<i32> {
         match (level, name) {
+            (1, 16) => Ok(i32::from(self.pass_credentials.get())),
+            (1, 29 | 35 | 63 | 64) => Ok(i32::from(self.timestamp.get() == name)),
             (1, 3) => Ok(self.kind as i32),
             (1, 4) => Ok(if self.overrun.replace(false) { 105 } else { 0 }),
             (1, 7 | 8) => Ok(self.buffers.get()),
@@ -681,6 +699,43 @@ impl Drop for Socket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn container_uevent_listener_is_quiet_and_separate_from_rtnetlink() {
+        let namespace = Arc::new(Namespace::default());
+        let events = Socket::new(namespace.clone(), None, 2, 15).unwrap();
+        events.bind_bytes(&source(123, u32::MAX)).unwrap();
+        assert_eq!(events.local_bytes().unwrap(), source(123, u32::MAX));
+        events.set_option(1, 16, 1).unwrap();
+        assert_eq!(events.get_option(1, 16), Ok(1));
+        assert_eq!(events.poll(1), Ok(0));
+        assert!(matches!(events.recv(1024, MSG_DONTWAIT), Err(NetError(11))));
+        notify(
+            &namespace.listeners,
+            vec![(namespace.id(), 16, 1, vec![0; 16])],
+        );
+        assert_eq!(events.poll(1), Ok(0));
+        assert_eq!(events.send_bytes(b"injected", 0, None), Err(NetError(95)));
+        // Port IDs are scoped by protocol even within the same namespace.
+        let routes = Socket::new(namespace, None, 3, 0).unwrap();
+        routes.bind_bytes(&source(123, 1 | (1 << 19))).unwrap();
+        routes.set_option(1, 16, 1).unwrap();
+        routes.set_option(1, 29, 1).unwrap();
+        assert_eq!(routes.get_option(1, 29), Ok(1));
+        let request = message(18, 1 | 0x300, 42, 0, &[0; 16]);
+        routes.send_bytes(&request, 0, None).unwrap();
+        // Linux netlink accepts SO_TIMESTAMP but does not attach timestamps.
+        assert_eq!(
+            routes.recv(65536, MSG_PEEK).unwrap().credentials,
+            Some([0, 0, 0])
+        );
+        let packet = routes.recv(65536, 0).unwrap();
+        assert_eq!(packet.credentials, Some([0, 0, 0]));
+        assert_eq!(packet.netlink_address, Some(source(0, 0)));
+        routes.set_option(1, 16, 0).unwrap();
+        routes.set_option(1, 29, 0).unwrap();
+        routes.send_bytes(&request, 0, None).unwrap();
+        assert_eq!(routes.recv(65536, 0).unwrap().credentials, None);
+    }
     #[test]
     fn namespace_resolution_precedes_topology_writer_and_preserves_error_ack() {
         let network = Network::new(NetworkMode::Loopback);

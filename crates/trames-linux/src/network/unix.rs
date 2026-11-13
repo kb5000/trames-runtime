@@ -115,6 +115,10 @@ pub(crate) fn control(
             if a[1] != 1 {
                 return Err(Errno(92));
             }
+            if matches!(a[2], 20 | 21 | 66 | 67) {
+                socket.set_io_timeout(matches!(a[2], 20 | 66), timeout_option(memory, a)?);
+                return Ok(0);
+            }
             if (a[4] as u32) < 4 || a[4] as u32 > i32::MAX as u32 {
                 return Err(Errno(22));
             }
@@ -131,6 +135,11 @@ pub(crate) fn control(
         209 => {
             if a[1] != 1 {
                 return Err(Errno(92));
+            }
+            if matches!(a[2], 20 | 21 | 66 | 67) {
+                return read_option(memory, a, || {
+                    Ok(timeout_bytes(socket.io_timeout(matches!(a[2], 20 | 66))))
+                });
             }
             if a[2] == 17 {
                 let mut credentials = socket.peer_credentials();

@@ -4,6 +4,7 @@ use super::*;
 use std::time::{Duration, Instant};
 
 pub(super) enum Anonymous {
+    Sync(Arc<sync_file::File>),
     Uring(Arc<Uring>),
     Bpf(Arc<bpf::Program>),
     Inotify(Arc<inotify::InotifyInstance>),
@@ -39,6 +40,7 @@ impl SignalMask {
     }
 }
 pub(super) enum SharedControl {
+    Sync(Arc<sync_file::File>),
     Binder(Arc<binder::Connection>),
     Cgroup(Arc<cgroup::CgroupFile>),
     Uring(Arc<Uring>),
@@ -52,6 +54,7 @@ pub(super) enum SharedControl {
 impl SharedControl {
     fn capture(control: &Anonymous) -> Option<Self> {
         Some(match control {
+            Anonymous::Sync(file) => Self::Sync(file.clone()),
             Anonymous::Uring(ring) => Self::Uring(ring.clone()),
             Anonymous::Signal(mask) => Self::Signal(mask.clone()),
             Anonymous::Bpf(program) => Self::Bpf(program.clone()),
@@ -63,6 +66,12 @@ impl SharedControl {
     }
     pub(super) fn owner_projection(&self) -> Option<Anonymous> {
         Some(match self {
+            Self::Sync(file) => {
+                if !file.is_fence() {
+                    return None;
+                }
+                Anonymous::Sync(file.clone())
+            }
             Self::Cgroup(_) | Self::Binder(_) => return None,
             Self::Uring(ring) => Anonymous::Uring(ring.clone()),
             Self::Signal(mask) => Anonymous::Signal(mask.clone()),
@@ -119,6 +128,7 @@ impl WatchState {
 impl Anonymous {
     pub(super) fn name(&self) -> &'static [u8] {
         match self {
+            Self::Sync(_) => b"anon_inode:[sync_file]",
             Self::Uring(_) => b"anon_inode:[io_uring]",
             Self::Bpf(_) => b"anon_inode:bpf-prog",
             Self::Inotify(_) => b"anon_inode:inotify",
@@ -135,6 +145,7 @@ impl Anonymous {
         reader: Option<&Arc<dyn SignalReader>>,
     ) -> u16 {
         match self {
+            Self::Sync(file) => file.poll(events).0,
             Self::Uring(ring) => {
                 if ring.cq_ready() != 0 {
                     events & 1
@@ -193,9 +204,12 @@ impl Anonymous {
         match self {
             Self::Event(counter) => counter.read(count),
             Self::Timer(timer) => timer.read(count),
-            Self::Bpf(_) | Self::Signal(_) | Self::Epoll(_) | Self::Inotify(_) | Self::Uring(_) => {
-                Err(Errno(22))
-            }
+            Self::Sync(_)
+            | Self::Bpf(_)
+            | Self::Signal(_)
+            | Self::Epoll(_)
+            | Self::Inotify(_)
+            | Self::Uring(_) => Err(Errno(22)),
         }
     }
     pub(super) fn write(&mut self, bytes: &[u8]) -> Result<usize> {
@@ -306,8 +320,18 @@ impl Vfs {
         Self::poll_epoch_with(o, None)
     }
     fn poll_epoch_with(o: &OpenDescription, reader: Option<&Arc<dyn SignalReader>>) -> [u64; 2] {
+        if let Some(SharedControl::Sync(file)) = &o.control {
+            return file.poll(0).1;
+        }
         if let Some(SharedControl::Binder(process)) = &o.control {
-            return process.poll(0).1;
+            return process
+                .poll_for(
+                    reader
+                        .and_then(|r| r.global_tid())
+                        .unwrap_or(process.owner()),
+                    0,
+                )
+                .1;
         }
         if let Some(SharedControl::Cgroup(file)) = &o.control {
             return file.poll(0).1;

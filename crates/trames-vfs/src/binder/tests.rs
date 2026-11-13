@@ -102,6 +102,18 @@ impl Client {
             records.push((cmd, bytes[at + 4..at + 4 + len].to_vec()));
             at += 4 + len;
         }
+        let acknowledgements: Vec<_> = records
+            .iter()
+            .filter_map(|(cmd, data)| match *cmd {
+                BR_INCREFS => Some(command(INCREFS_DONE, data)),
+                BR_ACQUIRE => Some(command(ACQUIRE_DONE, data)),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        if !acknowledgements.is_empty() {
+            self.write(&acknowledgements);
+        }
         Some(records)
     }
     fn transaction(&mut self) -> (u32, Vec<u8>) {
@@ -271,6 +283,302 @@ fn worker_path_views_retain_original_context_and_mmap_release_not_physical_snaps
         "retained CPU byte pages cannot retain the removed VMA's Binder process"
     );
     drop(retained);
+}
+#[test]
+fn retired_binder_addresses_accept_new_cookies_after_actual_reference_release() {
+    let root = Vfs::default();
+    let mut owner = Client::new(&root, 10, b"/dev/hwbinder");
+    let mut receiver = Client::new(&root, 20, b"/dev/hwbinder");
+    receiver.manager();
+    for generation in 1..=32 {
+        let cookie = 0x2000 + generation * 16;
+        owner.send(
+            0,
+            ACCEPT_FDS,
+            &flat(TYPE_BINDER, 0x1110, cookie),
+            &[0],
+            false,
+        );
+        let (_, request) = receiver.transaction();
+        let handle = dword(&receiver.payload(&request), 8);
+        receiver.write(&command(INCREFS, &handle.to_le_bytes()));
+        receiver.write(&command(ACQUIRE, &handle.to_le_bytes()));
+        receiver.send(0, 0, b"accepted", &[], true);
+        receiver.free(&request);
+        let (_, reply) = owner.transaction();
+        owner.free(&reply);
+        assert!(matches!(
+            owner.process().owned_node(0x1110, cookie + 1, 0x100, 10),
+            Err(Errno(22))
+        ));
+        receiver.write(&command(RELEASE, &handle.to_le_bytes()));
+        receiver.write(&command(DECREFS, &handle.to_le_bytes()));
+        while owner.receive().is_some() {}
+        assert!(!owner
+            .process()
+            .state
+            .lock()
+            .unwrap()
+            .nodes
+            .contains_key(&0x1110));
+    }
+}
+#[test]
+fn binder_readiness_is_per_original_thread_and_retired_poll_cannot_retarget_tid_reuse() {
+    struct Reader(u32);
+    impl SignalReader for Reader {
+        fn global_tid(&self) -> Option<u32> {
+            Some(self.0)
+        }
+        fn poll(&self, _: u64) -> (u16, [u64; 2]) {
+            (0, [0; 2])
+        }
+        fn take(&self, _: u64) -> Option<[u8; 128]> {
+            None
+        }
+        fn subscribe(&self, _: &Arc<IoSignal>) -> Vec<IoSubscription> {
+            Vec::new()
+        }
+    }
+    let root = Vfs::default();
+    let owner = Client::new(&root, 10, b"/dev/binder");
+    let process = owner.process();
+    let main = owner
+        .vfs
+        .direct_descriptors()
+        .with_signal_reader(Some(Arc::new(Reader(10))))
+        .get(owner.fd)
+        .unwrap();
+    let worker = owner
+        .vfs
+        .direct_descriptors()
+        .with_signal_reader(Some(Arc::new(Reader(11))))
+        .get(owner.fd)
+        .unwrap();
+    let before = main.peek_poll(1);
+    process.bytes(11, BR_COMPLETE);
+    assert_eq!(
+        main.peek_poll(1),
+        before,
+        "another thread's completion is not readable or a new edge here"
+    );
+    assert_eq!(worker.peek_poll(1).0, 1);
+    process.thread_exit(11);
+    assert_eq!(worker.peek_poll(1).0, 0x18);
+    let new = owner
+        .vfs
+        .direct_descriptors()
+        .with_signal_reader(Some(Arc::new(Reader(11))))
+        .get(owner.fd)
+        .unwrap();
+    process.bytes(11, BR_COMPLETE);
+    assert_eq!(new.peek_poll(1).0, 1);
+    assert_eq!(
+        worker.peek_poll(1).0,
+        0x18,
+        "accepted old poll cannot select a new task with the same TID"
+    );
+    assert_eq!(main.peek_poll(1), before);
+}
+#[test]
+fn parcel_reference_commands_survive_remote_death_and_ignore_bad_user_counts() {
+    let root = Vfs::default();
+    let mut service = Client::new(&root, 10, b"/dev/binder");
+    let mut client = Client::new(&root, 20, b"/dev/binder");
+    service.manager();
+    client.send(0, ACCEPT_FDS, b"object", &[], false);
+    let (_, request) = service.transaction();
+    service.send(0, 0, &flat(TYPE_BINDER, 0x1110, 0x2220), &[0], true);
+    service.free(&request);
+    let (_, reply) = client.transaction();
+    let handle = dword(&client.payload(&reply), 8);
+    service.process().close();
+    for cmd in [INCREFS, ACQUIRE, RELEASE, DECREFS] {
+        client.write(&command(cmd, &handle.to_le_bytes()));
+    }
+    client.send(handle, 0, b"dead", &[], false);
+    assert_eq!(client.transaction().0, BR_DEAD_REPLY);
+    client.free(&reply);
+    for cmd in [INCREFS, ACQUIRE, RELEASE, DECREFS] {
+        client.write(&command(cmd, &u32::MAX.to_le_bytes()));
+    }
+    client.write(&command(FREE_BUFFER, &0u64.to_le_bytes()));
+    client.write(&command(ACQUIRE_DONE, &[0; 16]));
+}
+#[test]
+fn completion_read_cannot_start_unrelated_process_rpc_inside_caller_locks() {
+    let root = Vfs::default();
+    let mut caller = Client::new(&root, 10, b"/dev/binder");
+    let mut manager = Client::new(&root, 20, b"/dev/binder");
+    let mut client = Client::new(&root, 30, b"/dev/binder");
+    manager.manager();
+    caller.enter();
+    let node = caller
+        .process()
+        .owned_node(0x1110, 0x2220, 0x100, 10)
+        .unwrap();
+    let reference = client.process().reference(node, 3).unwrap();
+    caller.send(0, ONE_WAY, b"outgoing", &[], false);
+    client.send(reference.handle, ONE_WAY, b"unrelated RPC", &[], false);
+    let records = caller.receive().unwrap();
+    assert!(records.iter().any(|(cmd, _)| *cmd == BR_COMPLETE));
+    assert!(!records.iter().any(|(cmd, _)| *cmd == BR_TRANSACTION));
+    let (_, request) = caller.transaction();
+    assert_eq!(caller.payload(&request), b"unrelated RPC");
+    caller.free(&request);
+    drop(BufferReference(reference, true));
+}
+#[test]
+fn outgoing_rpc_waiter_does_not_suppress_server_pool_growth() {
+    let root = Vfs::default();
+    let mut service = Client::new(&root, 10, b"/dev/hwbinder");
+    let mut downstream = Client::new(&root, 20, b"/dev/hwbinder");
+    downstream.manager();
+    service.send(0, ACCEPT_FDS, b"downstream", &[], false);
+    service.receive().unwrap(); // Original caller consumed its completion.
+    let mut waiting = service.start(&[], 4096).unwrap();
+    assert_eq!(waiting.finish(&mut service.memory), Ok(None));
+    service.tid = 11;
+    service.enter();
+    service
+        .control(SET_MAX_THREADS, &1u32.to_le_bytes())
+        .unwrap();
+    let node = service
+        .process()
+        .owned_node(0x1110, 0x2220, 0x100, 11)
+        .unwrap();
+    let reference = downstream.process().reference(node, 3).unwrap();
+    let records = service.receive().unwrap();
+    assert!(records.iter().any(|(cmd, _)| *cmd == BR_SPAWN));
+    drop(BufferReference(reference, true));
+    drop(waiting);
+}
+#[test]
+fn returned_temporary_object_acquisitions_precede_reply_completion() {
+    let root = Vfs::default();
+    let mut server = Client::new(&root, 10, b"/dev/hwbinder");
+    let mut client = Client::new(&root, 20, b"/dev/hwbinder");
+    server.manager();
+    client.send(0, ACCEPT_FDS, b"new object", &[], false);
+    let (_, request) = server.transaction();
+    server.send(0, 0, &flat(TYPE_BINDER, 0x1110, 0x2220), &[0], true);
+    let records = server.receive().unwrap();
+    let commands: Vec<_> = records
+        .into_iter()
+        .map(|(cmd, _)| cmd)
+        .filter(|cmd| *cmd != BR_NOOP)
+        .collect();
+    assert_eq!(commands, [BR_INCREFS, BR_ACQUIRE, BR_COMPLETE]);
+    server.free(&request);
+    let (_, reply) = client.transaction();
+    client.free(&reply);
+}
+#[test]
+fn queued_transaction_holds_guest_object_until_target_buffer_is_freed() {
+    let root = Vfs::default();
+    let mut owner = Client::new(&root, 10, b"/dev/binder");
+    let mut client = Client::new(&root, 20, b"/dev/binder");
+    client.manager();
+    owner.send(
+        0,
+        ACCEPT_FDS,
+        &flat(TYPE_BINDER, 0x1110, 0x2220),
+        &[0],
+        false,
+    );
+    let (_, exported) = client.transaction();
+    let handle = dword(&client.payload(&exported), 8);
+    client.write(&command(ACQUIRE, &handle.to_le_bytes()));
+    client.send(0, 0, b"ready", &[], true);
+    client.free(&exported);
+    let (_, reply) = owner.transaction();
+    owner.free(&reply);
+    client.send(handle, ONE_WAY, b"in flight", &[], false);
+    client.write(&command(RELEASE, &handle.to_le_bytes()));
+    let records = owner.receive().unwrap();
+    assert!(!records
+        .iter()
+        .any(|(cmd, _)| matches!(*cmd, BR_RELEASE | BR_DECREFS)));
+    let transaction = records
+        .iter()
+        .find(|(cmd, _)| *cmd == BR_TRANSACTION)
+        .unwrap()
+        .1
+        .clone();
+    assert_eq!(
+        (word(&transaction, 0), word(&transaction, 8)),
+        (0x1110, 0x2220)
+    );
+    assert!(matches!(
+        owner.process().owned_node(0x1110, 0x3330, 0x100, 10),
+        Err(Errno(22))
+    ));
+    owner.free(&transaction);
+    let mut releases = Vec::new();
+    while let Some(records) = owner.receive() {
+        releases.extend(
+            records
+                .into_iter()
+                .map(|(cmd, _)| cmd)
+                .filter(|cmd| matches!(*cmd, BR_RELEASE | BR_DECREFS)),
+        );
+    }
+    assert_eq!(releases, [BR_RELEASE, BR_DECREFS]);
+    assert!(owner
+        .process()
+        .owned_node(0x1110, 0x3330, 0x100, 10)
+        .is_ok());
+}
+#[test]
+fn malformed_or_unallocatable_replies_unwind_both_original_threads_and_allow_next_call() {
+    for device in [b"/dev/binder".as_slice(), b"/dev/hwbinder"] {
+        let root = Vfs::default();
+        let mut service = Client::new(&root, 10, device);
+        service.manager();
+        let mut client = Client::new(&root, 20, device);
+        for case in 0..4 {
+            client.send(
+                0,
+                if case == 2 { 0 } else { ACCEPT_FDS },
+                b"request",
+                &[],
+                false,
+            );
+            let (_, request) = service.transaction();
+            match case {
+                0 => {
+                    let mut fd = flat(TYPE_FD, u32::MAX as u64, 0);
+                    put32(&mut fd, 4, 0);
+                    service.send(0, 0, &fd, &[0], true);
+                }
+                1 => service.send(0, 0, &TYPE_BINDER.to_le_bytes(), &[0], true),
+                2 => {
+                    let fd = flat(TYPE_FD, service.fd as u64, 0);
+                    service.send(0, 0, &fd, &[0], true);
+                }
+                _ => service.send(0, 0, &vec![1; 0x10001], &[], true),
+            }
+            let records = service.receive().unwrap();
+            assert!(records.iter().any(|r| r.0 == BR_COMPLETE));
+            assert!(!records.iter().any(|r| r.0 == BR_FAILED_REPLY));
+            assert_eq!(client.transaction().0, BR_FAILED_REPLY);
+            service.free(&request);
+            assert!(client.process().state.lock().unwrap().threads[&20]
+                .stack
+                .is_empty());
+            assert!(service.process().state.lock().unwrap().threads[&10]
+                .stack
+                .is_empty());
+            client.send(0, ACCEPT_FDS, b"retry", &[], false);
+            let (_, request) = service.transaction();
+            service.send(0, 0, b"ok", &[], true);
+            service.free(&request);
+            let (cmd, reply) = client.transaction();
+            assert_eq!(cmd, BR_REPLY);
+            assert_eq!(client.payload(&reply), b"ok");
+            client.free(&reply);
+        }
+    }
 }
 #[test]
 fn synchronous_call_reply_and_original_buffer_reuse() {
@@ -521,7 +829,7 @@ fn sg_parent_pointers_and_fd_arrays_use_original_shared_descriptions() {
 #[test]
 fn racing_buffer_references_keep_handle_membership_and_node_events_ordered() {
     let root = Vfs::default();
-    let owner = Client::new(&root, 1, b"/dev/binder");
+    let mut owner = Client::new(&root, 1, b"/dev/binder");
     let receiver = Client::new(&root, 2, b"/dev/binder");
     let owner_process = owner.process();
     let receiver_process = receiver.process();
@@ -543,12 +851,11 @@ fn racing_buffer_references_keep_handle_membership_and_node_events_ordered() {
     let state = node.state.lock().unwrap();
     assert_eq!((state.strong, state.weak), (0, 0));
     drop(state);
-    let state = owner_process.state.lock().unwrap();
     let mut strong = false;
     let mut weak = false;
-    for work in &state.threads[&1].queue {
-        if let Work::Node(bytes) = work {
-            match dword(bytes, 0) {
+    while let Some(records) = owner.receive() {
+        for (cmd, _) in records {
+            match cmd {
                 BR_INCREFS => {
                     assert!(!weak);
                     weak = true;
@@ -565,7 +872,7 @@ fn racing_buffer_references_keep_handle_membership_and_node_events_ordered() {
                     assert!(weak && !strong);
                     weak = false;
                 }
-                _ => unreachable!(),
+                _ => {}
             }
         }
     }

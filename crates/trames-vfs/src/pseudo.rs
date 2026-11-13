@@ -793,6 +793,7 @@ pub struct ProcessInfo {
     pub maps: Vec<u8>,
     pub user_ticks: u64,
     pub start_ticks: u64,
+    pub start_stack: u64,
     pub terminal: bool,
     pub terminal_number: u32,
     pub fds: Vec<FdInfo>,
@@ -817,6 +818,8 @@ pub struct RuntimeInfo {
     pub cpu_features: &'static str,
     pub processes: Vec<ProcessInfo>,
     pub uptime: Duration,
+    /// Original guest CLOCK_MONOTONIC epoch, also used by sync-file timestamps.
+    pub monotonic_origin: Option<std::time::Instant>,
     pub boot_time: u64,
     pub context_switches: u64,
     pub cpu_user_ticks: u64,
@@ -1030,6 +1033,7 @@ impl PseudoFs {
 }
 #[derive(Clone, Copy)]
 pub(super) enum Device {
+    SwSync,
     Binder(u8),
     Render,
     Unregistered(u32),
@@ -1064,6 +1068,7 @@ impl Device {
                 0x108 => Self::Random,
                 0x109 => Self::Urandom,
                 0x10b => Self::Kmsg,
+                0xf200 => Self::SwSync,
                 0x502 => Self::Ptmx,
                 0xe280 => Self::Render,
                 0xf100..=0xf102 => Self::Binder((value - 0xf100) as u8),
@@ -1073,6 +1078,7 @@ impl Device {
     }
     pub(super) fn rdev(self) -> u64 {
         match self {
+            Self::SwSync => 0xf200,
             Self::Binder(device) => 0xf100 + device as u64,
             Self::Unregistered(rdev) => rdev as u64,
             Self::Render => 0xe280,
@@ -1091,7 +1097,7 @@ impl Device {
     pub(super) fn read(self, count: usize) -> Result<Vec<u8>> {
         let mut data = vec![0; count.min(storage::MAX_TRANSFER)];
         match self {
-            Self::Binder(_) => return Err(Errno(22)),
+            Self::Binder(_) | Self::SwSync => return Err(Errno(22)),
             Self::Unregistered(_) => return Err(Errno(6)),
             Self::Render => return Err(Errno(22)),
             Self::Zero | Self::Full => {}
@@ -1106,7 +1112,7 @@ impl Device {
     }
     pub(super) fn write(self, data: &[u8]) -> Result<usize> {
         match self {
-            Self::Binder(_) => Err(Errno(22)),
+            Self::Binder(_) | Self::SwSync => Err(Errno(22)),
             Self::Unregistered(_) => Err(Errno(6)),
             Self::Render => Err(Errno(22)),
             Self::Full => Err(Errno(28)),
@@ -1723,6 +1729,7 @@ impl Vfs {
                     | b"/dev/binder"
                     | b"/dev/hwbinder"
                     | b"/dev/vndbinder"
+                    | b"/dev/sw_sync"
                     | b"/dev/vda"
                     | b"/dev/vda1"
                     | b"/dev/trames-bridge"
@@ -1833,6 +1840,7 @@ impl Vfs {
             b"/dev/trames-bridge" if self.bridge.is_some() => return Ok(Some((Content::Device(Device::Bridge), 0o20600))),
             b"/dev/kmsg" => return Ok(Some((Content::Device(Device::Kmsg),0o20600))),
             b"/dev/binder" => return Ok(Some((Content::Device(Device::Binder(0)),0o20666))),
+            b"/dev/sw_sync" | b"/sys/kernel/debug/sync/sw_sync" => return Ok(Some((Content::Device(Device::SwSync),0o20666))),
             b"/dev/hwbinder" => return Ok(Some((Content::Device(Device::Binder(1)),0o20666))),
             b"/dev/vndbinder" => return Ok(Some((Content::Device(Device::Binder(2)),0o20666))),
             b"/dev/vda" => return Ok(Some((Content::Device(Device::Vda),0o60600))),
@@ -2025,6 +2033,7 @@ impl Vfs {
                             fields[20] = p.virtual_bytes.to_string();
                             fields[21] = (p.mapped_bytes / 4096).to_string();
                             fields[22] = u64::MAX.to_string();
+                            fields[25] = p.start_stack.to_string();
                             fields[36] = p.processor.to_string();
                             format!("{} ({name}) {}\n", p.pid, fields.join(" ")).into_bytes()
                         }
@@ -2558,6 +2567,7 @@ impl Vfs {
                 "binder",
                 "hwbinder",
                 "vndbinder",
+                "sw_sync",
             ]
             .iter()
             .map(|s| s.as_bytes().to_vec())

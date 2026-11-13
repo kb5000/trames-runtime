@@ -65,6 +65,43 @@ fn repeated_host_import_is_atomic_preserves_open_inode_and_survives_cancel() {
     assert_eq!(reopened.executable(b"/upload").unwrap(), b"replacement");
 }
 #[test]
+fn posix_acl_persistence_and_chmod_checkpoint_failure_preserve_inode_authority() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.mkdir_at(AT_FDCWD, b"/acl", 0o777).unwrap();
+    let mut bytes = 2u32.to_le_bytes().to_vec();
+    for (tag, perm, id) in [
+        (1u16, 7u16, u32::MAX),
+        (2, 7, 1000),
+        (4, 0, u32::MAX),
+        (16, 7, u32::MAX),
+        (32, 0, u32::MAX),
+    ] {
+        bytes.extend(tag.to_le_bytes());
+        bytes.extend(perm.to_le_bytes());
+        bytes.extend(id.to_le_bytes());
+    }
+    v.set_xattr(AT_FDCWD, Some(b"/acl"), true, acl::DEFAULT, Some(&bytes), 0)
+        .unwrap();
+    let fd = v.open_at(AT_FDCWD, b"/acl/file", 0o102, 0o660).unwrap();
+    v.close(fd).unwrap();
+    let old = v
+        .get_xattr(AT_FDCWD, Some(b"/acl/file"), true, acl::ACCESS)
+        .unwrap();
+    fs::create_dir(dir.0.join("manifest.new")).unwrap();
+    assert!(v.chmod_at(AT_FDCWD, b"/acl/file", 0o600).is_err());
+    assert_eq!(
+        v.get_xattr(AT_FDCWD, Some(b"/acl/file"), true, acl::ACCESS)
+            .unwrap(),
+        old
+    );
+    fs::remove_dir(dir.0.join("manifest.new")).unwrap();
+    drop(v);
+    let mut v = dir.open();
+    v.credentials = Credentials::user(1000, 1000);
+    assert!(v.open_at(AT_FDCWD, b"/acl/file", 2, 0).is_ok());
+}
+#[test]
 fn inode_attributes_persist_share_hardlinks_and_rollback_failed_commits() {
     let dir = Temp::new();
     let mut v = dir.open();

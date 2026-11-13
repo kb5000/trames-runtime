@@ -45,11 +45,11 @@ pub fn timerfd_control_with_boot(
         let delta = if a[1] & 1 == 0 {
             value
         } else {
-            let now = if timer.clock == 0 {
+            let now = if matches!(timer.clock, 0 | 8) {
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map_err(|_| Errno(5))?
-            } else if timer.clock == 7 {
+            } else if matches!(timer.clock, 7 | 9) {
                 boot.map_or_else(|| started.elapsed(), |b| b.elapsed())
             } else {
                 started.elapsed()
@@ -64,7 +64,7 @@ pub fn timerfd_control_with_boot(
         Some((
             interval,
             deadline,
-            (timer.clock == 0 && a[1] & 3 == 3).then_some(value),
+            (matches!(timer.clock, 0 | 8) && a[1] & 3 == 3).then_some(value),
         ))
     } else {
         None

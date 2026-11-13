@@ -76,10 +76,6 @@ pub fn build_initial_stack(
     let env_end = environment
         .last()
         .map_or(arg_end, |last| last + envp.last().unwrap().len() as u64 + 1);
-    elf.memory.set_image_ranges(trames_memory::ImageRanges {
-        arguments: (arg_start, arg_end),
-        environment: (env_start, env_end),
-    });
     cursor -= 16;
     let mut entropy = [0; 16];
     crate::fill_entropy(&mut entropy)
@@ -88,6 +84,7 @@ pub fn build_initial_stack(
     // Static Linux auxv, including real host entropy for the guest stack guard.
     let mut auxv = vec![
         (6u64, PAGE_SIZE),
+        (17, 100), // AT_CLKTCK: the same Linux USER_HZ used by /proc stat.
         (16, features.hwcap),
         (26, features.hwcap2),
         (9, elf.entry),
@@ -124,6 +121,11 @@ pub fn build_initial_stack(
         .map(|v| v & !15)
         .filter(|&v| v >= STACK_TOP - INITIAL_ARGUMENT_BYTES)
         .ok_or(ImageError::Arguments("stack exceeds 64 KiB"))?;
+    elf.memory.set_image_ranges(trames_memory::ImageRanges {
+        arguments: (arg_start, arg_end),
+        environment: (env_start, env_end),
+        start_stack: sp,
+    });
     for (index, word) in words.iter().enumerate() {
         elf.memory
             .write(sp + index as u64 * 8, &word.to_le_bytes())?;

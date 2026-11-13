@@ -134,7 +134,16 @@ impl Credentials {
             0
         };
         let mode = node.file_metadata().mode;
-        (mode >> shift) & bits == bits
+        let permitted = if c.fsuid != node.uid {
+            node.xattrs
+                .get(acl::ACCESS)
+                .map_or((mode >> shift) & bits == bits, |value| {
+                    acl::allows(value, node, c, bits)
+                })
+        } else {
+            (mode >> shift) & bits == bits
+        };
+        permitted
             || c.has_cap(capabilities::DAC_OVERRIDE)
                 && (bits & 1 == 0
                     || matches!(node.content, Content::Directory)

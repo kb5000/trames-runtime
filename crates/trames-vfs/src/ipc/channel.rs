@@ -310,7 +310,9 @@ impl Resource {
         flags: u32,
         ancillary: bool,
     ) -> Option<Result<Received>> {
-        if flags & !(2 | 0x20 | 0x40 | 0x100 | 0x4000 | 0x40000000) != 0 {
+        // Linux accepts the output-only MSG_CTRUNC bit on input. Android's
+        // ReceiveFileDescriptorVector passes it on every Zygote receive.
+        if flags & !(2 | 8 | 0x20 | 0x40 | 0x100 | 0x4000 | 0x40000000) != 0 {
             return Some(Err(Errno(95)));
         }
         if self.kind == 1 && flags & 0x100 != 0 && flags & 0x40 == 0 && count > PIPE_CAPACITY {

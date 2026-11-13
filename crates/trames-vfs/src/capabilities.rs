@@ -49,6 +49,7 @@ pub const NET_BIND_SERVICE: u32 = 10;
 pub const SYS_RESOURCE: u32 = 24;
 pub const MKNOD: u32 = 27;
 pub const SYSLOG: u32 = 34;
+pub const WAKE_ALARM: u32 = 35;
 pub const LAST: u32 = 40;
 pub const ALL: u64 = (1 << (LAST + 1)) - 1;
 const FS: u64 = (1 << CHOWN)

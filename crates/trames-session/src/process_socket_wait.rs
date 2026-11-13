@@ -1855,6 +1855,7 @@ fn shared_signalfd_reads_the_current_tasks_queue_and_does_not_capture_its_creato
         .unwrap();
     let mut peer = p.fork();
     let info = |sender| Info {
+        user: None,
         sender,
         uid: 123,
         status: 0,

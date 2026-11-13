@@ -193,6 +193,7 @@ struct LogState {
     started: Instant,
     window: Instant,
     emitted: u32,
+    burst_limit: u32,
     suppressed: u64,
     records: VecDeque<Record>,
     bytes: usize,
@@ -207,6 +208,7 @@ impl Default for LogState {
             started: Instant::now(),
             window: Instant::now(),
             emitted: 0,
+            burst_limit: RECORDS_PER_SECOND,
             suppressed: 0,
             records: VecDeque::new(),
             bytes: 0,
@@ -231,7 +233,7 @@ impl LogState {
                 self.insert(4, &message);
             }
         }
-        if self.emitted >= RECORDS_PER_SECOND {
+        if self.emitted >= self.burst_limit {
             self.suppressed = self.suppressed.saturating_add(1);
             return;
         }
@@ -356,6 +358,11 @@ impl LogState {
     }
 }
 impl Vfs {
+    /// Explicit host diagnostics retain boot bursts in the same bounded ring.
+    /// Normal sessions keep their existing rate limit and memory bound.
+    pub fn retain_kernel_log_bursts(&self) {
+        self.kernel_log.state.lock().unwrap().burst_limit = u32::MAX;
+    }
     /// Cold scheduling hint for a legacy stream waiter without a kmsg FD.
     /// Merely sharing a session log must not divert unrelated solo CPU work.
     pub fn can_write_kernel_log_for(&self, reader: &Self) -> bool {

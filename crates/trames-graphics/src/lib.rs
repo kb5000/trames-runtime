@@ -70,13 +70,28 @@ pub unsafe trait Image: Send + Sync {
     /// # Safety
     /// `device` is a live id<MTLDevice> for the duration of this call.
     unsafe fn metal_texture(&self, device: usize) -> io::Result<Arc<Texture>>;
+    fn cpu_pages(
+        &self,
+        _offset: u64,
+        _length: u64,
+    ) -> io::Result<Vec<Arc<dyn trames_memory::PageBacking>>> {
+        Err(io::Error::from_raw_os_error(95))
+    }
+    fn cpu_access(&self, _begin: bool) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(95))
+    }
 }
+/// A native bridge marker contains ownership only, never pixel copies or a
+/// guest-supplied pointer. Its original SharedFile export proves provenance.
+pub struct ImageAttachment(pub Arc<dyn Image>);
 /// Real per-caller files_struct authority, supplied only for native FD operations.
 pub trait ImageFds: Send + Sync {
     fn lookup(&self, fd: u32) -> io::Result<Arc<dyn Image>>;
     fn insert(&self, image: Arc<dyn Image>) -> io::Result<u32>;
     fn close(&self, fd: u32);
 }
+#[cfg(target_vendor = "apple")]
+mod cpu;
 mod native;
 pub use native::Context;
 #[cfg(target_vendor = "apple")]

@@ -81,6 +81,7 @@ pub(crate) fn execute<C: Cpu>(
                 {
                     snapshot.io_signals.inbox.discard(31);
                     let info = trames_kernel::signal::Info {
+                        user: None,
                         sender: entry.data(),
                         uid: 0xc000_00b7,
                         status: number as i32,

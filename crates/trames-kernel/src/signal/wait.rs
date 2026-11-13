@@ -76,7 +76,11 @@ impl SignalWait {
             return None;
         };
         if let Some((sig, mut value)) = task.dequeue(mask) {
-            if value.timer.is_none() && value.fault.is_none() && value.poll.is_none() {
+            if value.user.is_none()
+                && value.timer.is_none()
+                && value.fault.is_none()
+                && value.poll.is_none()
+            {
                 value.sender = namespace.local(value.sender);
             }
             return Some((|| {

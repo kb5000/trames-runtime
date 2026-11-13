@@ -79,6 +79,7 @@ struct State {
     closed: bool,
     threads: BTreeMap<u32, Thread>,
     queue: VecDeque<Work>,
+    queue_epoch: u64,
     nodes: BTreeMap<u64, Arc<Node>>,
     handles: BTreeMap<u32, Arc<Reference>>,
     next_handle: u32,
@@ -89,29 +90,46 @@ struct State {
     requested_threads: u32,
     last_error: (u32, u32, i32),
 }
-#[derive(Default)]
 struct Thread {
+    identity: u64,
+    epoch: u64,
+    poll: Weak<PollConnection>,
     queue: VecDeque<Work>,
     stack: Vec<Arc<Call>>,
     looper: bool,
     registered: bool,
     waiting: bool,
 }
+impl Default for Thread {
+    fn default() -> Self {
+        Self {
+            identity: trames_memory::new_backing_identity(),
+            epoch: 0,
+            poll: Weak::new(),
+            queue: VecDeque::new(),
+            stack: Vec::new(),
+            looper: false,
+            registered: false,
+            waiting: false,
+        }
+    }
+}
 enum Work {
     Bytes(Vec<u8>),
-    Node(Vec<u8>),
+    Node(Arc<Node>),
     Transaction(Arc<Buffer>),
     Reply(Arc<Buffer>, Arc<Call>),
-    Dead(Arc<Call>),
+    Dead(Arc<Call>, u32),
     Death(u64),
     ClearDeath(u64),
 }
 impl Work {
     fn size(&self) -> usize {
         match self {
-            Self::Bytes(bytes) | Self::Node(bytes) => bytes.len(),
+            Self::Bytes(bytes) => bytes.len(),
+            Self::Node(..) => 40,
             Self::Transaction(_) | Self::Reply(..) => 68,
-            Self::Dead(_) => 4,
+            Self::Dead(..) => 4,
             Self::Death(_) | Self::ClearDeath(_) => 12,
         }
     }
@@ -127,9 +145,12 @@ struct Call {
 }
 impl Call {
     fn fail(self: &Arc<Self>) {
+        self.fail_with(BR_DEAD_REPLY);
+    }
+    fn fail_with(self: &Arc<Self>, command: u32) {
         if !self.finished.swap(true, Ordering::AcqRel) {
             if let Some(from) = self.from.upgrade() {
-                let _ = from.enqueue(Some(self.from_tid), Work::Dead(self.clone()));
+                let _ = from.enqueue(Some(self.from_tid), Work::Dead(self.clone(), command));
             }
         }
     }
@@ -141,7 +162,6 @@ struct Node {
     cookie: u64,
     flags: u32,
     dead: AtomicBool,
-    publishing: AtomicBool,
     is_manager: AtomicBool,
     state: Mutex<NodeState>,
 }
@@ -150,10 +170,30 @@ struct NodeState {
     strong: u64,
     weak: u64,
     local_weak: u64,
+    inflight: u64,
+    queued: u64,
+    pending_weak: u64,
+    pending_strong: u64,
     async_active: bool,
     async_queue: VecDeque<Arc<Buffer>>,
     watchers: Vec<(Weak<Connection>, u64)>,
-    notices: VecDeque<u32>,
+    has_weak: bool,
+    has_strong: bool,
+}
+impl NodeState {
+    fn idle(&self) -> bool {
+        self.strong == 0
+            && self.weak == 0
+            && self.local_weak == 0
+            && self.inflight == 0
+            && self.queued == 0
+            && self.pending_weak == 0
+            && self.pending_strong == 0
+            && !self.async_active
+            && self.async_queue.is_empty()
+            && !self.has_weak
+            && !self.has_strong
+    }
 }
 impl Node {
     fn change(&self, strong: bool, add: bool, amount: u64) -> Option<u32> {
@@ -180,44 +220,92 @@ impl Node {
             } else {
                 None
             };
-            let notice = notice.filter(|_| !self.is_manager.load(Ordering::Relaxed));
-            if let Some(cmd) = notice {
-                state.notices.push_back(cmd);
-            }
-            notice
+            notice.filter(|_| !self.is_manager.load(Ordering::Relaxed))
         }
     }
-    fn publish(&self, _: u32) {
-        // Preserve transitions from racing references without calling another
-        // process under either resource lock. The current caller drains finite
-        // node work; this creates no thread, polling loop or message service.
-        if self
-            .publishing
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
+    fn publish(self: &Arc<Self>, _: u32) {
+        // One coalesced node work item, as in Linux Binder. Replaying every
+        // transient zero would release a guest object before a concurrent new
+        // reference could acquire it. Reconcile actual references at delivery.
+        if self.is_manager.load(Ordering::Relaxed) {
             return;
         }
-        loop {
-            let cmd = {
-                let mut state = self.state.lock().unwrap();
-                match state.notices.pop_front() {
-                    Some(cmd) => cmd,
-                    None => {
-                        self.publishing.store(false, Ordering::Release);
-                        return;
-                    }
-                }
-            };
-            let Some(owner) = self.owner.upgrade() else {
-                continue;
-            };
-            let mut payload = self.pointer.to_le_bytes().to_vec();
-            payload.extend_from_slice(&self.cookie.to_le_bytes());
+        {
+            let mut state = self.state.lock().unwrap();
+            let strong = state.strong != 0 || state.inflight != 0 || state.pending_strong != 0;
+            let weak =
+                state.weak != 0 || state.local_weak != 0 || state.pending_weak != 0 || strong;
+            if state.queued != 0 || strong == state.has_strong && weak == state.has_weak {
+                return;
+            }
+            state.queued = 1;
+        }
+        if let Some(owner) = self.owner.upgrade() {
             owner.enqueue_node(
                 self.owner_tid.load(Ordering::Relaxed) as u32,
-                Work::Node(command(cmd, &payload)),
+                Work::Node(self.clone()),
             );
+        }
+    }
+    fn notices(&self) -> Vec<u8> {
+        let mut state = self.state.lock().unwrap();
+        state.queued = 0;
+        let strong = state.strong != 0 || state.inflight != 0 || state.pending_strong != 0;
+        let weak = state.weak != 0 || state.local_weak != 0 || state.pending_weak != 0 || strong;
+        let mut out = Vec::new();
+        let mut payload = self.pointer.to_le_bytes().to_vec();
+        payload.extend_from_slice(&self.cookie.to_le_bytes());
+        for (changed, cmd) in [
+            (weak && !state.has_weak, BR_INCREFS),
+            (strong && !state.has_strong, BR_ACQUIRE),
+            (!strong && state.has_strong, BR_RELEASE),
+            (!weak && state.has_weak, BR_DECREFS),
+        ] {
+            if changed {
+                out.extend_from_slice(&command(cmd, &payload));
+                match cmd {
+                    BR_INCREFS => state.pending_weak = 1,
+                    BR_ACQUIRE => state.pending_strong = 1,
+                    _ => {}
+                }
+            }
+        }
+        state.has_weak = weak;
+        state.has_strong = strong;
+        out
+    }
+    fn acknowledge(self: &Arc<Self>, command: u32) -> Result<()> {
+        {
+            let mut state = self.state.lock().unwrap();
+            let pending = if command == INCREFS_DONE {
+                &mut state.pending_weak
+            } else {
+                &mut state.pending_strong
+            };
+            if *pending == 0 {
+                return Err(Errno(22));
+            }
+            *pending -= 1;
+        }
+        self.publish(0);
+        self.retire();
+        Ok(())
+    }
+    fn notice_delivered(self: &Arc<Self>) {
+        self.retire();
+    }
+    fn retire(self: &Arc<Self>) {
+        if let Some(owner) = self.owner.upgrade() {
+            let mut state = owner.state.lock().unwrap();
+            if !self.is_manager.load(Ordering::Relaxed)
+                && self.state.lock().unwrap().idle()
+                && state
+                    .nodes
+                    .get(&self.pointer)
+                    .is_some_and(|node| Arc::ptr_eq(node, self))
+            {
+                state.nodes.remove(&self.pointer);
+            }
         }
     }
     fn die(&self) {
@@ -276,6 +364,28 @@ impl Node {
                 let _ = owner.enqueue(None, Work::Transaction(buffer));
             }
         }
+    }
+}
+// A Linux local strong reference holds the actual guest object, not merely
+// the host Arc, while constructing/queuing transactions or translating handles.
+struct NodeLease(Arc<Node>);
+impl NodeLease {
+    fn new(node: Arc<Node>) -> Self {
+        node.state.lock().unwrap().inflight += 1;
+        Self(node)
+    }
+}
+impl std::ops::Deref for NodeLease {
+    type Target = Node;
+    fn deref(&self) -> &Node {
+        &self.0
+    }
+}
+impl Drop for NodeLease {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap().inflight -= 1;
+        self.0.publish(0);
+        self.0.retire();
     }
 }
 struct Reference {
@@ -404,6 +514,7 @@ enum Object {
         offset: usize,
         node: Arc<Node>,
         strong: bool,
+        _lease: Option<NodeLease>,
     },
     Buffer {
         offset: usize,
@@ -497,15 +608,65 @@ impl Drop for Buffer {
                 node.finish_async();
             }
         }
+        if let Some(node) = &self.node {
+            node.state.lock().unwrap().inflight -= 1;
+            node.publish(0);
+            node.retire();
+        }
     }
 }
 impl Connection {
+    pub(super) fn owner(&self) -> u32 {
+        self.owner
+    }
     pub(super) fn poll_handle(self: &Arc<Self>) -> Arc<dyn DirectPoll> {
+        // The shared OFD cache has no caller. Do not create a retired leader's
+        // Binder thread while preparing another task's original poll context.
         Arc::new(PollConnection {
             process: Arc::downgrade(self),
+            tid: self.owner,
             identity: self.identity as usize,
+            bound: false,
             readiness: self.readiness.clone(),
         })
+    }
+    fn poll_handle_for(self: &Arc<Self>, tid: u32) -> Arc<dyn DirectPoll> {
+        let mut state = self.state.lock().unwrap();
+        let thread = state.threads.entry(tid).or_default();
+        if let Some(poll) = thread.poll.upgrade() {
+            return poll;
+        }
+        let poll = Arc::new(PollConnection {
+            process: Arc::downgrade(self),
+            tid,
+            identity: thread.identity as usize,
+            bound: true,
+            readiness: self.readiness.clone(),
+        });
+        thread.poll = Arc::downgrade(&poll);
+        poll
+    }
+    pub(super) fn poll_for(&self, tid: u32, events: u16) -> (u16, [u64; 2]) {
+        self.poll_thread(tid, None, events)
+    }
+    fn poll_thread(&self, tid: u32, identity: Option<usize>, events: u16) -> (u16, [u64; 2]) {
+        let state = self.state.lock().unwrap();
+        let thread = state.threads.get(&tid);
+        if state.closed
+            || identity.is_some_and(|id| thread.is_none_or(|t| t.identity as usize != id))
+        {
+            return (0x18, [u64::MAX, 0]);
+        }
+        let local = thread.is_some_and(|t| !t.queue.is_empty());
+        let process = thread.is_none_or(|t| t.stack.is_empty() && t.queue.is_empty());
+        let ready = local || process && !state.queue.is_empty();
+        (
+            (if ready { events & 1 } else { 0 }),
+            [
+                thread.map_or(0, |t| t.epoch),
+                if process { state.queue_epoch } else { 0 },
+            ],
+        )
     }
     pub fn check_owner(&self, owner: u32) -> Result<()> {
         if owner != self.owner {
@@ -530,9 +691,12 @@ impl Connection {
                 return Err(Errno(111));
             }
             if let Some(tid) = tid {
-                state.threads.entry(tid).or_default().queue.push_back(work);
+                let thread = state.threads.entry(tid).or_default();
+                thread.queue.push_back(work);
+                thread.epoch = thread.epoch.wrapping_add(1);
             } else {
                 state.queue.push_back(work);
+                state.queue_epoch = state.queue_epoch.wrapping_add(1);
             }
         }
         self.notify();
@@ -549,8 +713,10 @@ impl Connection {
             }
             if let Some(thread) = state.threads.get_mut(&tid) {
                 thread.queue.push_back(work);
+                thread.epoch = thread.epoch.wrapping_add(1);
             } else {
                 state.queue.push_back(work);
+                state.queue_epoch = state.queue_epoch.wrapping_add(1);
             }
         }
         self.notify();
@@ -564,12 +730,16 @@ impl Connection {
             return Err(Errno(111));
         }
         if let Some(node) = state.nodes.get(&pointer) {
-            return if node.cookie == cookie {
+            if node.cookie == cookie {
                 node.owner_tid.store(tid as u64, Ordering::Relaxed);
-                Ok(node.clone())
-            } else {
-                Err(Errno(22))
-            };
+                return Ok(node.clone());
+            }
+            // Failed packet imports can leave an unpublished empty node. Only
+            // a fully retired generation may be replaced at a reused address.
+            if node.is_manager.load(Ordering::Relaxed) || !node.state.lock().unwrap().idle() {
+                return Err(Errno(22));
+            }
+            state.nodes.remove(&pointer);
         }
         state.threads.entry(tid).or_default();
         let node = Arc::new(Node {
@@ -579,7 +749,6 @@ impl Connection {
             cookie,
             flags,
             dead: AtomicBool::new(false),
-            publishing: AtomicBool::new(false),
             is_manager: AtomicBool::new(false),
             state: Mutex::default(),
         });
@@ -606,9 +775,9 @@ impl Connection {
         }
         Ok(reference.node.clone())
     }
-    fn strong_target(&self, handle: u32) -> Result<Arc<Node>> {
+    fn strong_target(&self, handle: u32) -> Result<NodeLease> {
         if handle == 0 {
-            return self.target(0);
+            return self.target(0).map(NodeLease::new);
         }
         let state = self.state.lock().unwrap();
         let reference = state.handles.get(&handle).ok_or(Errno(22))?;
@@ -619,7 +788,9 @@ impl Connection {
         if reference.node.dead.load(Ordering::Relaxed) {
             return Err(Errno(3));
         }
-        Ok(reference.node.clone())
+        // Pin under the sender's handle index, before another thread can
+        // release its final handle. Target buffers extend this pin until free.
+        Ok(NodeLease::new(reference.node.clone()))
     }
     fn reference(&self, node: Arc<Node>, index: usize) -> Result<Arc<Reference>> {
         let mut state = self.state.lock().unwrap();
@@ -687,21 +858,33 @@ impl Connection {
     fn ref_command(&self, cmd: u32, handle: u32) -> Result<()> {
         let index = usize::from(matches!(cmd, ACQUIRE | RELEASE));
         if matches!(cmd, INCREFS | ACQUIRE) {
-            let target = self.target(handle)?;
+            let target = if handle == 0 {
+                let Ok(node) = self.target(0) else {
+                    return Ok(());
+                };
+                node
+            } else {
+                let state = self.state.lock().unwrap();
+                let Some(reference) = state.handles.get(&handle) else {
+                    return Ok(());
+                };
+                // References survive their remote process. libbinder can still
+                // acquire/release one while consuming death and queued parcels.
+                reference.node.clone()
+            };
             if target.owner.ptr_eq(&self.myself) {
                 return Err(Errno(22));
             }
             self.reference(target, index).map(|_| ())
         } else {
-            let reference = self
-                .state
-                .lock()
-                .unwrap()
-                .handles
-                .get(&handle)
-                .cloned()
-                .ok_or(Errno(22))?;
-            self.release_ref(&reference, index)
+            let reference = self.state.lock().unwrap().handles.get(&handle).cloned();
+            let Some(reference) = reference else {
+                return Ok(());
+            };
+            match self.release_ref(&reference, index) {
+                Err(Errno(22)) => Ok(()), // Linux ignores invalid refcount commands.
+                result => result,
+            }
         }
     }
     fn set_manager(&self, pointer: u64, cookie: u64, flags: u32, uid: u32, tid: u32) -> Result<()> {
@@ -787,6 +970,7 @@ impl Connection {
                         offset: at,
                         node,
                         strong,
+                        _lease,
                     } => {
                         if node.owner.ptr_eq(&self.myself) {
                             put32(
@@ -876,6 +1060,9 @@ impl Connection {
             56,
             pool.base + (offset + offsets_at) as u64,
         );
+        if let Some(node) = &node {
+            node.state.lock().unwrap().inflight += 1;
+        }
         Ok(Arc::new(Buffer {
             pool,
             offset,
@@ -889,43 +1076,60 @@ impl Connection {
             async_active: AtomicBool::new(false),
         }))
     }
+    fn take_reply(&self, tid: u32) -> Result<Arc<Call>> {
+        let mut state = self.state.lock().unwrap();
+        let thread = state.threads.entry(tid).or_default();
+        let call = thread.stack.last().ok_or(Errno(71))?;
+        if !call.to.ptr_eq(&self.myself) || call.to_tid.load(Ordering::Relaxed) != tid as u64 {
+            return Err(Errno(71));
+        }
+        Ok(thread.stack.pop().unwrap())
+    }
+    fn reject_reply(&self, tid: u32, command: u32) -> Result<()> {
+        let call = self.take_reply(tid)?;
+        call.fail_with(command);
+        // Linux completes the replier's write while the original caller gets
+        // the failed reply. Neither thread retains the finished stack frame.
+        self.bytes(tid, BR_COMPLETE);
+        Ok(())
+    }
     fn submit(&self, tid: u32, packet: Packet, reply: bool, identity: [u32; 2]) -> Result<()> {
         if reply {
-            let call = {
-                let mut state = self.state.lock().unwrap();
-                let thread = state.threads.entry(tid).or_default();
-                let call = thread.stack.last().ok_or(Errno(71))?;
-                if !call.to.ptr_eq(&self.myself)
-                    || call.to_tid.load(Ordering::Relaxed) != tid as u64
+            let call = self.take_reply(tid)?;
+            let prepared = (|| {
+                if !call.accept_fds
+                    && packet
+                        .objects
+                        .iter()
+                        .any(|o| matches!(o, Object::Fd { .. }))
                 {
-                    return Err(Errno(71));
+                    return Err(Errno(1));
                 }
-                thread.stack.pop().unwrap()
-            };
-            if !call.accept_fds
-                && packet
-                    .objects
-                    .iter()
-                    .any(|o| matches!(o, Object::Fd { .. }))
-            {
-                call.fail();
-                return Err(Errno(1));
-            }
-            let result = (|| {
                 let receiver = call.from.upgrade().ok_or(Errno(3))?;
                 let buffer = receiver.make_buffer(packet, None, None, identity)?;
+                Ok((receiver, buffer))
+            })();
+            // Buffer translation queues the owner's ACQUIRE before COMPLETE,
+            // keeping returned temporary guest objects alive. COMPLETE must in
+            // turn precede any immediate nested call provoked by the reply.
+            self.bytes(tid, BR_COMPLETE);
+            let result = prepared.and_then(|(receiver, buffer): (Arc<Connection>, Arc<Buffer>)| {
                 if call.finished.swap(true, Ordering::AcqRel) {
                     return Err(Errno(3));
                 }
                 receiver.enqueue(Some(call.from_tid), Work::Reply(buffer, call.clone()))
-            })();
-            if result.is_err() {
-                call.fail();
+            });
+            if let Err(error) = result {
+                call.fail_with(if matches!(error.0, 3 | 111) {
+                    BR_DEAD_REPLY
+                } else {
+                    BR_FAILED_REPLY
+                });
             }
-            self.bytes(tid, BR_COMPLETE);
-            return result;
+            return Ok(());
         }
-        let node = self.strong_target(dword(&packet.header, 0))?;
+        let target = self.strong_target(dword(&packet.header, 0))?;
+        let node = target.0.clone();
         if node.owner.ptr_eq(&self.myself) {
             return Err(Errno(22));
         }
@@ -980,6 +1184,10 @@ impl Connection {
             }
             ancestor = call.parent.clone();
         }
+        // Completion must precede any immediate nested callback from the
+        // receiver. Otherwise its sendReply consumes the older completion and
+        // leaves its own BR_COMPLETE in the idle server command stream.
+        self.bytes(tid, BR_COMPLETE);
         let result = if oneway {
             node.queue_async(buffer)
         } else {
@@ -987,17 +1195,13 @@ impl Connection {
         };
         if result.is_err() {
             if let Some(call) = call {
-                call.finished.store(true, Ordering::Relaxed);
-                let mut state = self.state.lock().unwrap();
-                let thread = state.threads.entry(tid).or_default();
-                if thread.stack.last().is_some_and(|c| Arc::ptr_eq(c, &call)) {
-                    thread.stack.pop();
-                }
+                call.fail();
             }
-            return result;
+            // Publication was admitted before a concurrent destination exit.
+            // A synchronous caller receives DEAD_REPLY; an admitted oneway has
+            // no reply, like an async transaction whose target then exits.
         }
-        self.bytes(tid, BR_COMPLETE);
-        result
+        Ok(())
     }
     fn free_buffer(&self, address: u64) -> Result<()> {
         let buffer = self
@@ -1017,7 +1221,7 @@ impl Connection {
                 call.fail();
             }
             for work in thread.queue {
-                if matches!(work, Work::Node(_)) {
+                if matches!(work, Work::Node(..)) {
                     let _ = self.enqueue(None, work);
                 } else if let Work::Transaction(buffer) = work {
                     if let Some(call) = &buffer.call {
@@ -1171,12 +1375,7 @@ impl DirectPoll for Connection {
         self.identity as usize
     }
     fn poll(&self, events: u16) -> (u16, [u64; 2]) {
-        let state = self.state.lock().unwrap();
-        let ready = !state.queue.is_empty() || state.threads.values().any(|t| !t.queue.is_empty());
-        (
-            (if state.closed { 0x18 } else { 0 }) | if ready { events & 1 } else { 0 },
-            [self.epoch.load(Ordering::Relaxed), 0],
-        )
+        self.poll_for(self.owner, events)
     }
     fn subscribe(&self, signal: &Arc<IoSignal>) -> IoSubscription {
         self.subscribe(signal)
@@ -1184,17 +1383,27 @@ impl DirectPoll for Connection {
 }
 struct PollConnection {
     process: Weak<Connection>,
+    tid: u32,
     identity: usize,
+    bound: bool,
     readiness: Arc<Readiness>,
 }
 impl DirectPoll for PollConnection {
+    fn bind_task(&self, tid: u32) -> Option<Arc<dyn DirectPoll>> {
+        if self.bound && tid == self.tid {
+            return None;
+        }
+        Some(self.process.upgrade()?.poll_handle_for(tid))
+    }
     fn identity(&self) -> usize {
         self.identity
     }
     fn poll(&self, events: u16) -> (u16, [u64; 2]) {
         self.process
             .upgrade()
-            .map_or((0x18, [u64::MAX, 0]), |process| process.poll(events))
+            .map_or((0x18, [u64::MAX, 0]), |process| {
+                process.poll_thread(self.tid, self.bound.then_some(self.identity), events)
+            })
     }
     fn subscribe(&self, signal: &Arc<IoSignal>) -> IoSubscription {
         self.readiness.subscribe(signal)

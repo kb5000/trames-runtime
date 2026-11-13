@@ -80,10 +80,10 @@ impl Actions {
             let bytes = memory.read_array::<32>(a[1]).map_err(|_| Errno(14))?;
             let word = |i| u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
             // musl sign-extends int sa_flags; the kernel uses its low 32 bits.
-            let flags = word(8) as u32 as u64;
-            if flags & !0xdc000007 != 0 {
-                return Err(Errno(22));
-            }
+            // Linux accepts unknown bits and clears them on installation. This
+            // also implements SA_UNSUPPORTED probing without claiming support
+            // for SA_EXPOSE_TAGBITS (our fault records use untagged addresses).
+            let flags = word(8) as u32 as u64 & 0xdc000007;
             Some(Action {
                 handler: word(0),
                 flags,
@@ -214,6 +214,35 @@ mod tests {
         assert_eq!(
             actions.query([10, 0, 0, 16, 0, 0], &mut memory),
             Some(Err(Errno(22)))
+        );
+    }
+    #[test]
+    fn unsupported_flag_probes_install_handlers_and_report_only_supported_bits() {
+        let actions = Actions::default();
+        let mut memory = memory();
+        memory.write_array(0x1000, 0x4000u64.to_le_bytes()).unwrap();
+        // SA_SIGINFO | SA_UNSUPPORTED | SA_EXPOSE_TAGBITS | an unknown bit.
+        memory
+            .write_array(0x1008, 0x00000e04u64.to_le_bytes())
+            .unwrap();
+        let installed = actions
+            .call([11, 0x1000, 0, 8, 0, 0], &mut memory)
+            .unwrap()
+            .unwrap();
+        assert_eq!(installed.handler, 0x4000);
+        assert_eq!(installed.flags, 4);
+        actions.call([11, 0, 0x1100, 8, 0, 0], &mut memory).unwrap();
+        assert_eq!(memory.read_u64(0x1100).unwrap(), 0x4000);
+        assert_eq!(memory.read_u64(0x1108).unwrap(), 4);
+        // Unknown bits are accepted even without SA_UNSUPPORTED, as in Linux.
+        memory.write_array(0x1008, 0x200u64.to_le_bytes()).unwrap();
+        assert_eq!(
+            actions
+                .call([11, 0x1000, 0, 8, 0, 0], &mut memory)
+                .unwrap()
+                .unwrap()
+                .flags,
+            0
         );
     }
     #[test]

@@ -811,7 +811,21 @@ impl Vfs {
         let mut at = path.clone();
         let mut suffix = Vec::new();
         for _ in 0..=MAX_MOUNTS {
-            if at.mount.as_ref().map(|m| m.id) == root.mount.as_ref().map(|m| m.id)
+            // An OFD opened before CLONE_NEWNS retains its original mount tree.
+            // Both namespace roots can still name the same filesystem root;
+            // finish that original ancestry rather than exposing its backing
+            // bind source (e.g. /system/apex instead of /apex) on proc FD links.
+            let same_root = at
+                .mount
+                .as_ref()
+                .zip(root.mount.as_ref())
+                .is_some_and(|(a, b)| {
+                    a.parent.borrow().is_none()
+                        && b.parent.borrow().is_none()
+                        && a.fs.same_data(&b.fs)
+                        && Arc::ptr_eq(&a.root, &b.root)
+                });
+            if (at.mount.as_ref().map(|m| m.id) == root.mount.as_ref().map(|m| m.id) || same_root)
                 && below(&at.key, &root.key)
             {
                 let cut = if root.key == b"/" { 0 } else { root.key.len() };
@@ -2303,6 +2317,10 @@ mod boundary_tests {
         );
         v.unshare_mounts().unwrap();
         assert_eq!(v.cwd().unwrap(), b"/b/1");
+        assert_eq!(
+            v.fd_snapshot().iter().find(|f| f.fd == fd).unwrap().target,
+            b"/b/1/status"
+        );
         let after = v.open_at(-100, b"status", 0, 0).unwrap();
         assert_eq!(
             v.fd_snapshot()

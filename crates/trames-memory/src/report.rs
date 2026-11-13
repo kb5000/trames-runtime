@@ -10,6 +10,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 pub struct ImageRanges {
     pub arguments: (u64, u64),
     pub environment: (u64, u64),
+    pub start_stack: u64,
 }
 #[derive(Clone)]
 pub struct MemoryReport(pub(super) Arc<Report>);
@@ -503,6 +504,7 @@ mod tests {
         let report = memory.memory_report();
         assert_eq!(report.image_ranges(), None);
         let image = ImageRanges {
+            start_stack: 0,
             arguments: (0x1000, 0x1008),
             environment: (0x1008, 0x1010),
         };
@@ -517,12 +519,14 @@ mod tests {
         assert_eq!(fork.memory_report().image_ranges(), Some(image));
         assert_ne!(fork.memory_report().identity(), report.identity());
         fork.set_image_ranges(ImageRanges {
+            start_stack: 0,
             arguments: (0x2000, 0x2008),
             environment: (0x2008, 0x2008),
         });
         assert_eq!(report.image_ranges(), Some(image));
         let mut shared = memory.share();
         shared.set_image_ranges(ImageRanges {
+            start_stack: 0,
             arguments: image.arguments,
             environment: (0x1010, 0x1020),
         });

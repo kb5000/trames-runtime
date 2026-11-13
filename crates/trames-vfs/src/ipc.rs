@@ -151,6 +151,7 @@ pub struct LocalResource {
     reuse: [std::sync::atomic::AtomicU32; 2],
     passcred: std::sync::atomic::AtomicBool,
     timestamp: std::sync::atomic::AtomicU32,
+    timeouts: SharedCell<[Option<std::time::Duration>; 2]>,
     datagram_peer: SharedCell<std::sync::Weak<LocalResource>>,
 }
 /// One accepted complete Unix OFD, independent of later close/numeric reuse.
@@ -233,9 +234,8 @@ impl LocalResource {
         ns.sockets.retain(|socket| socket.strong_count() != 0);
         ns.abstract_names
             .retain(|_, socket| socket.strong_count() != 0);
-        if ns.sockets.len() >= 1024 {
-            return Err(Errno(23));
-        }
+        // Original file-table reservations enforce RLIMIT_NOFILE. A network
+        // namespace is shared by many processes and has no 1024-socket quota.
         let core = Self::new(kind, credentials, network.clone(), ownership);
         ns.sockets.push(Arc::downgrade(&core));
         Ok(core)
@@ -264,8 +264,15 @@ impl LocalResource {
             reuse: Default::default(),
             passcred: std::sync::atomic::AtomicBool::new(false),
             timestamp: std::sync::atomic::AtomicU32::new(0),
+            timeouts: SharedCell::new([None, None]),
             datagram_peer: SharedCell::new(std::sync::Weak::new()),
         })
+    }
+    pub fn set_io_timeout(&self, receive: bool, duration: Option<std::time::Duration>) {
+        self.timeouts.borrow_mut()[usize::from(receive)] = duration;
+    }
+    pub fn io_timeout(&self, receive: bool) -> Option<std::time::Duration> {
+        self.timeouts.borrow()[usize::from(receive)]
     }
     pub(super) fn pair(a: &Arc<Self>, b: &Arc<Self>) {
         let mut resource = channel::Resource::with_readiness(
@@ -475,7 +482,7 @@ impl LocalSocket {
     }
 
     pub fn recv(&self, count: usize, flags: u32) -> Result<LocalReceived> {
-        if flags & !(2 | 0x20 | 0x40 | 0x100 | 0x4000 | 0x40000000) != 0 {
+        if flags & !(2 | 8 | 0x20 | 0x40 | 0x100 | 0x4000 | 0x40000000) != 0 {
             return Err(Errno(95));
         }
         if self.kind == 1 && flags & 0x100 != 0 && flags & 0x40 == 0 && count > PIPE_CAPACITY {

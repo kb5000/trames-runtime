@@ -2,6 +2,7 @@
 //! Native, platform-independent Wayland compositor protocol and window state.
 use std::{io, os::unix::net::UnixStream, sync::Arc};
 use wayland_server::{backend::ClientData, Display, Resource};
+mod android;
 mod frame;
 mod gpu;
 mod input;

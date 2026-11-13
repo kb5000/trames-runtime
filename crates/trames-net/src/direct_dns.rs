@@ -261,6 +261,7 @@ impl Endpoint {
         }
         let empty = || Received {
             netlink_address: None,
+            credentials: None,
             packet_info: None,
             data: Vec::new(),
             address: None,
@@ -293,6 +294,7 @@ impl Endpoint {
         }
         Ok(Received {
             netlink_address: None,
+            credentials: None,
             packet_info: None,
             data,
             address: (!self.stream).then_some(ADDRESS),

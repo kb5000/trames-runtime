@@ -86,7 +86,7 @@ impl Lease<'_> {
         if matches!(operation, 110 | 111) {
             backend.authenticate_wayland(authenticated);
         }
-        let image_call = matches!(operation, 14 | 240..=242);
+        let image_call = matches!(operation, 14 | 240..=242 | 272..=275);
         if image_call {
             backend.authenticate_images(images.cloned());
         }

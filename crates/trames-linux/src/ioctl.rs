@@ -12,6 +12,9 @@ pub(crate) fn call(vfs: &mut Vfs, a: [u64; 6], memory: &mut impl CpuMemory) -> R
     if vfs.flags(a[0] as u32)? & trames_vfs::O_PATH != 0 {
         return Err(Errno(9));
     }
+    if let Some(file) = vfs.sync_file(a[0] as u32)? {
+        return file.ioctl(&vfs.descriptor_factory(), a[1] as u32, a[2], memory);
+    }
     if let Some(file) = vfs.binder_file(a[0] as u32)? {
         return match trames_vfs::binder::Ioctl::start(
             file,

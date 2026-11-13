@@ -107,6 +107,7 @@ mod tests {
     fn realtime_budget_preserves_fifo_and_cannot_drop_sigkill() {
         let mut q = Pending::default();
         let info = |sender| Info {
+            user: None,
             sender,
             uid: 123,
             status: 0,

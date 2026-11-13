@@ -831,6 +831,7 @@ impl<C: Cpu> Kernel<C> {
                 let _ = p.signals.io.inbox.enqueue(
                     31,
                     Info {
+                        user: None,
                         sender: decision & 0xffff,
                         uid: ARCH,
                         status: number as i32,

@@ -941,7 +941,8 @@ impl MappingFile {
     }
     pub fn executable(&self) -> bool {
         let open = self.0.open.borrow();
-        !matches!(open.anonymous, Some(events::Anonymous::Uring(_)))
+        open.native_image.is_none()
+            && !matches!(open.anonymous, Some(events::Anonymous::Uring(_)))
             && !matches!(open.control, Some(events::SharedControl::Binder(_)))
             && open
                 .mount
@@ -976,6 +977,11 @@ impl MappingFile {
                 .is_some_and(|m| m.kind == mounts::Kind::Cgroup)
         {
             return Err(Errno(19));
+        }
+        if let Some(image) = &o.native_image {
+            return image
+                .cpu_pages(offset, len)
+                .map_err(|e| Errno(e.raw_os_error().unwrap_or(5) as u32));
         }
         let node = o.data_node().ok_or(Errno(19))?;
         let readonly = o.mount.as_ref().is_some_and(|m| m.readonly());

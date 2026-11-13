@@ -25,6 +25,15 @@ pub struct TimerFd {
     pub(crate) readiness: Arc<Readiness>,
 }
 impl TimerFd {
+    /// Alarm capability controls guest wakeups. Host machine sleep remains the
+    /// host's policy; retained continuous timers become ready on host resume.
+    pub fn check_alarm(clock: u32, credentials: &crate::Credentials) -> Result<()> {
+        if matches!(clock, 8 | 9) && !credentials.has_cap(crate::capabilities::WAKE_ALARM) {
+            Err(Errno(1))
+        } else {
+            Ok(())
+        }
+    }
     pub(crate) fn new(clock: u32) -> Arc<Self> {
         Arc::new(Self {
             clock,
@@ -68,7 +77,7 @@ impl TimerFd {
         } else {
             None
         };
-        let boot = if self.clock == 7 {
+        let boot = if matches!(self.clock, 7..=9) {
             new.and_then(|(_, deadline, _)| deadline)
                 .map(BootTimer::new)
                 .transpose()?
@@ -109,23 +118,27 @@ impl TimerFd {
             }
         })
     }
-    pub(crate) fn native_fd(&self) -> Option<crate::HostFd> {
+    pub(crate) fn native_fds(&self) -> Vec<crate::HostFd> {
         let state = self.state.lock().unwrap();
         state
             .boot
             .as_ref()
             .and_then(BootTimer::fd)
-            .or_else(|| state.cancel.as_ref().and_then(ClockWatch::fd))
+            .into_iter()
+            .chain(state.cancel.as_ref().and_then(ClockWatch::fd))
+            .collect()
     }
-    pub(crate) fn subscribe(&self, signal: &Arc<crate::IoSignal>) -> crate::IoSubscription {
-        let subscription = self.readiness.subscribe(signal);
-        match self.native_fd() {
-            Some(fd) => subscription.with_host(fd, signal),
-            None => subscription,
-        }
+    pub(crate) fn subscribe(&self, signal: &Arc<crate::IoSignal>) -> Vec<crate::IoSubscription> {
+        let mut subscriptions = vec![self.readiness.subscribe(signal)];
+        subscriptions.extend(
+            self.native_fds()
+                .into_iter()
+                .map(|fd| crate::IoSubscription::native(Ok(fd), signal)),
+        );
+        subscriptions
     }
     pub(crate) fn deadline(&self) -> Option<Instant> {
-        if self.clock == 7 {
+        if matches!(self.clock, 7..=9) {
             return self.change(|state, now| {
                 state.tick(now);
                 state.deadline
@@ -205,11 +218,6 @@ impl State {
         }
     }
     fn tick(&mut self, now: Instant) {
-        if self.boot.is_some() {
-            self.tick_boot(now, trames_shared::boottime::continuous());
-            return;
-        }
-
         if self.cancel.as_ref().is_some_and(ClockWatch::changed) {
             // The absolute target remains in realtime coordinates after a
             // clock step. Cancellation is reported once; an unrearmed timer
@@ -220,9 +228,19 @@ impl State {
                     .ok()?;
                 now.checked_add(target.saturating_sub(real))
             });
+            if let (Some(boot), Some(deadline)) = (&mut self.boot, self.deadline) {
+                let delay = deadline.saturating_duration_since(now);
+                boot.deadline = trames_shared::boottime::continuous() + delay;
+                boot.arm(delay)
+                    .expect("rearm original realtime alarm after clock step");
+            }
             self.cancelled = true;
             self.pending = 0;
             self.epoch = self.epoch.wrapping_add(1);
+        }
+        if self.boot.is_some() {
+            self.tick_boot(now, trames_shared::boottime::continuous());
+            return;
         }
         if let Some(d) = self.deadline.filter(|d| *d <= now) {
             let elapsed = now.saturating_duration_since(d);
@@ -264,6 +282,30 @@ impl State {
 mod tests {
     use super::*;
     use crate::{Vfs, O_NONBLOCK};
+    #[test]
+    fn alarm_clocks_enforce_guest_capabilities_and_use_sleep_aware_native_waits() {
+        let mut v = Vfs::default();
+        for clock in [8, 9] {
+            let fd = v.timerfd(clock, O_NONBLOCK).unwrap();
+            let timer = v.timerfd_resource(fd).unwrap();
+            timer.update(Some((
+                Duration::ZERO,
+                Some(Instant::now() + Duration::from_millis(1)),
+            )));
+            let native = timer.native_fds();
+            assert_eq!(native.len(), 1);
+            let now = Instant::now();
+            let mut state = timer.state.lock().unwrap();
+            let deadline = state.boot.as_ref().unwrap().deadline;
+            state.tick_boot(now, deadline + Duration::from_secs(10));
+            assert_eq!(state.pending, 1);
+            drop(state);
+            v.credentials = crate::Credentials::user(1000, 1000);
+            assert_eq!(TimerFd::check_alarm(clock, &v.credentials), Err(Errno(1)));
+            assert_eq!(v.timerfd(clock, O_NONBLOCK), Err(Errno(1)));
+            v.credentials = crate::Credentials::default();
+        }
+    }
     #[test]
     fn periodic_expirations_keep_phase_accumulate_and_saturate() {
         let now = Instant::now();
@@ -363,7 +405,7 @@ mod sleep_tests {
             Duration::ZERO,
             Some(Instant::now() + Duration::from_millis(5)),
         )));
-        let fd = timer.native_fd().unwrap();
+        let fd = timer.native_fds().pop().unwrap();
         let mut poll = libc::pollfd {
             fd: fd.as_raw_fd(),
             events: libc::POLLIN,

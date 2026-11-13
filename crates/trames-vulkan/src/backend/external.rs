@@ -18,6 +18,104 @@ pub(super) enum Resource {
     },
 }
 impl Backend {
+    pub(super) fn android_image_layout(&self, a: [u64; 16]) -> Result<()> {
+        let files = self
+            .image_files
+            .as_ref()
+            .ok_or(vk::Result::ERROR_INVALID_EXTERNAL_HANDLE)?;
+        let native = files
+            .lookup(u32::try_from(a[2]).map_err(|_| vk::Result::ERROR_INVALID_EXTERNAL_HANDLE)?)
+            .map_err(|_| vk::Result::ERROR_INVALID_EXTERNAL_HANDLE)?;
+        let image = self.object(a[1], Kind::Image)?;
+        let shape = image
+            .image
+            .get()
+            .ok_or(vk::Result::ERROR_INVALID_EXTERNAL_HANDLE)?;
+        let info = native.info();
+        if shape.width != info.width
+            || shape.height != info.height
+            || shape.format.as_raw() != info.format as i32
+            || !image.deps.borrow().is_empty()
+            || Rc::strong_count(&image) != 2
+        {
+            return Err(vk::Result::ERROR_INVALID_EXTERNAL_HANDLE.into());
+        }
+        let mut resource = image.external.borrow_mut();
+        let Some(Resource::Image(layout)) = resource.as_deref_mut() else {
+            return Err(vk::Result::ERROR_INVALID_EXTERNAL_HANDLE.into());
+        };
+        layout.pitch = info.pitch;
+        Ok(())
+    }
+    pub(super) fn android_image(
+        &self,
+        m: &mut impl CpuMemory,
+        op: u64,
+        a: [u64; 16],
+    ) -> Result<()> {
+        let files = self
+            .image_files
+            .as_ref()
+            .ok_or(vk::Result::ERROR_INVALID_EXTERNAL_HANDLE)?;
+        if op == 272 {
+            output(m, a[3], 48)?;
+            let format = trames_graphics::Format::from_vk(a[0] as u32)
+                .ok_or(vk::Result::ERROR_FORMAT_NOT_SUPPORTED)?;
+            let width = u32::try_from(a[1]).map_err(|_| vk::Result::ERROR_FORMAT_NOT_SUPPORTED)?;
+            let height = u32::try_from(a[2]).map_err(|_| vk::Result::ERROR_FORMAT_NOT_SUPPORTED)?;
+            #[allow(clippy::default_constructed_unit_structs)]
+            // Non-Apple Context is an unsupported unit stub.
+            let image = trames_graphics::Context::default()
+                .allocate(format, width, height)
+                .map_err(|_| vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
+            let info = image.info();
+            let fd = files
+                .insert(image)
+                .map_err(|_| vk::Result::ERROR_OUT_OF_HOST_MEMORY)?;
+            if let Err(e) = write_words(
+                m,
+                a[3],
+                &[
+                    fd as u64,
+                    info.width as u64,
+                    info.height as u64,
+                    info.format as u64,
+                    info.pitch,
+                    info.size,
+                ],
+                48,
+            ) {
+                files.close(fd);
+                return Err(e);
+            }
+        } else {
+            let fd = u32::try_from(a[0]).map_err(|_| vk::Result::ERROR_INVALID_EXTERNAL_HANDLE)?;
+            let image = files
+                .lookup(fd)
+                .map_err(|_| vk::Result::ERROR_INVALID_EXTERNAL_HANDLE)?;
+            if op == 273 {
+                let info = image.info();
+                write_words(
+                    m,
+                    a[1],
+                    &[
+                        fd as u64,
+                        info.width as u64,
+                        info.height as u64,
+                        info.format as u64,
+                        info.pitch,
+                        info.size,
+                    ],
+                    48,
+                )?;
+            } else {
+                image
+                    .cpu_access(a[1] != 0)
+                    .map_err(|_| vk::Result::ERROR_MEMORY_MAP_FAILED)?;
+            }
+        }
+        Ok(())
+    }
     pub(super) fn native_image_types(&self) -> u32 {
         self.device.as_ref().unwrap().external_image_memory_types
     }

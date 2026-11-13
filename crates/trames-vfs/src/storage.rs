@@ -866,9 +866,6 @@ fn decode(disk: &Arc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
             }
             let node = nodes.get(&ino).ok_or(Errno(22))?;
             let mut n = node.borrow_mut();
-            if !matches!(n.content, Content::File(_) | Content::Directory) {
-                return Err(Errno(22));
-            }
             let entries = d.u32()?;
             if entries == 0 || entries > 128 {
                 return Err(Errno(22));
@@ -881,7 +878,22 @@ fn decode(disk: &Arc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
                 }
                 let name = d.take(len)?.to_vec();
                 let value = d.take(size)?.to_vec();
-                if !(name.starts_with(b"user.") || super::xattr::overlay_attribute(&name))
+                if !matches!(n.content, Content::File(_) | Content::Directory)
+                    && (!super::acl::name(&name) || matches!(n.content, Content::Symlink(_)))
+                {
+                    return Err(Errno(22));
+                }
+                if super::acl::name(&name) {
+                    super::acl::validate(&value)?;
+                    if value.len() == 4
+                        || name == super::acl::DEFAULT && !matches!(n.content, Content::Directory)
+                    {
+                        return Err(Errno(22));
+                    }
+                }
+                if !(name.starts_with(b"user.")
+                    || super::xattr::overlay_attribute(&name)
+                    || super::acl::name(&name))
                     || name.len() <= 5
                     || name.contains(&0)
                     || n.xattrs.insert(name, value).is_some()
