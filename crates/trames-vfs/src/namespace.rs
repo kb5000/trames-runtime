@@ -151,7 +151,7 @@ impl Vfs {
     }
     fn chmod_node(&self, node: NodeRef, mode: u32, persistent: bool) -> Result<()> {
         let _metadata = node.metadata.lock().unwrap();
-        self.pseudo_immutable(&node)?;
+        self.pseudo_metadata_mutable(&node)?;
         let mut n = node.borrow_mut();
         if !self.credentials.has_cap(capabilities::FOWNER) && self.credentials.fsuid != n.uid {
             return Err(Errno(1));
@@ -172,7 +172,7 @@ impl Vfs {
         }
         n.times[2] = storage::Timestamp::now();
         drop(n);
-        if let Err(e) = if persistent && node.borrow().links != 0 {
+        if let Err(e) = if persistent && !node.borrow().volatile && node.borrow().links != 0 {
             self.checkpoint()
         } else {
             Ok(())

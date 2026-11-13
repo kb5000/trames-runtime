@@ -1249,6 +1249,17 @@ impl Vfs {
     pub(super) fn pseudo_immutable(&self, node: &NodeRef) -> Result<()> {
         Self::pseudo_immutable_node(&node.borrow())
     }
+    /// cgroupfs owns mutable UID/GID/mode metadata even though its control
+    /// contents are virtual. This does not admit ordinary data writes,
+    /// truncation or changes to proc/sysfs metadata.
+    pub(super) fn pseudo_metadata_mutable(&self, node: &NodeRef) -> Result<()> {
+        let n = node.borrow();
+        if n.volatile && n.device == 5 {
+            Ok(())
+        } else {
+            Self::pseudo_immutable_node(&n)
+        }
+    }
     pub(super) fn pseudo_immutable_node(n: &Node) -> Result<()> {
         if n.volatile && !matches!(n.content, Content::Device(_)) {
             Err(Errno(30))

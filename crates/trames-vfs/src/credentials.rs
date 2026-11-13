@@ -453,7 +453,7 @@ impl Vfs {
     }
     fn chown_node(&self, node: NodeRef, uid: u32, gid: u32, persistent: bool) -> Result<()> {
         let _metadata = node.metadata.lock().unwrap();
-        self.pseudo_immutable(&node)?;
+        self.pseudo_metadata_mutable(&node)?;
         let mut n = node.borrow_mut();
         let c = &self.credentials;
         if !c.has_cap(capabilities::CHOWN)
@@ -483,7 +483,7 @@ impl Vfs {
         }
         n.times[2] = storage::Timestamp::now();
         drop(n);
-        if let Err(error) = if persistent && node.borrow().links != 0 {
+        if let Err(error) = if persistent && !node.borrow().volatile && node.borrow().links != 0 {
             self.checkpoint()
         } else {
             Ok(())

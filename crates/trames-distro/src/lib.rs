@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Pinned distribution verification and checked import into the private VFS.
+pub mod android;
 pub mod packages;
 pub mod rootfs;
 pub mod systemd;
@@ -27,6 +28,35 @@ const ARCHIVE_LIMIT: usize = 16 * 1024 * 1024;
 const EXPANDED_LIMIT: u64 = 128 * 1024 * 1024;
 const ENTRY_LIMIT: usize = 16_384;
 pub const MUSL_LOADER: &[u8] = b"/lib/ld-musl-aarch64.so.1";
+/// Seed a missing guest resolver through normal VFS path traversal. Images may
+/// make /etc a directory symlink; the raw embedding import API deliberately
+/// does not traverse such aliases. Existing guest configuration is retained.
+pub fn install_resolver(vfs: &mut Vfs, contents: &[u8]) -> Result<(), Error> {
+    match vfs.mkdir_at(AT_FDCWD, b"/etc", 0o755) {
+        Ok(()) | Err(Errno(17)) => (),
+        Err(error) => return Err(error.into()),
+    }
+    let fd = match vfs.open_at(AT_FDCWD, b"/etc/resolv.conf", 0xc1, 0o644) {
+        Ok(fd) => fd,
+        Err(Errno(17)) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let result = (|| {
+        let mut remaining = contents;
+        while !remaining.is_empty() {
+            let n = vfs.write(fd, remaining)?;
+            if n == 0 {
+                return Err(Errno(5));
+            }
+            remaining = &remaining[n..];
+        }
+        Ok(())
+    })();
+    let closed = vfs.close(fd);
+    result?;
+    closed?;
+    Ok(())
+}
 /// Replace the standard loader inode before starting any guest process.
 /// A sibling file is synced before one atomic namespace rename; the ordinary
 /// Alpine libc symlink continues to refer to that loader. Identical bytes are
@@ -287,6 +317,21 @@ fn install(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn resolver_uses_guest_directory_links_and_preserves_configuration() {
+        let mut vfs = Vfs::default();
+        vfs.import_file(b"/system/etc/build.prop", b"android".to_vec())
+            .unwrap();
+        vfs.symlink_at(b"/system/etc", AT_FDCWD, b"/etc").unwrap();
+        install_resolver(&mut vfs, b"nameserver 169.254.0.53\n").unwrap();
+        install_resolver(&mut vfs, b"replacement").unwrap();
+        assert_eq!(vfs.readlink_at(AT_FDCWD, b"/etc").unwrap(), b"/system/etc");
+        let fd = vfs
+            .open_at(AT_FDCWD, b"/system/etc/resolv.conf", 0, 0)
+            .unwrap();
+        assert_eq!(vfs.read(fd, 256).unwrap(), b"nameserver 169.254.0.53\n");
+        vfs.close(fd).unwrap();
+    }
     #[test]
     fn invalid_musl_does_not_modify_existing_loader_or_user_data() {
         let mut vfs = Vfs::default();

@@ -977,6 +977,8 @@ impl Vfs {
         if self.mounts.is_none() {
             self.initialize_mounts()?;
         }
+        let admin = self.mount_admin()?;
+        let _lease = admin.enter();
         let target = self.mount_location(target, true)?;
         let node = self.node(&target)?;
         if !matches!(node.borrow().content, Content::Directory) {
@@ -1019,15 +1021,7 @@ impl Vfs {
                 fallback: target.key,
             })),
         }));
-        self.register_mounts(std::slice::from_ref(&mount))?;
-        self.mounts
-            .as_ref()
-            .unwrap()
-            .0
-            .borrow_mut()
-            .mounts
-            .push(mount);
-        Ok(())
+        self.publish_mounts(self.mounts.as_ref().unwrap(), vec![mount])
     }
 }
 

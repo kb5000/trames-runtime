@@ -2,8 +2,11 @@
 //! Mount identity and metadata are separate from owner namespace controls.
 use super::*;
 pub(super) mod admin;
+mod propagation;
 mod registry;
 pub(super) use registry::Registry;
+#[cfg(test)]
+mod propagation_tests;
 pub(super) mod watch;
 #[cfg(test)]
 mod worker_tests;
@@ -87,6 +90,7 @@ pub(super) struct MountIdentity {
     pub pid_namespace: Option<PidNamespace>,
     pub devpts: Option<Arc<pty::Devpts>>,
     pub flags: MountFlags,
+    propagation: propagation::Metadata,
     pub writers: Arc<mapped::Writers>,
 }
 pub(super) struct MountData {
@@ -265,6 +269,7 @@ impl Mount {
             pid_namespace: init.pid_namespace,
             devpts: init.devpts,
             flags: MountFlags(AtomicU64::new(init.flags.get())),
+            propagation: Default::default(),
             writers: init.writers,
         });
         let shared = Arc::new(MountData {
@@ -633,11 +638,11 @@ impl Vfs {
             paths.root_mount = Some(root.clone());
         }
         self.register_mounts(&mounts)?;
-        self.mounts = Some(MountNamespace(Arc::new(SharedCell::new(Table::new(
+        self.mounts = Some(MountNamespace::create(Table::new(
             NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed),
             root,
             mounts,
-        )))));
+        )));
         Ok(())
     }
     // Resolve owner topology only for pathname/namespace operations. Ordinary
@@ -870,23 +875,12 @@ impl Vfs {
             .collect();
         let mut copies = BTreeMap::new();
         for m in &mounts {
-            copies.insert(
-                m.id,
-                Arc::new(Mount::new(MountInit {
-                    id: new_mount_id()?,
-                    fs: m.fs.clone(),
-                    root: m.root.clone(),
-                    root_key: m.root_key.clone(),
-                    kind: m.kind,
-                    namespace: m.namespace.clone(),
-                    pid_namespace: m.pid_namespace.clone(),
-                    devpts: m.devpts.clone(),
-                    flags: Cell::new(m.flags.get()),
-                    writers: Arc::default(),
-                    parent: RefCell::new(None),
-                })),
-            );
+            copies.insert(m.id, copy_mount(m)?);
         }
+        let shared_admin = mounts
+            .iter()
+            .any(|m| m.propagation() != propagation::State::default())
+            .then(|| old.admin.clone());
         for m in &mounts {
             if let Some(a) = m.parent.borrow().as_ref() {
                 *copies[&m.id].parent.borrow_mut() = Some(Attachment {
@@ -915,11 +909,11 @@ impl Vfs {
             remap(&mut paths.cwd_mount);
             remap(&mut paths.root_mount);
         }
-        self.mounts = Some(MountNamespace(Arc::new(SharedCell::new(Table::new(
-            NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed),
-            root,
-            mounts,
-        )))));
+        let mut table = Table::new(NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed), root, mounts);
+        if let Some(admin) = shared_admin {
+            table.admin = admin;
+        }
+        self.mounts = Some(MountNamespace::create(table));
         Ok(())
     }
 }
@@ -1033,6 +1027,7 @@ impl Vfs {
         const REMOUNT: u64 = 32;
         const PRIVATE: u64 = 1 << 18;
         const SLAVE: u64 = 1 << 19;
+        const SHARED: u64 = 1 << 20;
         const ATTRS: u64 = MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_RELATIME;
         if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
             return Err(Errno(1));
@@ -1061,19 +1056,8 @@ impl Vfs {
         {
             return Err(Errno(22));
         }
-        if flags & (PRIVATE | SLAVE) != 0 {
-            let propagation = flags & !REC;
-            if !matches!(propagation, PRIVATE | SLAVE) {
-                return Err(Errno(22));
-            }
-            if !self.is_mount_root(&target) {
-                return Err(Errno(22));
-            }
-            // Linux leaves a private mount private when requested to become
-            // slave: it has no shared peer/master to follow. Every mount in
-            // this runtime is private. MS_SHARED still requires actual event
-            // propagation and remains unsupported.
-            return Ok(());
+        if flags & (PRIVATE | SLAVE | SHARED) != 0 {
+            return self.change_propagation(&target, flags);
         }
         if flags & REMOUNT != 0 {
             #[cfg(all(feature = "hostfs", unix))]
@@ -1120,6 +1104,17 @@ impl Vfs {
             }
             let source = self.mount_location(source.ok_or(Errno(22))?, true)?;
             let moved = source.mount.as_ref().ok_or(Errno(22))?;
+            if parent.propagation() != propagation::State::default()
+                || moved.propagation() != propagation::State::default()
+                || moved
+                    .parent
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|a| a.parent.propagation() != propagation::State::default())
+            {
+                return Err(Errno(95));
+            }
+
             let table = self.mounts.as_ref().ok_or(Errno(22))?.0.borrow_mut();
             if !self.is_mount_root(&source)
                 || Arc::ptr_eq(moved, &table.root)
@@ -1270,11 +1265,11 @@ impl Vfs {
                 }
                 b"tmpfs" | b"mqueue" => {
                     let mqueue = kind == Some(b"mqueue");
-                    let (limit, nodes, mode) = if mqueue {
+                    let (limit, nodes, mode, uid, gid) = if mqueue {
                         if data.is_some_and(|d| !d.is_empty()) {
                             return Err(Errno(95));
                         }
-                        (0, 1, 0o1777)
+                        (0, 1, 0o1777, None, None)
                     } else {
                         tmpfs_options(
                             data.unwrap_or_default(),
@@ -1292,8 +1287,8 @@ impl Vfs {
                         device: id,
                         content: Content::Directory,
                         mode: 0o40000 | mode,
-                        uid: self.credentials.fsuid,
-                        gid: self.credentials.fsgid,
+                        uid: uid.unwrap_or(self.credentials.fsuid),
+                        gid: gid.unwrap_or(self.credentials.fsgid),
                         volatile: false,
                         inode,
                         links: 1,
@@ -1412,6 +1407,13 @@ impl Vfs {
                 fallback: target.key,
             })),
         }));
+        if flags & BIND != 0 && root.namespace.is_none() {
+            let source_mount = self
+                .mount_location(source.ok_or(Errno(22))?, true)?
+                .mount
+                .ok_or(Errno(22))?;
+            root.set_propagation(source_mount.propagation());
+        }
         let mut copies = BTreeMap::new();
         if !additions.is_empty() {
             let source = self.mount_location(source.ok_or(Errno(22))?, true)?;
@@ -1430,13 +1432,7 @@ impl Vfs {
         }
         let mut added = vec![root];
         added.extend(additions.iter().map(|m| copies[&m.id].clone()));
-        self.register_mounts(&added)?;
-        let mut table = ns.0.borrow_mut();
-        table.mounts.extend(added);
-        let events = table.events.clone();
-        drop(table);
-        events.changed();
-        Ok(())
+        self.publish_mounts(&ns, added)
     }
     pub fn umount(&mut self, target: &[u8], flags: u64) -> Result<()> {
         let admin = self.mount_admin()?;
@@ -1455,50 +1451,10 @@ impl Vfs {
         if !self.is_mount_root(&target) {
             return Err(Errno(22));
         }
-        let mut table = self.mounts.as_ref().ok_or(Errno(22))?.0.borrow_mut();
-        if Arc::ptr_eq(mount, &table.root) {
-            return Err(Errno(16));
-        }
-        if !table.mounts.iter().any(|m| Arc::ptr_eq(m, mount)) {
-            return Err(Errno(22));
-        }
-        let mut ids = vec![mount.id];
-        loop {
-            let before = ids.len();
-            for m in &table.mounts {
-                if !ids.contains(&m.id)
-                    && m.parent
-                        .borrow()
-                        .as_ref()
-                        .is_some_and(|a| ids.contains(&a.parent.id))
-                {
-                    ids.push(m.id);
-                }
-            }
-            if ids.len() == before {
-                break;
-            }
-        }
-        if flags & 2 == 0 && (ids.len() > 1 || mount.in_use() || mount.writers.active()) {
-            return Err(Errno(16));
-        }
-        let detached: Vec<_> = table
-            .mounts
-            .iter()
-            .filter(|m| ids.contains(&m.id))
-            .cloned()
-            .collect();
-        table.mounts.retain(|m| !ids.contains(&m.id));
-        let events = table.events.clone();
-        if flags & 2 != 0 {
-            self.detached_mounts.borrow_mut().push(detached);
-        }
-        *mount.parent.borrow_mut() = None;
-        drop(table);
-        events.changed();
+        let result = self.unmount_propagated(mount, flags);
         drop(target);
         self.reap_detached_mounts();
-        Ok(())
+        result
     }
     pub fn pivot_root(&mut self, new_root: &[u8], put_old: &[u8]) -> Result<()> {
         let admin = self.mount_admin()?;
@@ -1547,6 +1503,17 @@ impl Vfs {
             return Err(Errno(16));
         }
         let previous = table.root.clone();
+        if previous.propagation() != propagation::State::default()
+            || new_mount.propagation() != propagation::State::default()
+            || new_mount
+                .parent
+                .borrow()
+                .as_ref()
+                .is_some_and(|a| a.parent.propagation() != propagation::State::default())
+        {
+            return Err(Errno(22));
+        }
+
         *new_mount.parent.borrow_mut() = None;
         *previous.parent.borrow_mut() = Some(Attachment {
             parent: new_mount.clone(),
@@ -1619,7 +1586,7 @@ pub(super) fn new_mount_id() -> Result<u64> {
         .map_err(|_| Errno(28))
 }
 fn copy_mount(m: &Mount) -> Result<Arc<Mount>> {
-    Ok(Arc::new(Mount::new(MountInit {
+    let copy = Arc::new(Mount::new(MountInit {
         id: new_mount_id()?,
         fs: m.fs.clone(),
         root: m.root.clone(),
@@ -1631,7 +1598,9 @@ fn copy_mount(m: &Mount) -> Result<Arc<Mount>> {
         flags: Cell::new(m.flags.get()),
         writers: Arc::default(),
         parent: RefCell::new(None),
-    })))
+    }));
+    copy.set_propagation(m.propagation());
+    Ok(copy)
 }
 pub(super) fn below(path: &[u8], root: &[u8]) -> bool {
     path == root || path.starts_with(root) && (root == b"/" || path.get(root.len()) == Some(&b'/'))
@@ -1652,15 +1621,29 @@ fn tmpfs_quantity(value: &str) -> Result<u64> {
         .checked_mul(1u64 << shift)
         .ok_or(Errno(22))
 }
-fn tmpfs_options(data: &[u8], memory: u64) -> Result<(u64, usize, u32)> {
+type TmpfsOptions = (u64, usize, u32, Option<u32>, Option<u32>);
+fn tmpfs_options(data: &[u8], memory: u64) -> Result<TmpfsOptions> {
     let mut size = MAX_FILE_BYTES as u64;
     let mut nodes = MAX_NODES;
     let mut mode = 0o1777;
+    let mut uid = None;
+    let mut gid = None;
     for item in data.split(|b| *b == b',').filter(|v| !v.is_empty()) {
         let at = item.iter().position(|b| *b == b'=').ok_or(Errno(22))?;
         let (key, value) = (&item[..at], &item[at + 1..]);
         let value = std::str::from_utf8(value).map_err(|_| Errno(22))?;
         match key {
+            b"uid" | b"gid" => {
+                let id = value.parse::<u32>().map_err(|_| Errno(22))?;
+                if id == u32::MAX {
+                    return Err(Errno(22));
+                }
+                if key == b"uid" {
+                    uid = Some(id);
+                } else {
+                    gid = Some(id);
+                }
+            }
             b"mode" => {
                 mode = u32::from_str_radix(value, 8).map_err(|_| Errno(22))?;
                 if mode & !0o7777 != 0 {
@@ -1697,7 +1680,7 @@ fn tmpfs_options(data: &[u8], memory: u64) -> Result<(u64, usize, u32)> {
             _ => return Err(Errno(95)),
         }
     }
-    Ok((size, nodes, mode))
+    Ok((size, nodes, mode, uid, gid))
 }
 
 fn escape_mount_field(bytes: &[u8]) -> String {
@@ -1752,6 +1735,11 @@ pub(super) fn table_text(snapshot: &NamespaceSnapshot, info: bool) -> Vec<u8> {
         return Vec::new();
     };
     let table = table.borrow();
+    let alive = if table.mounts.iter().any(|m| m.propagation().master != 0) {
+        propagation::live_groups(&table.admin.namespaces())
+    } else {
+        Default::default()
+    };
     let mut text = String::new();
     for m in &table.mounts {
         let Some(mut target) = mount_absolute(m, &m.root_path(), &table.root) else {
@@ -1809,7 +1797,7 @@ pub(super) fn table_text(snapshot: &NamespaceSnapshot, info: bool) -> Vec<u8> {
             let dev = m.device();
             let parent = m.parent.borrow().as_ref().map_or(m.id, |a| a.parent.id);
             text.push_str(&format!(
-                "{} {} {}:{} {} {} {} - {} {} {}{}\n",
+                "{} {} {}:{} {} {} {}{} - {} {} {}{}\n",
                 m.id,
                 parent,
                 (dev >> 8) & 0xfff,
@@ -1817,6 +1805,17 @@ pub(super) fn table_text(snapshot: &NamespaceSnapshot, info: bool) -> Vec<u8> {
                 escape_mount_field(&root),
                 escape_mount_field(&target),
                 flags,
+                {
+                    let p = m.propagation().resolved(&alive);
+                    let mut tags = String::new();
+                    if p.shared != 0 {
+                        tags.push_str(&format!(" shared:{}", p.shared));
+                    }
+                    if p.master != 0 {
+                        tags.push_str(&format!(" master:{}", p.master));
+                    }
+                    tags
+                },
                 m.fs_name(),
                 source,
                 if m.readonly() { "ro" } else { "rw" },
@@ -2493,7 +2492,7 @@ mod boundary_tests {
         assert_eq!(tmpfs_options(b"nr_inodes=1%", 0), Err(Errno(22)));
         assert_eq!(
             tmpfs_options(b"size=0,nr_inodes=0", 0),
-            Ok((i64::MAX as u64, usize::MAX, 0o1777))
+            Ok((i64::MAX as u64, usize::MAX, 0o1777, None, None))
         );
     }
     #[test]

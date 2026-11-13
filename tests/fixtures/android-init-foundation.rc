@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Acceptance-only boot script for the unchanged Android init/logd/libbinder.
+# It deliberately never sets sys.boot_completed or claims a complete desktop.
+import /init.environ.rc
+import /system/etc/init/logd.rc
+import /system/etc/init/servicemanager.rc
+import /system/etc/init/apexd.rc
+
+on early-init
+    exec_start apexd-bootstrap
+    update_linker_config
+    setprop sys.use_memfd true
+
+on init
+    start logd
+    start servicemanager
+    start apexd
+    setprop trames.foundation.init ready
+    mkdir /data/trames-foundation 0700 root root
+    rm /data/trames-foundation/ok
+    chmod 0755 /trames-init-probe
+    start trames-foundation-probe
+
+service trames-foundation-probe /trames-init-probe
+    disabled
+    oneshot
+    user root
+    group root system log readproc
+    stdio_to_kmsg

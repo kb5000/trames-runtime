@@ -8,12 +8,28 @@ use super::*;
 pub(crate) struct Admin {
     transaction: std::sync::Mutex<()>,
     readiness: Arc<crate::readiness::Readiness>,
+    // Only namespaces with real shared/slave mount relationships share this
+    // structural transaction domain. Weak entries never retain a namespace.
+    namespaces: std::sync::Mutex<Vec<std::sync::Weak<SharedCell<Table>>>>,
 }
 pub(crate) struct Lease<'a> {
     guard: Option<std::sync::MutexGuard<'a, ()>>,
     admin: &'a Admin,
 }
 impl Admin {
+    pub(super) fn register(&self, table: &Arc<SharedCell<Table>>) {
+        let mut namespaces = self.namespaces.lock().unwrap();
+        namespaces.retain(|n| n.strong_count() != 0);
+        namespaces.push(Arc::downgrade(table));
+    }
+    pub(super) fn namespaces(&self) -> Vec<MountNamespace> {
+        self.namespaces
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n.upgrade().map(MountNamespace))
+            .collect()
+    }
     pub(crate) fn try_enter(&self) -> Option<Lease<'_>> {
         match self.transaction.try_lock() {
             Ok(guard) => Some(Lease {

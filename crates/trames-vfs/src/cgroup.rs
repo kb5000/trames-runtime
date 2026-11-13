@@ -1385,6 +1385,45 @@ impl CgroupFile {
 mod tests {
     use super::*;
     #[test]
+    fn original_cgroup_metadata_accepts_owners_modes_and_readonly_mount_rules() {
+        let mut v = setup();
+        v.mkdir_at(AT_FDCWD, b"/sys/fs/cgroup/uid_1000", 0o755)
+            .unwrap();
+        v.chown_at(AT_FDCWD, b"/sys/fs/cgroup/uid_1000/.", 1000, 1000, true)
+            .unwrap();
+        v.chmod_at(AT_FDCWD, b"/sys/fs/cgroup/uid_1000", 0o770)
+            .unwrap();
+        v.chown_at(
+            AT_FDCWD,
+            b"/sys/fs/cgroup/uid_1000/cgroup.procs",
+            1000,
+            1000,
+            false,
+        )
+        .unwrap();
+        let stat = v.stat_at(AT_FDCWD, b"/sys/fs/cgroup/uid_1000").unwrap();
+        assert_eq!(u32::from_le_bytes(stat[24..28].try_into().unwrap()), 1000);
+        assert_eq!(
+            u32::from_le_bytes(stat[16..20].try_into().unwrap()) & 0o7777,
+            0o770
+        );
+        assert_eq!(
+            v.chmod_at(AT_FDCWD, b"/proc/cmdline", 0o777),
+            Err(Errno(30))
+        );
+        let fd = v
+            .open_at(AT_FDCWD, b"/sys/fs/cgroup/uid_1000/cgroup.procs", 2, 0)
+            .unwrap();
+        assert_eq!(v.truncate_fd(fd, 0), Err(Errno(30)));
+        v.close(fd).unwrap();
+        v.mount(None, b"/sys/fs/cgroup", None, 32 | 1, None)
+            .unwrap();
+        assert_eq!(
+            v.chown_at(AT_FDCWD, b"/sys/fs/cgroup/uid_1000", 0, 0, false),
+            Err(Errno(30))
+        );
+    }
+    #[test]
     fn owner_and_source_control_io_use_one_original_file_position() {
         let mut v = setup();
         v.mkdir_at(AT_FDCWD, b"/sys/fs/cgroup/x", 0o755).unwrap();
