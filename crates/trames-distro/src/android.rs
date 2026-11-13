@@ -3,6 +3,45 @@
 //! inputs only: init, properties, logging, Binder and ART remain guest programs.
 use trames_vfs::{Errno, Vfs, AT_FDCWD};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+pub fn command() -> Vec<String> {
+    vec!["/system/bin/init".into(), "second_stage".into()]
+}
+/// Validate a cold Android image before publishing an environment. Ordinary
+/// syscalls, buffer access and frame presentation never consult this metadata.
+pub fn validate_image(vfs: &mut Vfs) -> Result<()> {
+    crate::rootfs::validate_command(vfs, &command())?;
+    for path in [
+        b"/system/bin/init".as_slice(),
+        b"/system/bin/bootstrap/linker64",
+    ] {
+        vfs.executable(path)?;
+    }
+    for path in [
+        b"/vendor/lib64/hw/vulkan.trames.so".as_slice(),
+        b"/vendor/lib64/hw/gralloc.trames.so",
+        b"/vendor/bin/hw/trames-hal-service",
+    ] {
+        let bytes = optional_file(vfs, path)?
+            .ok_or("Android support components are missing; import a Trames Android package")?;
+        if bytes.get(..5) != Some(b"\x7fELF\x02")
+            || bytes.get(18..20) != Some(&183u16.to_le_bytes())
+        {
+            return Err("Android support component is not ARM64 ELF".into());
+        }
+    }
+    if let Some(bytes) = optional_file(vfs, b"/.trames-android.json")? {
+        let metadata: serde_json::Value = serde_json::from_slice(&bytes)?;
+        if metadata["schema"] != 1
+            || metadata["target"] != "android"
+            || metadata["abi"] != "arm64-v8a"
+            || metadata["graphics_contract"] != 1
+            || metadata["android_api"] != 33
+        {
+            return Err("Android package requires a different Trames version or ABI".into());
+        }
+    }
+    Ok(())
+}
 fn directory(vfs: &mut Vfs, path: &[u8], mode: u32) -> Result<()> {
     match vfs.mkdir_at(AT_FDCWD, path, mode) {
         Ok(()) => Ok(()),
@@ -213,7 +252,7 @@ pub fn prepare(vfs: &mut Vfs) -> Result<()> {
     // The original HWC can also put its cursor on a native-image subsurface.
     // Use that same retained GPU transport instead of its unaccepted EGL-to-SHM
     // cursor readback path. Explicit caller settings still win over defaults.
-    let defaults = b"ro.lmk.use_new_strategy=true\nro.lmk.psi_partial_stall_ms=0\nro.lmk.psi_complete_stall_ms=0\nro.cold_boot_done=true\nro.zygote=zygote64\nro.product.cpu.abilist=arm64-v8a\nro.product.cpu.abilist64=arm64-v8a\nro.product.cpu.abilist32=\nsys.use_memfd=true\nwaydroid.stub_sensors_hal=true\nwaydroid.xdg_runtime_dir=/run/trames-wayland\nwaydroid.wayland_display=wayland-0\npersist.waydroid.cursor_on_subsurface=true\n";
+    let defaults = b"ro.lmk.use_new_strategy=true\nro.lmk.psi_partial_stall_ms=0\nro.lmk.psi_complete_stall_ms=0\nro.cold_boot_done=true\nro.zygote=zygote64\ndalvik.vm.dex2oat64.enabled=true\nro.product.cpu.abilist=arm64-v8a\nro.product.cpu.abilist64=arm64-v8a\nro.product.cpu.abilist32=\nsys.use_memfd=true\nwaydroid.stub_sensors_hal=true\nwaydroid.xdg_runtime_dir=/run/trames-wayland\nwaydroid.wayland_display=wayland-0\npersist.waydroid.cursor_on_subsurface=true\n";
     for line in defaults
         .split(|b| *b == b'\n')
         .filter(|line| !line.is_empty())
@@ -383,6 +422,35 @@ pub fn display(vfs: &mut Vfs, directory: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn package_rejects_foreign_init_missing_hal_and_incompatible_contract() {
+        let mut vfs = Vfs::default();
+        let mut elf = vec![0; 64];
+        elf[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        elf[18..20].copy_from_slice(&183u16.to_le_bytes());
+        vfs.import_executable(b"/system/bin/init", elf.clone())
+            .unwrap();
+        vfs.import_executable(b"/system/bin/bootstrap/linker64", elf.clone())
+            .unwrap();
+        assert!(validate_image(&mut vfs).is_err());
+        for path in [
+            b"/vendor/lib64/hw/vulkan.trames.so".as_slice(),
+            b"/vendor/lib64/hw/gralloc.trames.so",
+            b"/vendor/bin/hw/trames-hal-service",
+        ] {
+            vfs.import_executable(path, elf.clone()).unwrap();
+        }
+        validate_image(&mut vfs).unwrap();
+        crate::systemd::file(&mut vfs, b"/.trames-android.json", br#"{"schema":1,"target":"android","abi":"arm64-v8a","graphics_contract":2,"android_api":33}"#).unwrap();
+        assert!(validate_image(&mut vfs).is_err());
+        elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+        let mut foreign = Vfs::default();
+        foreign.import_executable(b"/system/bin/init", elf).unwrap();
+        assert!(validate_image(&mut foreign)
+            .unwrap_err()
+            .to_string()
+            .contains("ARM64"));
+    }
+    #[test]
     fn arm64_audio_launcher_preserves_original_service_policy_and_other_sections() {
         let source=b"service vendor.audio-hal /vendor/bin/hw/android.hardware.audio.service\n    override\n    user host\n    capabilities BLOCK_SUSPEND\n    rlimit rtprio 10 10\n    onrestart restart audioserver\n\nservice camera /system/bin/cameraserver\n    rlimit rtprio 10 10\n";
         let text = String::from_utf8(audio_launcher(source).unwrap()).unwrap();
@@ -432,6 +500,7 @@ mod tests {
             .unwrap();
         let properties = String::from_utf8(properties).unwrap();
         assert!(properties.contains("ro.lmk.psi_partial_stall_ms=0\n"));
+        assert!(properties.contains("dalvik.vm.dex2oat64.enabled=true\n"));
         assert!(properties.contains("persist.waydroid.cursor_on_subsurface=false\n"));
         assert!(!properties.contains("persist.waydroid.cursor_on_subsurface=true"));
         for name in ["touch", "keyboard", "pointer", "tablet"] {
