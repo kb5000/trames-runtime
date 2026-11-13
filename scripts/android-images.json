@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "android_api": 33,
+  "architecture": "arm64-v8a",
+  "system": {
+    "filename": "lineage-20.0-20260927-VANILLA-waydroid_arm64-system.zip",
+    "url": "https://sourceforge.net/projects/waydroid/files/images/system/lineage/waydroid_arm64/lineage-20.0-20260927-VANILLA-waydroid_arm64-system.zip/download",
+    "size": 912267974,
+    "sha256": "5fb8179ed4455f45919c5a2bfbfdd1591619295994ad321217f03bb1dcfc53a7",
+    "image_name": "system.img",
+    "image_size": 1994985472
+  },
+  "vendor": {
+    "filename": "lineage-20.0-20260927-MAINLINE-waydroid_arm64-vendor.zip",
+    "url": "https://sourceforge.net/projects/waydroid/files/images/vendor/waydroid_arm64/lineage-20.0-20260927-MAINLINE-waydroid_arm64-vendor.zip/download",
+    "size": 147678746,
+    "sha256": "20a49c11961a5ac7295320f578764eeab3c982b217f1bfde7473adfc22e747ae",
+    "image_name": "vendor.img",
+    "image_size": 421634048
+  },
+  "upstream_system_metadata": "https://ota.waydro.id/system/lineage/waydroid_arm64/VANILLA.json",
+  "upstream_vendor_metadata": "https://ota.waydro.id/vendor/waydroid_arm64/MAINLINE.json"
+}

@@ -11,7 +11,7 @@ use std::{
 };
 use trames_vfs::{Vfs, AT_FDCWD, MAX_PATH};
 
-fn temporary() -> Result<File> {
+pub(super) fn temporary() -> Result<File> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     for _ in 0..32 {
         let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -33,7 +33,7 @@ fn temporary() -> Result<File> {
     }
     Err("cannot allocate rootfs snapshot".into())
 }
-fn mkdirs(vfs: &mut Vfs, path: &[u8]) -> Result<()> {
+pub(super) fn mkdirs(vfs: &mut Vfs, path: &[u8]) -> Result<()> {
     let mut current = Vec::new();
     for part in path.split(|&b| b == b'/').filter(|p| !p.is_empty()) {
         current.push(b'/');

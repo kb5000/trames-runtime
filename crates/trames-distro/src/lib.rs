@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Pinned distribution verification and checked import into the private VFS.
 pub mod android;
+pub mod android_package;
 pub mod boot;
 pub mod packages;
 pub mod rootfs;

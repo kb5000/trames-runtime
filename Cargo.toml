@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/ext4-view"]
 members = [
     "crates/trames-graphics",
     "crates/trames-video",
