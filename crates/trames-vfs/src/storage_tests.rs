@@ -1584,3 +1584,32 @@ fn hardlinked_symlinks_keep_inode_identity_and_resolve_relative_to_each_parent()
         );
     }
 }
+
+#[test]
+fn socket_chown_on_disk_root_completes_on_source_without_filesystem_handoff() {
+    let dir = Temp::new();
+    let mut owner = dir.open();
+    owner
+        .configure_managed_uplink(NetworkMode::Outbound)
+        .unwrap();
+    let fd = owner.socket(2, 2, 0).unwrap();
+    let paths = owner.path_queries();
+    assert!(owner.namespace_host_work());
+    let reply = paths.namespace_attempt(NamespaceCall::Chown {
+        fd: fd as i32,
+        path: None,
+        uid: 1073,
+        gid: u32::MAX,
+        nofollow: false,
+        empty: false,
+    });
+    match reply {
+        NamespaceAttempt::Complete(Ok(FileValue::Count(0))) => {}
+        _ => panic!("socket metadata escaped the current execution worker"),
+    }
+    assert_eq!(owner.socket_fd(fd).unwrap().inode_owner(), [1073, 0]);
+    assert_eq!(
+        u32::from_le_bytes(owner.stat_fd(fd).unwrap()[24..28].try_into().unwrap()),
+        1073
+    );
+}

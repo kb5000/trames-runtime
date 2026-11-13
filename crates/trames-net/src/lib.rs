@@ -54,6 +54,40 @@ impl Default for Network {
     }
 }
 impl Network {
+    pub fn is_managed_uplink(&self) -> bool {
+        self.1.graph.read().unwrap().managed(self.namespace_id())
+    }
+    pub fn stable_secret(&self, scope: u32) -> Result<std::net::Ipv6Addr> {
+        self.1
+            .graph
+            .read()
+            .unwrap()
+            .stable_secret(self.namespace_id(), scope)
+    }
+    pub fn set_stable_secret(&self, scope: u32, secret: std::net::Ipv6Addr) -> Result<()> {
+        self.1
+            .graph
+            .write()
+            .unwrap()
+            .set_stable_secret(self.namespace_id(), scope, secret)
+    }
+    pub fn ipv6_knob(&self, scope: u32, knob: usize) -> Result<i32> {
+        self.1
+            .graph
+            .read()
+            .unwrap()
+            .ipv6_knob(self.namespace_id(), scope, knob)
+    }
+    pub fn set_ipv6_knob(&self, scope: u32, knob: usize, value: i32) -> Result<()> {
+        let changes =
+            self.1
+                .graph
+                .write()
+                .unwrap()
+                .set_ipv6_knob(self.namespace_id(), scope, knob, value)?;
+        self.1.notify(changes);
+        Ok(())
+    }
     /// Trusted embedder test/service mapping; never reachable from a guest syscall.
     pub fn map_host_ip(
         &self,
@@ -152,6 +186,54 @@ impl Network {
             .expect("new native namespace");
         namespace.refresh_native();
         Self(Backend::Native(native), namespace)
+    }
+    /// Configurable guest IP link with the existing userspace/native gateway;
+    /// host interface addresses and routes remain outside guest control.
+    pub fn managed_uplink(mode: NetworkMode) -> Result<Self> {
+        let network = Self::new(mode);
+        network.1.graph.write().unwrap().manage_uplink(
+            network.namespace_id(),
+            matches!(mode, NetworkMode::Full | NetworkMode::Outbound),
+        );
+        let stack = network.1.root_stack()?;
+        Ok(Self(Backend::Virtual(stack), network.1))
+    }
+    pub fn set_device_ipv4(
+        &self,
+        index: u32,
+        address: Option<std::net::Ipv4Addr>,
+        prefix: Option<u8>,
+    ) -> Result<()> {
+        let changes = {
+            let mut graph = self.1.graph.write().unwrap();
+            let before = graph.device(self.namespace_id(), index)?;
+            graph.ioctl_ipv4(self.namespace_id(), index, address, prefix)?;
+            let after = graph.device(self.namespace_id(), index)?;
+            let mut changes = Vec::new();
+            for (a, kind) in before
+                .addresses
+                .iter()
+                .filter(|a| !after.addresses.contains(a))
+                .map(|a| (a, 21))
+                .chain(
+                    after
+                        .addresses
+                        .iter()
+                        .filter(|a| !before.addresses.contains(a))
+                        .map(|a| (a, 20)),
+                )
+            {
+                changes.push((
+                    self.namespace_id(),
+                    kind,
+                    0x10,
+                    rtnetlink::address_data(&after, *a),
+                ));
+            }
+            changes
+        };
+        self.1.notify(changes);
+        Ok(())
     }
     pub fn virtual_network(fabric: &Fabric, id: u8, mode: NetworkMode) -> Result<Self> {
         let stack = fabric.environment(id, mode)?;
@@ -256,6 +338,7 @@ impl Network {
     }
 }
 pub struct Socket {
+    inode_owner: Cell<u64>,
     // Immutable ABI type, retained across native/virtual endpoint transitions.
     kind: u32,
     // Serializes endpoint/control transitions, while ordinary data operations
@@ -303,6 +386,41 @@ impl WaitSource {
     }
 }
 impl Socket {
+    pub fn inode_owner(&self) -> [u32; 2] {
+        let v = self.inode_owner.get();
+        [v as u32, (v >> 32) as u32]
+    }
+    /// Set the fresh sockfs inode's creator, before publishing the descriptor.
+    /// Accepted transport routing UID is inherited separately from its listener.
+    pub fn initialize_inode_owner(&self, uid: u32, gid: u32) {
+        self.inode_owner.set(uid as u64 | ((gid as u64) << 32));
+    }
+    /// Serialize the actual inode metadata change and its Linux sk_uid update
+    /// on this socket's existing control gate, without a service thread.
+    pub fn chown(
+        &self,
+        uid: u32,
+        gid: u32,
+        authorize: impl FnOnce([u32; 2]) -> Result<()>,
+    ) -> Result<()> {
+        let _operation = self.operation.write();
+        let mut owner = self.inode_owner();
+        authorize(owner)?;
+        if uid != u32::MAX {
+            self.set_owner_uid(uid);
+            owner[0] = uid;
+        }
+        if gid != u32::MAX {
+            owner[1] = gid;
+        }
+        self.initialize_inode_owner(owner[0], owner[1]);
+        Ok(())
+    }
+    pub fn set_owner_uid(&self, uid: u32) {
+        if let SocketBackend::Virtual(socket) = &self.backend {
+            socket.set_owner_uid(uid);
+        }
+    }
     fn wrap(
         backend: SocketBackend,
         namespace: Arc<netlink::Namespace>,
@@ -310,6 +428,7 @@ impl Socket {
         kind: u32,
     ) -> Arc<Self> {
         Arc::new(Self {
+            inode_owner: Cell::new(0),
             kind: kind & 0xf,
             operation: parking_lot::RwLock::new(()),
             backend,
@@ -759,3 +878,6 @@ mod root_routing_tests;
 
 #[cfg(test)]
 mod shared_network_tests;
+
+#[cfg(test)]
+mod managed_network_tests;

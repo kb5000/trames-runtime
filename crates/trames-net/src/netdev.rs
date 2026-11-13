@@ -41,6 +41,11 @@ pub(crate) fn refresh_native(
 #[path = "netdev_router.rs"]
 mod router;
 pub(crate) use router::NativeForward;
+#[path = "netdev_ipv6.rs"]
+mod ipv6;
+#[path = "netdev_policy.rs"]
+mod policy;
+pub(crate) use policy::{Context as RouteContext, Entry as PolicyRoute, Rule};
 const MAX_LINKS: usize = 256;
 const MAX_ADDRESSES: usize = 6; // Plus the two loopback addresses in smoltcp.
 const MAX_ROUTES: usize = 64;
@@ -102,6 +107,8 @@ struct Link {
     master: Option<u32>,
     addresses: Vec<Address>,
     stats: Arc<Counters>,
+    ipv6: [i32; 4],
+    stable_secret: Option<std::net::Ipv6Addr>,
 }
 impl Link {
     fn snapshot(&self) -> Device {
@@ -138,6 +145,11 @@ struct Space {
     lo: Option<Arc<Loopback>>,
     routes: Vec<Route>,
     direct: bool,
+    managed_uplink: bool,
+    policy: policy::Policy,
+    ipv6_all: [i32; 4],
+    ipv6_default: [i32; 4],
+    stable_secret: Option<std::net::Ipv6Addr>,
     forwarding: [bool; 2],
     firewall: Arc<crate::nftables::Firewall>,
     connections: Arc<Mutex<crate::conntrack::State>>,
@@ -191,10 +203,97 @@ impl Address {
     }
 }
 impl Topology {
+    /// A guest-owned IP uplink uses the existing native gateway. Its metadata
+    /// never refreshes from or configures an actual host interface.
+    pub fn manage_uplink(&mut self, id: u64, enabled: bool) {
+        let space = self.spaces.get_mut(&id).unwrap();
+        space.managed_uplink = true;
+        space.direct = enabled;
+        space.routes.clear();
+        self.devices.insert(
+            (id, 2),
+            Link {
+                index: 2,
+                name: b"eth0".to_vec(),
+                namespace: id,
+                kind: DeviceKind::Direct,
+                up: true,
+                mtu: 1500,
+                tx_queue_len: 0,
+                mac: [0; 6],
+                master: None,
+                addresses: Vec::new(),
+                stats: Arc::default(),
+                ipv6: self.spaces[&id].ipv6_default,
+                stable_secret: None,
+            },
+        );
+        self.changed();
+    }
+    pub fn ioctl_ipv4(
+        &mut self,
+        id: u64,
+        index: u32,
+        address: Option<Ipv4Addr>,
+        prefix: Option<u8>,
+    ) -> Result<()> {
+        let d = self.device(id, index)?;
+        if d.kind == DeviceKind::Loopback
+            || d.kind == DeviceKind::Direct && !self.spaces[&id].managed_uplink
+        {
+            return Err(NetError(95));
+        }
+        if prefix.is_some_and(|p| p > 32) || address.is_some_and(|a| a.octets()[0] >= 224) {
+            return Err(NetError(22));
+        }
+        let previous = d.addresses.iter().find(|a| a.ip.is_ipv4()).copied();
+        let supplied = address.is_some();
+        let address = address
+            .or_else(|| {
+                previous.and_then(|a| {
+                    if let IpAddr::V4(ip) = a.ip {
+                        Some(ip)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .ok_or(NetError(99))?;
+        if prefix.is_none() && previous.is_some_and(|a| a.ip == IpAddr::V4(address)) {
+            return Ok(());
+        }
+        let prefix = prefix
+            .or_else(|| (!supplied).then(|| previous.map(|a| a.prefix)).flatten())
+            .unwrap_or(if address.octets()[0] < 128 {
+                8
+            } else if address.octets()[0] < 192 {
+                16
+            } else {
+                24
+            });
+        let d = self.devices.get_mut(&(id, index)).unwrap();
+        if let Some(old) = previous {
+            d.addresses.retain(|a| *a != old);
+        }
+        if !address.is_unspecified() {
+            d.addresses.insert(
+                0,
+                Address {
+                    ip: address.into(),
+                    prefix,
+                },
+            );
+        }
+        self.changed();
+        Ok(())
+    }
     fn direct_current(&self, id: u64, enabled: bool, info: Option<NetworkInfo>) -> bool {
         let Some(space) = self.spaces.get(&id) else {
             return true;
         };
+        if space.managed_uplink {
+            return true;
+        }
         if space.direct != enabled {
             return false;
         }
@@ -255,6 +354,11 @@ impl Topology {
                 lo,
                 routes: vec![],
                 direct: false,
+                managed_uplink: false,
+                policy: policy::Policy::default(),
+                ipv6_all: [1, 0, 0, 0],
+                ipv6_default: [1, 0, 0, 0],
+                stable_secret: None,
                 forwarding: [false; 2],
                 firewall: Arc::default(),
                 connections: Arc::default(),
@@ -284,6 +388,8 @@ impl Topology {
                     },
                 ],
                 stats: Arc::default(),
+                ipv6: self.spaces[&id].ipv6_default,
+                stable_secret: None,
             },
         );
         if let Some(info) = info {
@@ -330,6 +436,8 @@ impl Topology {
                     master: None,
                     addresses,
                     stats: Arc::default(),
+                    ipv6: self.spaces[&id].ipv6_default,
+                    stable_secret: None,
                 },
             );
         }
@@ -381,6 +489,8 @@ impl Topology {
                 master: None,
                 addresses: addresses.clone(),
                 stats: Arc::default(),
+                ipv6: self.spaces[&id].ipv6_default,
+                stable_secret: None,
             },
         );
         let space = self.spaces.get_mut(&id).unwrap();
@@ -528,6 +638,8 @@ impl Topology {
                 master: None,
                 addresses: vec![],
                 stats: Arc::default(),
+                ipv6: self.spaces[&id].ipv6_default,
+                stable_secret: None,
             },
         );
         Ok(index)
@@ -572,7 +684,12 @@ impl Topology {
         tx_queue_len: Option<u32>,
     ) -> Result<()> {
         let old = self.device(id, index)?;
-        if old.kind == DeviceKind::Direct {
+        if old.kind == DeviceKind::Direct && !self.spaces[&id].managed_uplink {
+            return Err(NetError(95));
+        }
+        if old.kind == DeviceKind::Direct
+            && (name.is_some() || target.is_some() || master.is_some() || mac.is_some())
+        {
             return Err(NetError(95));
         }
         if old.kind == DeviceKind::Loopback {
@@ -626,6 +743,11 @@ impl Topology {
                 .unwrap()
                 .routes
                 .retain(|r| r.device != index);
+            self.spaces
+                .get_mut(&id)
+                .unwrap()
+                .policy
+                .forget_device(index);
         }
         if let Some(up) = up {
             d.up = up;
@@ -667,11 +789,13 @@ impl Topology {
                 self.devices.remove(&key);
                 if let Some(s) = self.spaces.get_mut(&key.0) {
                     s.routes.retain(|r| r.device != peer);
+                    s.policy.forget_device(peer);
                 }
             }
         }
         if let Some(s) = self.spaces.get_mut(&id) {
             s.routes.retain(|r| r.device != index);
+            s.policy.forget_device(index);
         }
         for d in self.devices.values_mut() {
             if d.namespace == id && d.master == Some(index) {
@@ -694,7 +818,13 @@ impl Topology {
             return Err(NetError(22));
         }
         let d = self.devices.get(&(id, index)).ok_or(NetError(19))?;
-        if matches!(d.kind, DeviceKind::Loopback | DeviceKind::Direct) || d.master.is_some() {
+        if add && address.ip.is_ipv6() && d.ipv6[2] != 0 {
+            return Err(NetError(13));
+        }
+        if d.kind == DeviceKind::Loopback
+            || d.kind == DeviceKind::Direct && !self.spaces[&id].managed_uplink
+            || d.master.is_some()
+        {
             return Err(NetError(95));
         }
         if !add && !d.addresses.contains(&address) {
@@ -707,7 +837,7 @@ impl Topology {
             && self
                 .devices(id)
                 .iter()
-                .filter(|d| !matches!(d.kind, DeviceKind::Loopback | DeviceKind::Direct))
+                .filter(|d| d.kind != DeviceKind::Loopback)
                 .map(|d| d.addresses.len())
                 .sum::<usize>()
                 >= MAX_ADDRESSES
@@ -752,7 +882,9 @@ impl Topology {
         exclusive: bool,
     ) -> Result<()> {
         let d = self.device(id, route.device)?;
-        if d.kind == DeviceKind::Direct || route.destination != route.destination.network() {
+        if d.kind == DeviceKind::Direct && !self.spaces[&id].managed_uplink
+            || route.destination != route.destination.network()
+        {
             return Err(NetError(95));
         }
         if let Some(g) = route.gateway {
@@ -799,6 +931,9 @@ impl Topology {
         })
     }
     pub fn source(&self, id: u64, destination: IpAddr) -> Result<(IpAddr, u32, Option<IpAddr>)> {
+        self.source_for(id, destination, RouteContext::default())
+    }
+    fn source_main(&self, id: u64, destination: IpAddr) -> Result<(IpAddr, u32, Option<IpAddr>)> {
         if self.own(id, destination) {
             let d = self
                 .devices(id)
@@ -884,15 +1019,26 @@ impl Topology {
     }
 }
 impl View {
-    pub fn own(&self, ip: IpAddr) -> bool {
-        self.graph.read().unwrap().own(self.namespace, ip)
+    pub fn managed_uplink(&self) -> bool {
+        self.graph.read().unwrap().spaces[&self.namespace].managed_uplink
     }
-    pub fn source(&self, ip: IpAddr) -> Result<IpAddr> {
+
+    pub fn source_for(&self, ip: IpAddr, context: RouteContext) -> Result<IpAddr> {
         self.graph
             .read()
             .unwrap()
-            .source(self.namespace, ip)
+            .source_for(self.namespace, ip, context)
             .map(|v| v.0)
+    }
+    pub fn device(&self, name: &[u8]) -> Result<u32> {
+        self.graph
+            .read()
+            .unwrap()
+            .named(self.namespace, name)
+            .map(|d| d.index)
+    }
+    pub fn own(&self, ip: IpAddr) -> bool {
+        self.graph.read().unwrap().own(self.namespace, ip)
     }
     pub fn addresses(&self, up_only: bool) -> Vec<Address> {
         self.graph

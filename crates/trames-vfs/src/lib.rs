@@ -3069,7 +3069,7 @@ impl Vfs {
         }
         if let Some(control) = &o.network_control {
             let mut position = o.file_position.lock().unwrap();
-            let data = control.read(position.value, count);
+            let data = control.read(position.value, count)?;
             position.value += data.len() as u64;
             return Ok(data);
         }
@@ -3432,7 +3432,7 @@ impl Vfs {
             return file.read(offset, count);
         }
         if let Some(control) = &o.network_control {
-            return Ok(control.read(offset, count));
+            return control.read(offset, count);
         }
         if let Some(data) = Self::oom_read(&o, offset, count)? {
             return Ok(data);
@@ -3746,6 +3746,10 @@ impl Vfs {
                 return self.stat_inode(&n, o.mount.as_ref());
             }
         }
+        let owner = o
+            .socket
+            .as_ref()
+            .map_or([o.owner.0, o.owner.1], |s| s.inode_owner());
         self.stat_node(
             &Node {
                 identity: 0,
@@ -3783,8 +3787,8 @@ impl Vfs {
                     linux_namespace::NamespaceHandle::id,
                 ),
                 links: 1,
-                uid: o.owner.0,
-                gid: o.owner.1,
+                uid: owner[0],
+                gid: owner[1],
                 volatile: false,
                 times: [storage::Timestamp::default(); 3],
                 xattrs: BTreeMap::new(),

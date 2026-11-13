@@ -60,13 +60,37 @@ impl SocketOperation {
     }
 }
 #[derive(Clone, Copy)]
-enum Sysctl {
+pub(super) enum Sysctl {
     PingRange,
     UnprivilegedPort,
     Forwarding(bool),
     BridgeFilter(bool),
+    Ipv6(u32, usize),
+    StableSecret(u32),
 }
 impl Sysctl {
+    pub(super) fn ipv6_path(path: &[u8]) -> Option<Self> {
+        let tail = path.strip_prefix(b"/proc/sys/net/ipv6/conf/")?;
+        let cut = tail.iter().position(|b| *b == b'/')?;
+        let scope = match &tail[..cut] {
+            b"all" => 0,
+            b"default" => u32::MAX,
+            b"lo" => 1,
+            b"eth0" => 2,
+            _ => return None,
+        };
+        if &tail[cut + 1..] == b"stable_secret" {
+            return Some(Self::StableSecret(scope));
+        }
+        let knob = match &tail[cut + 1..] {
+            b"accept_ra" => 0,
+            b"use_tempaddr" => 1,
+            b"disable_ipv6" => 2,
+            b"addr_gen_mode" => 3,
+            _ => return None,
+        };
+        Some(Self::Ipv6(scope, knob))
+    }
     fn path(path: &[u8]) -> Option<Self> {
         match path {
             b"/proc/sys/net/ipv4/ping_group_range" => Some(Self::PingRange),
@@ -77,7 +101,7 @@ impl Sysctl {
             b"/proc/sys/net/ipv6/conf/all/forwarding" => Some(Self::Forwarding(true)),
             b"/proc/sys/net/bridge/bridge-nf-call-iptables" => Some(Self::BridgeFilter(false)),
             b"/proc/sys/net/bridge/bridge-nf-call-ip6tables" => Some(Self::BridgeFilter(true)),
-            _ => None,
+            _ => Self::ipv6_path(path),
         }
     }
 }
@@ -87,7 +111,7 @@ pub(super) struct Control {
     kind: Sysctl,
 }
 impl Control {
-    pub fn read(&self, offset: u64, count: usize) -> Vec<u8> {
+    pub fn read(&self, offset: u64, count: usize) -> Result<Vec<u8>> {
         let n = self.namespace.network.borrow();
         let data = match self.kind {
             Sysctl::PingRange => {
@@ -97,12 +121,18 @@ impl Control {
             Sysctl::UnprivilegedPort => format!("{}\n", n.unprivileged_port()),
             Sysctl::BridgeFilter(ipv6) => format!("{}\n", u8::from(n.bridge_filter(ipv6))),
             Sysctl::Forwarding(ipv6) => format!("{}\n", u8::from(n.forwarding(ipv6))),
+            Sysctl::StableSecret(scope) => {
+                format!("{}\n", n.stable_secret(scope).map_err(|e| Errno(e.0))?)
+            }
+            Sysctl::Ipv6(scope, knob) => {
+                format!("{}\n", n.ipv6_knob(scope, knob).map_err(|e| Errno(e.0))?)
+            }
         }
         .into_bytes();
         let start = usize::try_from(offset)
             .unwrap_or(usize::MAX)
             .min(data.len());
-        data[start..start + count.min(data.len() - start)].to_vec()
+        Ok(data[start..start + count.min(data.len() - start)].to_vec())
     }
     pub fn write(&self, bytes: &[u8], offset: u64, authorized: bool) -> Result<usize> {
         if !authorized {
@@ -115,6 +145,24 @@ impl Control {
             return Err(Errno(22));
         }
         let text = std::str::from_utf8(bytes).map_err(|_| Errno(22))?;
+        if let Sysctl::StableSecret(scope) = self.kind {
+            let secret = text.trim().parse().map_err(|_| Errno(22))?;
+            self.namespace
+                .network
+                .borrow()
+                .set_stable_secret(scope, secret)
+                .map_err(|e| Errno(e.0))?;
+            return Ok(bytes.len());
+        }
+        if let Sysctl::Ipv6(scope, knob) = self.kind {
+            let value = text.trim().parse::<i32>().map_err(|_| Errno(22))?;
+            self.namespace
+                .network
+                .borrow()
+                .set_ipv6_knob(scope, knob, value)
+                .map_err(|e| Errno(e.0))?;
+            return Ok(bytes.len());
+        }
         let values = text
             .split_ascii_whitespace()
             .map(|v| v.parse::<u32>().map_err(|_| Errno(22)))
@@ -176,6 +224,14 @@ impl Vfs {
         let fabric = trames_net::Fabric::new().map_err(|e| Errno(e.0))?;
         self.configure_virtual_network(&fabric, 2, mode)
     }
+    pub fn configure_managed_uplink(&mut self, mode: NetworkMode) -> Result<()> {
+        if self.network.live_sockets() != 0 {
+            return Err(Errno(16));
+        }
+        self.network = trames_net::Network::managed_uplink(mode).map_err(|e| Errno(e.0))?;
+        *self.root_network.network.borrow_mut() = self.network.clone();
+        Ok(())
+    }
     pub fn map_network_host_ip(
         &self,
         virtual_ip: std::net::IpAddr,
@@ -210,6 +266,19 @@ impl Vfs {
         }
         self.network
             .set_device_up(index, up)
+            .map_err(|e| Errno(e.0))
+    }
+    pub fn set_network_device_ipv4(
+        &self,
+        index: u32,
+        address: Option<std::net::Ipv4Addr>,
+        prefix: Option<u8>,
+    ) -> Result<()> {
+        if !self.credentials.has_cap(capabilities::NET_ADMIN) {
+            return Err(Errno(1));
+        }
+        self.network
+            .set_device_ipv4(index, address, prefix)
             .map_err(|e| Errno(e.0))
     }
     pub fn socket_send_bytes(
@@ -259,6 +328,7 @@ impl Vfs {
         socket: Arc<NetSocket>,
         flags: u32,
     ) -> Descriptor {
+        socket.initialize_inode_owner(owner.0, owner.1);
         Descriptor {
             open: OpenHandle::new(OpenDescription {
                 shared: Arc::new(SharedOpenDescription {
@@ -455,6 +525,59 @@ mod tests {
         v.credentials = Credentials::user(1000, 1000);
         v.seek(f, 0, 0).unwrap();
         assert_eq!(v.write(f, b"0"), Err(Errno(13)));
+    }
+    #[test]
+    fn socket_chown_updates_original_inode_alias_and_route_uid_with_real_authority() {
+        let mut v = Vfs::default();
+        v.configure_managed_uplink(NetworkMode::Outbound).unwrap();
+        let fd = v.socket(2, 2, 0).unwrap();
+        let alias = v.dup(fd, 0, false).unwrap();
+        v.chown_fd(fd, 1073, u32::MAX).unwrap();
+        let stat = v.stat_fd(alias).unwrap();
+        assert_eq!(u32::from_le_bytes(stat[24..28].try_into().unwrap()), 1073);
+        assert_eq!(v.socket_fd(alias).unwrap().inode_owner(), [1073, 0]);
+        v.credentials = Credentials::user(1000, 1000);
+        assert_eq!(v.chown_fd(alias, 1000, 1000), Err(Errno(1)));
+        assert_eq!(v.socket_fd(fd).unwrap().inode_owner(), [1073, 0]);
+        v.credentials = Credentials::user(1073, 1073);
+        v.chown_fd(alias, u32::MAX, 1073).unwrap();
+        assert_eq!(v.socket_fd(fd).unwrap().inode_owner(), [1073, 1073]);
+    }
+    #[test]
+    fn managed_ipv6_controls_pin_original_namespace_and_recheck_writer() {
+        let mut v = Vfs::default();
+        v.configure_managed_uplink(NetworkMode::Outbound).unwrap();
+        v.set_runtime_info(1, RuntimeInfo::default());
+        let path = b"/proc/sys/net/ipv6/conf/eth0/stable_secret";
+        let fd = v.open_at(AT_FDCWD, path, 2, 0).unwrap();
+        assert_eq!(v.read(fd, 128), Err(Errno(5)));
+        v.write(fd, b"fdaa::1").unwrap();
+        v.seek(fd, 0, 0).unwrap();
+        let text = v.read(fd, 128).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&text)
+                .unwrap()
+                .trim()
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap(),
+            "fdaa::1".parse::<std::net::Ipv6Addr>().unwrap()
+        );
+        let original = v.network.clone();
+        v.unshare_net().unwrap();
+        v.seek(fd, 0, 0).unwrap();
+        v.credentials = Credentials::user(1000, 1000);
+        assert_eq!(v.write(fd, b"fdaa::2"), Err(Errno(13)));
+        assert_eq!(
+            original.stable_secret(2).unwrap(),
+            "fdaa::1".parse::<std::net::Ipv6Addr>().unwrap()
+        );
+        v.credentials = Credentials::default();
+        v.write(fd, b"fdaa::3").unwrap();
+        assert_eq!(
+            original.stable_secret(2).unwrap(),
+            "fdaa::3".parse::<std::net::Ipv6Addr>().unwrap()
+        );
+        assert!(!v.network.is_managed_uplink());
     }
     #[test]
     fn bridge_sysctls_are_namespace_pinned_and_authorized() {

@@ -1,6 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 impl Socket {
+    pub fn set_owner_uid(&self, uid: u32) {
+        self.uid.set(uid);
+    }
+    fn route_source(&self, view: &crate::netdev::View, ip: IpAddr) -> Result<IpAddr> {
+        view.source_for(
+            ip,
+            crate::netdev::RouteContext {
+                mark: self.mark.get(),
+                uid: self.uid.get(),
+                device: (self.route_device.get() != 0).then(|| self.route_device.get()),
+            },
+        )
+    }
     pub fn info(&self) -> crate::SocketInfo {
         let fabric = self.network.0.fabric.0.borrow();
         let state = self.state.borrow();
@@ -153,7 +166,9 @@ impl Socket {
         if a.port() == 0 && !matches!(self.kind, 3 | 4) {
             return Err(NetError(22));
         }
-        let v = a.ip();
+        self.destination_ip(a.ip())
+    }
+    fn destination_ip(&self, v: IpAddr) -> Result<()> {
         if self.network.0.routing.is_none()
             && self.network.is_isolated()
             && (!v.is_loopback() || !self.network.0.loopback_up.get())
@@ -177,7 +192,7 @@ impl Socket {
             return Err(NetError(99));
         }
         if let Some(view) = &self.network.0.routing {
-            view.source(v)?;
+            self.route_source(view, v)?;
             return Ok(());
         }
         if private_ip(v) && v != IpAddr::V4(v4(1)) && v != IpAddr::V6(v6(1)) {
@@ -474,14 +489,21 @@ impl Socket {
         };
         drop(state);
         drop(i);
-        Ok((
-            self.network.wrap(self.family, 1, accepted, reservation),
-            self.presented(peer),
-        ))
+        let socket = self.network.wrap(self.family, 1, accepted, reservation);
+        socket.uid.set(self.uid.get());
+        socket.mark.set(self.mark.get());
+        socket.route_device.set(self.route_device.get());
+        Ok((socket, self.presented(peer)))
     }
     pub fn connect(&self, a: SocketAddr) -> Result<()> {
         let a = self.normalize(a)?;
-        self.destination(a)?;
+        // UDP connect is also Linux's source-route probe: a zero destination
+        // port selects the source without establishing a getpeername peer.
+        if self.kind == 2 {
+            self.destination_ip(a.ip())?;
+        } else {
+            self.destination(a)?;
+        }
         let state = self.state.borrow();
         if self.kind == 1 {
             match state.connection {
@@ -499,6 +521,22 @@ impl Socket {
         }
         if self.kind != 1 {
             let mut s = self.state.borrow_mut();
+            if self.kind == 2 && s.bound.is_some_and(|b| b.ip().is_unspecified()) {
+                let source = if let Some(view) = &self.network.0.routing {
+                    self.route_source(view, a.ip())?
+                } else if a.ip().is_loopback() {
+                    if a.is_ipv4() {
+                        Ipv4Addr::LOCALHOST.into()
+                    } else {
+                        Ipv6Addr::LOCALHOST.into()
+                    }
+                } else if a.is_ipv4() {
+                    self.network.0.info.ipv4.into()
+                } else {
+                    self.network.0.info.ipv6.into()
+                };
+                s.bound.as_mut().unwrap().set_ip(source);
+            }
             s.peer = Some(a);
             s.connection = Connection::Connected;
             return Ok(());
@@ -506,7 +544,7 @@ impl Socket {
         let mut bound = self.state.borrow().bound.unwrap();
         if bound.ip().is_unspecified() {
             bound.set_ip(if let Some(view) = &self.network.0.routing {
-                view.source(a.ip())?
+                self.route_source(view, a.ip())?
             } else if a.ip().is_loopback() {
                 if a.is_ipv4() {
                     Ipv4Addr::LOCALHOST.into()
@@ -572,6 +610,7 @@ impl Socket {
         self.state
             .borrow()
             .peer
+            .filter(|a| self.kind != 2 || a.port() != 0)
             .map(|a| self.presented(a))
             .ok_or(NetError(107))
     }
@@ -620,6 +659,11 @@ impl Socket {
         destination: Option<SocketAddr>,
         info: Option<crate::PacketInfo>,
     ) -> Result<usize> {
+        if self.kind == 1 && self.network.0.managed_uplink {
+            if let Some(peer) = self.state.borrow().peer {
+                self.destination(peer)?;
+            }
+        }
         if info.is_some() && self.kind != 2 {
             return Err(NetError(95));
         }
@@ -661,7 +705,7 @@ impl Socket {
                     .0
                     .routing
                     .as_ref()
-                    .map(|view| view.source(a.ip()))
+                    .map(|view| self.route_source(view, a.ip()))
                     .transpose()?
             } else {
                 None
@@ -930,6 +974,10 @@ impl Socket {
         Ok((ready & events) | (ready & 24))
     }
     pub fn set_option(&self, level: u32, name: u32, value: i32) -> Result<()> {
+        if (level, name) == (1, 36) {
+            self.mark.set(value as u32);
+            return Ok(());
+        }
         let mut i = self.network.0.fabric.0.borrow_mut();
         let mut state = self.state.borrow_mut();
         match (level, name) {
@@ -1013,6 +1061,9 @@ impl Socket {
         Ok(())
     }
     pub fn get_option(&self, level: u32, name: u32) -> Result<i32> {
+        if (level, name) == (1, 36) {
+            return Ok(self.mark.get() as i32);
+        }
         if (level, name) == (1, 4) {
             let _ = self.connect_complete();
             return Ok(self.state.borrow_mut().error.take().unwrap_or(0) as i32);
@@ -1076,16 +1127,22 @@ impl Socket {
                 return Err(NetError(22));
             }
             let end = value.iter().position(|b| *b == 0).unwrap_or(value.len());
-            let device = match &value[..end] {
-                b"" => None,
-                b"lo" => Some(1),
-                b"eth0" if !self.network.is_isolated() => Some(2),
-                _ => return Err(NetError(19)),
+            let device = if value[..end].is_empty() {
+                None
+            } else if let Some(view) = &self.network.0.routing {
+                Some(view.device(&value[..end])?)
+            } else {
+                match &value[..end] {
+                    b"lo" => Some(1),
+                    b"eth0" if !self.network.is_isolated() => Some(2),
+                    _ => return Err(NetError(19)),
+                }
             };
-            if self.kind != 4 {
+            if self.kind != 4 && self.network.0.routing.is_none() {
                 return Err(NetError(95));
             }
             self.state.borrow_mut().device = device;
+            self.route_device.set(device.unwrap_or(0));
             return Ok(());
         }
         if value.len() < 4 {
@@ -1146,7 +1203,7 @@ impl Socket {
         let source = if !bound.is_unspecified() {
             bound
         } else if let Some(view) = &self.network.0.routing {
-            view.source(a.ip())?
+            self.route_source(view, a.ip())?
         } else if a.ip().is_loopback() {
             if self.family == 2 {
                 Ipv4Addr::LOCALHOST.into()
@@ -1318,7 +1375,7 @@ impl Socket {
             smoltcp::wire::Icmpv4Packet::new_unchecked(&mut data).fill_checksum();
         } else {
             let source = if let Some(view) = &self.network.0.routing {
-                let IpAddr::V6(source) = view.source(a.ip())? else {
+                let IpAddr::V6(source) = self.route_source(view, a.ip())? else {
                     return Err(NetError(97));
                 };
                 source

@@ -527,6 +527,21 @@ impl Vfs {
         self.fd_writable(fd)?;
         let open_descriptor = self.descriptor(fd)?;
         let open = open_descriptor.open.borrow();
+        if let Some(socket) = &open.socket {
+            let c = &self.credentials;
+            return socket
+                .chown(uid, gid, |[current_uid, current_gid]| {
+                    if !c.has_cap(capabilities::CHOWN)
+                        && (c.fsuid != current_uid
+                            || uid != u32::MAX && uid != current_uid
+                            || gid != u32::MAX && gid != current_gid && !c.in_group(gid))
+                    {
+                        return Err(trames_net::NetError(1));
+                    }
+                    Ok(())
+                })
+                .map_err(|e| Errno(e.0));
+        }
         let node = open.metadata_node().ok_or(Errno(22))?;
         self.chown_node(node, uid, gid, open.node.is_some())
     }

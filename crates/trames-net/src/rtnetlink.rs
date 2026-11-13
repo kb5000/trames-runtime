@@ -68,7 +68,7 @@ pub(crate) fn link_data(g: &Topology, d: &Device) -> Vec<u8> {
     let carrier = g.carrier(d);
     let flags = match d.kind {
         DeviceKind::Loopback => 8 | if d.up { 0x41 } else { 0 },
-        DeviceKind::Direct => 0xc1,
+        DeviceKind::Direct => 0x80 | if d.up { 0x41 } else { 0 },
         _ => 0x1002 | u32::from(d.up) | if carrier { 0x10040 } else { 0 },
     };
     data[8..12].copy_from_slice(&flags.to_le_bytes());
@@ -188,7 +188,7 @@ pub(crate) fn request(
     // BusyBox/iproute2 may request a dump using only struct rtgenmsg (one
     // family byte), while Go sends the complete per-message structure.
     let padded;
-    let request = if dump && matches!(request.len(), 17 | 20) && matches!(kind, 18 | 22 | 26) {
+    let request = if dump && matches!(request.len(), 17 | 20) && matches!(kind, 18 | 22 | 26 | 34) {
         padded = {
             let mut data = request.to_vec();
             data.resize(
@@ -221,6 +221,79 @@ pub(crate) fn request(
             return Err(NetError(95));
         }
         match kind {
+            32..=34 => {
+                if request.len() < 28 {
+                    return Err(NetError(22));
+                }
+                let family = request[16];
+                if !matches!(family, 0 | 2 | 10) {
+                    return Err(NetError(97));
+                }
+                if kind == 34 {
+                    if !dump {
+                        return Err(NetError(95));
+                    }
+                    for rule in graph.policy_rules(ns, family) {
+                        out.push(message(32, 2, seq, port, &rule_data(&rule)));
+                    }
+                    return Ok(());
+                }
+                if !admin {
+                    return Err(NetError(1));
+                }
+                let a = attrs(&request[28..])?;
+                if !matches!(family, 2 | 10)
+                    || request[17..20] != [0; 3]
+                    || request[21..23] != [0; 2]
+                    || !matches!(request[23], 0 | 1 | 6 | 7 | 8)
+                    || u32v(&request[24..28])? & !2 != 0
+                    || a.iter()
+                        .any(|(k, _)| !matches!(k, 3 | 6 | 10 | 15 | 16 | 17 | 20))
+                {
+                    return Err(NetError(95));
+                }
+                let uid = get(&a, 20)
+                    .map(|v| {
+                        Ok::<_, NetError>([
+                            u32v(v.get(..4).ok_or(NetError(22))?)?,
+                            u32v(v.get(4..).ok_or(NetError(22))?)?,
+                        ])
+                    })
+                    .transpose()?;
+                if uid.is_some_and(|v| v[0] > v[1]) {
+                    return Err(NetError(22));
+                }
+                let rule = crate::netdev::Rule {
+                    family,
+                    priority: get(&a, 6).map(u32v).transpose()?.unwrap_or(32765),
+                    table: get(&a, 15)
+                        .map(u32v)
+                        .transpose()?
+                        .unwrap_or(request[20] as u32),
+                    action: request[23],
+                    mark: get(&a, 10).map(u32v).transpose()?.unwrap_or(0),
+                    mask: get(&a, 16)
+                        .map(u32v)
+                        .transpose()?
+                        .unwrap_or(if get(&a, 10).is_some() { u32::MAX } else { 0 }),
+                    input: get(&a, 3).map(text).transpose()?.map(Vec::from),
+                    output: get(&a, 17).map(text).transpose()?.map(Vec::from),
+                    uid,
+                    invert: u32v(&request[24..28])? & 2 != 0,
+                };
+                if kind == 32 && (rule.action == 0 || rule.action == 1 && rule.table == 0) {
+                    return Err(NetError(22));
+                }
+                let bytes = rule_data(&rule);
+                graph.policy_rule(
+                    ns,
+                    rule,
+                    kind == 32,
+                    flags & 0x200 != 0,
+                    get(&a, 6).is_some(),
+                )?;
+                changes.push((ns, kind, if family == 2 { 0x80 } else { 0x80000 }, bytes));
+            }
             16..=19 => {
                 if request.len() < 32 {
                     return Err(NetError(22));
@@ -441,7 +514,6 @@ pub(crate) fn request(
                 }
                 let prefix = request[17];
                 let index = u32v(&request[20..24])?;
-                let a = attrs(&request[24..])?;
                 if kind == 22 {
                     if !dump {
                         return Err(NetError(95));
@@ -465,6 +537,7 @@ pub(crate) fn request(
                     }
                     return Ok(());
                 }
+                let a = attrs(&request[24..])?;
                 if !admin {
                     return Err(NetError(1));
                 }
@@ -477,6 +550,19 @@ pub(crate) fn request(
                     family,
                     get(&a, 2).or_else(|| get(&a, 1)).ok_or(NetError(22))?,
                 )?;
+                if kind == 20 && addr == IpAddr::V4(Ipv4Addr::UNSPECIFIED) {
+                    // Linux __inet_insert_ifa frees a zero IPv4 local address
+                    // and returns success without installing it. Android's
+                    // original ifc_add_address emits this after clearing IPv4.
+                    graph.device(ns, index)?;
+                    if prefix > 32 {
+                        return Err(NetError(22));
+                    }
+                    if get(&a, 4).is_some_and(|v| v.len() != 4) {
+                        return Err(NetError(22));
+                    }
+                    return Ok(());
+                }
                 if get(&a, 1)
                     .map(|v| ip(family, v))
                     .transpose()?
@@ -527,7 +613,13 @@ pub(crate) fn request(
                 if !matches!(family, 0 | 2 | 10) {
                     return Err(NetError(97));
                 }
-                let a = attrs(&request[28..])?;
+                // Legacy iproute2 uses ifinfomsg plus IFLA_EXT_MASK for all
+                // dumps. Linux non-strict address/route dumps ignore that tail.
+                let a = if kind == 26 && dump {
+                    Vec::new()
+                } else {
+                    attrs(&request[28..])?
+                };
                 if kind == 26 {
                     if !dump {
                         // RouteGet is used by libnetwork to find the actual
@@ -568,9 +660,11 @@ pub(crate) fn request(
                         out.push(message(24, 0, seq, port, &data));
                         return Ok(());
                     }
-                    for r in graph.routes(ns) {
-                        if family == 0 || (family == 2) == r.destination.ip.is_ipv4() {
-                            out.push(message(24, 2, seq, port, &route_data(r)));
+                    for (table, r) in graph.policy_routes(ns) {
+                        if (family == 0 || (family == 2) == r.route.destination.ip.is_ipv4())
+                            && (request[20] == 0 || request[20] as u32 == table)
+                        {
+                            out.push(message(24, 2, seq, port, &policy_route_data(table, r)));
                         }
                     }
                     return Ok(());
@@ -579,11 +673,10 @@ pub(crate) fn request(
                     return Err(NetError(1));
                 }
                 if request[18..20] != [0; 2]
-                    || request[20] != 254
                     || !matches!(request[22], 0 | 253)
-                    || request[23] != 1
+                    || !matches!(request[23], 1 | 6 | 7 | 8 | 9)
                     || request[24..28] != [0; 4]
-                    || a.iter().any(|(k, _)| !matches!(k, 1 | 4 | 5 | 6 | 7))
+                    || a.iter().any(|(k, _)| !matches!(k, 1 | 4 | 5 | 6 | 7 | 15))
                 {
                     return Err(NetError(95));
                 }
@@ -603,7 +696,10 @@ pub(crate) fn request(
                 if destination.prefix > if family == 2 { 32 } else { 128 } {
                     return Err(NetError(22));
                 }
-                let device = u32v(get(&a, 4).ok_or(NetError(22))?)?;
+                let device = get(&a, 4).map(u32v).transpose()?.unwrap_or(0);
+                if request[23] == 1 && device == 0 {
+                    return Err(NetError(22));
+                }
                 if let Some(source) = get(&a, 7) {
                     if !graph
                         .device(ns, device)?
@@ -621,9 +717,22 @@ pub(crate) fn request(
                     metric: get(&a, 6).map(u32v).transpose()?.unwrap_or(0),
                     protocol: request[21],
                 };
-                graph.route(
-                    ns,
+                let table = get(&a, 15)
+                    .map(u32v)
+                    .transpose()?
+                    .unwrap_or(if request[20] == 0 {
+                        254
+                    } else {
+                        request[20] as u32
+                    });
+                let entry = crate::netdev::PolicyRoute {
                     route,
+                    kind: request[23],
+                };
+                graph.policy_route(
+                    ns,
+                    table,
+                    entry,
                     kind == 24,
                     flags & 0x100 != 0,
                     flags & 0x200 != 0,
@@ -632,7 +741,7 @@ pub(crate) fn request(
                     ns,
                     kind,
                     if family == 2 { 0x40 } else { 0x400 },
-                    route_data(route),
+                    policy_route_data(table, entry),
                 ));
             }
             _ => return Err(NetError(95)),
@@ -664,7 +773,7 @@ pub(crate) fn request(
         retained_namespaces,
     })
 }
-fn address_data(d: &Device, a: Address) -> Vec<u8> {
+pub(crate) fn address_data(d: &Device, a: Address) -> Vec<u8> {
     let mut data = vec![
         if a.ip.is_ipv4() { 2 } else { 10 },
         a.prefix,
@@ -679,6 +788,42 @@ fn address_data(d: &Device, a: Address) -> Vec<u8> {
     attr(&mut data, 3, &name);
     attr(&mut data, 8, &0x80u32.to_le_bytes());
     data
+}
+pub(crate) fn policy_route_data(table: u32, entry: crate::netdev::PolicyRoute) -> Vec<u8> {
+    let mut bytes = route_data(entry.route);
+    bytes[4] = if table < 256 { table as u8 } else { 0 };
+    bytes[7] = entry.kind;
+    attr(&mut bytes, 15, &table.to_le_bytes());
+    bytes
+}
+fn rule_data(rule: &crate::netdev::Rule) -> Vec<u8> {
+    let mut bytes = vec![0; 12];
+    bytes[0] = rule.family;
+    bytes[7] = rule.action;
+    bytes[8..12].copy_from_slice(&(if rule.invert { 2u32 } else { 0 }).to_le_bytes());
+    attr(&mut bytes, 6, &rule.priority.to_le_bytes());
+    if rule.table != 0 {
+        attr(&mut bytes, 15, &rule.table.to_le_bytes());
+    }
+    if rule.mask != 0 {
+        attr(&mut bytes, 10, &rule.mark.to_le_bytes());
+        attr(&mut bytes, 16, &rule.mask.to_le_bytes());
+    }
+    for (kind, name) in [(3, &rule.input), (17, &rule.output)] {
+        if let Some(name) = name {
+            let mut n = name.clone();
+            n.push(0);
+            attr(&mut bytes, kind, &n);
+        }
+    }
+    if let Some(uid) = rule.uid {
+        attr(
+            &mut bytes,
+            20,
+            &[uid[0].to_le_bytes(), uid[1].to_le_bytes()].concat(),
+        );
+    }
+    bytes
 }
 fn route_data(r: Route) -> Vec<u8> {
     let mut data = vec![
@@ -696,7 +841,9 @@ fn route_data(r: Route) -> Vec<u8> {
         0,
     ];
     attr(&mut data, 1, &octets(r.destination.ip));
-    attr(&mut data, 4, &r.device.to_le_bytes());
+    if r.device != 0 {
+        attr(&mut data, 4, &r.device.to_le_bytes());
+    }
     if let Some(g) = r.gateway {
         attr(&mut data, 5, &octets(g));
     }

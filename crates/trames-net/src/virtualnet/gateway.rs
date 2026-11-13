@@ -193,8 +193,13 @@ impl Gateway {
         let tuple = h.tuple;
         let dest = tuple.destination;
 
-        if !crate::conntrack::key(&p).is_some_and(|k| self.routed.contains_key(&k))
-            && (dest.ip() == IpAddr::V4(v4(1)) || dest.ip() == IpAddr::V6(v6(1)))
+        let local_gateway = dest.ip() == IpAddr::V4(v4(1)) || dest.ip() == IpAddr::V6(v6(1));
+        // Managed IP links use this gateway's existing DNS service even though
+        // their policy route is recorded for reply delivery. Routed container
+        // destinations otherwise keep their normal native forwarding meaning.
+        if local_gateway
+            && (ns.managed_uplink && dest.port() == 53
+                || !crate::conntrack::key(&p).is_some_and(|k| self.routed.contains_key(&k)))
         {
             return self.node.port.receive_packet(p);
         }
@@ -718,8 +723,22 @@ impl Gateway {
                     break;
                 };
                 let source = address(meta.endpoint);
-                if let Some((&node, _)) = nodes.iter().find(|(_, n)| {
-                    source.ip() == IpAddr::V4(v4(n.id)) || source.ip() == IpAddr::V6(v6(n.id))
+                let destination = SocketAddr::new(addr(meta.local_address.unwrap()), 53);
+                let routed_node = self
+                    .routed
+                    .get(&crate::conntrack::Key {
+                        protocol: 17,
+                        tuple: Tuple {
+                            source,
+                            destination,
+                        },
+                    })
+                    .map(|flow| flow.node);
+                if let Some(node) = routed_node.or_else(|| {
+                    nodes.iter().find_map(|(&key, n)| {
+                        (source.ip() == IpAddr::V4(v4(n.id)) || source.ip() == IpAddr::V6(v6(n.id)))
+                            .then_some(key)
+                    })
                 }) {
                     queries.push((
                         data.to_vec(),

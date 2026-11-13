@@ -357,6 +357,16 @@ fn prepare_namespace(view: &mut Vfs, call: &NamespaceCall) -> bool {
     if matches!(call, NamespaceCall::Memfd(_)) {
         return true;
     }
+    // Socket ownership is original sockfs metadata plus sk_uid. It performs
+    // no filesystem I/O merely because the calling task's root is disk-backed.
+    if let NamespaceCall::Chown { fd, path: None, .. } = call {
+        if view
+            .descriptor(*fd as u32)
+            .is_ok_and(|d| d.open.borrow().socket.is_some())
+        {
+            return false;
+        }
+    }
     if !view.query.as_ref().unwrap().namespace_io {
         return false;
     }

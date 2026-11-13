@@ -58,6 +58,9 @@ impl Default for Namespace {
     }
 }
 impl Namespace {
+    pub fn notify(&self, changes: Vec<(u64, u16, u32, Vec<u8>)>) {
+        notify(&self.listeners, changes);
+    }
     pub fn isolated(&self, loopback: std::sync::Arc<crate::netdev::Loopback>) -> Result<Self> {
         let reservation = self.quota.reserve().map_err(|_| NetError(28))?;
         let mut namespace = Self::default();
@@ -320,7 +323,7 @@ impl Socket {
             // ND_USEROPT is a valid subscription too. This guest network has
             // no router-advertisement producer, so it remains quiet until one
             // exists, like a Linux interface receiving no advertisements.
-            0 => 1 | 0x10 | 0x40 | 0x100 | 0x400 | (1 << 19),
+            0 => 1 | 0x10 | 0x40 | 0x80 | 0x100 | 0x400 | (1 << 19),
             // Container devices are provisioned before listeners start. This
             // is the guest's actual quiet uevent channel, not the host's device
             // stream. Device injection and synthetic broadcasts are unsupported.
@@ -510,7 +513,7 @@ impl Socket {
             && requests.iter().any(|r| {
                 matches!(
                     u16::from_le_bytes(r[4..6].try_into().unwrap()),
-                    16 | 17 | 19 | 20 | 21 | 24 | 25
+                    16 | 17 | 19 | 20 | 21 | 24 | 25 | 32 | 33
                 )
             })
         {
@@ -534,7 +537,7 @@ impl Socket {
             // side-effect free and are checked against the exact response size.
             if matches!(
                 u16::from_le_bytes(request[4..6].try_into().unwrap()),
-                16 | 17 | 19 | 20 | 21 | 24 | 25
+                16 | 17 | 19 | 20 | 21 | 24 | 25 | 32 | 33
             ) && (self.replies.borrow().len() + replies.len() >= 128
                 || self
                     .replies

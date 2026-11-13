@@ -210,6 +210,7 @@ impl DescriptorFactory {
             .network
             .socket(family, kind & 0xf, protocol)
             .map_err(|e| Errno(e.0))?;
+        socket.set_owner_uid(self.credentials.fsuid);
         let descriptor = Vfs::socket_descriptor(self.open_id(), self.owner, socket, kind);
         reserved.publish(descriptor, None)
     }

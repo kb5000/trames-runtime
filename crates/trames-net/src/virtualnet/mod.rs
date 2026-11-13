@@ -105,6 +105,7 @@ struct NamespaceData {
     isolated: Cell<bool>,
     loopback_up: std::sync::Arc<crate::netdev::Loopback>,
     routing: Option<crate::netdev::View>,
+    managed_uplink: bool,
 }
 #[derive(Clone)]
 pub(super) struct Network(Arc<Namespace>);
@@ -159,6 +160,9 @@ pub(super) struct SocketMeta {
     family: u32,
     kind: u32,
     state: SharedState<State>,
+    mark: Cell<u32>,
+    uid: Cell<u32>,
+    route_device: Cell<u32>,
 }
 fn v4(id: u8) -> Ipv4Addr {
     Ipv4Addr::new(10, 0, 0, id)
@@ -318,6 +322,7 @@ impl Fabric {
                 isolated: Cell::new(false),
                 loopback_up: std::sync::Arc::new(crate::netdev::Loopback::new(true)),
                 routing: None,
+                managed_uplink: false,
             }),
         });
         node.owner = Arc::downgrade(&ns.data);
@@ -358,6 +363,7 @@ impl Fabric {
                 finished: Cell::new(false),
                 isolated: Cell::new(true),
                 loopback_up,
+                managed_uplink: routing.managed_uplink(),
                 routing: Some(routing),
             }),
         });
@@ -966,6 +972,9 @@ impl Network {
                 family,
                 kind,
                 state: SharedState::new(state),
+                mark: Cell::new(0),
+                uid: Cell::new(0),
+                route_device: Cell::new(0),
             }),
             _reservation: reservation,
         });

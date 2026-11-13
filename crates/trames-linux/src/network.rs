@@ -73,6 +73,14 @@ pub(super) fn control(
                 return Ok(0);
             }
             write_option(memory, a, |value| {
+                if a[1] as u32 == 1 && a[2] as u32 == 36 {
+                    let credentials = factory.local_credentials();
+                    if !credentials.has_cap(trames_vfs::capabilities::NET_ADMIN)
+                        && !credentials.has_cap(trames_vfs::capabilities::NET_RAW)
+                    {
+                        return Err(Errno(1));
+                    }
+                }
                 if socket.is_netlink() && a[1] as u32 == 1 && matches!(a[2] as u32, 32 | 33) {
                     if !factory
                         .local_credentials()
@@ -501,11 +509,30 @@ impl Linux {
             }
             if !matches!(
                 request,
-                0x8910 | 0x8913 | 0x8914 | 0x8915 | 0x891b | 0x8921 | 0x8933 | 0x8942 | 0x8927
+                0x8910
+                    | 0x8913
+                    | 0x8914
+                    | 0x8915
+                    | 0x8916
+                    | 0x891b
+                    | 0x891c
+                    | 0x8921
+                    | 0x8933
+                    | 0x8942
+                    | 0x8927
             ) {
                 return Err(Errno(25));
             }
-            Self::check(memory, a[2], 40, Access::Write)?;
+            Self::check(
+                memory,
+                a[2],
+                40,
+                if matches!(request, 0x8914 | 0x8916 | 0x891c) {
+                    Access::Read
+                } else {
+                    Access::Write
+                },
+            )?;
             let mut entry = [0; 40];
             memory.read(a[2], &mut entry).map_err(|_| Errno(14))?;
             let device = if request == 0x8910 {
@@ -518,6 +545,23 @@ impl Linux {
             .ok_or(Errno(19))?;
             let loopback = device.kind == trames_net::DeviceKind::Loopback;
             match request {
+                0x8916 | 0x891c => {
+                    if u16::from_le_bytes(entry[16..18].try_into().unwrap()) != 2 {
+                        return Err(Errno(22));
+                    }
+                    let ip = std::net::Ipv4Addr::from(<[u8; 4]>::try_from(&entry[20..24]).unwrap());
+                    if request == 0x8916 {
+                        vfs.set_network_device_ipv4(device.index, Some(ip), None)?;
+                    } else {
+                        let mask = u32::from(ip);
+                        let prefix = mask.leading_ones();
+                        if mask != u32::MAX.checked_shl(32 - prefix).unwrap_or(0) {
+                            return Err(Errno(22));
+                        }
+                        vfs.set_network_device_ipv4(device.index, None, Some(prefix as u8))?;
+                    }
+                    return Ok(0);
+                }
                 0x8914 => {
                     let flags = u16::from_le_bytes(entry[16..18].try_into().unwrap());
                     if flags & !(1 | 2 | 8 | 0x40 | 0x1000) != 0 {
@@ -549,7 +593,7 @@ impl Linux {
                     let flags: u16 = if loopback {
                         8 | if device.up { 0x41 } else { 0 }
                     } else if device.kind == trames_net::DeviceKind::Direct {
-                        0xc1
+                        0x80 | if device.up { 0x41 } else { 0 }
                     } else {
                         0x1002
                             | u16::from(device.up)

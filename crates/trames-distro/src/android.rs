@@ -2,6 +2,10 @@
 //! Cold preparation for the original Waydroid init. This supplies container
 //! inputs only: init, properties, logging, Binder and ART remain guest programs.
 use trames_vfs::{Errno, Vfs, AT_FDCWD};
+// A stock desktop already uses about 1,000 sleeping/runnable guest tasks.
+// Leave room for application worker pools (including nested codec pools).
+// Admission is atomic metadata only: no RAM or host threads are preallocated.
+pub const TASK_LIMIT: usize = 8192;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 pub fn command() -> Vec<String> {
     vec!["/system/bin/init".into(), "second_stage".into()]
@@ -124,6 +128,47 @@ pub fn environment() -> Vec<String> {
     .map(str::to_owned)
     .collect()
 }
+fn prepare_network(vfs: &mut Vfs) -> Result<()> {
+    let path = b"/data/misc/ethernet/ipconfig.txt";
+    let current = b"/data/misc/apexdata/com.android.tethering/misc/ethernet/ipconfig.txt";
+    if optional_file(vfs, path)?.is_some() || optional_file(vfs, current)?.is_some() {
+        return Ok(());
+    }
+    // Original Android 13 IpConfigStore v3 / DataOutputStream format. Configure
+    // the guest IP uplink, not a host NIC; EthernetTracker/IpClient/netd still
+    // perform their original service registration and kernel operations.
+    fn utf(out: &mut Vec<u8>, value: &str) {
+        out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        out.extend_from_slice(value.as_bytes());
+    }
+    let mut bytes = 3u32.to_be_bytes().to_vec();
+    for text in ["ipAssignment", "STATIC", "linkAddress", "10.0.0.2"] {
+        utf(&mut bytes, text);
+    }
+    bytes.extend_from_slice(&24u32.to_be_bytes());
+    utf(&mut bytes, "gateway");
+    bytes.extend_from_slice(&0u32.to_be_bytes());
+    bytes.extend_from_slice(&1u32.to_be_bytes());
+    for text in [
+        "10.0.0.1",
+        "dns",
+        "10.0.0.1",
+        "proxySettings",
+        "NONE",
+        "id",
+        "eth0",
+        "eos",
+    ] {
+        utf(&mut bytes, text);
+    }
+    directory(vfs, b"/data/misc", 0o771)?;
+    directory(vfs, b"/data/misc/ethernet", 0o770)?;
+    crate::systemd::file(vfs, path, &bytes)?;
+    vfs.chown_at(AT_FDCWD, b"/data/misc/ethernet", 1000, 1000, false)?;
+    vfs.chmod_at(AT_FDCWD, b"/data/misc/ethernet", 0o770)?;
+    vfs.chown_at(AT_FDCWD, path, 1000, 1000, false)?;
+    Ok(())
+}
 /// Each boot gets fresh device/property/socket state; /data stays private and
 /// persistent. The image's Waydroid property overlay, if supplied, is retained.
 pub fn prepare(vfs: &mut Vfs) -> Result<()> {
@@ -149,6 +194,7 @@ pub fn prepare(vfs: &mut Vfs) -> Result<()> {
     for path in [b"/data".as_slice(), b"/metadata"] {
         vfs.mount(Some(path), path, None, 4096, None)?;
     }
+    prepare_network(vfs)?;
     // Waydroid's launcher normally supplies this writable container mount.
     // Zygote creates per-user storage views here after Android remounts / RO.
     vfs.mount(

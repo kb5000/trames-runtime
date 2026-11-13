@@ -26,6 +26,7 @@ fn socket_admission_lease_rolls_back_errors_and_releases_without_namespace_rc() 
         operation: _,
         _reservation,
         kind: _,
+        inode_owner: _,
         changed: _,
     } = Arc::try_unwrap(socket).ok().unwrap();
     drop((backend, namespace));
