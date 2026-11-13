@@ -285,7 +285,7 @@ fn native_device_namespace_opens_and_metadata_use_original_shared_nodes() {
         (b"/dev/vda", 0),
         (b"/dev/vda1", 0),
         (b"/dev/kmsg", 2 | O_NONBLOCK),
-        (b"/dev/trames-bridge", 2),
+        (b"/dev/trames/info", 2),
     ] {
         let fd = paths
             .open_at_resolve(AT_FDCWD, path, flags, 0, 0, &files)
@@ -304,7 +304,7 @@ fn native_device_namespace_opens_and_metadata_use_original_shared_nodes() {
     user.credentials = Credentials::user(1000, 1000);
     assert_eq!(
         user.path_queries()
-            .open_at_resolve(AT_FDCWD, b"/dev/trames-bridge", 2, 0, 0, &files),
+            .open_at_resolve(AT_FDCWD, b"/dev/trames/info", 2, 0, 0, &files),
         Some(Err(Errno(13)))
     );
     epoch.finish();
@@ -317,6 +317,9 @@ fn bridge_source_waits_retain_accepted_ofd_but_snapshots_do_not_keep_connections
         fn wake_io(&self, _: &Arc<IoSignal>) {}
     }
     let broker = trames_bridge::Broker::default();
+    broker
+        .configure(trames_bridge::Policy::default().with_clipboard(true))
+        .unwrap();
     let mut v = Vfs::default();
     snapshot(&mut v);
     v.attach_bridge(broker.clone());
@@ -324,7 +327,7 @@ fn bridge_source_waits_retain_accepted_ofd_but_snapshots_do_not_keep_connections
     let files = epoch.capture(&v, true);
     let paths = v.path_queries();
     let fd = paths
-        .open_at_resolve(AT_FDCWD, b"/dev/trames-bridge", 2, 0, 0, &files)
+        .open_at_resolve(AT_FDCWD, b"/dev/trames/clipboard", 2, 0, 0, &files)
         .unwrap()
         .unwrap();
     assert!(v.epoch_stream_io(fd));
@@ -347,7 +350,7 @@ fn bridge_source_waits_retain_accepted_ofd_but_snapshots_do_not_keep_connections
         "accepted work retains its original connection"
     );
     let replacement = paths
-        .open_at_resolve(AT_FDCWD, b"/dev/trames-bridge", 2, 0, 0, &files)
+        .open_at_resolve(AT_FDCWD, b"/dev/trames/clipboard", 2, 0, 0, &files)
         .unwrap()
         .unwrap();
     assert_eq!(replacement, fd);

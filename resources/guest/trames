@@ -1,0 +1,45 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Cold controls only. Files move through the existing mounted hostfs data path.
+set -f
+result_code=no
+case "$1" in
+  info) device=info; method=bridge.info; params='{}'; stream=no ;;
+  host-exec|host-cli)
+    action=$1; shift
+    [ "$1" = -- ] && shift
+    [ "$#" -gt 0 ] || { echo 'Usage: trames host-exec|host-cli -- COMMAND [ARG...]' >&2; exit 2; }
+    argv='['; separator=''
+    for arg do
+      encoded=$(printf '%s\n' "$arg" | awk 'BEGIN{printf "\""}{if(NR>1)printf "\\n";for(i=1;i<=length($0);i++){c=substr($0,i,1);if(c=="\\")printf "\\\\";else if(c=="\"")printf "\\\"";else if(c=="\t")printf "\\t";else if(c=="\r")printf "\\r";else printf "%s",c}}END{printf "\""}') || exit 1
+      argv=$argv$separator$encoded; separator=,
+    done
+    params='{"argv":'$argv']}'; stream=yes; result_code=yes
+    if [ "$action" = host-exec ]; then device=host-exec; method=host.exec; else device=host-control; method=host.cli; fi ;;
+  clipboard)
+    device=clipboard; stream=no
+    case "$2" in
+      read) method=clipboard.read; params='{}';;
+      write) method=clipboard.write; [ "$#" -eq 3 ] || { echo 'Usage: trames clipboard write JSON_TEXT' >&2; exit 2; }; params='{"text":'$3'}';;
+      *) echo 'Usage: trames clipboard read | write JSON_TEXT' >&2; exit 2;;
+    esac ;;
+  files) device=file-transfer; method=files.list; params='{}'; stream=no ;;
+  rpc)
+    [ "$#" -eq 4 ] || { echo 'Usage: trames rpc DEVICE METHOD JSON_PARAMS' >&2; exit 2; }
+    device=$2; method=$3; params=$4; stream=no
+    case "$method" in host.exec|host.cli) stream=yes;; esac
+    case "$device" in info|host-control|host-exec|file-transfer|port-forward|mount-control|clipboard) :;; *) exit 2;; esac ;;
+  *) echo 'Usage: trames info | clipboard read|write JSON_TEXT | files | host-exec -- COMMAND [ARG...] | host-cli -- ARGS... | rpc DEVICE METHOD JSON_PARAMS' >&2; exit 2 ;;
+esac
+exec 3<>"/dev/trames/$device" || exit 1
+printf '{"version":1,"id":1,"method":"%s","params":%s}\n' "$method" "$params" >&3 || exit 1
+while IFS= read -r response <&3; do
+  printf '%s\n' "$response"
+  case "$response" in *'"error":'*) exit 1;; esac
+  [ "$stream" = yes ] || exit 0
+  case "$response" in *'"done":true'*)
+    [ "$result_code" = yes ] || exit 0
+    code=$(printf '%s\n' "$response" | awk '{sub(/^.*"exit_code":/,"");sub(/[^0-9].*$/,"");print $0+0}')
+    exit "$code";; esac
+done
+exit 1

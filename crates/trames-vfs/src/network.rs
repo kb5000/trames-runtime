@@ -298,6 +298,22 @@ impl Vfs {
             .map_err(|e| Errno(e.0))
     }
 
+    /// Trusted embedder control; guest socket and netlink paths cannot grant it.
+    pub fn publish_host_port(
+        &self,
+        host: std::net::SocketAddr,
+        port: u16,
+        kind: u32,
+    ) -> Result<()> {
+        self.network
+            .publish_port(host, port, kind)
+            .map_err(|e| Errno(e.0))
+    }
+    pub fn unpublish_host_port(&self, host: std::net::SocketAddr, kind: u32) -> Result<()> {
+        self.network
+            .unpublish_port(host, kind)
+            .map_err(|e| Errno(e.0))
+    }
     pub fn network_info(&self) -> Option<trames_net::NetworkInfo> {
         self.network.info()
     }

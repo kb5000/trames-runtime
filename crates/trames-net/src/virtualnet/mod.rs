@@ -66,6 +66,20 @@ struct Inner {
     stats: NetworkStats,
     drop_every: u32,
     corrupt_every: u32,
+    external: Option<ExternalPort>,
+    revision: u64,
+}
+/// Per-environment link, driven by the original socket waiters. No broker thread.
+struct ExternalPort {
+    socket: Arc<std::os::unix::net::UnixDatagram>,
+    path: std::path::PathBuf,
+    id: u8,
+    nat: bool,
+}
+impl Drop for ExternalPort {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 struct Node {
     id: u8,
@@ -250,7 +264,58 @@ impl Fabric {
             stats: NetworkStats::default(),
             drop_every: 0,
             corrupt_every: 0,
+            external: None,
+            revision: 0,
         }))))
+    }
+    /// Attach a host-authorized private Trames network. The product owns its
+    /// directory/lease; bind is exclusive and never replaces a live endpoint.
+    pub fn attach(&self, directory: &std::path::Path, id: u8, nat: bool) -> Result<()> {
+        if !(2..=254).contains(&id) {
+            return Err(NetError(22));
+        }
+        let mut inner = self.0.borrow_mut();
+        if inner.external.is_some() {
+            return Err(NetError(16));
+        }
+        let path = directory.join(format!("p{id}"));
+        let socket = std::os::unix::net::UnixDatagram::bind(&path)
+            .map_err(|e| NetError(e.raw_os_error().unwrap_or(5) as u32))?;
+        if let Err(e) = socket.set_nonblocking(true) {
+            let _ = std::fs::remove_file(&path);
+            return Err(NetError(e.raw_os_error().unwrap_or(5) as u32));
+        }
+        inner.external = Some(ExternalPort {
+            socket: Arc::new(socket),
+            path,
+            id,
+            nat,
+        });
+        Ok(())
+    }
+    pub(super) fn external_waiter(&self) -> Option<Arc<std::os::unix::net::UnixDatagram>> {
+        self.0.borrow().external.as_ref().map(|e| e.socket.clone())
+    }
+    pub fn publish(&self, host: SocketAddr, guest: SocketAddr, kind: u32) -> Result<()> {
+        let mut i = self.0.borrow_mut();
+        i.gateway.publish(host, guest, kind)?;
+        i.revision = i.revision.wrapping_add(1);
+        if let Some(link) = &i.external {
+            let _ = link.socket.send_to(&[], &link.path);
+        }
+        Ok(())
+    }
+    pub fn unpublish(&self, host: SocketAddr, kind: u32) -> Result<()> {
+        let mut i = self.0.borrow_mut();
+        i.gateway.unpublish(host, kind)?;
+        i.revision = i.revision.wrapping_add(1);
+        if let Some(link) = &i.external {
+            let _ = link.socket.send_to(&[], &link.path);
+        }
+        Ok(())
+    }
+    pub(super) fn revision(&self) -> u64 {
+        self.0.borrow().revision
     }
     /// Explicit trusted native service mapping; never callable by a guest syscall.
     pub fn map_host_ip(&self, virtual_ip: IpAddr, host_ip: IpAddr) -> Result<()> {
@@ -440,6 +505,32 @@ impl Inner {
             node.detached.retain(|(h, _)| !gone.contains(h));
             for h in gone {
                 node.sockets.remove(h);
+            }
+        }
+        if let Some(link) = &self.external {
+            let mut bytes = [0u8; 65536];
+            for _ in 0..64 {
+                match link.socket.recv(&mut bytes) {
+                    Ok(n) => {
+                        let packet = &bytes[..n];
+                        let Some(h) = packet::header(packet) else {
+                            continue;
+                        };
+                        let dst = h.tuple.destination.ip();
+                        if dst == IpAddr::V4(v4(link.id)) || dst == IpAddr::V6(v6(link.id)) {
+                            if let Some(node) = self.nodes.values_mut().find(|n| n.id == link.id) {
+                                if node.port.receive_packet(packet.to_vec()) {
+                                    node.links[1].rx_packets += 1;
+                                    node.links[1].rx_bytes += n as u64;
+                                } else {
+                                    node.links[1].rx_dropped += 1;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
             }
         }
         // Bound work per scheduler slice even when a peer produces data continuously.
@@ -669,6 +760,29 @@ impl Inner {
                     }
                 } else if source != 0
                     && dynamic.is_none()
+                    && private_ip(dst)
+                    && dst != IpAddr::V4(v4(1))
+                    && dst != IpAddr::V6(v6(1))
+                {
+                    if let Some(link) = &self.external {
+                        let id = match dst {
+                            IpAddr::V4(a) => Some(a.octets()[3]),
+                            IpAddr::V6(a) => u8::try_from(a.segments()[7]).ok(),
+                        };
+                        if let Some(id) = id.filter(|id| *id >= 2) {
+                            let path = link.path.parent().unwrap().join(format!("p{id}"));
+                            if link.socket.send_to(&p, path).is_err() {
+                                self.stats.dropped += 1;
+                            }
+                        }
+                    } else {
+                        self.stats.dropped += 1;
+                    }
+                } else if source != 0
+                    && dynamic.is_none()
+                    && (dst == IpAddr::V4(v4(1))
+                        || dst == IpAddr::V6(v6(1))
+                        || self.external.as_ref().is_none_or(|e| e.nat))
                     && (!private_ip(dst) || dst == IpAddr::V4(v4(1)) || dst == IpAddr::V6(v6(1)))
                 {
                     if !self.gateway.ingress(source, p, &h, &self.nodes, now) {
@@ -880,6 +994,9 @@ impl Drop for Namespace {
     }
 }
 impl Network {
+    pub(super) fn fabric(&self) -> Fabric {
+        self.0.fabric.clone()
+    }
     pub(super) fn mode(&self) -> NetworkMode {
         self.0.mode
     }

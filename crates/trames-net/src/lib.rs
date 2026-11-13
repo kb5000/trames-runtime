@@ -103,6 +103,28 @@ impl Network {
         };
         fabric.map_host_ip(virtual_ip, host_ip)
     }
+    /// Host-authorized mapping on an existing private network, never a syscall.
+    pub fn publish_port(&self, host: SocketAddr, port: u16, kind: u32) -> Result<()> {
+        let Backend::Virtual(stack) = &self.0 else {
+            return Err(NetError(95));
+        };
+        let info = stack.info();
+        let guest = SocketAddr::new(
+            if host.is_ipv4() {
+                info.ipv4.into()
+            } else {
+                info.ipv6.into()
+            },
+            port,
+        );
+        stack.fabric().publish(host, guest, kind)
+    }
+    pub fn unpublish_port(&self, host: SocketAddr, kind: u32) -> Result<()> {
+        let Backend::Virtual(stack) = &self.0 else {
+            return Err(NetError(95));
+        };
+        stack.fabric().unpublish(host, kind)
+    }
     pub fn namespace_id(&self) -> u64 {
         self.1.id()
     }
@@ -368,21 +390,34 @@ macro_rules! delegate {
 /// One original native observer, with stable identity across repeated waits.
 /// The handle keeps that identity allocated until its registration is retired.
 #[derive(Clone)]
-pub struct WaitSource(Arc<native::Socket>);
+pub enum WaitSource {
+    Native(Arc<native::Socket>),
+    Link(Arc<std::os::unix::net::UnixDatagram>),
+}
 impl WaitSource {
     pub fn identity(&self) -> usize {
-        Arc::as_ptr(&self.0) as usize
+        match self {
+            Self::Native(s) => Arc::as_ptr(s) as usize,
+            Self::Link(s) => Arc::as_ptr(s) as usize,
+        }
     }
     pub fn drain(&self) {
-        let _ = self.0.poll_epoch();
+        if let Self::Native(s) = self {
+            let _ = s.poll_epoch();
+        }
+    }
+    fn fd(&self) -> std::io::Result<std::os::fd::OwnedFd> {
+        match self {
+            Self::Native(s) => s.wait_event_fd(),
+            Self::Link(s) => Ok(s.try_clone()?.into()),
+        }
     }
     pub fn open(&self) -> std::io::Result<trames_shared::HostFd> {
-        Ok(trames_shared::HostFd::retained(
-            self.0.wait_event_fd()?,
-            // Keep the allocation identity, not the endpoint, alive. A
-            // replaced hybrid native branch must still close immediately.
-            Arc::new(Arc::downgrade(&self.0)),
-        ))
+        let keep: Arc<dyn std::any::Any + Send + Sync> = match self {
+            Self::Native(s) => Arc::new(Arc::downgrade(s)),
+            Self::Link(s) => s.clone(),
+        };
+        Ok(trames_shared::HostFd::retained(self.fd()?, keep))
     }
 }
 impl Socket {
@@ -517,10 +552,15 @@ impl Socket {
             SocketBackend::Netlink(_) => (Vec::new(), None),
         };
         let delay = fabric.as_ref().map(|f| f.next_wait());
+        let external = fabric.as_ref().and_then(|f| f.external_waiter());
         if let Some(fabric) = fabric {
             native.extend(fabric.native_waiters().into_iter().map(|(s, _)| s));
         }
-        (native.into_iter().map(WaitSource).collect(), delay)
+        let mut sources: Vec<_> = native.into_iter().map(WaitSource::Native).collect();
+        if let Some(link) = external {
+            sources.push(WaitSource::Link(link));
+        }
+        (sources, delay)
     }
     pub fn wait_sources(&self) -> std::io::Result<(Vec<std::os::fd::OwnedFd>, Option<Duration>)> {
         let (sources, delay) = self.wait_interests();
@@ -528,7 +568,7 @@ impl Socket {
             .into_iter()
             .map(|source| {
                 source.drain();
-                source.0.wait_event_fd()
+                source.fd()
             })
             .collect::<std::io::Result<Vec<_>>>()?;
         Ok((fds, delay))
@@ -552,6 +592,7 @@ impl Socket {
     pub fn wait_revision(&self) -> u64 {
         match &self.backend {
             SocketBackend::Hybrid(socket) => socket.wait_revision(),
+            SocketBackend::Virtual(socket) => socket.fabric().revision(),
             _ => 0,
         }
     }
@@ -859,10 +900,14 @@ pub fn wait_with_fds(
         duration = duration.min(f.next_wait());
         native.extend(f.native_waiters());
     }
+    use std::os::fd::AsFd;
+    let links: Vec<_> = fabrics.iter().filter_map(Fabric::external_waiter).collect();
+    let mut fds = fds.to_vec();
+    fds.extend(links.iter().map(|link| link.as_fd()));
     if native.is_empty() && fds.is_empty() {
         std::thread::sleep(duration);
     } else {
-        native::wait_with_fds(&native, fds, duration)?;
+        native::wait_with_fds(&native, &fds, duration)?;
     }
     for f in &fabrics {
         f.tick();

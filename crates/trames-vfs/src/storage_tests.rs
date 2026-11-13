@@ -724,7 +724,7 @@ fn bridge_device_is_volatile_nonseekable_and_shared_by_dup() {
     v.attach_bridge(broker.clone());
     v.set_runtime_info(1, RuntimeInfo::default());
     let fd = v
-        .open_at(AT_FDCWD, b"/dev/trames-bridge", 2 | O_NONBLOCK, 0)
+        .open_at(AT_FDCWD, b"/dev/trames/info", 2 | O_NONBLOCK, 0)
         .unwrap();
     assert_eq!(v.read(fd, 1), Err(Errno(11)));
     assert_eq!(v.poll(fd, 5), 4);
@@ -743,7 +743,7 @@ fn bridge_device_is_volatile_nonseekable_and_shared_by_dup() {
     v.sync().unwrap();
     drop(v);
     let v = dir.open();
-    assert_eq!(v.stat_at(AT_FDCWD, b"/dev/trames-bridge"), Err(Errno(2)));
+    assert_eq!(v.stat_at(AT_FDCWD, b"/dev/trames/info"), Err(Errno(2)));
 }
 #[test]
 fn pseudo_views_do_not_enter_the_manifest_or_consume_disk_quota() {
@@ -1611,5 +1611,37 @@ fn socket_chown_on_disk_root_completes_on_source_without_filesystem_handoff() {
     assert_eq!(
         u32::from_le_bytes(owner.stat_fd(fd).unwrap()[24..28].try_into().unwrap()),
         1073
+    );
+}
+
+#[test]
+fn host_capability_nodes_cannot_be_forged_and_open_fds_observe_revocation() {
+    let mut v = Vfs::default();
+    let broker = trames_bridge::Broker::default();
+    v.attach_bridge(broker.clone());
+    v.set_runtime_info(1, RuntimeInfo::default());
+    assert_eq!(v.stat_at(AT_FDCWD, b"/dev/trames/host-exec"), Err(Errno(2)));
+    broker
+        .configure(trames_bridge::Policy::new(false, true, false, false, false))
+        .unwrap();
+    let fd = v
+        .open_at(AT_FDCWD, b"/dev/trames/host-exec", 2 | O_NONBLOCK, 0)
+        .unwrap();
+    broker.configure(Default::default()).unwrap();
+    v.write(
+        fd,
+        b"{\"version\":1,\"id\":1,\"method\":\"host.exec\",\"params\":{}}\n",
+    )
+    .unwrap();
+    assert!(String::from_utf8(v.read(fd, 65536).unwrap())
+        .unwrap()
+        .contains("permission_denied"));
+    assert_eq!(v.stat_at(AT_FDCWD, b"/dev/trames/host-exec"), Err(Errno(2)));
+    // A device number in a persistent inode never resolves to a scoped broker.
+    v.mknod_at(AT_FDCWD, b"/forged-host-exec", 0o20600, 0xf002)
+        .unwrap();
+    assert_eq!(
+        v.open_at(AT_FDCWD, b"/forged-host-exec", 2, 0),
+        Err(Errno(6))
     );
 }

@@ -965,6 +965,29 @@ impl Vfs {
         );
         directory::encode(&o.file_position, count, &entries)
     }
+    /// Cold embedding control on the original namespace. Cloning a view retains
+    /// its shared resources; it neither forks a guest nor stops execution slots.
+    pub fn mount_host_authorized(
+        &self,
+        target: &[u8],
+        host: impl AsRef<Path>,
+        readonly: bool,
+    ) -> Result<()> {
+        let mut view = self.clone();
+        view.mount_host(target, host, readonly)
+    }
+    pub fn unmount_host_authorized(&self, target: &[u8]) -> Result<()> {
+        let mut view = self.clone();
+        let path = view.mount_location(target, true)?;
+        if !path
+            .mount
+            .as_ref()
+            .is_some_and(|m| m.kind == mounts::Kind::Host)
+        {
+            return Err(Errno(1));
+        }
+        view.umount(target, 0)
+    }
     /// Embedding-only mount: Linux mount(2) cannot manufacture host authority.
     /// The selected directory already exists; mounts are session-local.
     pub fn mount_host(
@@ -1520,6 +1543,21 @@ mod tests {
         assert_ne!(u64::from_le_bytes(fs[16..24].try_into().unwrap()), 0);
     }
     use std::io::Write;
+    #[test]
+    fn authorized_control_mount_updates_original_namespace_without_a_new_owner() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.0.join("visible"), b"original").unwrap();
+        let mut v = Vfs::default();
+        v.mkdir_at(AT_FDCWD, b"/share", 0o755).unwrap();
+        v.mount_host_authorized(b"/share", &fixture.0, true)
+            .unwrap();
+        let fd = v.open_at(AT_FDCWD, b"/share/visible", 0, 0).unwrap();
+        assert_eq!(v.read(fd, 32).unwrap(), b"original");
+        v.close(fd).unwrap();
+        v.unmount_host_authorized(b"/share").unwrap();
+        assert_eq!(v.open_at(AT_FDCWD, b"/share/visible", 0, 0), Err(Errno(2)));
+        assert_eq!(v.unmount_host_authorized(b"/"), Err(Errno(1)));
+    }
 }
 
 #[cfg(test)]

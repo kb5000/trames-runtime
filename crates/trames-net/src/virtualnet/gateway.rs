@@ -59,8 +59,16 @@ struct RoutedFlow {
     input: u32,
     last: Instant,
 }
+struct Published {
+    native: Arc<native::Socket>,
+    guest: SocketAddr,
+    kind: u32,
+    peers: BTreeMap<SocketAddr, SocketHandle>,
+}
 pub(super) struct Gateway {
     pub node: Node,
+    published: Vec<Published>,
+    next_port: u16,
     pub mappings: BTreeMap<IpAddr, IpAddr>,
     routed: BTreeMap<crate::conntrack::Key, RoutedFlow>,
     native: native::Network,
@@ -98,6 +106,8 @@ impl Gateway {
             }
         }
         Ok(Self {
+            published: Vec::new(),
+            next_port: 40000,
             node,
             mappings: BTreeMap::new(),
             routed: BTreeMap::new(),
@@ -328,10 +338,169 @@ impl Gateway {
         );
         self.node.port.tx.push_back(bytes);
     }
+    pub fn publish(&mut self, host: SocketAddr, guest: SocketAddr, kind: u32) -> Result<()> {
+        if ![1, 2].contains(&kind) || host.is_ipv4() != guest.is_ipv4() {
+            return Err(NetError(22));
+        }
+        let native = self.native.socket(
+            if host.is_ipv4() { 2 } else { 10 },
+            kind,
+            if kind == 1 { 6 } else { 17 },
+        )?;
+        native.bind(host)?;
+        if kind == 1 {
+            native.listen(128)?;
+        }
+        self.published.push(Published {
+            native,
+            guest,
+            kind,
+            peers: BTreeMap::new(),
+        });
+        Ok(())
+    }
+    pub fn unpublish(&mut self, host: SocketAddr, kind: u32) -> Result<()> {
+        let index = self
+            .published
+            .iter()
+            .position(|p| p.kind == kind && p.native.local_addr() == Ok(host))
+            .ok_or(NetError(2))?;
+        let port = self.published.remove(index);
+        for handle in port.peers.values() {
+            self.node.sockets.remove(*handle);
+        }
+        Ok(())
+    }
+    fn service_published(&mut self, now: smoltcp::time::Instant, nodes: &BTreeMap<u64, Node>) {
+        for port in &mut self.published {
+            let Some((&key, node)) = nodes.iter().find(|(_, n)| {
+                port.guest.ip() == IpAddr::V4(v4(n.id)) || port.guest.ip() == IpAddr::V6(v6(n.id))
+            }) else {
+                continue;
+            };
+            for _ in 0..8 {
+                if port.kind == 1 {
+                    if self.tcp.len() >= FLOWS {
+                        break;
+                    }
+                    let (native, _) = match port.native.accept() {
+                        Ok(pair) => pair,
+                        Err(_) => break,
+                    };
+                    let local = SocketAddr::new(
+                        if port.guest.is_ipv4() {
+                            v4(1).into()
+                        } else {
+                            v6(1).into()
+                        },
+                        self.next_port,
+                    );
+                    self.next_port = if self.next_port == 60000 {
+                        40000
+                    } else {
+                        self.next_port + 1
+                    };
+                    let mut t = tcp_socket();
+                    if t.connect(
+                        self.node.iface.context(),
+                        endpoint(port.guest),
+                        endpoint(local),
+                    )
+                    .is_err()
+                    {
+                        continue;
+                    }
+                    let handle = self.node.sockets.add(t);
+                    let owner = node
+                        .registry
+                        .iter()
+                        .filter_map(Weak::upgrade)
+                        .find(|s| {
+                            let state = s.state.borrow();
+                            s.kind == 1
+                                && state.connection == Connection::Listening
+                                && state.bound.is_some_and(|a| {
+                                    a.port() == port.guest.port()
+                                        && (a.ip().is_unspecified() || a.ip() == port.guest.ip())
+                                })
+                        })
+                        .map(|s| Arc::downgrade(&s))
+                        .unwrap_or_default();
+                    self.tcp.push(TcpFlow {
+                        node: key,
+                        tuple: Tuple {
+                            source: port.guest,
+                            destination: local,
+                        },
+                        native,
+                        handle: Some(handle),
+                        syn: None,
+                        owner,
+                        native_eof: false,
+                        write_shutdown: false,
+                        last: Instant::now(),
+                    });
+                } else {
+                    let received = match port.native.recv(65535, 0) {
+                        Ok(r) => r,
+                        Err(_) => break,
+                    };
+                    let Some(peer) = received.address else {
+                        continue;
+                    };
+                    let handle = if let Some(h) = port.peers.get(&peer) {
+                        *h
+                    } else {
+                        if port.peers.len() >= 64 {
+                            continue;
+                        }
+                        let local = SocketAddr::new(
+                            if port.guest.is_ipv4() {
+                                v4(1).into()
+                            } else {
+                                v6(1).into()
+                            },
+                            self.next_port,
+                        );
+                        self.next_port = if self.next_port == 60000 {
+                            40000
+                        } else {
+                            self.next_port + 1
+                        };
+                        let mut u = udp_socket();
+                        if u.bind(endpoint(local)).is_err() {
+                            continue;
+                        }
+                        let h = self.node.sockets.add(u);
+                        port.peers.insert(peer, h);
+                        h
+                    };
+                    let _ = self
+                        .node
+                        .sockets
+                        .get_mut::<udp::Socket>(handle)
+                        .send_slice(&received.data, endpoint(port.guest));
+                }
+            }
+            for (&peer, &handle) in &port.peers {
+                let u = self.node.sockets.get_mut::<udp::Socket>(handle);
+                for _ in 0..8 {
+                    match u.recv() {
+                        Ok((data, _)) => {
+                            let _ = port.native.send(data, 0, Some(peer));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+        let _ = now;
+    }
     pub fn service(&mut self, now: smoltcp::time::Instant, nodes: &BTreeMap<u64, Node>) {
         self.routed.retain(|_, r| {
             nodes.contains_key(&r.node) && r.last.elapsed() < Duration::from_secs(600)
         });
+        self.service_published(now, nodes);
         self.icmp_service(nodes);
         let mut gone = Vec::new();
         let mut failures = Vec::new();
@@ -380,7 +549,10 @@ impl Gateway {
                 .node
                 .sockets
                 .get_mut::<tcp::Socket>(flow.handle.unwrap());
-            if matches!(t.state(), tcp::State::Listen | tcp::State::SynReceived) {
+            if matches!(
+                t.state(),
+                tcp::State::Listen | tcp::State::SynReceived | tcp::State::SynSent
+            ) {
                 continue;
             }
             t.set_timeout(None);
@@ -585,7 +757,11 @@ impl Gateway {
         self.dns_service(nodes);
     }
     pub fn waiters(&self) -> Vec<(Arc<native::Socket>, u16)> {
-        let mut waiters = Vec::new();
+        let mut waiters: Vec<_> = self
+            .published
+            .iter()
+            .map(|p| (p.native.clone(), 1))
+            .collect();
         waiters.extend(
             self.icmp
                 .iter()

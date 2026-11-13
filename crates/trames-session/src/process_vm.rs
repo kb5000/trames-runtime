@@ -1279,7 +1279,7 @@ mod tests {
                     if let Some(info) = vfs
                         .fd_snapshot()
                         .into_iter()
-                        .find(|info| info.target == b"/dev/trames-bridge")
+                        .find(|info| info.target == b"/dev/trames/info")
                     {
                         let sender = vfs
                             .shared_files()
@@ -1324,7 +1324,7 @@ mod tests {
                 if id == 1 {
                     p.linux.vfs.set_runtime_info(1, Default::default());
                     p.linux.vfs.attach_bridge(Default::default());
-                    p.memory.write(0x1000, b"/dev/trames-bridge\0").unwrap();
+                    p.memory.write(0x1000, b"/dev/trames/info\0").unwrap();
                     map(&mut p, 0x3000, done.clone(), None);
                     for (i, value) in [(-100i64) as u64, 0x1000, 2, 0].into_iter().enumerate() {
                         p.cpu.set_x(i, value);

@@ -518,7 +518,7 @@ mod tests {
                     .next()
                     .unwrap();
                 v.stat_at_flags(fd as i32, name, true).unwrap();
-                found |= name == b"trames-bridge";
+                found |= name == b"trames";
                 at += length;
             }
             assert_eq!(found, attached);
@@ -1044,7 +1044,7 @@ pub(super) enum Device {
     Urandom,
     Pts(u32, u32), // scheduler identity, devpts-local slave number
     Ptmx,
-    Bridge,
+    Bridge(trames_bridge::Channel),
     Vda,
     Vda1,
 }
@@ -1089,7 +1089,7 @@ impl Device {
             Self::Urandom => 0x109,
             Self::Pts(_, number) => ((136 + number / 256) as u64) << 8 | (number % 256) as u64,
             Self::Ptmx => 0x502,
-            Self::Bridge => 0xf000,
+            Self::Bridge(channel) => 0xf000 + channel as u64,
             Self::Vda => 0xfd00,
             Self::Vda1 => 0xfd01,
         }
@@ -1105,7 +1105,7 @@ impl Device {
             Self::Kmsg => return Err(Errno(29)),
             Self::Pts(_, _) => return Err(Errno(11)),
             Self::Ptmx => return Err(Errno(95)),
-            Self::Bridge => return Err(Errno(19)),
+            Self::Bridge(_) => return Err(Errno(19)),
             Self::Vda | Self::Vda1 => return Err(Errno(95)),
         }
         Ok(data)
@@ -1119,7 +1119,7 @@ impl Device {
             Self::Kmsg => Err(Errno(29)),
             Self::Pts(_, _) => Err(Errno(11)),
             Self::Ptmx => Err(Errno(95)),
-            Self::Bridge => Err(Errno(19)),
+            Self::Bridge(_) => Err(Errno(19)),
             Self::Vda | Self::Vda1 => Err(Errno(95)),
             _ => Ok(data.len()),
         }
@@ -1732,15 +1732,20 @@ impl Vfs {
                     | b"/dev/sw_sync"
                     | b"/dev/vda"
                     | b"/dev/vda1"
-                    | b"/dev/trames-bridge"
-            ) || [b"/dev/pts".as_slice(), b"/dev/dri", b"/dev/block"]
-                .iter()
-                .any(|base| {
-                    path == *base
-                        || path
-                            .strip_prefix(*base)
-                            .is_some_and(|p| p.starts_with(b"/"))
-                });
+                    | b"/dev/trames"
+            ) || [
+                b"/dev/pts".as_slice(),
+                b"/dev/dri",
+                b"/dev/block",
+                b"/dev/trames",
+            ]
+            .iter()
+            .any(|base| {
+                path == *base
+                    || path
+                        .strip_prefix(*base)
+                        .is_some_and(|p| p.starts_with(b"/"))
+            });
             if !owner {
                 return Ok(None);
             }
@@ -1767,6 +1772,16 @@ impl Vfs {
         let directory = || Some((Content::Directory, 0o40555));
         let regular = |value: Vec<u8>| Some((file(value), 0o100444));
         let link = |value: Vec<u8>| Some((Content::Symlink(value), 0o120777));
+        if let Some(tail) = path.strip_prefix(b"/dev/trames/") {
+            if let Some(broker) = &self.bridge {
+                for channel in trames_bridge::Channel::ALL {
+                    if tail == channel.name().as_bytes() && broker.enabled(channel) {
+                        return Ok(Some((Content::Device(Device::Bridge(channel)), 0o20600)));
+                    }
+                }
+            }
+            return Err(Errno(2));
+        }
         if let Some(tail) = path.strip_prefix(b"/dev/pts/") {
             if let Some(id) = std::str::from_utf8(tail)
                 .ok()
@@ -1837,7 +1852,7 @@ impl Vfs {
                 let fd = if path == b"/dev/stdin" { 0 } else if path == b"/dev/stdout" { 1 } else { 2 };
                 return Ok(link(format!("/proc/self/fd/{fd}").into_bytes()));
             }
-            b"/dev/trames-bridge" if self.bridge.is_some() => return Ok(Some((Content::Device(Device::Bridge), 0o20600))),
+            b"/dev/trames" if self.bridge.is_some()=>return Ok(directory()),
             b"/dev/kmsg" => return Ok(Some((Content::Device(Device::Kmsg),0o20600))),
             b"/dev/binder" => return Ok(Some((Content::Device(Device::Binder(0)),0o20666))),
             b"/dev/sw_sync" | b"/sys/kernel/debug/sync/sw_sync" => return Ok(Some((Content::Device(Device::SwSync),0o20666))),
@@ -2747,7 +2762,17 @@ impl Vfs {
             }
         }
         if path == b"/dev" && self.bridge.is_some() {
-            names.push(b"trames-bridge".to_vec());
+            names.push(b"trames".to_vec());
+        }
+        if path == b"/dev/trames" {
+            if let Some(broker) = &self.bridge {
+                names.extend(
+                    trames_bridge::Channel::ALL
+                        .into_iter()
+                        .filter(|c| broker.enabled(*c))
+                        .map(|c| c.name().as_bytes().to_vec()),
+                );
+            }
         }
         let pseudo = self.pseudo.borrow();
         let r = self.proc_runtime(at, &pseudo.runtime);

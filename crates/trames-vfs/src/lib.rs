@@ -2615,18 +2615,18 @@ impl Vfs {
         {
             return Err(Errno(6));
         }
-        let bridge = if flags & O_PATH == 0
-            && matches!(
-                node.borrow().content,
-                Content::Device(pseudo::Device::Bridge)
-            ) {
-            Some(
-                self.bridge
-                    .as_ref()
-                    .ok_or(Errno(19))?
-                    .connect()
-                    .map_err(Errno)?,
-            )
+        let bridge = if flags & O_PATH == 0 {
+            if let Content::Device(pseudo::Device::Bridge(channel)) = node.borrow().content {
+                Some(
+                    self.bridge
+                        .as_ref()
+                        .ok_or(Errno(19))?
+                        .connect_channel(channel)
+                        .map_err(Errno)?,
+                )
+            } else {
+                None
+            }
         } else {
             None
         };

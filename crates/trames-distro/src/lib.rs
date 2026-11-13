@@ -3,6 +3,7 @@
 pub mod android;
 pub mod android_package;
 pub mod boot;
+pub mod environment;
 pub mod packages;
 pub mod rootfs;
 pub mod systemd;

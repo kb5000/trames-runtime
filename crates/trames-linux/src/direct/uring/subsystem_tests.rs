@@ -160,7 +160,7 @@ fn native_device_scalar_vector_and_positioned_errors_share_the_original_abi() {
         b"/dev/dri/renderD128".as_slice(),
         b"/dev/vda",
         b"/dev/vda1",
-        b"/dev/trames-bridge",
+        b"/dev/trames/info",
     ] {
         for flags in [0, 1, 2, 0x200000] {
             let fd = l.vfs.open_at(-100, path, flags, 0).unwrap() as u64;
@@ -188,7 +188,7 @@ fn native_device_scalar_vector_and_positioned_errors_share_the_original_abi() {
                     }
                 }
             }
-            if path != b"/dev/trames-bridge" {
+            if path != b"/dev/trames/info" {
                 calls.extend([
                     (63, [fd, 0x2100, 1, 0, 0, 0]),
                     (64, [fd, 0x2100, 1, 0, 0, 0]),
@@ -228,7 +228,7 @@ fn native_device_opens_and_bridge_requests_use_original_source_resources() {
         b"/dev/kmsg",
         b"/dev/vda",
         b"/dev/vda1",
-        b"/dev/trames-bridge",
+        b"/dev/trames/info",
     ]
     .into_iter()
     .enumerate()
@@ -239,7 +239,7 @@ fn native_device_opens_and_bridge_requests_use_original_source_resources() {
         let fd = submit(&d, &mut m, ring_fd, &ring, open, &t);
         assert!(fd >= 0, "{} returned {fd}", String::from_utf8_lossy(path));
         assert!(l.vfs.stat_fd(fd as u32).is_ok());
-        if path == b"/dev/trames-bridge" {
+        if path == b"/dev/trames/info" {
             let fd = fd as u32;
             let frame = b"{\"version\":1,\"id\":7,\"method\":\"bridge.info\",\"params\":{}}\n";
             m.write(0x3000, frame).unwrap();

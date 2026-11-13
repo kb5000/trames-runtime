@@ -23,7 +23,117 @@ const METHODS: &[&str] = &[
     "files.import",
     "files.export",
     "device.info",
+    "host.cli",
+    "host.exec",
+    "ports.list",
+    "ports.add",
+    "ports.remove",
+    "mounts.list",
+    "mounts.add",
+    "mounts.remove",
 ];
+/// Low-frequency host authority. Native API thunks do not use these channels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Channel {
+    Info = 0,
+    HostControl = 1,
+    HostExec = 2,
+    Files = 3,
+    Ports = 4,
+    Mounts = 5,
+    Clipboard = 6,
+}
+impl Channel {
+    pub const ALL: [Self; 7] = [
+        Self::Info,
+        Self::HostControl,
+        Self::HostExec,
+        Self::Files,
+        Self::Ports,
+        Self::Mounts,
+        Self::Clipboard,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::HostControl => "host-control",
+            Self::HostExec => "host-exec",
+            Self::Files => "file-transfer",
+            Self::Ports => "port-forward",
+            Self::Mounts => "mount-control",
+            Self::Clipboard => "clipboard",
+        }
+    }
+    fn permits(self, method: &str) -> bool {
+        if method == "bridge.info" || method == "device.info" || method == "request.cancel" {
+            return true;
+        }
+        match self {
+            Self::Info => method.starts_with("accel."),
+            Self::HostControl => matches!(method, "url.open" | "host.cli"),
+            Self::Clipboard => matches!(method, "clipboard.read" | "clipboard.write"),
+            Self::HostExec => method == "host.exec",
+            Self::Files => method.starts_with("files."),
+            Self::Ports => method.starts_with("ports."),
+            Self::Mounts => method.starts_with("mounts."),
+        }
+    }
+}
+#[derive(Clone, Copy, Debug)]
+pub struct Policy(u16);
+impl Default for Policy {
+    fn default() -> Self {
+        Self(1)
+    }
+}
+impl Policy {
+    pub fn new(host_ui: bool, host_exec: bool, files: bool, ports: bool, mounts: bool) -> Self {
+        Self(
+            1 | (u16::from(host_ui) << 1)
+                | (u16::from(host_exec) << 2)
+                | (u16::from(files) << 3)
+                | (u16::from(ports) << 4)
+                | (u16::from(mounts) << 5),
+        )
+    }
+    pub fn with_cli(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.0 |= 1 << 7;
+        } else {
+            self.0 &= !(1 << 7);
+        }
+        self
+    }
+    pub fn with_clipboard(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.0 |= 1 << 6;
+        } else {
+            self.0 &= !(1 << 6);
+        }
+        self
+    }
+    pub fn allows(self, channel: Channel) -> bool {
+        if channel == Channel::HostControl {
+            self.0 & (2 | (1 << 7)) != 0
+        } else {
+            self.0 & (1 << channel as u8) != 0
+        }
+    }
+    fn permits(self, channel: Channel, method: &str) -> bool {
+        self.allows(channel)
+            && channel.permits(method)
+            && if method == "host.cli" {
+                self.0 & (1 << 7) != 0
+            } else if channel == Channel::HostControl
+                && !matches!(method, "bridge.info" | "device.info" | "request.cancel")
+            {
+                self.0 & 2 != 0
+            } else {
+                true
+            }
+    }
+}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
@@ -32,7 +142,7 @@ pub struct Request {
     pub method: String,
     pub params: Value,
 }
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct HostRequest {
     pub ticket: u64,
     pub request: Request,
@@ -65,6 +175,7 @@ struct Stream {
     readiness: Arc<trames_shared::Readiness>,
     epoch: [u64; 2],
     slot: usize,
+    channel: Option<Channel>,
 }
 struct Pending {
     connection: u64,
@@ -75,19 +186,25 @@ struct Pending {
 #[derive(Default)]
 struct State {
     next: u64,
+    policy: Policy,
+    host_wake: Option<Arc<trames_shared::HostWake>>,
+    host_pending: bool,
     streams: BTreeMap<u64, Stream>,
     pending: BTreeMap<u64, Pending>,
     accel: hash::Registry,
     changed: [Option<Arc<trames_shared::Readiness>>; MAX_CONNECTIONS],
 }
 #[derive(Clone, Default)]
-pub struct Broker(Arc<Mutex<State>>);
+pub struct Broker(Arc<Mutex<State>>, Arc<std::sync::atomic::AtomicBool>);
 pub struct Connection {
     broker: Broker,
     id: u64,
     readiness: Arc<trames_shared::Readiness>,
 }
-struct Guard<'a>(Option<MutexGuard<'a, State>>);
+struct Guard<'a>(
+    Option<MutexGuard<'a, State>>,
+    &'a std::sync::atomic::AtomicBool,
+);
 impl std::ops::Deref for Guard<'_> {
     type Target = State;
     fn deref(&self) -> &State {
@@ -101,8 +218,25 @@ impl std::ops::DerefMut for Guard<'_> {
 }
 impl Drop for Guard<'_> {
     fn drop(&mut self) {
+        self.1.store(
+            self.0
+                .as_ref()
+                .unwrap()
+                .pending
+                .values()
+                .any(|p| !p.dispatched),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let notifications = std::mem::take(&mut self.0.as_mut().unwrap().changed);
+        let wake = if std::mem::take(&mut self.0.as_mut().unwrap().host_pending) {
+            self.0.as_ref().unwrap().host_wake.clone()
+        } else {
+            None
+        };
         drop(self.0.take());
+        if let Some(wake) = wake {
+            wake.notify();
+        }
         for ready in notifications.into_iter().flatten() {
             ready.notify_locked();
         }
@@ -123,6 +257,7 @@ impl Drop for Connection {
                 s.changed[stream.slot] = Some(self.readiness.clone());
             }
             s.pending.retain(|_, p| p.connection != self.id);
+            s.host_pending = true;
         }
     }
 }
@@ -166,10 +301,64 @@ fn expire(s: &mut State, now: Instant) {
 }
 impl Broker {
     fn lock(&self) -> Result<Guard<'_>, u32> {
-        self.0.lock().map(|guard| Guard(Some(guard))).map_err(|_| 5)
+        self.0
+            .lock()
+            .map(|guard| Guard(Some(guard), &self.1))
+            .map_err(|_| 5)
     }
-    pub fn connect(&self) -> Result<Arc<Connection>, u32> {
+    pub fn host_ready(&self) -> bool {
+        self.1.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn bind_host_wake(&self, wake: Arc<trames_shared::HostWake>) {
+        if let Ok(mut s) = self.lock() {
+            s.host_wake = Some(wake);
+        }
+    }
+    pub fn enabled(&self, channel: Channel) -> bool {
+        self.0.lock().is_ok_and(|s| s.policy.allows(channel))
+    }
+    pub fn configure(&self, policy: Policy) -> Result<(), u32> {
         let mut s = self.lock()?;
+        s.policy = policy;
+        s.host_pending = true;
+        let denied: Vec<_> = s
+            .pending
+            .iter()
+            .filter(|(_, p)| {
+                s.streams
+                    .get(&p.connection)
+                    .and_then(|stream| stream.channel)
+                    .is_some_and(|c| !policy.permits(c, &p.request.method))
+            })
+            .map(|(&t, _)| t)
+            .collect();
+        for ticket in denied {
+            if let Some(p) = s.pending.remove(&ticket) {
+                output(
+                    &mut s,
+                    p.connection,
+                    failure(
+                        Some(p.request.id),
+                        "permission_denied",
+                        "Host capability was revoked",
+                    ),
+                )?;
+            }
+        }
+        Ok(())
+    }
+    /// Trusted host-only connection used by embedders/tests, never selected by mknod.
+    pub fn connect(&self) -> Result<Arc<Connection>, u32> {
+        self.connection(None)
+    }
+    pub fn connect_channel(&self, channel: Channel) -> Result<Arc<Connection>, u32> {
+        self.connection(Some(channel))
+    }
+    fn connection(&self, channel: Option<Channel>) -> Result<Arc<Connection>, u32> {
+        let mut s = self.lock()?;
+        if channel.is_some_and(|channel| !s.policy.allows(channel)) {
+            return Err(13);
+        }
         if s.streams.len() >= MAX_CONNECTIONS {
             return Err(24);
         }
@@ -188,6 +377,7 @@ impl Broker {
                 readiness: readiness.clone(),
                 epoch: [0; 2],
                 slot,
+                channel,
             },
         );
         let connection = Arc::new(Connection {
@@ -221,6 +411,15 @@ impl Broker {
         s.pending.get_mut(&ticket).ok_or(5u32)?.dispatched = true;
         Ok(Some(data))
     }
+    pub fn deadline(&self) -> Option<Instant> {
+        self.0
+            .lock()
+            .ok()?
+            .pending
+            .values()
+            .map(|p| p.deadline)
+            .min()
+    }
     pub fn active(&self, ticket: u64) -> bool {
         let Ok(mut s) = self.lock() else {
             return false;
@@ -229,6 +428,23 @@ impl Broker {
         s.pending
             .get(&ticket)
             .is_some_and(|p| p.deadline > Instant::now())
+    }
+    /// One bounded streaming control frame; backpressure stays on this open.
+    pub fn stream(&self, ticket: u64, value: Value, done: bool) -> Result<(), u32> {
+        let mut s = self.lock()?;
+        expire(&mut s, Instant::now());
+        let p = s.pending.get(&ticket).ok_or(2u32)?;
+        let connection = p.connection;
+        let id = p.request.id;
+        output(
+            &mut s,
+            connection,
+            json!({"version":VERSION,"id":id,"result":value}),
+        )?;
+        if done {
+            s.pending.remove(&ticket);
+        }
+        Ok(())
     }
     pub fn reply(&self, bytes: &[u8]) -> Result<(), u32> {
         if bytes.len() > MAX_FRAME {
@@ -322,6 +538,7 @@ impl Connection {
             .drain(..count.min(stream.output.len()))
             .collect();
         if !bytes.is_empty() {
+            s.host_pending = true;
             s.changed(self.id, 1);
         }
         Ok(bytes)
@@ -385,6 +602,22 @@ fn submit(s: &mut State, connection: u64, frame: &[u8]) -> Result<(), u32> {
         }
     };
     let id = Some(request.id);
+    if s.streams
+        .get(&connection)
+        .and_then(|stream| stream.channel)
+        .is_some_and(|channel| !s.policy.permits(channel, &request.method))
+    {
+        output(
+            s,
+            connection,
+            failure(
+                id,
+                "permission_denied",
+                "Method is outside this device capability",
+            ),
+        )?;
+        return Ok(());
+    }
     if request.version != VERSION || !request.params.is_object() || request.method.len() > 64 {
         output(
             s,
@@ -409,6 +642,7 @@ fn submit(s: &mut State, connection: u64, frame: &[u8]) -> Result<(), u32> {
             .find(|(_, p)| p.connection == connection && Some(p.request.id) == target)
             .map(|(&t, _)| t);
         if let Some(t) = ticket {
+            s.host_pending = true;
             let p = s.pending.remove(&t).ok_or(5u32)?;
             output(
                 s,
@@ -422,10 +656,15 @@ fn submit(s: &mut State, connection: u64, frame: &[u8]) -> Result<(), u32> {
             json!({"version":VERSION,"id":id,"result":{"cancelled":ticket.is_some()}}),
         )?;
     } else if request.method == "bridge.info" {
+        let channel = s.streams.get(&connection).and_then(|stream| stream.channel);
+        let methods: Vec<_> = METHODS
+            .iter()
+            .filter(|method| channel.is_none_or(|channel| s.policy.permits(channel, method)))
+            .collect();
         output(
             s,
             connection,
-            json!({"version":VERSION,"id":id,"result":{"protocol":VERSION,"methods":METHODS,"max_frame":MAX_FRAME,"consent":"per_request"}}),
+            json!({"version":VERSION,"id":id,"result":{"protocol":VERSION,"methods":methods,"max_frame":MAX_FRAME,"consent":"host_authorized"}}),
         )?;
     } else if request.method.starts_with("accel.") {
         let value = match request.method.as_str() {
@@ -490,6 +729,7 @@ fn submit(s: &mut State, connection: u64, frame: &[u8]) -> Result<(), u32> {
             failure(id, "busy", "Native request limit reached"),
         )?;
     } else {
+        s.host_pending = true;
         let ticket = next(s)?;
         s.pending.insert(
             ticket,
@@ -782,5 +1022,35 @@ mod tests {
         assert!(matches!(b.connect(), Err(24)));
         drop(connections);
         assert!(b.connect().is_ok());
+    }
+    #[test]
+    fn clipboard_cli_and_host_exec_have_independent_authority() {
+        let b = Broker::default();
+        b.configure(Policy::new(true, false, false, false, false))
+            .unwrap();
+        assert!(!b.enabled(Channel::Clipboard));
+        let control = b.connect_channel(Channel::HostControl).unwrap();
+        request(&control, 1, "clipboard.read", json!({}));
+        assert!(String::from_utf8(control.read(32768).unwrap())
+            .unwrap()
+            .contains("permission_denied"));
+        request(&control, 2, "host.cli", json!({"argv":["--version"]}));
+        assert!(String::from_utf8(control.read(32768).unwrap())
+            .unwrap()
+            .contains("permission_denied"));
+        b.configure(Policy::default().with_clipboard(true)).unwrap();
+        assert!(!b.enabled(Channel::HostControl));
+        assert!(!b.enabled(Channel::HostExec));
+        let clip = b.connect_channel(Channel::Clipboard).unwrap();
+        request(&clip, 3, "clipboard.write", json!({"text":"剪贴板 🧪"}));
+        assert!(b.poll(MAX_FRAME).unwrap().is_some());
+        b.configure(Default::default()).unwrap();
+        assert!(String::from_utf8(clip.read(32768).unwrap())
+            .unwrap()
+            .contains("permission_denied"));
+        request(&clip, 4, "clipboard.read", json!({}));
+        assert!(String::from_utf8(clip.read(32768).unwrap())
+            .unwrap()
+            .contains("permission_denied"));
     }
 }

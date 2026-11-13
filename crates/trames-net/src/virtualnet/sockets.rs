@@ -197,10 +197,11 @@ impl Socket {
         }
         if private_ip(v) && v != IpAddr::V4(v4(1)) && v != IpAddr::V6(v6(1)) {
             let i = self.network.0.fabric.0.borrow();
-            if !i
-                .nodes
-                .values()
-                .any(|n| v == IpAddr::V4(v4(n.id)) || v == IpAddr::V6(v6(n.id)))
+            if i.external.is_none()
+                && !i
+                    .nodes
+                    .values()
+                    .any(|n| v == IpAddr::V4(v4(n.id)) || v == IpAddr::V6(v6(n.id)))
             {
                 return Err(NetError(113));
             }

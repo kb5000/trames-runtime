@@ -206,6 +206,9 @@ impl NativeTerminals {
 
 /// Quote actual argv values twice: once for the child shell, once for the launcher.
 pub fn launcher(command: &[String]) -> String {
+    launcher_at(command, None)
+}
+pub fn launcher_at(command: &[String], cwd: Option<&str>) -> String {
     fn quote(s: &str) -> String {
         format!("'{}'", s.replace('\'', "'\"'\"'"))
     }
@@ -214,6 +217,9 @@ pub fn launcher(command: &[String]) -> String {
         .map(|s| quote(s))
         .collect::<Vec<_>>()
         .join(" ");
-    let child = format!("exec {command} <\"$1\" >\"$1\" 2>&1");
+    let prefix = cwd
+        .map(|cwd| format!("cd {} && ", quote(cwd)))
+        .unwrap_or_default();
+    let child = format!("{prefix}exec {command} <\"$1\" >\"$1\" 2>&1");
     format!("set -m; trap '' CHLD; while :; do if IFS= read -r tty <&3; then setsid /bin/sh -c {} sh \"$tty\" 3<&- & fi; done",quote(&child))
 }
