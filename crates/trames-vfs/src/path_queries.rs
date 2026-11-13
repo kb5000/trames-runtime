@@ -177,6 +177,7 @@ impl Vfs {
         view.credentials = self.credentials.clone();
         view.dumpable = self.dumpable.clone();
         view.kernel_log = self.kernel_log.clone();
+        view.binder = self.binder.clone();
         view.bridge = self.bridge.clone();
         view.native_services = self.native_services.clone();
         view.uts = self.uts.clone();

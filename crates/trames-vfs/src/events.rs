@@ -39,6 +39,7 @@ impl SignalMask {
     }
 }
 pub(super) enum SharedControl {
+    Binder(Arc<binder::Connection>),
     Cgroup(Arc<cgroup::CgroupFile>),
     Uring(Arc<Uring>),
     Signal(Arc<SignalMask>),
@@ -62,7 +63,7 @@ impl SharedControl {
     }
     pub(super) fn owner_projection(&self) -> Option<Anonymous> {
         Some(match self {
-            Self::Cgroup(_) => return None,
+            Self::Cgroup(_) | Self::Binder(_) => return None,
             Self::Uring(ring) => Anonymous::Uring(ring.clone()),
             Self::Signal(mask) => Anonymous::Signal(mask.clone()),
             Self::Bpf(program) => Anonymous::Bpf(program.clone()),
@@ -305,6 +306,9 @@ impl Vfs {
         Self::poll_epoch_with(o, None)
     }
     fn poll_epoch_with(o: &OpenDescription, reader: Option<&Arc<dyn SignalReader>>) -> [u64; 2] {
+        if let Some(SharedControl::Binder(process)) = &o.control {
+            return process.poll(0).1;
+        }
         if let Some(SharedControl::Cgroup(file)) = &o.control {
             return file.poll(0).1;
         }

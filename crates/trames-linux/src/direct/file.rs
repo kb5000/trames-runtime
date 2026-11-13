@@ -348,6 +348,7 @@ impl DirectSyscalls {
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
         let pending = PendingIo {
+            binder: None,
             aio: None,
             number,
             args,
@@ -902,6 +903,7 @@ impl DirectSyscalls {
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
         IoAttempt::Blocked(PendingIo {
+            binder: None,
             aio: None,
             number,
             args,
@@ -967,6 +969,7 @@ impl DirectSyscalls {
             .lock()
             .unwrap() = Some(work);
         IoAttempt::Blocked(PendingIo {
+            binder: None,
             aio: None,
             number,
             args,

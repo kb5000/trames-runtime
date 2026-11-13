@@ -348,6 +348,25 @@ pub(super) enum PollOpen {
     Epoll(Arc<SharedOpenDescription>),
 }
 impl SharedFiles {
+    /// Buffer-owned Android FDA cleanup must not consume a reused descriptor.
+    pub(crate) fn close_if_slot(&self, fd: u32, identity: &CloseOnExec, owner: u32) {
+        let retired = {
+            let mut entries = self.0.entries.lock().unwrap();
+            let same = entries
+                .get(&fd)
+                .is_some_and(|s| s.cloexec.same_slot(identity));
+            if !same {
+                return;
+            }
+            let retired = entries.remove(&fd);
+            self.changed(&mut entries);
+            retired
+        };
+        if let Some(retired) = retired {
+            retired.release_record_locks(owner);
+            drop(retired);
+        }
+    }
     /// Retain the complete original OFD for an observation, including control
     /// descriptions whose byte operations have a separate implementation.
     pub(super) fn observation_descriptor(&self, fd: u32) -> Result<Descriptor> {

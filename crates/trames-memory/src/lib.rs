@@ -298,11 +298,21 @@ impl Memory {
         let account = self.fork_account();
         let identity = NEXT_SPACE.fetch_add(1, Ordering::Relaxed);
         let mut frames = Slots::new();
+        let mut excluded = BTreeSet::new();
         for source in self.frames.iter() {
             let Some(source) = source else {
                 frames.push(None);
                 continue;
             };
+            if source
+                .backing
+                .as_ref()
+                .is_some_and(|b| !b.object.inherit_on_fork())
+            {
+                excluded.insert(frames.len());
+                frames.push(None);
+                continue;
+            }
             let pinned = !self.pinned.is_empty() && self.page_pinned(source);
             let resident = source.charge.resident();
             let mut page = source.clone();
@@ -319,7 +329,15 @@ impl Memory {
         }
         let mut cloned = Self {
             mmu: self.mmu.empty_like(),
-            pages: self.pages.clone(),
+            pages: if excluded.is_empty() {
+                self.pages.clone()
+            } else {
+                self.pages
+                    .iter()
+                    .filter(|(_, frame)| !excluded.contains(frame))
+                    .map(|(base, frame)| (*base, *frame))
+                    .collect()
+            },
             anonymous: self.anonymous.fork(&account),
             sparse_pages: RefCell::new(BTreeMap::new()),
             parallel_anonymous_dirty: false,
@@ -354,6 +372,16 @@ impl Memory {
             parallel_mappings: BTreeSet::new(),
             parallel_reservations_dirty: false,
         };
+        if !excluded.is_empty() {
+            for (&base, frame) in &self.pages {
+                if excluded.contains(frame) {
+                    Arc::make_mut(&mut cloned.region_layout).replace(base, base + PAGE_SIZE, None);
+                }
+            }
+            for frame in excluded {
+                cloned.free_frames.push(frame);
+            }
+        }
         // A retained worker can have reached pages absent from the coordinator's
         // descriptor table. Fork them through the same COW boundary as pages.
         for base in self.anonymous.populated() {
@@ -876,6 +904,9 @@ impl Memory {
                 self.parallel_mappings.insert(base);
             }
             let frame = self.pages.remove(&base).expect("mapped frame");
+            if let Some(backing) = self.frames[frame].as_ref().and_then(|p| p.backing.as_ref()) {
+                backing.object.unmapped();
+            }
             self.frames[frame] = None;
             self.free_frames.push(frame);
         }
@@ -970,9 +1001,13 @@ impl Memory {
                 });
             }
             if permissions.write
-                && p.backing
-                    .as_ref()
-                    .is_some_and(|b| b.shared && !b.object.writable())
+                && p.backing.as_ref().is_some_and(|b| {
+                    if b.shared {
+                        !b.object.writable()
+                    } else {
+                        !b.object.private_writable()
+                    }
+                })
             {
                 return Err(MemoryError::Permission {
                     address: base,

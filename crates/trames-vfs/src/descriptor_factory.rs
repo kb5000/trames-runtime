@@ -15,6 +15,7 @@ pub struct DescriptorFactory {
     terminal_task: Option<Arc<dyn pty::TerminalTask>>,
     devices: cgroup::DeviceAuthority,
     pub(super) cgroups: Arc<SharedCell<cgroup::Cgroups>>,
+    pub(super) binder: Arc<binder::Contexts>,
 }
 pub(super) struct OpenIds {
     next: AtomicU64,
@@ -45,6 +46,7 @@ impl Vfs {
             terminal_task: self.terminal_task(),
             devices: self.device_access(),
             cgroups: self.cgroups.clone(),
+            binder: self.binder.clone(),
         }
     }
 }

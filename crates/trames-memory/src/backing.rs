@@ -59,6 +59,11 @@ impl SyncRange {
 /// Implementations synchronize their own metadata and physical byte owners;
 /// Send + Sync does not authorize concurrent structural changes to a Memory.
 pub trait PageBacking: Send + Sync {
+    /// Cold fork policy for device mappings (Linux VM_DONTCOPY). Thread clones
+    /// sharing the same mm keep the original mapping and never consult this.
+    fn inherit_on_fork(&self) -> bool {
+        true
+    }
     /// Publication admission for an original file's physical layout. Only
     /// mapping/snapshot construction consults this; CPU byte access does not.
     fn layout(&self) -> Option<Arc<crate::layout::Layout>> {
@@ -206,6 +211,13 @@ pub trait PageBacking: Send + Sync {
     }
     fn version(&self) -> u64;
     fn writable(&self) -> bool;
+    /// Maximum private/COW permission for special device mappings. Ordinary
+    /// read-only files may still create writable private copies.
+    fn private_writable(&self) -> bool {
+        true
+    }
+    /// Original VMA removal, before retained byte snapshots are reclaimed.
+    fn unmapped(&self) {}
     /// Maximum mapping permission, sampled by mmap/mprotect, never CPU loads.
     fn executable(&self) -> bool {
         true
@@ -326,7 +338,15 @@ impl Memory {
             .checked_mul(PAGE_SIZE)
             .ok_or(MemoryError::Limit)?;
         Self::mapping_end(address, len)?;
-        if shared_mapping && permissions.write && objects.iter().any(|b| !b.writable()) {
+        if permissions.write
+            && objects.iter().any(|b| {
+                if shared_mapping {
+                    !b.writable()
+                } else {
+                    !b.private_writable()
+                }
+            })
+        {
             return Err(MemoryError::Permission {
                 address,
                 access: Access::Write,

@@ -319,7 +319,7 @@ impl Vfs {
         let mut n = node.borrow_mut();
         let current = n.seals.ok_or(Errno(22))?;
         let Some(add) = add else { return Ok(current) };
-        if add & !15 != 0 {
+        if add & !31 != 0 {
             return Err(Errno(22));
         }
         if o.flags.get() & 3 != 2 || current & 1 != 0 {
@@ -380,3 +380,72 @@ mod allocation_tests {
 #[cfg(test)]
 #[path = "memfd_source_tests.rs"]
 mod source_tests;
+
+#[cfg(test)]
+mod future_write_tests {
+    use super::*;
+    use trames_memory::{Memory, Permissions, PAGE_SIZE};
+    #[test]
+    fn future_write_preserves_old_vma_rights_but_denies_new_write_entries() {
+        let mut v = Vfs::default();
+        let fd = v.memfd_create(b"android", 3).unwrap();
+        v.truncate_fd(fd, PAGE_SIZE).unwrap();
+        let mut memory = Memory::default();
+        memory
+            .map_backed(
+                0x1000,
+                v.mapping_pages(fd, 0, PAGE_SIZE, true, true).unwrap(),
+                true,
+                Permissions::RW,
+                false,
+            )
+            .unwrap();
+        memory
+            .map_backed(
+                0x2000,
+                v.mapping_pages(fd, 0, PAGE_SIZE, true, false).unwrap(),
+                true,
+                Permissions {
+                    read: true,
+                    write: false,
+                    execute: false,
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(v.seals(fd, Some(0x10)), Ok(0));
+        assert_eq!(v.seals(fd, None), Ok(0x10));
+        assert_eq!(v.write(fd, b"new"), Err(Errno(1)));
+        assert_eq!(v.pwrite(fd, b"new", 0), Err(Errno(1)));
+        assert!(matches!(
+            v.mapping_pages(fd, 0, PAGE_SIZE, true, true),
+            Err(Errno(1))
+        ));
+        memory.write(0x1000, b"old").unwrap();
+        memory.protect(0x2000, PAGE_SIZE, Permissions::RW).unwrap();
+        memory.write(0x2000, b"vma").unwrap();
+        assert_eq!(v.pread(fd, 3, 0).unwrap(), b"vma");
+        let pages = v.mapping_pages(fd, 0, PAGE_SIZE, true, false).unwrap();
+        memory
+            .map_backed(
+                0x3000,
+                pages,
+                true,
+                Permissions {
+                    read: true,
+                    write: false,
+                    execute: false,
+                },
+                false,
+            )
+            .unwrap();
+        assert!(memory.protect(0x3000, PAGE_SIZE, Permissions::RW).is_err());
+        // This seal does not imply GROW/SHRINK. Android sizes a new sealed
+        // memfd after sealing it; both operations must remain legal.
+        v.truncate_fd(fd, PAGE_SIZE * 2).unwrap();
+        v.truncate_fd(fd, PAGE_SIZE).unwrap();
+        assert_eq!(v.seals(fd, Some(8)), Err(Errno(16)));
+        memory.unmap(0x1000, PAGE_SIZE * 3).unwrap();
+        assert_eq!(v.seals(fd, Some(8)), Ok(0));
+    }
+}

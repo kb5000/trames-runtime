@@ -79,11 +79,12 @@ fn complete_fd_control_uses_original_credentials_and_seals_without_joined_dispat
         fcntl(path, 1034, 0, -9);
         fcntl(foreign, 1034, 0, -22);
         fcntl(seal, 1034, 0, 0);
-        fcntl(seal, 1033, 16, -22);
+        fcntl(seal, 1033, 32, -22);
         fcntl(seal, 1033, 6, 0);
         fcntl(seal, 1034, 0, 6);
+        fcntl(busy, 1033, 16, 0);
         fcntl(busy, 1033, 8, -16);
-        fcntl(busy, 1034, 0, 0);
+        fcntl(busy, 1034, 0, 16);
         fcntl(seal, 1033, 8, 0);
         fcntl(seal, 1034, 0, 14);
         fcntl(seal, 1033, 1, 0);
@@ -151,7 +152,7 @@ fn complete_fd_control_uses_original_credentials_and_seals_without_joined_dispat
             root.linux.vfs.flags(alias).unwrap(),
             2 | trames_vfs::O_NOATIME
         );
-        assert_eq!(root.linux.vfs.seals(busy, None), Ok(0));
+        assert_eq!(root.linux.vfs.seals(busy, None), Ok(16));
         assert_eq!(root.linux.vfs.seals(seal, None), Ok(15));
         assert_eq!(root.linux.vfs.pread(seal, 7, 0).unwrap(), b"payload");
         assert_eq!(k.parallel_rounds, 1);

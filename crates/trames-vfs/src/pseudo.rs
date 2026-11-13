@@ -1030,6 +1030,7 @@ impl PseudoFs {
 }
 #[derive(Clone, Copy)]
 pub(super) enum Device {
+    Binder(u8),
     Render,
     Unregistered(u32),
     Kmsg,
@@ -1065,12 +1066,14 @@ impl Device {
                 0x10b => Self::Kmsg,
                 0x502 => Self::Ptmx,
                 0xe280 => Self::Render,
+                0xf100..=0xf102 => Self::Binder((value - 0xf100) as u8),
                 _ => Self::Unregistered(value),
             }),
         }
     }
     pub(super) fn rdev(self) -> u64 {
         match self {
+            Self::Binder(device) => 0xf100 + device as u64,
             Self::Unregistered(rdev) => rdev as u64,
             Self::Render => 0xe280,
             Self::Kmsg => 0x10b,
@@ -1088,6 +1091,7 @@ impl Device {
     pub(super) fn read(self, count: usize) -> Result<Vec<u8>> {
         let mut data = vec![0; count.min(storage::MAX_TRANSFER)];
         match self {
+            Self::Binder(_) => return Err(Errno(22)),
             Self::Unregistered(_) => return Err(Errno(6)),
             Self::Render => return Err(Errno(22)),
             Self::Zero | Self::Full => {}
@@ -1102,6 +1106,7 @@ impl Device {
     }
     pub(super) fn write(self, data: &[u8]) -> Result<usize> {
         match self {
+            Self::Binder(_) => Err(Errno(22)),
             Self::Unregistered(_) => Err(Errno(6)),
             Self::Render => Err(Errno(22)),
             Self::Full => Err(Errno(28)),
@@ -1704,6 +1709,9 @@ impl Vfs {
                     | b"/dev/stdout"
                     | b"/dev/stderr"
                     | b"/dev/kmsg"
+                    | b"/dev/binder"
+                    | b"/dev/hwbinder"
+                    | b"/dev/vndbinder"
                     | b"/dev/vda"
                     | b"/dev/vda1"
                     | b"/dev/trames-bridge"
@@ -1813,6 +1821,9 @@ impl Vfs {
             }
             b"/dev/trames-bridge" if self.bridge.is_some() => return Ok(Some((Content::Device(Device::Bridge), 0o20600))),
             b"/dev/kmsg" => return Ok(Some((Content::Device(Device::Kmsg),0o20600))),
+            b"/dev/binder" => return Ok(Some((Content::Device(Device::Binder(0)),0o20666))),
+            b"/dev/hwbinder" => return Ok(Some((Content::Device(Device::Binder(1)),0o20666))),
+            b"/dev/vndbinder" => return Ok(Some((Content::Device(Device::Binder(2)),0o20666))),
             b"/dev/vda" => return Ok(Some((Content::Device(Device::Vda),0o60600))),
             b"/dev/vda1" => return Ok(Some((Content::Device(Device::Vda1),0o60600))),
             b"/dev/block/253:0" => return Ok(link(b"../vda".to_vec())),
@@ -1837,6 +1848,10 @@ impl Vfs {
             b"/proc/devices" => return Ok(regular(b"Character devices:\n  1 mem\n  5 /dev/tty\n136 pts\n\nBlock devices:\n253 virtblk\n".to_vec())),
             b"/proc/diskstats" => return Ok(regular(b"253 0 vda 0 0 0 0 0 0 0 0 0 0 0\n253 1 vda1 0 0 0 0 0 0 0 0 0 0 0\n".to_vec())),
             b"/proc/version" => return Ok(regular(b"Linux version 6.0.0-trames (Trames userspace compatibility runtime)\n".to_vec())),
+            // This runtime has no SELinux LSM. Absence of selinuxfs plus this
+            // boot flag means disabled; never synthesize enforce=0 (permissive).
+            b"/proc/cmdline" => return Ok(regular(b"selinux=0\n".to_vec())),
+            b"/proc/bootconfig" => return Ok(regular(Vec::new())),
             b"/proc/cgroups" => return Ok(regular(self.cgroup_subsystems())),
             b"/proc/filesystems" => return Ok(regular(b"nodev\tproc\nnodev\tsysfs\nnodev\tdevpts\nnodev\trootfs\nnodev\ttmpfs\nnodev\tcgroup2\nnodev\tmqueue\nnodev\toverlay\n".to_vec())),
             b"/proc/stat" => {
@@ -2508,13 +2523,30 @@ impl Vfs {
                 "partitions",
                 "devices",
                 "diskstats",
+                "cmdline",
+                "bootconfig",
             ]
             .iter()
             .map(|s| s.as_bytes().to_vec())
             .collect(),
             b"/dev" => [
-                "zero", "full", "random", "urandom", "kmsg", "ptmx", "pts", "fd", "stdin",
-                "stdout", "stderr", "vda", "vda1", "block",
+                "zero",
+                "full",
+                "random",
+                "urandom",
+                "kmsg",
+                "ptmx",
+                "pts",
+                "fd",
+                "stdin",
+                "stdout",
+                "stderr",
+                "vda",
+                "vda1",
+                "block",
+                "binder",
+                "hwbinder",
+                "vndbinder",
             ]
             .iter()
             .map(|s| s.as_bytes().to_vec())

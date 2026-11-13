@@ -916,6 +916,25 @@ pub(super) fn uring_pages(node: &Arc<Inode>, length: u64) -> Result<UringPages> 
 #[derive(Clone)]
 pub struct MappingFile(Descriptor);
 impl MappingFile {
+    /// Binder receive mappings carry their selected original-mm address. Other
+    /// files keep the ordinary offset-only mapping path unchanged.
+    pub fn binder_pages(
+        &self,
+        address: u64,
+        offset: u64,
+        len: u64,
+        writable: bool,
+    ) -> Option<Result<Vec<Arc<dyn PageBacking>>>> {
+        let open = self.0.open.borrow();
+        let events::SharedControl::Binder(process) = open.control.as_ref()? else {
+            return None;
+        };
+        Some(if open.flags.get() & O_PATH != 0 {
+            Err(Errno(9))
+        } else {
+            process.mapping(address, offset, len, writable)
+        })
+    }
     pub fn layout(&self) -> Option<Arc<trames_memory::layout::Layout>> {
         let node = self.0.open.borrow().data_node()?;
         Some(node.layout.get_or_init(Default::default).clone())
@@ -923,6 +942,7 @@ impl MappingFile {
     pub fn executable(&self) -> bool {
         let open = self.0.open.borrow();
         !matches!(open.anonymous, Some(events::Anonymous::Uring(_)))
+            && !matches!(open.control, Some(events::SharedControl::Binder(_)))
             && open
                 .mount
                 .as_ref()
@@ -962,7 +982,7 @@ impl MappingFile {
         if shared && writable && readonly {
             return Err(Errno(30));
         }
-        let sealed = node.borrow().seals.is_some_and(|s| s & 8 != 0);
+        let sealed = node.borrow().seals.is_some_and(|s| s & 0x18 != 0);
         if shared && writable && sealed {
             return Err(Errno(1));
         }

@@ -2720,6 +2720,32 @@ impl<C: Cpu> Kernel<C> {
                     pid,
                     &Arc::downgrade(&self.byte_target),
                 )
+        } else if number == 29
+            && (p
+                .byte_wait
+                .as_ref()
+                .is_some_and(trames_linux::PendingIo::is_binder)
+                || p.linux
+                    .vfs
+                    .binder_file(a[0] as u32)
+                    .ok()
+                    .flatten()
+                    .is_some())
+        {
+            let direct = trames_linux::DirectSyscalls::new(p.linux.vfs.direct_descriptors())
+                .with_resources(p.linux.vfs.descriptor_factory());
+            if let Some(wait) = p.byte_wait.take() {
+                Some(direct.resume(wait, &mut p.memory))
+            } else {
+                direct.start(
+                    number,
+                    a,
+                    &mut p.memory,
+                    pid,
+                    &Arc::downgrade(&self.byte_target),
+                    None,
+                )
+            }
         } else if number == 29 && trames_linux::terminal_query_request(a[1] as u32) {
             match (p.linux.vfs.pty(a[0] as u32), p.linux.vfs.terminal_task()) {
                 (Ok(Some(end)), Some(task)) => Some(trames_linux::IoAttempt::Complete(

@@ -267,7 +267,10 @@ pub(crate) fn execute<C: Cpu>(
             break 'entry None;
         }
         if let Some(snapshot) = work.syscalls.as_ref().filter(|snapshot| {
-            snapshot.seccomp.mode() != 0
+            (snapshot.seccomp.mode() != 0
+                || snapshot
+                    .direct
+                    .supports_binder(work.cpu.x(8) as u32, std::array::from_fn(|i| work.cpu.x(i))))
                 && (trames_linux::DirectSyscalls::file_entry(
                     work.cpu.x(8) as u32,
                     std::array::from_fn(|i| work.cpu.x(i)),

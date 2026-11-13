@@ -12,6 +12,19 @@ pub(crate) fn call(vfs: &mut Vfs, a: [u64; 6], memory: &mut impl CpuMemory) -> R
     if vfs.flags(a[0] as u32)? & trames_vfs::O_PATH != 0 {
         return Err(Errno(9));
     }
+    if let Some(file) = vfs.binder_file(a[0] as u32)? {
+        return match trames_vfs::binder::Ioctl::start(
+            file,
+            vfs.descriptor_factory(),
+            vfs.task_pid(),
+            a[1] as u32,
+            a[2],
+            memory,
+        )? {
+            trames_vfs::binder::Started::Complete(value) => Ok(value),
+            trames_vfs::binder::Started::Read(mut read) => read.finish(memory)?.ok_or(Errno(11)),
+        };
+    }
     if a[1] as u32 == 0x541b {
         if let Some(bytes) = vfs.readable_bytes(a[0] as u32)? {
             memory

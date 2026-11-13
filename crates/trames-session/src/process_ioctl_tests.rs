@@ -27,6 +27,164 @@ fn wait() -> [u32; 7] {
     ]
 }
 #[test]
+fn binder_call_reply_parks_original_workers_with_one_or_many_cpu_slots() {
+    use trames_vfs::binder::{abi as b, Ioctl, Started};
+    fn word(out: &mut [u8], at: usize, value: u64) {
+        out[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    fn wr<C: Cpu>(p: &mut Process<C>, address: u64, write: u64, size: u64, capacity: u64) {
+        let mut header = [0; 48];
+        word(&mut header, 0, size);
+        word(&mut header, 16, write);
+        word(&mut header, 24, capacity);
+        word(&mut header, 40, 0x2000);
+        p.memory.write(address, &header).unwrap();
+    }
+    fn binder<C: Cpu>(p: &mut Process<C>, owner: u32) -> u32 {
+        p.linux.vfs.set_lock_owner(owner);
+        let fd = p.linux.vfs.open_at(-100, b"/dev/binder", 2, 0).unwrap();
+        let pages = p
+            .linux
+            .vfs
+            .mapping_file(fd)
+            .unwrap()
+            .binder_pages(0x100000, 0, 0x10000, false)
+            .unwrap()
+            .unwrap();
+        p.memory
+            .map_backed(
+                0x100000,
+                pages,
+                false,
+                Permissions {
+                    read: true,
+                    write: false,
+                    execute: false,
+                },
+                false,
+            )
+            .unwrap();
+        fd
+    }
+    fn invoke(words: &mut Vec<u32>, fd: u32, address: u32) {
+        mov(words, 0, fd);
+        mov(words, 1, b::WRITE_READ);
+        mov(words, 2, address);
+        mov(words, 8, 29);
+        words.push(0xd4000001);
+    }
+    for slots in [1, 4, 12] {
+        let mut k = kernel();
+        k.cpu_count = slots.max(4);
+        k.workers = crate::workers::Pool::new(slots);
+        k.per_cpu = vec![Duration::ZERO; k.cpu_count];
+        k.profile_syscalls = true;
+        let mut service = process();
+        service
+            .linux
+            .vfs
+            .set_runtime_info(1, trames_vfs::RuntimeInfo::default());
+        let mut client = service.fork();
+        client.vm_id = 2;
+        client.tgid = 2;
+        let service_fd = binder(&mut service, 1);
+        let client_fd = binder(&mut client, 2);
+        service.memory.write(0x1000, &[0; 4]).unwrap();
+        assert!(matches!(
+            Ioctl::start(
+                service.linux.vfs.binder_file(service_fd).unwrap().unwrap(),
+                service.linux.vfs.descriptor_factory(),
+                1,
+                b::SET_CONTEXT_MGR,
+                0x1000,
+                &mut service.memory
+            )
+            .unwrap(),
+            Started::Complete(0)
+        ));
+        service
+            .memory
+            .write(0x1100, &b::ENTER_LOOPER.to_le_bytes())
+            .unwrap();
+        wr(&mut service, 0x1000, 0x1100, 4, 0);
+        let Started::Read(mut enter) = Ioctl::start(
+            service.linux.vfs.binder_file(service_fd).unwrap().unwrap(),
+            service.linux.vfs.descriptor_factory(),
+            1,
+            b::WRITE_READ,
+            0x1000,
+            &mut service.memory,
+        )
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(enter.finish(&mut service.memory).unwrap(), Some(0));
+        drop(enter);
+        for (p, cmd, payload) in [
+            (&mut service, b::REPLY, b"pong"),
+            (&mut client, b::TRANSACTION, b"ping"),
+        ] {
+            let mut transaction = [0; 64];
+            word(&mut transaction, 32, 4);
+            word(&mut transaction, 48, 0x1700);
+            p.memory
+                .write(0x1500, &b::command(cmd, &transaction))
+                .unwrap();
+            p.memory.write(0x1700, payload).unwrap();
+        }
+        wr(&mut service, 0x1200, 0, 0, 256);
+        wr(&mut service, 0x1280, 0x1500, 68, 0);
+        wr(&mut client, 0x1200, 0x1500, 68, 8);
+        wr(&mut client, 0x1280, 0, 0, 256);
+        let mut serve = Vec::new();
+        invoke(&mut serve, service_fd, 0x1200);
+        serve.push(0xaa0003f3);
+        invoke(&mut serve, service_fd, 0x1280);
+        mov(&mut serve, 0, 0x2800);
+        mov(&mut serve, 1, 1);
+        serve.push(0xb9000001);
+        serve.extend(wait());
+        let mut call = Vec::new();
+        invoke(&mut call, client_fd, 0x1200);
+        invoke(&mut call, client_fd, 0x1280);
+        call.push(0xaa0003f3);
+        mov(&mut call, 0, 0x2038);
+        call.push(0xf9400001);
+        call.push(0xb9400022);
+        mov(&mut call, 0, 0x2800);
+        call.push(0xb9000002);
+        call.extend(wait());
+        code(&mut service, 0x4000, &serve);
+        code(&mut client, 0x5000, &call);
+        client.cpu.set_pc(0x5000);
+        for p in [&service, &client] {
+            p.signals.io.scheduling.set_affinity((1 << slots) - 1);
+        }
+        k.processes.insert(1, service);
+        k.processes.insert(2, client);
+        assert!(k
+            .parallel_round(&mut trames_linux::CapturedOutput::default(), 1_000_000)
+            .unwrap());
+        assert_eq!(
+            k.processes.read(&1).memory.read_array::<4>(0x2800).unwrap(),
+            1u32.to_le_bytes()
+        );
+        assert_eq!(
+            k.processes.read(&2).memory.read_array::<4>(0x2800).unwrap(),
+            *b"pong"
+        );
+        assert_eq!(k.processes.read(&1).cpu.x(19), 0);
+        assert_eq!(k.processes.read(&2).cpu.x(19), 0);
+        assert_eq!(k.service_requests, 0);
+        assert_eq!(k.vm_checkpoint_spaces, 0);
+        assert!(
+            k.cohort_return_syscalls.is_empty(),
+            "{:?}",
+            k.cohort_return_syscalls
+        );
+    }
+}
+#[test]
 fn descriptor_ioctl_family_finishes_on_source_workers_without_joined_dispatch() {
     for (cpus, slots, filtered) in [(4, 4, false), (12, 12, false), (4, 1, false), (4, 1, true)] {
         let mut k = kernel();

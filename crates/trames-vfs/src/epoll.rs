@@ -295,14 +295,17 @@ pub(super) fn control(
         return Err(Errno(22));
     }
     let t = target.borrow();
-    let cgroup = matches!(t.control, Some(events::SharedControl::Cgroup(_)));
+    let resource_control = matches!(
+        t.control,
+        Some(events::SharedControl::Cgroup(_) | events::SharedControl::Binder(_))
+    );
     if t.namespace.is_some()
         || matches!(t.kind, FdKind::Node(_))
             && t.bridge.is_none()
             && t.pipe.is_none()
             && t.kernel_log.is_none()
             && t.mount_file.is_none()
-            && !cgroup
+            && !resource_control
     {
         return Err(Errno(1));
     }
@@ -313,7 +316,7 @@ pub(super) fn control(
         && t.pipe.is_none()
         && t.kernel_log.is_none()
         && t.mount_file.is_none()
-        && !cgroup
+        && !resource_control
         && t.socket.as_ref().and_then(|s| s.poll_epoch()).is_none()
         && !matches!(
             t.anonymous,

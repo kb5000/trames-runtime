@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Shared virtual namespace; host IO is confined to an explicitly selected store.
 #![recursion_limit = "512"]
+pub mod binder;
 mod bpf;
 mod task_name;
 pub use task_name::TaskName;
@@ -772,6 +773,7 @@ pub struct Vfs {
     pub credentials: Credentials,
     pseudo: Arc<SharedCell<pseudo::PseudoFs>>,
     kernel_log: Arc<kernel_log::KernelLog>,
+    binder: Arc<binder::Contexts>,
     cgroups: Arc<SharedCell<cgroup::Cgroups>>,
     dumpable: Dumpable,
     pid: u32,
@@ -856,6 +858,7 @@ impl Vfs {
             credentials: self.credentials.clone(),
             pseudo: self.pseudo.clone(),
             kernel_log: self.kernel_log.clone(),
+            binder: self.binder.clone(),
             cgroups: self.cgroups.clone(),
             dumpable: self.dumpable.clone(),
             pid: self.pid,
@@ -910,6 +913,7 @@ impl Vfs {
             credentials: Credentials::default(),
             pseudo: Arc::new(SharedCell::new(pseudo::PseudoFs::default())),
             kernel_log: Arc::default(),
+            binder: Arc::default(),
             cgroups: Arc::default(),
             dumpable: Dumpable::default(),
             pid: 1,
@@ -1245,6 +1249,13 @@ impl Vfs {
         pending: u64,
         reader: Option<&Arc<dyn SignalReader>>,
     ) -> u16 {
+        if let Some(events::SharedControl::Binder(process)) = &o.control {
+            return if o.flags.get() & O_PATH != 0 {
+                32
+            } else {
+                process.poll(events).0
+            };
+        }
         if let Some(file) = &o.mount_file {
             return file.watch.poll(events).0;
         }
@@ -2648,6 +2659,20 @@ impl Vfs {
         } else {
             None
         };
+        let binder_control = if flags & O_PATH == 0 {
+            match node.borrow().content {
+                Content::Device(pseudo::Device::Binder(device)) => {
+                    Some(events::SharedControl::Binder(self.binder.open(
+                        device as usize,
+                        self.lock_owner,
+                        self.credentials.euid,
+                    )))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         let cgroup_control = self
             .cgroup_file(&p, &node)?
             .map(events::SharedControl::Cgroup);
@@ -2675,7 +2700,7 @@ impl Vfs {
                     file_authority: Default::default(),
                     tcp_publication: Default::default(),
                     socket_control: None,
-                    control: cgroup_control,
+                    control: binder_control.or(cgroup_control),
                     read_node,
                     id: self.open_id(),
                     owner: (self.credentials.fsuid, self.credentials.fsgid),
@@ -3282,7 +3307,7 @@ impl Vfs {
                         .checked_add(bytes.len() as u64)
                         .filter(|&n| n <= i64::MAX as u64)
                         .ok_or(Errno(27))?;
-                    if seals.is_some_and(|s| s & 8 != 0 || s & 4 != 0 && end > b.len()) {
+                    if seals.is_some_and(|s| s & 0x18 != 0 || s & 4 != 0 && end > b.len()) {
                         return Err(Errno(1));
                     }
                     let available = if seals.is_some() {

@@ -727,6 +727,7 @@ impl Snapshot {
     pub fn exit_thread(&self, pid: u32, status: i32, memory: &mut impl CpuMemory) -> Option<Exit> {
         let files = self.exit_files.as_ref()?;
         let last = self.io_signals.try_exit(pid, status)?;
+        self.direct.binder_exit(pid, last);
         if last {
             self.direct.release_process_locks();
             if let Some(timers) = &self.timers {

@@ -539,6 +539,9 @@ impl DirectFd {
             }
         } else {
             match &open.control {
+                Some(events::SharedControl::Binder(process)) => {
+                    ByteResource::PollOnly(process.poll_handle())
+                }
                 // Sharing OFD ownership grants no creator-task signal queue or
                 // BPF byte authority. These retain their original ABI handling.
                 Some(

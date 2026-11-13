@@ -11,6 +11,7 @@ use trames_memory::{Access, CpuMemory};
 use trames_vfs::{DirectFds, Errno};
 use trames_vfs::{IoSignal, IoSubscription, IoWake};
 mod aio;
+mod binder;
 pub(crate) mod file;
 pub use aio::{Aio, RetainedAio};
 #[cfg(test)]
@@ -39,6 +40,7 @@ fn tcp_wait_fd(tcp: &trames_net::DirectTcp) -> std::io::Result<trames_vfs::HostF
 /// A stopped syscall, not a re-executed SVC. Subscriptions do not retain guest
 /// FD table entries or count as additional pipe endpoints.
 pub struct PendingIo {
+    binder: Option<Box<trames_vfs::binder::Ioctl>>,
     pub aio: Option<RetainedAio>,
     pub number: u32,
     pub args: [u64; 6],
@@ -110,6 +112,9 @@ impl RetainedByte {
     }
 }
 impl PendingIo {
+    pub fn is_binder(&self) -> bool {
+        self.binder.is_some()
+    }
     /// Passive original-socket lifetime across a cohort handoff. Accepted TCP
     /// retries observe that socket's live policy, independently of numeric reuse.
     pub fn tcp_liveness(&self) -> Option<trames_net::TcpLease> {
@@ -456,11 +461,25 @@ impl DirectSyscalls {
     pub fn supports_ioctl(&self, number: u32, args: [u64; 6]) -> bool {
         number == 29 && self.paths.is_some() && !matches!(args[1] as u32, 0x5421 | 0x5452)
     }
+    pub fn supports_binder(&self, number: u32, args: [u64; 6]) -> bool {
+        number == 29
+            && args[1] as u32 == trames_vfs::binder::abi::WRITE_READ
+            && self
+                .resources
+                .as_ref()
+                .is_some_and(|f| f.binder_file(args[0] as u32).is_some())
+    }
     fn invoke_other_ioctl(
         &self,
         args: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
+        // WRITE_READ can consume write commands before parking. The legacy
+        // single-assignment probe must leave it untouched for start_binder;
+        // returning EAGAIN here would lose the retained read operation.
+        if self.supports_binder(29, args) {
+            return None;
+        }
         // Task-sensitive PTY controls and shared flag/async changes keep their
         // existing accepted endpoint and signal-routing implementations.
         if matches!(args[1] as u32, 0x5421 | 0x5452)
@@ -1107,6 +1126,7 @@ impl DirectSyscalls {
             };
         self.resume(
             PendingIo {
+                binder: None,
                 aio: None,
                 number,
                 args,
@@ -1422,6 +1442,11 @@ impl DirectSyscalls {
             return self.start_memory_sync(args, memory, pid, target);
         }
         if number == 29 {
+            if let Some(attempt) = self.start_binder(args, memory, pid, target) {
+                return Some(attempt);
+            }
+        }
+        if number == 29 {
             if !crate::pty::terminal_job_request(args[1] as u32) {
                 if let Some(result) = self.invoke_control(number, args, memory) {
                     return Some(IoAttempt::Complete(result));
@@ -1559,6 +1584,7 @@ impl DirectSyscalls {
         };
         Some(self.resume(
             PendingIo {
+                binder: None,
                 aio: None,
                 number,
                 args,
@@ -1688,6 +1714,7 @@ impl DirectSyscalls {
         let signal = IoSignal::new(pid, target.clone());
         let subscriptions = wait.subscribe(&signal);
         PendingIo {
+            binder: None,
             aio: None,
             number: wait.number,
             args: wait.args,
@@ -1919,6 +1946,7 @@ impl DirectSyscalls {
         };
         self.resume_inner_in(
             PendingIo {
+                binder: None,
                 aio: None,
                 number,
                 args,
@@ -1965,6 +1993,7 @@ impl DirectSyscalls {
         let subscriptions = vec![request.subscribe(&signal)];
         self.resume(
             PendingIo {
+                binder: None,
                 aio: None,
                 number: 32,
                 args,
@@ -2030,6 +2059,9 @@ impl DirectSyscalls {
         original_paths: Option<&trames_vfs::Vfs>,
     ) -> IoAttempt {
         self.terminal_stop.set(false);
+        if pending.binder.is_some() {
+            return self.resume_binder(pending, memory);
+        }
         if pending.fifo_open.is_some() {
             return self.resume_fifo_open(pending);
         }

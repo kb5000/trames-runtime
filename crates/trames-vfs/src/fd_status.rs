@@ -11,6 +11,9 @@ impl From<bool> for CloseOnExec {
     }
 }
 impl CloseOnExec {
+    pub(super) fn same_slot(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
     pub(super) fn get(&self) -> bool {
         self.0.load(Ordering::Relaxed)
     }

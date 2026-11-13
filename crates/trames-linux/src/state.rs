@@ -1003,7 +1003,14 @@ impl Linux {
         } = plan;
         let shared = flags & 3 != 2;
         if let Some(file) = file {
-            let objects = file.pages(offset, len, shared, permissions.write)?;
+            let (objects, shared) =
+                if let Some(pages) = file.binder_pages(address, offset, len, permissions.write) {
+                    // Binder maps kernel-owned pages even with MAP_PRIVATE. They
+                    // must remain canonical shared bytes, never a file COW copy.
+                    (pages?, true)
+                } else {
+                    (file.pages(offset, len, shared, permissions.write)?, shared)
+                };
             memory
                 .map_backed(address, objects, shared, permissions, flags & 0x10 != 0)
                 .map_err(Self::memory_errno)?;

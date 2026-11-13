@@ -534,6 +534,7 @@ impl<C: Cpu> Lifecycle<C> {
             };
             p.linux.vfs.sync_task_namespaces();
             p.linux.vfs.set_lock_owner(p.tgid);
+            p.linux.vfs.binder_exit(work.pid, last);
             if last {
                 p.linux.vfs.release_process_locks();
                 self.timers.clear_process(p.tgid, false);

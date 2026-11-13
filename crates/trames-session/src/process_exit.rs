@@ -214,6 +214,7 @@ impl<C: Cpu> Kernel<C> {
             return Ok(());
         };
         p.linux.vfs.sync_task_namespaces();
+        p.linux.vfs.binder_exit(pid, last);
         {
             let task = &mut *p;
             task.linux.vfs.set_lock_owner(task.tgid);

@@ -484,6 +484,7 @@ impl DirectSyscalls {
                 }
             }
             Ok(IoAttempt::Blocked(PendingIo {
+                binder: None,
                 aio: Some(RetainedAio {
                     context,
                     batch: batch_state,
