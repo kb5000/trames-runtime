@@ -799,6 +799,16 @@ impl Clone for Vfs {
     }
 }
 impl Vfs {
+    /// Environment-owned host controls retain the original namespace/network,
+    /// without holding guest task custody or extending any guest OFD lifetime.
+    pub fn host_control_view(&self) -> Self {
+        let mut view = self.clone();
+        view.fds = DescriptorTable::default();
+        view.controlling = Default::default();
+        view.embedding_terminal = Default::default();
+        view.pid_identity = None;
+        view
+    }
     pub fn task_signal(&self) -> Option<Arc<dyn TaskSignal>> {
         self.signal_reader.borrow().as_ref()?.task_signal()
     }

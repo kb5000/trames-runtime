@@ -305,6 +305,37 @@ mod tests {
         (k, output, process)
     }
     #[test]
+    fn embedding_poll_never_holds_original_task_custody() {
+        struct Probe {
+            task: tasks::Handle<Cpu>,
+            polls: usize,
+        }
+        impl GuestOutput for Probe {
+            fn source_console(&mut self) -> Arc<dyn trames_vfs::ConsoleIo> {
+                Arc::new(trames_vfs::CapturedConsole::default())
+            }
+            fn write(&mut self, _: OutputFd, bytes: &[u8]) -> std::io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn poll_host(&mut self, _: &trames_vfs::Vfs) -> std::io::Result<HostState> {
+                assert!(
+                    self.task.try_admit().is_some(),
+                    "host callbacks must not exclude guest mmap admission"
+                );
+                self.polls += 1;
+                Ok(HostState::Running)
+            }
+        }
+        let (mut k, _, _) = setup(false);
+        let mut probe = Probe {
+            task: k.processes.handle(&1).unwrap(),
+            polls: 0,
+        };
+        k.host_poll(&mut probe).unwrap();
+        k.cohort_control(&[], &mut probe).unwrap();
+        assert_eq!(probe.polls, 2);
+    }
+    #[test]
     fn cold_host_launch_runs_on_sources_when_no_guest_cpu_is_ready() {
         struct Host {
             output: Output,

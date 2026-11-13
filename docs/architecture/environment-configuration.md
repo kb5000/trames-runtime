@@ -48,7 +48,6 @@ cwd = "/root"
 
 [display]
 windows = true
-scale = "host"
 
 [[mounts]]
 share = "project"
@@ -148,7 +147,10 @@ Cold configuration and control work stays outside normal syscall execution.
 Guest I/O retains original resource ownership and readiness. Native API calls
 continue through their existing CPU interception ABI. Blocked control requests
 return their execution slot; host subprocess pipes and exit events use the
-existing embedding wait loop.
+existing embedding wait loop. The embedding retains one host control view
+of the original environment namespace and network before execution starts. It
+holds no guest task/mm admission across callbacks and keeps no guest open file
+descriptions alive; host subprocess output cannot block an unrelated guest mmap.
 
 Platform support is explicit: iPad reads the same manifest and authorization
 schema, while arbitrary host execution and Mac network/mount administration are

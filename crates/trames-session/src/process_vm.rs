@@ -337,9 +337,10 @@ impl<C: Cpu> Kernel<C> {
         io: &mut impl GuestOutput,
     ) -> Result<bool, RuntimeError> {
         self.persistent_control_checks += 1;
-        if let Some(root) = self.processes.get(&1) {
+        self.bind_host_context();
+        if let Some(host) = &self.host_context {
             let state = io
-                .poll_host(&root.linux.vfs)
+                .poll_host(&host.vfs)
                 .map_err(|_| RuntimeError::Arguments("host session poll failed"))?;
             if state == HostState::Cancelled || io.cancellation_requested() {
                 if let Some(epoch) = epoch {
@@ -350,11 +351,8 @@ impl<C: Cpu> Kernel<C> {
             if let Some(epoch) = epoch {
                 epoch.pause_host(io.paused());
             }
-            let directory = root.signals.io_directory.clone();
-            let root_task = root.signals.io.clone();
-            drop(root);
             if let Some(signal) = io.root_signal() {
-                root_task.host_signal(signal);
+                host.root.host_signal(signal);
             }
             while let Some(request) = io.host_spawn() {
                 if let Some(epoch) = epoch {
@@ -364,7 +362,7 @@ impl<C: Cpu> Kernel<C> {
                 }
             }
             while let Some((group, signal)) = io.host_signal() {
-                directory.host_signal_group(group, signal);
+                host.directory.host_signal_group(group, signal);
             }
         }
         // Every original product actor was admitted before launch. Later
@@ -1261,6 +1259,7 @@ mod tests {
     #[test]
     fn native_device_open_and_bridge_read_keep_four_and_twelve_cpu_cohorts() {
         struct Host {
+            broker: trames_bridge::Broker,
             checks: usize,
             sent: bool,
             done: Arc<SharedPage>,
@@ -1272,25 +1271,14 @@ mod tests {
             }
             fn poll_host(
                 &mut self,
-                vfs: &trames_vfs::Vfs,
+                _: &trames_vfs::Vfs,
             ) -> std::io::Result<trames_linux::HostState> {
                 self.checks += 1;
                 if self.checks >= 3 && !self.sent {
-                    if let Some(info) = vfs
-                        .fd_snapshot()
-                        .into_iter()
-                        .find(|info| info.target == b"/dev/trames/info")
-                    {
-                        let sender = vfs
-                            .shared_files()
-                            .lookup(info.fd)
-                            .unwrap()
-                            .unwrap()
-                            .direct_byte()
-                            .unwrap();
-                        let frame =
-                            b"{\"version\":1,\"id\":7,\"method\":\"bridge.info\",\"params\":{}}\n";
-                        assert_eq!(sender.write(frame), Ok(frame.len()));
+                    if let Some(bytes) = self.broker.poll(32768).unwrap() {
+                        let request: trames_bridge::HostRequest =
+                            serde_json::from_slice(&bytes).unwrap();
+                        self.broker.reply(&serde_json::to_vec(&serde_json::json!({"version":1,"ticket":request.ticket,"result":{"ready":true}})).unwrap()).unwrap();
                         self.sent = true;
                     }
                 }
@@ -1313,6 +1301,8 @@ mod tests {
             k.workers = crate::workers::Pool::new(slots);
             k.per_cpu = vec![Duration::ZERO; cpus];
             let done = Arc::new(SharedPage::new([0; PAGE_SIZE as usize]));
+            let broker = trames_bridge::Broker::default();
+            let frame = b"{\"version\":1,\"id\":7,\"method\":\"device.info\",\"params\":{}}\n";
             for id in 1..=cpus {
                 let mut p = super::super::tests::process();
                 p.tgid = id as u32;
@@ -1323,8 +1313,9 @@ mod tests {
                     .set_affinity(if slots == 1 { 1 } else { 1 << (id - 1) });
                 if id == 1 {
                     p.linux.vfs.set_runtime_info(1, Default::default());
-                    p.linux.vfs.attach_bridge(Default::default());
+                    p.linux.vfs.attach_bridge(broker.clone());
                     p.memory.write(0x1000, b"/dev/trames/info\0").unwrap();
+                    p.memory.write(0x1100, frame).unwrap();
                     map(&mut p, 0x3000, done.clone(), None);
                     for (i, value) in [(-100i64) as u64, 0x1000, 2, 0].into_iter().enumerate() {
                         p.cpu.set_x(i, value);
@@ -1332,8 +1323,21 @@ mod tests {
                     code(
                         &mut p,
                         &[
-                            0xd2800708, 0xd4000001, 0xaa0003f4, 0xaa1403e0, 0xd2840001, 0xd2808002,
-                            0xd28007e8, 0xd4000001, 0xd2860001, 0xf9000020, 0x14000000,
+                            0xd2800708,
+                            0xd4000001,
+                            0xaa0003f4,
+                            0xd2822001,
+                            0xd2800002 | ((frame.len() as u32) << 5),
+                            0xd2800808,
+                            0xd4000001,
+                            0xaa1403e0,
+                            0xd2840001,
+                            0xd2808002,
+                            0xd28007e8,
+                            0xd4000001,
+                            0xd2860001,
+                            0xf9000020,
+                            0x14000000,
                         ],
                     );
                 } else {
@@ -1342,6 +1346,7 @@ mod tests {
                 k.processes.insert(id as u32, p);
             }
             let mut host = Host {
+                broker,
                 checks: 0,
                 sent: false,
                 done: done.clone(),

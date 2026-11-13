@@ -1,6 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 
+#[test]
+fn host_controls_do_not_keep_guest_pipe_writers_alive() {
+    let mut v = Vfs::default();
+    let [read, write] = v.pipe(O_NONBLOCK).unwrap();
+    let _host = v.host_control_view();
+    v.close(write).unwrap();
+    assert!(v.read(read, 1).unwrap().is_empty());
+}
+
 fn snapshot(v: &mut Vfs) {
     v.set_runtime_info(
         1,

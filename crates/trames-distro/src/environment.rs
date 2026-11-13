@@ -191,14 +191,10 @@ impl Default for Session {
 #[serde(default, deny_unknown_fields)]
 pub struct Display {
     pub windows: bool,
-    pub scale: String,
 }
 impl Default for Display {
     fn default() -> Self {
-        Self {
-            windows: true,
-            scale: "host".into(),
-        }
+        Self { windows: true }
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]

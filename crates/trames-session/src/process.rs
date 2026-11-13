@@ -649,6 +649,14 @@ enum ExecutionMode {
     #[cfg(all(test, trames_interpreter_conformance))]
     Bounded,
 }
+struct HostContext {
+    // Bound before source execution. Retain the environment's original host
+    // resources, never task/mm custody across an embedding callback. A slow
+    // host pipe/clipboard poll must not park guest mmap on a task admission.
+    vfs: trames_vfs::Vfs,
+    root: Arc<trames_kernel::signal::IoTask>,
+    directory: Arc<trames_kernel::signal::IoDirectory>,
+}
 pub(crate) struct Kernel<C: Cpu> {
     host_launches: Arc<host::Launches<C>>,
     #[cfg(all(test, trames_interpreter_conformance))]
@@ -734,6 +742,7 @@ pub(crate) struct Kernel<C: Cpu> {
     #[cfg(all(test, trames_interpreter_conformance))]
     proc_owner_waits: Vec<proc::ProcReadWait<C>>,
     host_wait: Option<trames_linux::HostWait>,
+    host_context: Option<HostContext>,
     profile_syscalls: bool,
     idle: Duration,
     load: Arc<std::sync::Mutex<crate::proc_views::Load>>,
@@ -1069,20 +1078,29 @@ impl<C: Cpu> Kernel<C> {
         }
         spaces.values().sum()
     }
+    fn bind_host_context(&mut self) {
+        if self.host_context.is_none() {
+            self.host_context = self.processes.get(&1).map(|root| HostContext {
+                vfs: root.linux.vfs.host_control_view(),
+                root: root.signals.io.clone(),
+                directory: root.signals.io_directory.clone(),
+            });
+        }
+    }
     fn host_poll(&mut self, io: &mut impl GuestOutput) -> Result<(), RuntimeError> {
-        let Some(root) = self.processes.get(&1) else {
+        self.bind_host_context();
+        let Some(host) = &self.host_context else {
             return Ok(());
         };
         let state = io
-            .poll_host(&root.linux.vfs)
+            .poll_host(&host.vfs)
             .map_err(|_| RuntimeError::Arguments("host session poll failed"))?;
         if state == HostState::Cancelled || io.cancellation_requested() {
             return Err(RuntimeError::Cancelled);
         }
         if let Some(signal) = io.root_signal() {
-            root.signals.io.host_signal(signal);
+            host.root.host_signal(signal);
         }
-        drop(root);
         while let Some(request) = io.host_spawn() {
             self.host_launches.submit(request);
         }
@@ -4719,6 +4737,7 @@ pub(super) fn run<C: Cpu>(
         #[cfg(all(test, trames_interpreter_conformance))]
         proc_owner_waits: Vec::new(),
         host_wait: None,
+        host_context: None,
         profile_syscalls: runtime.profile_syscalls,
         idle: Duration::ZERO,
         load: Arc::default(),
@@ -6614,6 +6633,7 @@ mod tests {
             #[cfg(all(test, trames_interpreter_conformance))]
             proc_owner_waits: Vec::new(),
             host_wait: None,
+            host_context: None,
             profile_syscalls: false,
             idle: Duration::ZERO,
             load: Arc::default(),
