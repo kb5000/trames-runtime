@@ -147,6 +147,7 @@ pub(crate) struct Endpoint {
     input: Mutex<Input>,
     state: Mutex<State>,
     epoch: AtomicU64,
+    write_epoch: AtomicU64,
     ready: Arc<UnixDatagram>,
     notify: UnixDatagram,
 }
@@ -181,6 +182,7 @@ impl Endpoint {
             input: Mutex::default(),
             state: Mutex::default(),
             epoch: AtomicU64::new(0),
+            write_epoch: AtomicU64::new(0),
             ready: Arc::new(ready),
             notify,
         }))
@@ -200,6 +202,17 @@ impl Endpoint {
     pub fn epoch(&self) -> u64 {
         self.epoch.load(Relaxed)
     }
+    pub fn write_epoch(&self) -> u64 {
+        self.write_epoch.load(Relaxed)
+    }
+    fn notify(&self) {
+        loop {
+            match self.notify.send(&[1]) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                _ => break,
+            }
+        }
+    }
     fn reserve(&self) -> Result<Admission<'_>> {
         let mut s = self.state.lock().unwrap();
         if !self.stream && s.write_closed {
@@ -218,6 +231,8 @@ impl Endpoint {
         let mut s = self.state.lock().unwrap();
         s.pending -= 1;
         if s.read_closed {
+            self.write_epoch.fetch_add(1, Relaxed);
+            self.notify();
             return;
         }
         if self.stream {
@@ -231,12 +246,7 @@ impl Endpoint {
         // This endpoint's queue lock covers publication and notification. A
         // waiter drains before its deciding readiness check under the same lock.
         // No coordinator, periodic tick or new resolver thread is involved.
-        loop {
-            match self.notify.send(&[1]) {
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                _ => break,
-            }
-        }
+        self.notify();
     }
     fn pump(self: &Arc<Self>) {
         self.service.tick();
@@ -252,6 +262,9 @@ impl Endpoint {
             if size > 4096 {
                 input.failed = true;
                 input.bytes.clear();
+                self.epoch.fetch_add(1, Relaxed);
+                self.write_epoch.fetch_add(1, Relaxed);
+                self.notify();
                 return;
             }
             if input.bytes.len() < size + 2 {
@@ -264,7 +277,12 @@ impl Endpoint {
             {
                 return;
             }
+            let full = input.bytes.len() == BUFFER;
             input.bytes.drain(..size + 2);
+            if full {
+                self.write_epoch.fetch_add(1, Relaxed);
+                self.notify();
+            }
         }
     }
     pub fn send(self: &Arc<Self>, bytes: &[u8]) -> Result<usize> {
@@ -317,6 +335,7 @@ impl Endpoint {
         if s.read_closed || self.stream && count == 0 {
             return Ok(empty());
         }
+        let writable_changed = !self.stream && s.pending + s.replies.len() == LIMIT;
         let Some(front) = s.replies.front_mut() else {
             return if self.stream
                 && s.write_closed
@@ -331,12 +350,23 @@ impl Endpoint {
         let size = count.min(front.len());
         let length = if self.stream { size } else { front.len() };
         let data = front[..size].to_vec();
+        let mut released = false;
         if flags & MSG_PEEK == 0 {
             if self.stream && size != front.len() {
                 front.drain(..size);
             } else {
                 s.replies.pop_front();
+                released = true;
             }
+        }
+        drop(s);
+        drop(input);
+        if released {
+            if writable_changed {
+                self.write_epoch.fetch_add(1, Relaxed);
+                self.notify();
+            }
+            self.pump();
         }
         Ok(Received {
             netlink_address: None,
@@ -382,6 +412,9 @@ impl Endpoint {
         if how != 0 {
             s.write_closed = true;
         }
+        self.epoch.fetch_add(1, Relaxed);
+        self.write_epoch.fetch_add(1, Relaxed);
+        self.notify();
         Ok(())
     }
 }
@@ -412,8 +445,52 @@ mod tests {
             assert!(!endpoint.state.lock().unwrap().replies.is_empty());
             assert_eq!(endpoint.poll(1), 1);
             assert!(!endpoint.recv(512, 0).unwrap().data.is_empty());
+            assert_eq!(endpoint.poll(1), 0);
             assert_eq!(nix::poll::poll(&mut fds, 0u16).unwrap(), 0);
         }
+    }
+    #[test]
+    fn shutdown_framing_errors_and_released_reply_slots_notify_native_waiters() {
+        use std::os::fd::AsFd;
+        let service = Service::new(NetworkMode::Loopback);
+        for stream in [false, true] {
+            let endpoint = Endpoint::new(service.clone(), stream).unwrap();
+            let waiter = endpoint.waiter();
+            let mut fds = [nix::poll::PollFd::new(
+                waiter.as_fd(),
+                nix::poll::PollFlags::POLLIN,
+            )];
+            assert_eq!(nix::poll::poll(&mut fds, 0u16).unwrap(), 0);
+            endpoint.shutdown(0).unwrap();
+            assert_eq!(nix::poll::poll(&mut fds, 1000u16).unwrap(), 1);
+            assert_eq!(endpoint.poll(1), 1);
+        }
+        let stream = Endpoint::new(service.clone(), true).unwrap();
+        let waiter = stream.waiter();
+        let mut fds = [nix::poll::PollFd::new(
+            waiter.as_fd(),
+            nix::poll::PollFlags::POLLIN,
+        )];
+        stream.send(&[0xff, 0xff]).unwrap();
+        assert_eq!(nix::poll::poll(&mut fds, 1000u16).unwrap(), 1);
+        assert_eq!(stream.poll(1), 24);
+
+        let udp = Endpoint::new(service, false).unwrap();
+        for _ in 0..LIMIT {
+            udp.send(b"xx").unwrap();
+        }
+        assert_eq!(udp.poll(4), 0);
+        let epoch = udp.write_epoch();
+        let waiter = udp.waiter();
+        let mut fds = [nix::poll::PollFd::new(
+            waiter.as_fd(),
+            nix::poll::PollFlags::POLLIN,
+        )];
+        assert_eq!(nix::poll::poll(&mut fds, 0u16).unwrap(), 0);
+        udp.recv(512, 0).unwrap();
+        assert_eq!(nix::poll::poll(&mut fds, 1000u16).unwrap(), 1);
+        assert_eq!(udp.poll(4), 4);
+        assert_ne!(udp.write_epoch(), epoch);
     }
     #[test]
     fn concurrent_datagram_admission_keeps_the_original_bound_and_returns_slots() {
@@ -497,7 +574,7 @@ mod tests {
         });
         e.shutdown(1).unwrap();
         assert!(e.recv(512, 0).unwrap().data.is_empty());
-        assert_eq!(e.epoch(), 64);
+        assert_eq!(e.epoch(), 65, "64 replies and the final EOF transition");
     }
     #[test]
     fn resolver_backpressure_rolls_back_admission_and_preserves_buffered_frames() {

@@ -398,6 +398,7 @@ impl Socket {
         let mut epoch = self.native.poll_epoch()?;
         for dns in self.dns.borrow().values() {
             epoch[0] = epoch[0].wrapping_add(dns.epoch());
+            epoch[1] = epoch[1].wrapping_add(dns.write_epoch());
         }
         Some(epoch)
     }
