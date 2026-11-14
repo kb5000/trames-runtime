@@ -232,6 +232,8 @@ pub(crate) struct Surface {
     pub interaction: Option<WindowInteraction>,
     pub requested_size: (u32, u32),
     pub top_parent: Option<u64>,
+    /// Available host workspace in this toplevel geometry's logical coordinates.
+    pub popup_bounds: Option<(i32, i32, u32, u32)>,
     pub min_size: (u32, u32),
     pub max_size: (u32, u32),
     pub restore_size: (u32, u32),
@@ -336,6 +338,7 @@ impl Surface {
             interaction: None,
             requested_size: (0, 0),
             top_parent: None,
+            popup_bounds: None,
             min_size: (0, 0),
             max_size: (0, 0),
             restore_size: (640, 480),

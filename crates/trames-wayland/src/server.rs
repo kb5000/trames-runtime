@@ -38,6 +38,7 @@ enum Command {
     ConnectXwm(UnixStream, crate::xwm::Identity),
     Resize(u64, u32, u32),
     OutputScale(u64, i32),
+    PopupBounds(u64, i32, i32, u32, u32),
     Mode(u64, WindowMode),
     Close(u64),
     Presented(u64, u64, u32),
@@ -202,6 +203,9 @@ impl Server {
     pub fn output_scale(&self, window: u64, scale: i32) -> io::Result<()> {
         self.0.send(Command::OutputScale(window, scale))
     }
+    pub fn popup_bounds(&self, id: u64, x: i32, y: i32, w: u32, h: u32) -> io::Result<()> {
+        self.0.send(Command::PopupBounds(id, x, y, w, h))
+    }
     pub fn resize(&self, id: u64, w: u32, h: u32) -> io::Result<()> {
         self.0.send(Command::Resize(id, w, h))
     }
@@ -291,6 +295,7 @@ fn run(
                     compositor.resize(id, w, h);
                 }
                 Command::OutputScale(window, scale) => compositor.output_scale(window, scale),
+                Command::PopupBounds(id, x, y, w, h) => compositor.popup_bounds(id, x, y, w, h),
                 Command::Mode(id, mode) => compositor.set_mode(id, mode),
                 Command::Close(id) => compositor.close(id),
                 Command::Presented(id, revision, time) => compositor.presented(id, revision, time),

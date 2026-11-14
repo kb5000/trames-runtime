@@ -707,8 +707,30 @@ fn original_c_scene_atomic_subsurface_popup_and_pointer_grab() {
             && log.contains("popup-dismissed")
             && scene.windows.first().is_some_and(|w| w.scene.len() == 2)
         {
-            server.close(scene.windows[0].id).unwrap();
+            server
+                .popup_bounds(scene.windows[0].id, 0, 0, 1920, 1020)
+                .unwrap();
+            key(34);
             phase = 7;
+        }
+        if phase == 7
+            && log.contains("wide-menu")
+            && scene.windows.first().is_some_and(|w| w.scene.len() == 3)
+        {
+            let w = &scene.windows[0];
+            assert_eq!(
+                (w.scene[2].x, w.scene[2].y, w.scene[2].destination),
+                (1576, 76, (340, 681))
+            );
+            server.popup_bounds(w.id, -200, -100, 1920, 1020).unwrap();
+            key(35);
+            phase = 8;
+        }
+        if phase == 8 && log.contains("repositioned=18") {
+            let w = &scene.windows[0];
+            assert_eq!((w.scene[2].x, w.scene[2].y), (1380, 76));
+            server.close(w.id).unwrap();
+            phase = 9;
         }
         if let Some(status) = child.try_wait().unwrap() {
             stdout.read_to_string(&mut log).unwrap();
@@ -730,7 +752,7 @@ fn original_c_scene_atomic_subsurface_popup_and_pointer_grab() {
         }
         thread::sleep(Duration::from_millis(2));
     }
-    assert_eq!(phase, 7, "{log}");
+    assert_eq!(phase, 9, "{log}");
     assert!(log.contains("repositioned=17"), "{log}");
 }
 

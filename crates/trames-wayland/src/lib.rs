@@ -114,6 +114,15 @@ impl Compositor {
             self.state.surface_output(id, scale);
         }
     }
+    /// Host workspace relative to a toplevel's logical content geometry.
+    /// Popup positioners also use these coordinates, independently of buffer scale.
+    pub fn popup_bounds(&mut self, id: u64, x: i32, y: i32, width: u32, height: u32) {
+        if width > 0 && height > 0 {
+            if let Some(surface) = self.state.surfaces.get_mut(&id) {
+                surface.popup_bounds = Some((x, y, width, height));
+            }
+        }
+    }
     pub fn resize(&mut self, id: u64, width: u32, height: u32) -> bool {
         if width == 0 || height == 0 || width > 4096 || height > 4096 {
             return false;

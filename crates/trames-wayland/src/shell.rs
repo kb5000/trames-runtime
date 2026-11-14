@@ -212,6 +212,7 @@ impl Dispatch<xdg_surface::XdgSurface, SurfaceKey> for State {
                     r.post_error(3u32, "invalid popup parent");
                     return;
                 }
+                let bounds = state.popup_constraint_bounds(parent.0);
                 let Some(s) = state.surfaces.get_mut(&key.0) else {
                     return;
                 };
@@ -224,7 +225,7 @@ impl Dispatch<xdg_surface::XdgSurface, SurfaceKey> for State {
                 }
                 s.role = Role::Popup;
                 s.popup = Some(init.init(id, *key));
-                let (x, y, w, h) = pos.geometry(state.viewport);
+                let (x, y, w, h) = pos.geometry_in(bounds);
                 s.parent = Some((parent.0, x, y));
                 s.size = (w, h);
                 s.requested_size = s.size;
@@ -444,7 +445,15 @@ impl Dispatch<xdg_popup::XdgPopup, SurfaceKey> for State {
                 if !p.complete() {
                     return;
                 }
-                let (x, y, w, h) = p.geometry(state.viewport);
+                let Some(parent) = state
+                    .surfaces
+                    .get(&key.0)
+                    .and_then(|s| s.parent)
+                    .map(|p| p.0)
+                else {
+                    return;
+                };
+                let (x, y, w, h) = p.geometry_in(state.popup_constraint_bounds(parent));
                 if let Some(s) = state.surfaces.get_mut(&key.0) {
                     if let Some((parent, ..)) = s.parent {
                         s.parent = Some((parent, x, y));

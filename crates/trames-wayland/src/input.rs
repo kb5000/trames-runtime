@@ -724,6 +724,19 @@ mod tests {
     }
 
     #[test]
+    fn popup_workspace_is_relative_to_the_current_parent_geometry() {
+        let mut compositor = popup_scene();
+        let state = &mut compositor.state;
+        state.surfaces.get_mut(&1).unwrap().geometry = Some((10, 10, 1920, 928));
+        assert_eq!(state.popup_constraint_bounds(1), (0, 0, 1920, 928));
+        state.surfaces.get_mut(&1).unwrap().popup_bounds = Some((-200, -100, 1920, 1020));
+        state.surfaces.get_mut(&2).unwrap().parent = Some((1, 400, 50));
+        state.surfaces.get_mut(&3).unwrap().parent = Some((2, 20, 10));
+        assert_eq!(state.popup_constraint_bounds(1), (-200, -100, 1920, 1020));
+        assert_eq!(state.popup_constraint_bounds(2), (-600, -150, 1920, 1020));
+        assert_eq!(state.popup_constraint_bounds(3), (-620, -160, 1920, 1020));
+    }
+    #[test]
     fn native_refocus_preserves_nested_popup_clicks_and_keyboard_state() {
         let mut compositor = popup_scene();
         let state = &mut compositor.state;
