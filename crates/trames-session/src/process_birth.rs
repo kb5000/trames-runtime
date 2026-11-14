@@ -29,6 +29,20 @@ pub(super) struct Birth {
     pub(super) memory_limits: super::super::MemoryLimits,
 }
 impl Birth {
+    fn reserve_task(&self, vfs: &trames_vfs::Vfs) -> Result<trames_kernel::task::Slot, Errno> {
+        self.capacity.reserve().ok_or_else(|| {
+            // Log only a failed admission, on the original bounded kernel log.
+            // Successful clone does not acquire a log lock or sample counters.
+            vfs.log(
+                4,
+                &format!(
+                    "task admission exhausted: threads-max={}",
+                    self.capacity.limit()
+                ),
+            );
+            Errno(11)
+        })
+    }
     pub(super) fn capture<C: Cpu>(kernel: &Kernel<C>) -> Self {
         Self {
             ids: kernel.task_ids.clone(),
@@ -275,7 +289,7 @@ impl Birth {
         {
             return Err(Errno(22));
         }
-        let slot = self.capacity.reserve().ok_or(Errno(11))?;
+        let slot = self.reserve_task(&p.linux.vfs)?;
         let id = self.ids.allocate().ok_or(Errno(11))?;
         let memory = if shared_vm {
             p.memory.share()
@@ -550,7 +564,7 @@ impl Birth {
         if request.argv.is_empty() {
             return Err(Errno(11));
         }
-        let slot = self.capacity.reserve().ok_or(Errno(11))?;
+        let slot = self.reserve_task(&root.linux.vfs)?;
         let id = self.ids.allocate().ok_or(Errno(11))?;
         let parent = root.signals.io.lifecycle().clone();
         let mut child = root.fork_state(

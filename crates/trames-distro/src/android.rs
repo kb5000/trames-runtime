@@ -5,7 +5,7 @@ use trames_vfs::{Errno, Vfs, AT_FDCWD};
 // A stock desktop already uses about 1,000 sleeping/runnable guest tasks.
 // Leave room for application worker pools (including nested codec pools).
 // Admission is atomic metadata only: no RAM or host threads are preallocated.
-pub const TASK_LIMIT: usize = 8192;
+pub const TASK_LIMIT: usize = trames_vfs::MAX_TASKS;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 pub fn command() -> Vec<String> {
     vec!["/system/bin/init".into(), "second_stage".into()]

@@ -209,8 +209,10 @@ impl std::ops::Index<usize> for FdMask {
         self.0.get(word).unwrap_or(&0)
     }
 }
-/// Scheduler task budget, also reported by procfs and RLIMIT_NPROC.
-pub const MAX_TASKS: usize = 256;
+/// Default environment task admission ceiling. This is a counter, not a
+/// preallocated table, thread pool, PID range or memory reservation. A browser
+/// can exceed 256 live threads during ordinary multi-process page loading.
+pub const MAX_TASKS: usize = 65_536;
 pub const PIPE_CAPACITY: usize = 65536;
 pub const AT_FDCWD: i32 = -100;
 pub const O_DIRECTORY: u32 = 0x4000;

@@ -46,8 +46,6 @@ use trames_vfs::{Errno, AT_FDCWD};
 use trames_vfs::{MAX_FDS, O_NONBLOCK};
 
 #[cfg(all(test, trames_interpreter_conformance))]
-const MAX_PROCESSES: usize = trames_vfs::MAX_TASKS;
-#[cfg(all(test, trames_interpreter_conformance))]
 const TOTAL_MAPPED_LIMIT: usize = 1024 * 1024 * 1024;
 use trames_kernel::scheduling::assign_cpus;
 #[cfg(all(test, trames_interpreter_conformance))]
@@ -9276,8 +9274,9 @@ mod boundary_tests {
     #[test]
     fn process_limit_rejects_fork_without_changing_parent_memory() {
         let mut k = kernel();
+        k.task_capacity = Arc::new(trames_kernel::task::Capacity::new(8));
         let mut p = admitted_process(&k);
-        for id in 2..=MAX_PROCESSES as u32 {
+        for id in 2..=8 {
             k.processes.insert(id, admitted_process(&k));
         }
         let before = p.memory.mapped_bytes();
