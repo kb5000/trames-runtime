@@ -556,7 +556,10 @@ impl Socket {
         if let Some(fabric) = fabric {
             native.extend(fabric.native_waiters().into_iter().map(|(s, _)| s));
         }
-        let mut sources: Vec<_> = native.into_iter().map(WaitSource::Native).collect();
+        let mut sources: Vec<_> = native
+            .into_iter()
+            .flat_map(|socket| socket.wait_interests())
+            .collect();
         if let Some(link) = external {
             sources.push(WaitSource::Link(link));
         }

@@ -4,6 +4,7 @@ use crate::{dns, NetError, NetworkMode, Received, MSG_PEEK};
 use std::{
     collections::{BTreeMap, VecDeque},
     net::{Ipv4Addr, SocketAddr},
+    os::unix::net::UnixDatagram,
     sync::{
         atomic::{AtomicU64, Ordering::Relaxed},
         Arc, Mutex, Weak,
@@ -44,13 +45,6 @@ impl Service {
     fn tick(&self) {
         let mut resolver = self.resolver.lock().unwrap();
         let Some(r) = resolver.as_mut() else { return };
-        while let Some((token, response)) = r.worker.result() {
-            if let Some(p) = r.pending.remove(&token) {
-                if let Some(e) = p.endpoint.upgrade() {
-                    e.complete(response.answer(&p.question, if e.stream { 4096 } else { 512 }));
-                }
-            }
-        }
         r.pending.retain(|_, p| {
             let Some(e) = p.endpoint.upgrade() else {
                 return false;
@@ -63,7 +57,22 @@ impl Service {
             }
         });
     }
-    fn submit(&self, endpoint: &Arc<Endpoint>, packet: &[u8]) -> Result<()> {
+    fn complete(&self, token: u64, response: dns::Response) {
+        let pending = self
+            .resolver
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|r| r.pending.remove(&token));
+        if let Some(pending) = pending {
+            if let Some(endpoint) = pending.endpoint.upgrade() {
+                endpoint.complete(
+                    response.answer(&pending.question, if endpoint.stream { 4096 } else { 512 }),
+                );
+            }
+        }
+    }
+    fn submit(self: &Arc<Self>, endpoint: &Arc<Endpoint>, packet: &[u8]) -> Result<()> {
         self.tick();
         // Reserve the original per-endpoint bound in the same transaction as
         // all other pending/reply changes. Parallel malformed/local requests
@@ -93,7 +102,15 @@ impl Service {
         if r.pending.len() >= LIMIT {
             return Err(NetError(11));
         }
-        if let Some(token) = r.worker.query(&question) {
+        let service = Arc::downgrade(self);
+        if let Some(token) = r.worker.query_notify(
+            &question,
+            Box::new(move |token, response| {
+                if let Some(service) = service.upgrade() {
+                    service.complete(token, response);
+                }
+            }),
+        ) {
             r.pending.insert(
                 token,
                 Pending {
@@ -130,6 +147,8 @@ pub(crate) struct Endpoint {
     input: Mutex<Input>,
     state: Mutex<State>,
     epoch: AtomicU64,
+    ready: Arc<UnixDatagram>,
+    notify: UnixDatagram,
 }
 struct Admission<'a> {
     endpoint: &'a Endpoint,
@@ -152,14 +171,31 @@ impl Drop for Admission<'_> {
     }
 }
 impl Endpoint {
-    pub fn new(service: Arc<Service>, stream: bool) -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new(service: Arc<Service>, stream: bool) -> std::io::Result<Arc<Self>> {
+        let (ready, notify) = UnixDatagram::pair()?;
+        ready.set_nonblocking(true)?;
+        notify.set_nonblocking(true)?;
+        Ok(Arc::new(Self {
             service,
             stream,
             input: Mutex::default(),
             state: Mutex::default(),
             epoch: AtomicU64::new(0),
-        })
+            ready: Arc::new(ready),
+            notify,
+        }))
+    }
+    pub fn waiter(&self) -> Arc<UnixDatagram> {
+        self.ready.clone()
+    }
+    fn drain_notification(&self) {
+        loop {
+            match self.ready.recv(&mut [0; 32]) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                _ => break,
+            }
+        }
     }
     pub fn epoch(&self) -> u64 {
         self.epoch.load(Relaxed)
@@ -192,6 +228,15 @@ impl Endpoint {
         }
         s.replies.push_back(packet);
         self.epoch.fetch_add(1, Relaxed);
+        // This endpoint's queue lock covers publication and notification. A
+        // waiter drains before its deciding readiness check under the same lock.
+        // No coordinator, periodic tick or new resolver thread is involved.
+        loop {
+            match self.notify.send(&[1]) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                _ => break,
+            }
+        }
     }
     fn pump(self: &Arc<Self>) {
         self.service.tick();
@@ -256,6 +301,7 @@ impl Endpoint {
         self.pump();
         let input = self.stream.then(|| self.input.lock().unwrap());
         let mut s = self.state.lock().unwrap();
+        self.drain_notification();
         if input.as_ref().is_some_and(|i| i.failed) {
             return Err(NetError(71));
         }
@@ -306,6 +352,7 @@ impl Endpoint {
         self.pump();
         let input = self.stream.then(|| self.input.lock().unwrap());
         let s = self.state.lock().unwrap();
+        self.drain_notification();
         if input.as_ref().is_some_and(|i| i.failed) {
             return 8 | 16;
         }
@@ -343,11 +390,37 @@ impl Endpoint {
 mod tests {
     use super::*;
     #[test]
+    fn completion_notifies_the_original_endpoint_without_a_guest_tick() {
+        use std::os::fd::AsFd;
+        for stream in [false, true] {
+            let endpoint = Endpoint::new(Service::new(NetworkMode::Loopback), stream).unwrap();
+            let packet = query(101, b"localhost", 1);
+            let bytes = if stream {
+                [&(packet.len() as u16).to_be_bytes()[..], &packet].concat()
+            } else {
+                packet
+            };
+            endpoint.send(&bytes).unwrap();
+            // Do not call Endpoint::poll/recv/Service::tick until the actual
+            // native notification arrives. Polling in the test hid this bug.
+            let waiter = endpoint.waiter();
+            let mut fds = [nix::poll::PollFd::new(
+                waiter.as_fd(),
+                nix::poll::PollFlags::POLLIN,
+            )];
+            assert_eq!(nix::poll::poll(&mut fds, 2000u16).unwrap(), 1);
+            assert!(!endpoint.state.lock().unwrap().replies.is_empty());
+            assert_eq!(endpoint.poll(1), 1);
+            assert!(!endpoint.recv(512, 0).unwrap().data.is_empty());
+            assert_eq!(nix::poll::poll(&mut fds, 0u16).unwrap(), 0);
+        }
+    }
+    #[test]
     fn concurrent_datagram_admission_keeps_the_original_bound_and_returns_slots() {
         fn shared<T: Send + Sync>() {}
         shared::<Service>();
         shared::<Endpoint>();
-        let e = Endpoint::new(Service::new(NetworkMode::Loopback), false);
+        let e = Endpoint::new(Service::new(NetworkMode::Loopback), false).unwrap();
         let start = std::sync::Barrier::new(33);
         std::thread::scope(|scope| {
             let jobs: Vec<_> = (0..32)
@@ -382,7 +455,7 @@ mod tests {
     }
     #[test]
     fn concurrent_stream_writers_and_reader_preserve_every_dns_frame_once() {
-        let e = Endpoint::new(Service::new(NetworkMode::Loopback), true);
+        let e = Endpoint::new(Service::new(NetworkMode::Loopback), true).unwrap();
         let start = std::sync::Barrier::new(5);
         std::thread::scope(|scope| {
             for worker in 0..4 {
@@ -430,7 +503,7 @@ mod tests {
     fn resolver_backpressure_rolls_back_admission_and_preserves_buffered_frames() {
         for stream in [false, true] {
             let service = Service::new(NetworkMode::Full);
-            let blocker = Endpoint::new(service.clone(), false);
+            let blocker = Endpoint::new(service.clone(), false).unwrap();
             let q = query(17, b"localhost", 1);
             // Keep the actual namespace resolver table full without relying
             // on host DNS latency. These weak outstanding targets model jobs
@@ -450,7 +523,7 @@ mod tests {
                     })
                     .collect(),
             });
-            let e = Endpoint::new(service.clone(), stream);
+            let e = Endpoint::new(service.clone(), stream).unwrap();
             if stream {
                 let frame = [&(q.len() as u16).to_be_bytes()[..], &q].concat();
                 assert_eq!(e.send(&frame), Ok(frame.len()));
@@ -484,7 +557,7 @@ mod tests {
         let service = Service::new(NetworkMode::Full);
         std::thread::scope(|scope| {
             for worker in 0..8u16 {
-                let e = Endpoint::new(service.clone(), false);
+                let e = Endpoint::new(service.clone(), false).unwrap();
                 scope.spawn(move || {
                     for index in 0..8 {
                         let q = query(
@@ -509,7 +582,7 @@ mod tests {
             .unwrap()
             .pending
             .is_empty());
-        let e = Endpoint::new(service.clone(), false);
+        let e = Endpoint::new(service.clone(), false).unwrap();
         e.send(&query(99, b"localhost", 1)).unwrap();
         let weak = Arc::downgrade(&e);
         drop(e);
@@ -548,7 +621,7 @@ mod tests {
     }
     #[test]
     fn dns_only_udp_preserves_ids_datagrams_peek_and_truncation() {
-        let e = Endpoint::new(Service::new(NetworkMode::Full), false);
+        let e = Endpoint::new(Service::new(NetworkMode::Full), false).unwrap();
         for (id, kind) in [(0x1234, 1), (0x5678, 28)] {
             let q = query(id, b"localhost", kind);
             assert_eq!(e.send(&q).unwrap(), q.len());
@@ -566,7 +639,7 @@ mod tests {
     }
     #[test]
     fn dns_tcp_reassembles_split_frames_and_half_close_preserves_reply() {
-        let e = Endpoint::new(Service::new(NetworkMode::Full), true);
+        let e = Endpoint::new(Service::new(NetworkMode::Full), true).unwrap();
         let q = query(17, b"localhost", 1);
         let size = (q.len() as u16).to_be_bytes();
         assert_eq!(e.send(&size[..1]).unwrap(), 1);
@@ -585,7 +658,7 @@ mod tests {
     }
     #[test]
     fn malformed_queries_and_backpressure_are_bounded_and_loopback_cannot_resolve_external() {
-        let e = Endpoint::new(Service::new(NetworkMode::Loopback), false);
+        let e = Endpoint::new(Service::new(NetworkMode::Loopback), false).unwrap();
         let q = query(1, b"external.invalid", 1);
         e.send(&q).unwrap();
         assert_eq!(e.recv(512, 0).unwrap().data[3] & 15, 5);
@@ -596,7 +669,7 @@ mod tests {
         for _ in 0..LIMIT {
             assert_eq!(e.recv(512, 0).unwrap().data[3] & 15, 1);
         }
-        let tcp = Endpoint::new(e.service.clone(), true);
+        let tcp = Endpoint::new(e.service.clone(), true).unwrap();
         assert_eq!(tcp.send(&[0xff, 0xff]).unwrap(), 2);
         assert_eq!(tcp.poll(1), 24);
         assert!(matches!(tcp.recv(32, 0), Err(NetError(71))));

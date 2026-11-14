@@ -67,12 +67,17 @@ pub fn wait_with_fds(
     extra: &[std::os::fd::BorrowedFd<'_>],
     timeout: Duration,
 ) -> Result<()> {
-    let has_dns = sockets.iter().any(|(s, _)| !s.dns.borrow().is_empty());
-    let timeout = if has_dns {
-        timeout.min(Duration::from_millis(2))
-    } else {
-        timeout
-    };
+    let notifications: Vec<_> = sockets
+        .iter()
+        .flat_map(|(socket, _)| {
+            socket
+                .dns
+                .borrow()
+                .values()
+                .map(|endpoint| endpoint.waiter())
+                .collect::<Vec<_>>()
+        })
+        .collect();
     let mut unique: Vec<(Arc<Socket>, u16)> = Vec::new();
     for (socket, events) in sockets {
         if socket.dns_peer.get() {
@@ -104,6 +109,11 @@ pub fn wait_with_fds(
         })
         .collect();
     fds.extend(extra.iter().map(|fd| PollFd::new(*fd, PollFlags::POLLIN)));
+    fds.extend(
+        notifications
+            .iter()
+            .map(|fd| PollFd::new(fd.as_fd(), PollFlags::POLLIN)),
+    );
     let timeout = PollTimeout::try_from(timeout).map_err(|_| NetError(22))?;
     match poll(&mut fds, timeout) {
         Ok(_) | Err(HostErrno::EINTR) => Ok(()),
@@ -532,12 +542,25 @@ impl Socket {
                     )
                     .map_err(from_io)?;
             }
-            entry.insert(direct_dns::Endpoint::new(
-                self.network.0.dns.clone(),
-                self.kind == 1,
-            ));
+            entry.insert(
+                direct_dns::Endpoint::new(self.network.0.dns.clone(), self.kind == 1)
+                    .map_err(from_io)?,
+            );
         }
         Ok(endpoints[&address].clone())
+    }
+    pub(crate) fn wait_interests(self: &Arc<Self>) -> Vec<crate::WaitSource> {
+        let mut sources = Vec::new();
+        if !self.dns_peer.get() {
+            sources.push(crate::WaitSource::Native(self.clone()));
+        }
+        sources.extend(
+            self.dns
+                .borrow()
+                .values()
+                .map(|dns| crate::WaitSource::Link(dns.waiter())),
+        );
+        sources
     }
     pub fn info(&self) -> super::SocketInfo {
         super::SocketInfo {

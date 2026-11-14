@@ -9,9 +9,15 @@ pub(crate) struct Question {
     pub kind: u16,
 }
 pub(crate) struct Resolver {
-    jobs: Option<mpsc::SyncSender<(u64, Question)>>,
+    jobs: Option<mpsc::SyncSender<Job>>,
     results: mpsc::Receiver<(u64, Response)>,
     next: u64,
+}
+type Completion = Box<dyn FnOnce(u64, Response) + Send>;
+struct Job {
+    id: u64,
+    question: Question,
+    complete: Option<Completion>,
 }
 pub(crate) enum Response {
     Addresses(Vec<IpAddr>, u8),
@@ -115,7 +121,7 @@ fn resolve(name: &str, kind: u16) -> (Vec<IpAddr>, u8) {
 }
 impl Resolver {
     pub fn new() -> Self {
-        let (jobs, rx) = mpsc::sync_channel::<(u64, Question)>(8);
+        let (jobs, rx) = mpsc::sync_channel::<Job>(8);
         let rx = Arc::new(Mutex::new(rx));
         let (tx, results) = mpsc::sync_channel(8);
         let mut workers = 0;
@@ -128,7 +134,11 @@ impl Resolver {
                     let Ok(job) = rx.lock().unwrap().recv() else {
                         break;
                     };
-                    let (id, question) = job;
+                    let Job {
+                        id,
+                        question,
+                        complete,
+                    } = job;
                     let response = if matches!(question.kind, 1 | 28) {
                         let (mut addresses, code) = resolve(&question.name, question.kind);
                         addresses.sort();
@@ -138,7 +148,9 @@ impl Resolver {
                     } else {
                         resolve_records(&question)
                     };
-                    if tx.send((id, response)).is_err() {
+                    if let Some(complete) = complete {
+                        complete(id, response);
+                    } else if tx.send((id, response)).is_err() {
                         break;
                     }
                 })
@@ -154,9 +166,24 @@ impl Resolver {
         }
     }
     pub fn query(&mut self, q: &Question) -> Option<u64> {
+        self.submit(q, None)
+    }
+    /// Direct endpoints publish from the existing blocking resolver worker;
+    /// they must not depend on another guest syscall to drain the result queue.
+    pub fn query_notify(&mut self, q: &Question, complete: Completion) -> Option<u64> {
+        self.submit(q, Some(complete))
+    }
+    fn submit(&mut self, q: &Question, complete: Option<Completion>) -> Option<u64> {
         let id = self.next;
         self.next = self.next.checked_add(1)?;
-        self.jobs.as_ref()?.try_send((id, q.clone())).ok()?;
+        self.jobs
+            .as_ref()?
+            .try_send(Job {
+                id,
+                question: q.clone(),
+                complete,
+            })
+            .ok()?;
         Some(id)
     }
     pub fn result(&self) -> Option<(u64, Response)> {

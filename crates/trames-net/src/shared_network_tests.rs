@@ -3,6 +3,66 @@ use super::*;
 use std::sync::Barrier;
 
 #[test]
+fn dns_reply_wakes_the_retained_native_wait_without_polling_or_a_guest_tick() {
+    for (kind, connected) in [(2, false), (2, true), (1, true)] {
+        let network = Network::new(NetworkMode::Outbound);
+        let socket = network.socket(2, kind, 0).unwrap();
+        let peer = "169.254.0.53:53".parse().unwrap();
+        if connected {
+            socket.connect(peer).unwrap();
+        } else {
+            // Acquire this unconnected socket's DNS endpoint before arming.
+            socket.send(b"xx", 0, Some(peer)).unwrap();
+            socket.recv(512, 0).unwrap();
+        }
+        let (sources, delay) = socket.wait_interests();
+        assert!(delay.is_none(), "native DNS must not need a periodic timer");
+        let mut wait = trames_shared::HostWait::new().unwrap();
+        wait.begin();
+        let mut notifications = 0;
+        for source in sources {
+            if matches!(source, WaitSource::Link(_)) {
+                wait.watch_owned(source.open().unwrap(), false).unwrap();
+                notifications += 1;
+            }
+        }
+        assert_eq!(
+            notifications, 1,
+            "DNS completion must be an actual wait source"
+        );
+        let query = b"\x12\x34\x01\x00\x00\x01\0\0\0\0\0\0\x09localhost\0\0\x01\0\x01";
+        let start = std::time::Instant::now();
+        wait.until(start + Duration::from_secs(2));
+        std::thread::scope(|scope| {
+            let socket = &socket;
+            scope.spawn(move || {
+                let framed;
+                let bytes = if kind == 1 {
+                    framed = [&(query.len() as u16).to_be_bytes()[..], query].concat();
+                    &framed[..]
+                } else {
+                    &query[..]
+                };
+                socket.send(bytes, 0, (!connected).then_some(peer)).unwrap();
+            });
+            wait.wait().unwrap();
+        });
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "wait slept until its timeout"
+        );
+        let response = socket.recv(512, 0).unwrap().data;
+        let response = if kind == 1 {
+            &response[2..]
+        } else {
+            &response[..]
+        };
+        assert_eq!(&response[..2], &query[..2]);
+        assert_eq!(response[3] & 15, 0);
+    }
+}
+
+#[test]
 fn complete_network_graph_is_shared_and_concurrent_creation_has_one_quota() {
     fn shared<T: Send + Sync>() {}
     shared::<Network>();
