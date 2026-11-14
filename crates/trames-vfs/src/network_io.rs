@@ -173,6 +173,31 @@ impl Vfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_first_dns_send_rearms_an_already_subscribed_udp_reader() {
+        let mut v = Vfs::default();
+        v.configure_network(NetworkMode::Outbound).unwrap();
+        let fd = v.socket(2, 2 | O_NONBLOCK, 0).unwrap();
+        let direct = v.direct_descriptors();
+        let reader = direct.get(fd).unwrap();
+        let socket = v.socket_operation(fd).unwrap();
+        let mut wait = trames_shared::HostWait::new().unwrap();
+        wait.begin();
+        wait.retain(reader.subscribe(wait.signal()));
+        assert!(!wait.signal().ready());
+        let revision = socket.wait_revision();
+        socket.with_tcp_publication(|| {
+            socket
+                .send(b"xx", 0, Some("169.254.0.53:53".parse().unwrap()))
+                .unwrap();
+        });
+        assert_ne!(socket.wait_revision(), revision);
+        assert!(
+            wait.signal().ready(),
+            "the old native-only wait must be rearmed"
+        );
+        assert_eq!(socket.recv(512, 0).unwrap().data[3] & 15, 1);
+    }
     use std::{
         io::Read,
         net::{Ipv4Addr, TcpListener},

@@ -595,6 +595,7 @@ impl Socket {
     pub fn wait_revision(&self) -> u64 {
         match &self.backend {
             SocketBackend::Hybrid(socket) => socket.wait_revision(),
+            SocketBackend::Native(socket) => socket.wait_revision(),
             SocketBackend::Virtual(socket) => socket.fabric().revision(),
             _ => 0,
         }

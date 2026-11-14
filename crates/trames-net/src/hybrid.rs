@@ -532,7 +532,14 @@ impl Socket {
         }
     }
     pub(super) fn wait_revision(&self) -> u64 {
-        (self.poll_revision.get() << 2) | self.path.get() as u64
+        let dns = self
+            .native
+            .borrow()
+            .as_ref()
+            .map_or(0, |socket| socket.wait_revision());
+        // The native DNS map has only the two fixed resolver aliases. Publish
+        // its lazy event-source admission through the existing change channel.
+        (self.poll_revision.get() << 4) | ((self.path.get() as u64) << 2) | dns
     }
     pub fn waiters(&self, events: u16) -> (Option<(Arc<native::Socket>, u16)>, Option<Fabric>) {
         let native = (self.path.get() != Path::Guest)

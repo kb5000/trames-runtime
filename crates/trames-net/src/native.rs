@@ -154,6 +154,7 @@ impl PreparedSocket {
             family: self.family,
             kind: self.kind,
             dns: SharedState::default(),
+            dns_revision: Cell::new(0),
             dns_target: Cell::new(direct_dns::ADDRESS),
             dns_peer: Cell::new(false),
             dns_receive_errors: Cell::new(false),
@@ -363,6 +364,7 @@ pub struct Socket {
     family: u32,
     kind: u32,
     dns: SharedState<std::collections::BTreeMap<SocketAddr, Arc<direct_dns::Endpoint>>>,
+    dns_revision: Cell<u64>,
     dns_target: Cell<SocketAddr>,
     dns_peer: Cell<bool>,
     dns_receive_errors: Cell<bool>,
@@ -546,8 +548,12 @@ impl Socket {
                 direct_dns::Endpoint::new(self.network.0.dns.clone(), self.kind == 1)
                     .map_err(from_io)?,
             );
+            self.dns_revision.set(self.dns_revision.get() + 1);
         }
         Ok(endpoints[&address].clone())
+    }
+    pub(crate) fn wait_revision(&self) -> u64 {
+        self.dns_revision.get()
     }
     pub(crate) fn wait_interests(self: &Arc<Self>) -> Vec<crate::WaitSource> {
         let mut sources = Vec::new();
