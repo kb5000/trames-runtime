@@ -7,6 +7,7 @@ use std::{
 };
 static NEXT_STAGING: AtomicU64 = AtomicU64::new(1);
 const LIMIT: usize = 4 * 1024 * 1024;
+const GALLIUM_LIMIT: usize = 64 * 1024 * 1024;
 const LIBRARY: &[u8] = b"/usr/lib/libtrames_vulkan_icd.so";
 const MANIFEST: &[u8] = b"/usr/share/vulkan/icd.d/trames.json";
 const JSON: &[u8] = br#"{"file_format_version":"1.0.0","ICD":{"api_version":"1.1.0","library_path":"/usr/lib/libtrames_vulkan_icd.so"}}"#;
@@ -31,21 +32,54 @@ pub fn install_vulkan_icd(reader: &mut impl Read, vfs: &mut Vfs) -> Result<bool,
 /// stay under /usr/lib, so installing/upgrading signed packages cannot overwrite
 /// the adapter and existing rootfs data needs no migration.
 pub fn install_zink_egl(reader: &mut impl Read, vfs: &mut Vfs) -> Result<bool, Error> {
+    install_mesa(reader, vfs, b"/usr/local/lib/libEGL.so.1", LIMIT)
+}
+/// The EGL frontend and Gallium share Mesa's private ABI. Install the matching
+/// patched Zink library beside EGL, leaving signed distro package files intact.
+pub fn install_zink_gallium(reader: &mut impl Read, vfs: &mut Vfs) -> Result<bool, Error> {
+    install_mesa(
+        reader,
+        vfs,
+        b"/usr/local/lib/libgallium-25.1.9.so",
+        GALLIUM_LIMIT,
+    )
+}
+fn install_mesa(
+    reader: &mut impl Read,
+    vfs: &mut Vfs,
+    path: &[u8],
+    limit: usize,
+) -> Result<bool, Error> {
     let mut bytes = Vec::new();
-    reader.take(LIMIT as u64 + 1).read_to_end(&mut bytes)?;
-    if bytes.len() > LIMIT
+    reader.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > limit
         || bytes.get(..6) != Some(b"\x7fELF\x02\x01")
         || bytes.get(18..20) != Some(&183u16.to_le_bytes())
     {
-        return Err(Error::Invalid("invalid bundled AArch64 Mesa EGL adapter"));
+        return Err(Error::Invalid("invalid bundled AArch64 Mesa library"));
     }
-    replace(vfs, b"/usr/local/lib/libEGL.so.1", &bytes)
+    replace(vfs, path, &bytes)
 }
 fn replace(vfs: &mut Vfs, path: &[u8], bytes: &[u8]) -> Result<bool, Error> {
     if let Ok(fd) = vfs.open_at(AT_FDCWD, path, 0, 0) {
-        let current = vfs.read(fd, bytes.len() + 1);
+        // VFS reads may be short (including its per-call transfer ceiling).
+        // Compare in bounded chunks so large Gallium files keep their inode
+        // on subsequent boots without allocating another library-sized copy.
+        let current: Result<bool, trames_vfs::Errno> = (|| {
+            let mut offset = 0;
+            loop {
+                let chunk = vfs.read(fd, (bytes.len() - offset + 1).min(1 << 20))?;
+                if chunk.is_empty() {
+                    return Ok(offset == bytes.len());
+                }
+                if bytes.get(offset..offset + chunk.len()) != Some(chunk.as_slice()) {
+                    return Ok(false);
+                }
+                offset += chunk.len();
+            }
+        })();
         vfs.close(fd)?;
-        if current.is_ok_and(|current| current == bytes) {
+        if current == Ok(true) {
             return Ok(false);
         }
     }
@@ -167,5 +201,22 @@ mod tests {
         assert!(install_zink_egl(&mut b"invalid".as_slice(), &mut vfs).is_err());
         assert_eq!(read(&mut vfs, path), bytes);
         assert_eq!(read(&mut vfs, b"/usr/lib/libEGL.so.1"), apk);
+    }
+    #[test]
+    fn paired_gallium_can_exceed_the_small_icd_limit_and_keeps_package_files() {
+        let mut vfs = Vfs::default();
+        let apk = b"original distro Gallium";
+        vfs.import_file(b"/usr/lib/libgallium-25.1.9.so", apk.to_vec())
+            .unwrap();
+        let mut bytes = library();
+        bytes.resize(LIMIT + 1, 0);
+        let path = b"/usr/local/lib/libgallium-25.1.9.so";
+        assert!(install_zink_gallium(&mut bytes.as_slice(), &mut vfs).unwrap());
+        let first = vfs.stat_at(AT_FDCWD, path).unwrap();
+        assert!(!install_zink_gallium(&mut bytes.as_slice(), &mut vfs).unwrap());
+        assert_eq!(&first[8..16], &vfs.stat_at(AT_FDCWD, path).unwrap()[8..16]);
+        assert!(install_zink_gallium(&mut b"invalid".as_slice(), &mut vfs).is_err());
+        assert_eq!(read(&mut vfs, path), bytes);
+        assert_eq!(read(&mut vfs, b"/usr/lib/libgallium-25.1.9.so"), apk);
     }
 }

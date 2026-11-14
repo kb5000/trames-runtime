@@ -203,6 +203,32 @@ pub fn renew_identity(vfs: &mut Vfs) -> Result<()> {
     Ok(())
 }
 
+/// Seed older/minimal Linux images for D-Bus without replacing an existing ID.
+/// Boot initialization only; no service or guest hot-path work is introduced.
+pub fn ensure_machine_identity(vfs: &mut Vfs) -> Result<()> {
+    match vfs.stat_at(AT_FDCWD, b"/etc/machine-id") {
+        Ok(_) => return Ok(()),
+        Err(trames_vfs::Errno(2)) => (),
+        Err(error) => return Err(error.into()),
+    }
+    use std::io::Read;
+    let mut random = [0u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+    let identity = random
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
+        + "\n";
+    // Use normal guest path traversal, including a rootfs with /etc linked to
+    // another directory. The raw archive-import API does not follow aliases.
+    match vfs.mkdir_at(AT_FDCWD, b"/etc", 0o755) {
+        Ok(()) | Err(trames_vfs::Errno(17)) => (),
+        Err(error) => return Err(error.into()),
+    }
+    file(vfs, b"/etc/machine-id", identity.as_bytes())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,6 +277,31 @@ mod tests {
         assert_eq!(monitor.control(false).unwrap(), None);
     }
 
+    #[test]
+    fn missing_machine_identity_is_seeded_once_and_existing_identity_is_preserved() {
+        let mut vfs = Vfs::default();
+        ensure_machine_identity(&mut vfs).unwrap();
+        let mut first = Vec::new();
+        vfs.export_writer(b"/etc/machine-id", &mut first).unwrap();
+        assert_eq!(first.len(), 33);
+        assert!(first[..32].iter().all(u8::is_ascii_hexdigit));
+        ensure_machine_identity(&mut vfs).unwrap();
+        let mut next = Vec::new();
+        vfs.export_writer(b"/etc/machine-id", &mut next).unwrap();
+        assert_eq!(first, next);
+    }
+    #[test]
+    fn machine_identity_follows_a_linked_etc_directory() {
+        let mut vfs = Vfs::default();
+        vfs.import_file(b"/config/etc/existing", b"keep".to_vec())
+            .unwrap();
+        vfs.symlink_at(b"/config/etc", AT_FDCWD, b"/etc").unwrap();
+        ensure_machine_identity(&mut vfs).unwrap();
+        assert_eq!(vfs.readlink_at(AT_FDCWD, b"/etc").unwrap(), b"/config/etc");
+        let fd = vfs.open_at(AT_FDCWD, b"/config/etc/machine-id", 0, 0).unwrap();
+        assert_eq!(vfs.read(fd, 64).unwrap().len(), 33);
+        vfs.close(fd).unwrap();
+    }
     #[test]
     fn imported_machine_identity_is_renewed_consistently() {
         let mut vfs = Vfs::default();

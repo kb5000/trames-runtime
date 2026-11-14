@@ -18,7 +18,7 @@ use std::{
 };
 pub use timezone::synchronize_timezone;
 use trames_vfs::{Errno, Vfs, AT_FDCWD, MAX_PATH};
-pub use vulkan::{install_vulkan_icd, install_zink_egl};
+pub use vulkan::{install_vulkan_icd, install_zink_egl, install_zink_gallium};
 pub use xwayland::{install_xwayland_launcher, install_xwayland_native};
 pub const ALPINE_VERSION: &str = "3.22.6";
 pub const ALPINE_URL: &str = "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/aarch64/alpine-minirootfs-3.22.6-aarch64.tar.gz";
