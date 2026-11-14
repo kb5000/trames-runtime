@@ -83,11 +83,14 @@ fn optional_file(vfs: &mut Vfs, path: &[u8]) -> Result<Option<Vec<u8>>> {
 }
 fn overlay(vfs: &mut Vfs, name: &str, target: &[u8], bytes: &[u8]) -> Result<()> {
     let source = format!("/run/trames-android/{name}");
-    crate::systemd::file(vfs, source.as_bytes(), bytes)?;
+    crate::systemd::file(vfs, source.as_bytes(), bytes)
+        .map_err(|error| format!("write Android overlay {name}: {error}"))?;
     if vfs.stat_at(AT_FDCWD, target).is_err_and(|e| e.0 == 2) {
-        crate::systemd::file(vfs, target, b"")?;
+        crate::systemd::file(vfs, target, b"")
+            .map_err(|error| format!("create Android overlay target {name}: {error}"))?;
     }
-    vfs.mount(Some(source.as_bytes()), target, None, 4096, None)?;
+    vfs.mount(Some(source.as_bytes()), target, None, 4096, None)
+        .map_err(|error| format!("mount Android overlay {name}: {error}"))?;
     Ok(())
 }
 fn audio_launcher(bytes: &[u8]) -> Result<Vec<u8>> {
@@ -298,7 +301,9 @@ pub fn prepare(vfs: &mut Vfs) -> Result<()> {
     // The original HWC can also put its cursor on a native-image subsurface.
     // Use that same retained GPU transport instead of its unaccepted EGL-to-SHM
     // cursor readback path. Explicit caller settings still win over defaults.
-    let defaults = b"ro.lmk.use_new_strategy=true\nro.lmk.psi_partial_stall_ms=0\nro.lmk.psi_complete_stall_ms=0\nro.cold_boot_done=true\nro.zygote=zygote64\ndalvik.vm.dex2oat64.enabled=true\nro.product.cpu.abilist=arm64-v8a\nro.product.cpu.abilist64=arm64-v8a\nro.product.cpu.abilist32=\nsys.use_memfd=true\nwaydroid.stub_sensors_hal=true\nwaydroid.xdg_runtime_dir=/run/trames-wayland\nwaydroid.wayland_display=wayland-0\npersist.waydroid.cursor_on_subsurface=true\n";
+    // No camera device is forwarded. Android's own no-camera mode makes camera
+    // enumeration return zero instead of waiting forever for an absent HAL.
+    let defaults = b"ro.lmk.use_new_strategy=true\nro.lmk.psi_partial_stall_ms=0\nro.lmk.psi_complete_stall_ms=0\nro.cold_boot_done=true\nro.zygote=zygote64\ndalvik.vm.dex2oat64.enabled=true\nro.product.cpu.abilist=arm64-v8a\nro.product.cpu.abilist64=arm64-v8a\nro.product.cpu.abilist32=\nsys.use_memfd=true\nconfig.disable_cameraservice=true\nwaydroid.stub_sensors_hal=true\nwaydroid.xdg_runtime_dir=/run/trames-wayland\nwaydroid.wayland_display=wayland-0\npersist.waydroid.cursor_on_subsurface=true\n";
     for line in defaults
         .split(|b| *b == b'\n')
         .filter(|line| !line.is_empty())
@@ -320,6 +325,13 @@ pub fn prepare(vfs: &mut Vfs) -> Result<()> {
         Some(b"mode=755,uid=0,gid=0,size=0,nr_inodes=0"),
     )?;
     directory(vfs, b"/run/trames-android", 0o755)?;
+    if optional_file(vfs, b"/system/bin/trames-media-service")?.is_some() {
+        // The adapter registers the original 64-bit OMX implementation and
+        // builds the original resource manager missing from this ARM64 image.
+        // Do not impersonate media.player: its normal local-codec fallback stays.
+        overlay(vfs, "trames-media.rc", b"/system/etc/init/trames-media.rc",
+            b"service trames-media /system/bin/trames-media-service\n    class main\n    user media\n    group audio camera inet drmrpc mediadrm\n    interface android.hardware.media.omx@1.0::IOmx default\n    interface android.hardware.media.omx@1.0::IOmxStore default\n\non property:init.svc.trames-media=running\n    stop media\n    stop vendor.media.omx\n\non property:config.disable_cameraservice=true\n    stop cameraserver\n    stop vendor.camera-provider-2-4\n    stop vendor.camera-provider-2-7-ext\n")?;
+    }
     // The selected Waydroid image has 64-bit audio implementations but a
     // 32-bit launcher. An explicitly installed ARM64 launcher reuses those
     // original implementations; other images and absent helpers stay intact.
@@ -506,6 +518,34 @@ mod tests {
         ));
         assert!(text.contains("service camera /system/bin/cameraserver\n    rlimit rtprio 10 10\n"));
         assert_eq!(text.matches("rlimit rtprio").count(), 1);
+    }
+    #[test]
+    fn cold_media_adapter_uses_original_init_and_no_camera_mode() {
+        let mut vfs = Vfs::default();
+        for file in [
+            b"/system/bin/init".as_slice(),
+            b"/system/bin/bootstrap/linker64",
+            b"/system/bin/trames-media-service",
+        ] {
+            vfs.import_executable(file, b"fixture".to_vec()).unwrap();
+        }
+        directory(&mut vfs, b"/system/etc", 0o755).unwrap();
+        directory(&mut vfs, b"/system/etc/init", 0o755).unwrap();
+        directory(&mut vfs, b"/vendor", 0o755).unwrap();
+        prepare(&mut vfs).unwrap();
+        let rc = optional_file(&mut vfs, b"/system/etc/init/trames-media.rc")
+            .unwrap()
+            .unwrap();
+        let rc = std::str::from_utf8(&rc).unwrap();
+        assert!(rc.contains("service trames-media /system/bin/trames-media-service\n"));
+        assert!(rc.contains("interface android.hardware.media.omx@1.0::IOmxStore default"));
+        assert!(rc.contains("stop vendor.media.omx"));
+        let props = optional_file(&mut vfs, b"/vendor/waydroid.prop")
+            .unwrap()
+            .unwrap();
+        assert!(std::str::from_utf8(&props)
+            .unwrap()
+            .contains("config.disable_cameraservice=true\n"));
     }
     #[test]
     fn boot_resets_property_socket_state_but_keeps_data_and_user_overlay() {

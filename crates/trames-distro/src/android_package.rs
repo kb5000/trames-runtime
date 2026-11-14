@@ -18,6 +18,7 @@ const COMPONENTS: [&str; 3] = [
     "vendor/lib64/hw/gralloc.trames.so",
     "vendor/bin/hw/trames-hal-service",
 ];
+const MEDIA_COMPONENT: &str = "system/bin/trames-media-service";
 pub const IMAGE_PINS: &str = include_str!("../../../scripts/android-images.json");
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -120,6 +121,7 @@ pub fn install(
         let name = String::from_utf8(entry.path_bytes().into_owned())?;
         if !entry.header().entry_type().is_file()
             || !(COMPONENTS.contains(&name.as_str())
+                || name == MEDIA_COMPONENT
                 || [
                     MANIFEST,
                     "vendor/waydroid.prop",
@@ -149,7 +151,8 @@ pub fn install(
         return Err("not an Android adapter package".into());
     }
     let plan = manifest_plan(&manifest)?;
-    if payload.len() != 7
+    let media = payload.contains_key(MEDIA_COMPONENT);
+    if payload.len() != 7 + usize::from(media)
         || payload.get("vendor/waydroid.prop").map(Vec::as_slice)
             != Some(
                 b"ro.hardware.vulkan=trames\nro.hardware.egl=angle\nro.hardware.gralloc=trames\n",
@@ -157,7 +160,10 @@ pub fn install(
     {
         return Err("incomplete Android adapter payload/configuration".into());
     }
-    for name in COMPONENTS {
+    for name in COMPONENTS
+        .into_iter()
+        .chain(media.then_some(MEDIA_COMPONENT))
+    {
         let bytes = payload
             .get(name)
             .ok_or("missing Android adapter component")?;
@@ -211,7 +217,7 @@ pub fn install(
         if vfs.stat_at_flags(AT_FDCWD, path.as_bytes(), true).is_ok() {
             vfs.unlink_at(AT_FDCWD, path.as_bytes(), false)?;
         }
-        let executable = name.starts_with("vendor/bin/");
+        let executable = name.starts_with("vendor/bin/") || name == MEDIA_COMPONENT;
         vfs.import_reader(path.as_bytes(), &mut bytes.as_slice(), executable)?;
         vfs.chown_at(AT_FDCWD, path.as_bytes(), 0, 0, false)?;
         vfs.chmod_at(

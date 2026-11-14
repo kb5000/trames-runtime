@@ -564,7 +564,14 @@ impl Linux {
                 }
                 0x8914 => {
                     let flags = u16::from_le_bytes(entry[16..18].try_into().unwrap());
-                    if flags & !(1 | 2 | 8 | 0x40 | 0x1000) != 0 {
+                    // netd preserves IFF_NOARP when raising the guest IP-only
+                    // uplink. Accept the link's existing intrinsic flag.
+                    let noarp = if device.kind == trames_net::DeviceKind::Direct {
+                        0x80
+                    } else {
+                        0
+                    };
+                    if flags & !(1 | 2 | 8 | 0x40 | noarp | 0x1000) != 0 {
                         return Err(Errno(95));
                     }
                     vfs.set_network_device_up(device.index, flags & 1 != 0)?;

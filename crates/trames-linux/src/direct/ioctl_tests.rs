@@ -10,6 +10,50 @@ fn memory() -> Memory {
 fn capture(linux: &Linux) -> DirectSyscalls {
     DirectSyscalls::new(linux.vfs.direct_descriptors()).with_paths(linux.vfs.path_queries())
 }
+
+#[test]
+fn managed_ip_link_can_roundtrip_netd_noarp_flags_on_both_dispatch_paths() {
+    for source in [false, true] {
+        let mut linux = Linux::new(0x10000);
+        linux
+            .vfs
+            .configure_managed_uplink(trames_vfs::NetworkMode::Full)
+            .unwrap();
+        let fd = linux.vfs.socket(2, 2, 0).unwrap();
+        let mut m = memory();
+        m.write(0x1000, b"eth0\0").unwrap();
+        for (request, set) in [
+            (0x8913, None),
+            (0x8914, Some(0x81u16)),
+            (0x8914, Some(0x80)),
+            (0x8913, None),
+            (0x8914, Some(0x81)),
+            (0x8913, None),
+        ] {
+            if let Some(flags) = set {
+                m.write_array(0x1010, flags.to_le_bytes()).unwrap();
+            }
+            let args = [fd as u64, request, 0x1000, 0, 0, 0];
+            let result = if source {
+                capture(&linux).invoke(29, args, &mut m).unwrap()
+            } else {
+                linux.syscall(29, args, &mut m, &mut crate::CapturedOutput::default())
+            };
+            assert_eq!(result, Ok(0));
+            let flags = u16::from_le_bytes(m.read_array::<2>(0x1010).unwrap());
+            assert_ne!(flags & 0x80, 0);
+        }
+        assert!(
+            linux
+                .vfs
+                .network_devices()
+                .iter()
+                .find(|d| d.name == b"eth0")
+                .unwrap()
+                .up
+        );
+    }
+}
 fn setup(kind: u8) -> (Linux, Memory, u32) {
     let mut linux = Linux::new(0x10000);
     linux.vfs.set_runtime_info(
