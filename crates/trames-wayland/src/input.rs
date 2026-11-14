@@ -208,6 +208,13 @@ impl State {
         self.seat.pointers.retain(Resource::is_alive);
         match event {
             InputEvent::Focus { window } => {
+                // Native focus names the containing toplevel, including when
+                // its popup overlay becomes key or a button is released. That
+                // is not a focus departure: retain the popup's keyboard focus,
+                // implicit grab and complete click instead of dismissing it.
+                if window.is_some() && self.focus_toplevel(self.seat.focus) == window {
+                    return;
+                }
                 self.dismiss_popups();
                 if window.is_none() {
                     let buttons = self.seat.buttons.iter().copied().collect::<Vec<_>>();
@@ -596,6 +603,7 @@ mod tests {
     use super::*;
     use crate::scene::{BufferData, BufferLease, ImageBuffer, ShmBuffer, Surface, SurfaceKey};
     use std::sync::{Arc, Mutex, Weak};
+    use wayland_protocols::xdg::shell::server::{xdg_popup, xdg_toplevel};
     use wayland_server::protocol::{wl_buffer, wl_surface};
 
     #[test]
@@ -644,8 +652,7 @@ mod tests {
         assert!(state.seat.pressed.contains(&47));
     }
 
-    #[test]
-    fn nested_popup_unmap_restores_mapped_ancestors_without_stealing_other_focus() {
+    fn popup_scene() -> Compositor {
         let mut compositor = Compositor::new().unwrap();
         let (_peer, socket) = UnixStream::pair().unwrap();
         compositor
@@ -689,9 +696,88 @@ mod tests {
                 .unwrap();
             let mut surface = Surface::new(resource, 1);
             surface.parent = parent.map(|p| (p, 0, 0));
+            if parent.is_none() {
+                surface.top = Some(
+                    client
+                        .create_resource::<xdg_toplevel::XdgToplevel, _, State>(
+                            &handle,
+                            3,
+                            SurfaceKey(id),
+                        )
+                        .unwrap(),
+                );
+            } else {
+                surface.popup = Some(
+                    client
+                        .create_resource::<xdg_popup::XdgPopup, _, State>(
+                            &handle,
+                            3,
+                            SurfaceKey(id),
+                        )
+                        .unwrap(),
+                );
+            }
             surface.current = Some(image.clone());
             compositor.state.surfaces.insert(id, surface);
         }
+        compositor
+    }
+
+    #[test]
+    fn native_refocus_preserves_nested_popup_clicks_and_keyboard_state() {
+        let mut compositor = popup_scene();
+        let state = &mut compositor.state;
+        state.focus_surface(Some(3));
+        state.seat.pointer = Some(3);
+        state.seat.popups = vec![2, 3];
+        state.seat.pressed.insert(29);
+        state.seat.modifiers = 4;
+        let serial = state.serial;
+        // AppKit reports the containing toplevel for both an overlay becoming
+        // key and each mouse button. Neither is a departure from its popup tree.
+        state.input(InputEvent::Focus { window: Some(1) });
+        assert_eq!(state.seat.focus, Some(3));
+        assert_eq!(state.seat.popups, [2, 3]);
+        assert!(state.surfaces[&2].current.is_some());
+        assert!(state.surfaces[&3].current.is_some());
+        assert!(state.seat.pressed.contains(&29));
+        assert_eq!(state.seat.modifiers, 4);
+        assert_eq!(state.serial, serial);
+        state.input(InputEvent::Button {
+            button: 0x110,
+            pressed: true,
+            time: 1,
+        });
+        state.input(InputEvent::Focus { window: Some(1) });
+        state.input(InputEvent::Button {
+            button: 0x110,
+            pressed: false,
+            time: 2,
+        });
+        assert_eq!(state.seat.focus, Some(3));
+        assert_eq!(state.seat.popups, [2, 3]);
+        assert!(state.seat.buttons.is_empty());
+        // A real toplevel change must still dismiss menus and release keys.
+        state.input(InputEvent::Focus { window: Some(4) });
+        assert_eq!(state.seat.focus, Some(4));
+        assert!(state.seat.popups.is_empty());
+        assert!(state.surfaces[&2].current.is_none());
+        assert!(state.surfaces[&3].current.is_none());
+        assert!(state.seat.pressed.is_empty());
+        state.input(InputEvent::Button {
+            button: 0x110,
+            pressed: true,
+            time: 3,
+        });
+        state.input(InputEvent::Focus { window: None });
+        assert_eq!(state.seat.focus, None);
+        assert!(state.seat.buttons.is_empty());
+        assert_eq!(state.seat.grab, None);
+    }
+
+    #[test]
+    fn nested_popup_unmap_restores_mapped_ancestors_without_stealing_other_focus() {
+        let mut compositor = popup_scene();
         let state = &mut compositor.state;
         state.focus_surface(Some(3));
         state.seat.pointer = Some(3);
