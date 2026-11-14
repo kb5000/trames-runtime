@@ -298,7 +298,9 @@ mod tests {
         vfs.symlink_at(b"/config/etc", AT_FDCWD, b"/etc").unwrap();
         ensure_machine_identity(&mut vfs).unwrap();
         assert_eq!(vfs.readlink_at(AT_FDCWD, b"/etc").unwrap(), b"/config/etc");
-        let fd = vfs.open_at(AT_FDCWD, b"/config/etc/machine-id", 0, 0).unwrap();
+        let fd = vfs
+            .open_at(AT_FDCWD, b"/config/etc/machine-id", 0, 0)
+            .unwrap();
         assert_eq!(vfs.read(fd, 64).unwrap().len(), 33);
         vfs.close(fd).unwrap();
     }
