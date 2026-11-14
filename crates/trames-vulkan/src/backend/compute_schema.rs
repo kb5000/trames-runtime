@@ -46,6 +46,7 @@ pub(super) const EXTENSIONS: &[(u64, &std::ffi::CStr, u32)] = &[
     (1 << 42, c"VK_EXT_line_rasterization", vk::API_VERSION_1_1),
     (1 << 43, c"VK_EXT_sample_locations", vk::API_VERSION_1_1),
     (1 << 44, c"VK_KHR_synchronization2", vk::API_VERSION_1_1),
+    (1 << 45, c"VK_EXT_depth_clip_enable", vk::API_VERSION_1_0),
 ];
 pub(super) const EXT_STORAGE_CLASS: u64 = 1 << 0;
 pub(super) const EXT_MAINTENANCE3: u64 = 1 << 16;
@@ -79,10 +80,11 @@ compute_features! {
     dynamic_rendering: PhysicalDeviceDynamicRenderingFeatures, 34, 13 => [74 => dynamic_rendering : true];
     extended_dynamic_state: PhysicalDeviceExtendedDynamicStateFeaturesEXT, 36, 13 => [75 => extended_dynamic_state : true];
     extended_dynamic_state2: PhysicalDeviceExtendedDynamicState2FeaturesEXT, 37, 13 => [76 => extended_dynamic_state2 : true, 77 => extended_dynamic_state2_logic_op : true, 78 => extended_dynamic_state2_patch_control_points : true];
-    extended_dynamic_state3: PhysicalDeviceExtendedDynamicState3FeaturesEXT, 38, 0 => [79 => extended_dynamic_state3_tessellation_domain_origin : false, 80 => extended_dynamic_state3_depth_clamp_enable : true, 81 => extended_dynamic_state3_polygon_mode : true, 82 => extended_dynamic_state3_rasterization_samples : false, 83 => extended_dynamic_state3_sample_mask : false, 84 => extended_dynamic_state3_alpha_to_coverage_enable : false, 85 => extended_dynamic_state3_alpha_to_one_enable : false, 86 => extended_dynamic_state3_logic_op_enable : false, 87 => extended_dynamic_state3_color_blend_enable : false, 88 => extended_dynamic_state3_color_blend_equation : false, 89 => extended_dynamic_state3_color_write_mask : false, 90 => extended_dynamic_state3_rasterization_stream : false, 91 => extended_dynamic_state3_conservative_rasterization_mode : false, 92 => extended_dynamic_state3_extra_primitive_overestimation_size : false, 93 => extended_dynamic_state3_depth_clip_enable : false, 94 => extended_dynamic_state3_sample_locations_enable : true, 95 => extended_dynamic_state3_color_blend_advanced : false, 96 => extended_dynamic_state3_provoking_vertex_mode : false, 97 => extended_dynamic_state3_line_rasterization_mode : true, 98 => extended_dynamic_state3_line_stipple_enable : false, 99 => extended_dynamic_state3_depth_clip_negative_one_to_one : false, 100 => extended_dynamic_state3_viewport_w_scaling_enable : false, 101 => extended_dynamic_state3_viewport_swizzle : false, 102 => extended_dynamic_state3_coverage_to_color_enable : false, 103 => extended_dynamic_state3_coverage_to_color_location : false, 104 => extended_dynamic_state3_coverage_modulation_mode : false, 105 => extended_dynamic_state3_coverage_modulation_table_enable : false, 106 => extended_dynamic_state3_coverage_modulation_table : false, 107 => extended_dynamic_state3_coverage_reduction_mode : false, 108 => extended_dynamic_state3_representative_fragment_test_enable : false, 109 => extended_dynamic_state3_shading_rate_image_enable : false];
+    extended_dynamic_state3: PhysicalDeviceExtendedDynamicState3FeaturesEXT, 38, 0 => [79 => extended_dynamic_state3_tessellation_domain_origin : false, 80 => extended_dynamic_state3_depth_clamp_enable : true, 81 => extended_dynamic_state3_polygon_mode : true, 82 => extended_dynamic_state3_rasterization_samples : false, 83 => extended_dynamic_state3_sample_mask : false, 84 => extended_dynamic_state3_alpha_to_coverage_enable : false, 85 => extended_dynamic_state3_alpha_to_one_enable : false, 86 => extended_dynamic_state3_logic_op_enable : false, 87 => extended_dynamic_state3_color_blend_enable : false, 88 => extended_dynamic_state3_color_blend_equation : false, 89 => extended_dynamic_state3_color_write_mask : false, 90 => extended_dynamic_state3_rasterization_stream : false, 91 => extended_dynamic_state3_conservative_rasterization_mode : false, 92 => extended_dynamic_state3_extra_primitive_overestimation_size : false, 93 => extended_dynamic_state3_depth_clip_enable : true, 94 => extended_dynamic_state3_sample_locations_enable : true, 95 => extended_dynamic_state3_color_blend_advanced : false, 96 => extended_dynamic_state3_provoking_vertex_mode : false, 97 => extended_dynamic_state3_line_rasterization_mode : true, 98 => extended_dynamic_state3_line_stipple_enable : false, 99 => extended_dynamic_state3_depth_clip_negative_one_to_one : false, 100 => extended_dynamic_state3_viewport_w_scaling_enable : false, 101 => extended_dynamic_state3_viewport_swizzle : false, 102 => extended_dynamic_state3_coverage_to_color_enable : false, 103 => extended_dynamic_state3_coverage_to_color_location : false, 104 => extended_dynamic_state3_coverage_modulation_mode : false, 105 => extended_dynamic_state3_coverage_modulation_table_enable : false, 106 => extended_dynamic_state3_coverage_modulation_table : false, 107 => extended_dynamic_state3_coverage_reduction_mode : false, 108 => extended_dynamic_state3_representative_fragment_test_enable : false, 109 => extended_dynamic_state3_shading_rate_image_enable : false];
     host_image_copy: PhysicalDeviceHostImageCopyFeaturesEXT, 39, 14 => [110 => host_image_copy : true];
     line_rasterization: PhysicalDeviceLineRasterizationFeaturesEXT, 42, 0 => [111 => rectangular_lines : true, 112 => bresenham_lines : true, 113 => smooth_lines : true, 114 => stippled_rectangular_lines : true, 115 => stippled_bresenham_lines : true, 116 => stippled_smooth_lines : true];
     synchronization2: PhysicalDeviceSynchronization2Features, 44, 13 => [117 => synchronization2 : true];
+    depth_clip_enable: PhysicalDeviceDepthClipEnableFeaturesEXT, 45, 0 => [118 => depth_clip_enable : true];
 }
 pub(super) const SHADER_SHARED_FLOAT32_ATOMICS: u128 = 1 << 13;
 pub(super) const SHADER_SHARED_FLOAT32_ATOMIC_ADD: u128 = 1 << 14;
@@ -109,10 +111,12 @@ pub(super) const EXTENDED_DYNAMIC_STATE2: u128 = 1 << 76;
 pub(super) const EXTENDED_DYNAMIC_STATE2_PATCH_CONTROL_POINTS: u128 = 1 << 78;
 pub(super) const EXTENDED_DYNAMIC_STATE3_DEPTH_CLAMP_ENABLE: u128 = 1 << 80;
 pub(super) const EXTENDED_DYNAMIC_STATE3_POLYGON_MODE: u128 = 1 << 81;
+pub(super) const EXTENDED_DYNAMIC_STATE3_DEPTH_CLIP_ENABLE: u128 = 1 << 93;
 pub(super) const EXTENDED_DYNAMIC_STATE3_SAMPLE_LOCATIONS_ENABLE: u128 = 1 << 94;
 pub(super) const EXTENDED_DYNAMIC_STATE3_LINE_RASTERIZATION_MODE: u128 = 1 << 97;
 pub(super) const HOST_IMAGE_COPY: u128 = 1 << 110;
 pub(super) const SYNCHRONIZATION2: u128 = 1 << 117;
+pub(super) const DEPTH_CLIP_ENABLE: u128 = 1 << 118;
 pub(super) const SUBGROUP_BROADCAST_DYNAMIC_ID: u128 = 1 << 39;
 pub(super) const SAMPLER_MIRROR_CLAMP_TO_EDGE: u128 = 1 << 40;
 pub(super) const SAMPLER_FILTER_MINMAX: u128 = 1 << 41;

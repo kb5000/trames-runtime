@@ -1,5 +1,5 @@
 {
-  "wire_revision": 20,
+  "wire_revision": 21,
   "extensions": [
     {"index": 0, "name": "storage_class", "extension": "VK_KHR_storage_buffer_storage_class", "minimum_api": 0, "promoted": 11},
     {"index": 1, "name": "storage16", "extension": "VK_KHR_16bit_storage", "minimum_api": 0, "promoted": 11},
@@ -45,7 +45,8 @@
     {"index": 41, "name": "format_feature_flags2", "extension": "VK_KHR_format_feature_flags2", "minimum_api": 12, "promoted": 13},
     {"index": 42, "name": "line_rasterization", "extension": "VK_EXT_line_rasterization", "minimum_api": 11, "promoted": 0},
     {"index": 43, "name": "sample_locations", "extension": "VK_EXT_sample_locations", "minimum_api": 11, "promoted": 0},
-    {"index": 44, "name": "synchronization2", "extension": "VK_KHR_synchronization2", "minimum_api": 11, "promoted": 13}
+    {"index": 44, "name": "synchronization2", "extension": "VK_KHR_synchronization2", "minimum_api": 11, "promoted": 13},
+    {"index": 45, "name": "depth_clip_enable", "extension": "VK_EXT_depth_clip_enable", "minimum_api": 0, "promoted": 0}
   ],
   "features": [
     {
@@ -348,7 +349,7 @@
         {"c": "extendedDynamicState3RasterizationStream", "rust": "extended_dynamic_state3_rasterization_stream", "kind": "Bool32", "expose": false},
         {"c": "extendedDynamicState3ConservativeRasterizationMode", "rust": "extended_dynamic_state3_conservative_rasterization_mode", "kind": "Bool32", "expose": false},
         {"c": "extendedDynamicState3ExtraPrimitiveOverestimationSize", "rust": "extended_dynamic_state3_extra_primitive_overestimation_size", "kind": "Bool32", "expose": false},
-        {"c": "extendedDynamicState3DepthClipEnable", "rust": "extended_dynamic_state3_depth_clip_enable", "kind": "Bool32", "expose": false},
+        {"c": "extendedDynamicState3DepthClipEnable", "rust": "extended_dynamic_state3_depth_clip_enable", "kind": "Bool32", "expose": true},
         {"c": "extendedDynamicState3SampleLocationsEnable", "rust": "extended_dynamic_state3_sample_locations_enable", "kind": "Bool32", "expose": true},
         {"c": "extendedDynamicState3ColorBlendAdvanced", "rust": "extended_dynamic_state3_color_blend_advanced", "kind": "Bool32", "expose": false},
         {"c": "extendedDynamicState3ProvokingVertexMode", "rust": "extended_dynamic_state3_provoking_vertex_mode", "kind": "Bool32", "expose": false},
@@ -400,6 +401,16 @@
       "bit": 117,
       "fields": [
         {"c": "synchronization2", "rust": "synchronization2", "kind": "Bool32", "expose": true}
+      ]
+    },
+    {
+      "extension": 45,
+      "name": "depth_clip_enable",
+      "type": "PhysicalDeviceDepthClipEnableFeaturesEXT",
+      "structure_type": "PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT",
+      "bit": 118,
+      "fields": [
+        {"c": "depthClipEnable", "rust": "depth_clip_enable", "kind": "Bool32", "expose": true}
       ]
     }
   ],

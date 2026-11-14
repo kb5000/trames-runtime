@@ -57,7 +57,12 @@ macro_rules! compute_properties {
 }
 include!("compute_schema.rs");
 
-fn executable_features(features: u128, moltenvk: bool, vendor: u32) -> u128 {
+fn executable_features(mut features: u128, moltenvk: bool, vendor: u32) -> u128 {
+    // Older native drivers can report the EDS3 field without the base extension.
+    // Gate once at discovery; ordinary draw/recording paths need no extra check.
+    if features & DEPTH_CLIP_ENABLE == 0 {
+        features &= !EXTENDED_DYNAMIC_STATE3_DEPTH_CLIP_ENABLE;
+    }
     if moltenvk && vendor == 0x106b {
         features & !(SHADER_SHARED_FLOAT32_ATOMICS | SHADER_SHARED_FLOAT32_ATOMIC_ADD)
     } else {
@@ -224,6 +229,15 @@ impl Capabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dynamic_depth_clip_requires_the_executable_base_feature() {
+        let dynamic = EXTENDED_DYNAMIC_STATE3_DEPTH_CLIP_ENABLE;
+        assert_eq!(executable_features(dynamic, true, 0x106b), 0);
+        assert_eq!(
+            executable_features(dynamic | DEPTH_CLIP_ENABLE, true, 0x106b),
+            dynamic | DEPTH_CLIP_ENABLE
+        );
+    }
     #[test]
     fn core12_promotion_merges_aliases_without_duplicate_native_nodes() {
         let bits = (1 << 4) | (1 << 7) | HOST_QUERY_RESET | SUBGROUP_BROADCAST_DYNAMIC_ID;

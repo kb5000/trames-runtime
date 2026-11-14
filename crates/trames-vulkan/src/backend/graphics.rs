@@ -811,6 +811,14 @@ impl Backend {
             Vec::new()
         };
         let dynamic_stride = extended.contains(&vk::DynamicState::VERTEX_INPUT_BINDING_STRIDE);
+        let depth_clip = if config[0] & 4194304 != 0 {
+            if device.compute_features & compute::DEPTH_CLIP_ENABLE == 0 {
+                return unsupported();
+            }
+            Some(words64(m, a[15] + 132 * 8, 1)?[0] != 0)
+        } else {
+            None
+        };
         let raster_values = if config[0] & 2097152 != 0 {
             words64(m, a[15] + 128 * 8, 4)?
                 .into_iter()
@@ -916,7 +924,7 @@ impl Backend {
         .limits;
         // Extended graphics state is copied before the asynchronous native
         // compiler starts; no guest pointers enter that worker.
-        if config[0] & !4194303 != 0 {
+        if config[0] & !8388607 != 0 {
             return unsupported();
         }
         let creation_flags = if config[0] & 65536 != 0 {
@@ -1267,6 +1275,12 @@ impl Backend {
                 .stippled_line_enable(extra[1] != 0)
                 .line_stipple_factor(extra[2] as u32)
                 .line_stipple_pattern(extra[3] as u16);
+            let mut depth_clip_state =
+                vk::PipelineRasterizationDepthClipStateCreateInfoEXT::default();
+            if let Some(enabled) = depth_clip {
+                depth_clip_state.depth_clip_enable = u32::from(enabled);
+                raster = raster.push_next(&mut depth_clip_state);
+            }
             if device.compute_extensions & compute::EXT_LINE_RASTERIZATION != 0 {
                 raster = raster.push_next(&mut line);
             }

@@ -24,6 +24,7 @@ pub(super) fn feature(state: vk::DynamicState) -> Result<u128> {
         S::PATCH_CONTROL_POINTS_EXT => compute::EXTENDED_DYNAMIC_STATE2_PATCH_CONTROL_POINTS,
         S::LOGIC_OP_EXT => 1 << 77,
         S::DEPTH_CLAMP_ENABLE_EXT => compute::EXTENDED_DYNAMIC_STATE3_DEPTH_CLAMP_ENABLE,
+        S::DEPTH_CLIP_ENABLE_EXT => compute::EXTENDED_DYNAMIC_STATE3_DEPTH_CLIP_ENABLE,
         S::POLYGON_MODE_EXT => compute::EXTENDED_DYNAMIC_STATE3_POLYGON_MODE,
         S::SAMPLE_LOCATIONS_ENABLE_EXT => compute::EXTENDED_DYNAMIC_STATE3_SAMPLE_LOCATIONS_ENABLE,
         S::LINE_RASTERIZATION_MODE_EXT => compute::EXTENDED_DYNAMIC_STATE3_LINE_RASTERIZATION_MODE,
@@ -109,6 +110,7 @@ impl Backend {
                 S::PATCH_CONTROL_POINTS_EXT => api2.cmd_set_patch_control_points(raw, a[3] as u32),
                 S::LOGIC_OP_EXT => api2.cmd_set_logic_op(raw, vk::LogicOp::from_raw(a[3] as i32)),
                 S::DEPTH_CLAMP_ENABLE_EXT => api3.cmd_set_depth_clamp_enable(raw, a[3] != 0),
+                S::DEPTH_CLIP_ENABLE_EXT => api3.cmd_set_depth_clip_enable(raw, a[3] != 0),
                 S::POLYGON_MODE_EXT => {
                     api3.cmd_set_polygon_mode(raw, vk::PolygonMode::from_raw(a[3] as i32))
                 }
