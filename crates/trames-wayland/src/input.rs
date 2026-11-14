@@ -200,6 +200,21 @@ impl State {
         }
         self.changed();
     }
+    fn focus_pointer_window(&mut self) {
+        // Pointer delivery and keyboard activation are different. Non-grabbing
+        // popups (Firefox panels) retain their parent's keyboard focus; sending
+        // a leave on that parent makes GTK roll them up before mouse release.
+        let focus = self.seat.pointer.and_then(|pointer| {
+            self.seat
+                .popups
+                .iter()
+                .rev()
+                .find(|&&popup| self.is_descendant(pointer, popup))
+                .copied()
+                .or_else(|| self.focus_toplevel(Some(pointer)))
+        });
+        self.focus_surface(focus);
+    }
     pub(crate) fn input(&mut self, event: InputEvent) {
         if self.defer_xkey(&event) {
             return;
@@ -305,7 +320,7 @@ impl State {
                             .is_none_or(|target| !self.is_descendant(target, popup))
                     }) {
                         self.dismiss_popups();
-                        self.focus_surface(self.seat.pointer);
+                        self.focus_pointer_window();
                         return;
                     }
                     if !self.seat.buttons.insert(button) {
@@ -314,7 +329,7 @@ impl State {
                     if self.seat.buttons.len() == 1 {
                         self.seat.grab = self.seat.pointer;
                     }
-                    self.focus_surface(self.seat.pointer);
+                    self.focus_pointer_window();
                 } else if !self.seat.buttons.remove(&button) {
                     return;
                 }
@@ -735,6 +750,35 @@ mod tests {
         assert_eq!(state.popup_constraint_bounds(1), (-200, -100, 1920, 1020));
         assert_eq!(state.popup_constraint_bounds(2), (-600, -150, 1920, 1020));
         assert_eq!(state.popup_constraint_bounds(3), (-620, -160, 1920, 1020));
+    }
+    #[test]
+    fn non_grabbing_popup_click_keeps_the_parent_keyboard_focus() {
+        let mut compositor = popup_scene();
+        let state = &mut compositor.state;
+        state.focus_surface(Some(1));
+        state.seat.pointer = Some(3);
+        state.seat.pressed.insert(29);
+        state.seat.modifiers = 4;
+        // Firefox's hamburger menu does not request xdg_popup.grab. A keyboard
+        // leave on its main surface rolls the menu up during the mouse press.
+        state.input(InputEvent::Button {
+            button: 0x110,
+            pressed: true,
+            time: 1,
+        });
+        assert_eq!(state.seat.focus, Some(1));
+        assert_eq!(state.seat.grab, Some(3));
+        assert!(state.seat.pressed.contains(&29));
+        assert_eq!(state.seat.modifiers, 4);
+        state.input(InputEvent::Focus { window: Some(1) });
+        state.input(InputEvent::Button {
+            button: 0x110,
+            pressed: false,
+            time: 2,
+        });
+        assert_eq!(state.seat.focus, Some(1));
+        assert!(state.seat.buttons.is_empty());
+        assert!(state.surfaces[&3].current.is_some());
     }
     #[test]
     fn native_refocus_preserves_nested_popup_clicks_and_keyboard_state() {

@@ -722,6 +722,31 @@ fn original_c_scene_atomic_subsurface_popup_and_pointer_grab() {
                 (w.scene[2].x, w.scene[2].y, w.scene[2].destination),
                 (1576, 76, (340, 681))
             );
+            server
+                .input(InputEvent::Pointer {
+                    window: w.id,
+                    x: 1586.0,
+                    y: 576.0,
+                    time: 23,
+                })
+                .unwrap();
+            server
+                .input(InputEvent::Button {
+                    button: 0x110,
+                    pressed: true,
+                    time: 24,
+                })
+                .unwrap();
+            server
+                .input(InputEvent::Focus { window: Some(w.id) })
+                .unwrap();
+            server
+                .input(InputEvent::Button {
+                    button: 0x110,
+                    pressed: false,
+                    time: 25,
+                })
+                .unwrap();
             server.popup_bounds(w.id, -200, -100, 1920, 1020).unwrap();
             key(35);
             phase = 8;
@@ -753,6 +778,10 @@ fn original_c_scene_atomic_subsurface_popup_and_pointer_grab() {
         thread::sleep(Duration::from_millis(2));
     }
     assert_eq!(phase, 9, "{log}");
+    let non_grabbing_menu = log.split("wide-menu").last().unwrap();
+    assert!(non_grabbing_menu.contains("button=popup 1"), "{log}");
+    assert!(non_grabbing_menu.contains("button=popup 0"), "{log}");
+    assert!(!non_grabbing_menu.contains("keyboard=popup"), "{log}");
     assert!(log.contains("repositioned=17"), "{log}");
 }
 
