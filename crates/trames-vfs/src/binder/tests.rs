@@ -474,6 +474,35 @@ fn returned_temporary_object_acquisitions_precede_reply_completion() {
     client.free(&reply);
 }
 #[test]
+fn released_objects_are_reclaimed_by_pool_after_exporting_worker_stops_reading() {
+    let root = Vfs::default();
+    let mut owner = Client::new(&root, 10, b"/dev/binder");
+    let client = Client::new(&root, 20, b"/dev/binder");
+    let process = owner.process();
+    let node = process.owned_node(0x1110, 0x2220, 0x100, 10).unwrap();
+    let reference = client.process().reference(node.clone(), 3).unwrap();
+    let acquired = owner.receive().unwrap();
+    assert!(acquired.iter().any(|(cmd, _)| *cmd == BR_ACQUIRE));
+    // The provider worker returns to application code. Only a different Binder
+    // pool thread reads after the remote cursor closes its observer reference.
+    owner.tid = 11;
+    owner.enter();
+    drop(BufferReference(reference, true));
+    let released = owner.receive().expect("pool must receive object releases");
+    let commands: Vec<_> = released
+        .iter()
+        .map(|(cmd, _)| *cmd)
+        .filter(|cmd| matches!(*cmd, BR_RELEASE | BR_DECREFS))
+        .collect();
+    assert_eq!(commands, [BR_RELEASE, BR_DECREFS]);
+    assert!(!process
+        .state
+        .lock()
+        .unwrap()
+        .nodes
+        .contains_key(&node.pointer));
+}
+#[test]
 fn queued_transaction_holds_guest_object_until_target_buffer_is_freed() {
     let root = Vfs::default();
     let mut owner = Client::new(&root, 10, b"/dev/binder");

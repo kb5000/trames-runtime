@@ -230,7 +230,7 @@ impl Node {
         if self.is_manager.load(Ordering::Relaxed) {
             return;
         }
-        {
+        let target_tid = {
             let mut state = self.state.lock().unwrap();
             let strong = state.strong != 0 || state.inflight != 0 || state.pending_strong != 0;
             let weak =
@@ -239,12 +239,14 @@ impl Node {
                 return;
             }
             state.queued = 1;
-        }
+            // Initial acquisition must precede the exporting thread's reply or
+            // completion. Releases belong to the process queue: an ordinary
+            // caller may never enter Binder again after its RPC returns.
+            (strong && !state.has_strong || weak && !state.has_weak)
+                .then(|| self.owner_tid.load(Ordering::Relaxed) as u32)
+        };
         if let Some(owner) = self.owner.upgrade() {
-            owner.enqueue_node(
-                self.owner_tid.load(Ordering::Relaxed) as u32,
-                Work::Node(self.clone()),
-            );
+            owner.enqueue_node(target_tid, Work::Node(self.clone()));
         }
     }
     fn notices(&self) -> Vec<u8> {
@@ -705,13 +707,13 @@ impl Connection {
     fn bytes(&self, tid: u32, cmd: u32) {
         let _ = self.enqueue(Some(tid), Work::Bytes(command(cmd, &[])));
     }
-    fn enqueue_node(&self, tid: u32, work: Work) {
+    fn enqueue_node(&self, tid: Option<u32>, work: Work) {
         {
             let mut state = self.state.lock().unwrap();
             if state.closed {
                 return;
             }
-            if let Some(thread) = state.threads.get_mut(&tid) {
+            if let Some(thread) = tid.and_then(|tid| state.threads.get_mut(&tid)) {
                 thread.queue.push_back(work);
                 thread.epoch = thread.epoch.wrapping_add(1);
             } else {

@@ -19,6 +19,7 @@ const COMPONENTS: [&str; 3] = [
     "vendor/bin/hw/trames-hal-service",
 ];
 const MEDIA_COMPONENT: &str = "system/bin/trames-media-service";
+const HWC_COMPONENT: &str = "vendor/lib64/hw/hwcomposer.trames.so";
 pub const IMAGE_PINS: &str = include_str!("../../../scripts/android-images.json");
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -122,6 +123,7 @@ pub fn install(
         if !entry.header().entry_type().is_file()
             || !(COMPONENTS.contains(&name.as_str())
                 || name == MEDIA_COMPONENT
+                || name == HWC_COMPONENT
                 || [
                     MANIFEST,
                     "vendor/waydroid.prop",
@@ -152,17 +154,21 @@ pub fn install(
     }
     let plan = manifest_plan(&manifest)?;
     let media = payload.contains_key(MEDIA_COMPONENT);
-    if payload.len() != 7 + usize::from(media)
-        || payload.get("vendor/waydroid.prop").map(Vec::as_slice)
-            != Some(
-                b"ro.hardware.vulkan=trames\nro.hardware.egl=angle\nro.hardware.gralloc=trames\n",
-            )
+    let hwc = payload.contains_key(HWC_COMPONENT);
+    let mut properties =
+        b"ro.hardware.vulkan=trames\nro.hardware.egl=angle\nro.hardware.gralloc=trames\n".to_vec();
+    if hwc {
+        properties.extend_from_slice(b"ro.hardware.hwcomposer=trames\n");
+    }
+    if payload.len() != 7 + usize::from(media) + usize::from(hwc)
+        || payload.get("vendor/waydroid.prop").map(Vec::as_slice) != Some(properties.as_slice())
     {
         return Err("incomplete Android adapter payload/configuration".into());
     }
     for name in COMPONENTS
         .into_iter()
         .chain(media.then_some(MEDIA_COMPONENT))
+        .chain(hwc.then_some(HWC_COMPONENT))
     {
         let bytes = payload
             .get(name)
@@ -434,6 +440,67 @@ mod tests {
         .to_string()
         .contains("unexpected"));
         assert!(vfs.stat_at(AT_FDCWD, b"/system").is_err());
+    }
+    #[test]
+    fn hwc_adapter_is_digest_checked_and_requires_matching_hal_selection() {
+        let mut elf = vec![0u8; 64];
+        elf[..5].copy_from_slice(b"\x7fELF\x02");
+        elf[18..20].copy_from_slice(&183u16.to_le_bytes());
+        for hwc in [false, true] {
+            let mut value = manifest();
+            let mut files = BTreeMap::new();
+            for name in COMPONENTS.into_iter().chain(hwc.then_some(HWC_COMPONENT)) {
+                value["components"][format!("/{name}")] = serde_json::json!({
+                    "size": elf.len(), "sha256": format!("{:x}", Sha256::digest(&elf))
+                });
+                files.insert(name, elf.clone());
+            }
+            let mut props =
+                b"ro.hardware.vulkan=trames\nro.hardware.egl=angle\nro.hardware.gralloc=trames\n"
+                    .to_vec();
+            if hwc {
+                props.extend_from_slice(b"ro.hardware.hwcomposer=trames\n");
+            }
+            files.insert("vendor/waydroid.prop", props);
+            files.insert(".trames-android/GPL-3.0.txt", b"fixture".to_vec());
+            files.insert(".trames-android/SOURCES.json", b"{}".to_vec());
+            files.insert(MANIFEST, serde_json::to_vec(&value).unwrap());
+            let package = Archive::new(
+                &files
+                    .iter()
+                    .map(|(k, v)| (*k, v.as_slice()))
+                    .collect::<Vec<_>>(),
+            );
+            let error = install(
+                &package.0,
+                Path::new("/absent-image-cache"),
+                &mut Vfs::default(),
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::NotFound
+            );
+            if hwc {
+                files.get_mut(HWC_COMPONENT).unwrap()[50] ^= 1;
+                let corrupt = Archive::new(
+                    &files
+                        .iter()
+                        .map(|(k, v)| (*k, v.as_slice()))
+                        .collect::<Vec<_>>(),
+                );
+                assert!(install(
+                    &corrupt.0,
+                    Path::new("/absent-image-cache"),
+                    &mut Vfs::default(),
+                    None
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("digest/ABI"));
+            }
+        }
     }
     #[test]
     fn ext4_preserves_hardlinks_symlinks_permissions_ids_and_excludes_mutable_payloads() {

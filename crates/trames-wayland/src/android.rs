@@ -143,17 +143,18 @@ impl Dispatch<AndroidWlegl, ()> for State {
                         return;
                     }
                 };
-                if width <= 0
-                    || height <= 0
-                    || info.width != width as u32
-                    || info.height != height as u32
-                    || info.format != native_format
-                    || stride <= 0
-                    || stride as u64 * 4 != info.pitch
-                {
-                    resource.post_error(1u32, "native image geometry mismatch");
+                if width <= 0 || height <= 0 || info.format != native_format || stride <= 0 {
+                    resource.post_error(1u32, format!(
+                        "native image geometry mismatch: requested {width}x{height} stride={stride} format={format}, image {}x{} pitch={} format={:?}",
+                        info.width, info.height, info.pitch, info.format));
                     return;
                 }
+                // The retained native plane owns its geometry and row layout.
+                // Waydroid's separate HIDL size/stride metadata can describe the
+                // next display configuration while its attached target is still
+                // the old image. Those duplicate hints must not disconnect the
+                // compositor. Texture and viewport bounds use actual ImageInfo;
+                // no guest-provided dimensions address or resize this storage.
                 let Ok(texture) = trames_graphics::Context::display_texture(image.as_ref()) else {
                     resource.post_error(0u32, "native texture unavailable");
                     return;
@@ -210,5 +211,111 @@ impl Dispatch<WlBuffer, Buffer> for State {
         _: &DisplayHandle,
         _: &mut DataInit<'_, Self>,
     ) {
+    }
+}
+
+#[cfg(all(test, target_vendor = "apple"))]
+mod tests {
+    use super::*;
+    use trames_shared::{NativeSocket, SharedFile};
+
+    fn message(id: u32, opcode: u32, words: &[u32]) -> Vec<u8> {
+        [id, (((words.len() + 2) * 4) as u32) << 16 | opcode]
+            .into_iter()
+            .chain(words.iter().copied())
+            .flat_map(u32::to_ne_bytes)
+            .collect()
+    }
+
+    #[test]
+    fn native_plane_bounds_survive_stale_waydroid_resize_metadata() {
+        for format in [1, 5] {
+            let mut compositor = Compositor::new().unwrap();
+            let (client, server) = UnixStream::pair().unwrap();
+            client.set_nonblocking(true).unwrap();
+            compositor
+                .connect(
+                    server,
+                    ClientIdentity {
+                        connection: 1,
+                        pid: 7,
+                        uid: 0,
+                        gid: 0,
+                    },
+                )
+                .unwrap();
+            let socket = NativeSocket::from(client);
+            socket.send_msg(&message(1, 1, &[2]), &[]).unwrap();
+            compositor.dispatch().unwrap();
+            let mut globals = vec![0; 65536];
+            let count = socket
+                .rcv_msg(&mut globals, &mut Default::default())
+                .unwrap();
+            let mut name = None;
+            let mut at = 0;
+            while at < count {
+                let size = (u32::from_ne_bytes(globals[at + 4..at + 8].try_into().unwrap()) >> 16)
+                    as usize;
+                if globals[at..at + size]
+                    .windows(14)
+                    .any(|s| s == b"android_wlegl\0")
+                {
+                    name = Some(u32::from_ne_bytes(
+                        globals[at + 8..at + 12].try_into().unwrap(),
+                    ));
+                }
+                at += size;
+            }
+            let mut bind = vec![name.unwrap(), 14];
+            let mut interface = b"android_wlegl\0".to_vec();
+            interface.resize(16, 0);
+            bind.extend(
+                interface
+                    .chunks_exact(4)
+                    .map(|s| u32::from_ne_bytes(s.try_into().unwrap())),
+            );
+            bind.extend([1, 3]);
+            socket.send_msg(&message(2, 0, &bind), &[]).unwrap();
+            compositor.dispatch().unwrap();
+            let image = trames_graphics::Context::default()
+                .allocate(trames_graphics::Format::Rgba8, 65, 37)
+                .unwrap();
+            let file = SharedFile::anonymous().unwrap();
+            file.attach(trames_graphics::ImageAttachment(image.clone()))
+                .unwrap();
+            let (fd, transfer) = file.export().unwrap();
+            socket
+                .send_msg(
+                    &message(3, 0, &[4, 1, 40, 0x54524742, 65, 37, 1, 80, 0, 0, 0, 0, 0]),
+                    &[],
+                )
+                .unwrap();
+            socket.send_msg(&message(4, 0, &[]), &[fd]).unwrap();
+            // The old target FD accompanies dimensions/stride from the next mode.
+            socket
+                .send_msg(&message(3, 1, &[5, 1088, 780, 1088, format, 0, 4]), &[])
+                .unwrap();
+            compositor.dispatch().unwrap();
+            assert!(transfer.claimed());
+            let resource = compositor.clients.get(&1).and_then(|client| {
+                client
+                    .object_from_protocol_id::<WlBuffer>(&compositor.display.handle(), 5)
+                    .ok()
+            });
+            if format == 1 {
+                let resource =
+                    resource.expect("resize metadata must not disconnect the image owner");
+                drop(file);
+                drop(image);
+                let lease = acquire(&resource).unwrap();
+                assert_eq!(lease.dimensions(), (65, 37));
+                assert!(lease.has_alpha());
+            } else {
+                assert!(
+                    resource.is_none(),
+                    "incompatible pixel interpretation must still fail"
+                );
+            }
+        }
     }
 }
