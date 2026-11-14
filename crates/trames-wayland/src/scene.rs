@@ -82,6 +82,12 @@ pub enum ImageBuffer {
     Gpu(Arc<dyn crate::GpuImage>),
 }
 impl ImageBuffer {
+    pub fn has_alpha(&self) -> bool {
+        match self {
+            Self::Shm(b) => b.pixels.alpha,
+            Self::Gpu(g) => g.has_alpha(),
+        }
+    }
     pub fn dimensions(&self) -> (u32, u32) {
         match self {
             Self::Shm(b) => (b.pixels.width, b.pixels.height),

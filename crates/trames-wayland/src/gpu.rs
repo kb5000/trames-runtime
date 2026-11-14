@@ -14,6 +14,11 @@ pub unsafe trait GpuImage: Send + Sync {
     fn dimensions(&self) -> (u32, u32);
     fn metal_texture(&self) -> usize;
     fn ready(&self) -> io::Result<bool>;
+    /// Whether the native plane carries premultiplied alpha. RGBX producers
+    /// remain opaque even when their native texture has an unused alpha lane.
+    fn has_alpha(&self) -> bool {
+        false
+    }
     /// Mailbox replaces queued frames; producer/UI leases still retain their
     /// resources until native writes/reads complete. FIFO remains the default.
     fn mailbox(&self) -> bool {

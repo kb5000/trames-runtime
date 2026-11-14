@@ -33,11 +33,13 @@ struct Handle {
 pub(crate) struct Buffer {
     image: Arc<dyn trames_graphics::Image>,
     texture: Arc<trames_graphics::Texture>,
+    alpha: bool,
     lease: Mutex<Weak<Lease>>,
 }
 struct Lease {
     image: Arc<dyn trames_graphics::Image>,
     texture: Arc<trames_graphics::Texture>,
+    alpha: bool,
     resource: WlBuffer,
 }
 // SAFETY: the buffer owns original native storage and texture. Waydroid HWC
@@ -54,6 +56,9 @@ unsafe impl GpuImage for Lease {
     fn ready(&self) -> io::Result<bool> {
         Ok(true)
     }
+    fn has_alpha(&self) -> bool {
+        self.alpha
+    }
 }
 impl Drop for Lease {
     fn drop(&mut self) {
@@ -69,6 +74,7 @@ pub(crate) fn acquire(resource: &WlBuffer) -> Option<ImageBuffer> {
         let lease = Arc::new(Lease {
             image: data.image.clone(),
             texture: data.texture.clone(),
+            alpha: data.alpha,
             resource: resource.clone(),
         });
         *current = Arc::downgrade(&lease);
@@ -157,6 +163,7 @@ impl Dispatch<AndroidWlegl, ()> for State {
                     Buffer {
                         image,
                         texture,
+                        alpha: matches!(format, 1 | 5),
                         lease: Mutex::default(),
                     },
                 );
