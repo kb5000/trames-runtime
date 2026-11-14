@@ -636,6 +636,48 @@ fn original_c_scene_atomic_subsurface_popup_and_pointer_grab() {
                 .first()
                 .is_some_and(|w| w.scene.len() == 3 && w.scene[2].x == 110)
         {
+            let window = &scene.windows[0];
+            let popup = &window.scene[2];
+            // A native overlay becoming key and the mouse-up both report the
+            // containing toplevel. The original client must still receive a
+            // complete menu click without xdg_popup.popup_done.
+            server
+                .input(InputEvent::Focus {
+                    window: Some(window.id),
+                })
+                .unwrap();
+            server
+                .input(InputEvent::Pointer {
+                    window: window.id,
+                    x: f64::from(popup.x) + 1.0,
+                    y: f64::from(popup.y) + 1.0,
+                    time: 17,
+                })
+                .unwrap();
+            server
+                .input(InputEvent::Button {
+                    button: 0x110,
+                    pressed: true,
+                    time: 18,
+                })
+                .unwrap();
+            server
+                .input(InputEvent::Focus {
+                    window: Some(window.id),
+                })
+                .unwrap();
+            server
+                .input(InputEvent::Button {
+                    button: 0x110,
+                    pressed: false,
+                    time: 19,
+                })
+                .unwrap();
+            phase = 5;
+        }
+        if phase == 5 && log.contains("button=popup 1") && log.contains("button=popup 0") {
+            assert!(!log.contains("popup-dismissed"), "{log}");
+            assert_eq!(scene.windows[0].scene.len(), 3);
             let root = scene.windows[0].id;
             server
                 .input(InputEvent::Pointer {
@@ -659,14 +701,14 @@ fn original_c_scene_atomic_subsurface_popup_and_pointer_grab() {
                     time: 22,
                 })
                 .unwrap();
-            phase = 5;
+            phase = 6;
         }
-        if phase == 5
+        if phase == 6
             && log.contains("popup-dismissed")
             && scene.windows.first().is_some_and(|w| w.scene.len() == 2)
         {
             server.close(scene.windows[0].id).unwrap();
-            phase = 6;
+            phase = 7;
         }
         if let Some(status) = child.try_wait().unwrap() {
             stdout.read_to_string(&mut log).unwrap();
@@ -688,7 +730,7 @@ fn original_c_scene_atomic_subsurface_popup_and_pointer_grab() {
         }
         thread::sleep(Duration::from_millis(2));
     }
-    assert_eq!(phase, 6, "{log}");
+    assert_eq!(phase, 7, "{log}");
     assert!(log.contains("repositioned=17"), "{log}");
 }
 
