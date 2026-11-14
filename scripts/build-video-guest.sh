@@ -31,6 +31,10 @@ v={'profile':65543,'auxv_key':'0x54520009','wire_revision':2,
    'completion':'per-surface guest eventfd; blocking guest poll',
    'frame_export':{'operation':8,'memory_type':'DRM_PRIME_2','access':'read-only','planes':['R8','GR88'],'modifier':'LINEAR','fd_ownership':'guest files_struct'},'sha256':hashlib.sha256(driver.read_bytes()).hexdigest(),
    'needed':subprocess.check_output(['readelf','-d',str(driver)],text=True)}
+v['source_sha256']={str(f):hashlib.sha256(f.read_bytes()).hexdigest()
+                    for f in sorted(Path('crates/trames-video/guest').iterdir())
+                    if f.suffix in ('.c','.h','.S')}
+v['build_recipe_sha256']=hashlib.sha256(Path('scripts/build-video-guest.sh').read_bytes()).hexdigest()
 (p/'manifest.json').write_text(json.dumps(v,indent=2)+'\n')
 PY
 cp LICENSE "$output/GPL-3.0.txt"

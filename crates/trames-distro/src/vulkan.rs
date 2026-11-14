@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Refresh the app-owned guest ICD without recreating files on every launch.
+//! Install app-owned graphics/video libraries before guest startup.
 use crate::{Error, Vfs, AT_FDCWD};
 use std::{
     io::Read,
@@ -32,19 +32,48 @@ pub fn install_vulkan_icd(reader: &mut impl Read, vfs: &mut Vfs) -> Result<bool,
 /// stay under /usr/lib, so installing/upgrading signed packages cannot overwrite
 /// the adapter and existing rootfs data needs no migration.
 pub fn install_zink_egl(reader: &mut impl Read, vfs: &mut Vfs) -> Result<bool, Error> {
-    install_mesa(reader, vfs, b"/usr/local/lib/libEGL.so.1", LIMIT)
+    install_library(reader, vfs, b"/usr/local/lib/libEGL.so.1", LIMIT)
 }
 /// The EGL frontend and Gallium share Mesa's private ABI. Install the matching
 /// patched Zink library beside EGL, leaving signed distro package files intact.
 pub fn install_zink_gallium(reader: &mut impl Read, vfs: &mut Vfs) -> Result<bool, Error> {
-    install_mesa(
+    install_library(
         reader,
         vfs,
         b"/usr/local/lib/libgallium-25.1.9.so",
         GALLIUM_LIMIT,
     )
 }
-fn install_mesa(
+/// Cold-start app-owned VideoToolbox VA-API driver, using the same atomic
+/// replacement and unchanged-file handling as the graphics adapters.
+pub fn install_vaapi_driver(reader: &mut impl Read, vfs: &mut Vfs) -> Result<bool, Error> {
+    install_library(
+        reader,
+        vfs,
+        b"/usr/local/lib/dri/trames_drv_video.so",
+        LIMIT,
+    )
+}
+/// ABI-compatible decoder overlay; distro libraries remain under /usr/lib.
+pub fn install_video_codec(
+    reader: &mut impl Read,
+    vfs: &mut Vfs,
+    name: &str,
+) -> Result<bool, Error> {
+    if !matches!(
+        name,
+        "libavcodec.so.61" | "libavutil.so.59" | "libswresample.so.5" | "libswscale.so.8"
+    ) {
+        return Err(Error::Invalid("unsupported bundled video library"));
+    }
+    install_library(
+        reader,
+        vfs,
+        format!("/usr/local/lib/{name}").as_bytes(),
+        GALLIUM_LIMIT,
+    )
+}
+fn install_library(
     reader: &mut impl Read,
     vfs: &mut Vfs,
     path: &[u8],
@@ -56,7 +85,7 @@ fn install_mesa(
         || bytes.get(..6) != Some(b"\x7fELF\x02\x01")
         || bytes.get(18..20) != Some(&183u16.to_le_bytes())
     {
-        return Err(Error::Invalid("invalid bundled AArch64 Mesa library"));
+        return Err(Error::Invalid("invalid bundled AArch64 guest library"));
     }
     replace(vfs, path, &bytes)
 }
