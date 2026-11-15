@@ -45,6 +45,35 @@ creation/destruction. Ordinary byte reads and writes gain no generation counter,
 permission check, barrier, message or lock. Relaxed atomics track scalar flush
 coverage; existing filesystem and checkpoint ownership still protects the data.
 
+## File-specific manifest preparation
+
+Each store retains the last accepted serialized manifest and a compact sorted
+inode/offset vector under the existing checkpoint mutex. A regular file fsync
+uses the original retained inode, updates only its fixed-width v4 metadata
+header, and recalculates the existing whole-manifest checksum. It does not walk
+paths, reconstruct the namespace/attribute tables or borrow unrelated inodes.
+Metadata that already matches the accepted snapshot needs no new publication;
+the original file-data synchronization and any pending directory retry remain.
+
+Namespace and attribute transactions still construct a complete snapshot and
+replace its offset index on success. Consequently hard links, replacement,
+rename and variable-size attribute records cannot leave stale positions behind.
+The cache is private to the original store, so equal inode numbers from different
+stores do not share an index. Unlinked retained objects do not update a new inode
+that happens to occupy their former pathname.
+
+If publication fails before rename, both the cached 64-byte header and checksum
+are restored. After rename, the cache describes the newly committed manifest;
+directory-generation retry handles any remaining durability failure. Concurrent
+file syncs merge into the latest snapshot through the original commit mutex.
+Tests also hold an unrelated inode's metadata locked while completing target
+file sync, ensuring whole-namespace traversal cannot return through this path.
+
+This is CPU-side incremental preparation. The on-disk v4 file, checksum and
+atomic-replacement protocol remain unchanged: each dirty metadata publication
+still writes a complete manifest. The retained buffer is proportional to actual
+manifest bytes and inode count, with no new work on ordinary byte reads/writes.
+
 ## Validation and remaining costs
 
 Regressions exercise both descriptor/worker paths, hard links, file growth,
@@ -54,7 +83,8 @@ locally on macOS; VFS also compiles for the physical iPad target.
 
 Mac fio measurements and limitations are recorded in the product repository:
 [storage synchronization acceptance](https://github.com/kb5000/trames-mac/blob/main/docs/validation/mac-storage-sync-20261115.md).
-Data-only synchronization improves substantially. Full file synchronization still
-serializes and replaces the whole manifest, with distinct data/manifest/directory
-barriers. Reducing those costs further needs an incremental metadata design or a
-proven ordered barrier batch, rather than silently removing durability steps.
+Data-only synchronization improves substantially. File-specific preparation also
+reduces full-sync cost, while full file synchronization still replaces the whole
+manifest with distinct data/manifest/directory barriers. Reducing those costs
+further needs incremental on-disk metadata or a proven ordered barrier batch,
+rather than silently removing durability steps.

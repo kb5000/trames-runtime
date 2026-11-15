@@ -60,6 +60,7 @@ pub struct DiskSync {
 /// Owned host resources only, shared with the existing bounded disk workers.
 pub struct DiskSyncJob {
     backing: Arc<storage::DiskBacking>,
+    node: NodeRef,
     filesystem: Option<Arc<SharedCell<Filesystem>>>,
     data_only: bool,
 }
@@ -74,7 +75,7 @@ impl DiskSyncJob {
         .map_err(storage::host_errno)?;
         if let Some(filesystem) = self.filesystem {
             let fs = filesystem.borrow();
-            fs.sync_file_metadata(self.data_only, None)?;
+            fs.sync_file_metadata(self.data_only, Some(&self.node), None)?;
         }
         Ok(())
     }
@@ -170,6 +171,7 @@ impl Vfs {
         }
         let job = DiskSyncJob {
             backing,
+            node: node.clone(),
             filesystem: (n.links != 0).then(|| filesystem.shared.clone()),
             data_only,
         };

@@ -1503,6 +1503,7 @@ fn file_sync_retains_its_mount_after_detach_and_preserves_persistent_errors() {
         v.sync_fd(fd, true).unwrap();
         assert_eq!(v.pread(fd, 8, 0).unwrap(), b"retained");
     }
+    v.pwrite(named, b"dirty", 0).unwrap();
     assert!(v.sync_fd(named, false).is_err());
     // fdatasync preserves data/length without publishing timestamps. A blocked
     // unrelated manifest cannot turn a successful data flush into a failure.
@@ -1576,6 +1577,7 @@ fn directory_flushes_follow_mutations_and_retry_post_rename_errors() {
     assert!(disk.take_sync_trace().is_empty());
     // Both the post-rename attempt and its explicit durability retry fail.
     // The publication remains committed and must not trigger namespace rollback.
+    v.pwrite(fd, b"metadata", 0).unwrap();
     disk.fail_directory_syncs(2);
     assert_eq!(v.sync_fd(fd, false), Err(Errno(5)));
     assert_eq!(disk.take_sync_trace(), ["directory", "directory"]);
@@ -1621,6 +1623,145 @@ fn data_sync_survives_process_exit_without_vfs_shutdown() {
     let fd = reopened.open_at(AT_FDCWD, b"/data", 0, 0).unwrap();
     assert_eq!(reopened.pread(fd, 13, 8192).unwrap(), b"survives-exit");
     assert_eq!(size(reopened.stat_fd(fd).unwrap()), 8205);
+}
+
+#[test]
+fn inode_sync_does_not_wait_for_unrelated_inode_metadata() {
+    use std::{sync::mpsc, time::Duration};
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.import_file(b"/target", b"old".to_vec()).unwrap();
+    v.import_file(b"/unrelated", b"peer".to_vec()).unwrap();
+    let fd = v.open_at(AT_FDCWD, b"/target", 2, 0).unwrap();
+    v.pwrite(fd, b"new", 0).unwrap();
+    let unrelated = v.fs.borrow().paths[b"/unrelated".as_slice()].clone();
+    let (ready, started) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let owner = std::thread::spawn(move || {
+        let _busy = unrelated.borrow_mut();
+        ready.send(()).unwrap();
+        released.recv().unwrap();
+    });
+    started.recv().unwrap();
+    let (pending, job) = v.prepare_disk_sync(fd, false).unwrap().unwrap();
+    let (done, completed) = mpsc::channel();
+    let sync = std::thread::spawn(move || done.send(job.run()).unwrap());
+    let result = completed.recv_timeout(Duration::from_secs(3));
+    release.send(()).unwrap();
+    owner.join().unwrap();
+    sync.join().unwrap();
+    result
+        .expect("target sync scanned or locked an unrelated inode")
+        .unwrap();
+    drop(pending);
+    drop(v);
+    let mut reopened = dir.open();
+    let fd = reopened.open_at(AT_FDCWD, b"/target", 0, 0).unwrap();
+    assert_eq!(reopened.pread(fd, 3, 0).unwrap(), b"new");
+}
+
+#[test]
+fn inode_sync_keeps_namespace_attributes_hardlinks_and_rollback_cache() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.import_file(b"/first", b"first".to_vec()).unwrap();
+    v.import_file(b"/second", b"second".to_vec()).unwrap();
+    let a = v.open_at(AT_FDCWD, b"/first", 2, 0).unwrap();
+    let b = v.open_at(AT_FDCWD, b"/second", 2, 0).unwrap();
+    v.link_at(AT_FDCWD, b"/first", AT_FDCWD, b"/alias").unwrap();
+    v.set_xattr(a as i32, None, true, b"user.cache", Some(b"retained"), 0)
+        .unwrap();
+    v.chmod_fd(a, 0o640).unwrap();
+    let before = fs::read(dir.0.join("manifest")).unwrap();
+    v.pwrite(a, b"changed", 0).unwrap();
+    fs::create_dir(dir.0.join("manifest.new")).unwrap();
+    assert!(v.sync_fd(a, false).is_err());
+    assert_eq!(fs::read(dir.0.join("manifest")).unwrap(), before);
+    fs::remove_dir(dir.0.join("manifest.new")).unwrap();
+    v.pwrite(b, b"other", 0).unwrap();
+    v.sync_fd(b, false).unwrap();
+    // A subsequent commit must use the intact cached snapshot after failure.
+    v.sync_fd(a, false).unwrap();
+    let after = fs::read(dir.0.join("manifest")).unwrap();
+    let disk = v.fs.borrow().disk.clone().unwrap();
+    disk.take_sync_trace();
+    v.sync_fd(a, false).unwrap();
+    assert!(disk.take_sync_trace().is_empty());
+    assert_eq!(fs::read(dir.0.join("manifest")).unwrap(), after);
+    drop(disk);
+    drop(v);
+    let mut reopened = dir.open();
+    let fd = reopened.open_at(AT_FDCWD, b"/alias", 0, 0).unwrap();
+    assert_eq!(reopened.pread(fd, 7, 0).unwrap(), b"changed");
+    assert_eq!(
+        u32::from_le_bytes(reopened.stat_fd(fd).unwrap()[16..20].try_into().unwrap()) & 0o777,
+        0o640
+    );
+    assert_eq!(
+        reopened
+            .get_xattr(fd as i32, None, true, b"user.cache")
+            .unwrap(),
+        b"retained"
+    );
+}
+
+#[test]
+fn inode_sync_rebuilds_positions_after_replacement_and_rename() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.import_file(b"/file", b"old inode".to_vec()).unwrap();
+    let old = v.open_at(AT_FDCWD, b"/file", 2, 0).unwrap();
+    v.import_reader_replace(b"/file", &mut &b"new inode"[..])
+        .unwrap();
+    let new = v.open_at(AT_FDCWD, b"/file", 2, 0).unwrap();
+    v.pwrite(old, b"orphan", 0).unwrap();
+    v.sync_fd(old, false).unwrap();
+    v.rename_at(AT_FDCWD, b"/file", AT_FDCWD, b"/renamed", 0)
+        .unwrap();
+    v.pwrite(new, b"current", 0).unwrap();
+    v.sync_fd(new, false).unwrap();
+    drop(v);
+    let mut reopened = dir.open();
+    assert_eq!(reopened.stat_at(AT_FDCWD, b"/file"), Err(Errno(2)));
+    let fd = reopened.open_at(AT_FDCWD, b"/renamed", 0, 0).unwrap();
+    assert_eq!(reopened.pread(fd, 7, 0).unwrap(), b"current");
+}
+
+#[test]
+fn concurrent_inode_syncs_merge_metadata_into_the_latest_manifest() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    let mut fds = Vec::new();
+    for path in [b"/one", b"/two", b"/red", b"/six"] {
+        v.import_file(path, b"original".to_vec()).unwrap();
+        fds.push((path, v.open_at(AT_FDCWD, path, 2, 0).unwrap()));
+    }
+    let mut pending = Vec::new();
+    let mut workers = Vec::new();
+    let mut times = Vec::new();
+    let barrier = Arc::new(std::sync::Barrier::new(fds.len()));
+    for &(path, fd) in &fds {
+        v.pwrite(fd, path, 0).unwrap();
+        times.push(v.stat_fd(fd).unwrap()[72..120].to_vec());
+        let (lease, job) = v.prepare_disk_sync(fd, false).unwrap().unwrap();
+        pending.push(lease);
+        let ready = barrier.clone();
+        workers.push(std::thread::spawn(move || {
+            ready.wait();
+            job.run()
+        }));
+    }
+    for worker in workers {
+        worker.join().unwrap().unwrap();
+    }
+    drop(pending);
+    drop(v);
+    let mut reopened = dir.open();
+    for ((path, _), times) in fds.into_iter().zip(times) {
+        let fd = reopened.open_at(AT_FDCWD, path, 0, 0).unwrap();
+        assert_eq!(&reopened.stat_fd(fd).unwrap()[72..120], times.as_slice());
+        assert_eq!(reopened.pread(fd, 4, 0).unwrap(), path);
+    }
 }
 
 #[test]

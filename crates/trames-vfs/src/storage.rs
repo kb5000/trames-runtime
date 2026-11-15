@@ -442,10 +442,16 @@ impl FileData {
     }
 }
 
+struct ManifestSnapshot {
+    bytes: Vec<u8>,
+    // Fixed-width inode header positions in the existing v4 format. Attribute
+    // and namespace changes rebuild the snapshot under the same commit lock.
+    metadata: Vec<(u64, usize)>,
+}
 pub(super) struct DiskStore {
     root: PathBuf,
     _lock: File,
-    checkpoint: std::sync::Mutex<()>,
+    checkpoint: std::sync::Mutex<Option<ManifestSnapshot>>,
     initializing: std::sync::atomic::AtomicBool,
     // Namespace publication only; normal byte reads/writes do not touch these.
     // A generation observed before a successful host flush is covered by it.
@@ -519,7 +525,7 @@ impl DiskStore {
         Ok(Arc::new(Self {
             root,
             _lock: lock,
-            checkpoint: std::sync::Mutex::new(()),
+            checkpoint: std::sync::Mutex::new(None),
             initializing: std::sync::atomic::AtomicBool::new(false),
             objects_generation: AtomicU64::new(1),
             objects_synced: AtomicU64::new(0),
@@ -682,6 +688,7 @@ impl Filesystem {
     pub(super) fn sync_file_metadata(
         &self,
         data_only: bool,
+        node: Option<&NodeRef>,
         overlay: Option<&overlay::Overlay>,
     ) -> Result<()> {
         // The v4 manifest contains identity/permissions/timestamps, not file
@@ -690,7 +697,13 @@ impl Filesystem {
         // not a timestamp-only namespace replacement. Overlay writeback keeps
         // its original checkpoint (it can still need to publish copy-up).
         if !data_only || self.disk.is_none() || overlay.is_some() {
-            self.checkpoint(overlay)?;
+            let patched = match (overlay, node) {
+                (None, Some(node)) => self.checkpoint_inode(node)?,
+                _ => false,
+            };
+            if !patched {
+                self.checkpoint(overlay)?;
+            }
         }
         if let Some(disk) = &self.disk {
             // Retry a previously failed post-rename directory flush. A clean
@@ -698,6 +711,46 @@ impl Filesystem {
             disk.sync_directory()?;
         }
         Ok(())
+    }
+    fn checkpoint_inode(&self, node: &NodeRef) -> Result<bool> {
+        let Some(disk) = &self.disk else {
+            return Ok(false);
+        };
+        if disk.initializing.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        let mut commit = disk.checkpoint.lock().unwrap();
+        let Some(snapshot) = commit.as_mut() else {
+            return Ok(false);
+        };
+        let n = node.borrow();
+        if n.links == 0 {
+            return Ok(true);
+        }
+        let Ok(index) = snapshot
+            .metadata
+            .binary_search_by_key(&n.inode, |entry| entry.0)
+        else {
+            return Ok(false);
+        };
+        let offset = snapshot.metadata[index].1;
+        let metadata = inode_metadata_bytes(&n);
+        drop(n);
+        let old: [u8; 64] = snapshot.bytes[offset..offset + 64].try_into().unwrap();
+        if old == metadata {
+            return Ok(true);
+        }
+        let checksum_at = snapshot.bytes.len() - 8;
+        let old_checksum: [u8; 8] = snapshot.bytes[checksum_at..].try_into().unwrap();
+        snapshot.bytes[offset..offset + 64].copy_from_slice(&metadata);
+        let hash = checksum(&snapshot.bytes[..checksum_at]);
+        snapshot.bytes[checksum_at..].copy_from_slice(&hash.to_le_bytes());
+        if let Err(error) = disk.commit(&snapshot.bytes) {
+            snapshot.bytes[offset..offset + 64].copy_from_slice(&old);
+            snapshot.bytes[checksum_at..].copy_from_slice(&old_checksum);
+            return Err(error);
+        }
+        Ok(true)
     }
     pub(super) fn checkpoint(&self, overlay: Option<&overlay::Overlay>) -> Result<()> {
         if let Some(overlay) = overlay {
@@ -711,12 +764,13 @@ impl Filesystem {
         }
         // One manifest transaction per store, including snapshot construction.
         // Other filesystems and ordinary byte I/O remain independent.
-        let _commit = disk.checkpoint.lock().unwrap();
+        let mut commit = disk.checkpoint.lock().unwrap();
         let mut nodes = BTreeMap::new();
         for n in self.paths.values() {
             nodes.insert(n.borrow().inode, n.clone());
         }
         let mut out = b"TRAMESFS".to_vec();
+        let mut metadata = Vec::with_capacity(nodes.len());
         out.extend(4u32.to_le_bytes());
         out.extend(self.limits.file_bytes.to_le_bytes());
         out.extend((self.limits.nodes as u32).to_le_bytes());
@@ -725,37 +779,9 @@ impl Filesystem {
         out.extend((self.paths.len() as u32).to_le_bytes());
         for (ino, node) in nodes {
             let n = node.borrow();
+            metadata.push((ino, out.len() + 8));
             out.extend(ino.to_le_bytes());
-            let metadata = n.file_metadata();
-            out.extend(metadata.mode.to_le_bytes());
-            out.extend(n.uid.to_le_bytes());
-            out.extend(n.gid.to_le_bytes());
-            out.extend([
-                match n.content {
-                    Content::Directory => 0,
-                    Content::File(_) => 1,
-                    Content::Null => 2,
-                    Content::Terminal => 3,
-                    Content::Symlink(_) => 4,
-                    Content::Fifo(_) => 5,
-                    Content::Socket(_) => 8,
-                    Content::Device(_) => {
-                        if n.mode & 0o170000 == 0o60000 {
-                            7
-                        } else {
-                            6
-                        }
-                    }
-                },
-                0,
-                0,
-                0,
-            ]);
-            for t in metadata.times {
-                out.extend(t.seconds.to_le_bytes());
-                out.extend(t.nanos.to_le_bytes());
-                out.extend([0; 4]);
-            }
+            out.extend(inode_metadata_bytes(&n));
             if let Content::Symlink(target) = &n.content {
                 out.extend((target.len() as u32).to_le_bytes());
                 out.extend(target);
@@ -796,8 +822,37 @@ impl Filesystem {
         if out.len() as u64 > MAX_MANIFEST {
             return Err(Errno(28));
         }
-        disk.commit(&out)
+        disk.commit(&out)?;
+        *commit = Some(ManifestSnapshot {
+            bytes: out,
+            metadata,
+        });
+        Ok(())
     }
+}
+fn inode_metadata_bytes(n: &Node) -> [u8; 64] {
+    let mut bytes = [0; 64];
+    let metadata = n.file_metadata();
+    bytes[..4].copy_from_slice(&metadata.mode.to_le_bytes());
+    bytes[4..8].copy_from_slice(&n.uid.to_le_bytes());
+    bytes[8..12].copy_from_slice(&n.gid.to_le_bytes());
+    bytes[12] = match n.content {
+        Content::Directory => 0,
+        Content::File(_) => 1,
+        Content::Null => 2,
+        Content::Terminal => 3,
+        Content::Symlink(_) => 4,
+        Content::Fifo(_) => 5,
+        Content::Socket(_) => 8,
+        Content::Device(_) if n.mode & 0o170000 == 0o60000 => 7,
+        Content::Device(_) => 6,
+    };
+    for (i, time) in metadata.times.into_iter().enumerate() {
+        let at = 16 + i * 16;
+        bytes[at..at + 8].copy_from_slice(&time.seconds.to_le_bytes());
+        bytes[at + 8..at + 12].copy_from_slice(&time.nanos.to_le_bytes());
+    }
+    bytes
 }
 struct Decoder<'a> {
     data: &'a [u8],
@@ -1451,7 +1506,8 @@ impl Vfs {
             }
             .map_err(host_errno);
         }
-        let n = o.node.as_ref().ok_or(Errno(22))?.borrow();
+        let node = o.node.as_ref().ok_or(Errno(22))?.clone();
+        let n = node.borrow();
         if let Content::File(data) = &n.content {
             data.sync(data_only)?;
         } else if !matches!(n.content, Content::Directory) {
@@ -1467,7 +1523,7 @@ impl Vfs {
             // detached mount. Anonymous/unlinked files have no namespace entry
             // to commit; their data sync above is still required.
             let fs = filesystem.borrow();
-            fs.sync_file_metadata(data_only && regular)?;
+            fs.sync_file_metadata(data_only && regular, regular.then_some(&node))?;
         }
         Ok(())
     }
