@@ -758,6 +758,15 @@ impl Connection {
         Ok(node)
     }
     fn target(&self, handle: u32) -> Result<Arc<Node>> {
+        let node = self.reference_node(handle)?;
+        if node.dead.load(Ordering::Relaxed) {
+            return Err(Errno(3));
+        }
+        Ok(node)
+    }
+    // A dead Binder remains a transferable identity. Window-info batches can
+    // retain tokens from an exited app; only calling that token must fail.
+    fn reference_node(&self, handle: u32) -> Result<Arc<Node>> {
         if handle == 0 {
             return self
                 .context
@@ -772,12 +781,16 @@ impl Connection {
         }
         let state = self.state.lock().unwrap();
         let reference = state.handles.get(&handle).ok_or(Errno(22))?;
-        if reference.node.dead.load(Ordering::Relaxed) {
-            return Err(Errno(3));
-        }
         Ok(reference.node.clone())
     }
     fn strong_target(&self, handle: u32) -> Result<NodeLease> {
+        let node = self.strong_reference(handle)?;
+        if node.dead.load(Ordering::Relaxed) {
+            return Err(Errno(3));
+        }
+        Ok(node)
+    }
+    fn strong_reference(&self, handle: u32) -> Result<NodeLease> {
         if handle == 0 {
             return self.target(0).map(NodeLease::new);
         }
@@ -786,9 +799,6 @@ impl Connection {
         let counts = reference.counts.lock().unwrap();
         if counts[1] == 0 && counts[3] == 0 {
             return Err(Errno(22));
-        }
-        if reference.node.dead.load(Ordering::Relaxed) {
-            return Err(Errno(3));
         }
         // Pin under the sender's handle index, before another thread can
         // release its final handle. Target buffers extend this pin until free.

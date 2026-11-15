@@ -314,10 +314,10 @@ impl Ioctl {
                             None,
                         )
                     } else if kind == TYPE_HANDLE {
-                        let lease = self.process.strong_target(dword(object, 8))?;
+                        let lease = self.process.strong_reference(dword(object, 8))?;
                         (lease.0.clone(), Some(lease))
                     } else {
-                        (self.process.target(dword(object, 8))?, None)
+                        (self.process.reference_node(dword(object, 8))?, None)
                     };
                     packet.objects.push(Object::Node {
                         offset,

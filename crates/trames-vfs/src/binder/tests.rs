@@ -406,6 +406,49 @@ fn parcel_reference_commands_survive_remote_death_and_ignore_bad_user_counts() {
     client.write(&command(ACQUIRE_DONE, &[0; 16]));
 }
 #[test]
+fn dead_tokens_do_not_discard_live_window_info_batches() {
+    for kind in [TYPE_HANDLE, TYPE_WEAK_HANDLE] {
+        let root = Vfs::default();
+        let exporter = Client::new(&root, 10, b"/dev/binder");
+        let mut sender = Client::new(&root, 20, b"/dev/binder");
+        let mut receiver = Client::new(&root, 30, b"/dev/binder");
+        receiver.manager();
+        let node = exporter
+            .process()
+            .owned_node(0x1110, 0x2220, 0x100, 10)
+            .unwrap();
+        let reference = sender.process().reference(node.clone(), 1).unwrap();
+        exporter.process().close();
+        let mut batch = flat(kind, reference.handle as u64, 0);
+        batch.extend_from_slice(b"new notification window");
+        sender.send(0, ONE_WAY, &batch, &[0], false);
+        let (command, header) = receiver.transaction();
+        assert_eq!(command, BR_TRANSACTION);
+        let payload = receiver.payload(&header);
+        assert_eq!(&payload[24..], b"new notification window");
+        assert_eq!(dword(&payload, 0), kind);
+        let received = dword(&payload, 8);
+        assert!(Arc::ptr_eq(
+            &receiver
+                .process()
+                .state
+                .lock()
+                .unwrap()
+                .handles
+                .get(&received)
+                .unwrap()
+                .node,
+            &node
+        ));
+        if kind == TYPE_HANDLE {
+            receiver.write(&super::command(ACQUIRE, &received.to_le_bytes()));
+            receiver.send(received, 0, b"call dead token", &[], false);
+            assert_eq!(receiver.transaction().0, BR_DEAD_REPLY);
+        }
+        receiver.free(&header);
+    }
+}
+#[test]
 fn completion_read_cannot_start_unrelated_process_rpc_inside_caller_locks() {
     let root = Vfs::default();
     let mut caller = Client::new(&root, 10, b"/dev/binder");
