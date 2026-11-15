@@ -1504,8 +1504,123 @@ fn file_sync_retains_its_mount_after_detach_and_preserves_persistent_errors() {
         assert_eq!(v.pread(fd, 8, 0).unwrap(), b"retained");
     }
     assert!(v.sync_fd(named, false).is_err());
-    assert!(v.sync_fd(named, true).is_err());
+    // fdatasync preserves data/length without publishing timestamps. A blocked
+    // unrelated manifest cannot turn a successful data flush into a failure.
+    v.sync_fd(named, true).unwrap();
     assert_eq!(fs::read(dir.0.join("manifest")).unwrap(), before);
+}
+
+#[test]
+fn data_sync_preserves_grown_data_without_namespace_publication_on_both_paths() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.import_file(b"/data", b"old".to_vec()).unwrap();
+    v.link_at(AT_FDCWD, b"/data", AT_FDCWD, b"/alias").unwrap();
+    let fd = v.open_at(AT_FDCWD, b"/alias", 2, 0).unwrap();
+    let manifest = fs::read(dir.0.join("manifest")).unwrap();
+    fs::create_dir(dir.0.join("manifest.new")).unwrap();
+    v.pwrite(fd, b"joined", 16384).unwrap();
+    v.sync_fd(fd, true).unwrap();
+    v.pwrite(fd, b"worker", 32768).unwrap();
+    let (pending, job) = v.prepare_disk_sync(fd, true).unwrap().unwrap();
+    std::thread::spawn(move || job.run())
+        .join()
+        .unwrap()
+        .unwrap();
+    drop(pending);
+    assert_eq!(fs::read(dir.0.join("manifest")).unwrap(), manifest);
+    assert!(v.sync_fd(fd, false).is_err());
+    fs::remove_dir(dir.0.join("manifest.new")).unwrap();
+    drop(v);
+    let mut reopened = dir.open();
+    let fd = reopened.open_at(AT_FDCWD, b"/data", 0, 0).unwrap();
+    assert_eq!(reopened.pread(fd, 6, 16384).unwrap(), b"joined");
+    assert_eq!(reopened.pread(fd, 6, 32768).unwrap(), b"worker");
+    assert_eq!(size(reopened.stat_fd(fd).unwrap()), 32774);
+}
+
+#[test]
+fn mapped_data_sync_flushes_pages_without_timestamp_checkpoint() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.import_file(b"/mapped", vec![0; 4096]).unwrap();
+    let fd = v.open_at(AT_FDCWD, b"/mapped", 2, 0).unwrap();
+    let mappings = v.mapping_pages(fd, 0, 4096, true, true).unwrap();
+    let manifest = fs::read(dir.0.join("manifest")).unwrap();
+    fs::create_dir(dir.0.join("manifest.new")).unwrap();
+    mappings[0].write(512, b"mapped sync").unwrap();
+    v.sync_fd(fd, true).unwrap();
+    assert_eq!(fs::read(dir.0.join("manifest")).unwrap(), manifest);
+    assert!(v.sync_fd(fd, false).is_err());
+    fs::remove_dir(dir.0.join("manifest.new")).unwrap();
+    drop(mappings);
+    drop(v);
+    let mut reopened = dir.open();
+    let fd = reopened.open_at(AT_FDCWD, b"/mapped", 0, 0).unwrap();
+    assert_eq!(reopened.pread(fd, 11, 512).unwrap(), b"mapped sync");
+}
+
+#[test]
+fn directory_flushes_follow_mutations_and_retry_post_rename_errors() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    let disk = v.fs.borrow().disk.clone().unwrap();
+    disk.take_sync_trace();
+    let fd = v.open_at(AT_FDCWD, b"/data", 0x42, 0o600).unwrap();
+    assert_eq!(disk.take_sync_trace(), ["objects", "directory"]);
+    v.pwrite(fd, b"metadata", 0).unwrap();
+    v.sync_fd(fd, false).unwrap();
+    assert_eq!(disk.take_sync_trace(), ["directory"]);
+    v.sync_fd(fd, true).unwrap();
+    disk.sync_directory().unwrap();
+    assert!(disk.take_sync_trace().is_empty());
+    // Both the post-rename attempt and its explicit durability retry fail.
+    // The publication remains committed and must not trigger namespace rollback.
+    disk.fail_directory_syncs(2);
+    assert_eq!(v.sync_fd(fd, false), Err(Errno(5)));
+    assert_eq!(disk.take_sync_trace(), ["directory", "directory"]);
+    v.sync_fd(fd, true).unwrap();
+    assert_eq!(disk.take_sync_trace(), ["directory"]);
+    v.link_at(AT_FDCWD, b"/data", AT_FDCWD, b"/alias").unwrap();
+    assert_eq!(disk.take_sync_trace(), ["directory"]);
+    let new = v.open_at(AT_FDCWD, b"/new", 0x42, 0o600).unwrap();
+    assert_eq!(disk.take_sync_trace(), ["objects", "directory"]);
+    v.close(new).unwrap();
+    drop(disk);
+    drop(v);
+    let mut reopened = dir.open();
+    let fd = reopened.open_at(AT_FDCWD, b"/alias", 0, 0).unwrap();
+    assert_eq!(reopened.pread(fd, 8, 0).unwrap(), b"metadata");
+}
+
+#[test]
+fn data_sync_survives_process_exit_without_vfs_shutdown() {
+    const CHILD: &str = "TRAMES_TEST_DATA_SYNC_EXIT_STORE";
+    if let Some(path) = std::env::var_os(CHILD) {
+        let mut v = Vfs::open_disk(path, DiskOptions::default()).unwrap();
+        let fd = v.open_at(AT_FDCWD, b"/data", 2, 0).unwrap();
+        v.pwrite(fd, b"survives-exit", 8192).unwrap();
+        v.sync_fd(fd, true).unwrap();
+        // Deliberately bypass VFS/destructor cleanup, as a terminated guest host.
+        std::process::exit(0);
+    }
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.import_file(b"/data", b"old".to_vec()).unwrap();
+    drop(v);
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "storage_tests::data_sync_survives_process_exit_without_vfs_shutdown",
+        ])
+        .env(CHILD, &dir.0)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let mut reopened = dir.open();
+    let fd = reopened.open_at(AT_FDCWD, b"/data", 0, 0).unwrap();
+    assert_eq!(reopened.pread(fd, 13, 8192).unwrap(), b"survives-exit");
+    assert_eq!(size(reopened.stat_fd(fd).unwrap()), 8205);
 }
 
 #[test]

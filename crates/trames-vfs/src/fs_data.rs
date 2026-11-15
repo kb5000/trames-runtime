@@ -102,6 +102,10 @@ impl<G: DerefMut<Target = Filesystem>> FsBorrow<'_, G> {
     }
 }
 impl<G: Deref<Target = Filesystem>> FsBorrow<'_, G> {
+    pub fn sync_file_metadata(&self, data_only: bool) -> Result<()> {
+        self.guard
+            .sync_file_metadata(data_only, self.overlay.as_deref())
+    }
     pub fn checkpoint(&self) -> Result<()> {
         self.guard.checkpoint(self.overlay.as_deref())
     }

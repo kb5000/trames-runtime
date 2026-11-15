@@ -74,10 +74,7 @@ impl DiskSyncJob {
         .map_err(storage::host_errno)?;
         if let Some(filesystem) = self.filesystem {
             let fs = filesystem.borrow();
-            fs.checkpoint(None)?;
-            if let Some(disk) = &fs.disk {
-                disk.sync_directory()?;
-            }
+            fs.sync_file_metadata(self.data_only, None)?;
         }
         Ok(())
     }

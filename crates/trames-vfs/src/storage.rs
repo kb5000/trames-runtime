@@ -206,8 +206,10 @@ impl Drop for DiskBacking {
         if self.host.is_some() {
             return;
         }
-        if self.remove_on_drop.load(Ordering::Relaxed) {
-            let _ = fs::remove_file(&self.path);
+        if self.remove_on_drop.load(Ordering::Relaxed) && fs::remove_file(&self.path).is_ok() {
+            if let Some(store) = &self._store {
+                store.objects_generation.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -445,6 +447,17 @@ pub(super) struct DiskStore {
     _lock: File,
     checkpoint: std::sync::Mutex<()>,
     initializing: std::sync::atomic::AtomicBool,
+    // Namespace publication only; normal byte reads/writes do not touch these.
+    // A generation observed before a successful host flush is covered by it.
+    // Concurrent later mutations remain pending; completion never regresses.
+    objects_generation: AtomicU64,
+    objects_synced: AtomicU64,
+    directory_generation: AtomicU64,
+    directory_synced: AtomicU64,
+    #[cfg(test)]
+    sync_trace: std::sync::Mutex<Vec<&'static str>>,
+    #[cfg(test)]
+    directory_failures: std::sync::atomic::AtomicUsize,
     pub(super) used: Arc<AtomicU64>,
 }
 fn regular(path: &Path) -> Result<()> {
@@ -508,6 +521,14 @@ impl DiskStore {
             _lock: lock,
             checkpoint: std::sync::Mutex::new(()),
             initializing: std::sync::atomic::AtomicBool::new(false),
+            objects_generation: AtomicU64::new(1),
+            objects_synced: AtomicU64::new(0),
+            directory_generation: AtomicU64::new(1),
+            directory_synced: AtomicU64::new(0),
+            #[cfg(test)]
+            sync_trace: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            directory_failures: std::sync::atomic::AtomicUsize::new(0),
             used: Arc::new(AtomicU64::new(0)),
         }))
     }
@@ -521,6 +542,7 @@ impl DiskStore {
         #[cfg(unix)]
         options.mode(0o600);
         drop(options.open(&path).map_err(host_errno)?);
+        self.objects_generation.fetch_add(1, Ordering::Relaxed);
         Ok(FileData::disk(DiskObject {
             length: 0,
             backing: Arc::new(DiskBacking {
@@ -563,9 +585,15 @@ impl DiskStore {
         let before_rename = (|| {
             file.write_all(bytes).map_err(host_errno)?;
             file.sync_all().map_err(host_errno)?;
-            File::open(self.root.join("objects"))
-                .and_then(|f| f.sync_all())
-                .map_err(host_errno)?;
+            let generation = self.objects_generation.load(Ordering::Relaxed);
+            if self.objects_synced.load(Ordering::Relaxed) < generation {
+                #[cfg(test)]
+                self.sync_trace.lock().unwrap().push("objects");
+                File::open(self.root.join("objects"))
+                    .and_then(|f| f.sync_all())
+                    .map_err(host_errno)?;
+                self.objects_synced.fetch_max(generation, Ordering::Relaxed);
+            }
             fs::rename(&tmp, self.root.join("manifest")).map_err(host_errno)
         })();
         if let Err(e) = before_rename {
@@ -574,13 +602,40 @@ impl DiskStore {
         }
         // Rename is the namespace commit point. Never roll back the in-memory tree
         // after it; a later fsync reports directory durability failures explicitly.
+        self.directory_generation.fetch_add(1, Ordering::Relaxed);
         let _ = self.sync_directory();
         Ok(())
     }
     pub(super) fn sync_directory(&self) -> Result<()> {
+        let generation = self.directory_generation.load(Ordering::Relaxed);
+        if self.directory_synced.load(Ordering::Relaxed) >= generation {
+            return Ok(());
+        }
+        #[cfg(test)]
+        {
+            self.sync_trace.lock().unwrap().push("directory");
+            if self
+                .directory_failures
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(Errno(5));
+            }
+        }
         File::open(&self.root)
             .and_then(|f| f.sync_all())
-            .map_err(host_errno)
+            .map_err(host_errno)?;
+        self.directory_synced
+            .fetch_max(generation, Ordering::Relaxed);
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(super) fn take_sync_trace(&self) -> Vec<&'static str> {
+        std::mem::take(&mut *self.sync_trace.lock().unwrap())
+    }
+    #[cfg(test)]
+    pub(super) fn fail_directory_syncs(&self, count: usize) {
+        self.directory_failures.store(count, Ordering::Relaxed);
     }
     fn recover(&self, live: &BTreeMap<u64, NodeRef>) -> Result<()> {
         let mut garbage = Vec::new();
@@ -608,6 +663,9 @@ impl DiskStore {
             }
         }
         // Do not delete anything until the manifest and every directory entry validate.
+        if !garbage.is_empty() {
+            self.objects_generation.fetch_add(1, Ordering::Relaxed);
+        }
         for path in garbage {
             fs::remove_file(path).map_err(host_errno)?;
         }
@@ -621,6 +679,26 @@ impl DiskStore {
 }
 
 impl Filesystem {
+    pub(super) fn sync_file_metadata(
+        &self,
+        data_only: bool,
+        overlay: Option<&overlay::Overlay>,
+    ) -> Result<()> {
+        // The v4 manifest contains identity/permissions/timestamps, not file
+        // length. Private data length is recovered from the original host
+        // object. fdatasync therefore needs that object's existing data sync,
+        // not a timestamp-only namespace replacement. Overlay writeback keeps
+        // its original checkpoint (it can still need to publish copy-up).
+        if !data_only || self.disk.is_none() || overlay.is_some() {
+            self.checkpoint(overlay)?;
+        }
+        if let Some(disk) = &self.disk {
+            // Retry a previously failed post-rename directory flush. A clean
+            // generation is already durable and requires no additional I/O.
+            disk.sync_directory()?;
+        }
+        Ok(())
+    }
     pub(super) fn checkpoint(&self, overlay: Option<&overlay::Overlay>) -> Result<()> {
         if let Some(overlay) = overlay {
             return overlay.checkpoint(self);
@@ -1380,6 +1458,7 @@ impl Vfs {
             return Err(Errno(22));
         }
         let linked = n.links != 0;
+        let regular = matches!(n.content, Content::File(_));
         let filesystem = o.mount.as_ref().map_or(&self.fs, |mount| &mount.fs).clone();
         drop(n);
         drop(o);
@@ -1388,10 +1467,7 @@ impl Vfs {
             // detached mount. Anonymous/unlinked files have no namespace entry
             // to commit; their data sync above is still required.
             let fs = filesystem.borrow();
-            fs.checkpoint()?;
-            if let Some(disk) = &fs.disk {
-                disk.sync_directory()?;
-            }
+            fs.sync_file_metadata(data_only && regular)?;
         }
         Ok(())
     }
