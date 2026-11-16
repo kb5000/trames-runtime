@@ -69,6 +69,10 @@ pub fn receive(input: impl Read, dest: &Path, options: &copy::Options) -> Result
                 return Err(Error::usage("Copy archive escapes its destination"));
             }
         }
+        // tar entries stop at the first end marker. Drain the original pipe
+        // before closing it, otherwise a split trailing marker can turn a
+        // successful copy into a broken pipe at the peer.
+        std::io::copy(&mut tar.into_inner(), &mut std::io::sink())?;
         let source = staging.join(root.ok_or_else(|| Error::usage("Empty copy archive"))?);
         let meta = fs::symlink_metadata(&source)?;
         if meta.is_dir() && !options.recursive {
@@ -105,8 +109,9 @@ mod tests {
         let mut bytes = Vec::new();
         send(&root.join("tree"), &mut bytes).unwrap();
         assert!(receive(&bytes[..], &root.join("denied"), &Default::default()).is_err());
+        let mut input = std::io::Cursor::new(&bytes);
         receive(
-            &bytes[..],
+            &mut input,
             &root.join("received"),
             &copy::Options {
                 recursive: true,
@@ -114,6 +119,11 @@ mod tests {
             },
         )
         .unwrap();
+        assert_eq!(
+            input.position(),
+            bytes.len() as u64,
+            "the pipe must be drained through its trailing markers"
+        );
         assert_eq!(
             fs::read(root.join("received/file")).unwrap(),
             b"hello\0world"
