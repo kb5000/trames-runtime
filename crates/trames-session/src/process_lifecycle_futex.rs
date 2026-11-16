@@ -150,7 +150,9 @@ mod tests {
         cold.state = State::Futex {
             wait: k
                 .futexes
-                .wait((0, 1, 0x2000), 3, 2, || Ok::<_, Errno>(()))
+                .wait((if mode >= 4 { 2 } else { 0 }, 1, 0x2000), 3, 2, || {
+                    Ok::<_, Errno>(())
+                })
                 .unwrap(),
             deadline: None,
         };

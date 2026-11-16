@@ -155,7 +155,7 @@ impl Default for SharedFiles {
     fn default() -> Self {
         Self(
             Arc::default(),
-            Arc::new(std::sync::atomic::AtomicU32::new(MAX_FDS)),
+            Arc::new(std::sync::atomic::AtomicU32::new(DEFAULT_MAX_FDS)),
         )
     }
 }

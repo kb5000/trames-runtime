@@ -1007,6 +1007,9 @@ impl DirectFd {
     pub fn is_epoll(&self) -> bool {
         matches!(self.resource, ByteResource::Epoll(_))
     }
+    pub fn is_pipe(&self) -> bool {
+        matches!(self.resource, ByteResource::Pipe { .. })
+    }
     pub fn is_unix(&self) -> bool {
         matches!(
             self.resource,

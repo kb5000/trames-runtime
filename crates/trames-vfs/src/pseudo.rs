@@ -211,7 +211,7 @@ mod tests {
         snapshot(&mut v);
         assert_eq!(
             read(&mut v, b"/proc/sys/fs/nr_open"),
-            format!("{MAX_FDS}\n").into_bytes()
+            format!("{DEFAULT_MAX_FDS}\n").into_bytes()
         );
         let limits = String::from_utf8(read(&mut v, b"/proc/self/limits")).unwrap();
         let row = limits
@@ -219,8 +219,8 @@ mod tests {
             .find(|line| line.starts_with("Max open files"))
             .unwrap();
         let fields: Vec<_> = row.split_whitespace().collect();
-        assert_eq!(fields[3], MAX_FDS.to_string());
-        assert_eq!(fields[4], MAX_FDS.to_string());
+        assert_eq!(fields[3], DEFAULT_MAX_FDS.to_string());
+        assert_eq!(fields[4], DEFAULT_MAX_FDS.to_string());
         let status = String::from_utf8(read(&mut v, b"/proc/self/status")).unwrap();
         assert!(status.contains("FDSize:\t512\n"));
     }
@@ -833,6 +833,7 @@ pub struct RuntimeInfo {
 }
 #[derive(Default)]
 pub(super) struct PseudoFs {
+    pub(super) nr_open: DescriptorCeiling,
     pub(super) boot_id: Arc<std::sync::OnceLock<Result<Vec<u8>>>>,
     pub(super) video_device: Arc<std::sync::atomic::AtomicBool>,
     pub(super) enabled: bool,
@@ -1495,7 +1496,7 @@ impl Vfs {
                 shared: Arc::new(SharedOpenDescription {
                     console: Default::default(),
                     oom: None,
-                    network_control: None,
+                    sysctl_control: None,
                     mount_file: None,
                     runtime_file: None,
                     socket: None,
@@ -1573,6 +1574,7 @@ impl Vfs {
             };
             out[..8].copy_from_slice(&magic.to_le_bytes());
             out[8..16].copy_from_slice(&4096u64.to_le_bytes());
+            out[64..72].copy_from_slice(&255u64.to_le_bytes());
         }
         Ok(out)
     }
@@ -1911,7 +1913,7 @@ impl Vfs {
             b"/proc/sys/kernel/cap_last_cap" => return Ok(regular(format!("{}\n", capabilities::LAST).into_bytes())),
             b"/proc/sys/kernel/pid_max" => return Ok(regular(b"2147483647\n".to_vec())),
             b"/proc/sys/kernel/threads-max" => return Ok(regular(format!("{task_limit}\n").into_bytes())),
-            b"/proc/sys/fs/nr_open" => return Ok(regular(format!("{MAX_FDS}\n").into_bytes())),
+            b"/proc/sys/fs/nr_open" => return Ok(Some((file(format!("{}\n", self.descriptor_ceiling().get()).into_bytes()), 0o100644))),
             b"/proc/sys/fs/file-max" => return Ok(regular(format!("{}\n", task_limit * MAX_FDS as usize).into_bytes())),
             b"/proc/sys/fs/file-nr" => return Ok(regular(format!("{}\t0\t{}\n", r.processes.iter().map(|p| p.fds.len()).sum::<usize>(), task_limit * MAX_FDS as usize).into_bytes())),
             b"/proc/sys/vm/overcommit_memory" => return Ok(regular(b"2\n".to_vec())),
@@ -2125,8 +2127,9 @@ impl Vfs {
                             };
                             let address_limit = limit(p.address_space_limit.unwrap_or(512 << 20));
                             let (core_soft, core_hard) = p.core_limits.unwrap_or((0, u64::MAX));
-                            let (fd_soft, fd_hard) =
-                                p.nofile_limits.unwrap_or((MAX_FDS as u64, MAX_FDS as u64));
+                            let (fd_soft, fd_hard) = p
+                                .nofile_limits
+                                .unwrap_or((DEFAULT_MAX_FDS as u64, DEFAULT_MAX_FDS as u64));
                             format!("Limit                     Soft Limit           Hard Limit           Units\nMax open files            {fd_soft:<20} {fd_hard:<20} files\nMax processes             {task_limit:<20} {task_limit:<20} processes\nMax address space         {address_limit:<20} {address_limit:<20} bytes\nMax file size             {:<20} {:<20} bytes\nMax core file size        {:<20} {:<20} bytes\n", limit(soft), limit(hard),limit(core_soft),limit(core_hard)).into_bytes()
                         }
                         _ => return Ok(None),

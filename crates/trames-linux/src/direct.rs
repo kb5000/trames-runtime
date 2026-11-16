@@ -76,11 +76,24 @@ pub struct RetainedByte {
 #[derive(Clone)]
 enum ByteOperation {
     Plain,
+    Pipe(Arc<std::sync::Mutex<PipeWrite>>),
     Message(Arc<local_message::AcceptedMessage>),
     Signal(Arc<signal_read::SignalRead>),
     Tcp(Arc<trames_vfs::DirectTcpFd>),
 }
+struct PipeWrite {
+    bytes: Vec<u8>,
+    written: usize,
+}
 impl RetainedByte {
+    pub fn partial_write(&self) -> Option<u64> {
+        if let ByteOperation::Pipe(write) = &self.operation {
+            let n = write.lock().unwrap().written;
+            (n != 0).then_some(n as u64)
+        } else {
+            None
+        }
+    }
     fn message(&self) -> Option<&Arc<local_message::AcceptedMessage>> {
         if let ByteOperation::Message(m) = &self.operation {
             Some(m)
@@ -1910,6 +1923,43 @@ impl DirectSyscalls {
         original_paths: Option<&trames_vfs::Vfs>,
     ) -> IoAttempt {
         let mut file = file;
+        if file.fd.is_pipe()
+            && !file.fd.nonblocking()
+            && matches!(number, 64 | 66)
+            && matches!(file.operation, ByteOperation::Plain)
+        {
+            let bytes = if number == 64 && args[2] > 4096 {
+                let count = args[2].min(crate::MAX_WRITE as u64) as usize;
+                let mut bytes = vec![0; count];
+                if memory.read(args[1], &mut bytes).is_err() {
+                    return self.complete_byte(&file, Err(Errno(14)));
+                }
+                Some(bytes)
+            } else if number == 66 {
+                // writev has no offset argument; x3 is unspecified by its ABI.
+                let mut vector_args = args;
+                vector_args[3] = 0;
+                match Linux::positioned_vector_parts(memory, vector_args, true) {
+                    Ok((parts, count)) if count > 4096 => {
+                        let mut bytes = Vec::new();
+                        if let Err(error) = Linux::gather_parts(memory, &parts, count, &mut bytes) {
+                            return self.complete_byte(&file, Err(error));
+                        }
+                        Some(bytes)
+                    }
+                    Ok(_) => None,
+                    Err(error) => return self.complete_byte(&file, Err(error)),
+                }
+            } else {
+                None
+            };
+            if let Some(bytes) = bytes {
+                file.operation = ByteOperation::Pipe(Arc::new(std::sync::Mutex::new(PipeWrite {
+                    bytes,
+                    written: 0,
+                })));
+            }
+        }
         let result = if matches!(number, 63 | 65 | 286)
             && file.fd.is_signalfd()
             && matches!(file.operation, ByteOperation::Plain)
@@ -4012,6 +4062,61 @@ mod tests {
         assert_eq!(m.read_array::<1>(0x1100).unwrap(), *b"o");
         assert_eq!(vfs.read(replacement, 1).unwrap(), b"n");
         assert_eq!(vfs.write(writer, b"x"), Err(Errno(32))); // completed lease released.
+    }
+
+    #[test]
+    fn blocking_pipe_scalar_and_vector_writes_retain_progress_without_replaying_bytes() {
+        for number in [64, 66] {
+            for close_reader in [false, true] {
+                let mut vfs = Vfs::default();
+                let [reader, writer] = vfs.pipe(0).unwrap();
+                let direct = DirectSyscalls::default().with_membership(vfs.shared_files());
+                let target: Arc<dyn IoWake> = Arc::new(Target);
+                let mut memory = Memory::default();
+                memory.map(0x1000, 0x22000, Permissions::RW).unwrap();
+                let bytes: Vec<_> = (0..131072).map(|i| (i % 251) as u8).collect();
+                memory.write(0x2000, &bytes).unwrap();
+                memory.write_array(0x1100, 0x2000u64.to_le_bytes()).unwrap();
+                memory
+                    .write_array(0x1108, (bytes.len() as u64).to_le_bytes())
+                    .unwrap();
+                let args = if number == 64 {
+                    [writer as u64, 0x2000, bytes.len() as u64, u64::MAX, 0, 0]
+                } else {
+                    [writer as u64, 0x1100, 1, u64::MAX, 0, 0]
+                };
+                let wait = pending(
+                    direct
+                        .start_owned_byte(
+                            None,
+                            number,
+                            args,
+                            &mut memory,
+                            1,
+                            &Arc::downgrade(&target),
+                        )
+                        .unwrap(),
+                );
+                assert_eq!(
+                    wait.retained_byte.as_ref().unwrap().partial_write(),
+                    Some(65536)
+                );
+                if close_reader {
+                    vfs.close(reader).unwrap();
+                    assert_eq!(
+                        complete(direct.resume_owned_byte(wait, &mut memory)),
+                        Ok(65536)
+                    );
+                } else {
+                    assert_eq!(vfs.read(reader, 65536).unwrap(), bytes[..65536]);
+                    assert_eq!(
+                        complete(direct.resume_owned_byte(wait, &mut memory)),
+                        Ok(bytes.len() as u64)
+                    );
+                    assert_eq!(vfs.read(reader, 65536).unwrap(), bytes[65536..]);
+                }
+            }
+        }
     }
 
     #[test]

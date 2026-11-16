@@ -28,6 +28,7 @@ type Queues = BTreeMap<Key, VecDeque<Arc<Ticket>>>;
 
 pub(super) struct Ticket {
     pub pid: u32,
+    pi_tid: u32,
     bits: u32,
     state: AtomicU8,
     target: Mutex<Option<Weak<dyn Wake>>>,
@@ -218,6 +219,7 @@ impl Futexes {
         compare()?;
         let ticket = Arc::new(Ticket {
             pid,
+            pi_tid: 0,
             bits,
             state: AtomicU8::new(WAITING),
             target: Mutex::new(target),
@@ -232,16 +234,41 @@ impl Futexes {
     pub fn wake(&self, key: Key, count: u32, bits: u32) -> u64 {
         self.wake_local(key, count, bits).woken
     }
+    pub fn wake_regular(
+        &self,
+        key: Key,
+        count: u32,
+        bits: u32,
+    ) -> Result<Effect, trames_vfs::Errno> {
+        self.wake_impl(key, count, bits, true)
+    }
     pub fn wake_local(&self, key: Key, count: u32, bits: u32) -> Effect {
+        self.wake_impl(key, count, bits, false)
+            .expect("internal futex wake")
+    }
+    fn wake_impl(
+        &self,
+        key: Key,
+        count: u32,
+        bits: u32,
+        ordinary: bool,
+    ) -> Result<Effect, trames_vfs::Errno> {
         if count == 0 {
-            return Effect::default();
+            return Ok(Effect::default());
         }
         let mut selected = Vec::new();
         {
             let mut queues = self.0.queues[shard(key)].lock().unwrap();
             let Some(queue) = queues.get_mut(&key) else {
-                return Effect::default();
+                return Ok(Effect::default());
             };
+            if ordinary
+                && queue
+                    .iter()
+                    .any(|t| t.pi_tid != 0 && t.state.load(Ordering::Relaxed) == WAITING)
+            {
+                return Err(trames_vfs::Errno(22));
+            }
             queue.retain(|ticket| {
                 if selected.len() < count as usize && ticket.bits & bits != 0 && ticket.claim(WOKEN)
                 {
@@ -255,7 +282,114 @@ impl Futexes {
                 queues.remove(&key);
             }
         }
-        self.publish(selected, 0)
+        Ok(self.publish(selected, 0))
+    }
+    /// PI lock admission and guest-word transition share the keyed wait lock.
+    /// Contended tasks release their execution slot, using ordinary retained
+    /// tickets; no host mutex is held while executing guest code.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pi_lock(
+        &self,
+        key: Key,
+        memory: &mut impl trames_memory::CpuMemory,
+        address: u64,
+        pid: u32,
+        tid: u32,
+        target: Option<Weak<dyn Wake>>,
+        try_only: bool,
+    ) -> Result<Option<Arc<Wait>>, trames_vfs::Errno> {
+        use trames_vfs::Errno;
+        let mut queues = self.0.queues[shard(key)].lock().unwrap();
+        let queue = queues.entry(key).or_default();
+        queue.retain(|t| t.state.load(Ordering::Relaxed) == WAITING);
+        if queue.iter().any(|t| t.pi_tid == 0) {
+            return Err(Errno(22));
+        }
+        let mut result = Ok(false);
+        memory
+            .atomic_update(address, 4, |bytes| {
+                let word = u32::from_le_bytes(bytes.try_into().unwrap());
+                let owner = word & 0x3fff_ffff;
+                let next = if owner == tid {
+                    result = Err(Errno(35));
+                    word
+                } else if owner == 0 {
+                    result = Ok(true);
+                    tid | (word & 0x4000_0000)
+                } else if try_only {
+                    result = Err(Errno(11));
+                    word
+                } else {
+                    word | 0x8000_0000
+                };
+                bytes.copy_from_slice(&next.to_le_bytes());
+                ((), next != word)
+            })
+            .map_err(|_| Errno(14))?;
+        match result {
+            Ok(false) => {}
+            result => {
+                if queue.is_empty() {
+                    queues.remove(&key);
+                }
+                return result.map(|_| None);
+            }
+        }
+        let ticket = Arc::new(Ticket {
+            pid,
+            pi_tid: tid,
+            bits: u32::MAX,
+            state: AtomicU8::new(WAITING),
+            target: Mutex::new(target),
+            key: Mutex::new(key),
+        });
+        queue.push_back(ticket.clone());
+        Ok(Some(Arc::new(Wait {
+            ticket,
+            table: self.clone(),
+        })))
+    }
+    pub fn pi_unlock(
+        &self,
+        key: Key,
+        memory: &mut impl trames_memory::CpuMemory,
+        address: u64,
+        tid: u32,
+    ) -> Result<Effect, trames_vfs::Errno> {
+        use trames_vfs::Errno;
+        let mut selected = Vec::new();
+        {
+            let mut queues = self.0.queues[shard(key)].lock().unwrap();
+            let queue = queues.entry(key).or_default();
+            queue.retain(|t| t.state.load(Ordering::Relaxed) == WAITING);
+            if queue.iter().any(|t| t.pi_tid == 0) {
+                return Err(Errno(22));
+            }
+            let mut result = Ok(());
+            memory
+                .atomic_update(address, 4, |bytes| {
+                    let word = u32::from_le_bytes(bytes.try_into().unwrap());
+                    if word & 0x3fff_ffff != tid {
+                        result = Err(Errno(1));
+                        return ((), false);
+                    }
+                    while let Some(ticket) = queue.pop_front() {
+                        if ticket.claim(WOKEN) {
+                            selected.push(ticket);
+                            break;
+                        }
+                    }
+                    let next = selected.first().map_or(0, |t| t.pi_tid | 0x8000_0000);
+                    bytes.copy_from_slice(&next.to_le_bytes());
+                    ((), true)
+                })
+                .map_err(|_| Errno(14))?;
+            result?;
+            if queue.is_empty() {
+                queues.remove(&key);
+            }
+        }
+        Ok(self.publish(selected, 0))
     }
     fn publish(&self, selected: Vec<Arc<Ticket>>, moved: u64) -> Effect {
         // Scheduler callbacks run after unlocking all buckets and keys.
@@ -369,12 +503,22 @@ impl Futexes {
     }
     /// The atomic guest update and both wake selections share the ordered
     /// buckets with compare-and-enqueue/requeue. Callbacks run after unlocking.
-    pub fn wake_op<E>(
+    pub fn wake_op_regular(
+        &self,
+        first: Key,
+        second: Key,
+        counts: [u32; 2],
+        update: impl FnOnce() -> Result<bool, trames_vfs::Errno>,
+    ) -> Result<Effect, trames_vfs::Errno> {
+        self.wake_op_impl(first, second, counts, update, Some(trames_vfs::Errno(22)))
+    }
+    fn wake_op_impl<E>(
         &self,
         first: Key,
         second: Key,
         counts: [u32; 2],
         update: impl FnOnce() -> Result<bool, E>,
+        invalid: Option<E>,
     ) -> Result<Effect, E> {
         fn select(queues: &mut Queues, key: Key, count: u32, selected: &mut Vec<Arc<Ticket>>) {
             let mut remaining = count;
@@ -399,6 +543,20 @@ impl Futexes {
             let mut low = self.0.queues[a.min(b)].lock().unwrap();
             let mut high = (a != b).then(|| self.0.queues[a.max(b)].lock().unwrap());
             let comparison = update()?;
+            if let Some(error) = invalid {
+                let pi = |queues: &Queues, key| {
+                    queues.get(&key).is_some_and(|q| {
+                        q.iter()
+                            .any(|t| t.pi_tid != 0 && t.state.load(Ordering::Relaxed) == WAITING)
+                    })
+                };
+                if pi(&low, first)
+                    || pi(&low, second)
+                    || high.as_ref().is_some_and(|q| pi(q, first) || pi(q, second))
+                {
+                    return Err(error);
+                }
+            }
             if a == b {
                 select(&mut low, first, counts[0], &mut selected);
                 if comparison {
@@ -421,6 +579,7 @@ impl Futexes {
     }
     /// Compare, wake and move under the same ordered bucket locks. Tickets keep
     /// their original deadline/epoch target; no Process walk or callback is needed.
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub fn requeue<E>(
         &self,
         old: Key,
@@ -428,6 +587,28 @@ impl Futexes {
         wake: u32,
         count: u32,
         compare: impl FnOnce() -> Result<(), E>,
+    ) -> Result<Effect, E> {
+        self.requeue_impl(old, new, wake, count, compare, None)
+    }
+    pub fn requeue_regular(
+        &self,
+        old: Key,
+        new: Key,
+        wake: u32,
+        count: u32,
+        compare: impl FnOnce() -> Result<(), trames_vfs::Errno>,
+    ) -> Result<Effect, trames_vfs::Errno> {
+        self.requeue_impl(old, new, wake, count, compare, Some(trames_vfs::Errno(22)))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn requeue_impl<E>(
+        &self,
+        old: Key,
+        new: Key,
+        wake: u32,
+        count: u32,
+        compare: impl FnOnce() -> Result<(), E>,
+        invalid: Option<E>,
     ) -> Result<Effect, E> {
         fn select(queue: &mut VecDeque<Arc<Ticket>>, count: u32, out: &mut Vec<Arc<Ticket>>) {
             queue.retain(|ticket| {
@@ -466,6 +647,20 @@ impl Futexes {
             let (lo, hi) = (a.min(b), a.max(b));
             let mut first = self.0.queues[lo].lock().unwrap();
             let mut second = (a != b).then(|| self.0.queues[hi].lock().unwrap());
+            if let Some(error) = invalid {
+                let pi = |queues: &Queues, key| {
+                    queues.get(&key).is_some_and(|q| {
+                        q.iter()
+                            .any(|t| t.pi_tid != 0 && t.state.load(Ordering::Relaxed) == WAITING)
+                    })
+                };
+                if pi(&first, old)
+                    || pi(&first, new)
+                    || second.as_ref().is_some_and(|q| pi(q, old) || pi(q, new))
+                {
+                    return Err(error);
+                }
+            }
             // Even an empty queue must perform CMP_REQUEUE's comparison.
             compare()?;
             if old == new {
@@ -572,6 +767,67 @@ impl Authority {
     }
     pub fn completed(&self) -> u64 {
         self.completed.get()
+    }
+}
+
+impl Authority {
+    pub fn robust_exit(&self, memory: &mut impl trames_memory::CpuMemory, head: u64, tid: u32) {
+        if head == 0 {
+            return;
+        }
+        let Ok(header) = memory.read_array::<24>(head) else {
+            return;
+        };
+        let first = u64::from_le_bytes(header[..8].try_into().unwrap());
+        let offset = i64::from_le_bytes(header[8..16].try_into().unwrap());
+        let pending = u64::from_le_bytes(header[16..].try_into().unwrap());
+        fn release(
+            authority: &Authority,
+            memory: &mut impl trames_memory::CpuMemory,
+            entry: u64,
+            offset: i64,
+            tid: u32,
+        ) {
+            // PI lists use bit zero as a tag. Ordinary robust pthread mutexes
+            // use the same atomic word and shared-key wake as Linux do_exit.
+            let address = (entry & !1).wrapping_add_signed(offset);
+            if address & 3 != 0 {
+                return;
+            }
+            let old = memory.atomic_update(address, 4, |bytes| {
+                let word = u32::from_le_bytes(bytes.try_into().unwrap());
+                let owned = word & 0x3fff_ffff == tid;
+                if owned {
+                    bytes.copy_from_slice(&((word & 0x8000_0000) | 0x4000_0000).to_le_bytes());
+                }
+                ((word, owned), owned)
+            });
+            if let Ok((word, true)) = old {
+                if entry & 1 == 0 && word & 0x8000_0000 != 0 {
+                    if let Ok(key) =
+                        crate::worker_syscalls::futex_key(memory, authority.vm, address, false)
+                    {
+                        authority.record(&authority.table.wake_local(key, 1, u32::MAX), false);
+                    }
+                }
+            }
+        }
+        let mut entry = first;
+        for _ in 0..2048 {
+            if entry & !1 == head || entry & !1 == 0 {
+                break;
+            }
+            let Ok(next) = memory.read_array::<8>(entry & !1) else {
+                break;
+            };
+            if entry & !1 != pending & !1 {
+                release(self, memory, entry, offset, tid);
+            }
+            entry = u64::from_le_bytes(next);
+        }
+        if pending & !1 != 0 {
+            release(self, memory, pending, offset, tid);
+        }
     }
 }
 

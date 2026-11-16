@@ -310,6 +310,10 @@ pub(super) fn control(
             && t.kernel_log.is_none()
             && t.mount_file.is_none()
             && !resource_control
+            && !t
+                .node
+                .as_ref()
+                .is_some_and(|n| n.simple_device == Some(simple_device::Kind::Random))
     {
         return Err(Errno(1));
     }

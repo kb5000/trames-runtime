@@ -190,6 +190,7 @@ impl Vfs {
         view.pid_ns = self.pid_ns.clone();
         view.cgroup_namespace = self.cgroup_namespace.clone();
         view.file_size_limit = self.file_size_limit.clone();
+        view.memory_resource_limits = self.memory_resource_limits.clone();
         view.context.share_mask(&self.context);
         view.lock_owner = self.lock_owner;
         view.record_locks = self.record_locks.clone();
@@ -210,6 +211,7 @@ impl Vfs {
                     .unwrap_or_else(|| self.pseudo.clone())
             });
             pseudo.boot_id = source.boot_id.clone();
+            pseudo.nr_open = source.nr_open.clone();
             pseudo.video_device = source.video_device.clone();
         }
         view.query = Some(Authority {
@@ -428,6 +430,7 @@ impl PathQueries {
             let root = publication.borrow();
             Arc::new(SharedCell::new(pseudo::PseudoFs {
                 boot_id: root.boot_id.clone(),
+                nr_open: root.nr_open.clone(),
                 video_device: root.video_device.clone(),
                 enabled: root.enabled,
                 runtime: root.runtime.clone(),

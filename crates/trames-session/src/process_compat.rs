@@ -252,7 +252,7 @@ mod tests {
         );
         assert_eq!(
             read_u64(&p.memory, 0x1100).unwrap(),
-            trames_vfs::MAX_FDS as u64
+            trames_vfs::DEFAULT_MAX_FDS as u64
         );
         assert_eq!(p.linux.vfs.descriptor_limit(), 8);
         let mut child = p.fork();
@@ -294,14 +294,17 @@ mod tests {
         );
         assert_eq!(
             k.processes.read(&2).limits.get(7).0,
-            trames_vfs::MAX_FDS as u64
+            trames_vfs::DEFAULT_MAX_FDS as u64
         );
         assert_eq!(
             k.rlimit(1, &mut p, 261, [3, 7, 0x1000, 0x1000, 0, 0]),
             Ok(0)
         );
-        assert_eq!(read_u64(&p.memory, 0x1000), Ok(trames_vfs::MAX_FDS as u64));
-        assert_eq!(p.limits.get(7).0, trames_vfs::MAX_FDS as u64);
+        assert_eq!(
+            read_u64(&p.memory, 0x1000),
+            Ok(trames_vfs::DEFAULT_MAX_FDS as u64)
+        );
+        assert_eq!(p.limits.get(7).0, trames_vfs::DEFAULT_MAX_FDS as u64);
         for id in [2, 3] {
             assert_eq!(k.processes.read(&id).limits.get(7), (8, 16));
             assert_eq!(k.processes.read(&id).linux.vfs.descriptor_limit(), 8);

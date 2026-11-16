@@ -62,7 +62,7 @@ pub use uts::uts_call;
 mod time_read;
 mod timer;
 pub use syslog::syslog;
-pub use time_read::{clock_read, gettimeofday};
+pub use time_read::{clock_read, cpu_clock_read, gettimeofday};
 mod uring;
 pub use state::{Linux, MmapPlan};
 pub use timer::{timerfd_control, timerfd_control_with_boot};

@@ -284,6 +284,15 @@ impl IoTask {
     pub fn set_group(&self, group: u32) {
         self.lifecycle().set_job_group(group);
     }
+    pub fn tid(&self) -> u32 {
+        self.pid.load(Ordering::Relaxed)
+    }
+    pub fn local_tid(&self) -> u32 {
+        self.inbox
+            .namespace
+            .get()
+            .map_or(self.tid(), |ns| ns.local(self.tid()))
+    }
     pub fn tgid(&self) -> u32 {
         self.tgid.load(Ordering::Relaxed)
     }
@@ -1005,6 +1014,115 @@ impl Signals {
         self.wait_mask = state.wait_mask;
         self.frames = state.frames;
         self.alt_stack = state.alt_stack;
+    }
+}
+
+impl IoRoutes {
+    fn address_target(&self, caller: &IoTask, local: u32) -> Result<Arc<IoTask>, Errno> {
+        let global = self.namespace.global(local).ok_or(Errno(3))?;
+        let target = self
+            .directory
+            .tasks(0, global)
+            .into_iter()
+            .next()
+            .ok_or(Errno(3))?;
+        if caller.tgid() != target.tgid() {
+            let (euid, privileged) = {
+                let credentials = caller.credentials().read();
+                (
+                    credentials.euid,
+                    credentials.has_cap(trames_vfs::capabilities::SYS_PTRACE),
+                )
+            };
+            let credentials = target.credentials().read();
+            if euid != 0
+                && !privileged
+                && !(euid == credentials.uid
+                    && euid == credentials.euid
+                    && euid == credentials.suid)
+            {
+                return Err(Errno(1));
+            }
+        }
+        Ok(target)
+    }
+    pub fn robust_list(
+        &self,
+        caller: &IoTask,
+        number: u32,
+        a: [u64; 6],
+        memory: &mut impl trames_memory::CpuMemory,
+    ) -> Result<u64, Errno> {
+        let addresses = caller.thread_addresses().ok_or(Errno(3))?;
+        if number == 99 {
+            if a[1] != 24 {
+                return Err(Errno(22));
+            }
+            addresses.set_robust(a[0]);
+        } else {
+            let head = if a[0] as u32 == 0 {
+                addresses.robust()
+            } else {
+                self.address_target(caller, a[0] as u32)?
+                    .thread_addresses()
+                    .ok_or(Errno(3))?
+                    .robust()
+            };
+            memory
+                .check(a[1], 8, trames_memory::Access::Write)
+                .map_err(|_| Errno(14))?;
+            memory
+                .check(a[2], 8, trames_memory::Access::Write)
+                .map_err(|_| Errno(14))?;
+            memory
+                .write_array(a[1], head.to_le_bytes())
+                .map_err(|_| Errno(14))?;
+            memory
+                .write_array(a[2], 24u64.to_le_bytes())
+                .map_err(|_| Errno(14))?;
+        }
+        Ok(0)
+    }
+    pub fn cpu_clock(
+        &self,
+        caller: &IoTask,
+        id: u64,
+    ) -> Option<Result<std::time::Duration, Errno>> {
+        let id = id as u32 as i32;
+        if id == 2 {
+            return Some(Ok(caller.lifecycle().cpu_time()));
+        }
+        if id == 3 {
+            return Some(Ok(caller.proc_view.elapsed()));
+        }
+        if id >= 0 || id & 7 == 7 {
+            return None;
+        }
+        Some((|| {
+            if id & 3 == 3 {
+                return Err(Errno(22));
+            }
+            let local = !(id >> 3) as u32;
+            if local == 0 {
+                return Ok(if id & 4 != 0 {
+                    caller.proc_view.elapsed()
+                } else {
+                    caller.lifecycle().cpu_time()
+                });
+            }
+            let target = self.address_target(caller, local).map_err(|_| Errno(22))?;
+            if id & 4 != 0 {
+                if target.tgid() != caller.tgid() {
+                    return Err(Errno(22));
+                }
+                Ok(target.proc_view.elapsed())
+            } else {
+                if self.namespace.local(target.tgid()) != local {
+                    return Err(Errno(22));
+                }
+                Ok(target.lifecycle().cpu_time())
+            }
+        })())
     }
 }
 

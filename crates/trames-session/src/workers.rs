@@ -685,12 +685,12 @@ impl<C: Cpu> Starter<C> {
                                                 syscalls += 1;
                                                 let interrupted=if let Some(wait)=&pending.retained_poll {
                                                     wait.finish(work.memory.as_deref_mut().expect("signal View"),Err(trames_vfs::Errno(4)))
-                                                }else{Err(trames_vfs::Errno(4))};
-                                                if action.flags & 0x10000000 != 0 && matches!(pending.number, 25 | 29 | 32 | 63..=66 | 71 | 76 | 206 | 207 | 211 | 212 | 269) && pending.deadline.is_none() {
+                                                }else if let Some(count)=pending.retained_byte.as_ref().and_then(|file| file.partial_write()){Ok(count)}else{Err(trames_vfs::Errno(4))};
+                                                if interrupted.is_err() && action.flags & 0x10000000 != 0 && matches!(pending.number, 25 | 29 | 32 | 63..=66 | 71 | 76 | 206 | 207 | 211 | 212 | 269) && pending.deadline.is_none() {
                                                     work.trace.restart();
                                                     for (i, value) in pending.args.iter().enumerate() { work.cpu.set_x(i, *value); }
                                                     work.cpu.set_pc(work.cpu.pc().wrapping_sub(4));
-                                                } else { work.trace.finish(&mut work.cpu, 0u64.wrapping_sub(interrupted.err().unwrap().0 as u64)); }
+                                                } else { work.trace.finish(&mut work.cpu, interrupted.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64))); }
                                             }
                                             if snapshot.enter_io_signal(&mut work.cpu, work.memory.as_deref_mut().expect("signal View"), sig, *info, action).is_err() {
                                                 snapshot.io_signals.lifecycle().request_exit(11);
@@ -1833,14 +1833,14 @@ mod tests {
                     snapshot
                         .futex
                         .table
-                        .wait((0, 0, address), 99, u32::MAX, || Ok::<(), ()>(()))
+                        .wait((2, 0, address), 99, u32::MAX, || Ok::<(), ()>(()))
                         .unwrap()
                 });
                 let second_legacy = legacy_wait.then(|| {
                     snapshot
                         .futex
                         .table
-                        .wait((0, 0, address), 100, u32::MAX, || Ok::<(), ()>(()))
+                        .wait((2, 0, address), 100, u32::MAX, || Ok::<(), ()>(()))
                         .unwrap()
                 });
                 let addresses = Arc::new(trames_execution::ThreadAddresses::new(address));

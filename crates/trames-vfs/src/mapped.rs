@@ -916,6 +916,23 @@ pub(super) fn uring_pages(node: &Arc<Inode>, length: u64) -> Result<UringPages> 
 #[derive(Clone)]
 pub struct MappingFile(Descriptor);
 impl MappingFile {
+    pub fn anonymous_zero(&self, shared: bool, writable: bool) -> Result<bool> {
+        let o = self.0.open.borrow();
+        if !o
+            .node
+            .as_ref()
+            .is_some_and(|n| n.simple_device == Some(simple_device::Kind::Zero))
+        {
+            return Ok(false);
+        }
+        if o.flags.get() & O_PATH != 0 {
+            return Err(Errno(9));
+        }
+        if o.flags.get() & 3 == 1 || shared && writable && o.flags.get() & 3 != 2 {
+            return Err(Errno(13));
+        }
+        Ok(true)
+    }
     /// Binder receive mappings carry their selected original-mm address. Other
     /// files keep the ordinary offset-only mapping path unchanged.
     pub fn binder_pages(

@@ -5,19 +5,37 @@
 /// Original per-thread user addresses at the kernel/executor boundary. A
 /// snapshot retains this object; it never copies mutable exit registration.
 #[derive(Default)]
-pub struct ThreadAddresses(core::sync::atomic::AtomicU64);
+pub struct ThreadAddresses {
+    clear_tid: core::sync::atomic::AtomicU64,
+    robust: core::sync::atomic::AtomicU64,
+}
 impl ThreadAddresses {
     pub fn new(clear_tid: u64) -> Self {
-        Self(core::sync::atomic::AtomicU64::new(clear_tid))
+        Self {
+            clear_tid: core::sync::atomic::AtomicU64::new(clear_tid),
+            robust: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+    pub fn robust(&self) -> u64 {
+        self.robust.load(core::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn set_robust(&self, address: u64) {
+        self.robust
+            .store(address, core::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn take_robust(&self) -> u64 {
+        self.robust.swap(0, core::sync::atomic::Ordering::Relaxed)
     }
     pub fn clear_tid(&self) -> u64 {
-        self.0.load(core::sync::atomic::Ordering::Relaxed)
+        self.clear_tid.load(core::sync::atomic::Ordering::Relaxed)
     }
     pub fn set_clear_tid(&self, address: u64) {
-        self.0.store(address, core::sync::atomic::Ordering::Relaxed);
+        self.clear_tid
+            .store(address, core::sync::atomic::Ordering::Relaxed);
     }
     pub fn take_clear_tid(&self) -> u64 {
-        self.0.swap(0, core::sync::atomic::Ordering::Relaxed)
+        self.clear_tid
+            .swap(0, core::sync::atomic::Ordering::Relaxed)
     }
 }
 

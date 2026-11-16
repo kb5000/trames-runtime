@@ -10,9 +10,11 @@ use trames_vfs::{
 };
 type Pair = (u64, u64);
 pub struct Limits {
-    values: Mutex<[Pair; 4]>, // FSIZE, CORE, NOFILE, NICE; original process authority.
+    values: Mutex<[Pair; 6]>, // FSIZE, CORE, NOFILE, NICE, DATA, AS.
     file_size: FileSizeLimit,
     nofile: DescriptorLimit,
+    nr_open: trames_vfs::DescriptorCeiling,
+    vm: trames_vfs::MemoryResourceLimits,
 }
 impl Limits {
     pub fn new(vfs: &Vfs) -> Arc<Self> {
@@ -20,23 +22,31 @@ impl Limits {
             values: Mutex::new([
                 (vfs.file_size_limit_handle().get(), u64::MAX),
                 (0, u64::MAX),
-                (vfs.descriptor_limit() as u64, trames_vfs::MAX_FDS as u64),
+                (
+                    vfs.descriptor_limit() as u64,
+                    vfs.descriptor_ceiling().get() as u64,
+                ),
                 (0, 0),
+                (vfs.memory_resource_limits().data(), u64::MAX),
+                (vfs.memory_resource_limits().address_space(), u64::MAX),
             ]),
             file_size: vfs.file_size_limit_handle(),
             nofile: vfs.descriptor_limit_handle(),
+            nr_open: vfs.descriptor_ceiling(),
+            vm: vfs.memory_resource_limits().clone(),
         })
     }
     pub fn fork(&self, vfs: &Vfs) -> Arc<Self> {
         let values = *self.values.lock().unwrap();
         let child = Self::new(vfs);
-        for (resource, value) in [1, 4, 7, 13].into_iter().zip(values) {
+        for (resource, value) in [1, 4, 7, 13, 2, 9].into_iter().zip(values) {
             child.set(resource, value);
         }
         child
     }
     pub fn bind(&self, vfs: &mut Vfs) {
         vfs.bind_resource_limits(self.file_size.clone(), self.nofile.clone());
+        vfs.bind_memory_resource_limits(self.vm.clone());
     }
     fn index(resource: u64) -> Option<usize> {
         match resource {
@@ -44,6 +54,8 @@ impl Limits {
             4 => Some(1),
             7 => Some(2),
             13 => Some(3),
+            2 => Some(4),
+            9 => Some(5),
             _ => None,
         }
     }
@@ -59,6 +71,7 @@ impl Limits {
         match resource {
             1 => self.file_size.set(soft),
             7 => self.nofile.set(soft as u32),
+            2 | 9 => self.vm.set(resource, soft),
             _ => {}
         }
     }
@@ -80,7 +93,11 @@ impl Limits {
                 if number == 163 { a[1] } else { 0 },
             )
         };
-        let ceiling = fixed.value(resource)?;
+        let ceiling = if resource == 7 {
+            self.nr_open.get() as u64
+        } else {
+            fixed.value(resource)?
+        };
         if old != 0 {
             memory
                 .check(old, 16, Access::Write)
@@ -104,7 +121,7 @@ impl Limits {
         let previous = Self::index(resource).map_or((ceiling, ceiling), |i| values[i]);
         if let Some(value) = next {
             if value.1 > previous.1 && !privileged
-                || !matches!(resource, 1 | 4) && value.1 > ceiling
+                || !matches!(resource, 1 | 2 | 4 | 9) && value.1 > ceiling
             {
                 return Err(Errno(1));
             }
@@ -299,7 +316,7 @@ mod tests {
         assert_eq!(thread.file_size_limit_handle().get(), 9);
         assert_eq!(thread.descriptor_limit(), 8);
         assert_eq!(fork.file_size_limit_handle().get(), u64::MAX);
-        assert_eq!(child.get(7).0, trames_vfs::MAX_FDS as u64);
+        assert_eq!(child.get(7).0, trames_vfs::DEFAULT_MAX_FDS as u64);
         child.set(1, (3, 6));
         assert_eq!(v.file_size_limit_handle().get(), 9);
     }
@@ -329,6 +346,60 @@ mod tests {
         pair(&mut m, (8, 16));
         assert_eq!(a.call(261, [42, 7, 0x1000, 0, 0, 0], &mut m), Ok(0));
         assert_eq!(replacement.get(7), (8, 16));
-        assert_eq!(old.get(7).0, trames_vfs::MAX_FDS as u64);
+        assert_eq!(old.get(7).0, trames_vfs::DEFAULT_MAX_FDS as u64);
+    }
+}
+
+#[cfg(test)]
+mod gvisor_regressions {
+    use super::*;
+    #[test]
+    fn source_sysctl_write_updates_preexisting_limits_and_fresh_path_captures() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, Default::default());
+        let limits = Limits::new(&v);
+        let paths = v.path_queries();
+        let mut epoch = trames_vfs::FileEpoch::default();
+        let files = epoch.capture(&v, true);
+        let fd = paths
+            .open_at_resolve(
+                trames_vfs::AT_FDCWD,
+                b"/proc/sys/fs/nr_open",
+                1,
+                0,
+                0,
+                &files,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(v.write(fd, b"4194304"), Ok(7));
+        let mut memory = trames_memory::Memory::default();
+        memory
+            .map(0x1000, 4096, trames_memory::Permissions::RW)
+            .unwrap();
+        memory
+            .write_array(0x1000, 4194304u64.to_le_bytes())
+            .unwrap();
+        memory
+            .write_array(0x1008, 4194304u64.to_le_bytes())
+            .unwrap();
+        assert_eq!(
+            limits.call(
+                164,
+                [7, 0x1000, 0, 0, 0, 0],
+                &mut memory,
+                Fixed {
+                    address_space: 8192,
+                    stack: 4096,
+                    tasks: 8192
+                },
+                true
+            ),
+            Ok(0)
+        );
+        assert_eq!(v.descriptor_limit(), 4194304);
+        let other = v.clone();
+        assert_eq!(other.descriptor_ceiling().get(), 4194304);
+        assert_eq!(limits.nr_open.get(), 4194304);
     }
 }

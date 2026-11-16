@@ -41,6 +41,8 @@ impl ExitResources<'_> {
             task.exit();
         }
         if let Some(addresses) = self.task.thread_addresses() {
+            self.futex
+                .robust_exit(memory, addresses.take_robust(), self.task.local_tid());
             let address = addresses.take_clear_tid();
             if address != 0 {
                 let _ = memory.write(address, &[0; 4]);
@@ -288,6 +290,25 @@ pub(super) fn sleep_parameters(
     ))
 }
 
+fn pi_deadline(memory: &impl CpuMemory, address: u64) -> Result<Option<Instant>, Errno> {
+    if address == 0 {
+        return Ok(None);
+    }
+    let ts = memory.read_array::<16>(address).map_err(|_| Errno(14))?;
+    let seconds = u64::from_le_bytes(ts[..8].try_into().unwrap());
+    let nanos = u64::from_le_bytes(ts[8..].try_into().unwrap());
+    if seconds > i64::MAX as u64 || nanos >= 1_000_000_000 {
+        return Err(Errno(22));
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Errno(5))?;
+    Instant::now()
+        .checked_add(Duration::new(seconds, nanos as u32).saturating_sub(now))
+        .map(Some)
+        .ok_or(Errno(22))
+}
+
 pub(super) fn futex_wait_parameters(
     memory: &impl CpuMemory,
     a: [u64; 6],
@@ -331,12 +352,16 @@ pub(super) fn futex_key(
     address: u64,
     private: bool,
 ) -> Result<crate::futex::Key, Errno> {
+    let address = address & 0x00ff_ffff_ffff_ffff;
+    if address > trames_memory::ADDRESS_LIMIT - 4 {
+        return Err(Errno(14));
+    }
     if !private {
         if let Some(key) = memory.shared_futex_key(address).map_err(|_| Errno(14))? {
             return Ok(key);
         }
     }
-    Ok((0, vm, address & 0x00ff_ffff_ffff_ffff))
+    Ok((if private { 0 } else { 2 }, vm, address))
 }
 pub(super) fn futex_parameters(
     memory: &impl CpuMemory,
@@ -346,7 +371,9 @@ pub(super) fn futex_parameters(
     if a[0] & 3 != 0 || a[1] & !0x1ff != 0 {
         return Err(Errno(22));
     }
-    memory.check(a[0], 4, Access::Read).map_err(|_| Errno(14))?;
+    if matches!(a[1] & 127, 0 | 9 | 6 | 7 | 8) {
+        memory.check(a[0], 4, Access::Read).map_err(|_| Errno(14))?;
+    }
     futex_key(memory, vm, a[0], a[1] & 128 != 0)
 }
 /// One ABI/validation implementation for owner and worker queue operations.
@@ -360,10 +387,10 @@ pub(super) fn futex_queue(
     match a[1] & 127 {
         op @ (1 | 10) => {
             let bits = if op == 10 { a[5] as u32 } else { u32::MAX };
-            if a[2] > i32::MAX as u64 || bits == 0 {
+            if bits == 0 {
                 return Err(Errno(22));
             }
-            Ok(table.wake_local(key, a[2] as u32, bits))
+            table.wake_regular(key, (a[2] as i32).max(1) as u32, bits)
         }
         op @ (3 | 4) => {
             if a[4] & 3 != 0 || a[2] > i32::MAX as u64 || a[3] > i32::MAX as u64 {
@@ -371,7 +398,7 @@ pub(super) fn futex_queue(
             }
             memory.check(a[4], 4, Access::Read).map_err(|_| Errno(14))?;
             let new = futex_key(memory, vm, a[4], a[1] & 128 != 0)?;
-            table.requeue(key, new, a[2] as u32, a[3] as u32, || {
+            table.requeue_regular(key, new, a[2] as u32, a[3] as u32, || {
                 if op == 4
                     && u32::from_le_bytes(memory.read_array::<4>(a[0]).map_err(|_| Errno(14))?)
                         != a[5] as u32
@@ -402,7 +429,7 @@ pub(super) fn futex_queue(
             // Linux's legacy wake-op wakes at least one waiter for each
             // selected queue even when its signed count is zero/negative.
             let counts = [a[2], a[3]].map(|count| (count as i32).max(1) as u32);
-            table.wake_op(key, second, counts, || {
+            table.wake_op_regular(key, second, counts, || {
                 let old = memory
                     .atomic_update(a[4], 4, |bytes| {
                         let old = u32::from_le_bytes(bytes.try_into().unwrap());
@@ -609,7 +636,7 @@ impl Snapshot {
         Ok(())
     }
     fn futex_wait<C: Cpu>(&self, cpu: &C) -> bool {
-        cpu.x(8) as u32 == 98 && matches!(cpu.x(1) & 127, 0 | 9)
+        cpu.x(8) as u32 == 98 && matches!(cpu.x(1) & 127, 0 | 9 | 6)
     }
     pub fn wait<C: Cpu>(
         &self,
@@ -637,6 +664,25 @@ impl Snapshot {
         }
         Some((|| {
             let key = futex_parameters(memory, self.futex.vm, std::array::from_fn(|i| cpu.x(i)))?;
+            if cpu.x(1) & 127 == 6 {
+                let deadline = pi_deadline(memory, cpu.x(3))?;
+                let wait = self.futex.table.pi_lock(
+                    key,
+                    memory,
+                    cpu.x(0),
+                    pid,
+                    self.identities[6] as u32,
+                    Some(epoch.futex_target()),
+                    false,
+                )?;
+                return match wait {
+                    Some(wait) => Ok(crate::run_queue::WaitState::Futex { wait, deadline }),
+                    None => Ok(crate::run_queue::WaitState::Sleep {
+                        deadline: Instant::now(),
+                        remaining: 0,
+                    }),
+                };
+            }
             let (bits, deadline) =
                 futex_wait_parameters(memory, std::array::from_fn(|i| cpu.x(i)), self.started)?;
             let wait =
@@ -655,7 +701,7 @@ impl Snapshot {
         })())
     }
     fn futex_queue<C: Cpu>(&self, cpu: &C) -> bool {
-        cpu.x(8) as u32 == 98 && matches!(cpu.x(1) & 127, 1 | 10 | 3 | 4 | 5)
+        cpu.x(8) as u32 == 98 && matches!(cpu.x(1) & 127, 1 | 10 | 3 | 4 | 5 | 7 | 8)
     }
     pub fn timer_entry<C: Cpu>(&self, cpu: &C) -> Option<crate::process::seccomp::EntryDecision> {
         (self.seccomp.mode() != 0
@@ -784,7 +830,7 @@ impl Snapshot {
         // futex/epoll checkpoint. Ordinary unfiltered calls keep the old path.
         if !matches!(
             cpu.x(8) as u32,
-            25 | 92 | 98 | 101 | 113..=115 | 124 | 139 | 154..=157 | 163 | 164 | 261 | 166 | 168 | 169 | 172..=179 | 270 | 271 | 278
+            25 | 92 | 98..=101 | 113..=115 | 124 | 139 | 154..=157 | 163 | 164 | 261 | 166 | 168 | 169 | 172..=179 | 270 | 271 | 278
         ) && !(cpu.x(8) as u32 == 29 && matches!(cpu.x(1) as u32, 0x5421 | 0x5452))
             && !(matches!(cpu.x(8) as u32, 160..=162) && self.uts.is_some())
             && !(cpu.x(8) as u32 == 32 && (cpu.x(1) as u32 & 4 != 0 || cpu.x(1) as u32 == 8))
@@ -921,6 +967,30 @@ impl Snapshot {
                 .invoke(number, std::array::from_fn(|i| cpu.x(i)), memory)?,
             // Every non-wait futex command shares the canonical validation and
             // terminal unsupported result; unknown operations are not owner work.
+            98 if matches!(cpu.x(1) & 127, 7 | 8) => (|| {
+                let key =
+                    futex_parameters(memory, self.futex.vm, std::array::from_fn(|i| cpu.x(i)))?;
+                if cpu.x(1) & 127 == 8 {
+                    self.futex.table.pi_lock(
+                        key,
+                        memory,
+                        cpu.x(0),
+                        self.io_signals.tid(),
+                        self.identities[6] as u32,
+                        None,
+                        true,
+                    )?;
+                    Ok(0)
+                } else {
+                    self.futex
+                        .table
+                        .pi_unlock(key, memory, cpu.x(0), self.identities[6] as u32)
+                        .map(|effect| {
+                            self.futex.record(&effect, false);
+                            0
+                        })
+                }
+            })(),
             98 if !self.futex_wait(cpu) => futex_queue(
                 &self.futex.table,
                 memory,
@@ -1018,15 +1088,29 @@ impl Snapshot {
                 })),
             number @ 172..=178 => Ok(self.identities[(number - 172) as usize]),
             169 => trames_linux::gettimeofday(memory, cpu.x(0), cpu.x(1)),
-            number @ (113 | 114) => trames_linux::clock_read(
+            99 | 100 => self.io_routes.robust_list(
+                &self.io_signals,
+                cpu.x(8) as u32,
+                std::array::from_fn(|i| cpu.x(i)),
                 memory,
-                number,
-                cpu.x(0),
-                cpu.x(1),
-                self.started,
-                self.direct.boot_clock(),
-                Some(&self.io_signals.proc_view),
             ),
+            number @ (113 | 114) => {
+                if let Some(elapsed) = self.io_routes.cpu_clock(&self.io_signals, cpu.x(0)) {
+                    elapsed.and_then(|elapsed| {
+                        trames_linux::cpu_clock_read(memory, number, cpu.x(1), elapsed)
+                    })
+                } else {
+                    trames_linux::clock_read(
+                        memory,
+                        number,
+                        cpu.x(0),
+                        cpu.x(1),
+                        self.started,
+                        self.direct.boot_clock(),
+                        Some(&self.io_signals.proc_view),
+                    )
+                }
+            }
             168 => (|| {
                 let cpu_address = cpu.x(0);
                 let node_address = cpu.x(1);
@@ -1070,10 +1154,10 @@ mod tests {
     use trames_memory::{Memory, Permissions, PAGE_SIZE};
     #[test]
     fn recognized_entries_and_legacy_diagnostic_embeddings_keep_their_actual_handlers() {
-        assert!(unknown_syscall::<Cpu>(99, [0; 6]));
+        assert!(unknown_syscall::<Cpu>(293, [0; 6]));
         for number in [
-            0, 1, 4, 292, 13, 31, 56, 93, 94, 98, 113, 142, 167, 179, 220, 221, 236, 268, 277, 280,
-            283, 425, 426, 427, 452,
+            0, 1, 4, 292, 13, 31, 56, 93, 94, 98, 99, 100, 113, 142, 167, 179, 220, 221, 236, 268,
+            277, 280, 283, 425, 426, 427, 452,
         ] {
             assert!(
                 !unknown_syscall::<Cpu>(number, [0; 6]),
@@ -1108,7 +1192,7 @@ mod tests {
                 assert_eq!(futex_queue(&table, memory, 7, args).unwrap_err().0, error);
                 assert!(!first.woken() && !second.woken());
             }
-            let result = futex_queue(&table, memory, 7, [0x1000, 4, 1, 1, 0x1004, 0]).unwrap();
+            let result = futex_queue(&table, memory, 7, [0x1000, 132, 1, 1, 0x1004, 0]).unwrap();
             assert_eq!((result.woken, result.moved), (1, 1));
             assert!(first.woken() && !second.woken());
             assert_eq!(table.wake((0, 7, 0x1000), 1, 2), 0);
@@ -1292,7 +1376,7 @@ mod tests {
         };
         let mut view = memory.parallel_view(&mut Default::default()).unwrap();
         let mut cpu = Cpu::new(0x4004, 0);
-        cpu.set_x(8, 99);
+        cpu.set_x(8, 293);
         assert!(!snapshot.unknown_entry(&cpu));
         assert_eq!(snapshot.invoke(&cpu, &mut view), None);
         cpu.set_x(8, 98);
@@ -1335,13 +1419,13 @@ mod tests {
         cpu.set_x(0, 0x2000);
         assert_eq!(
             snapshot.invoke(&cpu, &mut view),
-            Some(0u64.wrapping_sub(14))
+            Some(0) // Private wake keys do not dereference the guest word.
         );
         cpu.set_x(0, 0x1004);
         cpu.set_x(2, 1 << 31);
         assert_eq!(
             snapshot.invoke(&cpu, &mut view),
-            Some(0u64.wrapping_sub(22))
+            Some(0) // A negative legacy count wakes at most the first waiter.
         );
         cpu.set_x(1, 1); // Shared-key wake must use the actual backing key.
         cpu.set_x(2, 1);
@@ -1702,7 +1786,7 @@ mod tests {
         cpu.set_x(1, 0);
         assert_eq!(
             snapshot.invoke(&cpu, &mut view),
-            Some(0u64.wrapping_sub(22))
+            Some(0u64.wrapping_sub(14))
         );
         cpu.set_x(8, 114);
         cpu.set_x(0, 1);

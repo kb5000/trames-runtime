@@ -2250,7 +2250,10 @@ impl<C: Cpu> Kernel<C> {
                 p.state = State::Sleep(deadline, remaining);
                 Ok(None)
             },
-            113 | 114 => trames_linux::clock_read(
+            99 | 100 => trames_kernel::signal::IoRoutes { directory: p.signals.io_directory.clone(), namespace: p.linux.vfs.pid_namespace().clone(), uid: p.linux.vfs.credentials.uid, euid: p.linux.vfs.credentials.euid }.robust_list(&p.signals.io, number, a, &mut p.memory).map(Some),
+            113 | 114 => if let Some(elapsed) = (trames_kernel::signal::IoRoutes { directory: p.signals.io_directory.clone(), namespace: p.linux.vfs.pid_namespace().clone(), uid: p.linux.vfs.credentials.uid, euid: p.linux.vfs.credentials.euid }).cpu_clock(&p.signals.io, a[0]) {
+                elapsed.and_then(|elapsed| trames_linux::cpu_clock_read(&mut p.memory, number, a[1], elapsed)).map(Some)
+            } else { trames_linux::clock_read(
                 &mut p.memory,
                 number,
                 a[0],
@@ -2258,8 +2261,7 @@ impl<C: Cpu> Kernel<C> {
                 self.started,
                 Some(p.linux.boot_clock()),
                 Some(&p.signals.io.proc_view),
-            )
-            .map(Some),
+            ).map(Some) },
             179 => {
                 let vm_id = p.vm_id;
                 let runnable = p.runnable();

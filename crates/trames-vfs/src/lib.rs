@@ -38,7 +38,9 @@ mod fd_allocator;
 mod fd_table;
 mod resource_limits;
 pub use descriptor_factory::DescriptorFactory;
-pub use resource_limits::{DescriptorLimit, FileSizeLimit};
+pub use resource_limits::{
+    DescriptorCeiling, DescriptorLimit, FileSizeLimit, MemoryResourceLimits,
+};
 mod open_handle;
 pub use open_handle::OfdIdentity;
 use open_handle::{OpenHandle, OpenMount, OpenWeak};
@@ -132,6 +134,7 @@ pub use linux_namespace::{
 };
 mod network;
 mod network_io;
+mod sysctl;
 pub use network_io::{DirectNetwork, DirectTcpFd, NetworkEpoch};
 mod oom;
 mod overlay;
@@ -194,7 +197,9 @@ pub const MAX_PATH: usize = 4096;
 pub const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_NODES: usize = 1024;
 /// Linux's default nr_open ceiling. Tables allocate only occupied slots.
-pub const MAX_FDS: u32 = 1 << 20;
+pub const DEFAULT_MAX_FDS: u32 = 1 << 20;
+/// Linux nr_open_max, rounded for a 64-bit fd bitmap. Tables remain sparse.
+pub const MAX_FDS: u32 = (i32::MAX as u32) & !7;
 /// Cold descriptor classification, shared by epochs and sized to live numbers.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FdMask(Arc<[u64]>);
@@ -254,7 +259,7 @@ struct OpenDescription {
 struct SharedOpenDescription {
     console: std::sync::OnceLock<console::ConsoleEndpoint>,
     oom: Option<std::sync::Weak<OomTask>>,
-    network_control: Option<network::Control>,
+    sysctl_control: Option<sysctl::Control>,
     mount_file: Option<Arc<mounts::watch::MountFile>>,
     runtime_file: Option<Arc<proc_file::ProcFile>>,
     socket: Option<Arc<NetSocket>>,
@@ -290,7 +295,7 @@ struct SharedOpenDescription {
 impl SharedOpenDescription {
     fn proc_control(&self) -> bool {
         self.oom.is_some()
-            || self.network_control.is_some()
+            || self.sysctl_control.is_some()
             || self.mount_file.is_some()
             || self.runtime_file.is_some()
     }
@@ -784,6 +789,7 @@ pub struct Vfs {
     lock_owner: u32,
     record_locks: Arc<locks::Registry>,
     file_size_limit: FileSizeLimit,
+    memory_resource_limits: MemoryResourceLimits,
     file_size_signal: Cell<bool>,
     next_open: Arc<descriptor_factory::OpenIds>,
     proc_accessed: Cell<bool>,
@@ -879,6 +885,7 @@ impl Vfs {
             lock_owner: self.lock_owner,
             record_locks: self.record_locks.clone(),
             file_size_limit: self.file_size_limit.fork(),
+            memory_resource_limits: self.memory_resource_limits.fork(),
             file_size_signal: self.file_size_signal.clone(),
             next_open: self.next_open.clone(),
             proc_accessed: self.proc_accessed.clone(),
@@ -938,6 +945,7 @@ impl Vfs {
             lock_owner: 1,
             record_locks: Arc::default(),
             file_size_limit: FileSizeLimit::default(),
+            memory_resource_limits: MemoryResourceLimits::default(),
             file_size_signal: Cell::new(false),
             next_open: Arc::new(descriptor_factory::OpenIds::default()),
             proc_accessed: Cell::new(false),
@@ -978,7 +986,7 @@ impl Default for Vfs {
                         shared: Arc::new(SharedOpenDescription {
                             console: Default::default(),
                             oom: None,
-                            network_control: None,
+                            sysctl_control: None,
                             mount_file: None,
                             runtime_file: None,
                             socket: None,
@@ -1164,7 +1172,7 @@ impl Vfs {
             || o.bridge.is_some()
             || o.kernel_log.is_some()
             || o.oom.is_some()
-            || o.network_control.is_some()
+            || o.sysctl_control.is_some()
             || o.mount.as_ref().is_some_and(|m| {
                 matches!(
                     m.kind,
@@ -1366,7 +1374,7 @@ impl Vfs {
                         shared: Arc::new(SharedOpenDescription {
                             console: Default::default(),
                             oom: None,
-                            network_control: None,
+                            sysctl_control: None,
                             mount_file: None,
                             runtime_file: None,
                             socket: None,
@@ -2407,8 +2415,8 @@ impl Vfs {
             .and_then(|o| o.oom.clone())
             .or_else(|| self.oom_for_path(&p));
         let network_control = original
-            .and_then(|o| o.network_control.clone())
-            .or_else(|| self.network_control(&p));
+            .and_then(|o| o.sysctl_control.clone())
+            .or_else(|| self.sysctl_control(&p));
         let mount_file = (flags & O_PATH == 0)
             .then(|| self.proc_mount_file(&p))
             .flatten();
@@ -2677,6 +2685,11 @@ impl Vfs {
         } else {
             None
         };
+        let flags = if pipe.is_some() {
+            flags | 0x20000
+        } else {
+            flags
+        }; // Linux O_LARGEFILE on named FIFOs
         let notification = if let Some(original) = original {
             inotify::FileClose::reopen(&node, flags, original.notification.as_ref())
         } else {
@@ -2725,7 +2738,7 @@ impl Vfs {
                 shared: Arc::new(SharedOpenDescription {
                     console: Default::default(),
                     oom,
-                    network_control,
+                    sysctl_control: network_control,
                     mount_file,
                     runtime_file,
                     socket: None,
@@ -3079,7 +3092,7 @@ impl Vfs {
             position.value += bytes.len() as u64;
             return Ok(bytes);
         }
-        if let Some(control) = &o.network_control {
+        if let Some(control) = &o.sysctl_control {
             let mut position = o.file_position.lock().unwrap();
             let data = control.read(position.value, count)?;
             position.value += data.len() as u64;
@@ -3205,6 +3218,15 @@ impl Vfs {
     pub fn file_size_limit_handle(&self) -> FileSizeLimit {
         self.file_size_limit.clone()
     }
+    pub fn memory_resource_limits(&self) -> &MemoryResourceLimits {
+        &self.memory_resource_limits
+    }
+    pub fn bind_memory_resource_limits(&mut self, limits: MemoryResourceLimits) {
+        self.memory_resource_limits = limits;
+    }
+    pub fn descriptor_ceiling(&self) -> DescriptorCeiling {
+        self.pseudo.borrow().nr_open.clone()
+    }
     pub fn descriptor_limit_handle(&self) -> DescriptorLimit {
         self.shared_files().limit_handle()
     }
@@ -3231,6 +3253,9 @@ impl Vfs {
     ) -> Result<usize> {
         let file_size_limit = self.file_size_limit.get();
         let o = descriptor.open.borrow();
+        if offset.is_some() && o.pipe.is_some() {
+            return Err(Errno(29));
+        }
         if let Some(mount) = &o.mount {
             mount.writable()?;
         }
@@ -3239,12 +3264,12 @@ impl Vfs {
         if o.flags.get() & 3 == 0 {
             return Err(Errno(9));
         }
-        if let Some(control) = &o.network_control {
+        if let Some(control) = &o.sysctl_control {
             let mut position = o.file_position.lock().unwrap();
             let count = control.write(
                 bytes,
                 offset.unwrap_or(position.value),
-                self.credentials.euid == 0 || self.credentials.has_cap(capabilities::NET_ADMIN),
+                control.authorized(&self.credentials),
             )?;
             if offset.is_none() {
                 position.value += count as u64;
@@ -3428,7 +3453,7 @@ impl Vfs {
         offset: u64,
     ) -> Result<Vec<u8>> {
         let o = descriptor.open.borrow();
-        if o.bridge.is_some() || o.kernel_log.is_some() {
+        if o.bridge.is_some() || o.kernel_log.is_some() || o.pipe.is_some() {
             return Err(Errno(29));
         }
         if let Some(kind) = o.node.as_ref().and_then(|n| n.simple_device) {
@@ -3443,7 +3468,7 @@ impl Vfs {
         if let Some(file) = &o.runtime_file {
             return file.read(offset, count);
         }
-        if let Some(control) = &o.network_control {
+        if let Some(control) = &o.sysctl_control {
             return control.read(offset, count);
         }
         if let Some(data) = Self::oom_read(&o, offset, count)? {
@@ -3468,7 +3493,11 @@ impl Vfs {
         result
     }
     pub fn pwrite(&mut self, fd: u32, bytes: &[u8], offset: u64) -> Result<usize> {
-        if self.bridge_fd(fd) || self.descriptor(fd)?.open.borrow().kernel_log.is_some() {
+        if self.bridge_fd(fd) || {
+            let d = self.descriptor(fd)?;
+            let o = d.open.borrow();
+            o.kernel_log.is_some() || o.pipe.is_some()
+        } {
             return Err(Errno(29));
         }
         if offset > i64::MAX as u64 {

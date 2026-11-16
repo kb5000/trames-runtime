@@ -26,6 +26,7 @@ pub struct Group {
 #[derive(Default)]
 struct State {
     members: BTreeMap<u32, Member>,
+    retired_cpu: std::time::Duration,
     live: usize,
     child: Weak<Child>,
     tgid: u32,
@@ -277,6 +278,7 @@ impl Group {
             {
                 return None;
             }
+            state.retired_cpu = state.retired_cpu.saturating_add(task.proc_view.elapsed());
             let migrations = state.members.remove(&pid).unwrap().migrations;
             let status = if state.members.is_empty() && !state.completed {
                 state.completed = true;
@@ -390,6 +392,9 @@ impl Group {
             });
         // A non-leader exec replaces the old leader's PID with this original task.
         let replaced = state.members.insert(pid, member);
+        if let Some(task) = replaced.as_ref().and_then(|m| m.task.upgrade()) {
+            state.retired_cpu = state.retired_cpu.saturating_add(task.proc_view.elapsed());
+        }
         if replaced.as_ref().is_some_and(|m| !m.retiring) {
             state.live -= 1;
         }
@@ -437,6 +442,9 @@ impl Group {
             let mut s = self.state.lock().unwrap();
             mark();
             let removed = s.members.remove(&pid);
+            if let Some(task) = removed.as_ref().and_then(|m| m.task.upgrade()) {
+                s.retired_cpu = s.retired_cpu.saturating_add(task.proc_view.elapsed());
+            }
             if removed.as_ref().is_some_and(|m| !m.retiring) {
                 s.live -= 1;
             }
@@ -553,6 +561,18 @@ impl Group {
                 }
             }
         }
+    }
+    /// Original process accounting includes retired threads; no host-wide clock
+    /// or stopped-task wall time is charged to this process.
+    pub fn cpu_time(&self) -> std::time::Duration {
+        let state = self.state.lock().unwrap();
+        state
+            .members
+            .values()
+            .filter_map(|m| m.task.upgrade())
+            .fold(state.retired_cpu, |total, task| {
+                total.saturating_add(task.proc_view.elapsed())
+            })
     }
     pub fn tasks(&self) -> Vec<Arc<IoTask>> {
         self.state.lock().unwrap().tasks()
@@ -821,5 +841,31 @@ mod tests {
         peer.begin_exit(43, 37 << 8);
         assert_eq!(peer.finish_exit(43), Some(37 << 8));
         assert_eq!(group.exit_status(), Some(37 << 8));
+    }
+}
+
+#[cfg(test)]
+mod cpu_clock_regression {
+    use super::*;
+    #[test]
+    fn process_clock_keeps_retired_original_threads_and_does_not_charge_other_groups() {
+        let group = Group::default();
+        let a = Arc::new(IoTask::default());
+        let b = Arc::new(IoTask::default());
+        let unrelated = IoTask::default();
+        group.register(&a, 1);
+        group.register(&b, 2);
+        a.proc_view.account(std::time::Duration::from_secs(2), 0);
+        b.proc_view.account(std::time::Duration::from_secs(3), 1);
+        unrelated
+            .proc_view
+            .account(std::time::Duration::from_secs(99), 2);
+        assert_eq!(group.cpu_time(), std::time::Duration::from_secs(5));
+        assert_eq!(group.begin_exit(2, &b, 0, false, || {}), Some(false));
+        group.finish_exit(2, &b);
+        drop(b);
+        assert_eq!(group.cpu_time(), std::time::Duration::from_secs(5));
+        a.proc_view.account(std::time::Duration::from_secs(1), 1);
+        assert_eq!(group.cpu_time(), std::time::Duration::from_secs(6));
     }
 }

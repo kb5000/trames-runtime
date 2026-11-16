@@ -81,6 +81,28 @@ pub fn clock_read(
     Ok(0)
 }
 
+/// CPU clock values supplied by the original task/group authority.
+pub fn cpu_clock_read(
+    memory: &mut impl CpuMemory,
+    number: u32,
+    address: u64,
+    elapsed: std::time::Duration,
+) -> Result<u64, Errno> {
+    if number == 114 && address == 0 {
+        return Ok(0);
+    }
+    let elapsed = if number == 114 {
+        std::time::Duration::from_nanos(1)
+    } else {
+        elapsed
+    };
+    let mut out = [0; 16];
+    out[..8].copy_from_slice(&elapsed.as_secs().to_le_bytes());
+    out[8..].copy_from_slice(&(elapsed.subsec_nanos() as u64).to_le_bytes());
+    memory.write_array(address, out).map_err(|_| Errno(14))?;
+    Ok(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

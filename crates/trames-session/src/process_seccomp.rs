@@ -1076,7 +1076,9 @@ mod tests {
 
     #[test]
     fn unknown_entries_complete_on_sources_with_one_policy_decision_and_original_diagnostics() {
-        for number in [99u32, 100, 293, 0x7fff_ffff, u32::MAX] {
+        // Robust-list calls 99/100 are implemented; retain five genuinely
+        // unsupported entries to exercise the original ENOSYS/filter path.
+        for number in [293u32, 294, 295, 0x7fff_ffff, u32::MAX] {
             for policy in [None, Some(ALLOW), Some(0x5002a)] {
                 let mut p = super::super::tests::process();
                 let log = p.linux.vfs.kernel_log_capability();
@@ -2128,7 +2130,7 @@ mod tests {
                 assert_eq!(
                     p.memory.read_u64(0x1000).unwrap(),
                     if decision == 0x7fff0000 {
-                        trames_vfs::MAX_FDS as u64
+                        trames_vfs::DEFAULT_MAX_FDS as u64
                     } else {
                         0
                     }

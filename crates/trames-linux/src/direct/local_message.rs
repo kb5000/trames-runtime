@@ -253,6 +253,34 @@ impl DirectSyscalls {
         if let ByteOperation::Tcp(tcp) = &file.operation {
             return Some(self.transfer_tcp(tcp, number, args, memory));
         }
+        if let ByteOperation::Pipe(write) = &file.operation {
+            let mut write = write.lock().unwrap();
+            if write.written == write.bytes.len() {
+                return Some(Ok(write.written as u64));
+            }
+            return Some(match file.fd.write(&write.bytes[write.written..]) {
+                Ok(n) => {
+                    write.written += n;
+                    if write.written == write.bytes.len() || file.fd.nonblocking() {
+                        Ok(write.written as u64)
+                    } else {
+                        Err(Errno(11))
+                    }
+                }
+                Err(error) => {
+                    if error == Errno(32) && write.written != 0 {
+                        if let Some(task) = &self.task_signal {
+                            task.raise(13);
+                        }
+                    }
+                    if error != Errno(11) && write.written != 0 {
+                        Ok(write.written as u64)
+                    } else {
+                        Err(error)
+                    }
+                }
+            });
+        }
         if let ByteOperation::Signal(read) = &file.operation {
             return Some(read.check(&file.fd, memory));
         }

@@ -58,7 +58,7 @@ fn time_observations_complete_on_source_with_faults_nulls_overlap_and_filter() {
             calls.push((114, id, 0, 0));
         }
         calls.push((113, 3, 0x8ff8, 14)); // Supported thread clock, invalid destination.
-        calls.push((113, 2, 0x8ff8, 22)); // Process CPU clock remains unsupported.
+        calls.push((113, 2, 0x8ff8, 14)); // Supported process clock, invalid destination.
         calls.push((114, 1, 0x8ff8, 14));
         let mut code = Vec::new();
         for (i, &(number, a0, a1, _)) in calls.iter().enumerate() {

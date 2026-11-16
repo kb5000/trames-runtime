@@ -10,7 +10,7 @@ mmap, futex and uname. Upstream disabled tests remain disabled; upstream runtime
 skips and reference failures are reported separately. No expectation is relaxed
 for Trames, and `TEST_ON_GVISOR`/save-restore mode are unset.
 
-See [the first Mac results](../../docs/validation/gvisor-syscalls-20261117.md).
+See [the first Mac results and fix/rerun checkpoint](../../docs/validation/gvisor-syscalls-20261117.md#fix-and-rerun-checkpoint).
 
 ## Build on native ARM64 Linux
 

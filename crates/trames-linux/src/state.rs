@@ -151,6 +151,7 @@ impl Linux {
     pub fn inherit_exec_addresses(&mut self, old: &Self) {
         self.thread_addresses = old.thread_addresses.clone();
         self.thread_addresses.set_clear_tid(0);
+        self.thread_addresses.set_robust(0);
     }
     pub fn fork_tid(&mut self, address: u64) {
         self.thread_addresses.set_clear_tid(address);
@@ -787,7 +788,18 @@ impl Linux {
         else {
             return current;
         };
+        if address > current
+            && address.saturating_sub(self.heap.base()) > self.vfs.memory_resource_limits().data()
+        {
+            return current;
+        }
         let old_end = (current + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        if new_end > old_end
+            && memory.virtual_bytes().saturating_add(new_end - old_end)
+                > self.vfs.memory_resource_limits().address_space()
+        {
+            return current;
+        }
         if new_end > old_end
             && memory
                 .map(old_end, new_end - old_end, Permissions::RW)
@@ -906,7 +918,7 @@ impl Linux {
         Ok(())
     }
     pub fn prepare_mmap(&self, a: [u64; 6], memory: &Memory) -> Result<MmapPlan> {
-        let len = Self::page_length(a[1])?;
+        let len = Self::page_length(a[1]).map_err(|e| if a[1] != 0 { Errno(12) } else { e })?;
         let reservation = a[2] == 0 && a[3] & 0x23 == 0x22;
         if a[3] & 0x23 != 0x22 && len > trames_memory::MAX_DESCRIBED_BYTES as u64 {
             return Err(Errno(12));
@@ -928,6 +940,30 @@ impl Linux {
             return Err(Errno(22));
         }
         let fixed = flags & (0x10 | 0x100000) != 0;
+        // RLIMIT_AS covers virtual ownership, not resident bytes or lazy budgets.
+        let limit = self.vfs.memory_resource_limits().address_space();
+        if limit != u64::MAX {
+            let removed = if fixed {
+                memory
+                    .regions()
+                    .into_iter()
+                    .map(|(start, end, _)| {
+                        end.min(a[0].saturating_add(len))
+                            .saturating_sub(start.max(a[0]))
+                    })
+                    .sum::<u64>()
+            } else {
+                0
+            };
+            if memory
+                .virtual_bytes()
+                .saturating_sub(removed)
+                .saturating_add(len)
+                > limit
+            {
+                return Err(Errno(12));
+            }
+        }
         if fixed && !a[0].is_multiple_of(PAGE_SIZE) {
             return Err(Errno(22));
         }
@@ -948,7 +984,7 @@ impl Linux {
             return Err(Errno(17));
         }
         let permissions = Permissions {
-            read: a[2] & 1 != 0,
+            read: a[2] & 3 != 0,
             write: a[2] & 2 != 0,
             execute: a[2] & 4 != 0,
         };
@@ -1002,6 +1038,10 @@ impl Linux {
             lease: _lease,
         } = plan;
         let shared = flags & 3 != 2;
+        let file = match file {
+            Some(file) if file.anonymous_zero(shared, permissions.write)? => None,
+            file => file,
+        };
         if let Some(file) = file {
             let (objects, shared) =
                 if let Some(pages) = file.binder_pages(address, offset, len, permissions.write) {
@@ -1458,13 +1498,13 @@ impl Linux {
                         Err(Errno(22))
                     };
                 }
-                let len = Self::page_length(a[1])?;
+                let len = Self::page_length(a[1]).map_err(|_| Errno(12))?;
                 memory
                     .protect(
                         a[0],
                         len,
                         Permissions {
-                            read: a[2] & 1 != 0,
+                            read: a[2] & 3 != 0,
                             write: a[2] & 2 != 0,
                             execute: a[2] & 4 != 0,
                         },
@@ -1495,7 +1535,9 @@ mod tests {
         m.map(0x9000, PAGE_SIZE, Permissions::RW).unwrap();
         m.write_array(0x9000, 42u32.to_le_bytes()).unwrap();
         let original = l.thread_addresses().clone();
+        original.set_robust(0x9100);
         let mut child = l.clone_with_files(true);
+        assert_eq!(child.thread_addresses().robust(), 0);
         child.fork_tid(0x9004);
         assert!(!std::sync::Arc::ptr_eq(
             l.thread_addresses(),
@@ -1513,6 +1555,7 @@ mod tests {
         image.inherit_exec_addresses(&l);
         assert!(std::sync::Arc::ptr_eq(image.thread_addresses(), &original));
         assert_eq!(original.clear_tid(), 0);
+        assert_eq!(original.robust(), 0);
     }
     #[test]
     fn first_touch_output_quota_failure_does_not_consume_file_input() {

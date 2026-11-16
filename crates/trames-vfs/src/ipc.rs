@@ -597,7 +597,7 @@ impl Vfs {
                     owner,
                     console: Default::default(),
                     oom: None,
-                    network_control: None,
+                    sysctl_control: None,
                     mount_file: None,
                     runtime_file: None,
                     socket: None,
