@@ -206,11 +206,20 @@ pub struct Mount {
     #[serde(default)]
     pub readonly: bool,
 }
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Capability {
     pub enabled: bool,
-    pub shares: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shares: Option<Vec<String>>,
+}
+impl Default for Capability {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            shares: None,
+        }
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -228,7 +237,7 @@ impl Default for Interop {
         Self {
             clipboard: Capability {
                 enabled: true,
-                shares: vec![],
+                shares: None,
             },
             host_ui: Default::default(),
             host_cli: Default::default(),
@@ -422,23 +431,69 @@ pub fn install_cli(vfs: &mut trames_vfs::Vfs) -> Result<()> {
     install_cli_for(vfs, crate::boot::Target::Linux)
 }
 pub fn install_cli_for(vfs: &mut trames_vfs::Vfs, target: crate::boot::Target) -> Result<()> {
-    let (path, script) = if target == crate::boot::Target::Android {
-        (
-            b"/system/bin/trames".as_slice(),
-            include_str!("../../../resources/guest/trames").replacen(
-                "#!/bin/sh",
-                "#!/system/bin/sh",
-                1,
-            ),
-        )
+    let path = if target == crate::boot::Target::Android {
+        b"/system/bin/trames".as_slice()
     } else {
-        (
-            b"/usr/local/bin/trames".as_slice(),
-            include_str!("../../../resources/guest/trames").into(),
-        )
+        b"/usr/local/bin/trames".as_slice()
     };
-    vfs.import_reader_replace(path, &mut std::io::Cursor::new(script.as_bytes()))?;
+    use sha2::{Digest, Sha256};
+    fn existing(vfs: &mut trames_vfs::Vfs, path: &[u8]) -> Result<Option<Vec<u8>>> {
+        let fd = match vfs.open_at(trames_vfs::AT_FDCWD, path, 0, 0) {
+            Ok(fd) => fd,
+            Err(trames_vfs::Errno(2)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let result: Result<Option<Vec<u8>>> = (|| {
+            let mut bytes = Vec::new();
+            loop {
+                let chunk = vfs.read(fd, 65536)?;
+                if chunk.is_empty() {
+                    break;
+                }
+                bytes.extend(chunk);
+                if bytes.len() > 8 * 1024 * 1024 {
+                    return Err("existing trames command exceeds managed artifact size".into());
+                }
+            }
+            Ok(Some(bytes))
+        })();
+        let closed = vfs.close(fd);
+        let bytes = result?;
+        closed?;
+        Ok(bytes)
+    }
+    let bytes = include_bytes!(env!("TRAMES_GUEST_CLI"));
+    let record = b"/var/lib/trames/guest-cli.sha256";
+    if let Some(old) = existing(vfs, path)? {
+        let hash = format!("{:x}", Sha256::digest(&old));
+        let owned = old == bytes
+            || old == include_bytes!("../../../resources/guest/trames")
+            || existing(vfs, record)?.is_some_and(|r| r == hash.as_bytes());
+        if !owned {
+            return Err(format!("{} already contains an unrelated command; rename it before enabling Trames CLI injection",String::from_utf8_lossy(path)).into());
+        }
+    }
+    if target == crate::boot::Target::Linux {
+        match vfs.mkdir_at(trames_vfs::AT_FDCWD, b"/usr", 0o755) {
+            Ok(()) | Err(trames_vfs::Errno(17)) => (),
+            Err(e) => return Err(e.into()),
+        }
+        match vfs.mkdir_at(trames_vfs::AT_FDCWD, b"/usr/bin", 0o755) {
+            Ok(()) | Err(trames_vfs::Errno(17)) => (),
+            Err(e) => return Err(e.into()),
+        }
+        match vfs.readlink_at(trames_vfs::AT_FDCWD, b"/usr/bin/trames") {
+            Ok(link) if link == path => (),
+            Err(trames_vfs::Errno(2)) => {
+                vfs.symlink_at(path, trames_vfs::AT_FDCWD, b"/usr/bin/trames")?;
+            }
+            _ => return Err("/usr/bin/trames already contains an unrelated command".into()),
+        }
+    }
+    vfs.import_reader_replace(path, &mut std::io::Cursor::new(bytes))?;
     vfs.chmod_at(trames_vfs::AT_FDCWD, path, 0o755)?;
+    let hash = format!("{:x}", Sha256::digest(bytes));
+    vfs.import_reader_replace(record, &mut std::io::Cursor::new(hash.as_bytes()))?;
     Ok(())
 }
 pub fn guest(vfs: &mut trames_vfs::Vfs, defaults: &Manifest) -> Result<Option<Manifest>> {
@@ -483,15 +538,56 @@ pub struct Share {
     pub readonly: bool,
 }
 impl Grant {
+    /// Owner-chosen defaults, used only when creating a new authorization record.
+    /// Missing/invalid records never call this implicitly.
+    pub fn allowed() -> Self {
+        Self {
+            host_ui: true,
+            host_cli: true,
+            clipboard: true,
+            host_exec: true,
+            files: true,
+            ports: true,
+            mounts: true,
+            shares: BTreeMap::new(),
+        }
+    }
+    pub fn permission(&self, key: &str) -> Option<bool> {
+        Some(match key {
+            "host-ui" => self.host_ui,
+            "host-cli" => self.host_cli,
+            "host-exec" => self.host_exec,
+            "files" => self.files,
+            "mounts" => self.mounts,
+            "ports" => self.ports,
+            "clipboard" => self.clipboard,
+            _ => return None,
+        })
+    }
+    pub fn set_permission(&mut self, key: &str, allowed: bool) -> Result<()> {
+        *match key {
+            "host-ui" => &mut self.host_ui,
+            "host-cli" => &mut self.host_cli,
+            "host-exec" => &mut self.host_exec,
+            "files" => &mut self.files,
+            "mounts" => &mut self.mounts,
+            "ports" => &mut self.ports,
+            "clipboard" => &mut self.clipboard,
+            _ => return Err("unknown interoperability permission".into()),
+        } = allowed;
+        Ok(())
+    }
     pub fn effective(&self, requested: &Interop) -> Interop {
         let cap = |r: &Capability, enabled: bool| Capability {
             enabled: r.enabled && enabled,
-            shares: r
-                .shares
-                .iter()
-                .filter(|s| self.shares.contains_key(*s))
-                .cloned()
-                .collect(),
+            shares: Some(match &r.shares {
+                Some(shares) => shares
+                    .iter()
+                    .filter(|s| self.shares.contains_key(*s))
+                    .cloned()
+                    .collect(),
+                None => self.shares.keys().cloned().collect(),
+            }),
         };
         Interop {
             host_ui: cap(&requested.host_ui, self.host_ui),
@@ -560,9 +656,99 @@ impl Grant {
             .collect()
     }
 }
+/// A stable private view of the existing authorized hostfs resource. It needs no
+/// dynamic mount permission and adds nothing to ordinary byte I/O admission.
+pub fn share_path(alias: &str) -> String {
+    format!(
+        "/run/trames/shares/{}",
+        alias
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    )
+}
+pub fn control_info(c: &Manifest, g: &Grant, platform: &str) -> serde_json::Value {
+    use serde_json::json;
+    let e = g.effective(&c.interop);
+    let mac = platform == "macos";
+    let mut capabilities = serde_json::Map::new();
+    for (key, enabled, supported) in [
+        ("clipboard", e.clipboard.enabled, true),
+        ("files", e.files.enabled, true),
+        ("host-ui", e.host_ui.enabled, true),
+        ("host-cli", e.host_cli.enabled, mac),
+        ("host-exec", e.host_exec.enabled, mac),
+        ("mounts", e.mounts.enabled, mac),
+        ("ports", e.ports.enabled, mac),
+    ] {
+        capabilities.insert(
+            key.into(),
+            json!({"allowed":enabled&&supported,"supported":supported}),
+        );
+    }
+    let shares: Vec<_> = e
+        .files
+        .shares
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|alias| {
+            g.shares.get(alias).map(
+                |s| json!({"alias":alias,"guest_path":share_path(alias),"readonly":s.readonly}),
+            )
+        })
+        .collect();
+    json!({"schema_version":1,"environment":c.environment,"platform":platform,"network":c.network.mode,"capabilities":capabilities,"features":{"exec_bytes":mac,"exec_stdin":mac},"shares":shares,"file_scope":c.interop.files.shares})
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn owner_defaults_allow_but_imported_config_cannot_authorize_itself() {
+        let c = Manifest::default();
+        let denied = Grant::default();
+        let mut allowed = Grant::allowed();
+        assert!(!denied.effective(&c.interop).host_exec.enabled);
+        assert!(allowed.effective(&c.interop).host_exec.enabled);
+        allowed.shares.insert(
+            "work".into(),
+            Share {
+                host: "/work".into(),
+                readonly: true,
+            },
+        );
+        assert_eq!(
+            allowed
+                .effective(&c.interop)
+                .files
+                .shares
+                .as_deref()
+                .unwrap(),
+            ["work"]
+        );
+        let mut restricted = c.clone();
+        restricted.interop.files.shares = Some(vec![]);
+        assert!(allowed
+            .effective(&restricted.interop)
+            .files
+            .shares
+            .as_ref()
+            .unwrap()
+            .is_empty());
+        restricted.interop.host_exec.enabled = false;
+        assert!(!allowed.effective(&restricted.interop).host_exec.enabled);
+        assert_eq!(
+            control_info(&c, &allowed, "ipados")["capabilities"]["host-exec"]["supported"],
+            false
+        );
+        let mut v = trames_vfs::Vfs::default();
+        v.import_file(b"/usr/local/bin/trames", b"custom program".to_vec())
+            .unwrap();
+        assert!(install_cli(&mut v).is_err());
+        assert_eq!(v.executable(b"/usr/local/bin/trames").unwrap_err().0, 13);
+    }
     #[test]
     fn defaults_roundtrip_and_errors() {
         let m = Manifest::parse("").unwrap();
@@ -579,7 +765,7 @@ mod tests {
         let mut m = Manifest::default();
         m.interop.host_exec.enabled = true;
         m.interop.files.enabled = true;
-        m.interop.files.shares = vec!["project".into(), "private".into()];
+        m.interop.files.shares = Some(vec!["project".into(), "private".into()]);
         let mut grant = Grant {
             files: true,
             ..Default::default()
@@ -594,7 +780,7 @@ mod tests {
         let e = grant.effective(&m.interop);
         assert!(!e.host_exec.enabled);
         assert!(e.files.enabled);
-        assert_eq!(e.files.shares, ["project"]);
+        assert_eq!(e.files.shares.as_deref().unwrap(), ["project"]);
     }
     #[test]
     fn memory_and_identity() {
@@ -673,6 +859,6 @@ mod tests {
         assert!(v
             .executable(b"/usr/local/bin/trames")
             .unwrap()
-            .starts_with(b"#!/bin/sh"));
+            .starts_with(b"\x7fELF"));
     }
 }

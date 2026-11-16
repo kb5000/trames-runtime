@@ -1,6 +1,7 @@
 # Host and guest interoperability CLI design
 
-Status: **Proposed, not implemented**. Owner review draft, 2026-11-16.
+Status: **Implemented**, 2026-11-16. Shared static guest CLI, Mac owner commands
+and iPad adapters are in source; platform validation is recorded below.
 
 This replaces the initial injected shell helper with a coherent guest-side
 `trames` command and matching host-side interoperability operations. It applies
@@ -16,14 +17,14 @@ requiring a separate dynamic-mount grant or a per-copy Trames confirmation.
 
 ## Starting point
 
-`resources/guest/trames` currently implements `info`, clipboard read/write,
+Before this change, `resources/guest/trames` implemented `info`, clipboard read/write,
 file listing, `host-cli`, `host-exec` and raw RPC. Linux injection targets
 `/usr/local/bin/trames`; Android injection targets `/system/bin/trames`.
 The helper exposes JSON frames directly and depends on guest shell/awk.
 
 Mac already has independent host grants, argv subprocess execution, scoped
 Trames CLI delegation, clipboard, URL opening, port publication and mount
-controls. Its subprocess adapter currently supplies null stdin and text output.
+controls. Its former subprocess adapter supplied null stdin and text output.
 iPad has clipboard, URL/device information and Files listing/import/export;
 arbitrary host execution and Mac mount/network administration are unavailable.
 A shared wire method name alone does not establish product support.
@@ -452,3 +453,60 @@ neither restarts them nor changes their grants. This document changes no source,
 on-disk format, live permission setting, environment configuration or product
 Runtime pin. The default-allow policy and matching host commands remain proposed
 until their source and product rollout are implemented and validated.
+
+## Implementation and validation (2026-11-16)
+
+`trames-control` is a small shared crate without a kernel, executor or product
+adapter dependency. `scripts/build-guest-cli.py` builds one static AArch64 musl
+ELF for all products; distro injection checks the source and artifact hashes.
+Linux installs `/usr/local/bin/trames` plus `/usr/bin/trames`; Android installs
+`/system/bin/trames`. Help, version and shell completion need no control device.
+Injection recognizes the previous managed helper/hash and refuses to overwrite
+an unrelated rootfs command.
+
+The host grants remain independent UUID-bound authority. Missing grants deny;
+new owner-created records use host `permission_defaults` (all supported flags
+allowed). Existing explicit denials, share allowlists and read-only folders stay
+intact. `shares` omitted means all registered aliases; an explicit empty list
+means none. Owner permission changes apply on the next environment start;
+default changes affect future creations, and `permissions defaults` rejects `-e`.
+Guest `permissions`/`permissions show` never mutate policy. Full host execution
+can still indirectly edit host files as the host user, as discussed above.
+
+Mac guest file copies resolve file-authorized aliases onto private hostfs views
+under `/run/trames/shares/<hex alias>`. These reuse the original hostfs backend
+and require only file permission, independently of dynamic mount permission.
+Host-selected copies use the existing live exec pipe and a bounded tar stream;
+the original guest VFS owns every operation. A scoped encoding/decoding worker
+exists for one explicit owner copy and ends with it; no resident service,
+coordinator or polling bus is added. Completed staging entries are renamed in
+the destination filesystem, avoiding a second bulk data copy for ordinary
+new files/trees. Offline copies use the existing locked VFS. Existing directory
+merges may need ordinary copy work. Host `files ls guest:/PATH` works in both
+states. Neither operation boots/stops the guest merely to exchange files.
+
+iPad Files copies use the existing security-scoped provider adapter, including
+its single-file/1 GiB limit; recursive and no-clobber provider operations report
+unsupported rather than inventing a second storage path. Native folder IDs are
+stable share aliases. Explicit provider scopes are enforced by the broker.
+Following the owner's explicit confirmation, native actions execute according
+to environment policy without the old per-request Trames consent sheet; OS
+privacy and Files folder authorizations still apply. iPad host-exec, delegated
+host CLI, port and dynamic-mount administration remain unsupported.
+
+Host commands use advertised `exec_bytes`/`exec_stdin` features, base64 byte
+frames, one bounded in-flight stdin chunk and EOF acknowledgement. stdout and
+stderr stay separate, with a final remote exit status. Accepted streams and
+provider copies have no fixed total broker timeout; original producer readiness
+remains registered even without a deadline. Explicit client timeouts,
+interrupts, output closure, connection loss and policy revocation retain the
+existing cancellation/resource ownership. Scoped host CLI delegation cannot
+change permissions, select another environment, or stop/restart its own bridge.
+Use the separately granted host UI operation to open the manager.
+
+Validation: complete local shared-runtime CI; Mac unit/static/package checks;
+real disposable Alpine tests for owner defaults and denials, read-only guest
+permissions, literal argv, binary stdin/stdout/stderr, exit status, explicit
+timeout, independent file/mount permissions, and live/offline bidirectional
+file/tree copying. iPad Rust cross-check and Swift syntax validation cover the
+source adapter; no physical iPad deployment is claimed for this change.

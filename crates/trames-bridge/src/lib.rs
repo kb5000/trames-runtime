@@ -23,6 +23,9 @@ const METHODS: &[&str] = &[
     "files.import",
     "files.export",
     "device.info",
+    "session.info",
+    "ui.manager",
+    "host.input",
     "host.cli",
     "host.exec",
     "ports.list",
@@ -66,14 +69,20 @@ impl Channel {
         }
     }
     fn permits(self, method: &str) -> bool {
-        if method == "bridge.info" || method == "device.info" || method == "request.cancel" {
+        if matches!(
+            method,
+            "bridge.info" | "session.info" | "device.info" | "request.cancel"
+        ) {
             return true;
         }
         match self {
             Self::Info => method.starts_with("accel."),
-            Self::HostControl => matches!(method, "url.open" | "host.cli"),
+            Self::HostControl => matches!(
+                method,
+                "url.open" | "ui.manager" | "host.cli" | "host.input"
+            ),
             Self::Clipboard => matches!(method, "clipboard.read" | "clipboard.write"),
-            Self::HostExec => method == "host.exec",
+            Self::HostExec => matches!(method, "host.exec" | "host.input"),
             Self::Files => method.starts_with("files."),
             Self::Ports => method.starts_with("ports."),
             Self::Mounts => method.starts_with("mounts."),
@@ -123,10 +132,15 @@ impl Policy {
     fn permits(self, channel: Channel, method: &str) -> bool {
         self.allows(channel)
             && channel.permits(method)
-            && if method == "host.cli" {
+            && if method == "host.input" {
+                true
+            } else if method == "host.cli" {
                 self.0 & (1 << 7) != 0
             } else if channel == Channel::HostControl
-                && !matches!(method, "bridge.info" | "device.info" | "request.cancel")
+                && !matches!(
+                    method,
+                    "bridge.info" | "session.info" | "device.info" | "request.cancel"
+                )
             {
                 self.0 & 2 != 0
             } else {
@@ -182,11 +196,13 @@ struct Pending {
     request: Request,
     deadline: Instant,
     dispatched: bool,
+    unbounded: bool,
 }
 #[derive(Default)]
 struct State {
     next: u64,
     policy: Policy,
+    info: Value,
     host_wake: Option<Arc<trames_shared::HostWake>>,
     host_pending: bool,
     streams: BTreeMap<u64, Stream>,
@@ -283,7 +299,7 @@ fn expire(s: &mut State, now: Instant) {
     let expired: Vec<_> = s
         .pending
         .iter()
-        .filter(|(_, p)| p.deadline <= now)
+        .filter(|(_, p)| !p.unbounded && p.deadline <= now)
         .map(|(&t, _)| t)
         .collect();
     for t in expired {
@@ -347,6 +363,29 @@ impl Broker {
         }
         Ok(())
     }
+    /// Trusted embedding metadata; never accepted from a guest request.
+    pub fn describe(&self, info: Value) -> Result<(), u32> {
+        self.lock()?.info = info;
+        Ok(())
+    }
+    /// Accepted command streams remain owned by the original connection and
+    /// have no artificial total duration limit. Explicit client deadlines close it.
+    pub fn accept_stream(&self, ticket: u64) -> Result<(), u32> {
+        self.lock()?.pending.get_mut(&ticket).ok_or(2u32)?.unbounded = true;
+        Ok(())
+    }
+    pub fn input_target(&self, ticket: u64, id: u64) -> Option<u64> {
+        let s = self.0.lock().ok()?;
+        let c = s.pending.get(&ticket)?.connection;
+        s.pending
+            .iter()
+            .find(|(_, p)| {
+                p.connection == c
+                    && p.request.id == id
+                    && matches!(p.request.method.as_str(), "host.exec" | "host.cli")
+            })
+            .map(|(&t, _)| t)
+    }
     /// Trusted host-only connection used by embedders/tests, never selected by mknod.
     pub fn connect(&self) -> Result<Arc<Connection>, u32> {
         self.connection(None)
@@ -396,7 +435,7 @@ impl Broker {
         let Some((&ticket, p)) = s
             .pending
             .iter()
-            .find(|(_, p)| !p.dispatched && p.deadline > Instant::now())
+            .find(|(_, p)| !p.dispatched && (p.unbounded || p.deadline > Instant::now()))
         else {
             return Ok(None);
         };
@@ -408,7 +447,14 @@ impl Broker {
         if data.len() > capacity {
             return Err(90);
         }
-        s.pending.get_mut(&ticket).ok_or(5u32)?.dispatched = true;
+        let pending = s.pending.get_mut(&ticket).ok_or(5u32)?;
+        pending.dispatched = true;
+        if matches!(
+            pending.request.method.as_str(),
+            "files.import" | "files.export"
+        ) {
+            pending.unbounded = true;
+        }
         Ok(Some(data))
     }
     pub fn deadline(&self) -> Option<Instant> {
@@ -417,6 +463,7 @@ impl Broker {
             .ok()?
             .pending
             .values()
+            .filter(|p| !p.unbounded)
             .map(|p| p.deadline)
             .min()
     }
@@ -427,7 +474,7 @@ impl Broker {
         expire(&mut s, Instant::now());
         s.pending
             .get(&ticket)
-            .is_some_and(|p| p.deadline > Instant::now())
+            .is_some_and(|p| p.unbounded || p.deadline > Instant::now())
     }
     /// One bounded streaming control frame; backpressure stays on this open.
     pub fn stream(&self, ticket: u64, value: Value, done: bool) -> Result<(), u32> {
@@ -450,7 +497,7 @@ impl Broker {
         if bytes.len() > MAX_FRAME {
             return Err(90);
         }
-        let r: HostReply = serde_json::from_slice(bytes).map_err(|_| 22u32)?;
+        let mut r: HostReply = serde_json::from_slice(bytes).map_err(|_| 22u32)?;
         if r.version != VERSION
             || r.result.is_some() == r.error.is_some()
             || r.error
@@ -462,11 +509,18 @@ impl Broker {
         let mut s = self.lock()?;
         expire(&mut s, Instant::now());
         let p = s.pending.get(&r.ticket).ok_or(2u32)?;
-        if p.deadline <= Instant::now() {
+        if !p.unbounded && p.deadline <= Instant::now() {
             return Err(2);
         }
         if !p.dispatched {
             return Err(22);
+        }
+        if p.request.method == "files.list" {
+            if let Some(scope) = s.info["file_scope"].as_array() {
+                if let Some(shares) = r.result.as_mut().and_then(|v| v["shares"].as_array_mut()) {
+                    shares.retain(|share| scope.contains(&share["provider_id"]));
+                }
+            }
         }
         let value = if let Some(error) = r.error {
             json!({"version":VERSION,"id":p.request.id,"error":error})
@@ -494,7 +548,7 @@ impl Connection {
         let expired = s
             .pending
             .values()
-            .filter(|p| p.connection == self.id && p.deadline <= now)
+            .filter(|p| p.connection == self.id && !p.unbounded && p.deadline <= now)
             .count() as u64;
         let mut ready = 0;
         if !stream.output.is_empty() || expired != 0 {
@@ -522,7 +576,7 @@ impl Connection {
         let now = Instant::now();
         s.pending
             .values()
-            .filter(|p| p.connection == self.id && p.deadline > now)
+            .filter(|p| p.connection == self.id && !p.unbounded && p.deadline > now)
             .map(|p| p.deadline)
             .min()
     }
@@ -575,7 +629,14 @@ impl Connection {
 }
 impl trames_shared::ReadinessDriver for Connection {
     fn external(&self) -> bool {
-        self.next_deadline().is_some()
+        let Ok(state) = self.broker.0.lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        state
+            .pending
+            .values()
+            .any(|p| p.connection == self.id && (p.unbounded || p.deadline > now))
     }
     fn notification_only(&self) -> bool {
         true
@@ -655,6 +716,17 @@ fn submit(s: &mut State, connection: u64, frame: &[u8]) -> Result<(), u32> {
             connection,
             json!({"version":VERSION,"id":id,"result":{"cancelled":ticket.is_some()}}),
         )?;
+    } else if request.method == "session.info" {
+        let info = if s.info.is_null() {
+            json!({"platform":"unknown","environment":{},"capabilities":{},"features":{}})
+        } else {
+            s.info.clone()
+        };
+        output(
+            s,
+            connection,
+            json!({"version":VERSION,"id":id,"result":info}),
+        )?;
     } else if request.method == "bridge.info" {
         let channel = s.streams.get(&connection).and_then(|stream| stream.channel);
         let methods: Vec<_> = METHODS
@@ -716,6 +788,36 @@ fn submit(s: &mut State, connection: u64, frame: &[u8]) -> Result<(), u32> {
             connection,
             failure(id, "method_not_found", "Unknown capability"),
         )?;
+    } else if matches!(request.method.as_str(), "files.import" | "files.export")
+        && s.info["file_scope"]
+            .as_array()
+            .is_some_and(|scope| !scope.contains(&request.params["grant"]))
+    {
+        output(
+            s,
+            connection,
+            failure(
+                id,
+                "permission_denied",
+                "Files provider is outside this environment's scope",
+            ),
+        )?;
+    } else if request.method == "host.input"
+        && !s.pending.values().any(|p| {
+            p.connection == connection
+                && Some(p.request.id) == request.params["id"].as_u64()
+                && matches!(p.request.method.as_str(), "host.exec" | "host.cli")
+        })
+    {
+        output(
+            s,
+            connection,
+            failure(
+                id,
+                "permission_denied",
+                "Input does not belong to a command on this connection",
+            ),
+        )?;
     } else if s.pending.len() >= MAX_PENDING
         || s.pending
             .values()
@@ -738,6 +840,7 @@ fn submit(s: &mut State, connection: u64, frame: &[u8]) -> Result<(), u32> {
                 request,
                 deadline: Instant::now() + TIMEOUT,
                 dispatched: false,
+                unbounded: false,
             },
         );
     }
@@ -764,6 +867,63 @@ mod tests {
     }
     fn poll(b: &Broker) -> Value {
         serde_json::from_slice(&b.poll(65536).unwrap().unwrap()).unwrap()
+    }
+    #[test]
+    fn native_provider_scope_filters_metadata_and_rejects_unlisted_transfers() {
+        let b = Broker::default();
+        b.configure(Policy::new(false, false, true, false, false))
+            .unwrap();
+        b.describe(json!({"file_scope":["allowed"]})).unwrap();
+        let c = b.connect_channel(Channel::Files).unwrap();
+        c.write(b"{\"version\":1,\"id\":1,\"method\":\"files.list\",\"params\":{}}\n")
+            .unwrap();
+        let ticket = poll(&b)["ticket"].as_u64().unwrap();
+        b.reply(&serde_json::to_vec(&json!({"version":1,"ticket":ticket,"result":{"shares":[{"provider_id":"allowed"},{"provider_id":"other"}]}})).unwrap()).unwrap();
+        assert_eq!(
+            read(&c)[0]["result"]["shares"],
+            json!([{"provider_id":"allowed"}])
+        );
+        c.write(b"{\"version\":1,\"id\":2,\"method\":\"files.import\",\"params\":{\"grant\":\"other\"}}\n").unwrap();
+        assert_eq!(read(&c)[0]["error"]["code"], "permission_denied");
+        c.write(b"{\"version\":1,\"id\":3,\"method\":\"files.import\",\"params\":{\"grant\":\"allowed\"}}\n").unwrap();
+        let ticket = poll(&b)["ticket"].as_u64().unwrap();
+        assert!(b.active(ticket));
+        assert_eq!(c.next_deadline(), None);
+        assert!(trames_shared::ReadinessDriver::external(c.as_ref()));
+    }
+    #[test]
+    fn accepted_commands_have_no_total_timeout_and_input_is_connection_owned() {
+        let b = Broker::default();
+        b.configure(Policy::new(false, true, false, false, false))
+            .unwrap();
+        b.describe(json!({"environment":{"name":"test"}})).unwrap();
+        let info = b.connect_channel(Channel::Info).unwrap();
+        info.write(b"{\"version\":1,\"id\":1,\"method\":\"session.info\",\"params\":{}}\n")
+            .unwrap();
+        assert_eq!(read(&info)[0]["result"]["environment"]["name"], "test");
+        let a = b.connect_channel(Channel::HostExec).unwrap();
+        let other = b.connect_channel(Channel::HostExec).unwrap();
+        a.write(b"{\"version\":1,\"id\":1,\"method\":\"host.exec\",\"params\":{\"argv\":[\"/bin/cat\"]}}\n").unwrap();
+        let ticket = poll(&b)["ticket"].as_u64().unwrap();
+        b.accept_stream(ticket).unwrap();
+        b.0.lock()
+            .unwrap()
+            .pending
+            .get_mut(&ticket)
+            .unwrap()
+            .deadline = Instant::now();
+        assert!(b.active(ticket));
+        assert!(trames_shared::ReadinessDriver::external(a.as_ref()));
+        assert_eq!(a.next_deadline(), None);
+        assert_eq!(b.deadline(), None);
+        other.write(b"{\"version\":1,\"id\":2,\"method\":\"host.input\",\"params\":{\"id\":1,\"data\":\"YQ==\"}}\n").unwrap();
+        assert_eq!(read(&other)[0]["error"]["code"], "permission_denied");
+        a.write(b"{\"version\":1,\"id\":2,\"method\":\"host.input\",\"params\":{\"id\":1,\"data\":\"YQ==\"}}\n").unwrap();
+        let input = poll(&b)["ticket"].as_u64().unwrap();
+        assert_eq!(b.input_target(input, 1), Some(ticket));
+        drop(a);
+        assert!(!b.active(ticket));
+        assert!(!b.active(input));
     }
     #[test]
     fn replies_notify_original_connection_after_unlock_and_pure_peek_never_notifies() {
