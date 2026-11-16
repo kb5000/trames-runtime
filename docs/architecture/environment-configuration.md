@@ -102,6 +102,24 @@ mount commands. Read-only grants remain read-only when the guest requests a
 writable mount. Ordinary file I/O uses the existing hostfs resources without
 command RPCs or additional per-operation grant checks.
 
+### Planned default-policy revision (2026-11-16)
+
+The owner clarified that the next host/guest CLI should default all supported
+interoperability permissions to allowed, with host-only allow/deny operations
+and read-only guest permission inspection. New local authorization records and
+generated profiles must follow those host defaults; explicit denials and
+read-only scopes remain intact. The grant example above illustrates an
+explicitly restricted profile, not that proposed default template.
+
+Permitted file copies must work in both directions without requiring a visible
+mount or a separate mount-control grant. Host-created shares default to
+read/write unless restricted. An omitted share allowlist is proposed to mean
+all registered shares; an explicit empty list means none. Current code still
+uses an empty Vec and opt-in host permissions, so this requires implementation.
+See the [paired host/guest CLI design](guest-cli.md) for the command symmetry,
+authority boundary and direct reuse of the existing file data path. This
+proposal has not changed live environments or current default code.
+
 ## Control devices
 
 | Device | Requested capability | Purpose |
@@ -128,7 +146,7 @@ and this environment's lifecycle; it cannot modify grants, run debug backends,
 or administer other environments. General host administration requires the
 separate host-exec grant.
 
-A [proposed user-facing guest CLI](guest-cli.md) specifies grouped commands,
+A [proposed paired host/guest CLI](guest-cli.md) specifies grouped commands,
 human/JSON output, stream behavior and diagnostics. That proposal is not the
 currently deployed helper and does not change these permissions or device paths.
 

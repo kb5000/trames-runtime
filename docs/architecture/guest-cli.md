@@ -1,11 +1,18 @@
-# Guest CLI design
+# Host and guest interoperability CLI design
 
 Status: **Proposed, not implemented**. Owner review draft, 2026-11-16.
 
 This replaces the initial injected shell helper with a coherent guest-side
-`trames` command. It applies to Linux and Android guests on both Mac and iPad.
-It does not redesign the host CLI, introduce another execution backend or
-change ordinary filesystem/network/native GPU execution paths.
+`trames` command and matching host-side interoperability operations. It applies
+to Linux and Android guests on both Mac and iPad. The host keeps `-e NAME_OR_UUID`
+selection and its existing environment lifecycle commands. No new execution
+backend or ordinary filesystem/network/native GPU data path is introduced.
+
+Owner clarification, 2026-11-16: supported interoperability permissions default
+to allowed and may be restricted as needed. The host owns permission mutations;
+the guest permission interface is read-only. File transfer works in either
+direction whenever the applicable permission and path access allow it, without
+requiring a separate dynamic-mount grant or a per-copy Trames confirmation.
 
 ## Starting point
 
@@ -38,9 +45,11 @@ fix it. These observations are a baseline, not a promise about future sessions.
   color, cursor movement, spinner or progress messages.
 - Guest commands implicitly address the current environment. There is no
   guest `-e` selector for administering another environment.
-- Permissions stay in the environment configuration and host authorization.
-  The CLI reports effective access; it cannot grant itself access or create a
-  missing device. Platform restrictions remain explicit.
+- The host controls permission policy and can allow or deny capabilities. The
+  guest permission interface only reports effective access. Platform restrictions
+  remain explicit, even when the configured permission is allowed by default.
+- A permitted file transfer works in both directions through the existing file
+  backend. A visible mount is optional; its absence alone does not deny copying.
 
 ## Command surface
 
@@ -52,7 +61,7 @@ fix it. These observations are a baseline, not a promise about future sessions.
 | `trames clipboard get` | Write clipboard text to stdout, preserving its bytes and final newline state |
 | `trames clipboard set [TEXT]` | Set literal text, or read UTF-8 stdin when TEXT is absent |
 | `trames files ls` | List authorized share aliases, access and guest mount paths |
-| `trames files path ALIAS` | Print the mounted guest path, or explain that the share is not mounted |
+| `trames files path ALIAS` | Print an existing visible guest mount path; its absence does not prevent permitted copying |
 | `trames files cp SOURCE DEST` | Copy between guest paths and `share:ALIAS/PATH` |
 | `trames mount ls` | List current authorized host mounts |
 | `trames mount add ALIAS TARGET [--read-only]` | Mount an authorized share at a guest path for this boot |
@@ -61,7 +70,7 @@ fix it. These observations are a baseline, not a promise about future sessions.
 | `trames port publish HOST:GUEST [--listen IP] [--protocol tcp\|udp]` | Publish a bridge-network port for this boot |
 | `trames port unpublish HOST [--listen IP] [--protocol tcp\|udp]` | Remove exactly that publication |
 | `trames host cli -- ARGS...` | Invoke the permitted subset of the host Trames CLI |
-| `trames host exec -- PROGRAM [ARG...]` | Run an explicitly authorized host program |
+| `trames host exec -- PROGRAM [ARG...]` | Run a host program under the environment's effective host-execution permission |
 | `trames host open URL` | Open an HTTP(S) URL in the host browser |
 | `trames host gui` | Open/navigate to the host environment manager where supported |
 | `trames completion bash\|zsh\|fish` | Emit shell completion definitions |
@@ -102,6 +111,103 @@ Host argv is passed literally. No shell interpretation, expansion or implicit
 host executables use absolute paths, matching existing host policy. This does
 not imply that a Linux `/usr/bin` executable exists on macOS.
 
+## Matching host operations
+
+Resource groups use the same verbs on both sides. Host `-e` selects the target
+environment; the guest implicitly addresses its current environment. Local host
+paths are host paths, local guest paths are guest paths, and `guest:/PATH` lets
+the host explicitly name the selected environment's filesystem.
+
+| Operation | Host | Guest |
+| --- | --- | --- |
+| Status / diagnosis | `trames -e work status` / `doctor` | `trames status` / `doctor` |
+| Read permissions | `trames -e work permissions` | `trames permissions` |
+| Allow permissions | `trames -e work permissions allow clipboard files` | No mutation command |
+| Deny permissions | `trames -e work permissions deny host-exec` | No mutation command |
+| Allow all supported controls | `trames -e work permissions allow --all` | No mutation command |
+| List shares | `trames -e work files ls` | `trames files ls` |
+| Send a local file to the other side | `trames -e work files cp ./in.txt guest:/tmp/in.txt` | `trames files cp ./out.txt share:project/out.txt` |
+| Retrieve a file from the other side | `trames -e work files cp guest:/tmp/out.txt ./out.txt` | `trames files cp share:project/in.txt ./in.txt` |
+| Clipboard | `trames -e work clipboard get/set` | `trames clipboard get/set` |
+| Mount an authorized share | `trames -e work mount add project /work` | `trames mount add project /work` |
+| Publish a port | `trames -e work port publish 8080:80` | `trames port publish 8080:80` |
+| Execute on the other side | `trames -e work exec -- /bin/uname -a` | `trames host exec -- /usr/bin/uname -s` |
+| Open the host manager at this environment | `trames -e work gui` | `trames host gui` |
+
+The clipboard commands refer to the selected environment's host clipboard, not
+to a second private clipboard. Host `exec` keeps its established meaning of
+executing a guest command; guest `host exec` explicitly executes on the host.
+`host cli` invokes the scoped host Trames interface. It does not gain permission
+mutation merely because the actual host CLI has that capability.
+
+`trames permissions defaults` shows host-global defaults for future environments;
+`trames permissions defaults deny host-exec` and `allow --all` edit them. This
+explicit global scope cannot be combined with `-e`. The ordinary per-environment
+permission command updates one selected environment, preserving unrelated
+settings and share restrictions. Both APIs and the manager use the same policy
+model and persistence path, not separately implemented authorization rules.
+
+Host copies into/out of an environment obey its file interoperability policy,
+with applicable path/read-only restrictions. An owner-supplied local host path
+is authorized for that requested copy; it does not register a persistent share
+or expose its parent directory to future guest requests. Guest-originated host
+file locators continue to use configured share aliases.
+
+A running environment services host file operations through its original VFS
+and existing bounded I/O workers: one typed owner-side operation supplies paths
+or retained file resources, while bytes move through the normal filesystem
+backend. Do not open a second independent VFS/store over a running environment.
+For a stopped environment, use the existing offline VFS under its normal owner
+lock. A host file copy needs neither booting a guest nor stopping a running one.
+Control mutations such as live mount/port changes still require the environment
+to be running; read-only policy/status inspection remains available while stopped.
+
+## Defaults and permission authority
+
+All supported interoperability controls start allowed for newly owner-created
+environments: clipboard, files, mounts, ports, host UI, delegated host CLI and
+host command execution. New local UUID-bound authorization records and generated
+configuration must agree with that host default. Importing an image/profile
+through the owner's environment creation flow uses the same defaults, with
+explicitly authored restrictions preserved.
+
+Defaults are host policy, not a grant inferred from an arbitrary guest file.
+Changing defaults does not erase existing explicit denials or read-only share
+settings. A missing/malformed authorization record is an attachment/configuration
+error, not permission for the guest to fabricate its own authority. OS sandbox
+and privacy permissions remain supplied by the platform. iPad host execution
+continues to report unsupported; an allowed configuration flag cannot implement
+an unavailable platform operation. Component/hardware defaults are outside this
+CLI permission change.
+
+Host-configured shared folders default to bidirectional read/write access unless
+the owner chose read-only or a narrower allowlist. The default scope is all
+registered shares available to this environment, not an empty list requiring a
+second permission toggle. The planned schema must distinguish an omitted share
+allowlist (all registered shares) from an explicit empty list (none). This
+changes the current empty-Vec behavior and must be implemented explicitly rather
+than documented as already working. Registering a share remains a host operation;
+there is no implicit whole-host-root share.
+
+The host command/manager is the permission mutation interface; the guest has
+only listing and diagnostics. Existing grants authorize ordinary operations
+without an extra Trames confirmation for each file copy or command. iPad should
+reuse its already authorized Files roots instead of adding a second per-copy
+Trames approval. Required OS picker/privacy decisions still follow the platform.
+
+Unrestricted `host-exec` runs with the host user's authority in the present
+architecture. Therefore "guest permissions are read-only" is an interface rule,
+not an immutable security boundary against host-user code editing policy files
+or invoking the owner CLI. Strictly restricted environments must deny host-exec
+or use a genuinely reduced-authority executor; a blacklist of permission command
+names cannot provide that boundary. The owner-trusted default intentionally
+allows host execution. This clarification adds no new sandbox or service thread.
+
+Effective permission changes that require reattachment show "applies on next
+start". Setting a permission does not silently restart a live environment. The
+info/permission-query endpoint stays available even when every optional control
+is disabled, so the host cannot accidentally lock itself out of policy editing.
+
 ## Help and output
 
 Root help fits an ordinary 80-column terminal, groups commands by purpose and
@@ -127,9 +233,9 @@ Permission output has one effective state per capability, matching the manager:
 FEATURE           ACCESS
 Clipboard         allowed
 Shared files      allowed
-Host Trames CLI   not allowed
-Host commands     not allowed
-Port publishing   not applicable (host network)
+Host Trames CLI   allowed
+Host commands     allowed
+Port publishing   allowed (bridge networks)
 ```
 
 Do not expose two independent configuration-request/grant switches to the user.
@@ -251,11 +357,15 @@ spaces and Unicode are literal. Aliases are stable host-authorized names, not
 raw host paths or guessed folder display names. Never accept `/Users/...` as a
 host locator from the guest or resolve `..` outside the original share resource.
 
-On Mac, resolve an authorized mounted alias once, then use ordinary guest file
-I/O through the existing hostfs mount. Do not send file contents over NDJSON or
-introduce another storage/transfer backend. A share requiring mounting returns
-a clear hint; files permission alone does not grant dynamic mount authority.
-Normal `cp`, `mv`, tar and rsync retain the same existing path and performance.
+On Mac, resolve an authorized alias once and use the existing hostfs resource.
+A visible mount can be reused. If none exists, the file adapter must supply a
+copy-scoped file handle/view backed by that same hostfs implementation; this is
+an additional control/descriptor operation to implement, not a new filesystem
+or byte transport. It does not create a public mount or require the separate
+mount-control permission. Files permission plus valid source/destination access
+is sufficient for copying. Do not send file contents over NDJSON or introduce
+another storage/transfer backend. Normal `cp`, `mv`, tar and rsync retain the
+existing mounted path and its performance.
 
 `files cp` supports one file/tree source and a destination, with ordinary copy
 semantics, including `-r`, `--no-clobber` and explicit `--interactive` when a
@@ -318,13 +428,16 @@ CPU interception path; ordinary file/packet I/O gains no control-channel work.
 
 1. Implement the complete common CLI surface, help, text/JSON errors, feature
    discovery, language handling and injection as one coherent client change.
-2. Complete the corresponding product adapters, share metadata and stream
-   protocol/stdin/cancellation work. Mark unsupported platform features honestly.
+2. Complete matching host operations, host-only permission mutations/defaults,
+   product adapters, share metadata and stream protocol/stdin/cancellation work.
+   Mark unsupported platform features honestly.
 3. Concentrate tests: parser/help without devices; argument/Unicode/binary
    round-trips; stdout/stderr/EOF; nonzero status, Ctrl-C and broken pipe; jobs
    longer than the former broker deadline; missing/denied/unsupported devices;
-   share boundaries, normal mounted-file copy, read-only mounts, host/bridge
-   modes and current-UUID delegation.
+   share boundaries, host-to-guest and guest-to-host copy both with and without
+   visible mounts, read-only restrictions, host/bridge modes and current-UUID
+   delegation. Cover default-allowed creation, explicit denials, global/per-env
+   defaults, malformed authority and read-only guest permission commands.
 4. Validate real Alpine, Debian, Android and iPad injection with one artifact,
    and run affected local CI before integration. Compare share-copy throughput
    with ordinary guest `cp` and host native copy; keep bulk data on the original
@@ -336,4 +449,6 @@ verify command discovery through their actual session paths. These checks belong
 to startup/acceptance, not every terminal attach or ordinary read/write. Stable deployment
 and restarts of live environments are separate operational steps; this proposal
 neither restarts them nor changes their grants. This document changes no source,
-on-disk format, environment configuration or product Runtime pin.
+on-disk format, live permission setting, environment configuration or product
+Runtime pin. The default-allow policy and matching host commands remain proposed
+until their source and product rollout are implemented and validated.
