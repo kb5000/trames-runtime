@@ -128,6 +128,10 @@ and this environment's lifecycle; it cannot modify grants, run debug backends,
 or administer other environments. General host administration requires the
 separate host-exec grant.
 
+A [proposed user-facing guest CLI](guest-cli.md) specifies grouped commands,
+human/JSON output, stream behavior and diagnostics. That proposal is not the
+currently deployed helper and does not change these permissions or device paths.
+
 ## Network topology and execution
 
 `host` is the default and uses native host sockets. Port binds have the host's
