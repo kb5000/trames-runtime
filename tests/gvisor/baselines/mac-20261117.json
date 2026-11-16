@@ -1,0 +1,1390 @@
+{
+  "schema_version": 1,
+  "cases": 408,
+  "native_counts": {
+    "passed": 401,
+    "skipped": 7
+  },
+  "trames_counts": {
+    "passed": 335,
+    "no_result": 16,
+    "failed": 49,
+    "skipped": 8
+  },
+  "native_passed_cases": 401,
+  "outcomes_on_native_passed": {
+    "passed": 335,
+    "no_result": 16,
+    "failed": 49,
+    "skipped": 1
+  },
+  "strict_pass_fraction": 0.8354114713216958,
+  "groups": [
+    {
+      "name": "brk",
+      "cases": 1,
+      "native": {
+        "passed": 1
+      },
+      "trames": {
+        "passed": 1
+      }
+    },
+    {
+      "name": "clock_getres",
+      "cases": 1,
+      "native": {
+        "passed": 1
+      },
+      "trames": {
+        "passed": 1
+      }
+    },
+    {
+      "name": "clock_gettime",
+      "cases": 10,
+      "native": {
+        "passed": 9,
+        "skipped": 1
+      },
+      "trames": {
+        "no_result": 1,
+        "failed": 1,
+        "passed": 7,
+        "skipped": 1
+      }
+    },
+    {
+      "name": "dup",
+      "cases": 11,
+      "native": {
+        "passed": 11
+      },
+      "trames": {
+        "passed": 10,
+        "failed": 1
+      }
+    },
+    {
+      "name": "eventfd",
+      "cases": 11,
+      "native": {
+        "passed": 9,
+        "skipped": 2
+      },
+      "trames": {
+        "passed": 8,
+        "skipped": 3
+      }
+    },
+    {
+      "name": "getrandom",
+      "cases": 1,
+      "native": {
+        "passed": 1
+      },
+      "trames": {
+        "passed": 1
+      }
+    },
+    {
+      "name": "pipe",
+      "cases": 160,
+      "native": {
+        "passed": 156,
+        "skipped": 4
+      },
+      "trames": {
+        "failed": 9,
+        "passed": 141,
+        "no_result": 6,
+        "skipped": 4
+      }
+    },
+    {
+      "name": "epoll",
+      "cases": 24,
+      "native": {
+        "passed": 24
+      },
+      "trames": {
+        "passed": 23,
+        "failed": 1
+      }
+    },
+    {
+      "name": "mmap",
+      "cases": 118,
+      "native": {
+        "passed": 118
+      },
+      "trames": {
+        "passed": 97,
+        "failed": 15,
+        "no_result": 6
+      }
+    },
+    {
+      "name": "futex",
+      "cases": 67,
+      "native": {
+        "passed": 67
+      },
+      "trames": {
+        "failed": 22,
+        "passed": 42,
+        "no_result": 3
+      }
+    },
+    {
+      "name": "uname",
+      "cases": 4,
+      "native": {
+        "passed": 4
+      },
+      "trames": {
+        "passed": 4
+      }
+    }
+  ],
+  "tested_product": "Trames Dev 1.5.5 (dev) runtime 7f4cae8c5fabeb0d05362359f770af12ba231bc4",
+  "product_runtime": "7f4cae8c5fabeb0d05362359f770af12ba231bc4",
+  "reference_kernel": "7.0.0-43-generic",
+  "gvisor_revision": "89cacadae21eca4270a8f7c79281d0426d33ac5f",
+  "binary_hashes": {
+    "brk": "945af2fdb987851921d9ee45858932dfd8ca53e6922988feeaa5a321077e810c",
+    "clock_getres": "ba9d497ecd92bab487e7d136f83af867b342053f896b406395f6b108541678c7",
+    "clock_gettime": "0cb25cea950d49de6aa64b4f6dd571f2a6e4279b3f75be6dec143705f2552603",
+    "dup": "d47dc559219b4ce399aca9017873bb44b9164ac9dd69b775f37fb6f092875258",
+    "eventfd": "5acaadbdd1a4d7cb71407f28a6c2234f444a5259121c1036b9d507534fb7531c",
+    "getrandom": "7b38ac4f61fb15bfecc8bed41d953f30319844c473efe7876373a85991a7965e",
+    "pipe": "950296f0e9fc9d312f93f874f2fe211cba6db61df6945f5e317dd4a7de13c783",
+    "epoll": "1e69273d9441e07e1a203a337f0c29592190947e94030ba5b53cacd51bece5fe",
+    "mmap": "22223f641a94771536d4c93c855da2646481bb0583ddc6de81892694c851b3f9",
+    "futex": "b9788178dac8e07ffbc893d1750961b941a3d337e0275828623d59e07a572b47",
+    "uname": "a4df5052fb75aa6f588d3ad0fced42ac9778ba890d1310137b72b8d1223595fd"
+  },
+  "runtime_binary_sha256": "8d965c941a9d6d613a1f3011905aafdf491acbd56ea4930442108af190bd20d4",
+  "reference_fd_retry": "Six PipeFdCount cases retried with RLIMIT_NOFILE 1048576; all passed. Trames already exposes that limit.",
+  "passed": [
+    "BrkTest.BrkSyscallReturnsOldBrkOnFailure",
+    "ClockGetres.Timespec",
+    "ClockGettime.RealtimeWorks",
+    "ClockGettime.BoottimeIsAtLeastMonotonic",
+    "ClockGettime.InvalidClockIDReturnsEINVAL",
+    "ClockGettime/MonotonicClockTest.IsMonotonic/CLOCK_MONOTONIC",
+    "ClockGettime/MonotonicClockTest.IsMonotonic/CLOCK_MONOTONIC_COARSE",
+    "ClockGettime/MonotonicClockTest.IsMonotonic/CLOCK_MONOTONIC_RAW",
+    "ClockGettime/MonotonicClockTest.IsMonotonic/CLOCK_BOOTTIME",
+    "DupTest.Dup",
+    "DupTest.DupClearsCloExec",
+    "DupTest.DupWithOpath",
+    "DupTest.Dup2",
+    "DupTest.Rlimit",
+    "DupTest.Dup2SameFD",
+    "DupTest.Dup2WithOpath",
+    "DupTest.Dup3",
+    "DupTest.Dup3FailsSameFD",
+    "DupTest.Dup3WithOpath",
+    "EventfdTest.Nonblock",
+    "EventfdTest.BlockingWrite",
+    "EventfdTest.SmallWrite",
+    "EventfdTest.SmallRead",
+    "EventfdTest.IllegalPread",
+    "EventfdTest.IllegalPwrite",
+    "EventfdTest.BigRead",
+    "EventfdTest.NotifyNonZero",
+    "GetrandomTest.IsRandom",
+    "Pipe2Test.CloExec",
+    "Pipe2Test.BadOptions",
+    "NamedPipeTest.Truncate",
+    "Pipes/PipeTest.Inode/pipe",
+    "Pipes/PipeTest.Inode/pipe2blocking",
+    "Pipes/PipeTest.Inode/pipe2nonblocking",
+    "Pipes/PipeTest.Inode/smallbuffer",
+    "Pipes/PipeTest.Inode/namednonblocking",
+    "Pipes/PipeTest.Inode/namedblocking",
+    "Pipes/PipeTest.Permissions/pipe",
+    "Pipes/PipeTest.Permissions/pipe2blocking",
+    "Pipes/PipeTest.Permissions/pipe2nonblocking",
+    "Pipes/PipeTest.Permissions/smallbuffer",
+    "Pipes/PipeTest.Permissions/namednonblocking",
+    "Pipes/PipeTest.Permissions/namedblocking",
+    "Pipes/PipeTest.Flags/pipe",
+    "Pipes/PipeTest.Flags/pipe2blocking",
+    "Pipes/PipeTest.Flags/pipe2nonblocking",
+    "Pipes/PipeTest.Flags/smallbuffer",
+    "Pipes/PipeTest.Write/pipe",
+    "Pipes/PipeTest.Write/pipe2blocking",
+    "Pipes/PipeTest.Write/pipe2nonblocking",
+    "Pipes/PipeTest.Write/smallbuffer",
+    "Pipes/PipeTest.Write/namednonblocking",
+    "Pipes/PipeTest.Write/namedblocking",
+    "Pipes/PipeTest.WritePage/pipe",
+    "Pipes/PipeTest.WritePage/pipe2blocking",
+    "Pipes/PipeTest.WritePage/pipe2nonblocking",
+    "Pipes/PipeTest.WritePage/smallbuffer",
+    "Pipes/PipeTest.WritePage/namednonblocking",
+    "Pipes/PipeTest.WritePage/namedblocking",
+    "Pipes/PipeTest.NonBlocking/pipe",
+    "Pipes/PipeTest.NonBlocking/pipe2blocking",
+    "Pipes/PipeTest.NonBlocking/pipe2nonblocking",
+    "Pipes/PipeTest.NonBlocking/smallbuffer",
+    "Pipes/PipeTest.NonBlocking/namednonblocking",
+    "Pipes/PipeTest.NonBlocking/namedblocking",
+    "Pipes/PipeTest.Seek/pipe",
+    "Pipes/PipeTest.Seek/pipe2blocking",
+    "Pipes/PipeTest.Seek/pipe2nonblocking",
+    "Pipes/PipeTest.Seek/smallbuffer",
+    "Pipes/PipeTest.Seek/namednonblocking",
+    "Pipes/PipeTest.Seek/namedblocking",
+    "Pipes/PipeTest.WriterSideCloses/pipe",
+    "Pipes/PipeTest.WriterSideCloses/pipe2blocking",
+    "Pipes/PipeTest.WriterSideCloses/pipe2nonblocking",
+    "Pipes/PipeTest.WriterSideCloses/smallbuffer",
+    "Pipes/PipeTest.WriterSideCloses/namednonblocking",
+    "Pipes/PipeTest.WriterSideCloses/namedblocking",
+    "Pipes/PipeTest.WriterSideClosesReadDataFirst/pipe",
+    "Pipes/PipeTest.WriterSideClosesReadDataFirst/pipe2blocking",
+    "Pipes/PipeTest.WriterSideClosesReadDataFirst/pipe2nonblocking",
+    "Pipes/PipeTest.WriterSideClosesReadDataFirst/smallbuffer",
+    "Pipes/PipeTest.WriterSideClosesReadDataFirst/namednonblocking",
+    "Pipes/PipeTest.WriterSideClosesReadDataFirst/namedblocking",
+    "Pipes/PipeTest.ReaderSideCloses/pipe",
+    "Pipes/PipeTest.ReaderSideCloses/pipe2blocking",
+    "Pipes/PipeTest.ReaderSideCloses/pipe2nonblocking",
+    "Pipes/PipeTest.ReaderSideCloses/smallbuffer",
+    "Pipes/PipeTest.ReaderSideCloses/namednonblocking",
+    "Pipes/PipeTest.ReaderSideCloses/namedblocking",
+    "Pipes/PipeTest.CloseTwice/pipe",
+    "Pipes/PipeTest.CloseTwice/pipe2blocking",
+    "Pipes/PipeTest.CloseTwice/pipe2nonblocking",
+    "Pipes/PipeTest.CloseTwice/smallbuffer",
+    "Pipes/PipeTest.CloseTwice/namednonblocking",
+    "Pipes/PipeTest.CloseTwice/namedblocking",
+    "Pipes/PipeTest.BlockWriteClosed/pipe",
+    "Pipes/PipeTest.BlockWriteClosed/pipe2blocking",
+    "Pipes/PipeTest.BlockWriteClosed/pipe2nonblocking",
+    "Pipes/PipeTest.BlockWriteClosed/smallbuffer",
+    "Pipes/PipeTest.BlockWriteClosed/namednonblocking",
+    "Pipes/PipeTest.BlockWriteClosed/namedblocking",
+    "Pipes/PipeTest.ReadFromClosedFd/pipe",
+    "Pipes/PipeTest.ReadFromClosedFd/pipe2blocking",
+    "Pipes/PipeTest.ReadFromClosedFd/pipe2nonblocking",
+    "Pipes/PipeTest.ReadFromClosedFd/smallbuffer",
+    "Pipes/PipeTest.ReadFromClosedFd/namednonblocking",
+    "Pipes/PipeTest.ReadFromClosedFd/namedblocking",
+    "Pipes/PipeTest.FionRead/pipe",
+    "Pipes/PipeTest.FionRead/pipe2blocking",
+    "Pipes/PipeTest.FionRead/pipe2nonblocking",
+    "Pipes/PipeTest.FionRead/smallbuffer",
+    "Pipes/PipeTest.FionRead/namednonblocking",
+    "Pipes/PipeTest.FionRead/namedblocking",
+    "Pipes/PipeTest.OpenViaProcSelfFD/pipe",
+    "Pipes/PipeTest.OpenViaProcSelfFD/pipe2blocking",
+    "Pipes/PipeTest.OpenViaProcSelfFD/pipe2nonblocking",
+    "Pipes/PipeTest.OpenViaProcSelfFD/smallbuffer",
+    "Pipes/PipeTest.OpenViaProcSelfFDWithWrites/pipe",
+    "Pipes/PipeTest.OpenViaProcSelfFDWithWrites/pipe2blocking",
+    "Pipes/PipeTest.OpenViaProcSelfFDWithWrites/pipe2nonblocking",
+    "Pipes/PipeTest.OpenViaProcSelfFDWithWrites/smallbuffer",
+    "Pipes/PipeTest.ProcFDReleasesFile/pipe",
+    "Pipes/PipeTest.ProcFDReleasesFile/pipe2blocking",
+    "Pipes/PipeTest.ProcFDReleasesFile/pipe2nonblocking",
+    "Pipes/PipeTest.ProcFDReleasesFile/smallbuffer",
+    "Pipes/PipeTest.ProcFDReleasesFile/namednonblocking",
+    "Pipes/PipeTest.ProcFDReleasesFile/namedblocking",
+    "Pipes/PipeTest.ProcFDInfoReleasesFile/pipe",
+    "Pipes/PipeTest.ProcFDInfoReleasesFile/pipe2blocking",
+    "Pipes/PipeTest.ProcFDInfoReleasesFile/pipe2nonblocking",
+    "Pipes/PipeTest.ProcFDInfoReleasesFile/smallbuffer",
+    "Pipes/PipeTest.ProcFDInfoReleasesFile/namednonblocking",
+    "Pipes/PipeTest.ProcFDInfoReleasesFile/namedblocking",
+    "Pipes/PipeTest.SizeChange/pipe",
+    "Pipes/PipeTest.SizeChange/pipe2blocking",
+    "Pipes/PipeTest.SizeChange/pipe2nonblocking",
+    "Pipes/PipeTest.SizeChange/smallbuffer",
+    "Pipes/PipeTest.SizeChange/namednonblocking",
+    "Pipes/PipeTest.SizeChange/namedblocking",
+    "Pipes/PipeTest.SizeChangeMax/pipe",
+    "Pipes/PipeTest.SizeChangeMax/pipe2blocking",
+    "Pipes/PipeTest.SizeChangeMax/pipe2nonblocking",
+    "Pipes/PipeTest.SizeChangeMax/smallbuffer",
+    "Pipes/PipeTest.SizeChangeMax/namednonblocking",
+    "Pipes/PipeTest.SizeChangeMax/namedblocking",
+    "Pipes/PipeTest.SizeChangeFull/pipe",
+    "Pipes/PipeTest.SizeChangeFull/pipe2blocking",
+    "Pipes/PipeTest.SizeChangeFull/pipe2nonblocking",
+    "Pipes/PipeTest.SizeChangeFull/smallbuffer",
+    "Pipes/PipeTest.SizeChangeFull/namednonblocking",
+    "Pipes/PipeTest.SizeChangeFull/namedblocking",
+    "Pipes/PipeTest.Streaming/pipe",
+    "Pipes/PipeTest.Streaming/pipe2blocking",
+    "Pipes/PipeTest.Streaming/pipe2nonblocking",
+    "Pipes/PipeTest.Streaming/smallbuffer",
+    "Pipes/PipeTest.Streaming/namednonblocking",
+    "Pipes/PipeTest.Streaming/namedblocking",
+    "Pipes/PipeTest.ZeroSize/pipe",
+    "Pipes/PipeTest.ZeroSize/pipe2blocking",
+    "Pipes/PipeTest.ZeroSize/pipe2nonblocking",
+    "Pipes/PipeTest.ZeroSize/smallbuffer",
+    "Pipes/PipeTest.ZeroSize/namednonblocking",
+    "Pipes/PipeTest.ZeroSize/namedblocking",
+    "Pipes/PipeTest.PipeFdCount/pipe",
+    "Pipes/PipeTest.PipeFdCount/pipe2blocking",
+    "Pipes/PipeTest.PipeFdCount/pipe2nonblocking",
+    "Pipes/PipeTest.PipeFdCount/smallbuffer",
+    "Pipes/PipeTest.PipeFdCount/namednonblocking",
+    "Pipes/PipeTest.PipeFdCount/namedblocking",
+    "EpollTest.AllWritable",
+    "EpollTest.LastReadable",
+    "EpollTest.LastNonWritable",
+    "EpollTest.Timeout",
+    "EpollTest.EpollPwait2Timeout",
+    "EpollTest.WaitThenUnblock",
+    "EpollTest.UnblockWithSignal",
+    "EpollTest.TimeoutNoFds",
+    "EpollTest.UnblockWithNewFD",
+    "EpollTest.Oneshot",
+    "EpollTest.DoubleEpollOneShot",
+    "EpollTest.EdgeTriggered",
+    "EpollTest.OneshotAndEdgeTriggered",
+    "EpollTest.CycleOfOneDisallowed",
+    "EpollTest.CycleOfThreeDisallowed",
+    "EpollTest.CloseFile",
+    "EpollTest.PipeReaderHupAfterWriterClosed",
+    "EpollTest.PipeWriterErrAfterReaderClosed",
+    "EpollTest.DoubleLayerEpoll",
+    "EpollTest.RegularFiles",
+    "EpollTest.BadEventPointerCheckedFirst",
+    "EpollTest.TargetCheckedBeforeEpollType",
+    "EpollTest.ReadyMutexCircularity",
+    "MMapDeathTest.TruncateAfterCOWBreak",
+    "MMapTest.MapPipe",
+    "MMapTest.MapCharDevice",
+    "MMapTest.MapDirectory",
+    "MMapTest.MapAnything",
+    "MMapTest.SmallMap",
+    "MMapTest.HintAddress",
+    "MMapTest.MapFixed",
+    "MMapTest.MapFixed64",
+    "MMapTest.MapFixedNoReplaceEmpty",
+    "MMapTest.MapFixedNoReplaceExisting",
+    "MMapTest.MapFixedNoReplacePartialOverlap",
+    "MMapTest.MapFixedNoReplaceWithMapFixed",
+    "MMapTest.MapFixedNoReplaceAlignment",
+    "MMapTest.MapStack",
+    "MMapTest.MapLocked",
+    "MMapTest.NotPrivateOrShared",
+    "MMapTest.PrivateAndShared",
+    "MMapTest.FixedAlignment",
+    "MMapTest.NonFixedAlignment",
+    "MMapTest.InvalidLength",
+    "MMapTest.BadFd",
+    "MMapTest.ProtWrite",
+    "MMapTest.ProtectProtWrite",
+    "MMapTest.ProtNoneDeath",
+    "MMapTest.ReadOnlyDeath",
+    "MMapTest.MprotectReadOnlyDeath",
+    "MMapTest.MprotectNotPageAligned",
+    "MMapTest.MprotectProtNone",
+    "MMapTest.ProtExec",
+    "MMapTest.NoProtExecDeath",
+    "MMapTest.SettingProtNoneDoesntFreeMemory",
+    "MMapTest.AccessCOWInvalidatesCachedSegments",
+    "MMapTest.NoReserve",
+    "MMapFileTest.Read",
+    "MMapFileTest.MapOffset",
+    "MMapFileTest.MapOffsetBeyondEnd",
+    "MMapFileTest.MapSecondToLastPositivePage",
+    "MMapFileTest.MapLastPositivePage",
+    "MMapFileTest.MapFirstNegativePage",
+    "MMapFileTest.MapSecondToLastNegativePage",
+    "MMapFileTest.MapLastNegativePage",
+    "MMapFileTest.WritePrivateOnReadOnlyFd",
+    "MMapFileTest.WriteSharedOnReadOnlyFd",
+    "MMapFileTest.MmapFileWithOpath",
+    "MMapFileTest.ReadSharedConsistentWithOverwrite",
+    "MMapFileTest.ReadSharedConsistentWithPartialOverwrite",
+    "MMapFileTest.ReadSharedConsistentWithWriteAndFile",
+    "MMapFileTest.WriteShared",
+    "MMapFileTest.WriteSharedBeyondEnd",
+    "MMapFileTest.WriteSharedTruncateUp",
+    "MMapFileTest.ReadSharedTruncateDownThenUp",
+    "MMapFileTest.WriteSharedTruncateDownThenUp",
+    "MMapFileTest.ReadSharedTruncateSIGBUS",
+    "MMapFileTest.WriteSharedTruncateSIGBUS",
+    "MMapFileTest.ReadSharedTruncatePartialPage",
+    "MMapFileTest.WriteSharedTruncatePartialPage",
+    "MMapFileTest.WritePrivate",
+    "MMapFileTest.ReadingWritableSharedFilePageSucceeds",
+    "MMapFileTest.InternalSigBus",
+    "MMapFileTest.InternalSigBusZeroing",
+    "MMapFileTest.Bug38498194",
+    "MMapFileTest.SelfRead",
+    "MMapFileTest.SelfWrite",
+    "MMapNoFixtureTest.MapReadOnlyAfterCreateWriteOnly",
+    "ReadWriteSharedPrivate/MMapFileParamTest.MapPopulate/0",
+    "ReadWriteSharedPrivate/MMapFileParamTest.MapPopulate/1",
+    "ReadWriteSharedPrivate/MMapFileParamTest.MapPopulate/2",
+    "ReadWriteSharedPrivate/MMapFileParamTest.MapPopulate/3",
+    "ReadWriteSharedPrivate/MMapFileParamTest.MapPopulate/4",
+    "ReadWriteSharedPrivate/MMapFileParamTest.MapPopulate/5",
+    "ReadWriteSharedPrivate/MMapFileParamTest.MapPopulateShort/0",
+    "ReadWriteSharedPrivate/MMapFileParamTest.MapPopulateShort/1",
+    "ReadWriteSharedPrivate/MMapFileParamTest.MapPopulateShort/2",
+    "ReadWriteSharedPrivate/MMapFileParamTest.MapPopulateShort/3",
+    "ReadWriteSharedPrivate/MMapFileParamTest.MapPopulateShort/4",
+    "ReadWriteSharedPrivate/MMapFileParamTest.MapPopulateShort/5",
+    "ReadWriteSharedPrivate/MMapFileParamTest.WriteOnlyFd/0",
+    "ReadWriteSharedPrivate/MMapFileParamTest.WriteOnlyFd/1",
+    "ReadWriteSharedPrivate/MMapFileParamTest.WriteOnlyFd/2",
+    "ReadWriteSharedPrivate/MMapFileParamTest.WriteOnlyFd/3",
+    "ReadWriteSharedPrivate/MMapFileParamTest.WriteOnlyFd/4",
+    "ReadWriteSharedPrivate/MMapFileParamTest.WriteOnlyFd/5",
+    "ReadWriteSharedPrivate/MMapFileParamTest.SigBusDeath/0",
+    "ReadWriteSharedPrivate/MMapFileParamTest.SigBusDeath/1",
+    "ReadWriteSharedPrivate/MMapFileParamTest.SigBusDeath/2",
+    "ReadWriteSharedPrivate/MMapFileParamTest.SigBusDeath/3",
+    "ReadWriteSharedPrivate/MMapFileParamTest.SigBusDeath/4",
+    "ReadWriteSharedPrivate/MMapFileParamTest.SigBusDeath/5",
+    "ReadWriteSharedPrivate/MMapFileParamTest.NoSigBusOnPagesBeforeEOF/0",
+    "ReadWriteSharedPrivate/MMapFileParamTest.NoSigBusOnPagesBeforeEOF/1",
+    "ReadWriteSharedPrivate/MMapFileParamTest.NoSigBusOnPagesBeforeEOF/4",
+    "ReadWriteSharedPrivate/MMapFileParamTest.NoSigBusOnPagesBeforeEOF/5",
+    "ReadWriteSharedPrivate/MMapFileParamTest.NoSigBusOnPageContainingEOF/0",
+    "ReadWriteSharedPrivate/MMapFileParamTest.NoSigBusOnPageContainingEOF/1",
+    "ReadWriteSharedPrivate/MMapFileParamTest.NoSigBusOnPageContainingEOF/4",
+    "ReadWriteSharedPrivate/MMapFileParamTest.NoSigBusOnPageContainingEOF/5",
+    "SharedFutexTest.WakeInterprocessSharedAnon",
+    "SharedFutexTest.WakeInterprocessFile",
+    "SharedPrivate/PrivateAndSharedFutexTest.Wait_ZeroTimeout/0",
+    "SharedPrivate/PrivateAndSharedFutexTest.Wait_ZeroTimeout/1",
+    "SharedPrivate/PrivateAndSharedFutexTest.Wait_Timeout/0",
+    "SharedPrivate/PrivateAndSharedFutexTest.Wait_Timeout/1",
+    "SharedPrivate/PrivateAndSharedFutexTest.Wait_BitsetTimeout/0",
+    "SharedPrivate/PrivateAndSharedFutexTest.Wait_BitsetTimeout/1",
+    "SharedPrivate/PrivateAndSharedFutexTest.WaitBitset_NegativeTimeout/0",
+    "SharedPrivate/PrivateAndSharedFutexTest.WaitBitset_NegativeTimeout/1",
+    "SharedPrivate/PrivateAndSharedFutexTest.Wait_WrongVal/0",
+    "SharedPrivate/PrivateAndSharedFutexTest.Wait_WrongVal/1",
+    "SharedPrivate/PrivateAndSharedFutexTest.Wait_ZeroBitset/0",
+    "SharedPrivate/PrivateAndSharedFutexTest.Wait_ZeroBitset/1",
+    "SharedPrivate/PrivateAndSharedFutexTest.Wake1/0",
+    "SharedPrivate/PrivateAndSharedFutexTest.Wake1/1",
+    "SharedPrivate/PrivateAndSharedFutexTest.WakeAll/0",
+    "SharedPrivate/PrivateAndSharedFutexTest.WakeAll/1",
+    "SharedPrivate/PrivateAndSharedFutexTest.WakeSome/0",
+    "SharedPrivate/PrivateAndSharedFutexTest.WakeSome/1",
+    "SharedPrivate/PrivateAndSharedFutexTest.WaitBitset_Wake/0",
+    "SharedPrivate/PrivateAndSharedFutexTest.WaitBitset_Wake/1",
+    "SharedPrivate/PrivateAndSharedFutexTest.Wait_WakeBitset/0",
+    "SharedPrivate/PrivateAndSharedFutexTest.Wait_WakeBitset/1",
+    "SharedPrivate/PrivateAndSharedFutexTest.WaitBitset_WakeBitsetMatch/0",
+    "SharedPrivate/PrivateAndSharedFutexTest.WaitBitset_WakeBitsetMatch/1",
+    "SharedPrivate/PrivateAndSharedFutexTest.WaitBitset_WakeBitsetNoMatch/0",
+    "SharedPrivate/PrivateAndSharedFutexTest.WaitBitset_WakeBitsetNoMatch/1",
+    "SharedPrivate/PrivateAndSharedFutexTest.WakeOpCondSuccess/0",
+    "SharedPrivate/PrivateAndSharedFutexTest.WakeOpCondSuccess/1",
+    "SharedPrivate/PrivateAndSharedFutexTest.WakeOpCondFailure/0",
+    "SharedPrivate/PrivateAndSharedFutexTest.WakeOpCondFailure/1",
+    "SharedPrivate/PrivateAndSharedFutexTest.WakeOpCondNegativeCmparg/0",
+    "SharedPrivate/PrivateAndSharedFutexTest.WakeOpCondNegativeCmparg/1",
+    "SharedPrivate/PrivateAndSharedFutexTest.WakeOpCondSignedCompare/0",
+    "SharedPrivate/PrivateAndSharedFutexTest.WakeOpCondSignedCompare/1",
+    "SharedPrivate/PrivateAndSharedFutexTest.NoWakeInterprocessPrivateAnon/0",
+    "SharedPrivate/PrivateAndSharedFutexTest.NoWakeInterprocessPrivateAnon/1",
+    "SharedPrivate/PrivateAndSharedFutexTest.WakeAfterCOWBreak/0",
+    "SharedPrivate/PrivateAndSharedFutexTest.WakeAfterCOWBreak/1",
+    "SharedPrivate/PrivateAndSharedFutexTest.PITryLockConcurrency/0",
+    "SharedPrivate/PrivateAndSharedFutexTest.PITryLockConcurrency/1",
+    "UnameTest.Sanity",
+    "UnameTest.SetNames",
+    "UnameTest.UnprivilegedSetNames",
+    "UnameTest.UnshareUTS"
+  ],
+  "failures": [
+    {
+      "suite": "clock_gettime",
+      "case": "ClockGettime.CputimeId",
+      "status": "no_result",
+      "exit_code": 134,
+      "messages": [],
+      "stderr": "trames: session ready\nCheck failed: clock_gettime(id, &ts) == 0 (errno 22)\n"
+    },
+    {
+      "suite": "clock_gettime",
+      "case": "ClockGettime.JavaThreadTime",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/clock_gettime.cc:94\nValue of: clock_getres(clockid, &tp)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=22 Invalid argument)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "dup",
+      "case": "RlimitTest.DupLimitedByNROpenSysctl",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/dup.cc:155\nValue of: _expr_result\nExpected: is OK\n  Actual: PosixError(errno=30 Read-only file system) open(/proc/sys/fs/nr_open, 0x1, 0)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "pipe",
+      "case": "PipeTest.StatFS",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/pipe.cc:258\nExpected equality of these values:\n  st.f_namelen\n    Which is: 0\n  255\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "pipe",
+      "case": "Pipes/PipeTest.Flags/namednonblocking",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/pipe.cc:198\nValue of: fcntl(rfd_.get(), 3)\nExpected: is equal to 131072\n  Actual: 0 (of type int)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/pipe.cc:200\nValue of: fcntl(wfd_.get(), 3)\nExpected: is equal to 131073\n  Actual: 1 (of type int)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "pipe",
+      "case": "Pipes/PipeTest.Flags/namedblocking",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/pipe.cc:198\nValue of: fcntl(rfd_.get(), 3)\nExpected: is equal to 131072\n  Actual: 0 (of type int)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/pipe.cc:200\nValue of: fcntl(wfd_.get(), 3)\nExpected: is equal to 131073\n  Actual: 1 (of type int)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "pipe",
+      "case": "Pipes/PipeTest.OffsetCalls/pipe",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/pipe.cc:343\nValue of: pread(wfd_.get(), &buf, sizeof(buf), 0)\nExpected: -1 (failure), with errno PosixError(errno=29 Illegal seek)\n  Actual: -1 (of type long), with errno PosixError(errno=9 Bad file descriptor)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/pipe.cc:345\nValue of: pwrite(rfd_.get(), &buf, sizeof(buf), 0)\nExpected: -1 (failure), with errno PosixError(errno=29 Illegal seek)\n  Actual: -1 (of type long), with errno PosixError(errno=9 Bad file descriptor)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/pipe.cc:351\nValue of: preadv(wfd_.get(), &iov, 1, 0)\nExpected: -1 (failure), with errno PosixError(errno=29 Illegal seek)\n  Actual: -1 (of type long), with errno PosixError(errno=9 Bad file descriptor)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/pipe.cc:352\nValue of: pwritev(rfd_.get(), &iov, 1, 0)\nExpected: -1 (failure), with errno PosixError(errno=29 Illegal seek)\n  Actual: -1 (of type long), with errno PosixError(errno=9 Bad file descriptor)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "pipe",
+      "case": "Pipes/PipeTest.OffsetCalls/pipe2blocking",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/pipe.cc:343\nValue of: pread(wfd_.get(), &buf, sizeof(buf), 0)\nExpected: -1 (failure), with errno PosixError(errno=29 Illegal seek)\n  Actual: -1 (of type long), with errno PosixError(errno=9 Bad file descriptor)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/pipe.cc:345\nValue of: pwrite(rfd_.get(), &buf, sizeof(buf), 0)\nExpected: -1 (failure), with errno PosixError(errno=29 Illegal seek)\n  Actual: -1 (of type long), with errno PosixError(errno=9 Bad file descriptor)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/pipe.cc:351\nValue of: preadv(wfd_.get(), &iov, 1, 0)\nExpected: -1 (failure), with errno PosixError(errno=29 Illegal seek)\n  Actual: -1 (of type long), with errno PosixError(errno=9 Bad file descriptor)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/pipe.cc:352\nValue of: pwritev(rfd_.get(), &iov, 1, 0)\nExpected: -1 (failure), with errno PosixError(errno=29 Illegal seek)\n  Actual: -1 (of type long), with errno PosixError(errno=9 Bad file descriptor)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "pipe",
+      "case": "Pipes/PipeTest.OffsetCalls/pipe2nonblocking",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/pipe.cc:343\nValue of: pread(wfd_.get(), &buf, sizeof(buf), 0)\nExpected: -1 (failure), with errno PosixError(errno=29 Illegal seek)\n  Actual: -1 (of type long), with errno PosixError(errno=9 Bad file descriptor)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/pipe.cc:345\nValue of: pwrite(rfd_.get(), &buf, sizeof(buf), 0)\nExpected: -1 (failure), with errno PosixError(errno=29 Illegal seek)\n  Actual: -1 (of type long), with errno PosixError(errno=9 Bad file descriptor)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/pipe.cc:351\nValue of: preadv(wfd_.get(), &iov, 1, 0)\nExpected: -1 (failure), with errno PosixError(errno=29 Illegal seek)\n  Actual: -1 (of type long), with errno PosixError(errno=9 Bad file descriptor)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/pipe.cc:352\nValue of: pwritev(rfd_.get(), &iov, 1, 0)\nExpected: -1 (failure), with errno PosixError(errno=29 Illegal seek)\n  Actual: -1 (of type long), with errno PosixError(errno=9 Bad file descriptor)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "pipe",
+      "case": "Pipes/PipeTest.OffsetCalls/smallbuffer",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/pipe.cc:343\nValue of: pread(wfd_.get(), &buf, sizeof(buf), 0)\nExpected: -1 (failure), with errno PosixError(errno=29 Illegal seek)\n  Actual: -1 (of type long), with errno PosixError(errno=9 Bad file descriptor)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/pipe.cc:345\nValue of: pwrite(rfd_.get(), &buf, sizeof(buf), 0)\nExpected: -1 (failure), with errno PosixError(errno=29 Illegal seek)\n  Actual: -1 (of type long), with errno PosixError(errno=9 Bad file descriptor)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/pipe.cc:351\nValue of: preadv(wfd_.get(), &iov, 1, 0)\nExpected: -1 (failure), with errno PosixError(errno=29 Illegal seek)\n  Actual: -1 (of type long), with errno PosixError(errno=9 Bad file descriptor)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/pipe.cc:352\nValue of: pwritev(rfd_.get(), &iov, 1, 0)\nExpected: -1 (failure), with errno PosixError(errno=29 Illegal seek)\n  Actual: -1 (of type long), with errno PosixError(errno=9 Bad file descriptor)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "pipe",
+      "case": "Pipes/PipeTest.OffsetCalls/namednonblocking",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/pipe.cc:343\nValue of: pread(wfd_.get(), &buf, sizeof(buf), 0)\nExpected: -1 (failure), with errno PosixError(errno=29 Illegal seek)\n  Actual: -1 (of type long), with errno PosixError(errno=9 Bad file descriptor)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/pipe.cc:345\nValue of: pwrite(rfd_.get(), &buf, sizeof(buf), 0)\nExpected: -1 (failure), with errno PosixError(errno=29 Illegal seek)\n  Actual: -1 (of type long), with errno PosixError(errno=9 Bad file descriptor)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/pipe.cc:351\nValue of: preadv(wfd_.get(), &iov, 1, 0)\nExpected: -1 (failure), with errno PosixError(errno=29 Illegal seek)\n  Actual: -1 (of type long), with errno PosixError(errno=9 Bad file descriptor)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/pipe.cc:352\nValue of: pwritev(rfd_.get(), &iov, 1, 0)\nExpected: -1 (failure), with errno PosixError(errno=29 Illegal seek)\n  Actual: -1 (of type long), with errno PosixError(errno=9 Bad file descriptor)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "pipe",
+      "case": "Pipes/PipeTest.OffsetCalls/namedblocking",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/pipe.cc:343\nValue of: pread(wfd_.get(), &buf, sizeof(buf), 0)\nExpected: -1 (failure), with errno PosixError(errno=29 Illegal seek)\n  Actual: -1 (of type long), with errno PosixError(errno=9 Bad file descriptor)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/pipe.cc:345\nValue of: pwrite(rfd_.get(), &buf, sizeof(buf), 0)\nExpected: -1 (failure), with errno PosixError(errno=29 Illegal seek)\n  Actual: -1 (of type long), with errno PosixError(errno=9 Bad file descriptor)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/pipe.cc:351\nValue of: preadv(wfd_.get(), &iov, 1, 0)\nExpected: -1 (failure), with errno PosixError(errno=29 Illegal seek)\n  Actual: -1 (of type long), with errno PosixError(errno=9 Bad file descriptor)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/pipe.cc:352\nValue of: pwritev(rfd_.get(), &iov, 1, 0)\nExpected: -1 (failure), with errno PosixError(errno=29 Illegal seek)\n  Actual: -1 (of type long), with errno PosixError(errno=9 Bad file descriptor)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "pipe",
+      "case": "Pipes/PipeTest.BlockPartialWriteClosed/pipe",
+      "status": "no_result",
+      "exit_code": 1,
+      "messages": [],
+      "stderr": "trames: session ready\ntrames-mac: all virtual processes are blocked without an event source\n"
+    },
+    {
+      "suite": "pipe",
+      "case": "Pipes/PipeTest.BlockPartialWriteClosed/pipe2blocking",
+      "status": "no_result",
+      "exit_code": 1,
+      "messages": [],
+      "stderr": "trames: session ready\ntrames-mac: all virtual processes are blocked without an event source\n"
+    },
+    {
+      "suite": "pipe",
+      "case": "Pipes/PipeTest.BlockPartialWriteClosed/pipe2nonblocking",
+      "status": "no_result",
+      "exit_code": 1,
+      "messages": [],
+      "stderr": "trames: session ready\ntrames-mac: all virtual processes are blocked without an event source\n"
+    },
+    {
+      "suite": "pipe",
+      "case": "Pipes/PipeTest.BlockPartialWriteClosed/smallbuffer",
+      "status": "no_result",
+      "exit_code": 1,
+      "messages": [],
+      "stderr": "trames: session ready\ntrames-mac: all virtual processes are blocked without an event source\n"
+    },
+    {
+      "suite": "pipe",
+      "case": "Pipes/PipeTest.BlockPartialWriteClosed/namednonblocking",
+      "status": "no_result",
+      "exit_code": 1,
+      "messages": [],
+      "stderr": "trames: session ready\ntrames-mac: all virtual processes are blocked without an event source\n"
+    },
+    {
+      "suite": "pipe",
+      "case": "Pipes/PipeTest.BlockPartialWriteClosed/namedblocking",
+      "status": "no_result",
+      "exit_code": 1,
+      "messages": [],
+      "stderr": "trames: session ready\ntrames-mac: all virtual processes are blocked without an event source\n"
+    },
+    {
+      "suite": "epoll",
+      "case": "EpollTest.WatchOpenRandomDevice",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/epoll.cc:87\nValue of: RegisterEpollFD(epollfd.get(), device.get(), EPOLLIN, kMagicConstant)\nExpected: is OK\n  Actual: PosixError(errno=1 Operation not permitted) epoll_ctl (of type gvisor::testing::PosixError)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "mmap",
+      "case": "MMapTest.MapDevZeroShared",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/mmap.cc:175\nValue of: Map(0, kPageSize, 0x1 | 0x2, 0x01, dev_zero.get(), 0)\nExpected: not -1 (success)\n  Actual: 18446744073709551615 (of type unsigned long), with errno PosixError(errno=19 No such device)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "mmap",
+      "case": "MMapTest.MapDevZeroPrivate",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/mmap.cc:187\nValue of: Map(0, kPageSize, 0x1 | 0x2, 0x02, dev_zero.get(), 0)\nExpected: not -1 (success)\n  Actual: 18446744073709551615 (of type unsigned long), with errno PosixError(errno=19 No such device)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "mmap",
+      "case": "MMapTest.MapDevZeroNoPersistence",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/mmap.cc:201\nValue of: Map(0, kPageSize, 0x1 | 0x2, 0x01, dev_zero1.get(), 0)\nExpected: not -1 (success)\n  Actual: 18446744073709551615 (of type unsigned long), with errno PosixError(errno=19 No such device)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "mmap",
+      "case": "MMapTest.MapDevZeroSharedMultiplePages",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/mmap.cc:239\nValue of: Map(0, kPageSize * 2, 0x1 | 0x2, 0x02, dev_zero.get(), 0)\nExpected: not -1 (success)\n  Actual: 18446744073709551615 (of type unsigned long), with errno PosixError(errno=19 No such device)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "mmap",
+      "case": "MMapTest.MapDevZeroSharedFdNoPersistence",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/mmap.cc:263\nValue of: Map(0, kPageSize, 0x1 | 0x2, 0x01, dev_zero.get(), 0)\nExpected: not -1 (success)\n  Actual: 18446744073709551615 (of type unsigned long), with errno PosixError(errno=19 No such device)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "mmap",
+      "case": "MMapTest.MapDevZeroSegfaultAfterUnmap",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/mmap.cc:321\nValue of: (((signed char) (((child_exit_status) & 0x7f) + 1) >> 1) > 0) && ((child_exit_status) & 0x7f) == 11\n  Actual: false\nExpected: true\nexit status: 6\n"
+      ],
+      "stderr": "trames: session ready\nCheck failed: Map(0, kPageSize, PROT_READ | PROT_WRITE, MAP_SHARED, dev_zero.get(), 0) != reinterpret_cast<uintptr_t>(MAP_FAILED) (errno 19)\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "mmap",
+      "case": "MMapTest.MapDevZeroUnaligned",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/mmap.cc:332\nValue of: Map(0, size, 0x1 | 0x2, 0x01, dev_zero.get(), 0)\nExpected: not -1 (success)\n  Actual: 18446744073709551615 (of type unsigned long), with errno PosixError(errno=19 No such device)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "mmap",
+      "case": "MMapTest.ProtWriteOnly",
+      "status": "no_result",
+      "exit_code": 1,
+      "messages": [],
+      "stderr": "trames: session ready\ntrames-mac: initial stack: unclassified source CPU failure\n"
+    },
+    {
+      "suite": "mmap",
+      "case": "MMapTest.ProtWriteOnlyReadable",
+      "status": "no_result",
+      "exit_code": 139,
+      "messages": [],
+      "stderr": "trames: session ready\ntrames: CPU fault at PC 0x5f3d3c: guest memory: Permission { address: 268435456, access: Read }\n"
+    },
+    {
+      "suite": "mmap",
+      "case": "MMapTest.MprotectHugeLength",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/mmap.cc:696\nValue of: Protect(addr, static_cast<size_t>(-1), 0x1)\nExpected: -1 (failure), with errno PosixError(errno=12 Cannot allocate memory)\n  Actual: -1 (of type int), with errno PosixError(errno=22 Invalid argument)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "mmap",
+      "case": "MMapTest.NoExceedLimitData",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/mmap.cc:769\nValue of: setrlimit(RLIMIT_DATA, &setlim)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=1 Operation not permitted)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "mmap",
+      "case": "MMapTest.ExceedLimitData",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/mmap.cc:788\nValue of: setrlimit(RLIMIT_DATA, &setlim)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=1 Operation not permitted)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "mmap",
+      "case": "MMapTest.ExceedLimitDataPrlimit",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/mmap.cc:810\nValue of: prlimit(0, RLIMIT_DATA, &setlim, nullptr)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=1 Operation not permitted)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "mmap",
+      "case": "MMapTest.ExceedLimitDataPrlimitPID",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/mmap.cc:832\nValue of: prlimit(syscall(178), RLIMIT_DATA, &setlim, nullptr)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=1 Operation not permitted)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "mmap",
+      "case": "MMapTest.NoExceedLimitAS",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/mmap.cc:852\nValue of: setrlimit(RLIMIT_AS, &setlim)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=1 Operation not permitted)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "mmap",
+      "case": "MMapTest.ExceedLimitAS",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/mmap.cc:870\nValue of: setrlimit(RLIMIT_AS, &setlim)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=1 Operation not permitted)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "mmap",
+      "case": "MMapTest.HugeLength",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/mmap.cc:1695\nValue of: Map(0, static_cast<uint64_t>(-kPageSize + 1), 0x0, 0x02 | 0x20, -1, 0)\nExpected: -1 (failure), with errno PosixError(errno=12 Cannot allocate memory)\n  Actual: 18446744073709551615 (of type unsigned long), with errno PosixError(errno=22 Invalid argument)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "mmap",
+      "case": "ReadWriteSharedPrivate/MMapFileParamTest.NoSigBusOnPagesBeforeEOF/2",
+      "status": "no_result",
+      "exit_code": 1,
+      "messages": [],
+      "stderr": "trames: session ready\ntrames-mac: initial stack: unclassified source CPU failure\n"
+    },
+    {
+      "suite": "mmap",
+      "case": "ReadWriteSharedPrivate/MMapFileParamTest.NoSigBusOnPagesBeforeEOF/3",
+      "status": "no_result",
+      "exit_code": 1,
+      "messages": [],
+      "stderr": "trames: session ready\ntrames-mac: initial stack: unclassified source CPU failure\n"
+    },
+    {
+      "suite": "mmap",
+      "case": "ReadWriteSharedPrivate/MMapFileParamTest.NoSigBusOnPageContainingEOF/2",
+      "status": "no_result",
+      "exit_code": 1,
+      "messages": [],
+      "stderr": "trames: session ready\ntrames-mac: initial stack: unclassified source CPU failure\n"
+    },
+    {
+      "suite": "mmap",
+      "case": "ReadWriteSharedPrivate/MMapFileParamTest.NoSigBusOnPageContainingEOF/3",
+      "status": "no_result",
+      "exit_code": 1,
+      "messages": [],
+      "stderr": "trames: session ready\ntrames-mac: initial stack: unclassified source CPU failure\n"
+    },
+    {
+      "suite": "futex",
+      "case": "PrivateFutexTest.WakeOp0Set",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:618\nValue of: futex_wake_op(true, nullptr, &a, 0, 0, futex_op)\nExpected: is equal to 0\n  Actual: -1 (of type int), with errno PosixError(errno=14 Bad address)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:620\nExpected equality of these values:\n  a\n    Which is: 1\n  2\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "futex",
+      "case": "PrivateFutexTest.WakeOp0Add",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:626\nValue of: futex_wake_op(true, nullptr, &a, 0, 0, futex_op)\nExpected: is equal to 0\n  Actual: -1 (of type int), with errno PosixError(errno=14 Bad address)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:628\nExpected equality of these values:\n  a\n    Which is: 1\n  2\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "futex",
+      "case": "PrivateFutexTest.WakeOp0Or",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:634\nValue of: futex_wake_op(true, nullptr, &a, 0, 0, futex_op)\nExpected: is equal to 0\n  Actual: -1 (of type int), with errno PosixError(errno=14 Bad address)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:636\nExpected equality of these values:\n  a\n    Which is: 1\n  0b11\n    Which is: 3\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "futex",
+      "case": "PrivateFutexTest.WakeOp0Andn",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:642\nValue of: futex_wake_op(true, nullptr, &a, 0, 0, futex_op)\nExpected: is equal to 0\n  Actual: -1 (of type int), with errno PosixError(errno=14 Bad address)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:644\nExpected equality of these values:\n  a\n    Which is: 3\n  0b01\n    Which is: 1\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "futex",
+      "case": "PrivateFutexTest.WakeOp0Xor",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:650\nValue of: futex_wake_op(true, nullptr, &a, 0, 0, futex_op)\nExpected: is equal to 0\n  Actual: -1 (of type int), with errno PosixError(errno=14 Bad address)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:652\nExpected equality of these values:\n  a\n    Which is: 10\n  0b0110\n    Which is: 6\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "futex",
+      "case": "PrivateFutexTest.WakeOpNegativeOparg",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:658\nValue of: futex_wake_op(true, nullptr, &a, 0, 0, futex_op)\nExpected: is equal to 0\n  Actual: -1 (of type int), with errno PosixError(errno=14 Bad address)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:660\nExpected equality of these values:\n  a\n    Which is: 1\n  0\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "futex",
+      "case": "PrivateFutexTest.WakeOpShiftMasked",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:666\nValue of: futex_wake_op(true, nullptr, &a, 0, 0, futex_op)\nExpected: is equal to 0\n  Actual: -1 (of type int), with errno PosixError(errno=14 Bad address)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:668\nExpected equality of these values:\n  a\n    Which is: 0\n  2\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "futex",
+      "case": "RobustFutexTest.BasicSetGet",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:907\nValue of: set_robust_list(hd_ptr, sizeof(hd))\nExpected: is equal to 0\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:912\nValue of: get_robust_list(0, &new_hd_ptr, &len)\nExpected: is equal to 0\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:915\nExpected equality of these values:\n  len\n    Which is: 140737487304160\n  sizeof(hd)\n    Which is: 24\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "futex",
+      "case": "RobustFutexTest.GetFromOtherTid",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:923\nValue of: get_robust_list(0, &hd_ptr, &len)\nExpected: is equal to 0\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:929\nValue of: get_robust_list(0, &got_hd_ptr, &len)\nExpected: is equal to 0\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:931\nExpected: (hd_ptr) != (got_hd_ptr), actual: NULL vs NULL\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:934\nValue of: get_robust_list(tid, &got_hd_ptr, &len)\nExpected: is equal to 0\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "futex",
+      "case": "RobustFutexTest.InvalidSize",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:945\nValue of: set_robust_list(hd, sizeof(*hd) + 1)\nExpected: -1 (failure), with errno PosixError(errno=22 Invalid argument)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "futex",
+      "case": "RobustFutexTest.PthreadMutexAttr",
+      "status": "no_result",
+      "exit_code": 1,
+      "messages": [],
+      "stderr": "trames: session ready\ntrames-mac: all virtual processes are blocked without an event source\n"
+    },
+    {
+      "suite": "futex",
+      "case": "SharedPrivate/PrivateAndSharedFutexTest.Wake0/0",
+      "status": "no_result",
+      "exit_code": 1,
+      "messages": [],
+      "stderr": "trames: session ready\ntrames-mac: all virtual processes are blocked without an event source\n"
+    },
+    {
+      "suite": "futex",
+      "case": "SharedPrivate/PrivateAndSharedFutexTest.Wake0/1",
+      "status": "no_result",
+      "exit_code": 1,
+      "messages": [],
+      "stderr": "trames: session ready\ntrames-mac: all virtual processes are blocked without an event source\n"
+    },
+    {
+      "suite": "futex",
+      "case": "SharedPrivate/PrivateAndSharedFutexTest.WakeWrongKind/0",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:606\nValue of: futex_wake(!IsPrivate(), &a, 1)\nExpected: is equal to 0\n  Actual: 1 (of type int)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:597\nValue of: futex_wait(IsPrivate(), &a, kInitialValue, kIneffectiveWakeTimeout)\nExpected: -1 (failure), with errno PosixError(errno=110 Connection timed out)\n  Actual: 0 (of type int)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "futex",
+      "case": "SharedPrivate/PrivateAndSharedFutexTest.WakeWrongKind/1",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:606\nValue of: futex_wake(!IsPrivate(), &a, 1)\nExpected: is equal to 0\n  Actual: 1 (of type int)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:597\nValue of: futex_wait(IsPrivate(), &a, kInitialValue, kIneffectiveWakeTimeout)\nExpected: -1 (failure), with errno PosixError(errno=110 Connection timed out)\n  Actual: 0 (of type int)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "futex",
+      "case": "SharedPrivate/PrivateAndSharedFutexTest.PIBasic/0",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:741\nValue of: futex_lock_pi(IsPrivate(), &a)\nExpected: -1 (failure), with errno PosixError(errno=35 Resource deadlock avoided)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:745\nValue of: futex_unlock_pi(IsPrivate(), &a)\nExpected: -1 (failure), with errno PosixError(errno=1 Operation not permitted)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "futex",
+      "case": "SharedPrivate/PrivateAndSharedFutexTest.PIBasic/1",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:741\nValue of: futex_lock_pi(IsPrivate(), &a)\nExpected: -1 (failure), with errno PosixError(errno=35 Resource deadlock avoided)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:745\nValue of: futex_unlock_pi(IsPrivate(), &a)\nExpected: -1 (failure), with errno PosixError(errno=1 Operation not permitted)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "futex",
+      "case": "SharedPrivate/PrivateAndSharedFutexTest.PIConcurrency/0",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "futex",
+      "case": "SharedPrivate/PrivateAndSharedFutexTest.PIConcurrency/1",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:758\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "futex",
+      "case": "SharedPrivate/PrivateAndSharedFutexTest.PIWaiters/0",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:780\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:790\nExpected equality of these values:\n  a.load()\n    Which is: 1\n  contended\n    Which is: -2147483647\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:793\nValue of: syscall(98, &a, 3 | PrivateFlag(), 0, 1, &a)\nExpected: -1 (failure), with errno PosixError(errno=22 Invalid argument)\n  Actual: 0 (of type long)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:795\nValue of: futex_wake_bitset(is_priv, &a, 1, 2)\nExpected: -1 (failure), with errno PosixError(errno=22 Invalid argument)\n  Actual: 0 (of type int)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:797\nValue of: futex_wake(is_priv, &a, 1)\nExpected: -1 (failure), with errno PosixError(errno=22 Invalid argument)\n  Actual: 0 (of type int)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "futex",
+      "case": "SharedPrivate/PrivateAndSharedFutexTest.PIWaiters/1",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:780\nValue of: futex_lock_pi(is_priv, &a)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:790\nExpected equality of these values:\n  a.load()\n    Which is: 1\n  contended\n    Which is: -2147483647\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:793\nValue of: syscall(98, &a, 3 | PrivateFlag(), 0, 1, &a)\nExpected: -1 (failure), with errno PosixError(errno=22 Invalid argument)\n  Actual: 0 (of type long)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:795\nValue of: futex_wake_bitset(is_priv, &a, 1, 2)\nExpected: -1 (failure), with errno PosixError(errno=22 Invalid argument)\n  Actual: 0 (of type int)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:797\nValue of: futex_wake(is_priv, &a, 1)\nExpected: -1 (failure), with errno PosixError(errno=22 Invalid argument)\n  Actual: 0 (of type int)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "futex",
+      "case": "SharedPrivate/PrivateAndSharedFutexTest.PITryLock/0",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:808\nValue of: futex_trylock_pi(is_priv, &a)\nExpected: -1 (failure), with errno PosixError(errno=35 Resource deadlock avoided)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:810\nValue of: futex_trylock_pi(is_priv, &a)\nExpected: -1 (failure), with errno PosixError(errno=11 Resource temporarily unavailable)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "futex",
+      "case": "SharedPrivate/PrivateAndSharedFutexTest.PITryLock/1",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:808\nValue of: futex_trylock_pi(is_priv, &a)\nExpected: -1 (failure), with errno PosixError(errno=35 Resource deadlock avoided)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:810\nValue of: futex_trylock_pi(is_priv, &a)\nExpected: -1 (failure), with errno PosixError(errno=11 Resource temporarily unavailable)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "futex",
+      "case": "SharedPrivate/PrivateAndSharedFutexTest.PIWithOrdinaryWaiter/0",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:829\nValue of: syscall(98, &other, 6 | flags, 0, nullptr)\nExpected: not -1 (success)\n  Actual: -1 (of type long), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:855\nValue of: sleeping\n  Actual: false\nExpected: true\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:859\nValue of: futex_trylock_pi(priv, &word)\nExpected: -1 (failure), with errno PosixError(errno=22 Invalid argument)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:861\nValue of: syscall(98, &word, 7 | flags)\nExpected: -1 (failure), with errno PosixError(errno=22 Invalid argument)\n  Actual: -1 (of type long), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:864\nValue of: futex_wake(priv, &word, 1)\nExpected: is equal to 1\n  Actual: 0 (of type int)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    },
+    {
+      "suite": "futex",
+      "case": "SharedPrivate/PrivateAndSharedFutexTest.PIWithOrdinaryWaiter/1",
+      "status": "failed",
+      "exit_code": 1,
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:829\nValue of: syscall(98, &other, 6 | flags, 0, nullptr)\nExpected: not -1 (success)\n  Actual: -1 (of type long), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:855\nValue of: sleeping\n  Actual: false\nExpected: true\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:859\nValue of: futex_trylock_pi(priv, &word)\nExpected: -1 (failure), with errno PosixError(errno=22 Invalid argument)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:861\nValue of: syscall(98, &word, 7 | flags)\nExpected: -1 (failure), with errno PosixError(errno=22 Invalid argument)\n  Actual: -1 (of type long), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/futex.cc:864\nValue of: futex_wake(priv, &word, 1)\nExpected: is equal to 1\n  Actual: 0 (of type int)\n"
+      ],
+      "stderr": "trames: session ready\nFailed to match any benchmarks against regex: .\n"
+    }
+  ],
+  "additional_skips": [
+    {
+      "suite": "eventfd",
+      "case": "EventfdTest.BigWriteFails",
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-20261117/source/test/syscalls/linux/eventfd.cc:134\nversion.major < 6 || (version.major == 6 && version.minor < 9)\n"
+      ]
+    }
+  ],
+  "guest_kernel_release": "6.0.0-trames",
+  "guest_nofile": [
+    1048576,
+    1048576
+  ]
+}

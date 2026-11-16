@@ -1,0 +1,39 @@
+{
+  "gvisor": {
+    "revision": "89cacadae21eca4270a8f7c79281d0426d33ac5f",
+    "url": "https://codeload.github.com/google/gvisor/tar.gz/89cacadae21eca4270a8f7c79281d0426d33ac5f",
+    "sha256": "23276c6ca194c4818be1544be13c1def23a492fd8f96d261e0ef9b64a0b444aa"
+  },
+  "dependencies": [
+    {
+      "name": "abseil",
+      "url": "https://codeload.github.com/abseil/abseil-cpp/tar.gz/refs/tags/20260817.0",
+      "sha256": "f7e05179df39c45434cad433f5783840bb3788ef322976f9138bc6b72b3a107d",
+      "bytes": 2430876
+    },
+    {
+      "name": "googletest",
+      "url": "https://codeload.github.com/google/googletest/tar.gz/refs/tags/v1.18.0",
+      "sha256": "6e3191c1455468b3fc35a417fb565c1c5071aee1b7e7f85e30cf48a98d37d8b5",
+      "bytes": 894741
+    },
+    {
+      "name": "benchmark",
+      "url": "https://codeload.github.com/google/benchmark/tar.gz/refs/tags/v1.10.0",
+      "sha256": "acc5c7c0fbed855c4aaa2d7c3c36fb82b0c15c28f4e151e3f679c2fc0aa404af",
+      "bytes": 281371
+    }
+  ],
+  "runfiles": [
+    {
+      "url": "https://raw.githubusercontent.com/bazelbuild/bazel/6.5.0/tools/cpp/runfiles/runfiles_src.h",
+      "sha256": "acd57013bf0d2d8a26986737ab2724383ff578c5f6a07485848e874f02b57b85",
+      "bytes": 10302
+    },
+    {
+      "url": "https://raw.githubusercontent.com/bazelbuild/bazel/6.5.0/tools/cpp/runfiles/runfiles_src.cc",
+      "sha256": "e26ee736d835ddf248d847e00ea2b7047c20775d9eca61257bf8c9fcf6793d1c",
+      "bytes": 13237
+    }
+  ]
+}
