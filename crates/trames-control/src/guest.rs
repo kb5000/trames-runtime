@@ -203,12 +203,16 @@ pub struct Guest {
     pub timeout: Option<Duration>,
 }
 impl Guest {
-    fn require(&mut self, device: &str) -> Result<()> {
+    fn require(&mut self, device: &str, method: &str) -> Result<()> {
         if device == "info" {
             return Ok(());
         }
         let cap = match device {
-            "host-control" => None,
+            "host-control" => match method {
+                "host.cli" => Some("host-cli"),
+                "url.open" | "ui.manager" => Some("host-ui"),
+                _ => None,
+            },
             "host-exec" => Some("host-exec"),
             "clipboard" => Some("clipboard"),
             "file-transfer" => Some("files"),
@@ -246,7 +250,7 @@ impl Backend for Guest {
         Ok(info)
     }
     fn call(&mut self, device: &str, method: &str, params: Value) -> Result<Value> {
-        self.require(device)?;
+        self.require(device, method)?;
         if method == "files.list" {
             if let Some(path) = params["path"].as_str() {
                 let shares = self.call(device, method, json!({}))?;
@@ -333,7 +337,7 @@ impl Backend for Guest {
         err: &mut dyn Write,
     ) -> Result<u8> {
         self.timeout = o.timeout;
-        self.require(device)?;
+        self.require(device, method)?;
         let info = self.info()?;
         if info["features"]["exec_bytes"] != true || info["features"]["exec_stdin"] != true {
             return Err(Error::unavailable(
