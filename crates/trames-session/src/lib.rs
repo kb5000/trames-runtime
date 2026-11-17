@@ -625,7 +625,7 @@ mod tests {
         assert_eq!(host.limit(), u64::MAX);
         assert_eq!(host.used(), 0);
         let bounded = MemoryLimits::default().gpu_budget();
-        assert_eq!(bounded.limit(), 128 << 20);
+        assert_eq!(bounded.limit(), MemoryLimits::default().total as u64);
         assert_eq!(bounded.used(), 0);
     }
     #[test]

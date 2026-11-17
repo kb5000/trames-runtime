@@ -30,17 +30,16 @@ impl Budget {
         }
     }
     pub(crate) fn max_allocation(&self) -> u64 {
-        if self.limit == u64::MAX {
-            u64::MAX
-        } else {
-            64 << 20
-        }
+        self.limit
     }
-    /// Native allocations and coherent mapping baselines share this additional
-    /// session quota. Reserve no memory until an actual resource is created.
+    /// Native allocations and coherent mapping baselines share the configured
+    /// environment ceiling, not a separate one-eighth graphics allowance.
+    /// ANGLE may allocate large backing blocks even for small images. Neither
+    /// the session nor a single block gets a hidden smoke-test byte ceiling.
+    /// Construction reserves no memory; the native driver still owns failures.
     pub fn for_guest_memory(guest_bytes: usize) -> Self {
         Self {
-            limit: (guest_bytes as u64 / 8).min(1 << 30),
+            limit: guest_bytes as u64,
             ..Self::default()
         }
     }
@@ -92,7 +91,7 @@ mod tests {
         peer.release(192 << 20);
         budget.release(2 << 30);
         assert_eq!(peer.used(), 0);
-        assert_eq!(Budget::default().max_allocation(), 64 << 20);
+        assert_eq!(Budget::default().max_allocation(), 128 << 20);
     }
     #[test]
     fn compiler_capacity_is_shared_and_released_without_a_global_work_lock() {
@@ -119,16 +118,17 @@ mod tests {
     #[test]
     fn session_quota_scales_without_allocating_and_remains_shared() {
         let budget = Budget::for_guest_memory(4usize << 30);
-        assert_eq!(budget.limit(), 512 << 20);
+        assert_eq!(budget.limit(), 4 << 30);
+        assert_eq!(budget.max_allocation(), 4 << 30);
         assert_eq!(budget.used(), 0);
-        assert!(budget.reserve(320 << 20));
+        assert!(budget.reserve(3 << 30));
         let peer = budget.clone();
-        assert!(peer.reserve(192 << 20));
+        assert!(peer.reserve(1 << 30));
         assert!(!budget.reserve(1));
-        peer.release(192 << 20);
-        budget.release(320 << 20);
+        peer.release(1 << 30);
+        budget.release(3 << 30);
         assert_eq!(budget.used(), 0);
-        assert_eq!(Budget::for_guest_memory(1 << 30).limit(), 128 << 20);
-        assert_eq!(Budget::for_guest_memory(16usize << 30).limit(), 1 << 30);
+        assert_eq!(Budget::for_guest_memory(1 << 30).limit(), 1 << 30);
+        assert_eq!(Budget::for_guest_memory(16usize << 30).limit(), 16 << 30);
     }
 }
