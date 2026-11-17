@@ -102,7 +102,8 @@ continue to apply.
 
 ## Reproducing the Linux ABI check
 
-The standalone fixture exercises interface ioctls, socket BPF, epoll, TUN UDP
+Run these commands from the trames-ipad checkout, which contains the runtime
+submodule. The standalone fixture exercises interface ioctls, socket BPF, epoll, TUN UDP
 round trips, TAP, bridge/VLAN rtnetlink controls and opaque frame forwarding:
 
 ```sh
@@ -111,6 +112,55 @@ cargo build -p trames-cli --locked
 target/debug/trames-run --network full --cpus 1 --max-instructions 100000000 target/packet-tun/packet-tun
 target/debug/trames-run --network full --cpus 2 --max-instructions 100000000 target/packet-tun/packet-tun
 ```
+
+## Validation checkpoint — 2026-11-17
+
+Implementation commit: `3a729258770cad9ed50035aaa4397d3ab8a6cb9a`.
+
+- Shared runtime local CI: all eight shell steps pass, with 1,635 tests passing
+  and 31 existing skips. Format, all-target/all-feature Clippy, release build
+  and the physical-memory reclaim example pass.
+- Interpreter Linux conformance: 490 pass, three existing skips. The Linux ABI
+  fixture above passes with one and two CPUs using the final runtime sources.
+- Mac product workflow checks 1–10 pass. The embedded-Vulkan Dev app builds;
+  its signed hardware executor passes the same ABI fixture with two CPUs in a
+  disposable rootfs/store. Existing installed environments are not replaced.
+- iPad `trames-ffi` checks for `aarch64-apple-ios`. This is compile coverage;
+  physical-iPad TAP/VPN acceptance is not claimed.
+- Regressions include actual FDB redirect of socket traffic, ARP/NDP wire
+  messages, VLAN tag rewrite/isolation, real opaque-frame BPF/promiscuity,
+  atomic/authorized Netlink controls and manual notifications, learning/aging,
+  port teardown, loop rejection and fragmented UDP through bridge IP filtering.
+- Original protocol-resource tests cover reentrant notification, one-shot host
+  event rearming, no idle timer/poller allocation, final resource retirement,
+  and ARP completion across separate fabrics while the sender has no network
+  wait. No new runtime service thread is used.
+
+The reproducible host-only library microbenchmark is:
+
+```sh
+python3 runtime/scripts/benchmark-ethernet.py > ethernet.csv
+```
+
+Each row warms 64 packets then measures 10,000 sequential UDP sends/consumes
+with 64- or 1,400-byte payloads. Both host and Trames native receive retry with
+scheduler yield when nonblocking delivery is not immediately available. The
+internal case uses two environments on one fabric, without packet observers or
+firewall rules. All rows include the call wrapper and per-operation timing;
+these are not physical-network, guest-syscall or CPU-executor measurements.
+One local optimized ARM64 run during development produced:
+
+| Path | Bytes | Packets/s | P50 µs | P99 µs |
+| --- | ---: | ---: | ---: | ---: |
+| Host BSD UDP | 64 | 100,709 | 6.92 | 35.96 |
+| Trames native UDP | 64 | 132,310 | 5.88 | 43.88 |
+| Trames internal Ethernet UDP | 64 | 222,194 | 4.17 | 10.75 |
+| Host BSD UDP | 1,400 | 181,868 | 4.67 | 18.42 |
+| Trames native UDP | 1,400 | 148,261 | 5.88 | 20.54 |
+| Trames internal Ethernet UDP | 1,400 | 207,784 | 4.42 | 11.88 |
+
+Host scheduling and loopback packet arrival substantially affect these small
+samples; the table is a checkpoint, not evidence of a before/after speedup.
 
 References: [Linux bridge](https://docs.kernel.org/networking/bridge.html),
 [packet sockets](https://man7.org/linux/man-pages/man7/packet.7.html),
