@@ -33,15 +33,42 @@ impl Vfs {
         rights: LocalRights,
         credentials: [u32; 3],
     ) -> Result<usize> {
+        self.local_send_credentials_mode(
+            socket,
+            bytes,
+            flags,
+            destination,
+            rights,
+            credentials,
+            false,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn local_send_credentials_mode(
+        &self,
+        socket: &Rc<LocalSocket>,
+        bytes: &[u8],
+        flags: u32,
+        destination: Option<&[u8]>,
+        rights: LocalRights,
+        credentials: [u32; 3],
+        explicit: bool,
+    ) -> Result<usize> {
         if socket.kind != 2 || socket.channel.borrow().ends()[0].strong_count() != 0 {
             if destination.is_some() {
                 return Err(Errno(106));
             }
-            return socket.send_rights_credentials(bytes, flags, rights, credentials);
+            return socket.send_rights_credentials_mode(
+                bytes,
+                flags,
+                rights,
+                credentials,
+                explicit,
+            );
         }
         socket.check_datagram_send(bytes.len(), flags)?;
         let target = self.local_datagram_core(&socket.core, destination)?;
-        target.send_local_checked(bytes, flags, rights, credentials)
+        target.send_local_checked(bytes, flags, rights, credentials, explicit)
     }
 }
 
@@ -79,6 +106,7 @@ impl LocalDatagram {
         flags: u32,
         rights: SharedRights,
         identity: [u32; 3],
+        explicit: bool,
     ) -> Result<usize> {
         let receiver = self.receiver()?;
         let source = self.source.name.borrow().clone();
@@ -88,6 +116,7 @@ impl LocalDatagram {
             shared_rights::QueuedRights::for_receiver(&receiver, rights)?,
             identity,
             source,
+            explicit || self.source.reuse(16) != 0,
         )
     }
     fn send_local_checked(
@@ -96,8 +125,9 @@ impl LocalDatagram {
         flags: u32,
         rights: LocalRights,
         credentials: [u32; 3],
+        explicit: bool,
     ) -> Result<usize> {
-        self.send_shared_checked(bytes, flags, rights.shared(), credentials)
+        self.send_shared_checked(bytes, flags, rights.shared(), credentials, explicit)
     }
 }
 
@@ -108,6 +138,7 @@ impl LocalSocket {
         flags: u32,
         rights: LocalRights,
         identity: [u32; 3],
+        explicit: bool,
     ) -> Result<usize> {
         self.check_datagram_send(bytes.len(), flags)?;
         if !self.connected() {
@@ -120,7 +151,7 @@ impl LocalSocket {
             peer: Arc::downgrade(&peer),
             channel,
         };
-        target.send_local_checked(bytes, flags, rights, identity)
+        target.send_local_checked(bytes, flags, rights, identity, explicit)
     }
 }
 
@@ -157,6 +188,7 @@ impl LocalResource {
             None,
             identity.unwrap_or_else(|| self.credentials.get()),
             source,
+            self.reuse(16) != 0,
         )
     }
     pub(crate) fn addressed_datagram(&self) -> bool {
@@ -207,6 +239,7 @@ impl LocalOperation {
         }
         Some(Ok(target.get().expect("accepted datagram target")))
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn send_datagram(
         &self,
         target: &std::sync::OnceLock<LocalDatagram>,
@@ -214,11 +247,14 @@ impl LocalOperation {
         flags: u32,
         rights: SharedRights,
         identity: [u32; 3],
+        explicit: bool,
         resolve: impl FnOnce() -> Option<Result<LocalDatagram>>,
     ) -> Option<Result<usize>> {
         Some(
             self.datagram_admit(target, bytes.len(), flags, resolve)?
-                .and_then(|target| target.send_shared_checked(bytes, flags, rights, identity)),
+                .and_then(|target| {
+                    target.send_shared_checked(bytes, flags, rights, identity, explicit)
+                }),
         )
     }
 }
@@ -261,19 +297,56 @@ impl Vfs {
         destination: Option<&[u8]>,
         rights: LocalRights,
         identity: [u32; 3],
+        explicit: bool,
     ) -> Result<usize> {
         socket
             .datagram_admit(target, bytes.len(), flags, || {
                 Some(self.local_datagram_core(socket.core(), destination))
             })
             .expect("owner resolves datagram target")?
-            .send_local_checked(bytes, flags, rights, identity)
+            .send_local_checked(bytes, flags, rights, identity, explicit)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn addressed_credentials_follow_explicit_and_endpoint_requests_at_send_time() {
+        for mode in 0..3 {
+            let mut v = Vfs::default();
+            let tx = v.local_create(2, 0).unwrap();
+            let rx = v.local_create(2, 0).unwrap();
+            let sender = v.local_socket(tx).unwrap().unwrap();
+            let receiver = v.local_socket(rx).unwrap().unwrap();
+            let destination = b"\x01\x00\0credential-target";
+            v.local_bind(&receiver, destination).unwrap();
+            if mode == 1 {
+                sender.set_reuse(16, 1).unwrap();
+            }
+            assert_eq!(
+                v.local_send_credentials_mode(
+                    &sender,
+                    b"x",
+                    0,
+                    Some(destination),
+                    LocalRights::default(),
+                    [42, 1000, 1001],
+                    mode == 2
+                ),
+                Ok(1)
+            );
+            receiver.set_reuse(16, 1).unwrap();
+            assert_eq!(
+                receiver.recv(1, 0).unwrap().credentials,
+                Some(if mode == 0 {
+                    [0, 65534, 65534]
+                } else {
+                    [42, 1000, 1001]
+                })
+            );
+        }
+    }
     #[test]
     fn addressed_metadata_and_portable_rights_live_in_the_real_queue_without_owner_entries() {
         let mut v = Vfs::default();
@@ -287,6 +360,7 @@ mod tests {
         v.local_bind(&sender, name).unwrap();
         v.local_bind(&receiver, destination).unwrap();
         receiver.set_reuse(35, 1).unwrap();
+        sender.set_reuse(16, 1).unwrap();
         let event = v.eventfd(73, 0).unwrap();
         v.local_send_to(
             &sender,
@@ -297,8 +371,7 @@ mod tests {
         )
         .unwrap();
 
-        // Datagram credentials were always captured at send, even if passcred
-        // was enabled after enqueue. Keep that behavior outside the ledger.
+        // Sender-requested credentials survive late receiver enablement.
         receiver.set_reuse(16, 1).unwrap();
         v.close(event).unwrap();
         let fd = v.direct_descriptors().get(rx).unwrap();
@@ -359,6 +432,7 @@ mod tests {
                             0,
                             SharedRights::default(),
                             [n as u32 + 1, 0, 0],
+                            false,
                             || paths.local_datagram(&op, Some(destination))
                         ),
                         Some(Ok(2))

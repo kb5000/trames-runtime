@@ -153,6 +153,7 @@ impl SharedRights {
 }
 
 impl channel::Resource {
+    #[allow(clippy::too_many_arguments)]
     pub fn send_local(
         &self,
         side: usize,
@@ -160,11 +161,12 @@ impl channel::Resource {
         flags: u32,
         rights: &SharedRights,
         identity: [u32; 3],
+        explicit: bool,
     ) -> Option<Result<usize>> {
-        if rights.is_empty() {
+        if rights.is_empty() && !explicit {
             return Some(self.send_credentials(side, bytes, flags, Some(identity)));
         }
-        Some(self.send_shared(side, bytes, flags, rights.clone(), Some(identity)))
+        Some(self.send_shared_mode(side, bytes, flags, rights.clone(), Some(identity), explicit))
     }
     pub fn recv_local(
         &self,

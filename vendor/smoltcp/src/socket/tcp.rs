@@ -813,6 +813,18 @@ impl<'a> Socket<'a> {
 
     /// Return the connection state, in terms of the TCP state machine.
     #[inline]
+    /// Original transport estimates for Linux TCP_INFO, in microseconds/bytes.
+    /// Reading diagnostics does not advance the protocol or allocate buffers.
+    pub fn transport_info(&self) -> [u32; 6] {
+        [
+            self.rtte.retransmission_timeout().total_micros().min(u32::MAX as u64) as u32,
+            self.rtte.rtt.saturating_mul(1000),
+            self.rtte.deviation.saturating_mul(1000),
+            self.remote_mss.min(u32::MAX as usize) as u32,
+            self.congestion_controller.inner().window().min(u32::MAX as usize) as u32,
+            self.rx_buffer.capacity().saturating_sub(self.rx_buffer.len()).min(u32::MAX as usize) as u32,
+        ]
+    }
     pub fn state(&self) -> State {
         self.state
     }

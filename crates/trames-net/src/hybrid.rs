@@ -521,6 +521,13 @@ impl Socket {
     pub fn set_option(&self, level: u32, name: u32, value: i32) -> Result<()> {
         self.set_option_bytes(level, name, &value.to_le_bytes())
     }
+    pub fn tcp_info(&self) -> Result<[u8; 104]> {
+        if self.path.get() == Path::Guest {
+            self.guest()?.tcp_info()
+        } else {
+            self.native()?.tcp_info()
+        }
+    }
     pub fn get_option(&self, level: u32, name: u32) -> Result<i32> {
         if self.path.get() == Path::Guest {
             self.guest()?.get_option(level, name)

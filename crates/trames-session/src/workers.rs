@@ -584,6 +584,7 @@ impl<C: Cpu> Starter<C> {
                     let mut syscall_time = Duration::ZERO;
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         loop {
+                            job.restart_sleep_after_stop();
                             let work = &mut job.work;
                             if work.control.stopped() {
                                 break SliceOutcome::Yield { instructions: 0 };
@@ -685,8 +686,8 @@ impl<C: Cpu> Starter<C> {
                                                 syscalls += 1;
                                                 let interrupted=if let Some(wait)=&pending.retained_poll {
                                                     wait.finish(work.memory.as_deref_mut().expect("signal View"),Err(trames_vfs::Errno(4)))
-                                                }else if let Some(count)=pending.retained_byte.as_ref().and_then(|file| file.partial_write()){Ok(count)}else{Err(trames_vfs::Errno(4))};
-                                                if interrupted.is_err() && action.flags & 0x10000000 != 0 && matches!(pending.number, 25 | 29 | 32 | 63..=66 | 71 | 76 | 206 | 207 | 211 | 212 | 269) && pending.deadline.is_none() {
+                                                }else if let Some(result)=pending.retained_byte.as_ref().and_then(|file| file.interrupted(work.memory.as_deref_mut().expect("signal View"))).or_else(||pending.retained_socket.as_ref().and_then(|call|call.interrupted(work.memory.as_deref_mut().expect("signal View")))){result}else{Err(trames_vfs::Errno(4))};
+                                                if interrupted.is_err() && action.flags & 0x10000000 != 0 && matches!(pending.number, 25 | 29 | 32 | 63..=66 | 71 | 76 | 206 | 207 | 211 | 212 | 243 | 269) && pending.deadline.is_none() {
                                                     work.trace.restart();
                                                     for (i, value) in pending.args.iter().enumerate() { work.cpu.set_x(i, *value); }
                                                     work.cpu.set_pc(work.cpu.pc().wrapping_sub(4));

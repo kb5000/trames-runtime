@@ -1271,6 +1271,7 @@ impl Linux {
             },
             278 => crate::getrandom(a, memory),
             198..=212 | 242 => self.network_syscall(number, a, memory),
+            243 => self.receive_messages(a, memory),
             269 => self.send_messages(a, memory),
             65 => self.readv(a, memory, io),
             45 => {

@@ -3,6 +3,7 @@
 //! addresses, flags and errno numbers are translated explicitly.
 use crate::direct_dns;
 use crate::shared_state::{Cell, State as SharedState};
+use nix::libc;
 mod control;
 mod direct;
 mod state;
@@ -1180,6 +1181,76 @@ impl Socket {
             .set_option(self.family, self.kind, level, name, value)
     }
 
+    pub fn tcp_info(&self) -> Result<[u8; 104]> {
+        if self.kind != 1 {
+            return Err(NetError(95));
+        }
+        let mut out = [0; 104];
+        #[cfg(target_os = "linux")]
+        {
+            let mut length = out.len() as libc::socklen_t;
+            // SAFETY: initialized local ABI buffer and its exact writable length.
+            if unsafe {
+                libc::getsockopt(
+                    self.native.as_fd().as_raw_fd(),
+                    libc::IPPROTO_TCP,
+                    libc::TCP_INFO,
+                    out.as_mut_ptr().cast(),
+                    &mut length,
+                )
+            } != 0
+            {
+                return Err(from_io(io::Error::last_os_error()));
+            }
+        }
+        #[cfg(target_vendor = "apple")]
+        {
+            let mut info: libc::tcp_connection_info = unsafe { std::mem::zeroed() };
+            let mut length = std::mem::size_of_val(&info) as libc::socklen_t;
+            // SAFETY: the host writes only into this initialized local struct.
+            if unsafe {
+                libc::getsockopt(
+                    self.native.as_fd().as_raw_fd(),
+                    libc::IPPROTO_TCP,
+                    libc::TCP_CONNECTION_INFO,
+                    (&mut info as *mut libc::tcp_connection_info).cast(),
+                    &mut length,
+                )
+            } != 0
+            {
+                return Err(from_io(io::Error::last_os_error()));
+            }
+            out[0] = match info.tcpi_state {
+                0 => 7,
+                1 => 10,
+                2 => 2,
+                3 => 3,
+                4 => 1,
+                5 => 8,
+                6 => 4,
+                7 => 11,
+                8 => 9,
+                9 => 5,
+                10 => 6,
+                _ => 7,
+            };
+            out[6] = (info.tcpi_options & 3) as u8 | if info.tcpi_options & 4 != 0 { 4 } else { 0 };
+            out[7] = info.tcpi_snd_wscale.min(15) | (info.tcpi_rcv_wscale.min(15) << 4);
+            let mss = info.tcpi_maxseg.max(1);
+            for (offset, value) in [
+                (8, info.tcpi_rto.saturating_mul(1000)),
+                (16, info.tcpi_maxseg),
+                (68, info.tcpi_srtt.saturating_mul(1000)),
+                (72, info.tcpi_rttvar.saturating_mul(1000)),
+                (76, info.tcpi_snd_ssthresh / mss),
+                (80, info.tcpi_snd_cwnd / mss),
+                (96, info.tcpi_rcv_wnd),
+            ] {
+                out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        Ok(out)
+    }
     pub fn get_option(&self, level: u32, name: u32) -> Result<i32> {
         match (level, name) {
             (0, 11) if self.family == 2 && self.kind == 2 => {
@@ -1328,6 +1399,36 @@ fn from_errno(error: HostErrno) -> NetError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_tcp_info_and_requested_half_close_keep_host_transport_semantics() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let network = Network::new(NetworkMode::Loopback);
+        let client = network.socket(2, 1, 0).unwrap();
+        assert!(matches!(
+            client.connect(listener.local_addr().unwrap()),
+            Ok(()) | Err(NetError(115))
+        ));
+        let (peer, _) = listener.accept().unwrap();
+        for _ in 0..100 {
+            if client.connect_complete().unwrap() {
+                break;
+            }
+        }
+        let info = client.tcp_info().unwrap();
+        assert_eq!(info[0], 1);
+        assert!(u32::from_le_bytes(info[16..20].try_into().unwrap()) > 0);
+        use std::io::Write;
+        (&peer).write_all(b"tail").unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        while client.poll(0x2001).unwrap() & 0x2000 == 0 {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(client.poll(1).unwrap() & 0x2000, 0);
+        assert_eq!(client.poll(0x2001).unwrap() & 0x2001, 0x2001);
+    }
+
     #[test]
     fn shared_native_namespace_reserves_real_transports_and_cancels_on_workers() {
         fn shared<T: Send + Sync>() {}

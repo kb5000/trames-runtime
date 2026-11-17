@@ -454,6 +454,9 @@ pub(super) struct Job<C: Cpu> {
     pub stats: Stats,
     pub affinity: u64,
     pub waiting: Option<WaitState>,
+    /// restart_syscall is a new guest entry only after an actual group stop.
+    pub restart_wait: Option<WaitState>,
+    pub sleep_stop_generation: u64,
     pub io: Option<trames_linux::PendingIo>,
     pub uring: Option<trames_linux::UringBackground>,
     pub retry: Option<IoCall>,
@@ -487,9 +490,14 @@ impl<C: Cpu> Job<C> {
     ) -> Box<Self> {
         let before = work.cpu.decode_stats();
         Box::new(Self {
+            sleep_stop_generation: work
+                .syscalls
+                .as_ref()
+                .map_or(0, |s| s.io_signals.lifecycle().stop_generation()),
             work,
             affinity,
             waiting,
+            restart_wait: None,
             io: None,
             uring: None,
             retry: None,
@@ -508,6 +516,25 @@ impl<C: Cpu> Job<C> {
                 ..Default::default()
             },
         })
+    }
+    pub fn restart_sleep_after_stop(&mut self) -> bool {
+        if !matches!(self.waiting, Some(WaitState::Sleep { .. })) {
+            return false;
+        }
+        let Some(snapshot) = &self.work.syscalls else {
+            return false;
+        };
+        let generation = snapshot.io_signals.lifecycle().stop_generation();
+        if generation == self.sleep_stop_generation || snapshot.quiesced() {
+            return false;
+        }
+        self.sleep_stop_generation = generation;
+        self.restart_wait = self.waiting.take();
+        self.seccomp_entry = None;
+        let absolute = self.work.cpu.x(8) == 115 && self.work.cpu.x(1) & 1 != 0;
+        self.work.cpu.set_x(8, if absolute { 115 } else { 128 });
+        self.pending_cpu = Some(SliceOutcome::Syscall { instructions: 0 });
+        true
     }
     pub fn affinity(&self) -> u64 {
         self.work
@@ -575,7 +602,9 @@ impl<C: Cpu> Job<C> {
         [
             self.waiting
                 .as_ref()
-                .filter(|w| !stopped || !matches!(w, WaitState::Signal(_)))
+                .filter(|w| {
+                    !stopped || !matches!(w, WaitState::Signal(_) | WaitState::Sleep { .. })
+                })
                 .and_then(WaitState::deadline),
             self.io
                 .as_ref()
@@ -1797,6 +1826,8 @@ impl<C: Cpu> Epoch<C> {
                     .and_then(WaitState::deadline)
                     .is_some_and(|d| d <= now)
                     && !matches!(job.waiting, Some(WaitState::Signal(_)))
+                    && !job.stopped()
+                    && !job.restart_sleep_after_stop()
                 {
                     let waiting = job.waiting.take().unwrap();
                     job.work.trace.finish(&mut job.work.cpu, waiting.expire());
@@ -2087,6 +2118,8 @@ impl<C: Cpu> Epoch<C> {
                 .and_then(WaitState::deadline)
                 .is_some_and(|d| d <= Instant::now())
                 && !matches!(job.waiting, Some(WaitState::Signal(_)))
+                && !job.stopped()
+                && !job.restart_sleep_after_stop()
             {
                 let waiting = job.waiting.take().unwrap();
                 job.work.trace.finish(&mut job.work.cpu, waiting.expire());

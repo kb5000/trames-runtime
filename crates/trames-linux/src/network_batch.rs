@@ -27,7 +27,102 @@ pub(crate) fn requested(memory: &impl CpuMemory, header: u64) -> Result<u64> {
     }
     Ok(total)
 }
+/// Timeout is checked between received messages, matching Linux (it does not
+/// wake an empty receive queue). Socket SO_RCVTIMEO keeps its existing wait.
+/// The accepted call owns this clock and output pointer across worker parking.
+pub(crate) struct Receive {
+    timeout: Option<(u64, std::time::Instant)>,
+}
+impl Receive {
+    pub fn new(a: [u64; 6], memory: &impl CpuMemory) -> Result<Self> {
+        if a[3] as u32 & 0x8000_0000 != 0 {
+            return Err(Errno(22));
+        }
+        let timeout = if a[4] == 0 {
+            None
+        } else {
+            let duration = crate::timer::duration(memory, a[4])?;
+            Some((
+                a[4],
+                std::time::Instant::now()
+                    .checked_add(duration)
+                    .ok_or(Errno(22))?,
+            ))
+        };
+        Ok(Self { timeout })
+    }
+    pub fn expired(&self) -> bool {
+        self.timeout
+            .is_some_and(|(_, end)| std::time::Instant::now() >= end)
+    }
+    pub fn flags(flags: u32, completed: u64) -> u32 {
+        (flags & !0x10000)
+            | if completed != 0 && flags & 0x10000 != 0 {
+                0x40
+            } else {
+                0
+            }
+    }
+    pub fn finish(&self, result: Result<u64>, memory: &mut impl CpuMemory) -> Result<u64> {
+        if result.is_ok_and(|n| n != 0) {
+            if let Some((address, end)) = self.timeout {
+                let left = end.saturating_duration_since(std::time::Instant::now());
+                let mut bytes = [0; 16];
+                bytes[..8].copy_from_slice(&left.as_secs().to_le_bytes());
+                bytes[8..].copy_from_slice(&(left.subsec_nanos() as u64).to_le_bytes());
+                memory.write(address, &bytes).map_err(|_| Errno(14))?;
+            }
+        }
+        result
+    }
+}
 impl Linux {
+    pub(super) fn receive_messages(&mut self, a: [u64; 6], memory: &mut Memory) -> Result<u64> {
+        let receive = Receive::new(a, memory)?;
+        if self.vfs.fd_kind(a[0] as u32)? != FdKind::Socket {
+            return Err(Errno(88));
+        }
+        let mut completed = 0;
+        while completed < a[2] as u32 as u64 {
+            let item = (|| {
+                let header = a[1].checked_add(completed * 64).ok_or(Errno(14))?;
+                let received = self.network_syscall(
+                    212,
+                    [
+                        a[0],
+                        header,
+                        Receive::flags(a[3] as u32, completed) as u64,
+                        0,
+                        0,
+                        0,
+                    ],
+                    memory,
+                )?;
+                memory
+                    .write(
+                        header.checked_add(56).ok_or(Errno(14))?,
+                        &(received as u32).to_le_bytes(),
+                    )
+                    .map_err(|_| Errno(14))?;
+                Ok(())
+            })();
+            if let Err(error) = item {
+                return receive.finish(
+                    if completed == 0 {
+                        Err(error)
+                    } else {
+                        Ok(completed)
+                    },
+                    memory,
+                );
+            }
+            completed += 1;
+            if receive.expired() {
+                break;
+            }
+        }
+        receive.finish(Ok(completed), memory)
+    }
     /// Batch sends can deliver SIGPIPE after earlier messages succeeded, even
     /// though the syscall returns a positive count instead of the final EPIPE.
     pub fn take_batch_pipe_signal(&mut self) -> bool {

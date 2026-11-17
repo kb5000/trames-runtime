@@ -12,6 +12,10 @@ for Trames, and `TEST_ON_GVISOR`/save-restore mode are unset.
 
 See [the first Mac results and fix/rerun checkpoint](../../docs/validation/gvisor-syscalls-20261117.md#fix-and-rerun-checkpoint).
 
+The [network ABI repair checkpoint](../../docs/validation/gvisor-network-abi-fixes-20261117.md)
+records a complete ancillary-message matrix and focused network/security reruns
+after the broad inventory.
+
 ## Build on native ARM64 Linux
 
 Install a C++17 compiler, CMake, Ninja, Python 3 and ordinary static glibc/libstdc++

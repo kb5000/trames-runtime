@@ -18,6 +18,7 @@ pub struct Group {
     job_ids: AtomicU64,
     controlling: std::sync::OnceLock<Weak<trames_vfs::ControllingTerminal>>,
     stopped: AtomicBool,
+    stop_generation: AtomicU64,
     termination: AtomicU32,
     state: Mutex<State>,
     exit_ready: Arc<trames_shared::Readiness>,
@@ -343,6 +344,10 @@ impl Group {
             .get(&pid)
             .is_none_or(|m| !m.running && !m.held)
     }
+    /// Counts actual guest group-stop transitions, never host execution yields.
+    pub fn stop_generation(&self) -> u64 {
+        self.stop_generation.load(Ordering::Relaxed)
+    }
     pub fn stopped(&self) -> bool {
         self.stopped.load(Ordering::Relaxed)
     }
@@ -466,6 +471,7 @@ impl Group {
             }
             if state.stop.is_none() {
                 state.stop = Some((signal, false));
+                self.stop_generation.fetch_add(1, Ordering::Relaxed);
                 self.stopped.store(true, Ordering::Relaxed);
             }
             for member in state.members.values() {

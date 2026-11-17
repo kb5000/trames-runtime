@@ -5,6 +5,8 @@ use super::*;
 use std::sync::Arc;
 
 const ALLOW: u32 = 0x7fff_0000;
+// LOG executes the syscall; this runtime has no Linux audit subsystem.
+const LOG: u32 = 0x7ffc_0000;
 const KILL_PROCESS: u32 = 0x8000_0000;
 const ARCH: u32 = 0xc000_00b7; // AUDIT_ARCH_AARCH64
 const MAX_INSNS: usize = 4096;
@@ -214,7 +216,7 @@ impl Seccomp {
         args: [u64; 6],
     ) -> Option<EntryDecision> {
         self.entry_value
-            .filter(|value| value & 0xffff_0000 != ALLOW)
+            .filter(|value| !matches!(value & 0xffff_0000, ALLOW | LOG))
             .map(|_| self.entry_decision(number, pc, args))
     }
     fn version(&self) -> &Version {
@@ -294,7 +296,7 @@ impl EntryDecision {
         self.value & 0xffff
     }
     pub(crate) fn allowed(&self) -> bool {
-        self.value & 0xffff_0000 == ALLOW
+        matches!(self.value & 0xffff_0000, ALLOW | LOG)
     }
     /// These decisions have no task lifecycle or signal-delivery effects.
     pub(crate) fn completed(&self) -> Option<u64> {
@@ -328,7 +330,7 @@ impl Seccomp {
         });
     }
     pub fn allows(&self, number: u32, pc: u64, args: [u64; 6]) -> bool {
-        self.decision(number, pc, args) & 0xffff_0000 == ALLOW
+        matches!(self.decision(number, pc, args) & 0xffff_0000, ALLOW | LOG)
     }
     pub fn mode(&self) -> u32 {
         let version = self.version();
@@ -576,7 +578,7 @@ impl Seccomp {
                 let action = u32::from_le_bytes(memory.read_array(a[2]).map_err(|_| Errno(14))?);
                 return if matches!(
                     action,
-                    0 | KILL_PROCESS | 0x0003_0000 | 0x0005_0000 | 0x7ff0_0000 | ALLOW
+                    0 | KILL_PROCESS | 0x0003_0000 | 0x0005_0000 | 0x7ff0_0000 | LOG | ALLOW
                 ) {
                     Ok(Ok(0))
                 } else {
@@ -803,7 +805,7 @@ impl<C: Cpu> Kernel<C> {
             .value_for(&p.seccomp, number, p.cpu.pc(), args)
             .expect("same accepted syscall entry");
         match decision & 0xffff_0000 {
-            ALLOW => {
+            ALLOW | LOG => {
                 p.seccomp_entry = Some(entry);
                 return false;
             }
@@ -4367,9 +4369,18 @@ mod tests {
                     k.processes.insert(id, peer);
                 }
                 k.processes.insert(1, p);
-                assert!(k
-                    .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
-                    .unwrap());
+                // The instruction budget belongs to the entire cohort, not to
+                // each PID. Under concurrent test load peers can consume its
+                // first slice before this task is dispatched. Await real work
+                // with bounded epochs, preserving every accounting assertion.
+                for _ in 0..8 {
+                    assert!(k
+                        .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
+                        .unwrap());
+                    if k.worker_syscalls != 0 {
+                        break;
+                    }
+                }
                 assert!(k.worker_syscalls > 0);
                 assert_eq!(k.syscalls, k.worker_syscalls);
                 assert!(k.cohort_return_syscalls.is_empty());

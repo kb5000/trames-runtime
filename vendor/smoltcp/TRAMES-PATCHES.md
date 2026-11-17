@@ -30,3 +30,9 @@ transmit preservation, shrinking below occupied data, zero-size datagram budget,
 64-packet bursts, live receive-buffer changes, and multiple 60 KB datagrams
 queued across bounded fabric slices. The private-link full-writer regression additionally checks that EAGAIN
 advances the original pending fragment resource instead of stranding it.
+
+`src/socket/tcp.rs` exposes a read-only transport diagnostic snapshot for Linux
+TCP_INFO: the original RTO/RTT estimates, negotiated peer MSS, congestion window
+and available receive-buffer space. It does not copy the TCP control block,
+advance protocol work or introduce a lock. Unimplemented Linux counters remain
+zero; the existing transport state supplies tcpi_state.

@@ -28,6 +28,7 @@ pub(crate) fn execute<C: Cpu>(
     resumed_policy: bool,
     result: SliceOutcome,
 ) -> Step {
+    let restart_wait = job.restart_wait.take();
     let work = &mut job.work;
     let domain = job.domain.as_ref();
     let mut thread_exit = None;
@@ -98,6 +99,12 @@ pub(crate) fn execute<C: Cpu>(
                 snapshot.io_signals.lifecycle().request_exit(31);
                 break 'entry None;
             }
+        }
+        if let Some(wait) = restart_wait {
+            // A real Linux restart entry passed the same seccomp dispatcher.
+            // Resume the accepted absolute deadline; never repeat guest import.
+            parked = Some(wait);
+            break 'entry Some(SliceOutcome::Yield { instructions: 0 });
         }
         if work.cpu.x(8) as u32 == 283 {
             if let (Some(snapshot), Some(epoch), Some(domain)) =
@@ -646,6 +653,8 @@ pub(crate) fn execute<C: Cpu>(
                     syscalls += 1;
                     match waiting {
                         Ok((deadline, remaining)) => {
+                            job.sleep_stop_generation =
+                                snapshot.io_signals.lifecycle().stop_generation();
                             parked = Some(crate::run_queue::WaitState::Sleep {
                                 deadline,
                                 remaining,

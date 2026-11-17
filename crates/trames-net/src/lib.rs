@@ -658,6 +658,15 @@ impl Socket {
         info.namespace_id = self.namespace.id();
         Some(info)
     }
+    pub fn tcp_info(&self) -> Result<[u8; 104]> {
+        let _operation = self.operation.read_recursive();
+        match &self.backend {
+            SocketBackend::Native(socket) => socket.tcp_info(),
+            SocketBackend::Virtual(socket) => socket.tcp_info(),
+            SocketBackend::Hybrid(socket) => socket.tcp_info(),
+            _ => Err(NetError(95)),
+        }
+    }
     /// Imported classic BPF only, never a guest sock_fprog pointer.
     pub fn attach_filter(&self, instructions: &[u8]) -> Result<()> {
         match &self.backend {

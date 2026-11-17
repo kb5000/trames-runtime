@@ -198,6 +198,7 @@ pub(super) struct Socket {
     readiness: Arc<trames_shared::Readiness>,
     buffers: Cell<i32>,
     ext_ack: Cell<bool>,
+    cap_ack: Cell<bool>,
     strict: Cell<bool>,
     pass_credentials: Cell<bool>,
     timestamp: Cell<u32>,
@@ -334,6 +335,7 @@ impl Socket {
             readiness: Arc::default(),
             buffers: Cell::new(65536),
             ext_ack: Cell::new(false),
+            cap_ack: Cell::new(false),
             strict: Cell::new(false),
             pass_credentials: Cell::new(false),
             timestamp: Cell::new(0),
@@ -452,6 +454,34 @@ impl Socket {
         wakes.flush();
         result
     }
+    fn capped_ack(&self, mut reply: Vec<u8>) -> Vec<u8> {
+        // A single datagram may pack several aligned nlmsghdr records. Compact
+        // each ACK in place; never drop later batch ACKs or dump records.
+        let (mut read, mut write) = (0, 0);
+        while read + 16 <= reply.len() {
+            let length = u32::from_le_bytes(reply[read..read + 4].try_into().unwrap()) as usize;
+            if length < 16 || length > reply.len() - read {
+                return reply;
+            }
+            let capped = length >= 36
+                && u16::from_le_bytes(reply[read + 4..read + 6].try_into().unwrap()) == 2
+                && (self.cap_ack.get() || reply[read + 16..read + 20] == [0; 4]);
+            let kept = if capped { 36 } else { length };
+            let stored = ((length + 3) & !3).min(reply.len() - read);
+            let kept_stored = if capped { 36 } else { stored };
+            reply.copy_within(read..read + kept_stored, write);
+            if capped {
+                reply[write..write + 4].copy_from_slice(&(kept as u32).to_le_bytes());
+                let flags =
+                    u16::from_le_bytes(reply[write + 6..write + 8].try_into().unwrap()) | 0x100;
+                reply[write + 6..write + 8].copy_from_slice(&flags.to_le_bytes());
+            }
+            read += stored;
+            write += kept_stored;
+        }
+        reply.truncate(write);
+        reply
+    }
     pub(super) fn send_deferred(
         &self,
         bytes: &[u8],
@@ -529,7 +559,7 @@ impl Socket {
             }
             wakes.0.push(self.readiness.clone());
             queue.extend(generated.into_iter().map(|data| Datagram {
-                data,
+                data: self.capped_ack(data),
                 source: source(0, 0),
             }));
             return Ok(bytes.len());
@@ -591,7 +621,7 @@ impl Socket {
             if replies.len() + generated.len() > 128 {
                 return Err(NetError(105));
             }
-            replies.extend(generated);
+            replies.extend(generated.into_iter().map(|reply| self.capped_ack(reply)));
         }
         let mut queued = self.replies.borrow_mut();
         if queued.len() + replies.len() > 128
@@ -697,6 +727,7 @@ impl Socket {
                     self.groups.get() & !group
                 });
             }
+            (270, 10) => self.cap_ack.set(value != 0),
             (270, 11) => self.ext_ack.set(value != 0),
             (270, 12) => self.strict.set(value != 0),
             _ => return Err(NetError(92)),
@@ -712,6 +743,7 @@ impl Socket {
             (1, 7 | 8) => Ok(self.buffers.get()),
             (1, 39) => Ok(16),
             (1, 38) => Ok(self.protocol as i32),
+            (270, 10) => Ok(i32::from(self.cap_ack.get())),
             (270, 11) => Ok(i32::from(self.ext_ack.get())),
             (270, 12) => Ok(i32::from(self.strict.get())),
             _ => Err(NetError(92)),
@@ -731,6 +763,45 @@ impl Drop for Socket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn capped_ack_preserves_every_packed_batch_record() {
+        let socket = Socket::new(Arc::new(Namespace::default()), None, 3, 12).unwrap();
+        socket.set_option(270, 10, 1).unwrap();
+        let mut payload = (-22i32).to_le_bytes().to_vec();
+        payload.extend_from_slice(&message(0x0a00, 5, 1, 0, &[0; 20]));
+        let first = message(2, 0, 1, 0, &payload);
+        let second = message(2, 0, 2, 0, &payload);
+        let out = socket.capped_ack([first, second].concat());
+        assert_eq!(out.len(), 72);
+        assert_eq!(&out[8..12], &1u32.to_le_bytes());
+        assert_eq!(&out[44..48], &2u32.to_le_bytes());
+        assert_eq!(&out[52..56], &(-22i32).to_le_bytes());
+    }
+    #[test]
+    fn capped_error_ack_preserves_original_header_and_marks_truncated_payload() {
+        for protocol in [0, 12] {
+            let socket = Socket::new(Arc::new(Namespace::default()), None, 3, protocol).unwrap();
+            let request = message(0xffff, 5, 99, 0, &[0; 20]);
+            socket
+                .send_bytes_authorized(&request, 0, None, true)
+                .unwrap();
+            let full = socket.recv(65536, 0).unwrap().data;
+            assert!(full.len() > 36);
+            socket.set_option(270, 10, 1).unwrap();
+            assert_eq!(socket.get_option(270, 10), Ok(1));
+            socket
+                .send_bytes_authorized(&request, 0, None, true)
+                .unwrap();
+            let capped = socket.recv(65536, 0).unwrap().data;
+            assert_eq!(capped.len(), 36);
+            assert_eq!(&capped[20..36], &request[..16]);
+            assert_eq!(
+                u16::from_le_bytes(capped[6..8].try_into().unwrap()) & 0x100,
+                0x100
+            );
+            assert_eq!(&capped[16..20], &full[16..20]);
+        }
+    }
     #[test]
     fn container_uevent_listener_is_quiet_and_separate_from_rtnetlink() {
         let namespace = Arc::new(Namespace::default());

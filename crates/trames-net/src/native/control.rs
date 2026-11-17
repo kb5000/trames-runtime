@@ -44,6 +44,9 @@ impl DirectControl {
         };
         address.map_err(from_io)?.as_socket().ok_or(NetError(5))
     }
+    pub fn tcp_info(&self) -> Result<[u8; 104]> {
+        self.socket.upgrade().ok_or(NetError(9))?.tcp_info()
+    }
     pub fn get_option(&self, level: u32, name: u32) -> Result<i32> {
         let owner = self.socket.upgrade().ok_or(NetError(9))?;
         if (level, name) == (1, 4) {
@@ -70,7 +73,7 @@ impl DirectControl {
                 (1, 2 | 6..=9) | (6, 1 | 4..=6) | (0, 2) | (41, 16 | 26)
             ),
             209 => {
-                matches!((level, name), (1, 2..=4 | 7..=9 | 30 | 38 | 39) | (6, 1 | 4..=6) | (41, 26))
+                matches!((level, name), (1, 2..=4 | 7..=9 | 30 | 38 | 39) | (6, 1 | 4..=6 | 11) | (41, 26))
             }
             _ => false,
         }

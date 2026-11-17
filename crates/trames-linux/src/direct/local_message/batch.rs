@@ -5,6 +5,7 @@ use std::sync::Mutex;
 
 pub(super) struct Batch {
     state: Mutex<State>,
+    receive: Option<crate::network_batch::Receive>,
 }
 #[derive(Default)]
 struct State {
@@ -12,16 +13,42 @@ struct State {
     active: Option<RetainedByte>,
     requested: u64,
     terminal: Option<Result<u64, Errno>>,
+    finished: bool,
     pipe: bool,
 }
 impl Batch {
-    pub fn new(args: [u64; 6]) -> Result<Self, Errno> {
+    pub fn new(number: u32, args: [u64; 6], memory: &impl CpuMemory) -> Result<Self, Errno> {
         if args[3] as u32 & 0x8000_0000 != 0 {
             return Err(Errno(22));
         }
         Ok(Self {
             state: Mutex::default(),
+            receive: if number == 243 {
+                Some(crate::network_batch::Receive::new(args, memory)?)
+            } else {
+                None
+            },
         })
+    }
+    fn finish(
+        &self,
+        result: Result<u64, Errno>,
+        memory: &mut impl CpuMemory,
+    ) -> Result<u64, Errno> {
+        self.receive
+            .as_ref()
+            .map_or(result, |receive| receive.finish(result, memory))
+    }
+    pub fn partial_receive(&self, memory: &mut impl CpuMemory) -> Option<Result<u64, Errno>> {
+        self.receive.as_ref()?;
+        let mut state = self.state.lock().unwrap();
+        if state.completed == 0 {
+            return None;
+        }
+        let result = self.finish(Ok(state.completed), memory);
+        state.terminal = Some(result);
+        state.finished = true;
+        Some(result)
     }
     pub fn pipe_signal(&self) -> bool {
         self.state.lock().unwrap().pipe
@@ -57,24 +84,44 @@ impl Batch {
     ) -> Option<Result<u64, Errno>> {
         let mut state = self.state.lock().unwrap();
         let a = accepted.args;
-        let count = (a[2] as u32).min(1024) as u64;
+        let receive = self.receive.is_some();
+        let operation = if receive { 212 } else { 211 };
+        let count = if receive {
+            a[2] as u32 as u64
+        } else {
+            (a[2] as u32).min(1024) as u64
+        };
         loop {
             if let Some(result) = state.terminal {
+                let result = if !state.finished {
+                    self.finish(result, memory)
+                } else {
+                    result
+                };
+                state.finished = true;
+                state.terminal = Some(result);
                 return Some(result);
             }
             if state.completed == count {
                 state.terminal = Some(Ok(count));
                 continue;
             }
+            let flags = if receive {
+                crate::network_batch::Receive::flags(a[3] as u32, state.completed)
+            } else {
+                a[3] as u32
+            };
             let mut deferred = false;
             let result = (|| {
                 let header = a[1].checked_add(state.completed * 64).ok_or(Errno(14))?;
-                let item_args = [a[0], header, a[3] as u32 as u64, 0, 0, 0];
+                let item_args = [a[0], header, flags as u64, 0, 0, 0];
                 if state.active.is_none() {
-                    state.requested = crate::network_batch::requested(memory, header)?;
+                    if !receive {
+                        state.requested = crate::network_batch::requested(memory, header)?;
+                    }
                     match direct.prepare_local_context(
                         fd,
-                        211,
+                        operation,
                         item_args,
                         memory,
                         (&accepted.factory, accepted.identity),
@@ -90,7 +137,7 @@ impl Batch {
                 let sent = direct
                     .transfer_retained(
                         state.active.as_ref().expect("accepted item"),
-                        211,
+                        operation,
                         item_args,
                         memory,
                         original_paths,
@@ -114,16 +161,26 @@ impl Batch {
             }
             match result {
                 Ok(sent) => {
-                    let short = sent < state.requested;
+                    let short = !receive && sent < state.requested
+                        || self.receive.as_ref().is_some_and(|r| r.expired());
                     state.completed += 1;
                     state.active = None;
                     if short {
                         state.terminal = Some(Ok(state.completed));
                     }
                 }
-                Err(Errno(11)) if state.completed == 0 => return Some(Err(Errno(11))),
+                Err(Errno(11))
+                    if state.completed == 0
+                        || receive && flags & 0x40 == 0 && !fd.nonblocking() =>
+                {
+                    return Some(Err(Errno(11)))
+                }
                 Err(error) => {
-                    if error.0 == 32 && fd.local_kind() == 1 && a[3] as u32 & 0x4000 == 0 {
+                    if !receive
+                        && error.0 == 32
+                        && fd.local_kind() == 1
+                        && a[3] as u32 & 0x4000 == 0
+                    {
                         state.pipe = true;
                     }
                     state.terminal = Some(if state.completed == 0 {

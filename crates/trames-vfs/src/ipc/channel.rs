@@ -183,7 +183,7 @@ impl Resource {
         flags: u32,
         identity: Option<[u32; 3]>,
     ) -> Result<usize> {
-        self.send_ancillary(side, bytes, flags, None, identity, Vec::new())
+        self.send_ancillary(side, bytes, flags, None, identity, Vec::new(), false)
     }
     pub(super) fn send_shared(
         &self,
@@ -192,6 +192,17 @@ impl Resource {
         flags: u32,
         rights: SharedRights,
         identity: Option<[u32; 3]>,
+    ) -> Result<usize> {
+        self.send_shared_mode(side, bytes, flags, rights, identity, false)
+    }
+    pub(super) fn send_shared_mode(
+        &self,
+        side: usize,
+        bytes: &[u8],
+        flags: u32,
+        rights: SharedRights,
+        identity: Option<[u32; 3]>,
+        explicit: bool,
     ) -> Result<usize> {
         let rights = if rights.owns_unix() {
             self.send_check(side, flags)?;
@@ -202,7 +213,7 @@ impl Resource {
         } else {
             (!rights.is_empty()).then_some(QueuedRights::Shared(rights))
         };
-        self.send_ancillary(side, bytes, flags, rights, identity, Vec::new())
+        self.send_ancillary(side, bytes, flags, rights, identity, Vec::new(), explicit)
     }
     pub(super) fn send_addressed(
         &self,
@@ -211,9 +222,11 @@ impl Resource {
         rights: Option<QueuedRights>,
         identity: [u32; 3],
         source: Vec<u8>,
+        explicit: bool,
     ) -> Result<usize> {
-        self.send_ancillary(1, bytes, flags, rights, Some(identity), source)
+        self.send_ancillary(1, bytes, flags, rights, Some(identity), source, explicit)
     }
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn send_ancillary(
         &self,
         side: usize,
@@ -222,6 +235,7 @@ impl Resource {
         rights: Option<QueuedRights>,
         identity: Option<[u32; 3]>,
         source: Vec<u8>,
+        explicit: bool,
     ) -> Result<usize> {
         if flags & !(0x40 | 0x4000 | 0x40000000) != 0 {
             return Err(Errno(95));
@@ -232,7 +246,7 @@ impl Resource {
                 return Ok(0);
             }
             let peer = 1 - side;
-            let credentials = if data.passcred[peer] || !source.is_empty() {
+            let credentials = if explicit || data.passcred[side] || data.passcred[peer] {
                 Some(identity.ok_or(Errno(95))?)
             } else {
                 None
@@ -480,6 +494,40 @@ impl Data {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn explicit_credentials_and_sender_passcred_are_distinct_from_late_receive_enable() {
+        for kind in [1, 2, 5] {
+            for mode in 0..3 {
+                let mut vfs = Vfs::default();
+                let [a, b] = vfs.socketpair(1, kind, 0).unwrap();
+                let tx = vfs.direct_descriptors().get(a).unwrap();
+                let receiver = vfs.local_socket(b).unwrap().unwrap();
+                if mode == 1 {
+                    vfs.local_socket(a)
+                        .unwrap()
+                        .unwrap()
+                        .set_reuse(16, 1)
+                        .unwrap();
+                }
+                let rights = SharedRights::default();
+                let result = if mode == 2 {
+                    tx.send_local_message_explicit(b"x", 0, &rights, [42, 1000, 1001])
+                } else {
+                    tx.send_local_message(b"x", 0, &rights, [42, 1000, 1001])
+                };
+                assert_eq!(result, Some(Ok(1)));
+                receiver.set_reuse(16, 1).unwrap();
+                assert_eq!(
+                    receiver.recv(1, 0).unwrap().credentials,
+                    Some(if mode == 0 {
+                        [0, 65534, 65534]
+                    } else {
+                        [42, 1000, 1001]
+                    })
+                );
+            }
+        }
+    }
     #[test]
     fn credentials_survive_partial_reads_and_cached_worker_capabilities() {
         let mut vfs = Vfs::default();

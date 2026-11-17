@@ -205,6 +205,14 @@ pub(crate) trait MessageIo {
         rights: Self::Rights,
         identity: [u32; 3],
     ) -> Option<Result<usize>>;
+    fn send_explicit(
+        &mut self,
+        bytes: &[u8],
+        flags: u32,
+        destination: Option<&[u8]>,
+        rights: Self::Rights,
+        identity: [u32; 3],
+    ) -> Option<Result<usize>>;
     fn sender_credentials(&self) -> [u32; 3];
     fn credentials(&self) -> &trames_vfs::Credentials;
     fn local_pid(&self, global: u32) -> u32;
@@ -251,6 +259,7 @@ impl MessageIo for OwnerMessage<'_> {
                 destination,
                 rights,
                 identity,
+                false,
             ));
         }
         Some(self.vfs.local_send_credentials(
@@ -260,6 +269,36 @@ impl MessageIo for OwnerMessage<'_> {
             destination,
             rights,
             identity,
+        ))
+    }
+    fn send_explicit(
+        &mut self,
+        bytes: &[u8],
+        flags: u32,
+        destination: Option<&[u8]>,
+        rights: Self::Rights,
+        identity: [u32; 3],
+    ) -> Option<Result<usize>> {
+        if let Some(datagram) = self.datagram {
+            return Some(self.vfs.send_datagram_owned(
+                &datagram.source,
+                &datagram.target,
+                bytes,
+                flags,
+                destination,
+                rights,
+                identity,
+                true,
+            ));
+        }
+        Some(self.vfs.local_send_credentials_mode(
+            self.socket,
+            bytes,
+            flags,
+            destination,
+            rights,
+            identity,
+            true,
         ))
     }
     fn sender_credentials(&self) -> [u32; 3] {
@@ -304,7 +343,7 @@ pub(crate) struct PreparedMessage<R> {
     frame: Message,
     args: [u64; 6],
     receive: bool,
-    send: Option<(Vec<u8>, R, [u32; 3])>,
+    send: Option<(Vec<u8>, R, [u32; 3], bool)>,
 }
 /// Import buffers, credentials and descriptor references once, before waiting.
 /// The typed worker Rights graph owns only actual shared OFDs.
@@ -331,6 +370,7 @@ pub(crate) fn prepare_message<I: MessageIo>(
         let vectors = &frame.vectors;
         let mut fds = Vec::new();
         let mut identity = io.sender_credentials();
+        let mut explicit = false;
         let mut offset = 0;
         while control_size - offset >= 16 {
             let length = u64_at(memory, control + offset)?;
@@ -360,6 +400,7 @@ pub(crate) fn prepare_message<I: MessageIo>(
                     return Err(Errno(1));
                 }
                 identity = [global, uid, gid];
+                explicit = true;
             } else {
                 for i in 0..(length - 16) / 4 {
                     fds.push(u32_at(memory, control + offset + 16 + i * 4)?);
@@ -387,7 +428,7 @@ pub(crate) fn prepare_message<I: MessageIo>(
             frame,
             args: a,
             receive,
-            send: Some((bytes, rights, identity)),
+            send: Some((bytes, rights, identity, explicit)),
         })
     })();
     if deferred.get() {
@@ -525,15 +566,26 @@ impl<R: Clone> PreparedMessage<R> {
                     received.data.len()
                 } as u64)
             } else {
-                let (bytes, rights, identity) = self.send.as_ref().expect("prepared send");
-                io.send(
-                    bytes,
-                    a[2] as u32,
-                    self.frame.destination.as_deref(),
-                    rights.clone(),
-                    *identity,
-                )
-                .unwrap_or_else(|| {
+                let (bytes, rights, identity, explicit) =
+                    self.send.as_ref().expect("prepared send");
+                let sent = if *explicit {
+                    io.send_explicit(
+                        bytes,
+                        a[2] as u32,
+                        self.frame.destination.as_deref(),
+                        rights.clone(),
+                        *identity,
+                    )
+                } else {
+                    io.send(
+                        bytes,
+                        a[2] as u32,
+                        self.frame.destination.as_deref(),
+                        rights.clone(),
+                        *identity,
+                    )
+                };
+                sent.unwrap_or_else(|| {
                     deferred.set(true);
                     Err(Errno(11))
                 })

@@ -51,7 +51,7 @@ impl State {
 impl Endpoint {
     pub(super) fn poll(&self, events: u16) -> Result<u16> {
         let mut wanted = PollFlags::empty();
-        if events & 1 != 0 {
+        if events & 0x2001 != 0 {
             wanted |= PollFlags::POLLIN;
         }
         if events & 2 != 0 {
@@ -60,9 +60,35 @@ impl Endpoint {
         if events & 4 != 0 {
             wanted |= PollFlags::POLLOUT;
         }
-        let mut fds = [PollFd::new(self.as_fd(), wanted)];
-        poll(&mut fds, PollTimeout::ZERO).map_err(from_errno)?;
-        let ready = fds[0].revents().unwrap_or(PollFlags::empty());
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let (ready, read_hangup) = {
+            // nix's PollFlags omits POLLRDHUP and rejects unknown revents.
+            // Keep the original native poll, preserving that Linux event bit.
+            let mut fd = nix::libc::pollfd {
+                fd: self.as_fd().as_raw_fd(),
+                events: wanted.bits()
+                    | if events & 0x2000 != 0 {
+                        nix::libc::POLLRDHUP
+                    } else {
+                        0
+                    },
+                revents: 0,
+            };
+            // SAFETY: one initialized host pollfd, live owned FD, zero timeout.
+            if unsafe { nix::libc::poll(&mut fd, 1, 0) } < 0 {
+                return Err(from_io(io::Error::last_os_error()));
+            }
+            (
+                PollFlags::from_bits_truncate(fd.revents),
+                fd.revents & nix::libc::POLLRDHUP != 0,
+            )
+        };
+        #[cfg(target_vendor = "apple")]
+        let ready = {
+            let mut fds = [PollFd::new(self.as_fd(), wanted)];
+            poll(&mut fds, PollTimeout::ZERO).map_err(from_errno)?;
+            fds[0].revents().unwrap_or(PollFlags::empty())
+        };
         let mut result = 0;
         for (native, guest) in [
             (PollFlags::POLLIN, 1),
@@ -76,7 +102,36 @@ impl Endpoint {
                 result |= guest;
             }
         }
-        Ok(result)
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if read_hangup {
+            result |= 0x2000;
+        }
+        #[cfg(target_vendor = "apple")]
+        if events & 0x2000 != 0
+            && ready.contains(PollFlags::POLLIN)
+            && matches!(self.socket, NativeSocket::Tcp(_))
+            && self.state.connection() == Connection::Connected
+        {
+            // Darwin has no POLLRDHUP. Query the original TCP state only for
+            // requested, readable half-close observations, including queued data.
+            // A peek alone misses FIN while unread payload remains buffered.
+            let mut info: nix::libc::tcp_connection_info = unsafe { std::mem::zeroed() };
+            let mut length = std::mem::size_of_val(&info) as nix::libc::socklen_t;
+            // SAFETY: initialized local host struct and its exact writable size.
+            let ok = unsafe {
+                nix::libc::getsockopt(
+                    self.as_fd().as_raw_fd(),
+                    nix::libc::IPPROTO_TCP,
+                    nix::libc::TCP_CONNECTION_INFO,
+                    (&mut info as *mut nix::libc::tcp_connection_info).cast(),
+                    &mut length,
+                )
+            } == 0;
+            if ok && matches!(info.tcpi_state, 0 | 5 | 7 | 8 | 10) {
+                result |= 0x2000;
+            }
+        }
+        Ok(result & (events | 8 | 16 | 32))
     }
     // Only connection completion serializes its host readiness/error sampling
     // and state transition. Ordinary TCP byte calls never take this lock.

@@ -229,6 +229,15 @@ fn ioctl_rejections_and_partial_render_outputs_preserve_error_precedence() {
 
 #[test]
 fn interface_controls_observe_live_original_network_and_credentials() {
+    // The debug packet-stack fixture exceeds Linux libtest's 2 MiB stack.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(interface_controls_original_network_case)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+fn interface_controls_original_network_case() {
     let (mut linux, mut m, fd) = setup(1);
     linux.vfs.unshare_net().unwrap();
     let direct = capture(&linux);

@@ -455,8 +455,27 @@ impl LocalSocket {
         rights: LocalRights,
         credentials: [u32; 3],
     ) -> Result<usize> {
+        self.send_rights_credentials_mode(bytes, flags, rights, credentials, false)
+    }
+    pub fn send_explicit_credentials(
+        &self,
+        bytes: &[u8],
+        flags: u32,
+        rights: LocalRights,
+        credentials: [u32; 3],
+    ) -> Result<usize> {
+        self.send_rights_credentials_mode(bytes, flags, rights, credentials, true)
+    }
+    fn send_rights_credentials_mode(
+        &self,
+        bytes: &[u8],
+        flags: u32,
+        rights: LocalRights,
+        credentials: [u32; 3],
+        explicit: bool,
+    ) -> Result<usize> {
         if self.addressed_datagram() {
-            return self.send_connected_rights(bytes, flags, rights, credentials);
+            return self.send_connected_rights(bytes, flags, rights, credentials, explicit);
         }
         // Preserve the original flags/connection/state checks before rights
         // graph traversal. Pure bytes need no owner rights-map operation.
@@ -467,17 +486,18 @@ impl LocalSocket {
             return Err(Errno(if self.kind == 2 { 89 } else { 107 }));
         }
         let binding = self.channel.borrow();
-        if rights.is_empty() {
+        if rights.is_empty() && !explicit {
             return binding
                 .resource
                 .send_credentials(self.side(), bytes, flags, Some(credentials));
         }
-        binding.resource.send_shared(
+        binding.resource.send_shared_mode(
             self.side(),
             bytes,
             flags,
             rights.shared(),
             Some(credentials),
+            explicit,
         )
     }
 

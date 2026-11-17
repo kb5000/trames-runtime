@@ -8,12 +8,13 @@ use std::sync::{
 };
 
 pub(super) fn number(number: u32) -> bool {
-    matches!(number, 206 | 207 | 211 | 212 | 269)
+    matches!(number, 206 | 207 | 211 | 212 | 243 | 269)
 }
 
 pub(super) struct Message {
     state: Mutex<State>,
     pipe: AtomicBool,
+    receive: Option<crate::network_batch::Receive>,
 }
 #[derive(Default)]
 struct State {
@@ -21,6 +22,7 @@ struct State {
     requested: u64,
     active: Option<Prepared>,
     terminal: Option<Result<u64, Errno>>,
+    finished: bool,
     recheck: bool,
 }
 impl Message {
@@ -32,6 +34,11 @@ impl Message {
     ) -> Result<Self, Errno> {
         Ok(Self {
             pipe: AtomicBool::new(false),
+            receive: if number == 243 {
+                Some(crate::network_batch::Receive::new(args, memory)?)
+            } else {
+                None
+            },
             state: Mutex::new(State {
                 active: Some(Prepared::raw(number, args, memory, flags)?),
                 ..State::default()
@@ -45,18 +52,43 @@ impl Message {
         address_size: usize,
         stream: bool,
     ) -> Result<Self, Errno> {
-        let active = if number == 269 {
+        let active = if matches!(number, 243 | 269) {
             None
         } else {
             Some(Prepared::new(number, args, memory, address_size, stream)?)
         };
         Ok(Self {
             pipe: AtomicBool::new(false),
+            receive: if number == 243 {
+                Some(crate::network_batch::Receive::new(args, memory)?)
+            } else {
+                None
+            },
             state: Mutex::new(State {
                 active,
                 ..State::default()
             }),
         })
+    }
+    fn finish(
+        &self,
+        result: Result<u64, Errno>,
+        memory: &mut impl CpuMemory,
+    ) -> Result<u64, Errno> {
+        self.receive
+            .as_ref()
+            .map_or(result, |receive| receive.finish(result, memory))
+    }
+    pub fn partial_receive(&self, memory: &mut impl CpuMemory) -> Option<Result<u64, Errno>> {
+        self.receive.as_ref()?;
+        let mut state = self.state.lock().unwrap();
+        if state.completed == 0 {
+            return None;
+        }
+        let result = self.finish(Ok(state.completed), memory);
+        state.terminal = Some(result);
+        state.finished = true;
+        Some(result)
     }
     pub fn pipe_signal(&self) -> bool {
         self.pipe.load(Ordering::Relaxed)
@@ -93,21 +125,38 @@ impl Message {
         mut send: impl FnMut(&[u8], u32, Option<&[u8]>) -> Result<usize, Errno>,
     ) -> Result<u64, Errno> {
         let mut state = self.state.lock().unwrap();
-        let batch = number == 269;
-        let flags = socket_flags(number, a);
+        let batch = matches!(number, 243 | 269);
+        let receive = number == 243;
+        let original_flags = socket_flags(number, a);
         let count = if batch {
-            (a[2] as u32).min(1024) as u64
+            if receive {
+                a[2] as u32 as u64
+            } else {
+                (a[2] as u32).min(1024) as u64
+            }
         } else {
             1
         };
         loop {
             if let Some(result) = state.terminal {
+                let result = if !state.finished {
+                    self.finish(result, memory)
+                } else {
+                    result
+                };
+                state.finished = true;
+                state.terminal = Some(result);
                 return result;
             }
             if state.completed == count {
                 state.terminal = Some(Ok(count));
                 continue;
             }
+            let flags = if receive {
+                crate::network_batch::Receive::flags(original_flags, state.completed)
+            } else {
+                original_flags
+            };
             let result = (|| {
                 let header = if batch {
                     a[1].checked_add(state.completed * 64).ok_or(Errno(14))?
@@ -115,9 +164,11 @@ impl Message {
                     a[1]
                 };
                 if state.active.is_none() {
-                    state.requested = crate::network_batch::requested(memory, header)?;
+                    if !receive {
+                        state.requested = crate::network_batch::requested(memory, header)?;
+                    }
                     state.active = Some(Prepared::new(
-                        211,
+                        if receive { 212 } else { 211 },
                         [a[0], header, flags as u64, 0, 0, 0],
                         memory,
                         socket.address_size(),
@@ -158,11 +209,18 @@ impl Message {
                 Ok(sent) => {
                     state.completed += 1;
                     state.active = None;
-                    if sent < state.requested {
+                    if !receive && sent < state.requested
+                        || self.receive.as_ref().is_some_and(|r| r.expired())
+                    {
                         state.terminal = Some(Ok(state.completed));
                     }
                 }
-                Err(Errno(11)) if state.completed == 0 => {
+                Err(Errno(11))
+                    if state.completed == 0
+                        || receive
+                            && flags & 0x40 == 0
+                            && socket.flags() & trames_vfs::O_NONBLOCK == 0 =>
+                {
                     state.recheck = true;
                     return Err(Errno(11));
                 }

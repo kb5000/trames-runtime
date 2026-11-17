@@ -833,7 +833,7 @@ impl Ruleset {
         let kind = kind(r);
         let flags = flags(r);
         let seq = u32::from_le_bytes(r[8..12].try_into().unwrap());
-        if r.len() < 20 || r[17] != 0 || r[18..20] != [0, 0] {
+        if r.len() < 20 || r[17] != 0 {
             return Err(NetError(22));
         }
         if kind == 11 << 8 && !batch {
@@ -872,7 +872,7 @@ impl Ruleset {
             return Err(NetError(95));
         }
         let family = r[16];
-        if !matches!(family, 0 | 1 | 2 | 10) || (!read && family == 0) {
+        if !matches!(family, 0 | 1 | 2 | 10) || (!read && family == 0 && op != 2) {
             return Err(NetError(97));
         }
         let mut out = vec![];
@@ -983,6 +983,19 @@ impl Ruleset {
             if dump {
                 out.push(message(3, 2, seq, port, &0i32.to_le_bytes()));
             }
+            return Ok(out);
+        }
+        if op == 2 && get(&a, 1).is_none() {
+            // An unnamed DELTABLE flushes the selected family, or the complete
+            // original namespace ruleset for NFPROTO_UNSPEC, in this transaction.
+            if flags & 0x100 != 0
+                && self.tables.iter().any(|((f, _), table)| {
+                    (family == 0 || family == *f) && !table.chains.is_empty()
+                })
+            {
+                return Err(NetError(16));
+            }
+            self.tables.retain(|(f, _), _| family != 0 && family != *f);
             return Ok(out);
         }
         let key = (family, name(&a, 1)?);

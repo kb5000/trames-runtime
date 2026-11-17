@@ -70,6 +70,16 @@ fn shared_batch(shared: &Firewall, r: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
     request_rules(shared, true, &requests, 1, true, 128, MAX_BYTES)
 }
 #[test]
+fn resource_id_and_unspecified_flush_use_one_original_rules_transaction() {
+    let ns = Namespace::default();
+    assert_eq!(errno(&batch(&ns, &[table("first"), table("second")])), 0);
+    let mut flush = req(2, 0, 4, &[]);
+    flush[18..20].copy_from_slice(&10u16.to_be_bytes());
+    assert_eq!(errno(&batch(&ns, &[flush])), 0);
+    let rules = ns.graph.read().unwrap().firewall(ns.id());
+    assert!(rules.read().unwrap().tables.is_empty());
+}
+#[test]
 fn concurrent_rule_batches_preserve_every_commit_and_generation() {
     let rules = std::sync::Arc::new(Firewall::default());
     let start = std::sync::Barrier::new(9);

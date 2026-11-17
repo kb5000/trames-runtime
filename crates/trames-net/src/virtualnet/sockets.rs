@@ -501,7 +501,15 @@ impl Socket {
         Ok((socket, self.presented(peer)))
     }
     pub fn connect(&self, a: SocketAddr) -> Result<()> {
-        let a = self.normalize(a)?;
+        let mut a = self.normalize(a)?;
+        // Linux treats a connect to an unspecified address as local loopback.
+        if a.ip().is_unspecified() {
+            a.set_ip(if a.is_ipv4() {
+                Ipv4Addr::LOCALHOST.into()
+            } else {
+                Ipv6Addr::LOCALHOST.into()
+            });
+        }
         // UDP connect is also Linux's source-route probe: a zero destination
         // port selects the source without establishing a getpeername peer.
         if self.kind == 2 {
@@ -990,6 +998,17 @@ impl Socket {
                     if s.can_recv() || !s.may_recv() || state.read_closed {
                         ready |= 1;
                     }
+                    if matches!(
+                        s.state(),
+                        tcp::State::CloseWait
+                            | tcp::State::LastAck
+                            | tcp::State::Closing
+                            | tcp::State::TimeWait
+                            | tcp::State::Closed
+                    ) || state.read_closed
+                    {
+                        ready |= 0x2000;
+                    }
                     if s.can_send() || !s.may_send() {
                         ready |= 4;
                     }
@@ -1134,6 +1153,36 @@ impl Socket {
         drop(state);
         i.driver_dirty = true;
         Ok(())
+    }
+    pub fn tcp_info(&self) -> Result<[u8; 104]> {
+        if self.kind != 1 {
+            return Err(NetError(95));
+        }
+        let state_code = self.info().state;
+        let fabric = self.network.0.fabric.0.borrow();
+        let state = self.state.borrow();
+        let socket = state.handles.first().and_then(|handle| {
+            fabric
+                .nodes
+                .get(&self.network.0.key)
+                .map(|node| node.sockets.get::<tcp::Socket>(*handle))
+        });
+        let mut out = [0; 104];
+        out[0] = state_code;
+        if let Some(socket) = socket {
+            let [rto, rtt, variance, mss, cwnd, window] = socket.transport_info();
+            for (offset, value) in [
+                (8, rto),
+                (16, mss),
+                (68, rtt),
+                (72, variance),
+                (80, cwnd / mss.max(1)),
+                (96, window),
+            ] {
+                out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        Ok(out)
     }
     pub fn get_option(&self, level: u32, name: u32) -> Result<i32> {
         if (level, name) == (1, 36) {

@@ -1054,10 +1054,29 @@ impl DirectFd {
         rights: &SharedRights,
         credentials: [u32; 3],
     ) -> Option<Result<usize>> {
+        self.send_local_message_mode(bytes, flags, rights, credentials, false)
+    }
+    pub fn send_local_message_explicit(
+        &self,
+        bytes: &[u8],
+        flags: u32,
+        rights: &SharedRights,
+        credentials: [u32; 3],
+    ) -> Option<Result<usize>> {
+        self.send_local_message_mode(bytes, flags, rights, credentials, true)
+    }
+    fn send_local_message_mode(
+        &self,
+        bytes: &[u8],
+        flags: u32,
+        rights: &SharedRights,
+        credentials: [u32; 3],
+        explicit: bool,
+    ) -> Option<Result<usize>> {
         let ByteResource::Unix { data, side } = &self.resource else {
             return None;
         };
-        data.send_local(*side, bytes, flags, rights, credentials)
+        data.send_local(*side, bytes, flags, rights, credentials, explicit)
     }
     pub fn is_pty(&self) -> bool {
         matches!(self.resource, ByteResource::Pty { .. })

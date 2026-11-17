@@ -391,6 +391,10 @@ mod tests {
         snapshot(&mut v);
         assert_eq!(read(&mut v, b"/proc/self/setgroups"), b"allow\n");
         assert_eq!(read(&mut v, b"/proc/1/task/1/setgroups"), b"allow\n");
+        for path in [b"/proc/self/uid_map".as_slice(), b"/proc/1/task/1/gid_map"] {
+            assert_eq!(read(&mut v, path), b"         0          0 4294967295\n");
+            assert!(v.open_at(AT_FDCWD, path, 1, 0).is_err());
+        }
         // User namespaces and changing their setgroups policy are unsupported.
         assert!(v.open_at(AT_FDCWD, b"/proc/self/setgroups", 1, 0).is_err());
     }
@@ -2010,6 +2014,7 @@ impl Vfs {
                         // All tasks currently belong to the initial user
                         // namespace; supplementary groups are not disabled.
                         b"setgroups" => b"allow\n".to_vec(),
+                        b"uid_map" | b"gid_map" => b"         0          0 4294967295\n".to_vec(),
                         b"comm" => comm(p),
                         b"cgroup" => {
                             [b"0::".as_slice(), &self.cgroup_view_path(&p.cgroup), b"\n"].concat()
@@ -2853,6 +2858,8 @@ impl Vfs {
                             "statm",
                             "oom_score_adj",
                             "setgroups",
+                            "uid_map",
+                            "gid_map",
                             "cgroup",
                             "cmdline",
                             "environ",

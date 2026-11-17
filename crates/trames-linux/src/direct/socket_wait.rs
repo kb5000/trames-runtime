@@ -133,6 +133,9 @@ impl RetainedSocket {
             Control::Unix { .. } => None,
         }
     }
+    pub fn interrupted(&self, memory: &mut impl CpuMemory) -> Option<Result<u64, Errno>> {
+        self.message.as_ref()?.partial_receive(memory)
+    }
     pub fn pipe_signal(&self) -> bool {
         self.message
             .as_ref()
@@ -385,7 +388,7 @@ impl DirectSyscalls {
         {
             return None;
         }
-        if number == 269 && args[3] as u32 & 0x8000_0000 != 0 {
+        if matches!(number, 243 | 269) && args[3] as u32 & 0x8000_0000 != 0 {
             return Some(Err(Errno(22)));
         }
         let factory = self.resources.as_ref()?;
@@ -416,10 +419,10 @@ impl DirectSyscalls {
             };
             let deadline = match &socket {
                 Control::Network(socket) => socket
-                    .io_timeout(matches!(number, 202 | 242 | 207 | 212))
+                    .io_timeout(matches!(number, 202 | 242 | 207 | 212 | 243))
                     .and_then(|d| Instant::now().checked_add(d)),
                 Control::Unix { socket, .. } => socket
-                    .io_timeout(matches!(number, 202 | 242 | 207 | 212))
+                    .io_timeout(matches!(number, 202 | 242 | 207 | 212 | 243))
                     .and_then(|d| Instant::now().checked_add(d)),
             };
             let message = match &socket {
@@ -506,6 +509,11 @@ impl DirectSyscalls {
             return IoAttempt::SocketCheckpoint(call);
         }
         if !call.waits(&result) {
+            let result = if result == Err(Errno(11)) {
+                call.interrupted(memory).unwrap_or(result)
+            } else {
+                result
+            };
             return self.finish_socket(call, result);
         }
         let mut pending = self.socket_wait(call, pid, target);
@@ -588,6 +596,11 @@ impl DirectSyscalls {
         } else if call.waits(&result) {
             IoAttempt::Blocked(pending)
         } else {
+            let result = if result == Err(Errno(11)) {
+                call.interrupted(memory).unwrap_or(result)
+            } else {
+                result
+            };
             self.finish_socket(pending.retained_socket.take().unwrap(), result)
         }
     }
@@ -656,6 +669,11 @@ impl DirectSyscalls {
             return IoAttempt::SocketCheckpoint(call);
         };
         if !call.waits(&result) {
+            let result = if result == Err(Errno(11)) {
+                call.interrupted(memory).unwrap_or(result)
+            } else {
+                result
+            };
             return self.finish_socket(call, result);
         }
         if matches!(call.socket, Control::Unix { .. }) {

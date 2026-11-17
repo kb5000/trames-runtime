@@ -1393,6 +1393,40 @@ impl Drop for Socket {
 mod shared_lifetime_tests {
     use super::*;
     #[test]
+    fn unspecified_connect_tcp_info_and_half_close_share_original_transport() {
+        let fabric = Fabric::new().unwrap();
+        let network = fabric.environment(2, NetworkMode::Full).unwrap();
+        let listener = network.socket(2, 1, 0).unwrap();
+        listener.bind("127.0.0.1:34011".parse().unwrap()).unwrap();
+        listener.listen(2).unwrap();
+        let client = network.socket(2, 1, 0).unwrap();
+        assert_eq!(client.tcp_info().unwrap()[0], 7);
+        assert_eq!(
+            client.connect("0.0.0.0:34011".parse().unwrap()),
+            Err(NetError(115))
+        );
+        for _ in 0..100 {
+            if client.connect_complete().unwrap() {
+                break;
+            }
+        }
+        let (peer, _) = listener.accept().unwrap();
+        let info = client.tcp_info().unwrap();
+        assert_eq!(info[0], 1);
+        for offset in [8, 16, 80] {
+            assert!(u32::from_le_bytes(info[offset..offset + 4].try_into().unwrap()) > 0);
+        }
+        assert_eq!(peer.send(b"tail", 0, None), Ok(4));
+        peer.shutdown(1).unwrap();
+        for _ in 0..100 {
+            if client.poll(0x2001).unwrap() & 0x2000 != 0 {
+                break;
+            }
+        }
+        assert_eq!(client.poll(0x2001), Ok(0x2001));
+        assert_eq!(client.tcp_info().unwrap()[0], 8);
+    }
+    #[test]
     fn closed_tcp_protocol_states_do_not_exhaust_later_accepts() {
         let fabric = Fabric::new().unwrap();
         let clients = fabric.environment(2, NetworkMode::Full).unwrap();

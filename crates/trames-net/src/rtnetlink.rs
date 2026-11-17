@@ -861,7 +861,7 @@ pub(crate) fn request(
     let retained_namespaces = namespaces.into_values().filter_map(Result::ok).collect();
     if let Err(e) = result {
         let mut data = (-(e.0 as i32)).to_le_bytes().to_vec();
-        data.extend_from_slice(&request[..16]);
+        data.extend_from_slice(request);
         return Ok(Reply {
             messages: vec![message(2, 0, seq, port, &data)],
             changes: vec![],

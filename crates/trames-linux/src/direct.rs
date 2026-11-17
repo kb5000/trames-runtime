@@ -86,6 +86,12 @@ struct PipeWrite {
     written: usize,
 }
 impl RetainedByte {
+    pub fn interrupted(&self, memory: &mut impl CpuMemory) -> Option<Result<u64, Errno>> {
+        if let Some(message) = self.message() {
+            return message.interrupted(memory);
+        }
+        self.partial_write().map(Ok)
+    }
     pub fn partial_write(&self) -> Option<u64> {
         if let ByteOperation::Pipe(write) = &self.operation {
             let n = write.lock().unwrap().written;
@@ -559,7 +565,7 @@ impl DirectSyscalls {
     }
     pub fn supports_local_message(&self, number: u32, fd: u32) -> bool {
         self.resources.is_some()
-            && (matches!(number, 211 | 212 | 269)
+            && (matches!(number, 211 | 212 | 243 | 269)
                 || matches!(number, 63..=66 | 206 | 207)
                     && self
                         .descriptors
@@ -863,7 +869,7 @@ impl DirectSyscalls {
     pub fn supports(&self, number: u32, fd: u32) -> bool {
         // Classify the ABI before resolving an FD. Creation, pathname, clock
         // and other non-I/O calls must not look up argument zero as a number.
-        if !matches!(number,22|28|29|62..=70|86|87|206|207|210..=212|269|441) {
+        if !matches!(number,22|28|29|62..=70|86|87|206|207|210..=212|243|269|441) {
             return false;
         }
         if self.network.get(fd).is_some() {
@@ -890,7 +896,7 @@ impl DirectSyscalls {
             fd.timer().is_some()
         } else if number == 28 {
             fd.is_inotify()
-        } else if matches!(number, 206 | 207 | 210..=212 | 269) {
+        } else if matches!(number, 206 | 207 | 210..=212 | 243 | 269) {
             fd.is_unix()
         } else if number == 29 {
             fd.has_readable_bytes() || fd.is_entropy_device()
@@ -1225,7 +1231,7 @@ impl DirectSyscalls {
         // entry, before any queue effect, rather than probing then re-resolving.
         if fd.is_unix() && fd.local_kind() != 1 && matches!(number, 63..=66 | 206 | 207)
             || fd.is_addressed_datagram() && matches!(number, 211 | 212)
-            || number == 269
+            || matches!(number, 243 | 269)
         {
             return None;
         }
@@ -1449,6 +1455,15 @@ impl DirectSyscalls {
         result: Result<u64, Errno>,
         memory: &mut impl CpuMemory,
     ) -> IoAttempt {
+        let result = if result == Err(Errno(11)) {
+            pending
+                .retained_byte
+                .as_ref()
+                .and_then(|file| file.interrupted(memory))
+                .unwrap_or(result)
+        } else {
+            result
+        };
         let result = if let Some(wait) = &pending.retained_poll {
             wait.finish(memory, result)
         } else {
@@ -1502,7 +1517,7 @@ impl DirectSyscalls {
         if Self::aio_call(number) {
             return self.start_aio(number, args, memory, pid, target, saved_deadline);
         }
-        if matches!(number, 206 | 207 | 211 | 212 | 269) && self.resources.is_some() {
+        if matches!(number, 206 | 207 | 211 | 212 | 243 | 269) && self.resources.is_some() {
             if let Some(attempt) = self.start_local_message(number, args, memory, pid, target) {
                 return Some(attempt);
             }
@@ -2020,7 +2035,7 @@ impl DirectSyscalls {
         let subscriptions = file.subscribe(&signal);
         let deadline = if let Some(socket) = file.fd.local_operation() {
             socket
-                .io_timeout(matches!(number, 63 | 65 | 207 | 212 | 286))
+                .io_timeout(matches!(number, 63 | 65 | 207 | 212 | 243 | 286))
                 .and_then(|timeout| Instant::now().checked_add(timeout))
         } else if let ByteOperation::Tcp(tcp) = &file.operation {
             tcp.timeouts[usize::from(matches!(number, 63 | 65 | 286))]
@@ -2298,7 +2313,7 @@ impl DirectSyscalls {
         match result {
             Err(Errno(11)) => {
                 if !self.terminal_stop.get()
-                    && ((matches!(pending.number, 63..=66 | 206 | 207 | 210..=212 | 269 | 286 | 287)
+                    && ((matches!(pending.number, 63..=66 | 206 | 207 | 210..=212 | 243 | 269 | 286 | 287)
                         && pending.retained_byte.as_ref().map_or_else(
                             || {
                                 pending.native_tcp.as_ref().map_or_else(
@@ -2434,7 +2449,7 @@ fn poll_deadline(
 
 fn socket_flags(number: u32, args: [u64; 6]) -> u32 {
     match number {
-        206 | 207 | 269 => args[3] as u32,
+        206 | 207 | 243 | 269 => args[3] as u32,
         211 | 212 => args[2] as u32,
         _ => 0,
     }
