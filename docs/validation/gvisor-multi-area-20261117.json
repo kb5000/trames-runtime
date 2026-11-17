@@ -1200,5 +1200,16 @@
     }
   ],
   "selection_policy": "All original Unix socket groups, complete prior ancillary/message selection, locks and filesystem dependency groups; 82 copy/sendfile/splice follow-up results supersede matching initial records.",
-  "evidence_root": "target/gvisor-multi-area-20261117"
+  "evidence_root": "target/gvisor-multi-area-20261117",
+  "local_checks": {
+    "runtime_macos": "8/8 passed",
+    "runtime_linux_arm64": "8/8 passed",
+    "ipad_arm64_compile": "passed",
+    "ipad_interpreter_unique_passes": 490,
+    "ipad_existing_ignores": 3,
+    "interpreter_full_run_passes": 488,
+    "corrected_unix_selection_passes": 11,
+    "repaired_capacity_fixture_failures": 2,
+    "note": "Reuse unchanged successful cases from the full run; test-only fixture corrections do not repeat unrelated acceptance. One earlier raw-IP stall passed isolated and on the following full serial run."
+  }
 }

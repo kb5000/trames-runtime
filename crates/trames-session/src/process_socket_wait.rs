@@ -2375,6 +2375,17 @@ fn unix_full_backlog_connect_releases_one_slot_until_accept_frees_capacity() {
     }
 }
 
+// Run actual guest reads to drain each filler packet; do not weaken the wait,
+// result, one-filter-decision or no-coordinator assertions below.
+fn repeat_calls(code: &mut Vec<u32>, count: u32, body: impl FnOnce(&mut Vec<u32>)) {
+    code.push(mov(20, count));
+    let start = code.len();
+    body(code);
+    code.push(0xf1000694); // subs x20, x20, #1
+    let back = start as i32 - code.len() as i32;
+    code.push(0x54000001 | ((back as u32 & 0x7ffff) << 5)); // b.ne start
+}
+
 #[test]
 fn unix_packet_bytes_messages_and_capacity_waits_run_on_workers_with_one_entry_decision() {
     for filtered in [false, true] {
@@ -2397,11 +2408,15 @@ fn unix_packet_bytes_messages_and_capacity_waits_run_on_workers_with_one_entry_d
                     if paired == 0 {
                         p.linux.vfs.local_bind(&receiver, address).unwrap();
                     }
-                    receiver.set_reuse(8, 256).unwrap();
+                    source.set_reuse(7, 1024).unwrap();
                     if paired == 0 {
                         p.linux.vfs.local_connect(&source, address).unwrap();
                     }
-                    p.linux.vfs.write(tx, &[0x55; 512]).unwrap();
+                    let filler = if paired == 0 { 128 } else { 4 };
+                    for _ in 0..filler {
+                        p.linux.vfs.write(tx, &[0x55; 512]).unwrap();
+                    }
+                    let calls = filler as u64 + 4;
                     p.memory.write(0x1000, address).unwrap();
                     p.memory.write(0x1030, b"data").unwrap();
                     for (at, value) in [
@@ -2461,20 +2476,23 @@ fn unix_packet_bytes_messages_and_capacity_waits_run_on_workers_with_one_entry_d
                         (0, 512, 0x1200, 0x1120, 0x1540),
                         (1, 4, 0x1400, 0x1140, 0x1580),
                     ] {
-                        let args = match receive {
-                            65 => [rx, iovec, 1, 0, 0, 0],
-                            212 => [rx, header, 0, 0, 0, 0],
-                            _ => [rx, buffer, count, 0, 0, 0],
-                        };
-                        for (i, value) in args.into_iter().enumerate() {
-                            child.push(mov(i as u32, value));
-                        }
-                        child.extend([
-                            mov(8, receive),
-                            0xd4000001,
-                            mov(10, 0x1800 + index * 8),
-                            0xf9000140,
-                        ]);
+                        let repeats = if index == 0 { filler } else { 1 };
+                        repeat_calls(&mut child, repeats, |child| {
+                            let args = match receive {
+                                65 => [rx, iovec, 1, 0, 0, 0],
+                                212 => [rx, header, 0, 0, 0, 0],
+                                _ => [rx, buffer, count, 0, 0, 0],
+                            };
+                            for (i, value) in args.into_iter().enumerate() {
+                                child.push(mov(i as u32, value));
+                            }
+                            child.extend([
+                                mov(8, receive),
+                                0xd4000001,
+                                mov(10, 0x1800 + index * 8),
+                                0xf9000140,
+                            ]);
+                        });
                     }
                     child.extend(park);
                     program(&mut p, parent);
@@ -2485,7 +2503,7 @@ fn unix_packet_bytes_messages_and_capacity_waits_run_on_workers_with_one_entry_d
                     k.processes.insert(1, p);
                     k.processes.insert(2, peer);
                     let until = Instant::now() + Duration::from_secs(3);
-                    while k.syscalls < 5 {
+                    while k.syscalls < calls {
                         let limit = k.instructions + 100_000;
                         assert!(k
                         .parallel_round(&mut trames_linux::CapturedOutput::default(), limit)
@@ -2507,9 +2525,9 @@ fn unix_packet_bytes_messages_and_capacity_waits_run_on_workers_with_one_entry_d
                         k.service_requests, 0,
                         "send={send} filtered={filtered} slots={slots}"
                     );
-                    assert_eq!(k.syscalls, 5);
+                    assert_eq!(k.syscalls, calls);
                     if filtered {
-                        assert_eq!(k.processes.read(&1).seccomp.evaluations(), 5);
+                        assert_eq!(k.processes.read(&1).seccomp.evaluations(), calls);
                     }
                     if slots == 1 {
                         assert!(k.worker_io_waits > 0);
@@ -2545,12 +2563,16 @@ fn unix_batch_capacity_waits_release_one_slot_and_preserve_a_single_filter_decis
                 };
                 p.linux
                     .vfs
-                    .local_socket(rx)
+                    .local_socket(tx)
                     .unwrap()
                     .unwrap()
-                    .set_reuse(8, 256)
+                    .set_reuse(7, 1024)
                     .unwrap();
-                p.linux.vfs.write(tx, &[0x55; 512]).unwrap();
+                let filler = if paired == 0 { 128 } else { 4 };
+                for _ in 0..filler {
+                    p.linux.vfs.write(tx, &[0x55; 512]).unwrap();
+                }
+                let calls = filler as u64 + 5;
                 p.memory.write(0x1030, b"data").unwrap();
                 for (at, value) in [
                     (0x1100, 0x1030u64),
@@ -2590,15 +2612,18 @@ fn unix_batch_capacity_waits_release_one_slot_and_preserve_a_single_filter_decis
                 parent.extend(park);
                 let mut child = Vec::new();
                 for (index, buffer, count) in [(0, 0x1200, 512), (1, 0x1400, 4), (2, 0x1410, 4)] {
-                    child.extend([
-                        mov(0, rx),
-                        mov(1, buffer),
-                        mov(2, count),
-                        mov(8, 63),
-                        0xd4000001,
-                        mov(10, 0x1800 + index * 8),
-                        0xf9000140,
-                    ]);
+                    let repeats = if index == 0 { filler } else { 1 };
+                    repeat_calls(&mut child, repeats, |child| {
+                        child.extend([
+                            mov(0, rx),
+                            mov(1, buffer),
+                            mov(2, count),
+                            mov(8, 63),
+                            0xd4000001,
+                            mov(10, 0x1800 + index * 8),
+                            0xf9000140,
+                        ]);
+                    });
                 }
                 child.extend(park);
                 program(&mut p, parent);
@@ -2609,7 +2634,7 @@ fn unix_batch_capacity_waits_release_one_slot_and_preserve_a_single_filter_decis
                 k.processes.insert(1, p);
                 k.processes.insert(2, peer);
                 let until = Instant::now() + Duration::from_secs(3);
-                while k.syscalls < 6 {
+                while k.syscalls < calls {
                     let limit = k.instructions + 100_000;
                     assert!(
                         k.parallel_round(&mut trames_linux::CapturedOutput::default(), limit)
@@ -2642,9 +2667,9 @@ fn unix_batch_capacity_waits_release_one_slot_and_preserve_a_single_filter_decis
                     *b"data"
                 );
                 assert_eq!(k.service_requests, 0);
-                assert_eq!(k.syscalls, 6);
+                assert_eq!(k.syscalls, calls);
                 if filtered {
-                    assert_eq!(k.processes.read(&1).seccomp.evaluations(), 6);
+                    assert_eq!(k.processes.read(&1).seccomp.evaluations(), calls);
                 }
                 if slots == 1 {
                     assert!(k.worker_io_waits > 0);

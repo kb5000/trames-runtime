@@ -94,6 +94,16 @@ worker entries, real pipe/socket lock conflicts, retained close/reuse lifetimes,
 and copy errors after original-resource asynchronous completion. The dedicated
 Linux CI instance is stopped after validation.
 
+iPad ARM64 core compilation passes. Interpreter conformance has **490 unique
+passes and three existing ignores**: the full serial run passed 488 and exposed
+two obsolete receive-buffer-based capacity fixtures. The corrected 11-test Unix
+selection passes, including both failures. Those fixtures now fill the sender
+budget or actual packet backlog, drain it using guest reads, and retain the
+execution-slot, filter-count and no-coordinator assertions. Already passing
+unrelated cases are reused. An earlier raw-IP wait stalled during one full run;
+the same case passed in isolation and in the subsequent serial run. Its sample
+and logs remain in the evidence directory; it is not claimed as a repaired bug.
+
 Original XML, native plans, audited results and logs are retained under ignored
 `target/gvisor-multi-area-20261117`; Linux CI evidence is under
 `target/local-ci/io/gvisor-multi-area-20261117`. Incremental compilation stays
