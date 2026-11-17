@@ -72,7 +72,7 @@ unchanged.
 
 ## Validation checkpoint — 2026-11-17
 
-- Local runtime workflow: all eight shell steps pass; 1,622 tests pass and 31
+- Local runtime workflow: all eight shell steps pass; 1,623 tests pass and 31
   retain their existing skip conditions.
 - Tests cover actual UDP over TUN in both directions, PI/no-PI, IPv6, final-close
   cleanup, namespace isolation, AF_PACKET capture/injection, BPF control flow,
@@ -82,6 +82,10 @@ unchanged.
   two CPUs. A second guest thread sends while the first blocks in epoll.
   Interface ioctls, guest-pointer `sock_fprog` import, TUN reads/writes, and the
   UDP reply are exercised through the real syscall ABI.
+- Mac product workflow checks 1–10 pass, and the Dev app builds successfully.
+  The same standalone fixture also passes with two CPUs through the signed Mac
+  hardware executor in a disposable minimal rootfs/store. The interpreter-side
+  Linux kernel conformance suite passes 490 tests (three existing skips).
 - `trames-ffi` checks successfully for `aarch64-apple-ios`. This is compile
   coverage, not a claim of a physical-iPad VPN acceptance run.
 
