@@ -726,3 +726,45 @@ fn tracking_without_nat_preserves_original_zero_udp_checksum() {
     assert!(state.existing_nat(&mut track, &mut packet, true));
     assert_eq!(packet, original);
 }
+
+#[test]
+fn full_udp_writer_advances_its_own_fragment_resource() {
+    let dir = std::path::PathBuf::from(format!("/tmp/trames-l2-full-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let a = Fabric::new().unwrap();
+    let b = Fabric::new().unwrap();
+    a.attach(&dir, 2, false).unwrap();
+    b.attach(&dir, 3, false).unwrap();
+    let na = Network::virtual_network(&a, 2, NetworkMode::Outbound).unwrap();
+    let nb = Network::virtual_network(&b, 3, NetworkMode::Outbound).unwrap();
+    let tx = na.socket(2, 2, 0).unwrap();
+    let rx = nb.socket(2, 2, 0).unwrap();
+    let address = "10.0.0.3:34569".parse().unwrap();
+    rx.bind(address).unwrap();
+    let payload = vec![0x5a; 60000];
+    let (mut sent, mut received) = (0, 0);
+    // No cross-fabric progress helper: a nonblocking writer must not strand
+    // its remaining fragments when it fills its own UDP queue.
+    for _ in 0..1024 {
+        match tx.send(&payload, 0, Some(address)) {
+            Ok(60000) => sent += 1,
+            Err(NetError(11)) => (),
+            other => panic!("send: {other:?}"),
+        }
+        match rx.recv(65535, 0) {
+            Ok(data) => {
+                assert_eq!(data.data, payload);
+                received += 1;
+            }
+            Err(NetError(11)) => (),
+            Err(e) => panic!("receive: {e:?}"),
+        }
+        if sent == 64 {
+            break;
+        }
+    }
+    assert_eq!(sent, 64);
+    assert!(received >= 32, "received only {received} datagrams");
+    drop((tx, rx, na, nb, a, b));
+    std::fs::remove_dir_all(dir).unwrap();
+}

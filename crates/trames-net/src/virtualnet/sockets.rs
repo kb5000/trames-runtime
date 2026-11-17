@@ -738,7 +738,8 @@ impl Socket {
                 .copied()
                 .ok_or(NetError(99))?;
             n.dirty = true;
-            n.sockets
+            let sent = n
+                .sockets
                 .get_mut::<udp::Socket>(h)
                 .send_slice(
                     bytes,
@@ -753,9 +754,12 @@ impl Socket {
                 .map_err(|e| match e {
                     udp::SendError::BufferFull => NetError(11),
                     _ => NetError(99),
-                })?;
+                });
             drop(state);
+            // A full queue can still own pending IP fragments. Advance that
+            // original resource before returning EAGAIN, as on successful IO.
             i.tick();
+            sent?;
             return Ok(bytes.len());
         }
         if destination.is_some() {
@@ -793,11 +797,11 @@ impl Socket {
         }
         let count = s.send_slice(bytes).map_err(|_| NetError(32))?;
         n.dirty |= count != 0;
+        drop(state);
+        i.tick();
         if count == 0 {
             return Err(NetError(11));
         }
-        drop(state);
-        i.tick();
         Ok(count)
     }
     pub fn recv(&self, count: usize, flags: u32) -> Result<Received> {
