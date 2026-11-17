@@ -1,0 +1,3767 @@
+{
+  "schema_version": 1,
+  "cases": 14530,
+  "native_counts": {
+    "passed": 13864,
+    "failed": 35,
+    "skipped": 593,
+    "no_result": 29,
+    "timeout": 9
+  },
+  "trames_counts": {
+    "passed": 8575,
+    "failed": 4836,
+    "skipped": 550,
+    "no_result": 96,
+    "timeout": 205,
+    "fixture_failed": 268
+  },
+  "native_passed_cases": 13864,
+  "outcomes_on_native_passed": {
+    "passed": 8526,
+    "failed": 4681,
+    "skipped": 104,
+    "no_result": 93,
+    "timeout": 197,
+    "fixture_failed": 263
+  },
+  "strict_pass_fraction": 0.6149740334679746,
+  "groups": [
+    {
+      "name": "clock_nanosleep",
+      "cases": 14,
+      "native": {
+        "passed": 14
+      },
+      "trames": {
+        "failed": 2,
+        "passed": 12
+      }
+    },
+    {
+      "name": "accept_bind",
+      "cases": 248,
+      "native": {
+        "passed": 248
+      },
+      "trames": {
+        "passed": 216,
+        "failed": 32
+      }
+    },
+    {
+      "name": "accept_bind_stream",
+      "cases": 4,
+      "native": {
+        "passed": 4
+      },
+      "trames": {
+        "failed": 4
+      }
+    },
+    {
+      "name": "access",
+      "cases": 19,
+      "native": {
+        "passed": 19
+      },
+      "trames": {
+        "failed": 16,
+        "passed": 3
+      }
+    },
+    {
+      "name": "affinity",
+      "cases": 14,
+      "native": {
+        "passed": 14
+      },
+      "trames": {
+        "passed": 12,
+        "skipped": 1,
+        "failed": 1
+      }
+    },
+    {
+      "name": "aio",
+      "cases": 14,
+      "native": {
+        "passed": 14
+      },
+      "trames": {
+        "failed": 5,
+        "passed": 9
+      }
+    },
+    {
+      "name": "alarm",
+      "cases": 5,
+      "native": {
+        "passed": 5
+      },
+      "trames": {
+        "passed": 5
+      }
+    },
+    {
+      "name": "bad",
+      "cases": 2,
+      "native": {
+        "passed": 2
+      },
+      "trames": {
+        "passed": 2
+      }
+    },
+    {
+      "name": "bind",
+      "cases": 96,
+      "native": {
+        "passed": 96
+      },
+      "trames": {
+        "passed": 96
+      }
+    },
+    {
+      "name": "socket",
+      "cases": 10,
+      "native": {
+        "passed": 10
+      },
+      "trames": {
+        "failed": 8,
+        "passed": 1,
+        "timeout": 1
+      }
+    },
+    {
+      "name": "socket_capability",
+      "cases": 2,
+      "native": {
+        "passed": 2
+      },
+      "trames": {
+        "passed": 1,
+        "failed": 1
+      }
+    },
+    {
+      "name": "bridge",
+      "cases": 6,
+      "native": {
+        "passed": 6
+      },
+      "trames": {
+        "passed": 3,
+        "failed": 3
+      }
+    },
+    {
+      "name": "brk",
+      "cases": 1,
+      "native": {
+        "passed": 1
+      },
+      "trames": {
+        "passed": 1
+      }
+    },
+    {
+      "name": "capabilities",
+      "cases": 14,
+      "native": {
+        "passed": 14
+      },
+      "trames": {
+        "passed": 13,
+        "failed": 1
+      }
+    },
+    {
+      "name": "chdir",
+      "cases": 4,
+      "native": {
+        "passed": 4
+      },
+      "trames": {
+        "passed": 4
+      }
+    },
+    {
+      "name": "chmod",
+      "cases": 19,
+      "native": {
+        "passed": 19
+      },
+      "trames": {
+        "passed": 19
+      }
+    },
+    {
+      "name": "chown",
+      "cases": 29,
+      "native": {
+        "passed": 29
+      },
+      "trames": {
+        "passed": 28,
+        "skipped": 1
+      }
+    },
+    {
+      "name": "sticky",
+      "cases": 5,
+      "native": {
+        "passed": 5
+      },
+      "trames": {
+        "passed": 5
+      }
+    },
+    {
+      "name": "chroot",
+      "cases": 12,
+      "native": {
+        "passed": 12
+      },
+      "trames": {
+        "failed": 1,
+        "passed": 11
+      }
+    },
+    {
+      "name": "pivot_root",
+      "cases": 19,
+      "native": {
+        "passed": 18,
+        "skipped": 1
+      },
+      "trames": {
+        "failed": 11,
+        "passed": 7,
+        "no_result": 1
+      }
+    },
+    {
+      "name": "clock_getres",
+      "cases": 1,
+      "native": {
+        "passed": 1
+      },
+      "trames": {
+        "passed": 1
+      }
+    },
+    {
+      "name": "clock_gettime",
+      "cases": 10,
+      "native": {
+        "passed": 9,
+        "skipped": 1
+      },
+      "trames": {
+        "passed": 9,
+        "skipped": 1
+      }
+    },
+    {
+      "name": "concurrency",
+      "cases": 3,
+      "native": {
+        "no_result": 1,
+        "passed": 2
+      },
+      "trames": {
+        "no_result": 1,
+        "passed": 2
+      }
+    },
+    {
+      "name": "bind_external",
+      "cases": 8,
+      "native": {
+        "failed": 8
+      },
+      "trames": {
+        "failed": 8
+      }
+    },
+    {
+      "name": "connect_external",
+      "cases": 11,
+      "native": {
+        "failed": 11
+      },
+      "trames": {
+        "failed": 11
+      }
+    },
+    {
+      "name": "pipe_external",
+      "cases": 4,
+      "native": {
+        "failed": 4
+      },
+      "trames": {
+        "failed": 4
+      }
+    },
+    {
+      "name": "copy_file_range",
+      "cases": 25,
+      "native": {
+        "passed": 25
+      },
+      "trames": {
+        "passed": 22,
+        "failed": 3
+      }
+    },
+    {
+      "name": "creat",
+      "cases": 3,
+      "native": {
+        "passed": 3
+      },
+      "trames": {
+        "passed": 3
+      }
+    },
+    {
+      "name": "dev",
+      "cases": 17,
+      "native": {
+        "passed": 17
+      },
+      "trames": {
+        "passed": 15,
+        "failed": 2
+      }
+    },
+    {
+      "name": "dup",
+      "cases": 11,
+      "native": {
+        "passed": 11
+      },
+      "trames": {
+        "passed": 11
+      }
+    },
+    {
+      "name": "cgroup2_ebpf",
+      "cases": 39,
+      "native": {
+        "passed": 37,
+        "skipped": 2
+      },
+      "trames": {
+        "passed": 21,
+        "failed": 15,
+        "skipped": 3
+      }
+    },
+    {
+      "name": "epoll",
+      "cases": 24,
+      "native": {
+        "passed": 24
+      },
+      "trames": {
+        "passed": 24
+      }
+    },
+    {
+      "name": "eventfd",
+      "cases": 11,
+      "native": {
+        "passed": 9,
+        "skipped": 2
+      },
+      "trames": {
+        "passed": 8,
+        "skipped": 3
+      }
+    },
+    {
+      "name": "exceptions",
+      "cases": 1,
+      "native": {
+        "passed": 1
+      },
+      "trames": {
+        "passed": 1
+      }
+    },
+    {
+      "name": "getcpu",
+      "cases": 2,
+      "native": {
+        "passed": 2
+      },
+      "trames": {
+        "passed": 2
+      }
+    },
+    {
+      "name": "getcpu_host",
+      "cases": 2,
+      "native": {
+        "passed": 2
+      },
+      "trames": {
+        "passed": 2
+      }
+    },
+    {
+      "name": "getrusage",
+      "cases": 5,
+      "native": {
+        "passed": 5
+      },
+      "trames": {
+        "failed": 5
+      }
+    },
+    {
+      "name": "exec_binary",
+      "cases": 49,
+      "native": {
+        "passed": 45,
+        "skipped": 4
+      },
+      "trames": {
+        "failed": 32,
+        "passed": 13,
+        "skipped": 4
+      }
+    },
+    {
+      "name": "exec",
+      "cases": 73,
+      "native": {
+        "passed": 71,
+        "failed": 2
+      },
+      "trames": {
+        "passed": 57,
+        "failed": 15,
+        "timeout": 1
+      }
+    },
+    {
+      "name": "exit",
+      "cases": 6,
+      "native": {
+        "passed": 6
+      },
+      "trames": {
+        "passed": 6
+      }
+    },
+    {
+      "name": "fallocate",
+      "cases": 11,
+      "native": {
+        "passed": 11
+      },
+      "trames": {
+        "passed": 9,
+        "skipped": 1,
+        "failed": 1
+      }
+    },
+    {
+      "name": "fault",
+      "cases": 2,
+      "native": {
+        "passed": 2
+      },
+      "trames": {
+        "passed": 1,
+        "failed": 1
+      }
+    },
+    {
+      "name": "fchdir",
+      "cases": 5,
+      "native": {
+        "passed": 5
+      },
+      "trames": {
+        "passed": 5
+      }
+    },
+    {
+      "name": "fcntl",
+      "cases": 97,
+      "native": {
+        "passed": 97
+      },
+      "trames": {
+        "passed": 81,
+        "failed": 16
+      }
+    },
+    {
+      "name": "flock",
+      "cases": 34,
+      "native": {
+        "passed": 33,
+        "timeout": 1
+      },
+      "trames": {
+        "passed": 31,
+        "timeout": 1,
+        "failed": 2
+      }
+    },
+    {
+      "name": "fork",
+      "cases": 24,
+      "native": {
+        "passed": 24
+      },
+      "trames": {
+        "failed": 12,
+        "passed": 12
+      }
+    },
+    {
+      "name": "fpsig_fork",
+      "cases": 1,
+      "native": {
+        "passed": 1
+      },
+      "trames": {
+        "passed": 1
+      }
+    },
+    {
+      "name": "fpsig_nested",
+      "cases": 1,
+      "native": {
+        "failed": 1
+      },
+      "trames": {
+        "failed": 1
+      }
+    },
+    {
+      "name": "sync_file_range",
+      "cases": 4,
+      "native": {
+        "passed": 4
+      },
+      "trames": {
+        "failed": 3,
+        "passed": 1
+      }
+    },
+    {
+      "name": "fsync",
+      "cases": 6,
+      "native": {
+        "passed": 6
+      },
+      "trames": {
+        "passed": 6
+      }
+    },
+    {
+      "name": "futex",
+      "cases": 67,
+      "native": {
+        "passed": 67
+      },
+      "trames": {
+        "passed": 67
+      }
+    },
+    {
+      "name": "getdents",
+      "cases": 23,
+      "native": {
+        "passed": 23
+      },
+      "trames": {
+        "passed": 20,
+        "failed": 3
+      }
+    },
+    {
+      "name": "getrandom",
+      "cases": 1,
+      "native": {
+        "passed": 1
+      },
+      "trames": {
+        "passed": 1
+      }
+    },
+    {
+      "name": "inotify",
+      "cases": 80,
+      "native": {
+        "passed": 79,
+        "skipped": 1
+      },
+      "trames": {
+        "passed": 48,
+        "timeout": 2,
+        "failed": 29,
+        "skipped": 1
+      }
+    },
+    {
+      "name": "ioctl",
+      "cases": 42,
+      "native": {
+        "passed": 42
+      },
+      "trames": {
+        "passed": 32,
+        "failed": 10
+      }
+    },
+    {
+      "name": "iouring",
+      "cases": 26,
+      "native": {
+        "passed": 22,
+        "skipped": 4
+      },
+      "trames": {
+        "passed": 22,
+        "skipped": 4
+      }
+    },
+    {
+      "name": "iptables",
+      "cases": 38,
+      "native": {
+        "passed": 36,
+        "skipped": 2
+      },
+      "trames": {
+        "failed": 34,
+        "passed": 1,
+        "skipped": 3
+      }
+    },
+    {
+      "name": "ip6tables",
+      "cases": 22,
+      "native": {
+        "passed": 22
+      },
+      "trames": {
+        "failed": 22
+      }
+    },
+    {
+      "name": "itimer",
+      "cases": 4,
+      "native": {
+        "passed": 4
+      },
+      "trames": {
+        "passed": 2,
+        "failed": 2
+      }
+    },
+    {
+      "name": "kcov",
+      "cases": 6,
+      "native": {
+        "skipped": 6
+      },
+      "trames": {
+        "skipped": 6
+      }
+    },
+    {
+      "name": "keys",
+      "cases": 31,
+      "native": {
+        "passed": 31
+      },
+      "trames": {
+        "failed": 31
+      }
+    },
+    {
+      "name": "kill",
+      "cases": 13,
+      "native": {
+        "skipped": 1,
+        "passed": 12
+      },
+      "trames": {
+        "skipped": 1,
+        "passed": 11,
+        "failed": 1
+      }
+    },
+    {
+      "name": "landlock_v1",
+      "cases": 23,
+      "native": {
+        "passed": 23
+      },
+      "trames": {
+        "skipped": 23
+      }
+    },
+    {
+      "name": "landlock_v2",
+      "cases": 2,
+      "native": {
+        "passed": 2
+      },
+      "trames": {
+        "skipped": 2
+      }
+    },
+    {
+      "name": "landlock_v3",
+      "cases": 2,
+      "native": {
+        "passed": 2
+      },
+      "trames": {
+        "skipped": 2
+      }
+    },
+    {
+      "name": "landlock_v4",
+      "cases": 5,
+      "native": {
+        "passed": 5
+      },
+      "trames": {
+        "skipped": 5
+      }
+    },
+    {
+      "name": "landlock_v5",
+      "cases": 2,
+      "native": {
+        "passed": 2
+      },
+      "trames": {
+        "skipped": 2
+      }
+    },
+    {
+      "name": "landlock_v6",
+      "cases": 4,
+      "native": {
+        "passed": 4
+      },
+      "trames": {
+        "skipped": 4
+      }
+    },
+    {
+      "name": "link",
+      "cases": 23,
+      "native": {
+        "passed": 23
+      },
+      "trames": {
+        "passed": 18,
+        "skipped": 3,
+        "failed": 2
+      }
+    },
+    {
+      "name": "lseek",
+      "cases": 15,
+      "native": {
+        "passed": 15
+      },
+      "trames": {
+        "passed": 11,
+        "failed": 3,
+        "skipped": 1
+      }
+    },
+    {
+      "name": "madvise",
+      "cases": 18,
+      "native": {
+        "passed": 18
+      },
+      "trames": {
+        "failed": 3,
+        "passed": 15
+      }
+    },
+    {
+      "name": "membarrier",
+      "cases": 4,
+      "native": {
+        "passed": 4
+      },
+      "trames": {
+        "passed": 3,
+        "skipped": 1
+      }
+    },
+    {
+      "name": "mempolicy",
+      "cases": 9,
+      "native": {
+        "passed": 9
+      },
+      "trames": {
+        "passed": 4,
+        "failed": 5
+      }
+    },
+    {
+      "name": "mincore",
+      "cases": 5,
+      "native": {
+        "passed": 5
+      },
+      "trames": {
+        "passed": 4,
+        "failed": 1
+      }
+    },
+    {
+      "name": "mkdir",
+      "cases": 7,
+      "native": {
+        "passed": 7
+      },
+      "trames": {
+        "passed": 7
+      }
+    },
+    {
+      "name": "mknod",
+      "cases": 9,
+      "native": {
+        "passed": 9
+      },
+      "trames": {
+        "passed": 8,
+        "failed": 1
+      }
+    },
+    {
+      "name": "fifo",
+      "cases": 7,
+      "native": {
+        "passed": 7
+      },
+      "trames": {
+        "passed": 6,
+        "failed": 1
+      }
+    },
+    {
+      "name": "mlock",
+      "cases": 20,
+      "native": {
+        "passed": 20
+      },
+      "trames": {
+        "failed": 20
+      }
+    },
+    {
+      "name": "mmap_eternal",
+      "cases": 1,
+      "native": {
+        "passed": 1
+      },
+      "trames": {
+        "timeout": 1
+      }
+    },
+    {
+      "name": "mmap",
+      "cases": 118,
+      "native": {
+        "passed": 118
+      },
+      "trames": {
+        "passed": 118
+      }
+    },
+    {
+      "name": "mount",
+      "cases": 117,
+      "native": {
+        "passed": 117
+      },
+      "trames": {
+        "passed": 71,
+        "failed": 41,
+        "skipped": 4,
+        "no_result": 1
+      }
+    },
+    {
+      "name": "mount_fd",
+      "cases": 41,
+      "native": {
+        "skipped": 3,
+        "passed": 38
+      },
+      "trames": {
+        "skipped": 5,
+        "failed": 36
+      }
+    },
+    {
+      "name": "mremap",
+      "cases": 34,
+      "native": {
+        "passed": 34
+      },
+      "trames": {
+        "no_result": 1,
+        "passed": 25,
+        "failed": 8
+      }
+    },
+    {
+      "name": "msync",
+      "cases": 110,
+      "native": {
+        "passed": 110
+      },
+      "trames": {
+        "passed": 110
+      }
+    },
+    {
+      "name": "munmap",
+      "cases": 3,
+      "native": {
+        "passed": 3
+      },
+      "trames": {
+        "passed": 3
+      }
+    },
+    {
+      "name": "open",
+      "cases": 42,
+      "native": {
+        "passed": 42
+      },
+      "trames": {
+        "passed": 35,
+        "failed": 7
+      }
+    },
+    {
+      "name": "open_create",
+      "cases": 16,
+      "native": {
+        "passed": 16
+      },
+      "trames": {
+        "passed": 13,
+        "failed": 3
+      }
+    },
+    {
+      "name": "openat2",
+      "cases": 50,
+      "native": {
+        "passed": 49,
+        "skipped": 1
+      },
+      "trames": {
+        "passed": 42,
+        "failed": 5,
+        "timeout": 2,
+        "skipped": 1
+      }
+    },
+    {
+      "name": "overlay",
+      "cases": 74,
+      "native": {
+        "skipped": 6,
+        "passed": 68
+      },
+      "trames": {
+        "skipped": 6,
+        "passed": 59,
+        "failed": 9
+      }
+    },
+    {
+      "name": "packet_socket_dgram",
+      "cases": 15,
+      "native": {
+        "skipped": 4,
+        "passed": 10,
+        "timeout": 1
+      },
+      "trames": {
+        "failed": 14,
+        "timeout": 1
+      }
+    },
+    {
+      "name": "packet_socket_raw",
+      "cases": 34,
+      "native": {
+        "passed": 32,
+        "skipped": 2
+      },
+      "trames": {
+        "failed": 34
+      }
+    },
+    {
+      "name": "packet_socket",
+      "cases": 21,
+      "native": {
+        "passed": 21
+      },
+      "trames": {
+        "passed": 12,
+        "failed": 9
+      }
+    },
+    {
+      "name": "packet_mmap",
+      "cases": 13,
+      "native": {
+        "passed": 12,
+        "timeout": 1
+      },
+      "trames": {
+        "failed": 13
+      }
+    },
+    {
+      "name": "pty",
+      "cases": 125,
+      "native": {
+        "passed": 123,
+        "skipped": 2
+      },
+      "trames": {
+        "passed": 91,
+        "skipped": 2,
+        "failed": 24,
+        "timeout": 8
+      }
+    },
+    {
+      "name": "pty_root",
+      "cases": 1,
+      "native": {
+        "passed": 1
+      },
+      "trames": {
+        "passed": 1
+      }
+    },
+    {
+      "name": "partial_bad_buffer",
+      "cases": 20,
+      "native": {
+        "passed": 20
+      },
+      "trames": {
+        "passed": 10,
+        "failed": 10
+      }
+    },
+    {
+      "name": "pause",
+      "cases": 1,
+      "native": {
+        "passed": 1
+      },
+      "trames": {
+        "passed": 1
+      }
+    },
+    {
+      "name": "personality",
+      "cases": 10,
+      "native": {
+        "passed": 9,
+        "skipped": 1
+      },
+      "trames": {
+        "failed": 7,
+        "passed": 2,
+        "skipped": 1
+      }
+    },
+    {
+      "name": "ping_socket",
+      "cases": 37,
+      "native": {
+        "skipped": 37
+      },
+      "trames": {
+        "failed": 21,
+        "passed": 16
+      }
+    },
+    {
+      "name": "pipe",
+      "cases": 160,
+      "native": {
+        "passed": 156,
+        "skipped": 4
+      },
+      "trames": {
+        "passed": 156,
+        "skipped": 4
+      }
+    },
+    {
+      "name": "pointer_auth",
+      "cases": 2,
+      "native": {
+        "skipped": 2
+      },
+      "trames": {
+        "skipped": 2
+      }
+    },
+    {
+      "name": "poll",
+      "cases": 25,
+      "native": {
+        "passed": 25
+      },
+      "trames": {
+        "passed": 15,
+        "timeout": 2,
+        "failed": 8
+      }
+    },
+    {
+      "name": "ppoll",
+      "cases": 9,
+      "native": {
+        "passed": 8,
+        "timeout": 1
+      },
+      "trames": {
+        "passed": 8,
+        "timeout": 1
+      }
+    },
+    {
+      "name": "prctl_setuid",
+      "cases": 6,
+      "native": {
+        "passed": 6
+      },
+      "trames": {
+        "passed": 5,
+        "failed": 1
+      }
+    },
+    {
+      "name": "pread64",
+      "cases": 12,
+      "native": {
+        "passed": 12
+      },
+      "trames": {
+        "passed": 11,
+        "failed": 1
+      }
+    },
+    {
+      "name": "preadv",
+      "cases": 2,
+      "native": {
+        "passed": 2
+      },
+      "trames": {
+        "passed": 2
+      }
+    },
+    {
+      "name": "preadv2",
+      "cases": 10,
+      "native": {
+        "passed": 10
+      },
+      "trames": {
+        "passed": 7,
+        "failed": 3
+      }
+    },
+    {
+      "name": "priority",
+      "cases": 19,
+      "native": {
+        "passed": 19
+      },
+      "trames": {
+        "passed": 14,
+        "failed": 5
+      }
+    },
+    {
+      "name": "proc",
+      "cases": 160,
+      "native": {
+        "passed": 158,
+        "skipped": 2
+      },
+      "trames": {
+        "passed": 73,
+        "failed": 78,
+        "timeout": 3,
+        "skipped": 6
+      }
+    },
+    {
+      "name": "proc_isolated",
+      "cases": 3,
+      "native": {
+        "passed": 3
+      },
+      "trames": {
+        "failed": 3
+      }
+    },
+    {
+      "name": "proc_keys",
+      "cases": 3,
+      "native": {
+        "passed": 3
+      },
+      "trames": {
+        "failed": 3
+      }
+    },
+    {
+      "name": "proc_net",
+      "cases": 26,
+      "native": {
+        "passed": 25,
+        "skipped": 1
+      },
+      "trames": {
+        "passed": 8,
+        "failed": 17,
+        "skipped": 1
+      }
+    },
+    {
+      "name": "proc_pid_coredump",
+      "cases": 5,
+      "native": {
+        "passed": 5
+      },
+      "trames": {
+        "failed": 5
+      }
+    },
+    {
+      "name": "proc_pid_oomscore",
+      "cases": 4,
+      "native": {
+        "passed": 4
+      },
+      "trames": {
+        "passed": 3,
+        "failed": 1
+      }
+    },
+    {
+      "name": "proc_pid_smaps",
+      "cases": 4,
+      "native": {
+        "skipped": 1,
+        "passed": 3
+      },
+      "trames": {
+        "skipped": 1,
+        "failed": 3
+      }
+    },
+    {
+      "name": "proc_pid_uid_gid_map",
+      "cases": 22,
+      "native": {
+        "passed": 22
+      },
+      "trames": {
+        "failed": 22
+      }
+    },
+    {
+      "name": "pselect",
+      "cases": 11,
+      "native": {
+        "passed": 10,
+        "timeout": 1
+      },
+      "trames": {
+        "passed": 10,
+        "timeout": 1
+      }
+    },
+    {
+      "name": "ptrace",
+      "cases": 36,
+      "native": {
+        "passed": 35,
+        "skipped": 1
+      },
+      "trames": {
+        "failed": 23,
+        "skipped": 12,
+        "passed": 1
+      }
+    },
+    {
+      "name": "pwrite64",
+      "cases": 11,
+      "native": {
+        "passed": 11
+      },
+      "trames": {
+        "passed": 10,
+        "failed": 1
+      }
+    },
+    {
+      "name": "pwritev2",
+      "cases": 11,
+      "native": {
+        "passed": 11
+      },
+      "trames": {
+        "failed": 2,
+        "passed": 9
+      }
+    },
+    {
+      "name": "raw_socket_hdrincl",
+      "cases": 15,
+      "native": {
+        "passed": 15
+      },
+      "trames": {
+        "failed": 15
+      }
+    },
+    {
+      "name": "raw_socket",
+      "cases": 155,
+      "native": {
+        "passed": 155
+      },
+      "trames": {
+        "failed": 155
+      }
+    },
+    {
+      "name": "raw_socket_icmp",
+      "cases": 20,
+      "native": {
+        "passed": 17,
+        "skipped": 3
+      },
+      "trames": {
+        "failed": 9,
+        "passed": 6,
+        "timeout": 2,
+        "skipped": 3
+      }
+    },
+    {
+      "name": "read",
+      "cases": 8,
+      "native": {
+        "passed": 8
+      },
+      "trames": {
+        "passed": 7,
+        "failed": 1
+      }
+    },
+    {
+      "name": "readahead",
+      "cases": 8,
+      "native": {
+        "passed": 6,
+        "skipped": 2
+      },
+      "trames": {
+        "passed": 5,
+        "skipped": 2,
+        "failed": 1
+      }
+    },
+    {
+      "name": "readv",
+      "cases": 32,
+      "native": {
+        "passed": 32
+      },
+      "trames": {
+        "passed": 30,
+        "failed": 2
+      }
+    },
+    {
+      "name": "readv_socket",
+      "cases": 23,
+      "native": {
+        "passed": 23
+      },
+      "trames": {
+        "passed": 23
+      }
+    },
+    {
+      "name": "rename",
+      "cases": 44,
+      "native": {
+        "passed": 44
+      },
+      "trames": {
+        "passed": 34,
+        "failed": 10
+      }
+    },
+    {
+      "name": "rlimits",
+      "cases": 7,
+      "native": {
+        "passed": 6,
+        "skipped": 1
+      },
+      "trames": {
+        "failed": 1,
+        "skipped": 1,
+        "passed": 5
+      }
+    },
+    {
+      "name": "rtsignal",
+      "cases": 4,
+      "native": {
+        "passed": 4
+      },
+      "trames": {
+        "passed": 4
+      }
+    },
+    {
+      "name": "sched",
+      "cases": 14,
+      "native": {
+        "passed": 14
+      },
+      "trames": {
+        "failed": 8,
+        "passed": 6
+      }
+    },
+    {
+      "name": "sched_yield",
+      "cases": 1,
+      "native": {
+        "passed": 1
+      },
+      "trames": {
+        "passed": 1
+      }
+    },
+    {
+      "name": "seccomp",
+      "cases": 23,
+      "native": {
+        "passed": 19,
+        "skipped": 4
+      },
+      "trames": {
+        "passed": 16,
+        "skipped": 4,
+        "failed": 3
+      }
+    },
+    {
+      "name": "select",
+      "cases": 9,
+      "native": {
+        "passed": 9
+      },
+      "trames": {
+        "passed": 9
+      }
+    },
+    {
+      "name": "sendfile",
+      "cases": 22,
+      "native": {
+        "passed": 20,
+        "skipped": 2
+      },
+      "trames": {
+        "failed": 4,
+        "passed": 16,
+        "skipped": 2
+      }
+    },
+    {
+      "name": "sendfile_socket",
+      "cases": 6,
+      "native": {
+        "passed": 6
+      },
+      "trames": {
+        "failed": 3,
+        "passed": 3
+      }
+    },
+    {
+      "name": "setgid",
+      "cases": 21,
+      "native": {
+        "skipped": 21
+      },
+      "trames": {
+        "skipped": 21
+      }
+    },
+    {
+      "name": "setns",
+      "cases": 17,
+      "native": {
+        "passed": 17
+      },
+      "trames": {
+        "failed": 7,
+        "passed": 10
+      }
+    },
+    {
+      "name": "splice",
+      "cases": 29,
+      "native": {
+        "passed": 29
+      },
+      "trames": {
+        "passed": 19,
+        "failed": 7,
+        "timeout": 3
+      }
+    },
+    {
+      "name": "sigaction",
+      "cases": 7,
+      "native": {
+        "passed": 7
+      },
+      "trames": {
+        "passed": 5,
+        "failed": 2
+      }
+    },
+    {
+      "name": "sigaltstack",
+      "cases": 5,
+      "native": {
+        "passed": 4,
+        "skipped": 1
+      },
+      "trames": {
+        "passed": 4,
+        "skipped": 1
+      }
+    },
+    {
+      "name": "sigreturn",
+      "cases": 1,
+      "native": {
+        "passed": 1
+      },
+      "trames": {
+        "passed": 1
+      }
+    },
+    {
+      "name": "signalfd",
+      "cases": 19,
+      "native": {
+        "passed": 19
+      },
+      "trames": {
+        "passed": 19
+      }
+    },
+    {
+      "name": "sigprocmask",
+      "cases": 8,
+      "native": {
+        "passed": 8
+      },
+      "trames": {
+        "passed": 8
+      }
+    },
+    {
+      "name": "sigstop",
+      "cases": 5,
+      "native": {
+        "timeout": 1,
+        "passed": 4
+      },
+      "trames": {
+        "timeout": 1,
+        "passed": 4
+      }
+    },
+    {
+      "name": "sigtimedwait",
+      "cases": 11,
+      "native": {
+        "passed": 11
+      },
+      "trames": {
+        "passed": 11
+      }
+    },
+    {
+      "name": "socket_data_transfer_stress",
+      "cases": 3,
+      "native": {
+        "passed": 3
+      },
+      "trames": {
+        "timeout": 3
+      }
+    },
+    {
+      "name": "socket_stress",
+      "cases": 30,
+      "native": {
+        "passed": 30
+      },
+      "trames": {
+        "failed": 30
+      }
+    },
+    {
+      "name": "socket_abstract",
+      "cases": 1464,
+      "native": {
+        "passed": 1387,
+        "skipped": 58,
+        "no_result": 19
+      },
+      "trames": {
+        "passed": 1166,
+        "failed": 244,
+        "skipped": 46,
+        "timeout": 8
+      }
+    },
+    {
+      "name": "socket_abstract_non_blocking",
+      "cases": 18,
+      "native": {
+        "passed": 18
+      },
+      "trames": {
+        "passed": 18
+      }
+    },
+    {
+      "name": "socket_unix_dgram_local",
+      "cases": 648,
+      "native": {
+        "passed": 648
+      },
+      "trames": {
+        "failed": 386,
+        "passed": 256,
+        "timeout": 6
+      }
+    },
+    {
+      "name": "socket_unix_dgram_non_blocking",
+      "cases": 6,
+      "native": {
+        "passed": 6
+      },
+      "trames": {
+        "passed": 6
+      }
+    },
+    {
+      "name": "socket_unix_seqpacket_local",
+      "cases": 336,
+      "native": {
+        "passed": 336
+      },
+      "trames": {
+        "passed": 288,
+        "failed": 42,
+        "timeout": 6
+      }
+    },
+    {
+      "name": "socket_unix_stream",
+      "cases": 216,
+      "native": {
+        "passed": 216
+      },
+      "trames": {
+        "passed": 156,
+        "failed": 60
+      }
+    },
+    {
+      "name": "socket_unix_stream_listener_close",
+      "cases": 2,
+      "native": {
+        "passed": 2
+      },
+      "trames": {
+        "failed": 2
+      }
+    },
+    {
+      "name": "socket_ip_tcp_generic_loopback",
+      "cases": 805,
+      "native": {
+        "passed": 805
+      },
+      "trames": {
+        "failed": 492,
+        "passed": 301,
+        "timeout": 12
+      }
+    },
+    {
+      "name": "socket_ip_tcp_udp_generic_loopback",
+      "cases": 24,
+      "native": {
+        "passed": 24
+      },
+      "trames": {
+        "passed": 24
+      }
+    },
+    {
+      "name": "socket_ip_tcp_loopback",
+      "cases": 318,
+      "native": {
+        "passed": 297,
+        "skipped": 12,
+        "no_result": 9
+      },
+      "trames": {
+        "passed": 222,
+        "failed": 84,
+        "skipped": 12
+      }
+    },
+    {
+      "name": "socket_ip_tcp_loopback_non_blocking",
+      "cases": 24,
+      "native": {
+        "passed": 24
+      },
+      "trames": {
+        "passed": 24
+      }
+    },
+    {
+      "name": "socket_ip_udp_loopback",
+      "cases": 552,
+      "native": {
+        "passed": 536,
+        "skipped": 16
+      },
+      "trames": {
+        "passed": 328,
+        "failed": 208,
+        "skipped": 16
+      }
+    },
+    {
+      "name": "socket_ipv4_udp_unbound_external_networking",
+      "cases": 38,
+      "native": {
+        "skipped": 38
+      },
+      "trames": {
+        "failed": 35,
+        "passed": 2,
+        "timeout": 1
+      }
+    },
+    {
+      "name": "socket_ipv6_udp_unbound_external_networking",
+      "cases": 8,
+      "native": {
+        "skipped": 8
+      },
+      "trames": {
+        "failed": 8
+      }
+    },
+    {
+      "name": "socket_bind_to_device",
+      "cases": 16,
+      "native": {
+        "passed": 16
+      },
+      "trames": {
+        "failed": 14,
+        "passed": 2
+      }
+    },
+    {
+      "name": "socket_bind_to_device_sequence",
+      "cases": 42,
+      "native": {
+        "passed": 42
+      },
+      "trames": {
+        "failed": 42
+      }
+    },
+    {
+      "name": "socket_bind_to_device_distribution",
+      "cases": 16,
+      "native": {
+        "passed": 16
+      },
+      "trames": {
+        "failed": 16
+      }
+    },
+    {
+      "name": "socket_ip_udp_loopback_non_blocking",
+      "cases": 12,
+      "native": {
+        "passed": 12
+      },
+      "trames": {
+        "passed": 12
+      }
+    },
+    {
+      "name": "socket_ipv4_udp_unbound_loopback",
+      "cases": 92,
+      "native": {
+        "passed": 88,
+        "skipped": 4
+      },
+      "trames": {
+        "failed": 84,
+        "skipped": 4,
+        "passed": 4
+      }
+    },
+    {
+      "name": "socket_ipv4_datagram_based_socket_unbound_loopback",
+      "cases": 96,
+      "native": {
+        "passed": 60,
+        "skipped": 36
+      },
+      "trames": {
+        "failed": 64,
+        "skipped": 32
+      }
+    },
+    {
+      "name": "socket_ipv6_unbound",
+      "cases": 16,
+      "native": {
+        "passed": 16
+      },
+      "trames": {
+        "passed": 8,
+        "failed": 8
+      }
+    },
+    {
+      "name": "socket_ipv6_udp_unbound_loopback",
+      "cases": 4,
+      "native": {
+        "passed": 4
+      },
+      "trames": {
+        "passed": 2,
+        "failed": 2
+      }
+    },
+    {
+      "name": "socket_ipv4_udp_unbound_loopback_nogotsan",
+      "cases": 4,
+      "native": {
+        "passed": 4
+      },
+      "trames": {
+        "failed": 4
+      }
+    },
+    {
+      "name": "socket_ipv4_udp_unbound_loopback_netlink",
+      "cases": 4,
+      "native": {
+        "passed": 4
+      },
+      "trames": {
+        "failed": 4
+      }
+    },
+    {
+      "name": "socket_ipv6_udp_unbound_loopback_netlink",
+      "cases": 2,
+      "native": {
+        "passed": 2
+      },
+      "trames": {
+        "failed": 2
+      }
+    },
+    {
+      "name": "socket_ip_unbound",
+      "cases": 84,
+      "native": {
+        "skipped": 4,
+        "passed": 80
+      },
+      "trames": {
+        "skipped": 4,
+        "failed": 64,
+        "passed": 16
+      }
+    },
+    {
+      "name": "socket_ip_unbound_netlink",
+      "cases": 4,
+      "native": {
+        "passed": 4
+      },
+      "trames": {
+        "failed": 4
+      }
+    },
+    {
+      "name": "socket_domain",
+      "cases": 636,
+      "native": {
+        "passed": 612,
+        "skipped": 24
+      },
+      "trames": {
+        "passed": 496,
+        "failed": 108,
+        "skipped": 24,
+        "timeout": 8
+      }
+    },
+    {
+      "name": "socket_domain_non_blocking",
+      "cases": 18,
+      "native": {
+        "passed": 18
+      },
+      "trames": {
+        "passed": 18
+      }
+    },
+    {
+      "name": "socket_filesystem",
+      "cases": 1464,
+      "native": {
+        "passed": 1406,
+        "skipped": 58
+      },
+      "trames": {
+        "passed": 1166,
+        "failed": 244,
+        "skipped": 46,
+        "timeout": 8
+      }
+    },
+    {
+      "name": "socket_filesystem_non_blocking",
+      "cases": 18,
+      "native": {
+        "passed": 18
+      },
+      "trames": {
+        "passed": 18
+      }
+    },
+    {
+      "name": "socket_inet_loopback",
+      "cases": 558,
+      "native": {
+        "passed": 555,
+        "skipped": 3
+      },
+      "trames": {
+        "failed": 459,
+        "passed": 66,
+        "timeout": 30,
+        "skipped": 3
+      }
+    },
+    {
+      "name": "socket_inet_loopback_nogotsan",
+      "cases": 4,
+      "native": {
+        "passed": 2,
+        "skipped": 2
+      },
+      "trames": {
+        "failed": 2,
+        "skipped": 2
+      }
+    },
+    {
+      "name": "socket_inet_loopback_isolated",
+      "cases": 166,
+      "native": {
+        "passed": 166
+      },
+      "trames": {
+        "failed": 118,
+        "timeout": 48
+      }
+    },
+    {
+      "name": "socket_netlink",
+      "cases": 12,
+      "native": {
+        "passed": 12
+      },
+      "trames": {
+        "failed": 5,
+        "passed": 7
+      }
+    },
+    {
+      "name": "socket_netlink_route",
+      "cases": 120,
+      "native": {
+        "passed": 112,
+        "skipped": 8
+      },
+      "trames": {
+        "passed": 42,
+        "failed": 69,
+        "skipped": 9
+      }
+    },
+    {
+      "name": "socket_netlink_netfilter",
+      "cases": 268,
+      "native": {
+        "passed": 263,
+        "skipped": 5
+      },
+      "trames": {
+        "fixture_failed": 268
+      }
+    },
+    {
+      "name": "socket_netlink_uevent",
+      "cases": 3,
+      "native": {
+        "passed": 3
+      },
+      "trames": {
+        "failed": 2,
+        "passed": 1
+      }
+    },
+    {
+      "name": "socket_stream_local",
+      "cases": 84,
+      "native": {
+        "passed": 84
+      },
+      "trames": {
+        "passed": 84
+      }
+    },
+    {
+      "name": "socket_stream_blocking_local",
+      "cases": 30,
+      "native": {
+        "passed": 30
+      },
+      "trames": {
+        "no_result": 6,
+        "passed": 12,
+        "timeout": 12
+      }
+    },
+    {
+      "name": "socket_stream_blocking_tcp",
+      "cases": 60,
+      "native": {
+        "passed": 60
+      },
+      "trames": {
+        "failed": 24,
+        "passed": 24,
+        "timeout": 12
+      }
+    },
+    {
+      "name": "socket_stream_nonblock_local",
+      "cases": 6,
+      "native": {
+        "passed": 6
+      },
+      "trames": {
+        "passed": 6
+      }
+    },
+    {
+      "name": "socket_unix_unbound_dgram",
+      "cases": 52,
+      "native": {
+        "passed": 52
+      },
+      "trames": {
+        "failed": 12,
+        "passed": 40
+      }
+    },
+    {
+      "name": "socket_unix_unbound_abstract",
+      "cases": 60,
+      "native": {
+        "passed": 58,
+        "skipped": 2
+      },
+      "trames": {
+        "passed": 40,
+        "failed": 18,
+        "skipped": 2
+      }
+    },
+    {
+      "name": "socket_unix_unbound_filesystem",
+      "cases": 18,
+      "native": {
+        "passed": 18
+      },
+      "trames": {
+        "passed": 12,
+        "failed": 6
+      }
+    },
+    {
+      "name": "socket_blocking_local",
+      "cases": 18,
+      "native": {
+        "passed": 18
+      },
+      "trames": {
+        "passed": 18
+      }
+    },
+    {
+      "name": "socket_blocking_ip",
+      "cases": 12,
+      "native": {
+        "passed": 12
+      },
+      "trames": {
+        "passed": 12
+      }
+    },
+    {
+      "name": "socket_non_stream_blocking_local",
+      "cases": 25,
+      "native": {
+        "passed": 25
+      },
+      "trames": {
+        "passed": 25
+      }
+    },
+    {
+      "name": "socket_non_stream_blocking_udp",
+      "cases": 8,
+      "native": {
+        "passed": 8
+      },
+      "trames": {
+        "failed": 4,
+        "passed": 4
+      }
+    },
+    {
+      "name": "socket_unix_pair",
+      "cases": 913,
+      "native": {
+        "passed": 819,
+        "skipped": 94
+      },
+      "trames": {
+        "passed": 678,
+        "failed": 152,
+        "skipped": 82,
+        "timeout": 1
+      }
+    },
+    {
+      "name": "socket_unix_unbound_seqpacket",
+      "cases": 16,
+      "native": {
+        "passed": 16
+      },
+      "trames": {
+        "failed": 16
+      }
+    },
+    {
+      "name": "socket_unix_unbound_stream",
+      "cases": 208,
+      "native": {
+        "passed": 196,
+        "skipped": 12
+      },
+      "trames": {
+        "failed": 52,
+        "passed": 144,
+        "skipped": 12
+      }
+    },
+    {
+      "name": "socket_netdevice",
+      "cases": 7,
+      "native": {
+        "passed": 7
+      },
+      "trames": {
+        "failed": 1,
+        "passed": 6
+      }
+    },
+    {
+      "name": "stat",
+      "cases": 59,
+      "native": {
+        "passed": 59
+      },
+      "trames": {
+        "skipped": 19,
+        "passed": 40
+      }
+    },
+    {
+      "name": "stat_times",
+      "cases": 12,
+      "native": {
+        "passed": 12
+      },
+      "trames": {
+        "failed": 4,
+        "passed": 8
+      }
+    },
+    {
+      "name": "statfs",
+      "cases": 9,
+      "native": {
+        "skipped": 1,
+        "passed": 8
+      },
+      "trames": {
+        "skipped": 1,
+        "passed": 5,
+        "failed": 3
+      }
+    },
+    {
+      "name": "symlink",
+      "cases": 33,
+      "native": {
+        "passed": 33
+      },
+      "trames": {
+        "passed": 32,
+        "failed": 1
+      }
+    },
+    {
+      "name": "sync",
+      "cases": 5,
+      "native": {
+        "passed": 5
+      },
+      "trames": {
+        "passed": 4,
+        "failed": 1
+      }
+    },
+    {
+      "name": "sysfs_cpu_topology",
+      "cases": 4,
+      "native": {
+        "passed": 4
+      },
+      "trames": {
+        "passed": 1,
+        "failed": 3
+      }
+    },
+    {
+      "name": "sysinfo",
+      "cases": 10,
+      "native": {
+        "passed": 10
+      },
+      "trames": {
+        "passed": 9,
+        "failed": 1
+      }
+    },
+    {
+      "name": "syslog",
+      "cases": 2,
+      "native": {
+        "passed": 2
+      },
+      "trames": {
+        "passed": 2
+      }
+    },
+    {
+      "name": "sysret",
+      "cases": 3,
+      "native": {
+        "passed": 3
+      },
+      "trames": {
+        "failed": 3
+      }
+    },
+    {
+      "name": "tcp_socket",
+      "cases": 190,
+      "native": {
+        "passed": 190
+      },
+      "trames": {
+        "passed": 74,
+        "failed": 112,
+        "timeout": 4
+      }
+    },
+    {
+      "name": "tgkill",
+      "cases": 3,
+      "native": {
+        "passed": 3
+      },
+      "trames": {
+        "passed": 3
+      }
+    },
+    {
+      "name": "timerfd",
+      "cases": 28,
+      "native": {
+        "passed": 25,
+        "skipped": 3
+      },
+      "trames": {
+        "passed": 25,
+        "skipped": 3
+      }
+    },
+    {
+      "name": "timers",
+      "cases": 15,
+      "native": {
+        "passed": 14,
+        "timeout": 1
+      },
+      "trames": {
+        "failed": 6,
+        "passed": 9
+      }
+    },
+    {
+      "name": "tkill",
+      "cases": 3,
+      "native": {
+        "passed": 3
+      },
+      "trames": {
+        "passed": 3
+      }
+    },
+    {
+      "name": "truncate",
+      "cases": 11,
+      "native": {
+        "passed": 11
+      },
+      "trames": {
+        "passed": 9,
+        "failed": 2
+      }
+    },
+    {
+      "name": "tuntap",
+      "cases": 25,
+      "native": {
+        "passed": 22,
+        "failed": 2,
+        "timeout": 1
+      },
+      "trames": {
+        "failed": 16,
+        "passed": 5,
+        "timeout": 4
+      }
+    },
+    {
+      "name": "tuntap_hostinet",
+      "cases": 1,
+      "native": {
+        "skipped": 1
+      },
+      "trames": {
+        "skipped": 1
+      }
+    },
+    {
+      "name": "udp_socket",
+      "cases": 164,
+      "native": {
+        "passed": 164
+      },
+      "trames": {
+        "failed": 89,
+        "passed": 75
+      }
+    },
+    {
+      "name": "udp_raw_socket",
+      "cases": 2,
+      "native": {
+        "passed": 2
+      },
+      "trames": {
+        "failed": 2
+      }
+    },
+    {
+      "name": "udp_bind",
+      "cases": 12,
+      "native": {
+        "passed": 12
+      },
+      "trames": {
+        "passed": 9,
+        "failed": 3
+      }
+    },
+    {
+      "name": "uidgid",
+      "cases": 26,
+      "native": {
+        "passed": 26
+      },
+      "trames": {
+        "passed": 25,
+        "skipped": 1
+      }
+    },
+    {
+      "name": "uname",
+      "cases": 4,
+      "native": {
+        "passed": 4
+      },
+      "trames": {
+        "passed": 4
+      }
+    },
+    {
+      "name": "unlink",
+      "cases": 23,
+      "native": {
+        "passed": 23
+      },
+      "trames": {
+        "passed": 21,
+        "failed": 2
+      }
+    },
+    {
+      "name": "unshare",
+      "cases": 5,
+      "native": {
+        "passed": 5
+      },
+      "trames": {
+        "failed": 3,
+        "passed": 2
+      }
+    },
+    {
+      "name": "utimes",
+      "cases": 16,
+      "native": {
+        "passed": 16
+      },
+      "trames": {
+        "passed": 12,
+        "failed": 4
+      }
+    },
+    {
+      "name": "vdso",
+      "cases": 1,
+      "native": {
+        "passed": 1
+      },
+      "trames": {
+        "skipped": 1
+      }
+    },
+    {
+      "name": "vfork",
+      "cases": 4,
+      "native": {
+        "passed": 3,
+        "timeout": 1
+      },
+      "trames": {
+        "passed": 3,
+        "timeout": 1
+      }
+    },
+    {
+      "name": "wait",
+      "cases": 64,
+      "native": {
+        "passed": 63,
+        "failed": 1
+      },
+      "trames": {
+        "passed": 34,
+        "failed": 26,
+        "timeout": 1,
+        "skipped": 3
+      }
+    },
+    {
+      "name": "write",
+      "cases": 36,
+      "native": {
+        "passed": 36
+      },
+      "trames": {
+        "failed": 2,
+        "passed": 34
+      }
+    },
+    {
+      "name": "memory_accounting",
+      "cases": 1,
+      "native": {
+        "skipped": 1
+      },
+      "trames": {
+        "skipped": 1
+      }
+    },
+    {
+      "name": "network_namespace",
+      "cases": 10,
+      "native": {
+        "passed": 7,
+        "skipped": 1,
+        "failed": 2
+      },
+      "trames": {
+        "passed": 5,
+        "failed": 4,
+        "skipped": 1
+      }
+    },
+    {
+      "name": "mq",
+      "cases": 19,
+      "native": {
+        "passed": 19
+      },
+      "trames": {
+        "failed": 19
+      }
+    },
+    {
+      "name": "semaphore",
+      "cases": 30,
+      "native": {
+        "passed": 30
+      },
+      "trames": {
+        "failed": 30
+      }
+    },
+    {
+      "name": "shm",
+      "cases": 27,
+      "native": {
+        "passed": 26,
+        "skipped": 1
+      },
+      "trames": {
+        "failed": 26,
+        "skipped": 1
+      }
+    },
+    {
+      "name": "msgqueue",
+      "cases": 36,
+      "native": {
+        "passed": 36
+      },
+      "trames": {
+        "failed": 32,
+        "skipped": 4
+      }
+    },
+    {
+      "name": "fadvise64",
+      "cases": 4,
+      "native": {
+        "passed": 4
+      },
+      "trames": {
+        "passed": 2,
+        "failed": 2
+      }
+    },
+    {
+      "name": "vdso_clock_gettime",
+      "cases": 2,
+      "native": {
+        "passed": 2
+      },
+      "trames": {
+        "passed": 2
+      }
+    },
+    {
+      "name": "proc_net_unix",
+      "cases": 9,
+      "native": {
+        "passed": 9
+      },
+      "trames": {
+        "failed": 8,
+        "passed": 1
+      }
+    },
+    {
+      "name": "memfd",
+      "cases": 21,
+      "native": {
+        "passed": 20,
+        "skipped": 1
+      },
+      "trames": {
+        "passed": 20,
+        "skipped": 1
+      }
+    },
+    {
+      "name": "proc_net_tcp",
+      "cases": 10,
+      "native": {
+        "passed": 10
+      },
+      "trames": {
+        "failed": 10
+      }
+    },
+    {
+      "name": "proc_net_udp",
+      "cases": 7,
+      "native": {
+        "passed": 7
+      },
+      "trames": {
+        "failed": 7
+      }
+    },
+    {
+      "name": "processes",
+      "cases": 8,
+      "native": {
+        "passed": 8
+      },
+      "trames": {
+        "passed": 7,
+        "timeout": 1
+      }
+    },
+    {
+      "name": "xattr",
+      "cases": 47,
+      "native": {
+        "passed": 45,
+        "skipped": 2
+      },
+      "trames": {
+        "passed": 38,
+        "skipped": 2,
+        "failed": 7
+      }
+    },
+    {
+      "name": "posix_acl",
+      "cases": 111,
+      "native": {
+        "passed": 101,
+        "skipped": 10
+      },
+      "trames": {
+        "failed": 111
+      }
+    },
+    {
+      "name": "cgroup",
+      "cases": 57,
+      "native": {
+        "skipped": 57
+      },
+      "trames": {
+        "skipped": 57
+      }
+    },
+    {
+      "name": "cgroup2",
+      "cases": 87,
+      "native": {
+        "skipped": 2,
+        "passed": 85
+      },
+      "trames": {
+        "skipped": 1,
+        "no_result": 86
+      }
+    },
+    {
+      "name": "cgroup2_transfer",
+      "cases": 2,
+      "native": {
+        "skipped": 2
+      },
+      "trames": {
+        "skipped": 1,
+        "failed": 1
+      }
+    },
+    {
+      "name": "deleted",
+      "cases": 5,
+      "native": {
+        "passed": 5
+      },
+      "trames": {
+        "passed": 5
+      }
+    },
+    {
+      "name": "close_range",
+      "cases": 14,
+      "native": {
+        "passed": 14
+      },
+      "trames": {
+        "passed": 14
+      }
+    },
+    {
+      "name": "fuse",
+      "cases": 24,
+      "native": {
+        "passed": 22,
+        "failed": 1,
+        "skipped": 1
+      },
+      "trames": {
+        "failed": 23,
+        "skipped": 1
+      }
+    },
+    {
+      "name": "process_vm_read_write",
+      "cases": 51,
+      "native": {
+        "passed": 51
+      },
+      "trames": {
+        "passed": 20,
+        "failed": 23,
+        "timeout": 8
+      }
+    },
+    {
+      "name": "host_pty",
+      "cases": 3,
+      "native": {
+        "failed": 3
+      },
+      "trames": {
+        "failed": 3
+      }
+    },
+    {
+      "name": "pidfd",
+      "cases": 34,
+      "native": {
+        "passed": 33,
+        "skipped": 1
+      },
+      "trames": {
+        "failed": 27,
+        "skipped": 6,
+        "timeout": 1
+      }
+    }
+  ],
+  "families": {
+    "Networking and sockets": {
+      "cases": 10827,
+      "native_passes": 10339,
+      "all": {
+        "passed": 6274,
+        "failed": 3810,
+        "skipped": 302,
+        "timeout": 167,
+        "fixture_failed": 268,
+        "no_result": 6
+      },
+      "on_native_passes": {
+        "passed": 6228,
+        "failed": 3676,
+        "skipped": 2,
+        "timeout": 164,
+        "fixture_failed": 263,
+        "no_result": 6
+      }
+    },
+    "Files, descriptors and I/O": {
+      "cases": 1846,
+      "native_passes": 1796,
+      "all": {
+        "failed": 405,
+        "passed": 1359,
+        "skipped": 60,
+        "timeout": 21,
+        "no_result": 1
+      },
+      "on_native_passes": {
+        "failed": 387,
+        "passed": 1359,
+        "skipped": 32,
+        "timeout": 18
+      }
+    },
+    "Processes, signals and scheduling": {
+      "cases": 360,
+      "native_passes": 345,
+      "all": {
+        "passed": 237,
+        "skipped": 12,
+        "failed": 106,
+        "no_result": 1,
+        "timeout": 4
+      },
+      "on_native_passes": {
+        "passed": 234,
+        "skipped": 4,
+        "failed": 105,
+        "timeout": 2
+      }
+    },
+    "Clocks and timers": {
+      "cases": 84,
+      "native_passes": 79,
+      "all": {
+        "passed": 65,
+        "skipped": 4,
+        "failed": 15
+      },
+      "on_native_passes": {
+        "passed": 65,
+        "failed": 14
+      }
+    },
+    "Memory and mappings": {
+      "cases": 326,
+      "native_passes": 325,
+      "all": {
+        "passed": 284,
+        "failed": 38,
+        "skipped": 2,
+        "timeout": 1,
+        "no_result": 1
+      },
+      "on_native_passes": {
+        "passed": 284,
+        "failed": 38,
+        "skipped": 1,
+        "timeout": 1,
+        "no_result": 1
+      }
+    },
+    "Isolation, security and procfs": {
+      "cases": 897,
+      "native_passes": 793,
+      "all": {
+        "passed": 281,
+        "failed": 355,
+        "skipped": 162,
+        "no_result": 87,
+        "timeout": 12
+      },
+      "on_native_passes": {
+        "passed": 281,
+        "failed": 354,
+        "no_result": 86,
+        "skipped": 60,
+        "timeout": 12
+      }
+    },
+    "Synchronization and IPC": {
+      "cases": 190,
+      "native_passes": 187,
+      "all": {
+        "passed": 75,
+        "skipped": 8,
+        "failed": 107
+      },
+      "on_native_passes": {
+        "passed": 75,
+        "skipped": 5,
+        "failed": 107
+      }
+    }
+  },
+  "build_blockers": [
+    {
+      "name": "fpsig_mut",
+      "reason": "No upstream source for ARM64"
+    },
+    {
+      "name": "fpstate_stop",
+      "reason": "No upstream source for ARM64"
+    },
+    {
+      "name": "arch_prctl",
+      "reason": "No upstream source for ARM64"
+    },
+    {
+      "name": "prctl",
+      "reason": "Unavailable runfile: //test/cmd/test_app"
+    },
+    {
+      "name": "rseq",
+      "reason": "Unavailable dependency: //test/syscalls/linux/rseq:lib"
+    }
+  ],
+  "build_failures": [],
+  "built_groups": 258,
+  "enabled_groups": 254,
+  "upstream_disabled_cases": [
+    {
+      "suite": "socket_inet_loopback",
+      "case": "AllFamilies/SocketMultiProtocolInetLoopbackTest.DISABLED_V4MappedLoopbackOnlyReservesV4/TCP"
+    },
+    {
+      "suite": "socket_inet_loopback",
+      "case": "AllFamilies/SocketMultiProtocolInetLoopbackTest.DISABLED_V4MappedLoopbackOnlyReservesV4/UDP"
+    },
+    {
+      "suite": "socket_inet_loopback",
+      "case": "AllFamilies/SocketMultiProtocolInetLoopbackTest.DISABLED_V4MappedAnyOnlyReservesV4/TCP"
+    },
+    {
+      "suite": "socket_inet_loopback",
+      "case": "AllFamilies/SocketMultiProtocolInetLoopbackTest.DISABLED_V4MappedAnyOnlyReservesV4/UDP"
+    },
+    {
+      "suite": "socket_inet_loopback",
+      "case": "AllFamilies/SocketMultiProtocolInetLoopbackTest.DISABLED_V4MappedEphemeralPortReserved/TCP"
+    },
+    {
+      "suite": "socket_inet_loopback",
+      "case": "AllFamilies/SocketMultiProtocolInetLoopbackTest.DISABLED_V4MappedEphemeralPortReserved/UDP"
+    },
+    {
+      "suite": "socket_inet_loopback_nogotsan",
+      "case": "All/SocketInetLoopbackTest.DISABLED_TestTCPPortExhaustion/ListenV4Any_ConnectV4Any"
+    },
+    {
+      "suite": "socket_inet_loopback_nogotsan",
+      "case": "All/SocketInetLoopbackTest.DISABLED_TestTCPPortExhaustion/ListenV4Any_ConnectV4Loopback"
+    },
+    {
+      "suite": "socket_inet_loopback_nogotsan",
+      "case": "All/SocketInetLoopbackTest.DISABLED_TestTCPPortExhaustion/ListenV4Any_ConnectV4MappedAny"
+    },
+    {
+      "suite": "socket_inet_loopback_nogotsan",
+      "case": "All/SocketInetLoopbackTest.DISABLED_TestTCPPortExhaustion/ListenV4Any_ConnectV4MappedLoopback"
+    },
+    {
+      "suite": "socket_inet_loopback_nogotsan",
+      "case": "All/SocketInetLoopbackTest.DISABLED_TestTCPPortExhaustion/ListenV4Loopback_ConnectV4Any"
+    },
+    {
+      "suite": "socket_inet_loopback_nogotsan",
+      "case": "All/SocketInetLoopbackTest.DISABLED_TestTCPPortExhaustion/ListenV4Loopback_ConnectV4Loopback"
+    },
+    {
+      "suite": "socket_inet_loopback_nogotsan",
+      "case": "All/SocketInetLoopbackTest.DISABLED_TestTCPPortExhaustion/ListenV4Loopback_ConnectV4MappedLoopback"
+    },
+    {
+      "suite": "socket_inet_loopback_nogotsan",
+      "case": "All/SocketInetLoopbackTest.DISABLED_TestTCPPortExhaustion/ListenV4MappedAny_ConnectV4Any"
+    },
+    {
+      "suite": "socket_inet_loopback_nogotsan",
+      "case": "All/SocketInetLoopbackTest.DISABLED_TestTCPPortExhaustion/ListenV4MappedAny_ConnectV4Loopback"
+    },
+    {
+      "suite": "socket_inet_loopback_nogotsan",
+      "case": "All/SocketInetLoopbackTest.DISABLED_TestTCPPortExhaustion/ListenV4MappedAny_ConnectV4MappedAny"
+    },
+    {
+      "suite": "socket_inet_loopback_nogotsan",
+      "case": "All/SocketInetLoopbackTest.DISABLED_TestTCPPortExhaustion/ListenV4MappedAny_ConnectV4MappedLoopback"
+    },
+    {
+      "suite": "socket_inet_loopback_nogotsan",
+      "case": "All/SocketInetLoopbackTest.DISABLED_TestTCPPortExhaustion/ListenV4MappedLoopback_ConnectV4Any"
+    },
+    {
+      "suite": "socket_inet_loopback_nogotsan",
+      "case": "All/SocketInetLoopbackTest.DISABLED_TestTCPPortExhaustion/ListenV4MappedLoopback_ConnectV4Loopback"
+    },
+    {
+      "suite": "socket_inet_loopback_nogotsan",
+      "case": "All/SocketInetLoopbackTest.DISABLED_TestTCPPortExhaustion/ListenV4MappedLoopback_ConnectV4MappedLoopback"
+    },
+    {
+      "suite": "socket_inet_loopback_nogotsan",
+      "case": "All/SocketInetLoopbackTest.DISABLED_TestTCPPortExhaustion/ListenV6Any_ConnectV4Any"
+    },
+    {
+      "suite": "socket_inet_loopback_nogotsan",
+      "case": "All/SocketInetLoopbackTest.DISABLED_TestTCPPortExhaustion/ListenV6Any_ConnectV4Loopback"
+    },
+    {
+      "suite": "socket_inet_loopback_nogotsan",
+      "case": "All/SocketInetLoopbackTest.DISABLED_TestTCPPortExhaustion/ListenV6Any_ConnectV4MappedAny"
+    },
+    {
+      "suite": "socket_inet_loopback_nogotsan",
+      "case": "All/SocketInetLoopbackTest.DISABLED_TestTCPPortExhaustion/ListenV6Any_ConnectV4MappedLoopback"
+    },
+    {
+      "suite": "socket_inet_loopback_nogotsan",
+      "case": "All/SocketInetLoopbackTest.DISABLED_TestTCPPortExhaustion/ListenV6Any_ConnectV6Any"
+    },
+    {
+      "suite": "socket_inet_loopback_nogotsan",
+      "case": "All/SocketInetLoopbackTest.DISABLED_TestTCPPortExhaustion/ListenV6Any_ConnectV6Loopback"
+    },
+    {
+      "suite": "socket_inet_loopback_nogotsan",
+      "case": "All/SocketInetLoopbackTest.DISABLED_TestTCPPortExhaustion/ListenV6Loopback_ConnectV6Any"
+    },
+    {
+      "suite": "socket_inet_loopback_nogotsan",
+      "case": "All/SocketInetLoopbackTest.DISABLED_TestTCPPortExhaustion/ListenV6Loopback_ConnectV6Loopback"
+    }
+  ],
+  "empty_built_groups": [
+    "32bit",
+    "socketopt",
+    "time",
+    "vsyscall"
+  ],
+  "upstream": {
+    "gvisor": {
+      "revision": "89cacadae21eca4270a8f7c79281d0426d33ac5f",
+      "url": "https://codeload.github.com/google/gvisor/tar.gz/89cacadae21eca4270a8f7c79281d0426d33ac5f",
+      "sha256": "23276c6ca194c4818be1544be13c1def23a492fd8f96d261e0ef9b64a0b444aa"
+    },
+    "dependencies": [
+      {
+        "name": "abseil",
+        "url": "https://codeload.github.com/abseil/abseil-cpp/tar.gz/refs/tags/20260817.0",
+        "sha256": "f7e05179df39c45434cad433f5783840bb3788ef322976f9138bc6b72b3a107d",
+        "bytes": 2430876
+      },
+      {
+        "name": "googletest",
+        "url": "https://codeload.github.com/google/googletest/tar.gz/refs/tags/v1.18.0",
+        "sha256": "6e3191c1455468b3fc35a417fb565c1c5071aee1b7e7f85e30cf48a98d37d8b5",
+        "bytes": 894741
+      },
+      {
+        "name": "benchmark",
+        "url": "https://codeload.github.com/google/benchmark/tar.gz/refs/tags/v1.10.0",
+        "sha256": "acc5c7c0fbed855c4aaa2d7c3c36fb82b0c15c28f4e151e3f679c2fc0aa404af",
+        "bytes": 281371
+      }
+    ],
+    "runfiles": [
+      {
+        "url": "https://raw.githubusercontent.com/bazelbuild/bazel/6.5.0/tools/cpp/runfiles/runfiles_src.h",
+        "sha256": "acd57013bf0d2d8a26986737ab2724383ff578c5f6a07485848e874f02b57b85",
+        "bytes": 10302
+      },
+      {
+        "url": "https://raw.githubusercontent.com/bazelbuild/bazel/6.5.0/tools/cpp/runfiles/runfiles_src.cc",
+        "sha256": "e26ee736d835ddf248d847e00ea2b7047c20775d9eca61257bf8c9fcf6793d1c",
+        "bytes": 13237
+      }
+    ]
+  },
+  "binary_hashes": {
+    "clock_nanosleep": "708b2a2125a9337b4af2368cb834b85038871ae2fc6e9c1b4e6266c8618772dc",
+    "32bit": "5d20cb220beb3c7e8cb532c542dd7fe8bdaecfa86751f137efa998919a40e059",
+    "accept_bind": "8c8e4ec7d2c4a487f205291e1fdb30726c752b2173ec381e253df0ab9b612c92",
+    "accept_bind_stream": "cb33caf6060415e94203063131cc1176d7869c5216273940603990d2c380ec5a",
+    "access": "8d77d402f9088d8f77c59a46c21bda0218d3eb2977068e5438dbc6b979755169",
+    "affinity": "451251a74cd84a3478217cc120869dd3f3e1bc817eee779920e2678243e66017",
+    "aio": "d340fa2973ea3ae65b8bc22b550ebb83214dfd4291b91219611595c1eb547367",
+    "alarm": "59f0e7692d11c89568376a195ca36c6bbe056fb00f4c21ca8e87211e5b2ac338",
+    "bad": "a6fa7aec636eccad639c407754c2ccc1cfbb39285c4681f0a2cfaf030ac60b3c",
+    "bind": "7562f2f939963e59af09968d3cb90114a138629fc7ce17bc70c3efe0a65a5807",
+    "socket": "a7fdb037de8d5f063f017a7a30572c1637d059998fc6514a21142e907d96abd6",
+    "socket_capability": "0f5e4ddca19c582b85a0b10f54c37606aab34f6fc2f5d8055abae71d7888d65d",
+    "bridge": "f2c46b6a9a8c8fac0630fb645a2191753d575cb41a23288231df71e7b9bfa983",
+    "brk": "9df9de5f74300f1948729d7d435e4b329a8cd914943f6c4d5ed4af12b8c0fd2d",
+    "capabilities": "f14aa315f6daadf8cfbb4cfec4c0856060c54af5ca5bfc842884f985e90ba86b",
+    "chdir": "114013c4361be9a6abf7f3ae09706ed6a95d63b13dd24a277e34b2b548193d64",
+    "chmod": "13b2629ef0984443ddd8b9fded26ba91cec1b61e18987aabe77d431ee52b7b40",
+    "chown": "90a85c8bf104dccaee97bba98e9f94afe3cec630abe8c28473526d21e0bd7ffb",
+    "sticky": "cf1390122affabb09503565ca88ae8d9d9c391b1b0c6d1faba824e546b9ca1c2",
+    "chroot": "1788393f131aa0f8ec4e40b74257267105ceada4050f396dbad8f55b07fe3f96",
+    "pivot_root": "fce74153982ba54f16fbc61715adf60b8918ffb3a3cbddb1bc49316972b9b70a",
+    "clock_getres": "b282173ee095d12eeab0f15481f223db31912d8e02f384f150b275cc51fee9d7",
+    "clock_gettime": "07996747551cff7582c70b77a54d7bc04777d2af7c0243062f04a4b60be213b7",
+    "concurrency": "f77d888151a7cb20f714d09e1eb08522c238764c474d83b2d2c27a7be0618b75",
+    "bind_external": "600f82ff81bcb56b9e87d649ef2c98406c36e2b4d0cbc29e2f6300c032886b3d",
+    "connect_external": "8b47286d797c213167bc94679c8d0b12ca9599272bfe8d3f065965ef59bc1914",
+    "pipe_external": "abdd4d783ab67e9bdc32f05fd2ac1298a98c044e4521d3b37ba15214ce3b1303",
+    "copy_file_range": "b252947814f7e9be0f9f0341c6ccf51712c88828198c02940e57d0b02c4385d4",
+    "creat": "f531452d30f937ebd2ccf6681f03c00ba7a5017eaeed811f2f9b022b5e181065",
+    "dev": "e82ea2f2c5bfc863273b92ad357de3229550a5fde779e8230d5204298ab2095c",
+    "dup": "9e312a665abbf630912b36b1510f2f3729945975c16ca4adf682972d7f7c7355",
+    "cgroup2_ebpf": "acf02441ca1c9c5a9ff7cedb6be029678fe5286486a9ff2b829f360877f61637",
+    "epoll": "3e32c9d35ea3f2e95d30d4d3bc665f964e220d7eb92b1257bb51ef5ac30c94c9",
+    "eventfd": "996de770756f98c0f78d02c1404dbd41c04a2bd2b84fdfac0298838e6f6bdfed",
+    "exceptions": "9b5d7a4964550f552f075fb9778b328cfa25bb28892e9fc151efb100af4d4a74",
+    "getcpu": "80f6ea9afe3cba138172ece3c9302eacd35b4b9a9ad64e88ecfc9dd0d6d8e743",
+    "getcpu_host": "80f6ea9afe3cba138172ece3c9302eacd35b4b9a9ad64e88ecfc9dd0d6d8e743",
+    "getrusage": "7650b2acfe414404674da8e5af2cec0cf14260c36dfb6d0cca3fac14b9702e2c",
+    "exec_binary": "190a4f7ffd02cc4669c46d4d90c2236280665ded3c241f62e39d3b58f526f475",
+    "exec": "670f79e29cc064a0e29bbb5a0f76d731f7568f71a82a7f638b877e039883d5a8",
+    "exit": "8c8bce51f8c6af3caf94ba2a29725eeadea8048be05ed9b69c18516c9e8cebde",
+    "fallocate": "6bb86a6a7380a80df827b5db60fb7e9ea5a2a85d85b386d17a454eed3c87cc79",
+    "fault": "abc7a524cba218a19151a752d6f828856e989f265c09ef0aefab49e01e33ea75",
+    "fchdir": "6a35e9f7e909702d758e3330b28692e3241d9943cb143034ccf5ad5574cd5ecd",
+    "fcntl": "87f8773d65921a7b76df1f3e3057eeec30c92406a98db2f1d48d9ef0a157b944",
+    "flock": "c8a756c3fd961326f80cc9c255bad202f71a713f4402008908808932c827d5a7",
+    "fork": "7e65bcb17a1cd12e9411256a0b47775834bc7048ee07880bae06a85eb10865ef",
+    "fpsig_fork": "d56614e53068950a0d2d92170bb9f42167f6391d88e2cb751ece18b4d9ec2b80",
+    "fpsig_nested": "deafb948c447c7d59d5e13de9ca4d4e99e5fad754453de832bc853f55a08b8e3",
+    "sync_file_range": "9afd8e481670bb262b93e2ec873bfb92296e00c2b0a9f71a61f1f75b7a5c8219",
+    "fsync": "19642b4ac3c5d45f0bb3d850965d005ca34c6de30d0ffe36d2efdc45b52434a4",
+    "futex": "f27b5d779199c5b0fd21c816b575739f2ff69b905f3b1db0f22d550aeb57e361",
+    "getdents": "39ac2820cc2cc8e3cd970cee1af99594ac05048d8ba6b450b5725e82f919ca3c",
+    "getrandom": "48f209a088563c7b7688e1350e6853a07194c6738e9c22c9461e26ab7d5d548c",
+    "inotify": "d67885cee998091e04d6be3cc2505e9717a71a9daa9674c7e912b55ec35d501b",
+    "ioctl": "957874f5805730f6f1d1d451c68a5ddd0ca6c31505ae85c8e7f1967de13f835f",
+    "iouring": "7ec927703e0d61c9f458307604f0bdf354a7c9fd9a7127b7e87e04b77d70fbc7",
+    "iptables": "20803541523095565e966910b014f3a3872a27abca82060b31bee838d508357a",
+    "ip6tables": "e07fa6cb82db5e404f966f0ec425a27ffd553860c395a2920b3a627721cc5db1",
+    "itimer": "7b2bf79bab1b6f692128722711b83b2d3f9c19944425e97a018a71c8866ac5ac",
+    "kcov": "141697c8e7ca4282ade8b31192648cb98b417b93042eeed9d8253ad35805a4db",
+    "keys": "2428fff682dbb7c9805e1e91235fa2d509157599b83ed69f9d85467f05cb67db",
+    "kill": "3a74100861c5ea6341c5f033f0b1daf877da3006e26877f76424621de6369990",
+    "landlock_v1": "fc68f847a8772aa5b774e265fa0ddebca16529369c388068501b2508207adf37",
+    "landlock_v2": "3314ad65eaed1158eee6e2fe6a98f1148f519c317ef39abd45814b1e4cd3c6c9",
+    "landlock_v3": "2a061725ed46910665f0e639aa0c161b339d0fdea5a4f0fbd4777de8248465bd",
+    "landlock_v4": "5b0b753ffb450c8da87aba9f30c7503ba8d3f4d3b77fc974cc0c5f197c1dbc9c",
+    "landlock_v5": "49d5ed30d3e7662d8ec115df40387d2d1960941c189a7f4d76eac02b50f77f83",
+    "landlock_v6": "5a2647f52bd4239e7dc89bd9bcdb26164fc8c3341cf7102abcedb1055d2a6532",
+    "link": "6ee3a62e9873aeafb12654753f3f87e481956a40932739fd1bb5f925cb8f4ba0",
+    "lseek": "6f412c23a481c2a9524ef3807651de1ba14886ed52990d21ce98af9a5006ee83",
+    "madvise": "ddda6b45f1b2b41cb8d2374a6b56c1073b73baa3b0b4cdad6a6977221eb43018",
+    "membarrier": "59da7e1499b9bcb6d6fc03dc3652c0a39854a713c47c1d0b4bb85dc1d1e72ed6",
+    "mempolicy": "d87daf18e7b222d724fe699c40a63e8b450e60ddf2a6aa633191b72de9734723",
+    "mincore": "20e4b4d712e5dae1d7125e3ae6489c6111e38c3a9e7f917fda057a694264ab51",
+    "mkdir": "df9bd5e0251bb1c898d69b6abd4e033ecb424844ea7104e073aba9cb5b067e97",
+    "mknod": "0768866a401f25c0587cd20b81c1908c56116bd3fb6b65e06af499d291d4e77c",
+    "fifo": "56f9fd19f94c3f1e46ceadc05118cd77cbd6204859e2fac0965c9a4a2c37e47a",
+    "mlock": "55e4e48470445c25b82cf5e5d0d92b6e81cced524c049cc12ee49dc4e695f399",
+    "mmap_eternal": "a240426f961b86345befa5832508e0a5732f4ea95e28eafba2957f7659c568fc",
+    "mmap": "a024283671308e217d80b13ece984356034c5b3ef49629f0345f595c29de3001",
+    "mount": "0a19bf727615944341b9db25c428542be8dab93c8eca2ba4e070294a984e432b",
+    "mount_fd": "40837c90f9508e9d6c406f38c6ff253ab9e3e7fc70412de226908408bf93ad81",
+    "mremap": "19c8189e0308c662918aa5048bc6576a93a945caf6e5f807139d35f72e1e7c7a",
+    "msync": "ff7215a94181145afa758ba5dc52deae6150f0fdb18b3da1b8f9b0abcafac4ff",
+    "munmap": "9f1124c980532e0dfe8fdfd26ded8ce721f3ba4900dfcbd77f4d7b6f77b719e9",
+    "open": "b6b74f233642fde17c7705f6758be4644e10c02b621ac813f35ab26e828cee10",
+    "open_create": "eb5c9779a2d03d4cb4010839a1eb3e74fad0e8fa617c22e9d901e08a032911db",
+    "openat2": "c1fe78e64108193ca201ffdfb9ec40cb54d5ebdf8a3b8b6551e563263eabc981",
+    "overlay": "81ecbb97292cb72fbae12bdfad56fe51e94c4c89b9b9bff494a570a5c2872941",
+    "packet_socket_dgram": "d2e0dfadb9f5deceacfffb84c1467a58c4e471f96c676811c135f3e2c9e37d42",
+    "packet_socket_raw": "9c664884472be907b6d59675a5ecaeba0e323aaacae5700909738c046e3a9f5a",
+    "packet_socket": "379e24d5d76c511562a4e02fb5b72586616d29cddcc9e34a97471bb1f14ab499",
+    "packet_mmap": "4e951af49af0b41ea27cf59eaa3e2a6103af0f3518322f28e82e878d5a6ef86d",
+    "pty": "13127a249ad173c3a8c1372c4ac8494122d59c548d010d64a442d8621e0997a3",
+    "pty_root": "64442a66e4b4a592fe61331b7e041f677988c0bb673adf8ee3d3317ef8cf378c",
+    "partial_bad_buffer": "4e63e2f94ecbac137632de7268c2278951d9695ad46f8edae6eaf523cba3685d",
+    "pause": "12ce6db63e0d1061a6129f64cba45e3fc27eba8c8530dfa13076a6289e5ad340",
+    "personality": "56137892e2a1081f992317bfd9baa1d21399692d7cfa3b225817051ff9c392be",
+    "ping_socket": "ee100250334df29819c7057a560ab07669673de13d8413803b3809575873872e",
+    "pipe": "1912a8a67c11a7a018c53b0edf2eae7f74b98be913fb13db67664aeb736a74c3",
+    "pointer_auth": "b040d4c95232016c2793fb6137f3660398b22e03ce10107cdc3630b72e398c6e",
+    "poll": "118c5ae1400bb549d6694a7eca1a608a1eb79d991290f6ff52c37c2b4b98b6df",
+    "ppoll": "29edb844eafce3ccbf28296f3e59892d9fcc6c47727f90a3d0b2fd1de38f2771",
+    "prctl_setuid": "2a3d2473f59de89d19a554e8a68932b1f18eea6037af5be06949d4acc37db8d9",
+    "pread64": "791856a3583540d240bc138a0aa7ff369aa7cd9a6256184ac43dd8fe23207f07",
+    "preadv": "07a15b771b9521f84e8ba539187e1729b70cfb012462f728b813ced49cc49474",
+    "preadv2": "e935dc8861574e5791189f51ca6994d1f3e5b5de8d5b2286fd3102828867e6fe",
+    "priority": "edddba8d4accf4015cee122e5ed262337c1a6ac2c36fd714cac91912fbce42b8",
+    "proc": "b70d9d6e4d30f704db03fe8c4796299cd2c1ba406ed1af69146c13c809e6add2",
+    "proc_isolated": "830277cf3b898dabca1ba567940234d50e60637ab7d4754f27d443efd4bbee8a",
+    "proc_keys": "4a6a0c038e7b8d41574d31ecc346a09de8d245d15117d628b93e38ca90915695",
+    "proc_net": "46aaabf2d782fe2fa5821a230e0c676777014e2d6926212f5a9cca2e3b62d204",
+    "proc_pid_coredump": "00ffc3b8e493afc916a416ff82818d0d5ae4f06de7b66824e91fdb92376cca6f",
+    "proc_pid_oomscore": "c8bedc932d43b366afa5096a20376e8dd80aa56f1e3c72f8e6cc4420a2131de5",
+    "proc_pid_smaps": "b446726fa8674520ad0075169857839ea1089ca75f6b9ba14d3407095d1b017c",
+    "proc_pid_uid_gid_map": "988b2d8d147fb1ad9dbb15fcca4d71544765e141b9ec2a7844b04dc703fe2a55",
+    "pselect": "01e6670cb521904f2d0919197d316ff174ea7d79ca0c7ee1bd2d9e0b0492f3f8",
+    "ptrace": "a20c525167adfbfe127c07f0161f4dbcee62385419c575bc9f8b0e0ad46698ba",
+    "pwrite64": "c0c42c37d871130488c4a0d8feaeeef9885ff2ddf2c54e4f1bf2622995aee0b6",
+    "pwritev2": "cb801e69a4b567ad29a4e7a11a88dabf6ed310ce824ec63f7702a901cad3e64e",
+    "raw_socket_hdrincl": "ae2bb0c2a17a294dffc2699ffee4517975429bf5745e0b9c883f957de5c03cfa",
+    "raw_socket": "f2a383fd59d8f7a5f31600dce15590eca138b36118b398c5e3b5c80a5037886e",
+    "raw_socket_icmp": "5c7d018f01f924a2d737b07ffaf3de4b23890ddee3375e4cb335d5b616522821",
+    "read": "1b7e2d3dc4f17a8a2775ba8ecc465816228a326bd0548bcba798237e0ea26115",
+    "readahead": "80cd9f77378161c2812dd6718b660485dd10c3d9479f5a16033ed8f4ee49c2dd",
+    "readv": "32e49a287330c9c1d4c1e9bbad87ea5cb83ceb099b4a6a775ba2f4d051ee48ed",
+    "readv_socket": "f8a82aaa96095f5e09374754e3adff846a4487cd259704c743a78b062497d180",
+    "rename": "e5aacd31e149d05b9d0cf8e2f8f9f795b6aa55cc59b2cd47e8c179e76aaa5da7",
+    "rlimits": "0fbcca6a595b694a4d5929fd1700f29d7006e5f2c6ab0567bf0f739fa3653e27",
+    "rtsignal": "f31adc3e7eeef80c4f4ff7b644eb61635e675dc3d16d89671e23dd22ceb174cc",
+    "sched": "8003bbd773368cc3d1358be5b08c981b69071d8063319bbfcada657a70c99a94",
+    "sched_yield": "c742ed53eed8a5b788f85241eaf0f0847cc444720e1e8b664bf71c2f137f6ad4",
+    "seccomp": "cda3a5c7e53842161de33be29467dc8b702641b5ca8df56e9fb30d03e804bc55",
+    "select": "8497e94501d9848b251db38ca37727bd9df0ee38f455d42c2f22da8a9982c726",
+    "sendfile": "7a92a287f3c91d6b1f8fd3dbad774a3a1e5d8dedad091d3b97bbba131e96d4f0",
+    "sendfile_socket": "1b388110b461085a24b02376df9f06334bdc2e85d8231a3be619543a5250478a",
+    "setgid": "10ed6f64d8a2d1e6717e9f7c11fb8b229adbb07cdcb17a55118191d195c006aa",
+    "setns": "13da2c3582a7be24b2f2bc99e31cf6772b31a156ded05c78a9acb3827b272ff5",
+    "splice": "a776f14ae55b2360114551d655947547ff157e8fce1aa75980936e9660632488",
+    "sigaction": "8934fc2dfa1a7e886a1819cdc5c210e0b6d2adba6a22f4dfbd1515622499499a",
+    "sigaltstack": "6b1ac6ebb1aeaa88f788a09326480e407ac1c7e3e233326e1eb67286f8b15266",
+    "sigreturn": "f7548aae8a74fd88230c0d46ca2426d250278dc3b340a06ee90748fc73eff858",
+    "signalfd": "de39a60a687734f5768225873c62bf45626b32ae2eb013da4dfa62d7a136f7da",
+    "sigprocmask": "9e5a1664d439e9bff4d44aa009c288857e9d50481b1dc37ab57adc3df83fb905",
+    "sigstop": "529190b3afd19e1be435307424b2760efcfd6abb96cd3c045968447ac44bc6a6",
+    "sigtimedwait": "018623fafdb73d98c4aa2dc49d0dfca4b5968e3f1bb77cff9af6c9ae3f3bf7d8",
+    "socketopt": "885eddeecb6403ae2b64cb4796c8a15594e5578b9a042f2a0da47077635a9ffa",
+    "socket_data_transfer_stress": "340790a9631a56955c0c6f27764efd619049edb128024ce808529f2839ecaa05",
+    "socket_stress": "82275cec13fd589bcdd1b734d08016d7a1f6327a45f3defcbb25772a39639673",
+    "socket_abstract": "1c04fcb5cbca0737bc5102463cb62040b8813499dbd32b7ca540d8a8882b2aab",
+    "socket_abstract_non_blocking": "46dcdf87d268ad767fd90956220ac7d7e45c7e932ce40a04a7bf34fbaced5375",
+    "socket_unix_dgram_local": "67072b934d360e9973e7f51775ba2fb8eedfcf3800ced64646c0af3988c2a9e7",
+    "socket_unix_dgram_non_blocking": "48fd1791d3696517fdc03cd492c91dc8b9c197f2022aa7901167ce2811b7315a",
+    "socket_unix_seqpacket_local": "4cdd10e4045124cc8a790039aafa976305513a2f92240827eb945c0ed58ed3e9",
+    "socket_unix_stream": "fdc2b043f5140edbd176c8b6972641d0ead051ac623d451a67381d668d5119d5",
+    "socket_unix_stream_listener_close": "63831badcc2e54aff15e560149fce9bdd79b9a2decfd90deda702acf19566f73",
+    "socket_ip_tcp_generic_loopback": "c5f6950825513fdaa4d44c37b134347f568c4c10c9e4830252e91588c8a4937d",
+    "socket_ip_tcp_udp_generic_loopback": "58141d729bbf8981d355e145ff4aa000ef6810918988c43f016a49f0cbf54fcb",
+    "socket_ip_tcp_loopback": "0c4efde4d551501e3392d16af0706343c93b848cc93093ded2e16e23bbc17a73",
+    "socket_ip_tcp_loopback_non_blocking": "92385554651c60e0c4d74380e6ec27a628595caad19608abfce6ed529e01bc3d",
+    "socket_ip_udp_loopback": "b76939df8649f3bb92321fbf702b73133060faaf92e194dd078caabe187327c1",
+    "socket_ipv4_udp_unbound_external_networking": "f5d6bf2af5b98f9c650a1daeb08c0a3e95f0b16004e69085659c5be96d57ded9",
+    "socket_ipv6_udp_unbound_external_networking": "173802206f3e6f0bc1e2a331f9e5c02a337194f8a412b96f987e81e8651d9e78",
+    "socket_bind_to_device": "5623f381d8229c3bd1704c1d58394f64c230ae21917883a1cfdeeb5b55b9c137",
+    "socket_bind_to_device_sequence": "965f240c015c0c51c3cc19ad3a06b9fc13373848189e53074ceb85e8138d202b",
+    "socket_bind_to_device_distribution": "602bc98f8d0457306601735eabfa18ab0d6dea61b92d01278efe3750f71ef80d",
+    "socket_ip_udp_loopback_non_blocking": "36fa610f515e5ac7af15f4ec6b4287e3af0841dd64a0f324f135ba7a9edce332",
+    "socket_ipv4_udp_unbound_loopback": "bb02772ae22c561f239a7a4261aaabcc608cbaf1be49601350e8a5ce8c878589",
+    "socket_ipv4_datagram_based_socket_unbound_loopback": "e75a2062fc742ec9ce227df57585f50e985da0c9d44b05a7e354e992ff9a13ae",
+    "socket_ipv6_unbound": "33ab103480bff9f6354b9e5e8b48cdf34ea352b554960b3707973a7afa59b498",
+    "socket_ipv6_udp_unbound_loopback": "140537c7742419fa01bf4e31a457e15ae080a4a1dd57cda5c1f2a7125d234aa5",
+    "socket_ipv4_udp_unbound_loopback_nogotsan": "49e84b7eba227584db5864a703e5e731ef97160ce3f6cc6f6023fd4dca652c28",
+    "socket_ipv4_udp_unbound_loopback_netlink": "f908e062976d63b29c38f614538008b4ab074d2123bfbd63419fcbe7357357c7",
+    "socket_ipv6_udp_unbound_loopback_netlink": "eb76296463d27baf402b1fa955aed1cde53416acb4fc20f7f01ec64099d6783c",
+    "socket_ip_unbound": "0aa313bc681e17074d3f892aec4b85615ebcb7d683773e90b2f3254e211c2cea",
+    "socket_ip_unbound_netlink": "1d2c15bc9849fc8ebc7fbcfdee4a8986e342370128bd49246e3e3f07fc118650",
+    "socket_domain": "3a76e3ca7964e335f5bdf75abff48b84626b7b5147aead509783624ec073a332",
+    "socket_domain_non_blocking": "6908846113b65017bb86589cbb0f3201444f18c39f4b2debe0d476ddddceba7e",
+    "socket_filesystem": "66b7e57e9547260671df9d34de163f5d1318db9834ac5e416c26d181ea5fbc51",
+    "socket_filesystem_non_blocking": "4c73a9d0ffa82bce8321a4465c74e235d0acb87c18eccd1f851928664872dde4",
+    "socket_inet_loopback": "fe7fffd2bff4fd2b6c2c7a4d8575097cc273805aac9c4539597412914d226990",
+    "socket_inet_loopback_nogotsan": "2bab1e0666f5562941d6e911cd8f12e29c785c20415e13b8a3ff8bd572c5db61",
+    "socket_inet_loopback_isolated": "0943fc37a46821dbb6970542c3156edf7ede30659d4382e34d1ab29e3de29bd8",
+    "socket_netlink": "ce6a8ee170fa439b09d193cda51a7c4068950e6fcb15788d76d972147f985d3f",
+    "socket_netlink_route": "19a0e2fc3add33320d393355729e18bd3c104004583ebe3413d507969b20057f",
+    "socket_netlink_netfilter": "87f4d8ae2ac1fed82e22b5fe17a75f1bb658a38f29b1f9d6d6a6fabc3491489f",
+    "socket_netlink_uevent": "19b9affc5f90f2841706b038da892a98fd940a10b8971e625acc2a3166272b24",
+    "socket_stream_local": "3b56098766c88f266272ae3ece661d37caa91e272b5d6dfbd55a7191b9fac70d",
+    "socket_stream_blocking_local": "d70724f2c72296f6d5ff21ae776777a6e0589473145c2700761d7db5937d831c",
+    "socket_stream_blocking_tcp": "4fc65fc06366bbf70c97847990b2a574df73cb70c167154b88616d9adc2787f8",
+    "socket_stream_nonblock_local": "ad673d988c0e4a12f09fff93b53312cb7fb8a4b8d26ddcee029725473504728a",
+    "socket_unix_unbound_dgram": "506bd4363f629599b718636924416898fbbf3f2171e4ef2264c1cb4e6c7d294c",
+    "socket_unix_unbound_abstract": "eda7eadabf25d247ee14f275a4075204e803c6a7b9bb05ae61bec65358bb753c",
+    "socket_unix_unbound_filesystem": "38dfc0d7fedd5b9eba4d60ff03a1a62cc83cfd2e23344fd4b96de6d6535569b6",
+    "socket_blocking_local": "70e46d6ff395f74a7be982227f417794cdf4261e1cbb611da75e5626fabe3d08",
+    "socket_blocking_ip": "d57b7cac520218b5b13d163633a35c6eb84ef84f05f427b78bba8a6e19f96e2f",
+    "socket_non_stream_blocking_local": "56943f90dcfa561eb504855cac0da2c9bbd5291ceda1eb0a18b95600696e8621",
+    "socket_non_stream_blocking_udp": "00f708a4af20f38f62e46d6b4343f971a8f6ff262e0788e6b5011cef82f168f4",
+    "socket_unix_pair": "68d5d5ac146dabaa60b999500ea112408e631bbd82ac40f1be296c1ac337fe14",
+    "socket_unix_unbound_seqpacket": "efbc5177203286b9106d848dd9eaf1e0bff483d0540a2777a2968340bd6fb21c",
+    "socket_unix_unbound_stream": "b0c9e4e5b2f5497f14fbfeab6a69492615ae3ae169844ea2ce8adaf8b067a0f3",
+    "socket_netdevice": "1521619bf97da63cf35985ac0157926f3ab5ce4a36f29428b9f9ddba14337cf2",
+    "stat": "6bb0b6ee102fd112c92afdc8bcc6f052e8bfdad15d7a174781185d21232e5b34",
+    "stat_times": "37da3c88ff0ac69c046492f898cc54fd8d20c27e05d3f7437532c9ec95c7ab93",
+    "statfs": "c2bd9895b88a39d60fa9256e3d578eb7e8f5d4d3cb5ccc079b1e0d21b0baf858",
+    "symlink": "7e50caddce009ce78b15df1deac77b30708f9bd3d997e333b724cb2dc7672fa3",
+    "sync": "cb91ba3c3acd46cdcef66be72dff45f88185066c1a905ad35beab98093417811",
+    "sysfs_cpu_topology": "406210762ee4d789f1e26ed9f19dd4892831edc4eb0e242a4a0d44ed3ef7cdb7",
+    "sysinfo": "0a0f03dfae566ac119a3ed9076ccacc438940274d00a4f6281f2685a5e7d263b",
+    "syslog": "3739dae1dd59a7f6dd3d9c736fac7b3b725955f52236b5074f5aa6d05a372a02",
+    "sysret": "92b0dabf358aab1a04f689a56a44bf3ea606fa99be127604298d6caa22c420e9",
+    "tcp_socket": "867800c7722394dee90810d5cb6442bdebc769f6d61c9541e7d82c34a7a2b374",
+    "tgkill": "69a5ad103f35fd32b5202b0d9d1c9c2cbc6fe420f8698f2360897a7ceff549c2",
+    "time": "68b7b3c93fd15459a4b012c476e7e0bbae4bb4dbae774d97058378c4e02959e1",
+    "timerfd": "95139f23af29c02153fabff99796d27f0c157fcb8b027a72cc8193b29a709fb6",
+    "timers": "2cf24599119844656c3422ec241376a248a0b35a522bde95d7fb307e54946cd7",
+    "tkill": "97e03fdb815c6f5d3301b2203e7c11db154ab538814b98616dded0d00b6b4b1c",
+    "truncate": "83be004804f8a5c0885c8052e53153bdc0fed61ce8aa5b914de9d5a422a8ff78",
+    "tuntap": "f12da8ef1c244bc09b7dff3fd92c54f2e687d4768bad39a94d689483a59a0b75",
+    "tuntap_hostinet": "16b7414433d69330c0c3a117ac47d8af0250acf3d73dd90aea4451854d528211",
+    "udp_socket": "9aca9f30e3af06ea0a7db1c206c944633f51fc854ae610a8ec429421dc0ca315",
+    "udp_raw_socket": "4b48f2a12a0c948d638385aabb5453fe5c28fdba689602c35e2e4b0f85266ee6",
+    "udp_bind": "89bb6e825328fe546aba33ab9ddde985fc37b35b9ac9fbd18de40a9b73b291d5",
+    "uidgid": "033bd97934b24eec6bebbf26c1fcc49ee8b512bdaf57eda9cfd1c55700c7dd32",
+    "uname": "0d3b7e9997654361a46d5fb95e35764a395235071d4b266b1dccc1bdb28b44e6",
+    "unlink": "ede7a98269c92c57943af31af394ff4e0b899349edfe8ba7870310ffd26f744c",
+    "unshare": "d4abf3ba8c6219300526dcd9e21f4f107ecc3b6a87124bd369a9f40df18044c9",
+    "utimes": "887a591d3fada79ebe828d9f3aea6d45af7de1a11b15549bdbb3c664f4e009d4",
+    "vdso": "a6ab400367c427b41943ece196d3794da8f27619c207c049b1d7a16aa176faf3",
+    "vfork": "dc7205f06a008e390600e863cc67fbb9f6fc33990436f28ffb65417ec67db41b",
+    "wait": "4d664675762a3a2d4935f12ec4022fc7a17c919c8e427e989b422f1d2d869ce6",
+    "write": "abb1e6f3605a60621e06af9053736e1ee52095709690abba18115ea0d5ca1ff5",
+    "memory_accounting": "d5e9018a84e495e8f30bed3f676b68335d71611419c2a8cf85f15f4e108cf971",
+    "network_namespace": "2c64365ca9d0fd2b926ee27c763e1abeef235d3652d5db5f1a2fbdb578a4407e",
+    "mq": "574bd143d9ef943ca75e5a967988049309501dcc4485d7c652bdeae10d0edc7a",
+    "semaphore": "b1809ec0fee0a4683b53220b5c60d3d51f25fba30c12abedecfad5f6b8a9cdd6",
+    "shm": "7413501c6abc622dda1a1d93f2205e54b8345baeddd8c1675113e271ec05867e",
+    "msgqueue": "6bdec5295790a35c2343631f5b576db4012c635204adde80976825b30675646d",
+    "fadvise64": "29f7a05c3682d12b7eafe957fc5cffc4156f5ed522217d2e0abc863abdb29ea7",
+    "vdso_clock_gettime": "414a1ecaee40a305934dd7eb4712413524813255b8564bc37e80152881b1b658",
+    "vsyscall": "34dda928a333efd8f53c402857b90fb3272f3888a1e27c2dceaaad12a8e42daf",
+    "proc_net_unix": "b4e1b9a066d31b63fbbcd8d8aa689ee73e9ca4109cc497c7dabcc39e1398ab95",
+    "memfd": "b3b84ecf629dd4af18f9d01955e6197b2788abd404b600b555a14b65e219c6d1",
+    "proc_net_tcp": "a78b9fc7b0560272027ae1720f0c308d6749a23d95206a0637380c25033fb39e",
+    "proc_net_udp": "2f36d4de257d38705fc110e933e41fbe4fcf135f6dcfc6fcdd36216fac373e6e",
+    "processes": "8cf6356605c28cd3dca19edf282c19d34911cb89eb59c32163310e4b48f13e00",
+    "xattr": "e69be1a1884d345b58c85bba21c36ae7c84086e7c13f41b07d54da67314c1cad",
+    "posix_acl": "bbabb1575f962de7ae85267f65b3461edf1af860a9284bab1088651cbd05db55",
+    "cgroup": "632f947a1a2c4eb5f5d8639f0b92e27a432dc59fc6d291f991cbe382e03e512f",
+    "cgroup2": "4e61131a7322dbb1f3c5e3197041f358262a5c01d02c6f80aed20efc59ec68b0",
+    "cgroup2_transfer": "0286e3ce35b857d9fb94cfed5fd19aff0fd342d3698cb077992f0ab387ddb181",
+    "deleted": "cf10fb586fedbd7135b1b58ad6d728538ed2a5e17620c02f8076f5195e25a9e6",
+    "close_range": "3a76cc170303fa175a3cc78e6dfe295f4e26cb7581d3c6915a8648fcde13a3cf",
+    "fuse": "6cc36482813a40a3c7b94b42ec39412643db49613994cc0755ab4dcdcb4efc94",
+    "process_vm_read_write": "193ac48fb2afc4b9cd29dda80b1243237897907fad161567bfb40fa493d3bf3f",
+    "host_pty": "58fd6430bbc1e937e87ff514381add18db22b5702e1666dfad36ed43fc96e071",
+    "pidfd": "4abf7be88d81e4c8392e8a44ae1a7c135edf3ccea623436c241d59d78a08f700"
+  },
+  "compiler": "c++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0\nCopyright (C) 2023 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
+  "reference_kernel": "7.0.0-43-generic",
+  "csv_sha256": "ff09f238acebaaf351b28bc3b9aebcddc16103207881c2ee849ff14df7b6d105",
+  "standalone_confirmations": {
+    "schema_version": 1,
+    "cases": 25,
+    "native_counts": {
+      "passed": 25
+    },
+    "trames_counts": {
+      "no_result": 1,
+      "failed": 23,
+      "fixture_failed": 1
+    },
+    "native_passed_cases": 25,
+    "outcomes_on_native_passed": {
+      "no_result": 1,
+      "failed": 23,
+      "fixture_failed": 1
+    },
+    "strict_pass_fraction": 0.0
+  },
+  "representative_gaps": [
+    {
+      "suite": "cgroup2",
+      "case": "Cgroup2Test.AttachNonExistentProc",
+      "status": "no_result",
+      "messages": []
+    },
+    {
+      "suite": "copy_file_range",
+      "case": "CopyFileRangeTest.DirectoryInputIsEISDIR",
+      "status": "failed",
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/copy_file_range.cc:276\nValue of: CopyFileRange(dirf.get(), nullptr, outf.get(), nullptr, 1, 0)\nExpected: -1 (failure), with errno PosixError(errno=21 Is a directory)\n  Actual: -1 (of type long), with errno PosixError(errno=22 Invalid argument)\n"
+      ]
+    },
+    {
+      "suite": "exec",
+      "case": "ExecTest.ACLExecuteOnlyBinary",
+      "status": "failed",
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/exec.cc:1147\nValue of: _expr_result\nExpected: is OK\n  Actual: PosixError(errno=2 No such file or directory) open(/proc/sys/fs/suid_dumpable, 0, 0)\n"
+      ]
+    },
+    {
+      "suite": "fcntl",
+      "case": "FcntlLockTest.SetLockDir",
+      "status": "failed",
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/fcntl.cc:396\nValue of: fcntl(fd, 6, &fl)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=9 Bad file descriptor)\n"
+      ]
+    },
+    {
+      "suite": "flock",
+      "case": "FlockTestNoFixture.FlockPipe",
+      "status": "failed",
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/flock.cc:693\nValue of: flock(fds[0], 2 | 4)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=9 Bad file descriptor)\n",
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/flock.cc:695\nValue of: flock(fds[1], 2 | 4)\nExpected: -1 (failure), with errno PosixError(errno=11 Resource temporarily unavailable)\n  Actual: -1 (of type int), with errno PosixError(errno=9 Bad file descriptor)\n",
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/flock.cc:697\nValue of: flock(fds[0], 8)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=9 Bad file descriptor)\n",
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/flock.cc:698\nValue of: flock(fds[1], 2 | 4)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=9 Bad file descriptor)\n"
+      ]
+    },
+    {
+      "suite": "fork",
+      "case": "CloneTest.Clone3AsClone",
+      "status": "failed",
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/fork.cc:626\nValue of: child_pid = clone3(&ca, sizeof(ca))\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/fork.cc:633\nValue of: waitpid(child_pid, &status, 0)\nExpected: is equal to -1\n  Actual: -1 (of type int), with errno PosixError(errno=10 No child processes)\n"
+      ]
+    },
+    {
+      "suite": "inotify",
+      "case": "Inotify.ChmodGeneratesAttribEvent",
+      "status": "failed",
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/inotify.cc:1268\nValue of: events\nExpected: 2 events:\n\tevents[0]: IN_ATTRIB, wd=1, name=gvisor_test_temp_2_1794908848705823000\n\tevents[1]: IN_ATTRIB, wd=2\n\n  Actual: { 48-byte object <02-00 00-00 04-00 00-00 00-00 00-00 00-00 00-00 10-C2 77-00 00-00 00-00 00-00 00-00 00-00 00-00 00-00 00-00 00-00 00-00 00-00 00-00 00-00 00-00>, 48-byte object <01-00 00-00 04-00 00-00 00-00 00-00 30-00 00-00 E0-C3 77-00 00-00 00-00 26-00 00-00 00-00 00-00 26-00 00-00 00-00 00-00 00-00 00-00 00-00 00-00> }, \n\tMismatch at index 0, want IN_ATTRIB, wd=1, name=gvisor_test_temp_2_1794908848705823000, got IN_ATTRIB, wd=2,\n\tMismatch at index 1, want IN_ATTRIB, wd=2, got IN_ATTRIB, wd=1, name=gvisor_test_temp_2_1794908848705823000,\n\tIn total of 2 events:\n\t\tevents[0]: IN_ATTRIB, wd=2\n\t\tevents[1]: IN_ATTRIB, wd=1, name=gvisor_test_temp_2_1794908848705823000\n\n",
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/inotify.cc:1268\nValue of: events\nExpected: 2 events:\n\tevents[0]: IN_ATTRIB, wd=1, name=gvisor_test_temp_2_1794908848705823000\n\tevents[1]: IN_ATTRIB, wd=2\n\n  Actual: { 48-byte object <02-00 00-00 04-00 00-00 00-00 00-00 00-00 00-00 10-C2 77-00 00-00 00-00 00-00 00-00 00-00 00-00 00-00 00-00 00-00 00-00 00-00 00-00 00-00 00-00>, 48-byte object <01-00 00-00 04-00 00-00 00-00 00-00 30-00 00-00 80-DE 77-00 00-00 00-00 26-00 00-00 00-00 00-00 26-00 00-00 00-00 00-00 00-00 00-00 00-00 00-00> }, \n\tMismatch at index 0, want IN_ATTRIB, wd=1, name=gvisor_test_temp_2_1794908848705823000, got IN_ATTRIB, wd=2,\n\tMismatch at index 1, want IN_ATTRIB, wd=2, got IN_ATTRIB, wd=1, name=gvisor_test_temp_2_1794908848705823000,\n\tIn total of 2 events:\n\t\tevents[0]: IN_ATTRIB, wd=2\n\t\tevents[1]: IN_ATTRIB, wd=1, name=gvisor_test_temp_2_1794908848705823000\n\n",
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/inotify.cc:1268\nValue of: events\nExpected: 2 events:\n\tevents[0]: IN_ATTRIB, wd=1, name=gvisor_test_temp_2_1794908848705823000\n\tevents[1]: IN_ATTRIB, wd=2\n\n  Actual: { 48-byte object <02-00 00-00 04-00 00-00 00-00 00-00 00-00 00-00 10-C2 77-00 00-00 00-00 00-00 00-00 00-00 00-00 00-00 00-00 00-00 00-00 00-00 00-00 00-00 00-00>, 48-byte object <01-00 00-00 04-00 00-00 00-00 00-00 30-00 00-00 E0-C3 77-00 00-00 00-00 26-00 00-00 00-00 00-00 26-00 00-00 00-00 00-00 00-00 00-00 00-00 00-00> }, \n\tMismatch at index 0, want IN_ATTRIB, wd=1, name=gvisor_test_temp_2_1794908848705823000, got IN_ATTRIB, wd=2,\n\tMismatch at index 1, want IN_ATTRIB, wd=2, got IN_ATTRIB, wd=1, name=gvisor_test_temp_2_1794908848705823000,\n\tIn total of 2 events:\n\t\tevents[0]: IN_ATTRIB, wd=2\n\t\tevents[1]: IN_ATTRIB, wd=1, name=gvisor_test_temp_2_1794908848705823000\n\n"
+      ]
+    },
+    {
+      "suite": "madvise",
+      "case": "MadviseDontforkTest.AddressLength",
+      "status": "failed",
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/madvise.cc:268\nValue of: madvise(addr, 0, 10)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=22 Invalid argument)\n",
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/madvise.cc:275\nValue of: madvise(addr, 1, 10)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=22 Invalid argument)\n",
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/madvise.cc:276\nValue of: madvise(addr, kPageSize, 10)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=22 Invalid argument)\n"
+      ]
+    },
+    {
+      "suite": "mlock",
+      "case": "MapLockedTest.Basic",
+      "status": "failed",
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/mlock.cc:254\nValue of: IsPageMlocked(mapping.addr())\n  Actual: false\nExpected: true\n",
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/mlock.cc:255\nValue of: munlock(mapping.ptr(), mapping.len())\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n"
+      ]
+    },
+    {
+      "suite": "mremap",
+      "case": "MremapTest.InPlace_Copy",
+      "status": "failed",
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/mremap.cc:396\nValue of: Mremap(m.ptr(), 0, kPageSize, 0, nullptr)\nExpected: has an errno value that is equal to 12, and has an error message that is anything\n  Actual: PosixError(errno=22 Invalid argument) mremap failed\n"
+      ]
+    },
+    {
+      "suite": "msgqueue",
+      "case": "MsgqueueTest.InterruptRecv",
+      "status": "failed",
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/msgqueue.cc:681\nValue of: _expr_result\nExpected: is OK\n  Actual: PosixError(errno=38 Function not implemented) msgget(0, 384)\n"
+      ]
+    },
+    {
+      "suite": "openat2",
+      "case": "Openat2Test.BeneathMagicSymlink",
+      "status": "failed",
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/openat2.cc:354\nValue of: OpenAt2(root.get(), JoinPath(\"proc/self/fd\", std::to_string(fd.get())), 00, 0, 0x08)\nExpected: has an errno value that is equal to 18, and has an error message that is anything\n  Actual: PosixError(errno=40 Too many levels of symbolic links) openat2(4, proc/self/fd/5, 0, 0, 0x8)\n"
+      ]
+    },
+    {
+      "suite": "packet_socket_dgram",
+      "case": "AllInetTests/CookedPacketTest.BindFail/0",
+      "status": "failed",
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/packet_socket_dgram.cc:154\nValue of: restore_config.error()\nExpected: has an errno value that is equal to 13, and has an error message that is anything\n  Actual: PosixError(errno=2 No such file or directory) open(/proc/sys/net/ipv4/conf/lo/accept_local, 0x2, 0) (of type gvisor::testing::PosixError)\n"
+      ]
+    },
+    {
+      "suite": "pidfd",
+      "case": "PidfdTest.Clone3InvalidFdAddrFails",
+      "status": "failed",
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/pidfd_test.cc:339\nExpected equality of these values:\n  (*__errno_location ())\n    Which is: 38\n  14\n",
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/pidfd_test.cc:354\nExpected equality of these values:\n  (*__errno_location ())\n    Which is: 38\n  14\n"
+      ]
+    },
+    {
+      "suite": "poll",
+      "case": "PollTest.BlockingEventPOLLRDNORM_POLLIN",
+      "status": "failed",
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/poll.cc:127\nExpected equality of these values:\n  poll_fd.revents & mask\n    Which is: 1\n  mask\n    Which is: 65\n"
+      ]
+    },
+    {
+      "suite": "prctl_setuid",
+      "case": "PrctlKeepCapsSetuidTest.NoKeepCapsAfterNewUserNamespace",
+      "status": "failed",
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/prctl_setuid.cc:224\nValue of: _expr_result\nExpected: is OK\n  Actual: PosixError(errno=22 Invalid argument) clone(CLONE_NEWUSER)\n"
+      ]
+    },
+    {
+      "suite": "process_vm_read_write",
+      "case": "ProcessVMInvalidTest.EmptyTransferPrecedesRemoteValidation",
+      "status": "failed",
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/process_vm_read_write.cc:331\nValue of: process_vm_readv(getpid(), &zero_len, 1, &valid, 1024 + 1, 0)\nExpected: is equal to 0\n  Actual: -1 (of type long), with errno PosixError(errno=22 Invalid argument)\n",
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/process_vm_read_write.cc:344\nValue of: process_vm_readv(absent, &zero_len, 1, &valid, 1, 0)\nExpected: is equal to 0\n  Actual: -1 (of type long), with errno PosixError(errno=38 Function not implemented)\n",
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/process_vm_read_write.cc:346\nValue of: process_vm_readv(absent, &valid, 1, &zero_len, 1, 0)\nExpected: is equal to 0\n  Actual: -1 (of type long), with errno PosixError(errno=38 Function not implemented)\n"
+      ]
+    },
+    {
+      "suite": "seccomp",
+      "case": "SeccompTest.RestartSyscallAfterGroupStopIsFiltered",
+      "status": "failed",
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/seccomp.cc:716\nValue of: (((signed char) (((status) & 0x7f) + 1) >> 1) > 0) && ((status) & 0x7f) == 31\n  Actual: false\nExpected: true\nstatus 0\n"
+      ]
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.BasicRecvmmsg/0",
+      "status": "failed",
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/socket_generic_test_cases.cc:167\nValue of: RetryEINTR(recvmmsg)(sockets->second_fd(), &msgs[0], msgs.size(), 0, nullptr)\nExpected: is equal to 10\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n"
+      ]
+    },
+    {
+      "suite": "socket_inet_loopback",
+      "case": "All/DualStackAfMismatchTest.V4ListenerV6Connect/TCP",
+      "status": "failed",
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/socket_inet_loopback.cc:327\nValue of: connect(socket_fd.get(), AsSockAddr(&v6_addr.addr), v6_addr.addr_len)\nExpected: -1 (failure), with errno PosixError(errno=97 Address family not supported by protocol)\n  Actual: -1 (of type int), with errno PosixError(errno=22 Invalid argument)\n"
+      ]
+    },
+    {
+      "suite": "socket_inet_loopback_isolated",
+      "case": "All/SocketInetLoopbackIsolatedTest.TCPActiveCloseTimeWaitReuseTest/ListenV4Any_ConnectV4Any",
+      "status": "failed",
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/util/socket_util.cc:1124\nValue of: RetryEINTR(connect)(conn_fd.get(), AsSockAddr(&conn_addr), connector->addr_len)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=13 Permission denied)\n",
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/socket_inet_loopback_isolated.cc:71\nValue of: bind(conn_fd.get(), AsSockAddr(&conn_bound_addr), param.connector.addr_len)\nExpected: -1 (failure), with errno PosixError(errno=98 Address already in use)\n  Actual: -1 (of type int), with errno PosixError(errno=97 Address family not supported by protocol)\n"
+      ]
+    },
+    {
+      "suite": "socket_ip_tcp_generic_loopback",
+      "case": "AllTCPSockets/TCPSocketPairTest.CheckTcpInfoFields/0",
+      "status": "failed",
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/socket_ip_tcp_generic.cc:143\nValue of: getsockopt(sockets->first_fd(), 6, 11, &opt, &optLen)\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=92 Protocol not available)\n"
+      ]
+    },
+    {
+      "suite": "socket_ip_udp_loopback",
+      "case": "AllUDPSockets/AllSocketPairTest.BasicRecvmmsg/0",
+      "status": "failed",
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/socket_generic_test_cases.cc:167\nValue of: RetryEINTR(recvmmsg)(sockets->second_fd(), &msgs[0], msgs.size(), 0, nullptr)\nExpected: is equal to 10\n  Actual: -1 (of type int), with errno PosixError(errno=38 Function not implemented)\n"
+      ]
+    },
+    {
+      "suite": "socket_netlink_netfilter",
+      "case": "AddChainErrorcases/NetlinkNetfilterChainTest.AnonymousChain/AddNamedBindingChain",
+      "status": "fixture_failed",
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/socket_netlink_netfilter.cc:89\nValue of: _expr_result\nExpected: is OK\n  Actual: PosixError(errno=2 No such file or directory) open(/proc/self/uid_map, 0, 0)\n"
+      ]
+    },
+    {
+      "suite": "socket_unix_pair",
+      "case": "AllUnixDomainSockets/UnixSocketPairCmsgTest.BasicCredPass/0",
+      "status": "failed",
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/socket_unix_cmsg.cc:796\nExpected equality of these values:\n  sent_creds.pid\n    Which is: 3\n  received_creds.pid\n    Which is: 0\n",
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/socket_unix_cmsg.cc:797\nExpected equality of these values:\n  sent_creds.uid\n    Which is: 0\n  received_creds.uid\n    Which is: 65534\n",
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/socket_unix_cmsg.cc:798\nExpected equality of these values:\n  sent_creds.gid\n    Which is: 0\n  received_creds.gid\n    Which is: 65534\n"
+      ]
+    }
+  ],
+  "execution": {
+    "date": "2026-11-17",
+    "runtime_revision": "7143bacd36327cc0d05b6fd7226a42058648fb02",
+    "runner_sha256": "22a6f3894e8bbf4d199272236adf35e3f4f740e801c5c8041e79f6ef98467534",
+    "rootfs_sha256": "821565fa8f3953eefd12497b166b4b50add2f7c57fb312e75862f5867e06fefe",
+    "guest_release": "6.0.0-trames",
+    "platform": "Mac HVF ARM64",
+    "cpus_per_guest": 2,
+    "lazy_memory_budget_gib_per_guest": 8,
+    "workers": 4,
+    "network": "Trames internal bridge; NAT disabled; no host listener path",
+    "process_context": "test PID 2, session/group 1",
+    "filesystem": "APFS clean imported-store clone per invocation; chunks of at most 50 original GTest cases; aborted prefixes re-executed for strict XML; singleton evidence reused only with matching runtime/ELF/environment identities",
+    "timeout": "base 5 seconds per active case, max(base,min(90,3*native_seconds+2)); alarm 65, itimer 95; singleton confirmations base 20",
+    "wall_budget_seconds_per_worker": 1800,
+    "minimum_host_free_gib": 8,
+    "product_environments": "Only disposable test registries; installed Stable/Dev environments not restarted",
+    "scope_exclusions": [
+      "iPad interpreter execution",
+      "Native BSD host-network path",
+      "28 upstream DISABLED cases",
+      "Non-ARM64 targets",
+      "gVisor-only save/restore mode",
+      "unresolved prctl Go runfile and rseq no-libc helper"
+    ]
+  },
+  "native_context": {
+    "schema_version": 1,
+    "kernel": "7.0.0-43-generic",
+    "machine": "aarch64",
+    "uid": 0,
+    "nofile": [
+      1048576,
+      1048576
+    ],
+    "max_cases_per_suite": 0,
+    "network": "internal",
+    "process_context": "pid2",
+    "native_init_sha256": "0dfc5f216287ec9bba22c01f3223e425431ae3cc29a34c92f6f0cf0dc0929b29"
+  },
+  "case_execution": {
+    "chunk_size": 50,
+    "fresh_store": true,
+    "timeout_base": 5.0,
+    "suite_timeouts": {
+      "alarm": 65.0,
+      "itimer": 95.0
+    },
+    "reference_timing_extension": "max(base,min(90,native_seconds*3+2))"
+  },
+  "clean_store_manifest_sha256": {
+    "0": "bf4d39467842f801679bfcde9cef1d6151ce94ba584eda616e0f208c1f585eee",
+    "1": "d12e867f48c99f791ec39e3bf0d6d081fe1db049e910268bb20f5a396dacdb1d",
+    "2": "c4de99b763c883f1da2e949279d7a3b7fdb1097dea4813165df2335a118bb825",
+    "3": "6b35de0f4efa71ededc774755c0b24b3f08aef4fd0c8a5d071e2f480d8f4cf26"
+  },
+  "xml_audit": {
+    "cases": 14530,
+    "counts": {
+      "passed": 8575,
+      "failed": 4836,
+      "skipped": 550,
+      "no_result": 96,
+      "timeout": 205,
+      "fixture_failed": 268
+    },
+    "original_passing_xml_verified": 8575,
+    "fixture_classifications_refined": 268,
+    "raw_results_sha256": "8a52ed9d4657aab5e0d54c099e4c23fe32f96d475964d47bbf28d2616db17afd",
+    "raw_source": "/Users/main/dev/trames/target/gvisor-expanded-20261117/trames-chunks"
+  },
+  "source_sha256": {
+    "tests/gvisor/CMakeLists.txt": "d92bb140a47f58b5a16d5086f2a703497a995e403a131ed9f61462c8213c9d06",
+    "tests/gvisor/batch.py": "93e5f2fcf13ffbd12d0251d5fed1228752bca94099cbfa518fe513f3690a8ac3",
+    "tests/gvisor/build_graph.py": "6a727b59852d400a4399fbd848e16e4e559064f69a9af204ff98561481f20c43",
+    "tests/gvisor/chunks.py": "8eb2c45eeb589bc78c85c454e20f0a418bd0057e3f6f48063b01e474de1ee46d",
+    "tests/gvisor/compare.py": "cbad23539946253820261ceb04c75b043e6b07d1eec45309e39f42afa501da9b",
+    "tests/gvisor/harness_test.py": "3d6cf29af169fd1c01744d9cd5770c8158761cd82c3418861a418a774f34adc6",
+    "tests/gvisor/inventory.py": "d03d6529c291e361fcf182d7caadb4e7a8855f7860336bedef22fd11780d871c",
+    "tests/gvisor/native-init.c": "d11cbd14fcc0ac325267083d156dabc024de45e5651cae447f37dc2be1b7e050",
+    "tests/gvisor/normalize.py": "e06e7e500ec06cfaf9c12676c7c81d5bd87a76e6e44bd56a64f49070a56f1867",
+    "tests/gvisor/prepare.py": "57d842e5d04d869a31d4ca2755d2e7cf9a44d28199cd362c974dc7eb72c72fe1",
+    "tests/gvisor/run.py": "ebf72d77e5ef9e73143134845560aa1b8f91703ef5ba57038481b4d96c526f18",
+    "tests/gvisor/summarize.py": "9a065cb12ac0b2a3cf637206148f4934e353a7d0d50e62fb716740046d984a2e",
+    "tests/gvisor/upstream.json": "ba610b717c0408368e284c9a2406f0582915456b99e6faaeb6e273de1d5fc5de"
+  },
+  "evidence_files_sha256": {
+    "target/local-ci/io/gvisor-expanded-20261117/native-final/results.json": "8e689bde4e6d2715427801aa9202b38cd4095d51bfd6529b098de0a9ee98a25a",
+    "target/local-ci/io/gvisor-expanded-20261117/native-final/plan.json": "601b76eb026ea7915d6eed6d2254de1b0cfeffd9cc82ec11b5475f36fdae6d25",
+    "target/gvisor-expanded-20261117/trames-chunks/results.json": "8a52ed9d4657aab5e0d54c099e4c23fe32f96d475964d47bbf28d2616db17afd",
+    "target/gvisor-expanded-20261117/trames-chunks/plan.json": "0e8765190dc29fc41baae62f4909c2581487af543c2638635379f81db0bb2f44",
+    "target/gvisor-expanded-20261117/standalone-confirmation/results.json": "1ebcae42d6d9784289892f4b7f081b4bb08b3a496cedc2b99c06ea88eabb7d08"
+  },
+  "pilot_rerun": {
+    "schema_version": 1,
+    "cases": 408,
+    "native_counts": {
+      "passed": 401,
+      "skipped": 7
+    },
+    "trames_counts": {
+      "passed": 400,
+      "skipped": 8
+    },
+    "native_passed_cases": 401,
+    "outcomes_on_native_passed": {
+      "passed": 400,
+      "skipped": 1
+    },
+    "strict_pass_fraction": 0.9975062344139651
+  }
+}

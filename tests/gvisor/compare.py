@@ -39,9 +39,12 @@ def main():
     result=dict(schema_version=1,cases=len(pairs),native_counts=dict(collections.Counter(r['native']['status'] for r in pairs)),trames_counts=dict(collections.Counter(r['trames']['status'] for r in pairs)),native_passed_cases=len(comparable),outcomes_on_native_passed=counts,strict_pass_fraction=counts.get('passed',0)/len(comparable) if comparable else None,groups=groups,details=pairs)
     a.output.mkdir(parents=True,exist_ok=True)
     (a.output/'comparison.json').write_text(json.dumps(result,indent=2)+'\n')
-    lines=['| Group | Cases | Native pass / skip | Trames pass / fail / abort / skip |','|---|---:|---:|---:|']
+    lines=['| Group | Cases | Native pass / nonpass | Pass | Assertion | Fixture | Abnormal | Timeout | Skip | Unrun/resource |','|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|']
     for g in groups:
-        n,t=g['native'],g['trames'];lines.append(f"| {g['name']} | {g['cases']} | {n.get('passed',0)} / {n.get('skipped',0)} | {t.get('passed',0)} / {t.get('failed',0)} / {t.get('no_result',0)+t.get('crashed',0)+t.get('timeout',0)} / {t.get('skipped',0)} |")
+        n,t=g['native'],g['trames']
+        abnormal=sum(t.get(k,0) for k in ['no_result','crashed','invalid_result','mismatched_result'])
+        unrun=sum(v for k,v in t.items() if k.startswith('not_run') or k=='disk_limit')
+        lines.append(f"| {g['name']} | {g['cases']} | {n.get('passed',0)} / {sum(n.values())-n.get('passed',0)} | {t.get('passed',0)} | {t.get('failed',0)} | {t.get('fixture_failed',0)} | {abnormal} | {t.get('timeout',0)} | {t.get('skipped',0)} | {unrun} |")
     (a.output/'table.md').write_text('\n'.join(lines)+'\n')
     print(json.dumps({k:v for k,v in result.items() if k not in ['groups','details']},indent=2))
 

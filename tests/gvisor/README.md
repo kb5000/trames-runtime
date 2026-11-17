@@ -4,8 +4,8 @@ This standalone entry builds unmodified upstream C++ syscall tests and runs the
 same static ARM64 ELF files on native Linux and Trames. It does not build/run
 `runsc`, fetch Go toolchains, or introduce a production runtime dependency.
 
-The initial scope is **11 groups / 408 enabled cases**, not the entire upstream
-suite: brk, clock_getres, clock_gettime, dup, eventfd, getrandom, pipe, epoll,
+The default pilot is **11 groups / 408 enabled cases**. The optional broad
+build below discovers the pinned Linux C++ BUILD targets. Pilot groups: brk, clock_getres, clock_gettime, dup, eventfd, getrandom, pipe, epoll,
 mmap, futex and uname. Upstream disabled tests remain disabled; upstream runtime
 skips and reference failures are reported separately. No expectation is relaxed
 for Trames, and `TEST_ON_GVISOR`/save-restore mode are unset.
@@ -91,3 +91,93 @@ BUILD graph as the reference. No unsupported test should be silently omitted.
 
 The binaries can also be transported to iPad for interpreter coverage, but this
 entry currently automates Mac HVF only; no physical iPad pass is implied.
+
+## Broad Linux/ARM64 coverage
+
+`--expanded` resolves the original `cc_binary`/`cc_library` dependency graph
+without evaluating arbitrary Starlark. It selects ARM64/Linux source branches,
+links the original alwayslink test registrations, and preserves ordinary lazy
+static extraction for `test_main` (some upstream programs supply their own main).
+Unknown dependencies and runfiles are explicit build blockers. No test assertion
+or upstream source is rewritten. `expanded.json` records the selected sources,
+helpers, blockers and the one compiler compatibility adjustment: Ubuntu fortify
+must be disabled for the upstream sticky-bit test's intentional missing-mode
+errno probe. Native and Trames use the same resulting ELF.
+
+```sh
+python3 tests/gvisor/prepare.py --output /tmp/gvisor-expanded --expanded \
+  --build --jobs 4 --export /tmp/gvisor-artifacts/bin
+cc -O2 -Wall -Wextra -Werror -static tests/gvisor/native-init.c \
+  -o /tmp/gvisor-native-init
+sudo python3 tests/gvisor/batch.py native \
+  --binaries /tmp/gvisor-artifacts/bin --output /tmp/gvisor-native-expanded \
+  --native-init /tmp/gvisor-native-init --jobs 4 --timeout 20 \
+  --suite-timeout alarm=60 --suite-timeout itimer=90 --time-budget 1800
+python3 tests/gvisor/inventory.py --binaries /tmp/gvisor-artifacts/bin \
+  --output /tmp/gvisor-inventory.json
+```
+
+The tiny native init owns PID/session 1, enables only loopback inside the
+reference network namespace, and runs each test as PID 2. The harness temporary
+ancestor is searchable (0755) so tests can deliberately drop UIDs and exercise
+their own directory permissions. Test roots/mounts/PID/IPC/UTS/network state are
+private to the disposable CI VM, not the Mac or production environments.
+Native reference failures, skips and timeouts do not count as Trames successes
+or valid Linux-passing comparison cases. Keep exported binaries immutable while
+references/guests are running.
+
+Copy the same artifacts and reference output to the Mac, then:
+
+```sh
+python3 tests/gvisor/batch.py trames --binaries /tmp/gvisor-artifacts/bin \
+  --reference /tmp/gvisor-native-expanded \
+  --reference-timings /tmp/gvisor-native-expanded \
+  --runner '/path/to/Trames Dev.app/Contents/MacOS/trames-mac-run' \
+  --rootfs /path/to/alpine-minirootfs.tar.gz --output /tmp/gvisor-trames-expanded \
+  --fresh-store --chunk-size 50 --jobs 4 --cpus 2 --timeout 5 \
+  --suite-timeout alarm=65 --suite-timeout itimer=95 --time-budget 1800
+python3 tests/gvisor/normalize.py --source /tmp/gvisor-trames-expanded \
+  --output /tmp/gvisor-trames-audited
+python3 tests/gvisor/compare.py --native /tmp/gvisor-native-expanded \
+  --trames /tmp/gvisor-trames-audited --output /tmp/gvisor-expanded-comparison
+```
+
+This mode uses a Trames-only bridge with NAT disabled. It does not bind test
+listeners to the host network. Each worker owns a new registry. The imported
+store is APFS-cloned before every process, including isolated retries. The
+original GTest fixtures run chunks of at most 50 selected names; no enabled
+case is sampled away. A full original XML report and the matching case set are
+required for every passing result. Stdout is used only to split an aborted or
+hung chunk into retries, never as passing evidence. A singleton group/case
+remains available with `--chunk-size 1`. A global GTest fixture failure is
+separate from an assertion failure or a successful skip.
+
+The active-case watchdog extends the base timeout for known native-passing slow
+cases to `max(base, min(90, 3 * native_seconds + 2))`. Explicit alarm/itimer
+allowances cover their original 20–30-second waits. Timing is only a timeout
+allowance, not a performance comparison. Unfinished work under `--time-budget`
+stays `not_run_budget`; disk pressure stays `disk_limit`/`not_run_disk_limit`.
+The default disk floor is 8 GiB. Neither condition becomes a pass or skip.
+
+Batch partitions balance complete case lists, splitting large parameterized
+groups across workers without duplication. Raw worker plans, XML/stdout/stderr
+and merged outcomes remain linked. To continue a previous partition with exact
+runtime/ELF/rootfs/network/CPU/runfile fingerprints, use `--reuse OLD_BATCH`.
+`--reuse-completed` also retains unchanged, already confirmed assertion/abort
+results; timeouts are retried. Completed singleton results can be reused by a
+chunked continuation. Keep the previous raw evidence directory.
+
+The broad runner currently automates Mac HVF only. iPad execution, upstream
+DISABLED cases, other architectures and gVisor-only save/restore modes remain
+separate coverage, irrespective of how many Linux syscall cases pass.
+
+`normalize.py` independently checks every reported pass against its exact saved
+XML case and exit status. It can refine an old `mismatched_result` containing a
+GTest `NonTestSuiteFailure` into `fixture_failed`; neither becomes a pass. This
+postprocessing does not alter raw logs, original assertions or executables.
+`summarize.py` exports a complete per-case CSV and compact group/family JSON.
+The harness evidence guards can be run without rebuilding any product:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/gvisor -p '*_test.py'
+```

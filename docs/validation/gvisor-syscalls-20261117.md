@@ -1,5 +1,7 @@
 # gVisor syscall pilot on Mac Dev — 2026-11-17
 
+The broader [254-group coverage report](gvisor-expanded-20261117.md) extends this pilot.
+
 See [the fix-and-rerun checkpoint](#fix-and-rerun-checkpoint) for the current result.
 
 The unmodified upstream syscall tests can run under Trames. This checkpoint
