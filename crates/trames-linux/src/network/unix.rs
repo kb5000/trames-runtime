@@ -4,7 +4,7 @@ use super::*;
 mod packet;
 pub(crate) use packet::{prepare_transfer, DatagramState, PreparedTransfer};
 impl Linux {
-    pub(super) fn local_network_vfs(
+    pub(crate) fn local_network_vfs(
         vfs: &mut trames_vfs::Vfs,
         socket: &std::rc::Rc<trames_vfs::LocalSocket>,
         number: u64,
@@ -36,7 +36,7 @@ impl Linux {
                     .recv(count, a[3] as u32 | nonblocking)
                     .map(|r| r.data)
             }),
-            206 | 207 => packet_transfer(
+            63..=66 | 206 | 207 => packet_transfer(
                 number as u32,
                 a,
                 memory,
@@ -65,6 +65,29 @@ impl Linux {
             _ => Err(Errno(95)),
         }
     }
+}
+
+pub(crate) fn write_packet_vfs(
+    vfs: &mut trames_vfs::Vfs,
+    socket: &std::rc::Rc<trames_vfs::LocalSocket>,
+    number: u32,
+    args: [u64; 6],
+    memory: &impl CpuMemory,
+) -> Result<u64> {
+    let nonblocking = if vfs.flags(args[0] as u32)? & trames_vfs::O_NONBLOCK != 0 {
+        0x40
+    } else {
+        0
+    };
+    let mut io = OwnerMessage {
+        vfs,
+        socket,
+        nonblocking,
+        datagram: None,
+    };
+    packet::PreparedPacket::prepare(number, args, memory, &io)?
+        .send(&mut io)
+        .expect("owner packet send")
 }
 
 pub(crate) fn accept(
@@ -191,6 +214,7 @@ pub(crate) fn control(
 pub(crate) trait MessageIo {
     type Rights: Clone;
     fn kind(&self) -> u32;
+    fn send_buffer(&self) -> usize;
     fn nonblocking(&self) -> u32;
     fn recv(
         &mut self,
@@ -235,6 +259,9 @@ impl MessageIo for OwnerMessage<'_> {
     type Rights = trames_vfs::LocalRights;
     fn kind(&self) -> u32 {
         self.socket.kind()
+    }
+    fn send_buffer(&self) -> usize {
+        self.socket.buffer_size(false)
     }
     fn nonblocking(&self) -> u32 {
         self.nonblocking
@@ -356,7 +383,13 @@ pub(crate) fn prepare_message<I: MessageIo>(
     let deferred = std::cell::Cell::new(false);
     let result = (|| {
         let receive = number == 212;
-        let frame = Message::prepare(memory, a[1], receive, io.kind() == 1)?;
+        let frame = Message::prepare(
+            memory,
+            a[1],
+            receive,
+            io.kind() == 1,
+            io.send_buffer().saturating_sub(32),
+        )?;
         if receive {
             return Ok(PreparedMessage {
                 frame,
@@ -631,7 +664,13 @@ struct Message {
     destination: Option<Vec<u8>>,
 }
 impl Message {
-    fn prepare(memory: &impl CpuMemory, pointer: u64, receive: bool, stream: bool) -> Result<Self> {
+    fn prepare(
+        memory: &impl CpuMemory,
+        pointer: u64,
+        receive: bool,
+        stream: bool,
+        send_limit: usize,
+    ) -> Result<Self> {
         if receive {
             Linux::check(memory, pointer, 56, Access::Write)?;
         }
@@ -665,17 +704,22 @@ impl Message {
         } else {
             None
         };
-        let prepare = if stream {
-            Vectors::prepare_stream
+        let access = if receive { Access::Write } else { Access::Read };
+        let vectors = if stream {
+            Vectors::prepare_stream(memory, word(16), word(24), access)?
         } else {
-            Vectors::prepare
+            Vectors::prepare_unix_packet(
+                memory,
+                word(16),
+                word(24),
+                access,
+                if receive {
+                    0x7ffff000
+                } else {
+                    send_limit.min(0x7ffff000)
+                },
+            )?
         };
-        let vectors = prepare(
-            memory,
-            word(16),
-            word(24),
-            if receive { Access::Write } else { Access::Read },
-        )?;
         Ok(Self {
             control,
             control_size,

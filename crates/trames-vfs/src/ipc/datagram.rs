@@ -55,7 +55,7 @@ impl Vfs {
         explicit: bool,
     ) -> Result<usize> {
         if socket.kind != 2 || socket.channel.borrow().ends()[0].strong_count() != 0 {
-            if destination.is_some() {
+            if destination.is_some() && socket.kind != 5 {
                 return Err(Errno(106));
             }
             return socket.send_rights_credentials_mode(
@@ -198,7 +198,7 @@ impl LocalResource {
         if flags & !(0x40 | 0x4000 | 0x40000000) != 0 {
             return Err(Errno(95));
         }
-        if length > self.buffer_size(false) {
+        if length > self.buffer_size(false).saturating_sub(32) {
             return Err(Errno(90));
         }
         if self.channel.borrow().resource.send_check(0, flags).is_err() {

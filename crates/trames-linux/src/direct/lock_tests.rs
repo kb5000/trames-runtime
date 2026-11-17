@@ -127,7 +127,6 @@ fn all_range_lock_commands_preserve_source_solo_error_and_pointer_precedence() {
             (path, 0x9000, 1, 9),
             (pipe, 0x9000, 1, 14),
             (directory, 0x1000, 3, 22),
-            (directory, 0x1000, 1, 9),
             (file, 0x9000, 1, 14),
         ] {
             memory.write_array(0x1000, flock(kind)).unwrap();
@@ -147,5 +146,16 @@ fn all_range_lock_commands_preserve_source_solo_error_and_pointer_precedence() {
                 );
             }
         }
+        memory.write_array(0x1000, flock(1)).unwrap();
+        let args = [directory as u64, command, 0x1000, 0, 0, 0];
+        let expected = if matches!(command, 5 | 36) {
+            Ok(0)
+        } else {
+            Err(Errno(9))
+        };
+        assert_eq!(
+            linux.syscall(25, args, &mut memory, &mut crate::CapturedOutput::default()),
+            expected
+        );
     }
 }

@@ -44,7 +44,7 @@ pub(crate) fn prepare_transfer<I: MessageIo>(
     Some(PreparedPacket::prepare(number, args, memory, io).map(PreparedTransfer::Packet))
 }
 impl PreparedPacket {
-    fn prepare(
+    pub(super) fn prepare(
         number: u32,
         a: [u64; 6],
         memory: &impl CpuMemory,
@@ -57,7 +57,23 @@ impl PreparedPacket {
             None
         };
         let mut bytes = Vec::new();
-        let (parts, count) = if number == 65 {
+        let packet = io.kind() != 1;
+        let access = if sending { Access::Read } else { Access::Write };
+        let limit = if sending {
+            io.send_buffer().saturating_sub(32).min(0x7ffff000)
+        } else {
+            0x7ffff000
+        };
+        let (parts, count) = if packet && matches!(number, 65 | 66) {
+            if a[2] > 1024 {
+                return Err(Errno(22));
+            }
+            let vectors = Vectors::prepare_unix_packet(memory, a[1], a[2], access, limit)?;
+            if sending {
+                bytes = vectors.read(memory)?;
+            }
+            (vectors.parts, vectors.size)
+        } else if number == 65 {
             Linux::readv_parts(memory, a)?
         } else if number == 66 {
             Linux::writev_transport_mode(a, memory, &mut bytes, false, |bytes| {
@@ -65,7 +81,14 @@ impl PreparedPacket {
             })?;
             (Vec::new(), bytes.len())
         } else {
-            let count = a[2].min(crate::MAX_WRITE as u64) as usize;
+            let count = a[2].min(if packet {
+                0x7ffff000
+            } else {
+                crate::MAX_WRITE as u64
+            }) as usize;
+            if packet && sending && count > limit {
+                return Err(Errno(90));
+            }
             Linux::check(
                 memory,
                 a[1],
@@ -120,6 +143,28 @@ impl PreparedPacket {
         memory: &mut impl CpuMemory,
         io: &mut impl MessageIo,
     ) -> Option<Result<u64>> {
+        if self.send.is_some() {
+            return self.send(io);
+        }
+        let received = match io.recv(self.count, self.flags | io.nonblocking())? {
+            Ok(received) => received,
+            Err(error) => return Some(Err(error)),
+        };
+        Some((|| {
+            Linux::scatter(memory, &self.parts, &received.data)?;
+            if let Some(output) = self.output {
+                output.write_bytes(memory, &received.source)?;
+            }
+            // Plain reads/recvfrom discard ancillary rights outside the queue lock.
+            io.receive_rights(received.rights, 0, false);
+            Ok(if self.flags & MSG_TRUNC != 0 {
+                received.length
+            } else {
+                received.data.len()
+            } as u64)
+        })())
+    }
+    pub(super) fn send(&self, io: &mut impl MessageIo) -> Option<Result<u64>> {
         if let Some(bytes) = &self.send {
             let rights = match io.send_rights(&[])? {
                 Ok(rights) => rights,
@@ -135,24 +180,7 @@ impl PreparedPacket {
                 )
                 .map(|r| r.map(|n| n as u64));
         }
-        let received = match io.recv(self.count, self.flags | io.nonblocking())? {
-            Ok(received) => received,
-            Err(error) => return Some(Err(error)),
-        };
-        Some((|| {
-            Linux::scatter(memory, &self.parts, &received.data)?;
-            if let Some(output) = self.output {
-                output.write_bytes(memory, &received.source)?;
-            }
-            // Plain reads/recvfrom discard ancillary rights on their original
-            // owner/portable path, outside the queue lock.
-            io.receive_rights(received.rights, 0, false);
-            Ok(if self.flags & MSG_TRUNC != 0 {
-                received.length
-            } else {
-                received.data.len()
-            } as u64)
-        })())
+        unreachable!("accepted packet send")
     }
 }
 impl<R: Clone> PreparedTransfer<R> {

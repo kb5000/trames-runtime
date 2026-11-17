@@ -193,6 +193,7 @@ impl Prepared {
                     u64_at(memory, a[1] + 24)?,
                     access,
                     receive || stream,
+                    trames_net::MAX_TRANSFER,
                 )?;
                 if receive {
                     Transfer::Receive {

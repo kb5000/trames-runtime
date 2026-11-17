@@ -269,6 +269,36 @@ impl Drop for OfdOwner {
     }
 }
 impl SharedOpenDescription {
+    fn existing_record_locks(&self) -> Option<Arc<Records>> {
+        self.metadata_node()
+            .and_then(|node| node.borrow().record_locks.get().cloned())
+            .or_else(|| self.ofd_records.get().map(|owner| owner.records.clone()))
+    }
+    fn record_locks(&self, registry: &Registry) -> Result<Arc<Records>> {
+        if self.flags.get() & O_PATH != 0 {
+            return Err(Errno(9));
+        }
+        if let Some(node) = self.metadata_node() {
+            return Ok(node
+                .borrow()
+                .record_locks
+                .get_or_init(|| registry.create())
+                .clone());
+        }
+        if self.kind != FdKind::Socket {
+            return Err(Errno(9));
+        }
+        // A socket has one original open description; dup, fork and SCM_RIGHTS
+        // retain it. POSIX and OFD ranges still use distinct owner identities.
+        Ok(self
+            .ofd_records
+            .get_or_init(|| OfdOwner {
+                records: registry.create(),
+                owner: OFD_LOCK_OWNER | self.id,
+            })
+            .records
+            .clone())
+    }
     pub(super) fn ofd_record_owner(&self, records: &Arc<Records>) -> u64 {
         self.ofd_records
             .get_or_init(|| OfdOwner {
@@ -343,17 +373,12 @@ impl RecordFile {
         self.file.open.flags.get()
     }
     fn records(&self) -> Result<Arc<Records>> {
-        let node = self.file.open.node.as_ref().ok_or(Errno(9))?.borrow();
-        Ok(node
-            .record_locks
-            .get_or_init(|| {
-                self.context
-                    .registry
-                    .as_ref()
-                    .expect("original lock registry")
-                    .create()
-            })
-            .clone())
+        self.file.open.record_locks(
+            self.context
+                .registry
+                .as_ref()
+                .expect("original lock registry"),
+        )
     }
     pub fn normalize(
         &self,
@@ -367,26 +392,23 @@ impl RecordFile {
             return Err(Errno(22));
         }
         let open = &self.file.open;
-        let node = open.node.as_ref().ok_or(Errno(9))?.borrow();
-        let Content::File(data) = &node.content else {
+        if open.flags.get() & O_PATH != 0 {
             return Err(Errno(9));
-        };
+        }
         let base = match whence {
             0 => 0,
             1 => open.file_position.snapshot(),
-            2 => data.len(),
+            2 => open
+                .metadata_node()
+                .map_or(0, |node| match &node.borrow().content {
+                    Content::File(data) => data.len(),
+                    _ => 0,
+                }),
             _ => return Err(Errno(22)),
         };
         let mut requested = normalize(kind, start, length, base, self.context.owner)?;
         if ofd {
-            let records = node.record_locks.get_or_init(|| {
-                self.context
-                    .registry
-                    .as_ref()
-                    .expect("original lock registry")
-                    .create()
-            });
-            requested.owner = open.ofd_record_owner(records);
+            requested.owner = open.ofd_record_owner(&self.records()?);
         }
         Ok(requested)
     }
@@ -424,12 +446,11 @@ impl Vfs {
     /// Cold admission only, without allocating an inode lock object.
     pub fn shares_record_wait(&self, wait: &RecordWait) -> bool {
         self.fds.entries().values().any(|descriptor| {
-            descriptor.open.borrow().node.as_ref().is_some_and(|node| {
-                node.borrow()
-                    .record_locks
-                    .get()
-                    .is_some_and(|records| Arc::ptr_eq(records, &wait.request.records))
-            })
+            descriptor
+                .open
+                .borrow()
+                .existing_record_locks()
+                .is_some_and(|records| Arc::ptr_eq(&records, &wait.request.records))
         })
     }
     pub fn normalize_ofd_lock(
@@ -529,14 +550,11 @@ impl Vfs {
 }
 impl SharedOpenDescription {
     pub(super) fn release_record_locks(&self, owner: u32) {
-        if let Some(node) = &self.node {
+        if let Some(records) = self.existing_record_locks() {
             // Do not allocate or lock a registry for an inode that has never
             // acquired a lock object. Close releases this process's locks even
             // when dup/another process retains the open description.
-            let records = node.borrow().record_locks.get().cloned();
-            if let Some(records) = records {
-                records.release(owner as u64);
-            }
+            records.release(owner as u64);
         }
     }
 }
@@ -570,6 +588,62 @@ impl Vfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn directory_pipe_and_socket_ranges_keep_real_conflicts_and_close_release() {
+        for kind in 0..4 {
+            let mut v = Vfs::default();
+            v.configure_managed_uplink(NetworkMode::Outbound).unwrap();
+            v.set_lock_owner(1);
+            let (fd, write_fd) = match kind {
+                0 => {
+                    let fd = v.open_at(AT_FDCWD, b"/", O_DIRECTORY, 0).unwrap();
+                    (fd, None)
+                }
+                1 => {
+                    let [r, w] = v.pipe(0).unwrap();
+                    (r, Some(w))
+                }
+                _ => {
+                    let fd = v.socket(if kind == 2 { 1 } else { 2 }, 1, 0).unwrap();
+                    (fd, Some(fd))
+                }
+            };
+            let alias = v.dup(fd, 0, false).unwrap();
+            let read = v.normalize_lock(fd, 0, 0, 3, 7).unwrap();
+            v.record_lock_set(fd, read).unwrap();
+            let mut peer = v.clone();
+            peer.set_lock_owner(2);
+            let candidate = peer.normalize_lock(fd, 1, 0, 5, 1).unwrap();
+            assert_eq!(
+                peer.record_lock_conflict(fd, candidate).unwrap(),
+                Some(read)
+            );
+            if let Some(write_fd) = write_fd {
+                let lock = peer.normalize_lock(write_fd, 1, 0, 5, 1).unwrap();
+                let request = peer.retain_record_lock(write_fd, lock).unwrap();
+                let wait = request.wait().unwrap();
+                assert!(v.shares_record_wait(&wait));
+                assert_eq!(wait.try_lock(), Err(Errno(11)));
+                // Any close by the POSIX owner releases its inode ranges,
+                // even though the original OFD remains open in the peer.
+                v.close(alias).unwrap();
+                std::thread::spawn(move || wait.try_lock())
+                    .join()
+                    .unwrap()
+                    .unwrap();
+            } else {
+                v.close(alias).unwrap();
+                assert_eq!(peer.record_lock_conflict(fd, candidate).unwrap(), None);
+                assert_eq!(peer.record_lock_set(fd, candidate), Err(Errno(9)));
+            }
+            if kind == 1 {
+                assert_eq!(v.record_lock_set(fd, candidate), Err(Errno(9)));
+                let w = write_fd.unwrap();
+                let read = v.normalize_lock(w, 0, 0, 0, 0).unwrap();
+                assert_eq!(v.record_lock_set(w, read), Err(Errno(9)));
+            }
+        }
+    }
     #[test]
     fn original_process_lock_domain_releases_on_a_source_executor_with_live_files() {
         let mut v = Vfs::default();

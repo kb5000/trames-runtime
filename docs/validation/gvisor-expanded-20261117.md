@@ -1,5 +1,10 @@
 # Broad gVisor syscall coverage — 2026-11-17
 
+Follow-up results are tracked in the [network ABI repair](gvisor-network-abi-fixes-20261117.md),
+[ancillary completion](gvisor-unix-ancillary-20261117.md), and
+[multi-area compatibility batch](gvisor-multi-area-20261117.md). The original
+full-sweep totals below remain a historical baseline.
+
 The current Mac Dev runner completed **14,530 enabled cases across 254 groups**
 from unmodified pinned upstream sources. **8,575 pass**, 4,836 have assertion
 failures, 268 fail a global fixture prerequisite, 96 abort/exit without usable

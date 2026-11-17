@@ -293,6 +293,11 @@ struct SharedOpenDescription {
     notification: Option<Arc<FileClose>>,
 }
 impl SharedOpenDescription {
+    fn metadata_node(&self) -> Option<NodeRef> {
+        self.node
+            .clone()
+            .or_else(|| self.pipe.as_ref()?.metadata.clone())
+    }
     fn proc_control(&self) -> bool {
         self.oom.is_some()
             || self.sysctl_control.is_some()
@@ -348,11 +353,6 @@ impl OpenDescription {
     }
     fn data_node(&self) -> Option<NodeRef> {
         self.read_node.clone().or_else(|| self.node.clone())
-    }
-    fn metadata_node(&self) -> Option<NodeRef> {
-        self.node
-            .clone()
-            .or_else(|| self.pipe.as_ref()?.metadata.clone())
     }
 }
 enum Content {
@@ -1839,7 +1839,9 @@ impl Vfs {
             Self::check_resolve_mount(&parent, &current, policy)?;
             if !parts.is_empty() || follow_final || trailing {
                 if policy & (2 | 4 | 8 | 16) != 0 && self.is_proc_magic_link(&current) {
-                    return Err(Errno(40));
+                    // Explicit NO_MAGICLINKS/NO_SYMLINKS takes precedence;
+                    // scoped lookups reject the object jump with EXDEV.
+                    return Err(Errno(if policy & (2 | 4) != 0 { 40 } else { 18 }));
                 }
                 // An nsfs magic link names an original kernel object, not its
                 // display label. Accept that object once for open/metadata.

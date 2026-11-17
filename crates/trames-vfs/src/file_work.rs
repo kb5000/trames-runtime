@@ -972,6 +972,41 @@ pub struct FileCopy {
     pub range: bool,
     stage: Option<(u64, Option<u64>, Vec<u8>)>,
 }
+impl Vfs {
+    /// Linux copy_file_range validates the original unsigned range before EOF
+    /// shortening. Both embedding and retained native I/O use this prelude.
+    pub fn copy_file_range_length(
+        source: &[u8; 128],
+        target: &[u8; 128],
+        from: u64,
+        to: u64,
+        count: u64,
+    ) -> Result<u64> {
+        for stat in [source, target] {
+            let mode = u32::from_le_bytes(stat[16..20].try_into().expect("mode")) & 0o170000;
+            if mode == 0o040000 {
+                return Err(Errno(21));
+            }
+            if mode != 0o100000 {
+                return Err(Errno(22));
+            }
+        }
+        from.checked_add(count).ok_or(Errno(75))?;
+        to.checked_add(count).ok_or(Errno(75))?;
+        if from > i64::MAX as u64 || to > i64::MAX as u64 {
+            return Err(Errno(22));
+        }
+        let size = u64::from_le_bytes(source[48..56].try_into().expect("size"));
+        let count = count.min(size.saturating_sub(from));
+        if source[..16] == target[..16]
+            && from < to.saturating_add(count)
+            && to < from.saturating_add(count)
+        {
+            return Err(Errno(22));
+        }
+        Ok(count)
+    }
+}
 impl FileCopy {
     pub fn new(
         from: Result<Option<u64>>,
@@ -1007,12 +1042,8 @@ impl FileCopy {
                     Some(offset) => offset,
                     None => v.seek(output, 0, 1)?,
                 };
-                if source[..16] == target[..16]
-                    && from < offset.saturating_add(self.count)
-                    && offset < from.saturating_add(self.count)
-                {
-                    return Err(Errno(22));
-                }
+                self.count =
+                    Vfs::copy_file_range_length(&source, &target, from, offset, self.count)?;
                 Some(offset)
             } else {
                 None

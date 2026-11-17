@@ -132,11 +132,18 @@ impl SharedOpenDescription {
         if self.flags.get() & O_PATH != 0 {
             return Err(Errno(9));
         }
-        let node = self.node.as_ref().ok_or(Errno(9))?.borrow();
+        let node = self.metadata_node();
+        if node.is_none() && self.kind != FdKind::Socket {
+            return Err(Errno(9));
+        }
         Ok(self.flock.get_or_init(|| {
             Arc::new(Owner {
                 id: self.id,
-                whole: node.whole_locks.get_or_init(Arc::default).clone(),
+                // Anonymous pipe ends share their existing metadata inode.
+                // Socket inode aliases all retain this original OFD.
+                whole: node.as_ref().map_or_else(Arc::default, |node| {
+                    node.borrow().whole_locks.get_or_init(Arc::default).clone()
+                }),
                 #[cfg(all(feature = "hostfs", unix))]
                 native: self.host_file.clone().map(hostfs::native_wait::Flock::new),
             })
@@ -170,12 +177,16 @@ impl Vfs {
     /// solo compute off the direct Memory path. No inode/object allocation.
     pub fn shares_flock(&self, request: &FlockRequest) -> bool {
         self.fds.entries().values().any(|d| {
-            d.open.borrow().node.as_ref().is_some_and(|n| {
-                n.borrow()
-                    .whole_locks
-                    .get()
-                    .is_some_and(|w| Arc::ptr_eq(w, &request.owner.whole))
-            })
+            let open = d.open.borrow();
+            open.flock
+                .get()
+                .is_some_and(|owner| Arc::ptr_eq(&owner.whole, &request.owner.whole))
+                || open.metadata_node().is_some_and(|n| {
+                    n.borrow()
+                        .whole_locks
+                        .get()
+                        .is_some_and(|w| Arc::ptr_eq(w, &request.owner.whole))
+                })
         })
     }
     pub fn flock(&mut self, fd: u32, operation: u32) -> Result<()> {
@@ -192,6 +203,37 @@ impl Vfs {
 mod tests {
     use super::*;
     use std::sync::{atomic::AtomicUsize, Barrier};
+
+    #[test]
+    fn anonymous_pipe_locks_share_the_inode_and_socket_locks_follow_the_original_ofd() {
+        let mut v = Vfs::default();
+        v.configure_managed_uplink(NetworkMode::Outbound).unwrap();
+        let [read, write] = v.pipe(0).unwrap();
+        let alias = v.dup(read, 0, false).unwrap();
+        v.flock(read, 2 | 4).unwrap();
+        assert_eq!(v.flock(write, 2 | 4), Err(Errno(11)));
+        let (accepted, _) = v.retain_flock(alias, 8).unwrap();
+        assert!(v.shares_flock(&accepted));
+        v.close(read).unwrap();
+        v.close(alias).unwrap();
+        assert_eq!(v.flock(write, 2 | 4), Err(Errno(11)));
+        std::thread::spawn(move || accepted.try_lock())
+            .join()
+            .unwrap()
+            .unwrap();
+        v.flock(write, 2 | 4).unwrap();
+        for family in [1, 2] {
+            let socket = v.socket(family, 1, 0).unwrap();
+            let alias = v.dup(socket, 0, false).unwrap();
+            v.flock(socket, 2 | 4).unwrap();
+            v.flock(alias, 1 | 4).unwrap();
+            let (request, _) = v.retain_flock(socket, 8).unwrap();
+            assert!(v.shares_flock(&request));
+            v.close(socket).unwrap();
+            v.close(alias).unwrap();
+            request.try_lock().unwrap();
+        }
+    }
 
     fn file(v: &mut Vfs) -> u32 {
         v.open_at(AT_FDCWD, b"/lock", 0x42, 0o600).unwrap()

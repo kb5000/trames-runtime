@@ -19,6 +19,73 @@ fn t() -> Arc<dyn IoWake> {
     Arc::new(Target::default())
 }
 #[test]
+fn original_copy_range_validates_requested_overflow_before_shortening_or_advancing() {
+    let mut l = Linux::new(0x100000);
+    l.vfs.import_file(b"/input", b"unchanged".to_vec()).unwrap();
+    let from = l.vfs.open_at(-100, b"/input", 0, 0).unwrap();
+    let to = l.vfs.open_at(-100, b"/output", 0x42, 0o600).unwrap();
+    let mut memory = Memory::default();
+    memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    let direct = DirectSyscalls::new(l.vfs.direct_descriptors())
+        .with_paths(l.vfs.path_queries())
+        .with_resources(l.vfs.descriptor_factory())
+        .with_file_executor(Arc::new(Queue(send)));
+    let target = t();
+    for (input, output, count, error) in [
+        (u64::MAX, 0, 1, 75),
+        (0, u64::MAX, 1, 75),
+        (1, 0, u64::MAX, 75),
+        (0, 1, u64::MAX, 75),
+        (u64::MAX - 1, 0, 1, 22),
+        (u64::MAX, 0, 0, 22),
+    ] {
+        memory.write_array(0x1000, input.to_le_bytes()).unwrap();
+        memory.write_array(0x1008, output.to_le_bytes()).unwrap();
+        let args = [from as u64, 0x1000, to as u64, 0x1008, count, 0];
+        let expected = Err(Errno(error));
+        assert_eq!(
+            l.syscall(
+                285,
+                args,
+                &mut memory,
+                &mut crate::CapturedOutput::default()
+            ),
+            expected
+        );
+        let attempt = direct.start_file_call(285, args, &mut memory, 1, &Arc::downgrade(&target));
+        let result = match attempt {
+            Some(IoAttempt::Complete(value)) => value,
+            Some(IoAttempt::Blocked(wait)) => {
+                let pending = wait.file_pending().unwrap();
+                let (work, result) = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+                std::thread::spawn(move || result.complete(work.run()))
+                    .join()
+                    .unwrap();
+                match direct.start_retained_file(
+                    pending,
+                    285,
+                    args,
+                    &mut memory,
+                    1,
+                    &Arc::downgrade(&target),
+                ) {
+                    IoAttempt::Complete(value) => value,
+                    _ => panic!("completed original copy"),
+                }
+            }
+            None => panic!("original copy admission"),
+            Some(_) => panic!("original copy returned an unrelated operation"),
+        };
+        assert_eq!(result, expected, "{input} {output} {count}");
+        assert_eq!(memory.read_u64(0x1000).unwrap(), input);
+        assert_eq!(memory.read_u64(0x1008).unwrap(), output);
+        assert_eq!(l.vfs.seek(from, 0, 1), Ok(0));
+        assert_eq!(l.vfs.seek(to, 0, 1), Ok(0));
+        assert_eq!(l.vfs.pread(to, 9, 0).unwrap(), b"");
+    }
+}
+#[test]
 fn native_memfd_creation_retains_original_name_files_credentials_and_handoff() {
     let mut v = trames_vfs::Vfs::default();
     v.credentials = trames_vfs::Credentials::user(1000, 1001);

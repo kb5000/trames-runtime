@@ -33,6 +33,9 @@ impl crate::network::unix::MessageIo for Message<'_> {
     fn kind(&self) -> u32 {
         self.fd.local_kind()
     }
+    fn send_buffer(&self) -> usize {
+        self.fd.local_send_buffer()
+    }
     fn nonblocking(&self) -> u32 {
         if self.fd.nonblocking() {
             0x40
@@ -72,7 +75,7 @@ impl crate::network::unix::MessageIo for Message<'_> {
                 },
             );
         }
-        if destination.is_some() {
+        if destination.is_some() && self.fd.local_kind() != 5 {
             return Some(Err(Errno(106)));
         }
         self.fd.send_local_message(bytes, flags, &rights, identity)
@@ -102,7 +105,7 @@ impl crate::network::unix::MessageIo for Message<'_> {
                 },
             );
         }
-        if destination.is_some() {
+        if destination.is_some() && self.fd.local_kind() != 5 {
             return Some(Err(Errno(106)));
         }
         self.fd
@@ -466,6 +469,74 @@ mod tests {
     }
     fn direct(v: &Vfs) -> DirectSyscalls {
         DirectSyscalls::new(v.direct_descriptors()).with_resources(v.descriptor_factory())
+    }
+    #[test]
+    fn large_packets_preserve_all_bytes_on_embedding_and_worker_scalar_vector_and_message_paths() {
+        let size = crate::MAX_WRITE + 4096;
+        let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        for worker in [false, true] {
+            for kind in [2, 5] {
+                for (send, recv) in [(64, 63), (66, 65), (211, 212)] {
+                    let mut l = Linux::new(0x300000);
+                    let [tx, rx] = l.vfs.socketpair(1, kind, 0).unwrap();
+                    l.vfs
+                        .local_socket(tx)
+                        .unwrap()
+                        .unwrap()
+                        .set_reuse(7, size as u32)
+                        .unwrap();
+                    let mut m = memory();
+                    m.map(0x10000, (size * 2) as u64, Permissions::RW).unwrap();
+                    m.write(0x10000, &payload).unwrap();
+                    m.write_array(0x1100, 0x10000u64.to_le_bytes()).unwrap();
+                    m.write_array(0x1108, (size as u64).to_le_bytes()).unwrap();
+                    header(&mut m, 0);
+                    let d = direct(&l.vfs);
+                    for (number, fd) in [(send, tx), (recv, rx)] {
+                        if fd == rx {
+                            m.write_array(0x1100, (0x10000 + size as u64).to_le_bytes())
+                                .unwrap();
+                        }
+                        let args = match number {
+                            63 | 64 => [
+                                fd as u64,
+                                if fd == tx {
+                                    0x10000
+                                } else {
+                                    0x10000 + size as u64
+                                },
+                                size as u64,
+                                0,
+                                0,
+                                0,
+                            ],
+                            65 | 66 => [fd as u64, 0x1100, 1, 0, 0, 0],
+                            _ => [fd as u64, 0x1000, 0, 0, 0, 0],
+                        };
+                        let result = if worker {
+                            let target: Arc<dyn IoWake> = Arc::new(Target);
+                            match d.start(
+                                number as u32,
+                                args,
+                                &mut m,
+                                1,
+                                &Arc::downgrade(&target),
+                                None,
+                            ) {
+                                Some(IoAttempt::Complete(result)) => result,
+                                _ => panic!("worker packet ABI {kind} {number}"),
+                            }
+                        } else {
+                            l.syscall(number, args, &mut m, &mut crate::CapturedOutput::default())
+                        };
+                        assert_eq!(result, Ok(size as u64), "{worker} {kind} {number}");
+                    }
+                    let mut out = vec![0; size];
+                    m.read(0x10000 + size as u64, &mut out).unwrap();
+                    assert_eq!(out, payload);
+                }
+            }
+        }
     }
     #[test]
     fn unix_receive_timeouts_park_on_original_socket_and_expire_after_fd_reuse() {
@@ -887,12 +958,12 @@ mod tests {
     fn blocked_send_keeps_original_rights_and_bytes_after_source_fd_and_header_reuse() {
         let mut v = Vfs::default();
         let [tx, rx] = v.socketpair(1, 1, 0).unwrap();
-        v.local_socket(rx)
+        v.local_socket(tx)
             .unwrap()
             .unwrap()
-            .set_reuse(8, 256)
+            .set_reuse(7, 1024)
             .unwrap();
-        assert_eq!(v.write(tx, &[0x55; 512]), Ok(512));
+        assert_eq!(v.write(tx, &[0x55; 2048]), Ok(2048));
         let event = v.eventfd(19, 0).unwrap();
         let d = direct(&v);
         let mut m = memory();
@@ -913,7 +984,7 @@ mod tests {
         m.write(0x1000, &[0xff; 56]).unwrap();
         m.write(0x1200, b"evil").unwrap();
         m.write(0x1300, &[0xff; 24]).unwrap();
-        assert_eq!(v.read(rx, 512).unwrap(), [0x55; 512]);
+        assert_eq!(v.read(rx, 2048).unwrap(), [0x55; 2048]);
         assert!(matches!(
             d.start_retained_byte(file, 211, args, &mut m, 1, &Arc::downgrade(&target)),
             IoAttempt::Complete(Ok(4))
@@ -986,14 +1057,17 @@ mod tests {
             let (mut v, tx, rx) = datagrams();
             let receiver = v.local_socket(rx).unwrap().unwrap();
             receiver.set_reuse(8, 256).unwrap();
-            v.local_send_to(
-                &v.local_socket(tx).unwrap().unwrap(),
-                &[0x55; 512],
-                0,
-                Some(b"\x01\x00/target\0"),
-                Default::default(),
-            )
-            .unwrap();
+            for _ in 0..128 {
+                v.local_send_to(
+                    &v.local_socket(tx).unwrap().unwrap(),
+                    &[0x55; 512],
+                    0,
+                    Some(b"\x01\x00/target\0"),
+                    Default::default(),
+                )
+                .unwrap();
+            }
+
             let d = datagram_direct(&v);
             let mut m = memory();
             let args = packet_args(&mut m, tx);
@@ -1029,7 +1103,9 @@ mod tests {
                     IoAttempt::Complete(Err(Errno(111)))
                 ));
             } else {
-                assert_eq!(receiver.recv(512, 0).unwrap().data, [0x55; 512]);
+                for _ in 0..128 {
+                    assert_eq!(receiver.recv(512, 0).unwrap().data, [0x55; 512]);
+                }
                 assert!(
                     wait.signal.ready(),
                     "receive frees target capacity, not source capacity"
@@ -1268,14 +1344,17 @@ mod tests {
         let (mut v, tx, rx) = datagrams();
         let receiver = v.local_socket(rx).unwrap().unwrap();
         receiver.set_reuse(8, 256).unwrap();
-        v.local_send_to(
-            &v.local_socket(tx).unwrap().unwrap(),
-            &[0x55; 512],
-            0,
-            Some(b"\x01\x00/target\0"),
-            Default::default(),
-        )
-        .unwrap();
+        for _ in 0..128 {
+            v.local_send_to(
+                &v.local_socket(tx).unwrap().unwrap(),
+                &[0x55; 512],
+                0,
+                Some(b"\x01\x00/target\0"),
+                Default::default(),
+            )
+            .unwrap();
+        }
+
         let event = v.eventfd(77, 0).unwrap();
         let d = datagram_direct(&v);
         let mut m = memory();
@@ -1299,7 +1378,9 @@ mod tests {
         )
         .unwrap();
         m.write(0x1200, b"next").unwrap();
-        assert_eq!(receiver.recv(512, 0).unwrap().data, [0x55; 512]);
+        for _ in 0..128 {
+            assert_eq!(receiver.recv(512, 0).unwrap().data, [0x55; 512]);
+        }
         assert!(wait.signal.ready());
         assert!(matches!(
             datagram_direct(&v)
@@ -1413,12 +1494,13 @@ mod tests {
     fn worker_batch_zero_count_cap_short_stream_and_partial_eagain_keep_linux_results() {
         let mut v = Vfs::default();
         let [tx, rx] = v.socketpair(1, 2, 0).unwrap();
-        v.local_socket(rx)
+        v.local_socket(tx)
             .unwrap()
             .unwrap()
-            .set_reuse(8, 256)
+            .set_reuse(7, 1024)
             .unwrap();
-        v.write(tx, &[0x55; 508]).unwrap();
+        v.write(tx, &[0x55; 2016]).unwrap();
+        v.write(tx, &[0x55; 28]).unwrap();
         let d = direct(&v);
         let mut m = memory();
         batch_headers(&mut m, 2);
@@ -1426,16 +1508,17 @@ mod tests {
             start_batch(&d, tx, 2, &mut m),
             IoAttempt::Complete(Ok(1))
         ));
-        assert_eq!(v.read(rx, 512).unwrap(), [0x55; 508]);
+        assert_eq!(v.read(rx, 2048).unwrap(), [0x55; 2016]);
+        assert_eq!(v.read(rx, 2048).unwrap(), [0x55; 28]);
         assert_eq!(v.read(rx, 4).unwrap(), b"abcd");
         assert_eq!(v.read(rx, 4), Err(Errno(11)));
         let [tx, rx] = v.socketpair(1, 1, 0).unwrap();
-        v.local_socket(rx)
+        v.local_socket(tx)
             .unwrap()
             .unwrap()
-            .set_reuse(8, 256)
+            .set_reuse(7, 1024)
             .unwrap();
-        v.write(tx, &[0x55; 510]).unwrap();
+        v.write(tx, &[0x55; 2046]).unwrap();
         let d = direct(&v);
         batch_headers(&mut m, 2);
         assert!(matches!(
@@ -1444,8 +1527,8 @@ mod tests {
         ));
         assert_eq!(word(&m, 0x1838), 2);
         assert_eq!(
-            v.read(rx, 512).unwrap(),
-            [vec![0x55; 510], b"ab".to_vec()].concat()
+            v.read(rx, 2048).unwrap(),
+            [vec![0x55; 2046], b"ab".to_vec()].concat()
         );
         assert!(matches!(
             start_batch(&d, tx, 0, &mut m),
@@ -1466,10 +1549,10 @@ mod tests {
         ));
         m.map(0x3000, 0x10000, Permissions::RW).unwrap();
         batch_headers(&mut m, 1024);
-        v.local_socket(rx)
+        v.local_socket(tx)
             .unwrap()
             .unwrap()
-            .set_reuse(8, 8192)
+            .set_reuse(7, 8192)
             .unwrap();
         assert!(matches!(
             start_batch(&d, tx, 1025, &mut m),

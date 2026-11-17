@@ -1039,6 +1039,10 @@ impl DirectFd {
             _ => 0,
         }
     }
+    pub fn local_send_buffer(&self) -> usize {
+        self.local_data()
+            .map_or(0, |(data, side)| data.buffer_size(side, false))
+    }
     pub fn recv_local_message(
         &self,
         count: usize,

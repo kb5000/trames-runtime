@@ -270,7 +270,11 @@ impl Linux {
         io: &mut impl crate::execution_io::Output,
     ) -> Result<u64> {
         let fd = a[0] as u32;
-        self.vfs.fd_kind(fd)?;
+        if self.vfs.fd_kind(fd)? == FdKind::Socket {
+            if let Some(socket) = self.vfs.local_socket(fd)?.filter(|s| s.kind() != 1) {
+                return Self::local_network_vfs(&mut self.vfs, &socket, 63, a, memory);
+            }
+        }
         Self::read_transport(a, memory, |count| self.read_bytes(fd, count, io))
     }
     pub(crate) fn read_transport(
@@ -365,6 +369,13 @@ impl Linux {
         memory: &mut impl CpuMemory,
         io: &mut impl crate::execution_io::Output,
     ) -> Result<u64> {
+        if let Some(socket) = self
+            .vfs
+            .local_socket(a[0] as u32)?
+            .filter(|s| s.kind() != 1)
+        {
+            return Self::local_network_vfs(&mut self.vfs, &socket, 65, a, memory);
+        }
         let records = self.vfs.readv_records(a[0] as u32)?;
         Self::readv_transport_mode(a, memory, records, |count| {
             self.read_bytes(a[0] as u32, count, io)
@@ -415,7 +426,21 @@ impl Linux {
         io: &mut impl crate::execution_io::Output,
         bytes: &mut Vec<u8>,
     ) -> Result<u64> {
-        self.vfs.fd_kind(a[0] as u32)?;
+        if self.vfs.fd_kind(a[0] as u32)? == FdKind::Socket {
+            if let Some(socket) = self
+                .vfs
+                .local_socket(a[0] as u32)?
+                .filter(|s| s.kind() != 1)
+            {
+                return crate::network::unix::write_packet_vfs(
+                    &mut self.vfs,
+                    &socket,
+                    64,
+                    a,
+                    memory,
+                );
+            }
+        }
         Self::write_transport(a, memory, bytes, |bytes| {
             self.write_bytes(a[0] as u32, bytes, io)
         })
@@ -536,6 +561,13 @@ impl Linux {
         io: &mut impl crate::execution_io::Output,
         bytes: &mut Vec<u8>,
     ) -> Result<u64> {
+        if let Some(socket) = self
+            .vfs
+            .local_socket(a[0] as u32)?
+            .filter(|s| s.kind() != 1)
+        {
+            return crate::network::unix::write_packet_vfs(&mut self.vfs, &socket, 66, a, memory);
+        }
         let records = self.vfs.is_eventfd(a[0] as u32)?;
         Self::writev_transport_mode(a, memory, bytes, records, |bytes| {
             self.write_bytes(a[0] as u32, bytes, io)

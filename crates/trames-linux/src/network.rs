@@ -394,22 +394,36 @@ struct Vectors {
     size: usize,
 }
 impl Vectors {
-    fn prepare(memory: &impl CpuMemory, pointer: u64, count: u64, access: Access) -> Result<Self> {
-        Self::prepare_prefix(
-            memory,
-            pointer,
-            count,
-            access,
-            matches!(access, Access::Write),
-        )
-    }
     fn prepare_stream(
         memory: &impl CpuMemory,
         pointer: u64,
         count: u64,
         access: Access,
     ) -> Result<Self> {
-        Self::prepare_prefix(memory, pointer, count, access, true)
+        Self::prepare_prefix(
+            memory,
+            pointer,
+            count,
+            access,
+            true,
+            trames_net::MAX_TRANSFER,
+        )
+    }
+    fn prepare_unix_packet(
+        memory: &impl CpuMemory,
+        pointer: u64,
+        count: u64,
+        access: Access,
+        limit: usize,
+    ) -> Result<Self> {
+        Self::prepare_prefix(
+            memory,
+            pointer,
+            count,
+            access,
+            matches!(access, Access::Write),
+            limit,
+        )
     }
     fn prepare_prefix(
         memory: &impl CpuMemory,
@@ -417,6 +431,7 @@ impl Vectors {
         count: u64,
         access: Access,
         short: bool,
+        limit: usize,
     ) -> Result<Self> {
         if count > 1024 {
             return Err(Errno(90));
@@ -439,7 +454,7 @@ impl Vectors {
                 .ok_or(Errno(22))?;
             // Stream sends and receives can complete one transport prefix.
             // Datagram sends must preserve the entire message or fail.
-            let room = (trames_net::MAX_TRANSFER - size) as u64;
+            let room = (limit - size) as u64;
             let length = if short {
                 length.min(room)
             } else if length > room {

@@ -6,9 +6,13 @@ use trames_vfs::{Errno, Vfs};
 type Result<T> = std::result::Result<T, Errno>;
 /// Shared transfer prelude. It accepts the caller's actual VFS bindings and
 /// imports pointers before data effects; source rejection uses the same order.
-fn regular_file(vfs: &Vfs, fd: u32) -> Result<[u8; 128]> {
+fn regular_file(vfs: &Vfs, fd: u32, copy: bool) -> Result<[u8; 128]> {
     let stat = vfs.stat_fd(fd)?;
-    if u32::from_le_bytes(stat[16..20].try_into().expect("mode")) & 0o170000 != 0o100000 {
+    let kind = u32::from_le_bytes(stat[16..20].try_into().expect("mode")) & 0o170000;
+    if copy && kind == 0o040000 {
+        return Err(Errno(21));
+    }
+    if kind != 0o100000 {
         return Err(Errno(22));
     }
     Ok(stat)
@@ -21,10 +25,14 @@ fn copy_offset(vfs: &Vfs, fd: u32, pointer: u64, memory: &impl CpuMemory) -> Res
     Linux::check(memory, pointer, 8, Access::Write)?;
     vfs.fd_kind(fd)?;
     let offset = memory.read_u64(pointer).map_err(|_| Errno(14))?;
-    if offset > i64::MAX as u64 {
-        return Err(Errno(22));
-    }
     Ok(offset)
+}
+fn signed_offset(offset: u64, error: u32) -> Result<u64> {
+    if offset > i64::MAX as u64 {
+        Err(Errno(error))
+    } else {
+        Ok(offset)
+    }
 }
 pub(crate) fn splice_parameters(
     vfs: &mut Vfs,
@@ -46,12 +54,12 @@ pub(crate) fn splice_parameters(
     let from = if a[1] == 0 {
         None
     } else {
-        Some(copy_offset(vfs, input, a[1], memory)?)
+        Some(signed_offset(copy_offset(vfs, input, a[1], memory)?, 22)?)
     };
     let to = if a[3] == 0 {
         None
     } else {
-        Some(copy_offset(vfs, output, a[3], memory)?)
+        Some(signed_offset(copy_offset(vfs, output, a[3], memory)?, 22)?)
     };
     Ok((from, to))
 }
@@ -72,7 +80,7 @@ impl CopyParameters {
         memory: &impl CpuMemory,
     ) -> Result<Self> {
         let copy = number == 285;
-        let (input, output, in_pointer, out_pointer, count) = if copy {
+        let (input, output, in_pointer, out_pointer, mut count) = if copy {
             (a[0] as u32, a[2] as u32, a[1], a[3], a[4])
         } else {
             (a[1] as u32, a[0] as u32, a[2], 0, a[3])
@@ -80,15 +88,20 @@ impl CopyParameters {
         if copy && a[5] != 0 {
             return Err(Errno(22));
         }
-        let from = regular_file(vfs, input)?;
+        let from = regular_file(vfs, input, copy)?;
         vfs.fd_kind(output)?;
         let from_offset = if in_pointer == 0 {
             vfs.seek(input, 0, 1)?
         } else {
-            copy_offset(vfs, input, in_pointer, memory)?
+            let offset = copy_offset(vfs, input, in_pointer, memory)?;
+            if copy {
+                offset
+            } else {
+                signed_offset(offset, 22)?
+            }
         };
         let to_offset = if copy {
-            let to = regular_file(vfs, output)?;
+            let to = regular_file(vfs, output, true)?;
             if vfs.flags(output)? & 0x400 != 0 {
                 return Err(Errno(9));
             }
@@ -97,12 +110,7 @@ impl CopyParameters {
             } else {
                 copy_offset(vfs, output, out_pointer, memory)?
             };
-            if from[..16] == to[..16]
-                && from_offset < offset.saturating_add(count)
-                && offset < from_offset.saturating_add(count)
-            {
-                return Err(Errno(22));
-            }
+            count = Vfs::copy_file_range_length(&from, &to, from_offset, offset, count)?;
             Some(offset)
         } else {
             None
@@ -342,6 +350,34 @@ mod tests {
         assert_eq!(l.file_syscall(285, a, &mut memory, &mut io), Ok(3));
         assert_eq!(l.vfs.seek(from, 0, 1).unwrap(), 3);
         assert_eq!(l.vfs.pread(to, 3, 0).unwrap(), b"abc");
+    }
+    #[test]
+    fn copy_checks_the_full_range_before_eof_and_has_no_effect_on_error() {
+        let mut l = Linux::new(0x3000);
+        let mut memory = Memory::default();
+        memory.map(0x1000, 4096, Permissions::RW).unwrap();
+        l.vfs.import_file(b"/src", b"abcdef".to_vec()).unwrap();
+        let from = l.vfs.open_at(-100, b"/src", 0, 0).unwrap();
+        let to = l.vfs.open_at(-100, b"/dst", 0x42, 0o600).unwrap();
+        let dir = l.vfs.open_at(-100, b"/", 0, 0).unwrap();
+        let mut io = CapturedOutput::default();
+        for (input, output, count, offset, expected) in [
+            (dir, to, 1, 0, 21),
+            (from, dir, 1, 0, 21),
+            (from, to, u64::MAX, 1, 75),
+            (from, to, 1, u64::MAX, 75),
+        ] {
+            memory.write(0x1000, &offset.to_le_bytes()).unwrap();
+            let a = [input as u64, 0x1000, output as u64, 0, count, 0];
+            assert_eq!(
+                l.file_syscall(285, a, &mut memory, &mut io),
+                Err(Errno(expected))
+            );
+            assert_eq!(memory.read_u64(0x1000).unwrap(), offset);
+            assert_eq!(l.vfs.seek(from, 0, 1).unwrap(), 0);
+            assert_eq!(l.vfs.seek(to, 0, 1).unwrap(), 0);
+            assert_eq!(l.vfs.pread(to, 8, 0).unwrap(), b"");
+        }
     }
     #[test]
     fn openat2_never_ignores_containment_flags_or_unknown_tail_fields() {

@@ -258,12 +258,12 @@ impl Resource {
                 [now.as_secs(), u64::from(now.subsec_nanos())]
             });
             let queue = &mut data.queues[peer];
-            if self.kind != 1 && bytes.len() > data.send_limit[side] {
+            if self.kind != 1 && bytes.len() > data.send_limit[side].saturating_sub(32) {
                 return Err(Errno(90));
             }
-            let room = data.send_limit[side]
-                .min(data.receive_limit[peer])
-                .saturating_sub(data.used[peer]);
+            // AF_UNIX flow control uses the sender's SO_SNDBUF. SO_RCVBUF is
+            // observable but does not constrain the peer's write budget.
+            let room = data.send_limit[side].saturating_sub(data.used[peer]);
             if (self.kind != 1 && (room < bytes.len() || queue.len() >= 128))
                 || (self.kind == 1 && room == 0 && !bytes.is_empty())
             {
@@ -485,9 +485,7 @@ impl Resource {
         let eof = data.read_closed[side] || !data.alive[peer] || data.write_closed[peer];
         let queue = &data.queues[side];
         let send_queue = &data.queues[peer];
-        let room = data.send_limit[side]
-            .min(data.receive_limit[peer])
-            .saturating_sub(data.used[peer]);
+        let room = data.send_limit[side].saturating_sub(data.used[peer]);
         let ready = (if !queue.is_empty() || (eof && self.kind != 2) {
             events & 1
         } else {
@@ -529,6 +527,30 @@ impl Data {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unix_sender_budget_ignores_receive_buffer_and_growing_it_unblocks_poll() {
+        for kind in [1, 2, 5] {
+            let data = Resource::new(kind, true);
+            data.set_buffer_unnotified(1, true, 128);
+            let bytes = vec![7; PIPE_CAPACITY / 4];
+            for _ in 0..4 {
+                assert_eq!(
+                    data.send_credentials(0, &bytes, 0x40, None),
+                    Ok(bytes.len())
+                );
+            }
+            assert_eq!(data.poll(0, 4).0, 0);
+            assert_eq!(data.send_credentials(0, &bytes, 0x40, None), Err(Errno(11)));
+            data.set_buffer_unnotified(0, false, PIPE_CAPACITY as u32);
+            assert_eq!(data.poll(0, 4).0, 4);
+            assert_eq!(
+                data.send_credentials(0, &bytes, 0x40, None),
+                Ok(bytes.len())
+            );
+            let out = data.recv_message(1, bytes.len(), 0).unwrap().unwrap();
+            assert_eq!(out.data, bytes);
+        }
+    }
     #[test]
     fn explicit_credentials_and_sender_passcred_are_distinct_from_late_receive_enable() {
         for kind in [1, 2, 5] {

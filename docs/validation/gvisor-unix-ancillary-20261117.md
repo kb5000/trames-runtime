@@ -1,5 +1,9 @@
 # Unix ancillary-message completion — 2026-11-17
 
+Follow-up: the [multi-area compatibility batch](gvisor-multi-area-20261117.md)
+repairs large Unix packets and send-buffer flow control, retaining all ancillary
+passes and bringing the sequenced-packet local group to 336/336.
+
 This closes all 84 remaining native-confirmed Unix ancillary failures from the
 [network ABI checkpoint](gvisor-network-abi-fixes-20261117.md). The complete
 upstream `UnixSocketPairCmsgTest` matrix now has **1,914 passes, 30 upstream skips

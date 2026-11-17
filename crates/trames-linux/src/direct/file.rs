@@ -1354,7 +1354,7 @@ fn copy_import<Q: std::borrow::Borrow<trames_vfs::PathQueries>>(
         Linux::check(memory, pointer, 8, Access::Read)?;
         Linux::check(memory, pointer, 8, Access::Write)?;
         let value = memory.read_u64(pointer).map_err(|_| Errno(14))?;
-        if value > i64::MAX as u64 {
+        if !range && value > i64::MAX as u64 {
             Err(Errno(22))
         } else {
             Ok(Some(value))
