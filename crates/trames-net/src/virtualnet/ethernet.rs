@@ -74,6 +74,9 @@ impl Inner {
                 Action::External(ns, index, frame) => self.external_frame(view, ns, index, frame),
             }
         }
+        if let Some(link) = &mut self.external {
+            self.stats.dropped += link.flush() as u64;
+        }
     }
     fn external_frame(&mut self, view: crate::netdev::View, ns: u64, index: u32, frame: Frame) {
         let Some(source) = self.node_key(&view, ns) else {
@@ -119,28 +122,27 @@ impl Inner {
             return;
         }
         if let Some(link) = &mut self.external {
-            // Peer discovery is only on flood traffic. Learned unicast avoids filesystem work.
             let known = self.ethernet_switch.lookup(0, frame.destination(), 30000);
             if !frame.multicast() {
-                if let Some(id) = known {
-                    let path = link.path.parent().unwrap().join(format!("p{id}"));
-                    let _ = link.socket.send_to(&frame.0, path);
+                if let Some(peer) = known {
+                    if !link.enqueue(peer as u8, frame) {
+                        self.stats.dropped += 1;
+                    }
                     return;
                 }
             }
             if let Ok(entries) = std::fs::read_dir(link.path.parent().unwrap()) {
                 for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path != link.path
-                        && entry
-                            .file_name()
-                            .to_string_lossy()
-                            .strip_prefix('p')
-                            .is_some_and(|n| {
-                                n.parse::<u8>().is_ok_and(|id| (2..=254).contains(&id))
-                            })
+                    if let Some(peer) = entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|n| n.strip_prefix('p'))
+                        .and_then(|n| n.parse::<u8>().ok())
+                        .filter(|p| *p != link.id && (2..=254).contains(p))
                     {
-                        let _ = link.socket.send_to(&frame.0, path);
+                        if !link.enqueue(peer, frame.clone()) {
+                            self.stats.dropped += 1;
+                        }
                     }
                 }
             }
@@ -169,37 +171,15 @@ impl Inner {
         }
     }
     pub(super) fn receive_external(&mut self) {
-        let Some(link) = &self.external else {
+        let Some(link) = &mut self.external else {
             return;
         };
-        let mut packets = Vec::new();
-        let mut bytes = [0u8; 65597];
-        for _ in 0..64 {
-            match link.socket.recv_from(&mut bytes) {
-                Ok((n, source)) => {
-                    if let Ok(frame) = Frame::new(&bytes[..n]) {
-                        let peer = source
-                            .as_pathname()
-                            .filter(|p| p.parent() == link.path.parent())
-                            .and_then(|p| p.file_name())
-                            .and_then(|n| n.to_str())
-                            .and_then(|n| n.strip_prefix('p'))
-                            .and_then(|n| n.parse::<u32>().ok())
-                            .filter(|id| (2..=254).contains(id));
-                        if peer.is_none() {
-                            continue;
-                        }
-                        if let Some(peer) = peer {
-                            self.ethernet_switch.learn(0, frame.source(), peer, 30000);
-                        }
-                        packets.push(frame);
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(_) => break,
-            }
-        }
+        let packets = link.receive(64);
         let id = link.id;
+        for (peer, frame) in &packets {
+            self.ethernet_switch
+                .learn(0, frame.source(), u32::from(*peer), 30000);
+        }
         let view = self
             .nodes
             .values()
@@ -211,7 +191,7 @@ impl Inner {
                 &view,
                 packets
                     .into_iter()
-                    .map(|f| Action::Receive(view.namespace, 2, f)),
+                    .map(|(_, f)| Action::Receive(view.namespace, 2, f)),
             );
         }
     }

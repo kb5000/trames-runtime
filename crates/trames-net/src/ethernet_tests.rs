@@ -637,3 +637,92 @@ fn bridged_large_datagrams_survive_ip_firewall_defragmentation() {
         .unwrap();
     assert_eq!(rx.poll(1), Ok(0));
 }
+
+#[test]
+fn udp_buffer_budget_controls_burst_capacity_and_preserves_queued_data_on_resize() {
+    let fabric = Fabric::new().unwrap();
+    let a = Network::virtual_network(&fabric, 2, NetworkMode::Outbound).unwrap();
+    let b = Network::virtual_network(&fabric, 3, NetworkMode::Outbound).unwrap();
+    let tx = a.socket(2, 2, 0).unwrap();
+    let rx = b.socket(2, 2, 0).unwrap();
+    rx.set_option(1, 8, 8192).unwrap();
+    rx.bind("10.0.0.3:34568".parse().unwrap()).unwrap();
+    assert_eq!(rx.get_option(1, 8), Ok(8192));
+    for n in 0u32..64 {
+        let mut data = [0u8; 64];
+        data[..4].copy_from_slice(&n.to_le_bytes());
+        tx.send(&data, 0, Some("10.0.0.3:34568".parse().unwrap()))
+            .unwrap();
+    }
+    // Shrinking retains existing packets, but rejects future enqueue until below budget.
+    rx.set_option(1, 8, 512).unwrap();
+    assert_eq!(rx.get_option(1, 8), Ok(512));
+    tx.send(b"over budget", 0, Some("10.0.0.3:34568".parse().unwrap()))
+        .unwrap();
+    for n in 0u32..64 {
+        let r = rx.recv(100, 0).unwrap();
+        assert_eq!(r.data.len(), 64);
+        assert_eq!(u32::from_le_bytes(r.data[..4].try_into().unwrap()), n);
+    }
+    assert_eq!(rx.poll(1), Ok(0));
+    tx.send(b"available", 0, Some("10.0.0.3:34568".parse().unwrap()))
+        .unwrap();
+    assert_eq!(rx.recv(100, 0).unwrap().data, b"available");
+    rx.set_option(1, 8, 4096).unwrap();
+    for _ in 0..65 {
+        tx.send(&[], 0, Some("10.0.0.3:34568".parse().unwrap()))
+            .unwrap();
+    }
+    for _ in 0..64 {
+        assert!(rx.recv(100, 0).unwrap().data.is_empty());
+    }
+    assert_eq!(rx.poll(1), Ok(0));
+}
+
+#[test]
+fn resized_packet_rings_keep_wrapped_data_and_pending_transmit_metadata() {
+    use smoltcp::storage::{PacketBuffer, PacketMetadata};
+    let mut ring = PacketBuffer::new(vec![PacketMetadata::EMPTY; 4], vec![0u8; 16]);
+    ring.enqueue(8, 1u8).unwrap().copy_from_slice(b"12345678");
+    ring.enqueue(4, 2).unwrap().copy_from_slice(b"abcd");
+    ring.dequeue().unwrap();
+    ring.enqueue(8, 3).unwrap().copy_from_slice(b"abcdefgh");
+    ring.resize_owned(1, 2);
+    assert_eq!(ring.packet_capacity(), 1);
+    assert_eq!(ring.payload_capacity(), 2);
+    assert!(ring.enqueue(1, 4).is_err());
+    let (h, data) = ring.dequeue().unwrap();
+    assert_eq!(h, 2);
+    assert_eq!(data, b"abcd");
+    let (h, data) = ring.dequeue().unwrap();
+    assert_eq!(h, 3);
+    assert_eq!(data, b"abcdefgh");
+    assert_eq!(ring.enqueue(2, 4).unwrap().len(), 2);
+    let mut socket = smoltcp::socket::udp::Socket::new(
+        PacketBuffer::new(vec![PacketMetadata::EMPTY; 1], vec![0u8; 8]),
+        PacketBuffer::new(vec![PacketMetadata::EMPTY; 2], vec![0u8; 16]),
+    );
+    socket.bind(12345).unwrap();
+    let endpoint = smoltcp::wire::IpEndpoint::new(
+        smoltcp::wire::IpAddress::Ipv4([192, 0, 2, 1].into()),
+        12346,
+    );
+    socket.send_slice(b"pending", endpoint).unwrap();
+    socket.resize_send_buffer(1, 2);
+    assert_eq!(socket.send_queue(), 7);
+    assert_eq!(socket.payload_send_capacity(), 2);
+    assert_eq!(socket.packet_send_capacity(), 1);
+}
+
+#[test]
+fn tracking_without_nat_preserves_original_zero_udp_checksum() {
+    let mut packet =
+        crate::packet_tests::udp4("192.0.2.1", "192.0.2.2", 1234, 5678, b"no translation");
+    let original = packet.clone();
+    let key = crate::conntrack::key(&packet).unwrap();
+    let mut track = crate::conntrack::Track::untracked(key, 0);
+    let state = crate::conntrack::State::default();
+    assert!(state.existing_nat(&mut track, &mut packet, false));
+    assert!(state.existing_nat(&mut track, &mut packet, true));
+    assert_eq!(packet, original);
+}

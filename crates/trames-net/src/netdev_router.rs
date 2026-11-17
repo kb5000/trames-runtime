@@ -32,7 +32,15 @@ impl Topology {
     ) -> bool {
         let (hook, raw) = stage;
         let (input, output) = devices;
-        self.spaces[&namespace].firewall.read().unwrap().process(
+        let firewall = &self.spaces[&namespace].firewall;
+        if !firewall.has_rules() {
+            // Existing NAT attachments survive rule removal; empty policy
+            // needs neither a rules read lock nor construction of hook inputs.
+            return raw
+                || !matches!(hook, 0 | 1 | 3 | 4)
+                || state.existing_nat(track, packet, matches!(hook, 1 | 4));
+        }
+        firewall.read().unwrap().process(
             packet,
             &Hook {
                 graph: self,
@@ -56,10 +64,8 @@ impl Topology {
         let k = conntrack::key(packet)?;
         let connection = self.spaces[&namespace].connections.clone();
         let mut state = connection.lock().unwrap();
-        let initial_out = self
-            .source(namespace, k.tuple.destination.ip())
-            .map(|(_, i, _)| i)
-            .unwrap_or(0);
+        let initial_route = self.source(namespace, k.tuple.destination.ip()).ok();
+        let initial_out = initial_route.map_or(0, |(_, i, _)| i);
         let first = if input.is_some() { 0 } else { 3 };
         let mut raw = Track::untracked(k, 0);
         if !self.hook(
@@ -102,7 +108,11 @@ impl Topology {
             let (out, gateway) = if external_reply {
                 (2, None)
             } else {
-                let (_, out, gateway) = self.source(namespace, destination).ok()?;
+                let (_, out, gateway) = if destination == k.tuple.destination.ip() {
+                    initial_route?
+                } else {
+                    self.source(namespace, destination).ok()?
+                };
                 (out, gateway)
             };
             if let Some(input) = input {

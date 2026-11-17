@@ -56,7 +56,7 @@ impl trames_shared::HostProtocol for Driver {
         };
         let mut sources = Vec::new();
         if let Some(link) = fabric.external_waiter() {
-            let source = WaitSource::Link(link);
+            let source = WaitSource::Wire(link);
             sources.push((source.identity(), source.open()?));
         }
         for (socket, _) in fabric.native_waiters() {

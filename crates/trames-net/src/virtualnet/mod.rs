@@ -6,6 +6,8 @@ use crate::shared_state::{Cell, State as SharedState};
 use crate::socket_quota::{Quota, Reservation};
 use std::ops::Deref;
 mod ethernet;
+mod wire;
+pub use wire::WireWait;
 mod gateway;
 pub(crate) mod packet;
 mod sockets;
@@ -74,20 +76,8 @@ struct Inner {
     stats: NetworkStats,
     drop_every: u32,
     corrupt_every: u32,
-    external: Option<ExternalPort>,
+    external: Option<wire::Wire>,
     revision: u64,
-}
-/// Per-environment link, driven by the original socket waiters. No broker thread.
-struct ExternalPort {
-    socket: Arc<std::os::unix::net::UnixDatagram>,
-    path: std::path::PathBuf,
-    id: u8,
-    nat: bool,
-}
-impl Drop for ExternalPort {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
 }
 struct Node {
     id: u8,
@@ -102,6 +92,10 @@ struct Node {
     resets: Vec<(Weak<SocketMeta>, Connection)>,
     links: [LinkStats; 2],
     configuration_revision: u64,
+    dirty: bool,
+    next_poll: Option<smoltcp::time::Instant>,
+    #[cfg(test)]
+    polls: u64,
     configuration_lo: bool,
 }
 struct Namespace {
@@ -167,6 +161,8 @@ struct State {
     hop_message: u32,
     device: Option<u32>,
     raw_identifiers: std::collections::BTreeSet<u16>,
+    receive_buffer: usize,
+    send_buffer: usize,
 }
 pub(super) struct Socket {
     network: Network,
@@ -186,6 +182,7 @@ pub(super) struct SocketMeta {
     mark: Cell<u32>,
     uid: Cell<u32>,
     route_device: Cell<u32>,
+    connecting: std::sync::atomic::AtomicBool,
 }
 fn v4(id: u8) -> Ipv4Addr {
     Ipv4Addr::new(10, 0, 0, id)
@@ -220,10 +217,22 @@ fn tcp_socket() -> tcp::Socket<'static> {
     s.set_timeout(Some(smoltcp::time::Duration::from_secs(60)));
     s
 }
+fn packet_slots(bytes: usize) -> usize {
+    (bytes / 64).max(1)
+}
 fn udp_socket() -> udp::Socket<'static> {
+    udp_socket_with_buffers(BUFFER, BUFFER)
+}
+fn udp_socket_with_buffers(receive: usize, send: usize) -> udp::Socket<'static> {
     udp::Socket::new(
-        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0; BUFFER]),
-        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0; BUFFER]),
+        udp::PacketBuffer::new(
+            vec![udp::PacketMetadata::EMPTY; packet_slots(receive)],
+            vec![0; receive],
+        ),
+        udp::PacketBuffer::new(
+            vec![udp::PacketMetadata::EMPTY; packet_slots(send)],
+            vec![0; send],
+        ),
     )
 }
 fn make_node(id: u8, now: smoltcp::time::Instant) -> Result<Node> {
@@ -261,6 +270,10 @@ fn make_node(id: u8, now: smoltcp::time::Instant) -> Result<Node> {
         resets: Vec::new(),
         links: [LinkStats::default(); 2],
         configuration_revision: u64::MAX,
+        dirty: true,
+        next_poll: None,
+        #[cfg(test)]
+        polls: 0,
         configuration_lo: false,
     })
 }
@@ -296,18 +309,10 @@ impl Fabric {
             return Err(NetError(16));
         }
         let path = directory.join(format!("p{id}"));
-        let socket = std::os::unix::net::UnixDatagram::bind(&path)
-            .map_err(|e| NetError(e.raw_os_error().unwrap_or(5) as u32))?;
-        if let Err(e) = socket.set_nonblocking(true) {
-            let _ = std::fs::remove_file(&path);
-            return Err(NetError(e.raw_os_error().unwrap_or(5) as u32));
-        }
-        inner.external = Some(ExternalPort {
-            socket: Arc::new(socket),
-            path,
-            id,
-            nat,
-        });
+        inner.external = Some(
+            wire::Wire::bind(path, id, nat)
+                .map_err(|e| NetError(e.raw_os_error().unwrap_or(5) as u32))?,
+        );
         Ok(())
     }
     pub(crate) fn bind_driver(&self, changed: &Arc<trames_shared::Readiness>) {
@@ -328,12 +333,19 @@ impl Fabric {
         }
         let mut inner = self.0.borrow_mut();
         inner.driver_maintenance = true;
+        if let Some(wire) = &inner.external {
+            wire.wait.drain();
+        }
         inner.tick();
     }
     pub(crate) fn protocol_delay(&self) -> Option<Duration> {
         let mut inner = self.0.borrow_mut();
         let now = inner.now();
-        if !inner.ethernet.is_empty() || !inner.injected.is_empty() {
+        if !inner.ethernet.is_empty()
+            || !inner.injected.is_empty()
+            || inner.external.as_ref().is_some_and(wire::Wire::runnable)
+            || inner.nodes.values().any(|n| n.dirty)
+        {
             return Some(Duration::ZERO);
         }
         let mut next = {
@@ -358,15 +370,15 @@ impl Fabric {
         }
         next
     }
-    pub(super) fn external_waiter(&self) -> Option<Arc<std::os::unix::net::UnixDatagram>> {
-        self.0.borrow().external.as_ref().map(|e| e.socket.clone())
+    pub(super) fn external_waiter(&self) -> Option<Arc<WireWait>> {
+        self.0.borrow().external.as_ref().map(|e| e.wait.clone())
     }
     pub fn publish(&self, host: SocketAddr, guest: SocketAddr, kind: u32) -> Result<()> {
         let mut i = self.0.borrow_mut();
         i.gateway.publish(host, guest, kind)?;
         i.revision = i.revision.wrapping_add(1);
         if let Some(link) = &i.external {
-            let _ = link.socket.send_to(&[], &link.path);
+            link.wait.wake();
         }
         Ok(())
     }
@@ -375,7 +387,7 @@ impl Fabric {
         i.gateway.unpublish(host, kind)?;
         i.revision = i.revision.wrapping_add(1);
         if let Some(link) = &i.external {
-            let _ = link.socket.send_to(&[], &link.path);
+            link.wait.wake();
         }
         Ok(())
     }
@@ -504,7 +516,17 @@ impl Fabric {
         Ok(Network(ns))
     }
     pub(super) fn tick(&self) {
-        self.0.borrow_mut().tick();
+        let mut inner = self.0.borrow_mut();
+        if let Some(wire) = &inner.external {
+            wire.wait.drain();
+        }
+        // Control operations mutate socket sets/topology through this entry.
+        // Data operations mark only their original node; never poll all nodes
+        // just because another application tried to read an empty queue.
+        for n in inner.nodes.values_mut() {
+            n.dirty = true;
+        }
+        inner.tick();
     }
     pub(super) fn next_wait(&self) -> Duration {
         let mut i = self.0.borrow_mut();
@@ -609,7 +631,18 @@ impl Inner {
                 .map(|(key, index, peer, p)| (key, Some(index), peer, p))
                 .collect();
             for (&key, node) in &mut self.nodes {
-                node.iface.poll(now, &mut node.port, &mut node.sockets);
+                if node.dirty
+                    || !node.port.rx.is_empty()
+                    || node.next_poll.is_some_and(|d| d <= now)
+                {
+                    node.dirty = false;
+                    node.iface.poll(now, &mut node.port, &mut node.sockets);
+                    node.next_poll = node.iface.poll_at(now, &node.sockets);
+                    #[cfg(test)]
+                    {
+                        node.polls += 1;
+                    }
+                }
                 while let Some(p) = node.port.tx.pop_front() {
                     packets.push((key, None, [0; 6], p));
                 }
@@ -922,20 +955,8 @@ impl Inner {
                     && dst != IpAddr::V4(v4(1))
                     && dst != IpAddr::V6(v6(1))
                 {
-                    if let Some(link) = &self.external {
-                        let id = match dst {
-                            IpAddr::V4(a) => Some(a.octets()[3]),
-                            IpAddr::V6(a) => u8::try_from(a.segments()[7]).ok(),
-                        };
-                        if let Some(id) = id.filter(|id| *id >= 2) {
-                            let path = link.path.parent().unwrap().join(format!("p{id}"));
-                            if link.socket.send_to(&p, path).is_err() {
-                                self.stats.dropped += 1;
-                            }
-                        }
-                    } else {
-                        self.stats.dropped += 1;
-                    }
+                    // Guest-owned links always use Ethernet; no legacy raw-IP wire.
+                    self.stats.dropped += 1;
                 } else if source != 0
                     && dynamic.is_none()
                     && (dst == IpAddr::V4(v4(1))
@@ -971,6 +992,9 @@ impl Inner {
             }
             for weak in &node.registry {
                 if let Some(socket) = weak.upgrade() {
+                    if !socket.connecting.load(std::sync::atomic::Ordering::Relaxed) {
+                        continue;
+                    }
                     let mut state = socket.state.borrow_mut();
                     if state.connection == Connection::Connecting {
                         if let Some(&h) = state.handles.first() {
@@ -985,6 +1009,10 @@ impl Inner {
                             }
                         }
                     }
+                    socket.connecting.store(
+                        state.connection == Connection::Connecting,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 }
             }
         }
@@ -1004,6 +1032,7 @@ impl Node {
         {
             return;
         }
+        self.dirty = true;
         self.configuration_revision = revision;
         self.configuration_lo = owner.loopback_up.get();
         let mut addresses = view.addresses(true);
@@ -1111,7 +1140,8 @@ impl Node {
                 for _ in count..needed {
                     let ep = SocketAddr::new(*a, bound.port());
                     let handle = if socket.kind == 2 {
-                        let mut u = udp_socket();
+                        let mut u =
+                            udp_socket_with_buffers(state.receive_buffer, state.send_buffer);
                         u.set_hop_limit(Some(state.hop_limit));
                         if u.bind(endpoint(ep)).is_err() {
                             break;
@@ -1310,6 +1340,8 @@ impl Network {
                 hop_message: 52,
                 device: None,
                 raw_identifiers: std::collections::BTreeSet::new(),
+                receive_buffer: BUFFER,
+                send_buffer: BUFFER,
             },
             reservation,
         ))
@@ -1324,6 +1356,7 @@ impl Network {
                 mark: Cell::new(0),
                 uid: Cell::new(0),
                 route_device: Cell::new(0),
+                connecting: std::sync::atomic::AtomicBool::new(false),
             }),
             _reservation: reservation,
         });
@@ -1337,6 +1370,7 @@ impl Drop for Socket {
     fn drop(&mut self) {
         let mut i = self.network.0.fabric.0.borrow_mut();
         if let Some(n) = i.nodes.get_mut(&self.network.0.key) {
+            n.dirty = true;
             for h in self.state.borrow_mut().handles.drain(..) {
                 if self.kind == 1 {
                     let s = n.sockets.get_mut::<tcp::Socket>(h);
@@ -1524,5 +1558,57 @@ mod shared_lifetime_tests {
         let _fabric = fabric.0.borrow_mut();
         drop(socket_observer);
         drop(namespace_observer);
+    }
+}
+
+#[cfg(test)]
+mod work_tests {
+    use super::*;
+    #[test]
+    fn empty_reads_and_buffered_udp_do_not_poll_unrelated_protocol_resources() {
+        let fabric = Fabric::new().unwrap();
+        let a = crate::Network::virtual_network(&fabric, 2, NetworkMode::Outbound).unwrap();
+        let b = crate::Network::virtual_network(&fabric, 3, NetworkMode::Outbound).unwrap();
+        let _other = crate::Network::virtual_network(&fabric, 4, NetworkMode::Outbound).unwrap();
+        let tx = a.socket(2, 2, 0).unwrap();
+        tx.bind("10.0.0.2:34801".parse().unwrap()).unwrap();
+        let rx = b.socket(2, 2, 0).unwrap();
+        rx.bind("10.0.0.3:34800".parse().unwrap()).unwrap();
+        assert_eq!(rx.recv(100, 0).err(), Some(NetError(11)));
+        let counts = || {
+            fabric
+                .0
+                .borrow()
+                .nodes
+                .iter()
+                .map(|(&k, n)| (k, n.polls))
+                .collect::<Vec<_>>()
+        };
+        let idle = counts();
+        for _ in 0..64 {
+            assert_eq!(rx.recv(100, 0).err(), Some(NetError(11)));
+        }
+        assert_eq!(counts(), idle, "empty reader repolled an idle fabric");
+        tx.send(b"ready", 0, Some("10.0.0.3:34800".parse().unwrap()))
+            .unwrap();
+        let queued = counts();
+        assert_eq!(rx.recv(100, 0).unwrap().data, b"ready");
+        assert_eq!(
+            counts(),
+            queued,
+            "buffered UDP read advanced unrelated resources"
+        );
+        let other = fabric
+            .0
+            .borrow()
+            .nodes
+            .iter()
+            .find(|(_, n)| n.id == 4)
+            .map(|(&k, _)| k)
+            .unwrap();
+        assert_eq!(
+            idle.iter().find(|v| v.0 == other),
+            queued.iter().find(|v| v.0 == other)
+        );
     }
 }

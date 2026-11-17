@@ -19,6 +19,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('samples', nargs='?', type=int, default=3, help='samples per case (default: 3)')
 parser.add_argument('seconds', nargs='?', type=float, default=0.5, help='bulk-send window per sample')
 parser.add_argument('rtt_iterations', nargs='?', type=int, default=2000, help='timed echoes per RTT sample')
+parser.add_argument('--filter', default='', help='optional path:protocol:test:flows case key')
 parser.add_argument('--check-only', action='store_true', help='run Clippy without measurements')
 args = parser.parse_args()
 if args.samples < 1 or args.rtt_iterations < 1 or not math.isfinite(args.seconds) or args.seconds <= 0:
@@ -34,6 +35,7 @@ with tempfile.TemporaryDirectory(prefix='trames-ethernet-bench-') as tmp:
         'trames-net={path=' + json.dumps(str(root / 'crates/trames-net')) + '}\n'
         'trames-shared={path=' + json.dumps(str(root / 'crates/trames-shared')) + '}\n'
         'socket2="=0.6.1"\n'
+        '[patch.crates-io]\nsmoltcp={path=' + json.dumps(str(root / 'vendor/smoltcp')) + '}\n'
         '[profile.release]\noverflow-checks=true\nlto="thin"\n'
     )
     shutil.copy2(root / 'Cargo.lock', project / 'Cargo.lock')
@@ -46,4 +48,4 @@ with tempfile.TemporaryDirectory(prefix='trames-ethernet-bench-') as tmp:
                        cwd=root, env=env, check=True)
     if not args.check_only:
         subprocess.run(['cargo', 'run', *common, '--', str(args.samples), str(args.seconds),
-                        str(args.rtt_iterations)], cwd=root, env=env, check=True)
+                        str(args.rtt_iterations), args.filter], cwd=root, env=env, check=True)

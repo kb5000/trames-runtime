@@ -26,7 +26,7 @@ pub use native::{
     MSG_TRUNC,
 };
 use std::{net::SocketAddr, sync::Arc, time::Duration};
-pub use virtualnet::{Fabric, LinkStats, NetworkInfo, NetworkStats};
+pub use virtualnet::{Fabric, LinkStats, NetworkInfo, NetworkStats, WireWait};
 type Result<T> = std::result::Result<T, NetError>;
 #[derive(Clone)]
 pub struct SocketInfo {
@@ -423,29 +423,40 @@ macro_rules! delegate {
 pub enum WaitSource {
     Native(Arc<native::Socket>),
     Link(Arc<std::os::unix::net::UnixDatagram>),
+    Wire(Arc<WireWait>),
 }
 impl WaitSource {
     pub fn identity(&self) -> usize {
         match self {
             Self::Native(s) => Arc::as_ptr(s) as usize,
             Self::Link(s) => Arc::as_ptr(s) as usize,
+            Self::Wire(s) => Arc::as_ptr(s) as usize,
         }
     }
     pub fn drain(&self) {
-        if let Self::Native(s) = self {
-            let _ = s.poll_epoch();
+        match self {
+            Self::Native(s) => {
+                let _ = s.poll_epoch();
+            }
+            Self::Wire(s) => s.drain(),
+            Self::Link(_) => (),
         }
     }
     fn fd(&self) -> std::io::Result<std::os::fd::OwnedFd> {
         match self {
             Self::Native(s) => s.wait_event_fd(),
             Self::Link(s) => Ok(s.try_clone()?.into()),
+            Self::Wire(s) => {
+                use std::os::fd::AsFd;
+                s.as_fd().try_clone_to_owned()
+            }
         }
     }
     pub fn open(&self) -> std::io::Result<trames_shared::HostFd> {
         let keep: Arc<dyn std::any::Any + Send + Sync> = match self {
             Self::Native(s) => Arc::new(Arc::downgrade(s)),
             Self::Link(s) => s.clone(),
+            Self::Wire(s) => s.clone(),
         };
         Ok(trames_shared::HostFd::retained(self.fd()?, keep))
     }
@@ -592,7 +603,7 @@ impl Socket {
             .flat_map(|socket| socket.wait_interests())
             .collect();
         if let Some(link) = external {
-            sources.push(WaitSource::Link(link));
+            sources.push(WaitSource::Wire(link));
         }
         (sources, delay)
     }

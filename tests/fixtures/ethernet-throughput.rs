@@ -563,6 +563,8 @@ fn main() {
     let seconds = args.get(1).map_or(0.5, |s| s.parse::<f64>().unwrap());
     let iterations = args.get(2).map_or(2000, |s| s.parse::<usize>().unwrap());
     assert!(samples > 0 && seconds > 0. && iterations > 0);
+    let filter = args.get(3).map(String::as_str).unwrap_or("");
+    eprintln!("benchmark-pid: {}", std::process::id());
     let mut cases = vec![];
     for protocol in [Protocol::Tcp, Protocol::Udp] {
         cases.push(Case {
@@ -607,6 +609,16 @@ fn main() {
         for sample in 0..samples {
             for offset in 0..paths.len() {
                 let path = paths[(sample + offset) % paths.len()];
+                let key = format!(
+                    "{}:{}:{}:{}",
+                    path.name(),
+                    case.protocol.name(),
+                    case.kind,
+                    case.flows
+                );
+                if !filter.is_empty() && key != filter {
+                    continue;
+                }
                 serial += 1;
                 eprintln!(
                     "benchmark: {} {} {} size={} flows={} sample={}",

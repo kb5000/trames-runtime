@@ -192,7 +192,7 @@ fn separate_fabrics_exchange_packets_and_isolate_named_links() {
     wait(&[(tx.clone(), 0), (rx.clone(), 1)], Duration::from_secs(1)).unwrap();
     assert_eq!(rx.recv(64, 0).unwrap().data, b"separate");
     let (sources, _) = rx.wait_interests();
-    assert!(sources.iter().any(|s| matches!(s, WaitSource::Link(_))));
+    assert!(sources.iter().any(|s| matches!(s, WaitSource::Wire(_))));
     // A different directory can reuse the same address and port without joining.
     let other = directory.join("other");
     std::fs::create_dir(&other).unwrap();

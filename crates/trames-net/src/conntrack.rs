@@ -254,9 +254,15 @@ impl State {
         if t.related {
             return icmp::translate(p, t, source);
         }
+        // A tracking hit does not imply translation. Preserve the original
+        // bytes/checksum when this connection has no NAT attachment.
+        if t.status & (16 | 32) == 0 {
+            return true;
+        }
         let Some(mut k) = key(p) else {
             return true;
         };
+        let original = k;
         if source {
             if t.reply && t.status & 32 != 0 {
                 k.tuple.source = t.original.tuple.destination;
@@ -268,7 +274,7 @@ impl State {
         } else if !t.reply && t.status & 32 != 0 {
             k.tuple.destination = t.translated.tuple.destination;
         }
-        rewrite(p, k)
+        k == original || rewrite(p, k)
     }
     pub fn nat(
         &mut self,

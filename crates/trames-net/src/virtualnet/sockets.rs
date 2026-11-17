@@ -373,7 +373,9 @@ impl Socket {
             let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
             let mut handles = Vec::new();
             for address in addresses {
-                let mut s = udp_socket();
+                let state = self.state.borrow();
+                let mut s = udp_socket_with_buffers(state.receive_buffer, state.send_buffer);
+                drop(state);
                 s.set_hop_limit(Some(self.state.borrow().hop_limit));
                 s.bind(IpListenEndpoint {
                     addr: Some(ip(address.ip())),
@@ -487,6 +489,8 @@ impl Socket {
             hop_message: state.hop_message,
             device: state.device,
             raw_identifiers: std::collections::BTreeSet::new(),
+            receive_buffer: state.receive_buffer,
+            send_buffer: state.send_buffer,
         };
         drop(state);
         drop(i);
@@ -581,6 +585,8 @@ impl Socket {
         state.bound = Some(bound);
         state.peer = Some(a);
         state.connection = Connection::Connecting;
+        self.connecting
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         drop(state);
         drop(i);
         self.fabric().tick();
@@ -639,8 +645,9 @@ impl Socket {
         self.fabric().tick();
         Ok(())
     }
+    // The caller has already progressed the original fabric. Never reacquire
+    // it here just to recheck the same connection/error state.
     fn before_io(&self) -> Result<()> {
-        let _ = self.connect_complete();
         let mut s = self.state.borrow_mut();
         if s.connection == Connection::Connecting {
             return Err(NetError(11));
@@ -674,7 +681,9 @@ impl Socket {
         if bytes.len() > MAX_TRANSFER {
             return Err(NetError(90));
         }
-        self.fabric().tick();
+        if !matches!(self.kind, 1 | 2) {
+            self.fabric().tick();
+        }
         if self.kind == 3 {
             return self.send_icmp(bytes, destination);
         }
@@ -728,6 +737,7 @@ impl Socket {
                 })
                 .copied()
                 .ok_or(NetError(99))?;
+            n.dirty = true;
             n.sockets
                 .get_mut::<udp::Socket>(h)
                 .send_slice(
@@ -744,16 +754,28 @@ impl Socket {
                     udp::SendError::BufferFull => NetError(11),
                     _ => NetError(99),
                 })?;
-            drop(i);
             drop(state);
-            self.fabric().tick();
+            i.tick();
             return Ok(bytes.len());
         }
         if destination.is_some() {
             return Err(NetError(106));
         }
-        self.before_io()?;
         let mut i = self.network.0.fabric.0.borrow_mut();
+        let can_enqueue = {
+            let state = self.state.borrow();
+            state.connection == Connection::Connected
+                && i.nodes.get(&self.network.0.key).is_some_and(|n| {
+                    state
+                        .handles
+                        .first()
+                        .is_some_and(|h| n.sockets.get::<tcp::Socket>(*h).can_send())
+                })
+        };
+        if !can_enqueue {
+            i.tick();
+        }
+        self.before_io()?;
         let state = self.state.borrow();
         if state.write_closed || matches!(state.connection, Connection::Failed(_)) {
             return Err(NetError(32));
@@ -770,12 +792,12 @@ impl Socket {
             return Err(NetError(32));
         }
         let count = s.send_slice(bytes).map_err(|_| NetError(32))?;
+        n.dirty |= count != 0;
         if count == 0 {
             return Err(NetError(11));
         }
-        drop(i);
         drop(state);
-        self.fabric().tick();
+        i.tick();
         Ok(count)
     }
     pub fn recv(&self, count: usize, flags: u32) -> Result<Received> {
@@ -785,17 +807,41 @@ impl Socket {
         if count > MAX_TRANSFER {
             return Err(NetError(90));
         }
-        self.fabric().tick();
+        if !matches!(self.kind, 1 | 2) {
+            self.fabric().tick();
+        }
         if self.kind == 3 {
             return self.recv_icmp(count, flags);
         }
         if self.kind == 4 {
             return self.recv_raw(count, flags);
         }
+        let mut i = self.network.0.fabric.0.borrow_mut();
+        // Buffered data belongs to this socket. Do not advance unrelated
+        // protocol resources just to dequeue it; progress only on exhaustion.
+        let buffered = {
+            let state = self.state.borrow();
+            i.nodes.get(&self.network.0.key).is_some_and(|n| {
+                if self.kind == 1 {
+                    state.connection == Connection::Connected
+                        && state
+                            .handles
+                            .first()
+                            .is_some_and(|h| n.sockets.get::<tcp::Socket>(*h).can_recv())
+                } else {
+                    state
+                        .handles
+                        .iter()
+                        .any(|h| n.sockets.get::<udp::Socket>(*h).can_recv())
+                }
+            })
+        };
+        if !buffered {
+            i.tick();
+        }
         if self.kind == 1 {
             self.before_io()?;
         }
-        let mut i = self.network.0.fabric.0.borrow_mut();
         let state = self.state.borrow();
         if state.read_closed || self.kind == 1 && count == 0 {
             return Ok(Received {
@@ -850,9 +896,11 @@ impl Socket {
             }
             .map_err(|_| NetError(11))?;
             bytes.truncate(size);
-            drop(i);
+            n.dirty |= flags & MSG_PEEK == 0 && size != 0;
             drop(state);
-            self.fabric().tick();
+            if flags & MSG_PEEK == 0 && size != 0 {
+                i.tick();
+            }
             Ok(Received {
                 packet_address: None,
                 netlink_address: None,
@@ -866,10 +914,7 @@ impl Socket {
         } else {
             for h in &state.handles {
                 let s = n.sockets.get_mut::<udp::Socket>(*h);
-                for _ in 0..16 {
-                    let Ok((data, meta)) = s.peek() else {
-                        break;
-                    };
+                while let Ok((data, meta)) = s.peek() {
                     let source = address(meta.endpoint);
                     if state.peer.is_some_and(|peer| peer != source) {
                         let _ = s.recv();
@@ -1010,6 +1055,23 @@ impl Socket {
                 if value <= 0 || value as usize > MAX_BUFFER {
                     return Err(NetError(22));
                 }
+                if self.kind == 2 {
+                    let bytes = value as usize;
+                    if name == 8 {
+                        state.receive_buffer = bytes;
+                    } else {
+                        state.send_buffer = bytes;
+                    }
+                    let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
+                    for h in &state.handles {
+                        let s = n.sockets.get_mut::<udp::Socket>(*h);
+                        if name == 8 {
+                            s.resize_receive_buffer(packet_slots(bytes), bytes);
+                        } else {
+                            s.resize_send_buffer(packet_slots(bytes), bytes);
+                        }
+                    }
+                }
             }
             (6, 1) if self.kind == 1 => state.nodelay = value != 0,
             (6, 4..=6) if self.kind == 1 => {
@@ -1039,6 +1101,7 @@ impl Socket {
         }
         if self.kind == 1 {
             let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
+            n.dirty = true;
             for h in &state.handles {
                 let s = n.sockets.get_mut::<tcp::Socket>(*h);
                 s.set_hop_limit(Some(state.hop_limit));
@@ -1064,6 +1127,8 @@ impl Socket {
                 }
             }
         }
+        drop(state);
+        i.driver_dirty = true;
         Ok(())
     }
     pub fn get_option(&self, level: u32, name: u32) -> Result<i32> {
@@ -1108,7 +1173,15 @@ impl Socket {
                 Ok(i32::from(state.receive_packet_info))
             }
             (0, 12) | (41, 51 | 8) => Ok(i32::from(state.receive_hops)),
-            (1, 7 | 8) => Ok(BUFFER as i32),
+            (1, 7 | 8) => Ok(if self.kind == 2 {
+                if name == 8 {
+                    state.receive_buffer
+                } else {
+                    state.send_buffer
+                }
+            } else {
+                BUFFER
+            } as i32),
             (6, 1) if self.kind == 1 => Ok(i32::from(state.nodelay)),
             (6, 4) if self.kind == 1 => Ok(state.keep_idle as i32),
             (6, 5) if self.kind == 1 => Ok(state.keep_interval as i32),

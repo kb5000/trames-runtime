@@ -46,4 +46,5 @@ overflow-checks = true
 lto = "thin"
 
 [patch.crates-io]
+smoltcp = { path = "vendor/smoltcp" }
 wayland-backend = { path = "vendor/wayland-backend" }

@@ -1,0 +1,2 @@
+# Preserve published third-party whitespace; local Rust patches are rustfmt checked.
+vendor/smoltcp/** -whitespace
