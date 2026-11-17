@@ -136,31 +136,22 @@ Implementation commit: `3a729258770cad9ed50035aaa4397d3ab8a6cb9a`.
   and ARP completion across separate fabrics while the sender has no network
   wait. No new runtime service thread is used.
 
-The reproducible host-only library microbenchmark is:
+The current TCP/UDP benchmark and its limits are recorded in the
+[network performance report](../validation/internal-network-tcp-udp-20261117.md).
+It covers native loopback, shared internal Ethernet and independent fabrics
+joined by private Unix links, with concurrent senders/receivers, RTT, one/four
+flows and UDP loss/burst retention. Incomplete private-link TCP transfers are
+reported explicitly.
 
 ```sh
-python3 runtime/scripts/benchmark-ethernet.py > ethernet.csv
+python3 runtime/scripts/benchmark-ethernet.py 3 0.75 3000 > tcp-udp.csv
 ```
 
-Each row warms 64 packets then measures 10,000 sequential UDP sends/consumes
-with 64- or 1,400-byte payloads. Both host and Trames native receive retry with
-scheduler yield when nonblocking delivery is not immediately available. The
-internal case uses two environments on one fabric, without packet observers or
-firewall rules. All rows include the call wrapper and per-operation timing;
-these are not physical-network, guest-syscall or CPU-executor measurements.
-One local optimized ARM64 run during development produced:
-
-| Path | Bytes | Packets/s | P50 µs | P99 µs |
-| --- | ---: | ---: | ---: | ---: |
-| Host BSD UDP | 64 | 100,709 | 6.92 | 35.96 |
-| Trames native UDP | 64 | 132,310 | 5.88 | 43.88 |
-| Trames internal Ethernet UDP | 64 | 222,194 | 4.17 | 10.75 |
-| Host BSD UDP | 1,400 | 181,868 | 4.67 | 18.42 |
-| Trames native UDP | 1,400 | 148,261 | 5.88 | 20.54 |
-| Trames internal Ethernet UDP | 1,400 | 207,784 | 4.42 | 11.88 |
-
-Host scheduling and loopback packet arrival substantially affect these small
-samples; the table is a checkpoint, not evidence of a before/after speedup.
+This supersedes the original single-threaded UDP send/consume harness. Its
+figures are a different workload and must not be compared as a before/after
+speedup. The new report records the host/internal MTU difference and known
+queue/backpressure problems; none is hidden behind successful short-packet
+smoke tests.
 
 References: [Linux bridge](https://docs.kernel.org/networking/bridge.html),
 [packet sockets](https://man7.org/linux/man-pages/man7/packet.7.html),

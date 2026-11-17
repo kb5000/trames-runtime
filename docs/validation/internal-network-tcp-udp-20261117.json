@@ -1,0 +1,47 @@
+{
+  "timestamp_utc": "2026-11-17T05:45:00.627443+00:00",
+  "runtime_revision": "efb44a93f13a7ff4f1f48940f77a84072ccea43b",
+  "cpu": "Apple M6",
+  "logical_cpus": 12,
+  "memory_bytes": 25769803776,
+  "macos": "27.0.1",
+  "host_loopback_mtu": 16384,
+  "internal_mtu": 1500,
+  "command": "python3 runtime/scripts/benchmark-ethernet.py 3 0.75 3000",
+  "rustc": "rustc 1.101.0-nightly (4ebd25825 2026-10-15)",
+  "release_profile": {
+    "lto": "thin",
+    "overflow-checks": true
+  },
+  "rows": 108,
+  "statuses": {
+    "ok": 102,
+    "incomplete": 6
+  },
+  "fixture_sha256": "90d7c952bc4320296402d6542038052732f5b7ba9062b912e1b5f17470496a7d",
+  "csv_sha256": "fae94c601cc3732eb0f94d84486c497396b1bc70d7398c2266e82fe9fd88ef8d",
+  "scope": "Host library calls with concurrent producer/consumer threads; no guest executor, interprocess address-space switches, firewall rules or packet observers.",
+  "unix_queue_capacity": [
+    {
+      "frame_bytes": 106,
+      "send_buffer": 2048,
+      "receive_buffer": 4096,
+      "queued_before_backpressure": 30,
+      "errno": 55
+    },
+    {
+      "frame_bytes": 1442,
+      "send_buffer": 2048,
+      "receive_buffer": 4096,
+      "queued_before_backpressure": 2,
+      "errno": 55
+    },
+    {
+      "frame_bytes": 1514,
+      "send_buffer": 2048,
+      "receive_buffer": 4096,
+      "queued_before_backpressure": 2,
+      "errno": 55
+    }
+  ]
+}
