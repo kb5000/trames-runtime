@@ -290,6 +290,7 @@ pub struct DirectSyscalls {
     paths: Option<trames_vfs::PathQueries>,
     file_prepared: RefCell<Option<file::PreparedFileCall>>,
     resources: Option<trames_vfs::DescriptorFactory>,
+    protocol_bound: Cell<bool>,
     urings: UringSnapshot,
     file_executor: Option<Arc<dyn FileExecutor>>,
     file_layouts: Option<Arc<crate::FileLayouts>>,
@@ -345,6 +346,7 @@ impl DirectSyscalls {
             factory = factory.with_local_identity(identity);
         }
         self.resources = Some(factory);
+        self.protocol_bound.set(false);
         if let Some((_, events)) = &mut self.aio {
             *events = events.with_files(resources.files.clone());
         }
@@ -407,6 +409,7 @@ impl DirectSyscalls {
             paths: None,
             file_prepared: Default::default(),
             resources: None,
+            protocol_bound: Cell::new(false),
             urings: Default::default(),
             file_executor: None,
             file_layouts: None,
@@ -432,12 +435,23 @@ impl DirectSyscalls {
             completed: Cell::new(0),
         }
     }
+    pub fn bind_host_protocol(&self, target: &Weak<dyn IoWake>) -> std::io::Result<()> {
+        if self.protocol_bound.get() {
+            return Ok(());
+        }
+        if let (Some(resources), Some(target)) = (&self.resources, target.upgrade()) {
+            target.register_protocol(resources.network_protocol())?;
+            self.protocol_bound.set(true);
+        }
+        Ok(())
+    }
     pub fn with_resources(mut self, mut resources: trames_vfs::DescriptorFactory) -> Self {
         self.urings.refresh_context();
         if let Some(identity) = self.local_identity {
             resources = resources.with_local_identity(identity);
         }
         self.resources = Some(resources);
+        self.protocol_bound.set(false);
         self
     }
     pub fn supports_creation(&self, number: u32) -> bool {
@@ -1459,6 +1473,9 @@ impl DirectSyscalls {
         target: &Weak<dyn IoWake>,
         saved_deadline: Option<Instant>,
     ) -> Option<IoAttempt> {
+        if let Err(e) = self.bind_host_protocol(target) {
+            return Some(IoAttempt::HostError(e));
+        }
         if crate::file_advice::entry(number) {
             return self
                 .invoke_file_io(number, args, memory)

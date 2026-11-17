@@ -152,7 +152,7 @@ impl Socket {
         )
     }
     fn own(&self, a: IpAddr) -> bool {
-        if let Some(v) = &self.network.0.routing {
+        if let Some(v) = self.network.0.routing.get() {
             return a.is_unspecified() || v.own(a);
         }
         a.is_unspecified()
@@ -169,7 +169,7 @@ impl Socket {
         self.destination_ip(a.ip())
     }
     fn destination_ip(&self, v: IpAddr) -> Result<()> {
-        if self.network.0.routing.is_none()
+        if self.network.0.routing.get().is_none()
             && self.network.is_isolated()
             && (!v.is_loopback() || !self.network.0.loopback_up.get())
         {
@@ -184,14 +184,14 @@ impl Socket {
         if self.network.0.mode == NetworkMode::Loopback && !self.own(v) {
             return Err(NetError(13));
         }
-        if self.network.0.routing.is_none()
+        if self.network.0.routing.get().is_none()
             && v.is_loopback()
             && !matches!(v,IpAddr::V4(a) if a==Ipv4Addr::LOCALHOST)
             && v != IpAddr::V6(Ipv6Addr::LOCALHOST)
         {
             return Err(NetError(99));
         }
-        if let Some(view) = &self.network.0.routing {
+        if let Some(view) = self.network.0.routing.get() {
             self.route_source(view, v)?;
             return Ok(());
         }
@@ -213,7 +213,7 @@ impl Socket {
         if !bound.ip().is_unspecified() {
             return vec![bound];
         }
-        if let Some(view) = &self.network.0.routing {
+        if let Some(view) = self.network.0.routing.get() {
             let ips = view.addresses(false);
             return ips
                 .into_iter()
@@ -523,7 +523,7 @@ impl Socket {
         if self.kind != 1 {
             let mut s = self.state.borrow_mut();
             if self.kind == 2 && s.bound.is_some_and(|b| b.ip().is_unspecified()) {
-                let source = if let Some(view) = &self.network.0.routing {
+                let source = if let Some(view) = self.network.0.routing.get() {
                     self.route_source(view, a.ip())?
                 } else if a.ip().is_loopback() {
                     if a.is_ipv4() {
@@ -544,7 +544,7 @@ impl Socket {
         }
         let mut bound = self.state.borrow().bound.unwrap();
         if bound.ip().is_unspecified() {
-            bound.set_ip(if let Some(view) = &self.network.0.routing {
+            bound.set_ip(if let Some(view) = self.network.0.routing.get() {
                 self.route_source(view, a.ip())?
             } else if a.ip().is_loopback() {
                 if a.is_ipv4() {
@@ -705,7 +705,7 @@ impl Socket {
                 self.network
                     .0
                     .routing
-                    .as_ref()
+                    .get()
                     .map(|view| self.route_source(view, a.ip()))
                     .transpose()?
             } else {
@@ -884,7 +884,7 @@ impl Socket {
                                 .network
                                 .0
                                 .routing
-                                .as_ref()
+                                .get()
                                 .and_then(|v| {
                                     v.graph
                                         .read()
@@ -1135,7 +1135,7 @@ impl Socket {
             let end = value.iter().position(|b| *b == 0).unwrap_or(value.len());
             let device = if value[..end].is_empty() {
                 None
-            } else if let Some(view) = &self.network.0.routing {
+            } else if let Some(view) = self.network.0.routing.get() {
                 Some(view.device(&value[..end])?)
             } else {
                 match &value[..end] {
@@ -1144,7 +1144,7 @@ impl Socket {
                     _ => return Err(NetError(19)),
                 }
             };
-            if self.kind != 4 && self.network.0.routing.is_none() {
+            if self.kind != 4 && self.network.0.routing.get().is_none() {
                 return Err(NetError(95));
             }
             self.state.borrow_mut().device = device;
@@ -1208,7 +1208,7 @@ impl Socket {
         let bound = state.bound.unwrap().ip();
         let source = if !bound.is_unspecified() {
             bound
-        } else if let Some(view) = &self.network.0.routing {
+        } else if let Some(view) = self.network.0.routing.get() {
             self.route_source(view, a.ip())?
         } else if a.ip().is_loopback() {
             if self.family == 2 {
@@ -1382,7 +1382,7 @@ impl Socket {
         if a.is_ipv4() {
             smoltcp::wire::Icmpv4Packet::new_unchecked(&mut data).fill_checksum();
         } else {
-            let source = if let Some(view) = &self.network.0.routing {
+            let source = if let Some(view) = self.network.0.routing.get() {
                 let IpAddr::V6(source) = self.route_source(view, a.ip())? else {
                     return Err(NetError(97));
                 };

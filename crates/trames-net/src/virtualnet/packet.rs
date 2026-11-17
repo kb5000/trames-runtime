@@ -4,7 +4,7 @@ use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 pub(super) const MTU: usize = 1500;
 const QUEUE: usize = 96;
 #[derive(Default)]
-pub(super) struct Port {
+pub(crate) struct Port {
     pub rx: VecDeque<Vec<u8>>,
     pub tx: VecDeque<Vec<u8>>,
     serial: u32,
@@ -139,8 +139,8 @@ impl Port {
         true
     }
 }
-pub(super) struct Rx(Vec<u8>);
-pub(super) struct Tx<'a>(&'a mut Port);
+pub(crate) struct Rx(Vec<u8>);
+pub(crate) struct Tx<'a>(&'a mut Port);
 impl RxToken for Rx {
     fn consume<R, F>(self, f: F) -> R
     where
@@ -302,6 +302,55 @@ pub(crate) fn valid_transport(p: &[u8]) -> bool {
         _ => false,
     }
 }
+/// L3 filtering uses reassembled datagrams; Ethernet egress restores real MTU fragments.
+pub(crate) fn fragment_link(packet: Vec<u8>, mtu: usize, serial: u32) -> Option<Vec<Vec<u8>>> {
+    if packet.len() <= mtu {
+        return Some(vec![packet]);
+    }
+    let h = header(&packet)?;
+    let mut out = Vec::new();
+    if packet[0] >> 4 == 4 {
+        if packet[6] & 0x40 != 0 {
+            return None;
+        }
+        let chunk = (mtu.checked_sub(h.offset)? / 8) * 8;
+        if chunk == 0 {
+            return None;
+        }
+        let chunks = packet[h.offset..].chunks(chunk);
+        let total = chunks.len();
+        for (n, data) in chunks.enumerate() {
+            let mut p = packet[..h.offset].to_vec();
+            p[2..4].copy_from_slice(&((h.offset + data.len()) as u16).to_be_bytes());
+            p[4..6].copy_from_slice(&(serial as u16).to_be_bytes());
+            p[6..8].copy_from_slice(
+                &(((n * chunk / 8) as u16) | if n + 1 < total { 0x2000 } else { 0 }).to_be_bytes(),
+            );
+            smoltcp::wire::Ipv4Packet::new_unchecked(&mut p).fill_checksum();
+            p.extend_from_slice(data);
+            out.push(p);
+        }
+    } else {
+        let chunk = (mtu.checked_sub(48)? / 8) * 8;
+        if chunk == 0 {
+            return None;
+        }
+        let chunks = packet[40..].chunks(chunk);
+        let total = chunks.len();
+        for (n, data) in chunks.enumerate() {
+            let mut p = packet[..40].to_vec();
+            p[6] = 44;
+            p[4..6].copy_from_slice(&((8 + data.len()) as u16).to_be_bytes());
+            p.extend_from_slice(&[packet[6], 0]);
+            p.extend_from_slice(&(((n * chunk) as u16) | u16::from(n + 1 < total)).to_be_bytes());
+            p.extend_from_slice(&serial.to_be_bytes());
+            p.extend_from_slice(data);
+            out.push(p);
+        }
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

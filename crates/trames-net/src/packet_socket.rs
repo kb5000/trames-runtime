@@ -30,18 +30,47 @@ impl Hub {
     pub fn observe(
         &self,
         device: &Device,
-        frame: [[u8; 6]; 2],
+        macs: [[u8; 6]; 2],
         packet: &[u8],
         outgoing: bool,
         wakes: &mut Vec<Arc<trames_shared::Readiness>>,
     ) {
-        if self.active.load(Relaxed) == 0 {
+        if !self.active() {
             return;
         }
-        let protocol = match packet.first().map(|v| v >> 4) {
-            Some(4) => 0x0800u16,
+        let protocol = match packet.first().map(|b| b >> 4) {
+            Some(4) => 0x0800,
             Some(6) => 0x86dd,
             _ => return,
+        };
+        self.observe_wire(
+            device,
+            &crate::ethernet::Frame::build(macs[0], macs[1], protocol, packet),
+            outgoing,
+            wakes,
+        );
+    }
+    pub fn observe_wire(
+        &self,
+        device: &Device,
+        frame: &crate::ethernet::Frame,
+        outgoing: bool,
+        wakes: &mut Vec<Arc<trames_shared::Readiness>>,
+    ) {
+        if !self.active() {
+            return;
+        }
+        let protocol = frame.outer_protocol();
+        let kind = if outgoing {
+            4
+        } else if frame.destination() == [255; 6] {
+            1
+        } else if frame.multicast() {
+            2
+        } else if frame.destination() != device.mac {
+            3
+        } else {
+            0
         };
         let sockets: Vec<_> = self
             .sockets
@@ -55,38 +84,35 @@ impl Hub {
                 || state.protocol != 3 && state.protocol != protocol
                 || state.index != 0 && state.index != device.index
                 || outgoing && state.ignore_outgoing
+                || kind == 3
+                    && !state
+                        .memberships
+                        .keys()
+                        .any(|(i, k, _)| *i == device.index && *k == 1)
             {
                 continue;
             }
-            let mut data = Vec::with_capacity(packet.len() + 14);
-            if socket.kind == 3 && device.kind != DeviceKind::Tun {
-                let [src, dst] = frame;
-                data.extend_from_slice(&dst);
-                data.extend_from_slice(&src);
-                data.extend_from_slice(&protocol.to_be_bytes());
-            }
-            data.extend_from_slice(packet);
+            let bytes = if device.kind == DeviceKind::Tun || socket.kind == 2 {
+                &frame.0[14..]
+            } else {
+                &frame.0[..]
+            };
             let length = state
                 .filter
                 .as_ref()
-                .map_or(data.len(), |p| p.run(&data).min(data.len()));
+                .map_or(bytes.len(), |p| p.run(bytes).min(bytes.len()));
             if length == 0 {
                 continue;
             }
-            data.truncate(length);
             if state.bytes + length > state.buffer || state.queue.len() >= 1024 {
                 state.dropped = state.dropped.wrapping_add(1);
                 continue;
             }
+            let data = bytes[..length].to_vec();
             state.bytes += length;
             state.packets = state.packets.wrapping_add(1);
             state.epoch = state.epoch.wrapping_add(1);
-            let mut source = address(
-                device.index,
-                protocol,
-                if outgoing { 4 } else { 0 },
-                frame[0],
-            );
+            let mut source = address(device.index, protocol, kind, frame.source());
             if device.kind == DeviceKind::Tun {
                 source[8..10].copy_from_slice(&65534u16.to_le_bytes());
                 source[11] = 0;
@@ -100,6 +126,7 @@ impl Hub {
     }
 }
 struct State {
+    memberships: std::collections::BTreeMap<(u32, u16, [u8; 6]), u32>,
     index: u32,
     protocol: u16,
     queue: VecDeque<(Vec<u8>, [u8; 20])>,
@@ -173,6 +200,7 @@ impl Socket {
             receiver: Arc::new(Receiver {
                 kind,
                 state: Mutex::new(State {
+                    memberships: Default::default(),
                     index: 0,
                     protocol: (protocol as u16).swap_bytes(),
                     queue: VecDeque::new(),
@@ -249,40 +277,35 @@ impl Socket {
             let s = self.state.lock();
             (s.index, s.protocol)
         };
-        let (packet, mac, protocol) = if self.kind == 3 {
-            if bytes.len() < 14 {
-                return Err(NetError(22));
-            }
-            let d = self
-                .namespace
-                .graph
-                .read()
-                .unwrap()
-                .device(self.namespace.id(), index)?;
-            if bytes[6..12] != d.mac {
-                return Err(NetError(95));
-            }
-            (
-                &bytes[14..],
-                <[u8; 6]>::try_from(&bytes[..6]).unwrap(),
-                u16::from_be_bytes(bytes[12..14].try_into().unwrap()),
-            )
+        let device = self
+            .namespace
+            .graph
+            .read()
+            .unwrap()
+            .device(self.namespace.id(), index)?;
+        if matches!(
+            device.kind,
+            DeviceKind::Direct | DeviceKind::Tun | DeviceKind::Loopback
+        ) {
+            return Err(NetError(95));
+        }
+        let frame = if self.kind == 3 {
+            crate::ethernet::Frame::new(bytes)?
         } else {
             let a = destination.ok_or(NetError(89))?;
             if a[11] != 6 {
                 return Err(NetError(22));
             }
-            (bytes, a[12..18].try_into().unwrap(), protocol)
+            crate::ethernet::Frame::build(
+                device.mac,
+                a[12..18].try_into().unwrap(),
+                protocol,
+                bytes,
+            )
         };
-        if !matches!(
-            (protocol, packet.first().map(|b| b >> 4)),
-            (0x0800, Some(4)) | (0x86dd, Some(6))
-        ) {
-            return Err(NetError(93));
-        }
         self.namespace
             .root_stack()?
-            .inject_link(index, mac, packet)?;
+            .inject_frame(index, frame, true)?;
         Ok(bytes.len())
     }
     pub fn recv(&self, count: usize, flags: u32) -> Result<Received> {
@@ -356,6 +379,35 @@ impl Socket {
         Ok(())
     }
     pub fn set_option_bytes(&self, level: u32, name: u32, bytes: &[u8]) -> Result<()> {
+        if level == 263 && matches!(name, 1 | 2) {
+            if bytes.len() < 16 {
+                return Err(NetError(22));
+            }
+            let index = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+            let kind = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+            let len = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
+            self.namespace
+                .graph
+                .read()
+                .unwrap()
+                .device(self.namespace.id(), index)?;
+            if !matches!(kind, 0..=2) || kind == 0 && len != 6 {
+                return Err(NetError(22));
+            }
+            let key = (index, kind, bytes[8..14].try_into().unwrap());
+            let mut s = self.state.lock();
+            if name == 1 {
+                *s.memberships.entry(key).or_default() += 1;
+            } else {
+                let n = s.memberships.get_mut(&key).ok_or(NetError(99))?;
+                *n -= 1;
+                if *n == 0 {
+                    s.memberships.remove(&key);
+                }
+            }
+            return Ok(());
+        }
+
         if level == 1 && name == 27 {
             return self.set_filter(None);
         }

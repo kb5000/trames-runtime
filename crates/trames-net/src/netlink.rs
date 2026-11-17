@@ -17,7 +17,8 @@ pub(super) struct Namespace {
     // Netlink sockets also pin the complete stack, not just link metadata.
     pub(crate) stack: std::sync::OnceLock<virtualnet::Network>,
     pub(crate) graph: std::sync::Arc<std::sync::RwLock<crate::netdev::Topology>>,
-    pub(crate) fabric: Arc<SharedState<Option<Fabric>>>,
+    pub(crate) fabric: Arc<crate::protocol::Group>,
+    pub(crate) driver: Arc<crate::protocol::Driver>,
     listeners: Arc<SharedState<Vec<Weak<Socket>>>>,
     loopback: Option<std::sync::Arc<crate::netdev::Loopback>>,
     pub(super) ping_range: Cell<[u32; 2]>,
@@ -36,6 +37,8 @@ impl Default for Namespace {
         graph.write().unwrap().add_space(id, None, None);
         let quota = Arc::new(crate::socket_quota::Quota::default());
         let reservation = quota.reserve().expect("initial namespace reservation");
+        let fabric = Arc::new(crate::protocol::Group::default());
+        let driver = Arc::new(crate::protocol::Driver::new(&fabric));
         Self {
             id,
             native: std::sync::OnceLock::new(),
@@ -43,7 +46,8 @@ impl Default for Namespace {
             nft_packet_hooks: Cell::new(true),
             stack: std::sync::OnceLock::new(),
             graph,
-            fabric: Arc::default(),
+            fabric,
+            driver,
             listeners: Arc::default(),
             loopback: None,
             ping_range: Cell::new([0, i32::MAX as u32]),
@@ -82,6 +86,7 @@ impl Namespace {
         namespace.quota = self.quota.clone();
         namespace._reservation = reservation;
         namespace.fabric = self.fabric.clone();
+        namespace.driver = self.driver.clone();
         namespace.listeners = self.listeners.clone();
         {
             let mut graph = self.graph.write().unwrap();
@@ -131,10 +136,13 @@ impl Namespace {
             view,
             std::sync::Arc::new(crate::netdev::Loopback::new(true)),
         )?;
+        fabric.bind_driver(&self.fabric.changed);
         self.stack
             .set(stack.clone())
             .ok()
             .expect("root stack initialized under namespace gate");
+        drop(_initialization);
+        self.fabric.changed.notify_atomic();
         Ok(stack)
     }
     pub fn id(&self) -> u64 {

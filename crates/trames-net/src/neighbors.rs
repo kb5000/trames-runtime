@@ -12,29 +12,17 @@ pub(crate) struct Entry {
 impl Topology {
     pub fn neighbors(&self, ns: u64, index: u32, family: u8) -> Vec<Entry> {
         let mut entries = self.spaces[&ns].neighbors.clone();
-        for d in self
-            .devices(ns)
-            .into_iter()
-            .filter(|d| index == 0 || index == d.index)
-        {
-            if !d.up || !matches!(d.kind, DeviceKind::Veth { .. } | DeviceKind::Bridge) {
-                continue;
-            }
-            for remote in self.devices.values().filter(|r| r.namespace != ns && r.up) {
-                for a in &remote.addresses {
-                    if self
-                        .resolve_neighbor_path(ns, d.index, a.ip)
-                        .is_some_and(|(target, _)| target == (remote.namespace, remote.index))
-                    {
-                        entries.entry((d.index, a.ip)).or_insert(Entry {
-                            index: d.index,
-                            address: a.ip,
-                            mac: Some(remote.mac),
-                            state: 64,
-                        });
-                    }
-                }
-            }
+        for (&(index, address), e) in self.spaces[&ns].neighbor_cache.entries.read().iter() {
+            entries.entry((index, address)).or_insert(Entry {
+                index,
+                address,
+                mac: e.mac,
+                state: if e.state == 2 && e.updated.elapsed() > std::time::Duration::from_secs(30) {
+                    4
+                } else {
+                    e.state
+                },
+            });
         }
         entries
             .into_values()
@@ -46,7 +34,10 @@ impl Topology {
     }
     pub fn neighbor(&mut self, ns: u64, entry: Entry, add: bool, flags: u16) -> Result<Entry> {
         let d = self.device(ns, entry.index)?;
-        if !matches!(d.kind, DeviceKind::Veth { .. } | DeviceKind::Bridge) {
+        if !matches!(
+            d.kind,
+            DeviceKind::Veth { .. } | DeviceKind::Bridge | DeviceKind::Tap
+        ) {
             return Err(NetError(95));
         }
         if entry.address.is_unspecified() || entry.address.is_multicast() {
@@ -55,7 +46,21 @@ impl Topology {
         let table = &mut self.spaces.get_mut(&ns).unwrap().neighbors;
         let key = (entry.index, entry.address);
         if !add {
-            return table.remove(&key).ok_or(NetError(2));
+            if let Some(e) = table.remove(&key) {
+                return Ok(e);
+            }
+            return self.spaces[&ns]
+                .neighbor_cache
+                .entries
+                .write()
+                .remove(&key)
+                .map(|e| Entry {
+                    index: entry.index,
+                    address: entry.address,
+                    mac: e.mac,
+                    state: e.state,
+                })
+                .ok_or(NetError(2));
         }
         if !matches!(entry.state, 1 | 2 | 4 | 8 | 16 | 32 | 64 | 128) {
             return Err(NetError(22));

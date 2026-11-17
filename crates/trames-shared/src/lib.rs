@@ -657,3 +657,6 @@ mod socket;
 pub use socket::{NativeSocket, MAX_BYTES_OUT, MAX_FDS_OUT};
 
 pub mod boottime;
+
+mod host_protocol;
+pub use host_protocol::{HostProtocol, HostProtocols, ProtocolInterests};

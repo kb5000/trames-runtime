@@ -5,6 +5,7 @@ use crate::shared_state::FabricState;
 use crate::shared_state::{Cell, State as SharedState};
 use crate::socket_quota::{Quota, Reservation};
 use std::ops::Deref;
+mod ethernet;
 mod gateway;
 pub(crate) mod packet;
 mod sockets;
@@ -59,8 +60,13 @@ pub struct LinkStats {
 #[derive(Clone)]
 pub struct Fabric(Arc<FabricState<Inner>>);
 struct Inner {
+    drivers: Vec<Weak<trames_shared::Readiness>>,
+    driver_dirty: bool,
+    driver_maintenance: bool,
     notifications: Vec<Arc<trames_shared::Readiness>>,
     injected: VecDeque<(u64, u32, [u8; 6], Vec<u8>)>,
+    ethernet: VecDeque<(crate::netdev::View, crate::ethernet::Action)>,
+    ethernet_switch: crate::ethernet::Switch,
     started: Instant,
     next_node: u64,
     nodes: BTreeMap<u64, Node>,
@@ -90,6 +96,7 @@ struct Node {
     sockets: SocketSet<'static>,
     port: Port,
     filter_rx: Port,
+    gateway_rx: Port,
     registry: Vec<Weak<SocketMeta>>,
     detached: Vec<(SocketHandle, Instant)>,
     resets: Vec<(Weak<SocketMeta>, Connection)>,
@@ -120,7 +127,7 @@ struct NamespaceData {
     finished: Cell<bool>,
     isolated: Cell<bool>,
     loopback_up: std::sync::Arc<crate::netdev::Loopback>,
-    routing: Option<crate::netdev::View>,
+    routing: std::sync::OnceLock<crate::netdev::View>,
     managed_uplink: bool,
 }
 #[derive(Clone)]
@@ -248,6 +255,7 @@ fn make_node(id: u8, now: smoltcp::time::Instant) -> Result<Node> {
         sockets: SocketSet::new(Vec::new()),
         port,
         filter_rx: Port::default(),
+        gateway_rx: Port::default(),
         registry: Vec::new(),
         detached: Vec::new(),
         resets: Vec::new(),
@@ -259,8 +267,13 @@ fn make_node(id: u8, now: smoltcp::time::Instant) -> Result<Node> {
 impl Fabric {
     pub fn new() -> Result<Self> {
         Ok(Self(Arc::new(FabricState::new(Inner {
+            drivers: Vec::new(),
+            driver_dirty: false,
+            driver_maintenance: false,
             notifications: Vec::new(),
             injected: VecDeque::new(),
+            ethernet: VecDeque::new(),
+            ethernet_switch: Default::default(),
             started: Instant::now(),
             next_node: 1,
             nodes: BTreeMap::new(),
@@ -296,6 +309,54 @@ impl Fabric {
             nat,
         });
         Ok(())
+    }
+    pub(crate) fn bind_driver(&self, changed: &Arc<trames_shared::Readiness>) {
+        let mut inner = self.0.borrow_mut();
+        if !inner
+            .drivers
+            .iter()
+            .any(|d| d.as_ptr() == Arc::as_ptr(changed))
+        {
+            inner.drivers.push(Arc::downgrade(changed));
+        }
+    }
+    pub(crate) fn protocol_tick(&self) {
+        for (socket, _) in self.native_waiters() {
+            for source in socket.wait_interests() {
+                source.drain();
+            }
+        }
+        let mut inner = self.0.borrow_mut();
+        inner.driver_maintenance = true;
+        inner.tick();
+    }
+    pub(crate) fn protocol_delay(&self) -> Option<Duration> {
+        let mut inner = self.0.borrow_mut();
+        let now = inner.now();
+        if !inner.ethernet.is_empty() || !inner.injected.is_empty() {
+            return Some(Duration::ZERO);
+        }
+        let mut next = {
+            let Inner { nodes, gateway, .. } = &mut *inner;
+            nodes
+                .values_mut()
+                .chain(std::iter::once(&mut gateway.node))
+                .filter_map(|n| n.iface.poll_delay(now, &n.sockets))
+                .map(|d| Duration::from_millis(d.total_millis()))
+                .min()
+        };
+        for view in inner
+            .nodes
+            .values()
+            .filter_map(|n| n.owner.upgrade())
+            .filter_map(|o| o.routing.get().cloned())
+        {
+            let graph = view.graph.read().unwrap();
+            if let Some(delay) = graph.neighbor_delay(view.namespace) {
+                next = Some(next.map_or(delay, |d| d.min(delay)));
+            }
+        }
+        next
     }
     pub(super) fn external_waiter(&self) -> Option<Arc<std::os::unix::net::UnixDatagram>> {
         self.0.borrow().external.as_ref().map(|e| e.socket.clone())
@@ -390,8 +451,8 @@ impl Fabric {
                 finished: Cell::new(false),
                 isolated: Cell::new(false),
                 loopback_up: std::sync::Arc::new(crate::netdev::Loopback::new(true)),
-                routing: None,
-                managed_uplink: false,
+                routing: std::sync::OnceLock::new(),
+                managed_uplink: true,
             }),
         });
         node.owner = Arc::downgrade(&ns.data);
@@ -433,7 +494,7 @@ impl Fabric {
                 isolated: Cell::new(true),
                 loopback_up,
                 managed_uplink: routing.managed_uplink(),
-                routing: Some(routing),
+                routing: std::sync::OnceLock::from(routing),
             }),
         });
         node.owner = Arc::downgrade(&ns.data);
@@ -469,6 +530,23 @@ fn private_ip(a: IpAddr) -> bool {
     }
 }
 impl crate::shared_state::AfterUnlock for Inner {
+    fn take_callbacks(&mut self) -> Vec<Box<dyn FnOnce() + Send>> {
+        let dirty = std::mem::take(&mut self.driver_dirty);
+        let maintenance = std::mem::take(&mut self.driver_maintenance);
+        if !dirty || maintenance {
+            return vec![];
+        }
+        self.drivers.retain(|d| d.strong_count() != 0);
+        let changed: Vec<_> = self.drivers.iter().filter_map(Weak::upgrade).collect();
+        if changed.is_empty() {
+            return vec![];
+        }
+        vec![Box::new(move || {
+            for changed in changed {
+                changed.notify_atomic();
+            }
+        })]
+    }
     fn take_notifications(&mut self) -> Vec<Arc<trames_shared::Readiness>> {
         std::mem::take(&mut self.notifications)
     }
@@ -490,6 +568,9 @@ impl Inner {
             + self.gateway.pending_handles()
     }
     fn tick(&mut self) {
+        self.driver_dirty = true;
+        self.ethernet_timers();
+        self.pump_ethernet();
         let now = self.now();
         let time = Instant::now();
         for node in self.nodes.values_mut() {
@@ -516,34 +597,11 @@ impl Inner {
                 node.sockets.remove(h);
             }
         }
-        if let Some(link) = &self.external {
-            let mut bytes = [0u8; 65536];
-            for _ in 0..64 {
-                match link.socket.recv(&mut bytes) {
-                    Ok(n) => {
-                        let packet = &bytes[..n];
-                        let Some(h) = packet::header(packet) else {
-                            continue;
-                        };
-                        let dst = h.tuple.destination.ip();
-                        if dst == IpAddr::V4(v4(link.id)) || dst == IpAddr::V6(v6(link.id)) {
-                            if let Some(node) = self.nodes.values_mut().find(|n| n.id == link.id) {
-                                if node.port.receive_packet(packet.to_vec()) {
-                                    node.links[1].rx_packets += 1;
-                                    node.links[1].rx_bytes += n as u64;
-                                } else {
-                                    node.links[1].rx_dropped += 1;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
-                }
-            }
-        }
+        self.receive_external();
+        self.pump_ethernet();
         // Bound work per scheduler slice even when a peer produces data continuously.
         for _ in 0..32 {
+            self.pump_ethernet();
             self.gateway.service(now, &self.nodes);
             let mut packets: Vec<_> = self
                 .injected
@@ -618,10 +676,22 @@ impl Inner {
                     None
                 };
                 let dynamic = routed_reply.as_ref().map(|r| r.0.clone()).or_else(|| {
+                    if source == 0 {
+                        return self
+                            .nodes
+                            .values()
+                            .find(|n| {
+                                h.tuple.destination.ip() == IpAddr::V4(v4(n.id))
+                                    || h.tuple.destination.ip() == IpAddr::V6(v6(n.id))
+                            })
+                            .and_then(|n| n.owner.upgrade())
+                            .and_then(|n| n.routing.get().cloned());
+                    }
+
                     self.nodes
                         .get(&source)
                         .and_then(|n| n.owner.upgrade())
-                        .and_then(|ns| ns.routing.clone())
+                        .and_then(|ns| ns.routing.get().cloned())
                 });
                 let mut delivery = None;
                 let target = if let Some(view) = &dynamic {
@@ -643,19 +713,79 @@ impl Inner {
                         continue;
                     }
                     let original = crate::conntrack::key(&p);
-                    let incoming = injected.or_else(|| routed_reply.as_ref().map(|r| r.1));
-                    delivery = view.graph.read().unwrap().route_packet_observed(
-                        view.namespace,
-                        incoming,
-                        peer,
-                        &mut p,
-                        &mut self.notifications,
-                    );
-                    let Some(route) = delivery else {
+                    let incoming = injected
+                        .or_else(|| routed_reply.as_ref().map(|r| r.1))
+                        .or_else(|| (source == 0).then_some(2));
+                    if let Some(index) = incoming {
+                        let d = view
+                            .graph
+                            .read()
+                            .unwrap()
+                            .device(view.namespace, index)
+                            .ok();
+                        if let Some(d) = d {
+                            if source == 0 && d.kind == crate::DeviceKind::Ethernet {
+                                let actions = view.graph.read().unwrap().ethernet_arrival(
+                                    view.namespace,
+                                    index,
+                                    [2, 0x54, 0x72, 0x61, 0, 1],
+                                    p,
+                                );
+                                self.queue_frames(view, actions);
+                                continue;
+                            }
+                            if d.kind == crate::DeviceKind::Tun {
+                                view.graph.read().unwrap().observe(
+                                    view.namespace,
+                                    index,
+                                    peer,
+                                    &p,
+                                    false,
+                                    &mut self.notifications,
+                                );
+                            }
+                        }
+                    }
+
+                    let step =
+                        view.graph
+                            .read()
+                            .unwrap()
+                            .route_one(view.namespace, incoming, &mut p);
+                    let Some((route, next_hop)) = step else {
                         self.stats.dropped += 1;
                         continue;
                     };
+                    delivery = Some(route);
+                    if let Some(next_hop) = next_hop.filter(|_| !route.tunnel && !route.external) {
+                        let actions = view.graph.read().unwrap().ethernet_ip(
+                            view.namespace,
+                            route.output,
+                            next_hop,
+                            p,
+                        );
+                        self.queue_frames(view, actions);
+                        continue;
+                    }
+                    if route.input == 1 {
+                        view.graph.read().unwrap().observe(
+                            view.namespace,
+                            1,
+                            peer,
+                            &p,
+                            false,
+                            &mut self.notifications,
+                        );
+                    }
                     if route.tunnel {
+                        view.graph.read().unwrap().observe(
+                            view.namespace,
+                            route.output,
+                            [0; 6],
+                            &p,
+                            true,
+                            &mut self.notifications,
+                        );
                         let graph = view.graph.read().unwrap();
                         let delivered = graph
                             .tunnel(route.namespace, route.input)
@@ -696,7 +826,7 @@ impl Inner {
                     }
                     self.nodes.iter().find_map(|(&key, n)| {
                         n.owner.upgrade().and_then(|ns| {
-                            ns.routing.as_ref().and_then(|r| {
+                            ns.routing.get().and_then(|r| {
                                 (r.namespace == route.namespace
                                     && std::sync::Arc::ptr_eq(&r.graph, &view.graph))
                                 .then_some(key)
@@ -711,7 +841,9 @@ impl Inner {
                         self.nodes
                             .iter()
                             .find(|(_, n)| {
-                                n.owner.upgrade().is_some_and(|ns| ns.routing.is_none())
+                                n.owner
+                                    .upgrade()
+                                    .is_some_and(|ns| ns.routing.get().is_none())
                                     && (dst == IpAddr::V4(v4(n.id)) || dst == IpAddr::V6(v6(n.id)))
                             })
                             .map(|(&key, _)| key)
@@ -863,7 +995,9 @@ impl Node {
         let Some(owner) = self.owner.upgrade() else {
             return;
         };
-        let Some(view) = &owner.routing else { return };
+        let Some(view) = owner.routing.get() else {
+            return;
+        };
         let revision = view.graph.read().unwrap().revision();
         if self.configuration_revision == revision
             && self.configuration_lo == owner.loopback_up.get()
@@ -872,7 +1006,10 @@ impl Node {
         }
         self.configuration_revision = revision;
         self.configuration_lo = owner.loopback_up.get();
-        let addresses = view.addresses(true);
+        let mut addresses = view.addresses(true);
+        // The IP-medium ICMPv4 socket uses the interface's primary address.
+        // Preserve the real link address before loopback when installing a view.
+        addresses.sort_by_key(|a| a.ip.is_loopback());
         let old = self.iface.ip_addrs();
         if old.len() == addresses.len()
             && old
@@ -1012,6 +1149,9 @@ impl NamespaceData {
         i.tick();
         i.gateway.close_node(self.key);
         i.nodes.remove(&self.key);
+        if i.external.is_none() {
+            i.ethernet_switch.forget(self.key as u32);
+        }
     }
 }
 impl Drop for Namespace {
@@ -1040,49 +1180,52 @@ impl Network {
         inner.tick();
         Ok(())
     }
-    pub(crate) fn inject_link(&self, index: u32, mac: [u8; 6], packet: &[u8]) -> Result<()> {
-        let view = self.0.routing.as_ref().ok_or(NetError(95))?;
-        let graph = view.graph.read().unwrap();
-        let device = graph.device(view.namespace, index)?;
-        if !device.up {
+    pub(crate) fn attach_routing(&self, view: crate::netdev::View) -> Result<()> {
+        if let Some(old) = self.0.routing.get() {
+            return if old.namespace == view.namespace && Arc::ptr_eq(&old.graph, &view.graph) {
+                Ok(())
+            } else {
+                Err(NetError(16))
+            };
+        }
+        self.0.routing.set(view).map_err(|_| NetError(16))
+    }
+    pub(crate) fn inject_frame(
+        &self,
+        index: u32,
+        frame: crate::ethernet::Frame,
+        outgoing: bool,
+    ) -> Result<()> {
+        if matches!(self.0.mode, NetworkMode::Off | NetworkMode::Loopback) {
+            return Err(NetError(13));
+        }
+        let view = self.0.routing.get().ok_or(NetError(95))?;
+        let d = view.graph.read().unwrap().device(view.namespace, index)?;
+        if !d.up {
             return Err(NetError(100));
         }
-        if packet.len() > device.mtu as usize {
+        if !matches!(
+            d.kind,
+            crate::DeviceKind::Veth { .. }
+                | crate::DeviceKind::Bridge
+                | crate::DeviceKind::Tap
+                | crate::DeviceKind::Ethernet
+        ) {
+            return Err(NetError(95));
+        }
+        if frame.0.len() > d.mtu as usize + 22 {
             return Err(NetError(90));
         }
-        let destination = crate::conntrack::key(packet)
-            .ok_or(NetError(22))?
-            .tuple
-            .destination
-            .ip();
-        let (target, input) = graph.packet_peer(view.namespace, index, destination, mac)?;
-        drop(graph);
         let mut inner = self.0.fabric.0.borrow_mut();
-        let key = inner
-            .nodes
-            .iter()
-            .find_map(|(&key, n)| {
-                n.owner.upgrade().and_then(|ns| {
-                    ns.routing.as_ref().and_then(|r| {
-                        (r.namespace == target && Arc::ptr_eq(&r.graph, &view.graph)).then_some(key)
-                    })
-                })
-            })
-            .ok_or(NetError(100))?;
-        if inner.injected.len() >= 96 {
+        if inner.ethernet.len() >= 96 {
             return Err(NetError(11));
         }
-        view.graph.read().unwrap().observe(
-            view.namespace,
-            index,
-            mac,
-            packet,
-            true,
-            &mut inner.notifications,
-        );
-        inner
-            .injected
-            .push_back((key, input, device.mac, packet.to_vec()));
+        let action = if outgoing {
+            crate::ethernet::Action::Send(view.namespace, index, frame)
+        } else {
+            crate::ethernet::Action::Receive(view.namespace, index, frame)
+        };
+        inner.ethernet.push_back((view.clone(), action));
         inner.tick();
         Ok(())
     }

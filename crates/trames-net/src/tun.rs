@@ -3,7 +3,7 @@
 use crate::*;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
-pub const FEATURES: u32 = 1 | 0x1000; // IFF_TUN | IFF_NO_PI
+pub const FEATURES: u32 = 1 | 2 | 0x1000; // IFF_TUN | IFF_TAP | IFF_NO_PI
 pub struct Connection {
     namespace: Arc<netlink::Namespace>,
     port: Mutex<Option<Arc<Port>>>,
@@ -11,7 +11,7 @@ pub struct Connection {
 }
 pub(crate) struct Port {
     pub index: u32,
-    flags: u16,
+    pub(crate) flags: u16,
     queue: Mutex<Queue>,
     readiness: Arc<trames_shared::Readiness>,
 }
@@ -35,7 +35,7 @@ impl Connection {
         if !admin {
             return Err(NetError(1));
         }
-        if flags & 0xf != 1 || flags & !(FEATURES as u16 | 0x8000) != 0 {
+        if !matches!(flags & 0xf, 1 | 2) || flags & !(FEATURES as u16 | 0x8000) != 0 {
             return Err(NetError(22));
         }
         self.namespace.root_stack()?;
@@ -44,9 +44,9 @@ impl Connection {
             return Err(NetError(22));
         }
         let mut graph = self.namespace.graph.write().unwrap();
-        let name = if name.is_empty() || name == b"tun%d" {
+        let name = if name.is_empty() || name == b"tun%d" || name == b"tap%d" {
             (0..256)
-                .map(|n| format!("tun{n}").into_bytes())
+                .map(|n| format!("{}{n}", if flags & 2 != 0 { "tap" } else { "tun" }).into_bytes())
                 .find(|name| {
                     graph
                         .devices(self.namespace.id())
@@ -57,7 +57,7 @@ impl Connection {
         } else {
             name.to_vec()
         };
-        let index = graph.create_tun(self.namespace.id(), &name)?;
+        let index = graph.create_tun(self.namespace.id(), &name, flags & 2 != 0)?;
         let port = Arc::new(Port {
             index,
             flags: flags & !0x8000,
@@ -108,7 +108,9 @@ impl Connection {
         if header != 0 {
             out.extend_from_slice(&(u16::from(n < packet.len())).to_le_bytes());
             out.extend_from_slice(
-                &(if packet[0] >> 4 == 4 {
+                &(if p.flags & 2 != 0 {
+                    u16::from_be_bytes([packet[12], packet[13]])
+                } else if packet[0] >> 4 == 4 {
                     0x0800u16
                 } else {
                     0x86dd
@@ -122,6 +124,24 @@ impl Connection {
     }
     pub fn write(&self, bytes: &[u8]) -> Result<usize> {
         let p = self.port.lock().clone().ok_or(NetError(77))?;
+        if p.flags & 2 != 0 {
+            let frame = if p.flags & 0x1000 != 0 {
+                bytes
+            } else {
+                if bytes.len() < 4 {
+                    return Err(NetError(22));
+                }
+                &bytes[4..]
+            };
+            let frame = crate::ethernet::Frame::new(frame)?;
+            if p.flags & 0x1000 == 0 && bytes[2..4] != frame.outer_protocol().to_be_bytes() {
+                return Err(NetError(22));
+            }
+            self.namespace
+                .root_stack()?
+                .inject_frame(p.index, frame, false)?;
+            return Ok(bytes.len());
+        }
         let packet = if p.flags & 0x1000 != 0 {
             bytes
         } else {

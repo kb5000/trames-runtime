@@ -51,6 +51,9 @@ impl Vfs {
     }
 }
 impl DescriptorFactory {
+    pub fn network_protocol(&self) -> Arc<dyn trames_shared::HostProtocol> {
+        self.network.protocol()
+    }
     pub fn files(&self) -> &SharedFiles {
         &self.files
     }

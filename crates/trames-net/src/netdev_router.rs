@@ -143,50 +143,79 @@ impl Topology {
         state.finish(track, result.is_some());
         result.map(|(out, gateway)| (out, gateway, track))
     }
+    pub fn route_one(
+        &self,
+        ns: u64,
+        input: Option<u32>,
+        packet: &mut [u8],
+    ) -> Option<(Delivery, Option<IpAddr>)> {
+        let (out, gateway, mut track) = self.route_namespace(ns, input, packet, false)?;
+        if out == 0 {
+            return Some((
+                Delivery {
+                    namespace: ns,
+                    input: input.unwrap_or(1),
+                    output: 0,
+                    external: false,
+                    tunnel: false,
+                },
+                None,
+            ));
+        }
+        let destination = conntrack::key(packet)?.tuple.destination.ip();
+        if self.own(ns, destination) {
+            let connections = self.spaces[&ns].connections.clone();
+            let mut state = connections.lock().unwrap();
+            let accepted = self.hook(ns, (0, true), (1, 0), packet, &mut track, &mut state)
+                && self.hook(ns, (0, false), (1, 0), packet, &mut track, &mut state)
+                && self.hook(ns, (1, false), (1, 0), packet, &mut track, &mut state);
+            state.finish(track, accepted);
+            if !accepted {
+                return None;
+            }
+            return Some((
+                Delivery {
+                    namespace: ns,
+                    input: 1,
+                    output: out,
+                    external: false,
+                    tunnel: false,
+                },
+                None,
+            ));
+        }
+        let d = self.device(ns, out).ok()?;
+        if d.kind == DeviceKind::Direct && input.is_some() && track.status & 16 == 0 {
+            return None;
+        }
+        Some((
+            Delivery {
+                namespace: ns,
+                input: out,
+                output: out,
+                external: d.kind == DeviceKind::Direct,
+                tunnel: d.kind == DeviceKind::Tun,
+            },
+            Some(gateway.unwrap_or(destination)),
+        ))
+    }
     pub fn route_packet(
         &self,
         source: u64,
         incoming: Option<u32>,
         packet: &mut [u8],
     ) -> Option<Delivery> {
-        self.route_packet_inner(source, incoming, [0; 6], packet, None)
-    }
-    pub fn route_packet_observed(
-        &self,
-        source: u64,
-        incoming: Option<u32>,
-        peer: [u8; 6],
-        packet: &mut [u8],
-        wakes: &mut Vec<Arc<trames_shared::Readiness>>,
-    ) -> Option<Delivery> {
-        self.route_packet_inner(source, incoming, peer, packet, Some(wakes))
-    }
-    fn route_packet_inner(
-        &self,
-        source: u64,
-        incoming: Option<u32>,
-        peer: [u8; 6],
-        packet: &mut [u8],
-        mut wakes: Option<&mut Vec<Arc<trames_shared::Readiness>>>,
-    ) -> Option<Delivery> {
+        // Native policy preview only. Actual guest Ethernet goes through
+        // route_one and the MAC/VLAN switch; never resurrect an IP shortcut here.
         let mut ns = source;
         let mut input = incoming;
-        let mut peer_mac = peer;
         let mut visited = BTreeSet::new();
         let mut first = 0;
         for _ in 0..16 {
             if !visited.insert(ns) {
                 return None;
             }
-            if let (Some(index), Some(wakes)) = (input, wakes.as_deref_mut()) {
-                self.observe(ns, index, peer_mac, packet, false, wakes);
-            }
             let (out, gateway, mut track) = self.route_namespace(ns, input, packet, false)?;
-            if out != 0 {
-                if let Some(wakes) = wakes.as_deref_mut() {
-                    self.observe(ns, out, [0; 6], packet, true, wakes);
-                }
-            }
             if first == 0 {
                 first = out;
             }
@@ -250,30 +279,16 @@ impl Topology {
             if let Some((bridge_ns, bridge_index)) =
                 bridge.filter(|(b, _)| *b != ns && *b != target)
             {
-                let target_device = self.device(target, target_input).ok()?;
-                let frame = [d.mac, target_device.mac];
-                if let Some(wakes) = wakes.as_deref_mut() {
-                    if let DeviceKind::Veth { peer } = d.kind {
-                        self.observe_frame(bridge_ns, peer, frame, packet, false, wakes);
-                    }
-                    self.observe_frame(bridge_ns, bridge_index, frame, packet, false, wakes);
-                }
                 if self.spaces[&bridge_ns].bridge_filter[usize::from(destination.is_ipv6())] {
                     self.bridge_packet(bridge_ns, bridge_index, packet)?;
                 }
-                if let (DeviceKind::Veth { peer }, Some(wakes)) =
-                    (target_device.kind, wakes.as_deref_mut())
-                {
-                    self.observe_frame(bridge_ns, peer, frame, packet, true, wakes);
-                }
             }
-            peer_mac = d.mac;
             ns = target;
             input = Some(target_input);
         }
         None
     }
-    fn bridge_packet(&self, ns: u64, bridge: u32, packet: &mut [u8]) -> Option<()> {
+    pub(super) fn bridge_packet(&self, ns: u64, bridge: u32, packet: &mut [u8]) -> Option<()> {
         let connection = self.spaces[&ns].connections.clone();
         let mut state = connection.lock().unwrap();
         let key = conntrack::key(packet)?;

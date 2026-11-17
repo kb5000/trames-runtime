@@ -187,7 +187,9 @@ fn separate_fabrics_exchange_packets_and_isolate_named_links() {
     rx.bind("0.0.0.0:32001".parse().unwrap()).unwrap();
     tx.send(b"separate", 0, Some("10.0.0.3:32001".parse().unwrap()))
         .unwrap();
-    wait(&[(rx.clone(), 1)], Duration::from_secs(1)).unwrap();
+    // The library caller drives both explicit fabrics during ARP resolution;
+    // product execution registers each fabric as an original protocol resource.
+    wait(&[(tx.clone(), 0), (rx.clone(), 1)], Duration::from_secs(1)).unwrap();
     assert_eq!(rx.recv(64, 0).unwrap().data, b"separate");
     let (sources, _) = rx.wait_interests();
     assert!(sources.iter().any(|s| matches!(s, WaitSource::Link(_))));

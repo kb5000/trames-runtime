@@ -3,6 +3,7 @@
 mod conntrack;
 mod direct_dns;
 mod dns;
+mod ethernet;
 mod hybrid;
 mod interfaces;
 mod native;
@@ -10,6 +11,7 @@ mod netdev;
 mod netlink;
 mod nftables;
 mod packet_socket;
+mod protocol;
 mod rtnetlink;
 mod shared_state;
 mod socket_filter;
@@ -145,6 +147,9 @@ impl Network {
     }
     /// A new Linux network namespace starts with an unconfigured, down lo and
     /// no external devices. Its stack never binds a host listener.
+    pub fn protocol(&self) -> Arc<dyn trames_shared::HostProtocol> {
+        self.1.driver.clone()
+    }
     pub fn isolated(&self) -> Result<Self> {
         let mode = match &self.0 {
             Backend::Native(n) => n.mode(),
@@ -164,11 +169,17 @@ impl Network {
             namespace: namespace.id(),
         };
         let stack = fabric.dynamic_environment(mode, view, loopback)?;
+        fabric.bind_driver(&namespace.fabric.changed);
         namespace
             .stack
             .set(stack.clone())
             .ok()
             .expect("new namespace stack");
+        stack.attach_routing(netdev::View {
+            graph: namespace.graph.clone(),
+            namespace: namespace.id(),
+        })?;
+        namespace.nft_packet_hooks.set(true);
         Ok(Self(Backend::Virtual(stack), namespace))
     }
     pub fn devices(&self) -> Vec<Device> {
@@ -263,6 +274,8 @@ impl Network {
     pub fn virtual_network(fabric: &Fabric, id: u8, mode: NetworkMode) -> Result<Self> {
         let stack = fabric.environment(id, mode)?;
         let namespace = Arc::new(netlink::Namespace::default());
+        *namespace.fabric.borrow_mut() = Some(fabric.clone());
+        fabric.bind_driver(&namespace.fabric.changed);
         namespace.nft_packet_hooks.set(false);
         namespace
             .graph
@@ -274,6 +287,11 @@ impl Network {
             .set(stack.clone())
             .ok()
             .expect("new explicit fabric namespace stack");
+        stack.attach_routing(netdev::View {
+            graph: namespace.graph.clone(),
+            namespace: namespace.id(),
+        })?;
+        namespace.nft_packet_hooks.set(true);
         Ok(Self(Backend::Virtual(stack), namespace))
     }
     pub fn forwarding(&self, ipv6: bool) -> bool {
@@ -973,3 +991,6 @@ mod managed_network_tests;
 
 #[cfg(test)]
 mod packet_tests;
+
+#[cfg(test)]
+mod ethernet_tests;

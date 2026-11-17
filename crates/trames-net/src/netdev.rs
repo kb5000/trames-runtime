@@ -49,10 +49,17 @@ pub(crate) use policy::{Context as RouteContext, Entry as PolicyRoute, Rule};
 const MAX_LINKS: usize = 256;
 const MAX_ADDRESSES: usize = 6; // Plus the two loopback addresses in smoltcp.
 const MAX_ROUTES: usize = 64;
+#[path = "ethernet_neighbor.rs"]
+mod ethernet_neighbor;
+#[path = "ethernet_switch.rs"]
+mod ethernet_switch;
 #[path = "neighbors.rs"]
 mod neighbors;
 #[path = "netdev_packet.rs"]
 mod packet;
+pub(crate) use ethernet_neighbor::ethernet_gateway;
+#[path = "ethernet_control.rs"]
+mod ethernet_control;
 pub(crate) use neighbors::Entry as NeighborEntry;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceKind {
@@ -61,6 +68,8 @@ pub enum DeviceKind {
     Veth { peer: u32 },
     Bridge,
     Tun,
+    Tap,
+    Ethernet,
 }
 #[derive(Clone, Debug)]
 pub struct Device {
@@ -102,6 +111,9 @@ impl Counters {
 }
 #[derive(Clone)]
 struct Link {
+    l2: crate::ethernet::PortConfig,
+    bridge_config: crate::ethernet::BridgeConfig,
+    switch: Arc<crate::ethernet::Switch>,
     index: u32,
     name: Vec<u8>,
     namespace: u64,
@@ -152,6 +164,8 @@ struct Space {
     packets: Arc<crate::packet_socket::Hub>,
     tunnels: BTreeMap<u32, std::sync::Weak<crate::tun::Port>>,
     neighbors: BTreeMap<(u32, IpAddr), NeighborEntry>,
+    neighbor_cache: Arc<crate::ethernet::NeighborCache>,
+    ip_serial: Arc<AtomicU64>,
     routes: Vec<Route>,
     direct: bool,
     managed_uplink: bool,
@@ -222,6 +236,9 @@ impl Topology {
         self.devices.insert(
             (id, 2),
             Link {
+                l2: Default::default(),
+                bridge_config: Default::default(),
+                switch: Arc::default(),
                 index: 2,
                 name: b"eth0".to_vec(),
                 namespace: id,
@@ -364,6 +381,8 @@ impl Topology {
                 packets: Arc::default(),
                 tunnels: BTreeMap::new(),
                 neighbors: BTreeMap::new(),
+                neighbor_cache: Arc::default(),
+                ip_serial: Arc::default(),
                 routes: vec![],
                 direct: false,
                 managed_uplink: false,
@@ -380,6 +399,9 @@ impl Topology {
         self.devices.insert(
             (id, 1),
             Link {
+                l2: Default::default(),
+                bridge_config: Default::default(),
+                switch: Arc::default(),
                 index: 1,
                 name: b"lo".to_vec(),
                 namespace: id,
@@ -437,14 +459,17 @@ impl Topology {
             self.devices.insert(
                 (id, 2),
                 Link {
+                    l2: Default::default(),
+                    bridge_config: Default::default(),
+                    switch: Arc::default(),
                     index: 2,
                     name: b"eth0".to_vec(),
                     namespace: id,
-                    kind: DeviceKind::Direct,
+                    kind: DeviceKind::Ethernet,
                     up: true,
                     mtu: info.mtu,
                     tx_queue_len: 0,
-                    mac: [0; 6],
+                    mac: [2, 0x54, 0x72, 0x61, 0, info.id],
                     master: None,
                     addresses,
                     stats: Arc::default(),
@@ -490,6 +515,9 @@ impl Topology {
         self.devices.insert(
             (id, 2),
             Link {
+                l2: Default::default(),
+                bridge_config: Default::default(),
+                switch: Arc::default(),
                 index: 2,
                 name: b"eth0".to_vec(),
                 namespace: id,
@@ -580,10 +608,15 @@ impl Topology {
             .collect()
     }
     pub fn device(&self, id: u64, index: u32) -> Result<Device> {
-        self.devices(id)
-            .into_iter()
-            .find(|d| d.index == index)
-            .ok_or(NetError(19))
+        let mut d = self
+            .devices
+            .get(&(id, index))
+            .ok_or(NetError(19))?
+            .snapshot();
+        if d.kind == DeviceKind::Loopback {
+            d.up = self.spaces[&id].lo.as_ref().is_none_or(|lo| lo.get());
+        }
+        Ok(d)
     }
     pub fn named(&self, id: u64, name: &[u8]) -> Result<Device> {
         self.devices(id)
@@ -632,6 +665,9 @@ impl Topology {
         self.devices.insert(
             (id, index),
             Link {
+                l2: Default::default(),
+                bridge_config: Default::default(),
+                switch: Arc::default(),
                 index,
                 name: name.to_vec(),
                 namespace: id,
@@ -725,7 +761,12 @@ impl Topology {
         if !self.spaces.contains_key(&target) {
             return Err(NetError(2));
         }
-        if target != id && matches!(old.kind, DeviceKind::Bridge | DeviceKind::Tun) {
+        if target != id
+            && matches!(
+                old.kind,
+                DeviceKind::Bridge | DeviceKind::Tun | DeviceKind::Tap | DeviceKind::Ethernet
+            )
+        {
             return Err(NetError(22));
         }
         if target != id && master.is_some_and(|m| m != 0) {
@@ -734,14 +775,22 @@ impl Topology {
         let newname = name.unwrap_or(&old.name);
         self.name_available(target, newname, (target == id).then_some(index))?;
         if let Some(master) = master.filter(|m| *m != 0) {
-            if !matches!(old.kind, DeviceKind::Veth { .. })
-                || self.device(target, master)?.kind != DeviceKind::Bridge
+            if !matches!(
+                old.kind,
+                DeviceKind::Veth { .. } | DeviceKind::Tap | DeviceKind::Ethernet
+            ) || self.device(target, master)?.kind != DeviceKind::Bridge
             {
                 return Err(NetError(22));
             }
         }
         if mac.is_some_and(|m| m == [0; 6] || m[0] & 1 != 0) {
             return Err(NetError(22));
+        }
+        if let Some(master) = master.filter(|m| *m != 0) {
+            self.check_bridge_loop(id, index, master)?;
+        }
+        if target != id || master.is_some_and(|m| Some(m).filter(|m| *m != 0) != old.master) {
+            self.forget_l2_port(id, index);
         }
         let mut d = self.devices.remove(&(id, index)).unwrap();
         d.namespace = target;
@@ -794,6 +843,7 @@ impl Topology {
         Ok(())
     }
     fn remove_link_inner(&mut self, id: u64, index: u32) {
+        self.forget_l2_port(id, index);
         let Some(d) = self.devices.remove(&(id, index)) else {
             return;
         };
@@ -803,6 +853,7 @@ impl Topology {
                 .iter()
                 .find_map(|(&key, d)| (d.index == peer).then_some(key))
             {
+                self.forget_l2_port(key.0, key.1);
                 self.devices.remove(&key);
                 if let Some(s) = self.spaces.get_mut(&key.0) {
                     s.neighbors.retain(|(i, _), _| *i != peer);

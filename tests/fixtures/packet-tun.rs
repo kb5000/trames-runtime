@@ -112,5 +112,99 @@ fn main() {
     assert_eq!(udp.recv(&mut reply).unwrap(), 7);
     assert_eq!(&reply[..7], b"tun ABI");
     drop(tun);
+    ethernet();
     println!("packet-tun: Linux ioctl, socket BPF, epoll, TUN and UDP round trip passed");
+}
+
+fn attribute(bytes: &mut Vec<u8>, kind: u16, value: &[u8]) {
+    bytes.extend_from_slice(&((value.len() + 4) as u16).to_le_bytes());
+    bytes.extend_from_slice(&kind.to_le_bytes());
+    bytes.extend_from_slice(value);
+    while bytes.len() % 4 != 0 {
+        bytes.push(0);
+    }
+}
+fn nl(control: i32, kind: u16, flags: u16, data: &[u8]) {
+    let mut bytes = ((16 + data.len()) as u32).to_le_bytes().to_vec();
+    bytes.extend_from_slice(&kind.to_le_bytes());
+    bytes.extend_from_slice(&(flags | 5).to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(data);
+    assert_eq!(
+        unsafe { write(control, bytes.as_ptr().cast(), bytes.len()) },
+        bytes.len() as isize
+    );
+    let mut reply = [0u8; 8192];
+    let n = unsafe { read(control, reply.as_mut_ptr().cast(), reply.len()) };
+    assert!(
+        n >= 20,
+        "netlink reply: {}",
+        std::io::Error::last_os_error()
+    );
+    assert_eq!(&reply[4..6], &2u16.to_le_bytes());
+    assert_eq!(&reply[16..20], &0i32.to_le_bytes());
+}
+fn ethernet() {
+    let control = fd(unsafe { socket(16, 3, 0) });
+    let ioctl_fd = fd(unsafe { socket(2, 2, 0) });
+    let mut bridge = vec![0u8; 16];
+    bridge[8] = 1;
+    bridge[12] = 1;
+    attribute(&mut bridge, 3, b"abi-br\0");
+    let mut info = vec![];
+    attribute(&mut info, 1, b"bridge\0");
+    let mut opts = vec![];
+    attribute(&mut opts, 7, &[1]);
+    attribute(&mut info, 2 | 0x8000, &opts);
+    attribute(&mut bridge, 18 | 0x8000, &info);
+    nl(control.as_raw_fd(), 16, 0x600, &bridge);
+    let mut config = [0u8; 40];
+    config[..6].copy_from_slice(b"abi-br");
+    request(ioctl_fd.as_raw_fd(), 0x8933, &mut config);
+    let br = u32::from_le_bytes(config[16..20].try_into().unwrap());
+    let mut taps = vec![];
+    for name in [b"abi-tap0", b"abi-tap1"] {
+        let tap = fd(unsafe { open(c"/dev/net/tun".as_ptr().cast(), 2 | 0x800) });
+        let mut config = [0u8; 40];
+        config[..name.len()].copy_from_slice(name);
+        config[16..18].copy_from_slice(&0x1002u16.to_le_bytes());
+        request(tap.as_raw_fd(), 0x400454ca, &mut config);
+        request(ioctl_fd.as_raw_fd(), 0x8933, &mut config);
+        let index = u32::from_le_bytes(config[16..20].try_into().unwrap());
+        let mut link = vec![0u8; 16];
+        link[4..8].copy_from_slice(&index.to_le_bytes());
+        link[8] = 1;
+        link[12] = 1;
+        attribute(&mut link, 10, &br.to_le_bytes());
+        nl(control.as_raw_fd(), 16, 0, &link);
+        let mut link = link[..16].to_vec();
+        link[0] = 7;
+        link[8..16].fill(0);
+        let mut vlans = vec![];
+        attribute(&mut vlans, 2, &[6, 0, 10, 0]);
+        attribute(&mut link, 26 | 0x8000, &vlans);
+        nl(control.as_raw_fd(), 19, 0, &link);
+        taps.push(tap);
+    }
+    let wire = [
+        &[2, 55, 44, 33, 22, 11, 2, 11, 22, 33, 44, 55, 0x88, 0xb5][..],
+        b"Linux Ethernet ABI",
+    ]
+    .concat();
+    assert_eq!(
+        unsafe { write(taps[0].as_raw_fd(), wire.as_ptr().cast(), wire.len()) },
+        wire.len() as isize
+    );
+    let mut received = [0u8; 2048];
+    let n = unsafe {
+        read(
+            taps[1].as_raw_fd(),
+            received.as_mut_ptr().cast(),
+            received.len(),
+        )
+    };
+    assert_eq!(n, wire.len() as isize);
+    assert_eq!(&received[..n as usize], wire);
+    println!("ethernet: TAP, Linux bridge/VLAN controls and opaque frame forwarding passed");
 }

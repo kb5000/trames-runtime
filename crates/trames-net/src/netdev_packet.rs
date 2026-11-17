@@ -4,14 +4,24 @@ impl Topology {
     pub fn packet_hub(&self, ns: u64) -> Arc<crate::packet_socket::Hub> {
         self.spaces[&ns].packets.clone()
     }
-    pub fn create_tun(&mut self, ns: u64, name: &[u8]) -> Result<u32> {
+    pub fn create_tun(&mut self, ns: u64, name: &[u8], tap: bool) -> Result<u32> {
         self.spaces
             .get_mut(&ns)
             .unwrap()
             .tunnels
             .retain(|_, p| p.strong_count() != 0);
-        let index = self.new_device(ns, name, DeviceKind::Tun)?;
-        self.devices.get_mut(&(ns, index)).unwrap().mac = [0; 6];
+        let index = self.new_device(
+            ns,
+            name,
+            if tap {
+                DeviceKind::Tap
+            } else {
+                DeviceKind::Tun
+            },
+        )?;
+        if !tap {
+            self.devices.get_mut(&(ns, index)).unwrap().mac = [0; 6];
+        }
         Ok(index)
     }
     pub fn attach_tun(&mut self, ns: u64, index: u32, port: std::sync::Weak<crate::tun::Port>) {
@@ -69,24 +79,6 @@ impl Topology {
             wakes,
         );
     }
-    pub fn observe_frame(
-        &self,
-        ns: u64,
-        index: u32,
-        frame: [[u8; 6]; 2],
-        packet: &[u8],
-        outgoing: bool,
-        wakes: &mut Vec<Arc<trames_shared::Readiness>>,
-    ) {
-        if !self.spaces[&ns].packets.active() {
-            return;
-        }
-        if let Some(d) = self.devices.get(&(ns, index)) {
-            self.spaces[&ns]
-                .packets
-                .observe(&d.snapshot(), frame, packet, outgoing, wakes);
-        }
-    }
     pub fn link_wakes(&self, ns: u64, index: u32, wakes: &mut Vec<Arc<trames_shared::Readiness>>) {
         if let Some(space) = self.spaces.get(&ns) {
             space.packets.link_wakes(wakes);
@@ -94,21 +86,5 @@ impl Topology {
                 wakes.push(port.readiness());
             }
         }
-    }
-    pub fn packet_peer(
-        &self,
-        ns: u64,
-        index: u32,
-        address: IpAddr,
-        mac: [u8; 6],
-    ) -> Result<(u64, u32)> {
-        let (key, _) = self
-            .neighbor_path(ns, index, address)
-            .ok_or(NetError(101))?;
-        let d = self.device(key.0, key.1)?;
-        if mac != d.mac {
-            return Err(NetError(101));
-        }
-        Ok(key)
     }
 }

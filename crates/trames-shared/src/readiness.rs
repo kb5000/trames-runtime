@@ -7,6 +7,9 @@ use std::sync::{
 };
 
 pub trait IoWake: Send + Sync {
+    fn register_protocol(&self, _protocol: Arc<dyn crate::HostProtocol>) -> std::io::Result<()> {
+        Ok(())
+    }
     fn wake_io(&self, signal: &Arc<IoSignal>);
     fn host_events(&self) -> std::io::Result<Option<Arc<crate::HostEvents>>> {
         Ok(None)

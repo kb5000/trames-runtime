@@ -109,6 +109,9 @@ impl<T> State<T> {
 /// The userspace packet stack has one actual mutable fabric transaction. It
 /// does not protect independent fabrics or the native TCP byte path.
 pub(crate) trait AfterUnlock {
+    fn take_callbacks(&mut self) -> Vec<Box<dyn FnOnce() + Send>> {
+        vec![]
+    }
     fn take_notifications(&mut self) -> Vec<std::sync::Arc<trames_shared::Readiness>>;
 }
 pub(crate) struct FabricState<T: AfterUnlock>(Mutex<T>);
@@ -127,7 +130,11 @@ impl<T: AfterUnlock> std::ops::DerefMut for FabricGuard<'_, T> {
 impl<T: AfterUnlock> Drop for FabricGuard<'_, T> {
     fn drop(&mut self) {
         let mut wakes = self.0.as_mut().unwrap().take_notifications();
+        let callbacks = self.0.as_mut().unwrap().take_callbacks();
         drop(self.0.take());
+        for callback in callbacks {
+            callback();
+        }
         wakes.sort_unstable_by_key(std::sync::Arc::as_ptr);
         wakes.dedup_by(|a, b| std::sync::Arc::ptr_eq(a, b));
         for source in wakes {

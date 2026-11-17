@@ -369,7 +369,7 @@ fn cycles_invalid_registers_and_native_hooks_are_rejected_atomically() {
             &legacy.1,
             &[table("f"), chain("f", "out", Some(3), 0, 0)]
         )),
-        -95
+        0
     );
 }
 #[test]

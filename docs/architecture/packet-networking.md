@@ -1,95 +1,109 @@
-# Guest packet networking
+# Guest Ethernet and packet networking
 
-Trames uses a shared userspace Linux network implementation on Mac and iPad.
-Ordinary root-namespace BSD TCP/UDP sockets keep their existing native path.
-Guest-owned interfaces use the existing IP fabric, routes, connection tracking,
-and nftables hooks. No host interface, host firewall, or coordinator thread is
-created by the interfaces below.
+Mac and iPad use the same userspace Linux network implementation. Guest-owned
+links carry real Ethernet frames; ordinary native root-namespace TCP/UDP keeps
+its BSD socket path. No host NIC, host bridge, host TAP, or host firewall is
+configured. There is no protocol broker or coordinator thread.
 
-## Supported interfaces
+## Data path
 
-| Interface | Current scope |
+An IP socket resolves its actual next hop with ARP or IPv6 NDP. The resulting
+Ethernet frame crosses veth endpoints, bridges and private Trames links by
+MAC/VLAN, independently of destination IP. Arbitrary EtherTypes and RAW source
+MACs are preserved. A static FDB entry can redirect normal UDP to a TAP sink;
+there is no parallel IP shortcut that bypasses the bridge.
+
+Each bridge owns its forwarding database. Known unicast goes to the learned
+port; unknown unicast, broadcast and multicast flood eligible ports. Learning,
+port state, hairpin and independent flood flags apply on the actual path. Static
+forwarding entries and local MAC entries are distinct. Dynamic entries age
+lazily (Linux clock ticks, default 300 seconds; zero disables expiry). Port
+removal/detachment clears its learned entries and neighbor state. Local veth
+attachments that would create a known bridge cycle are rejected.
+
+802.1Q filtering supports access/trunk ports, PVIDs, tagged/untagged egress,
+VLAN membership and range updates. VLAN configuration is validated before
+publication. Filtering is off by default, as on Linux. With filtering enabled,
+unknown VLANs cannot cross ports. The bridge local endpoint has its own VLAN
+membership. Endpoint VLAN netdevices and stacked/service tags are separate,
+unimplemented features.
+
+ARP requests/replies and IPv6 NS/NA are actual observable packets. A bounded
+neighbor cache holds unresolved datagrams, retries probes, releases pending
+traffic on resolution and reports failed/stale neighbors. Explicit entries
+remain authoritative. NDP validates hop limit, checksum and options and handles
+DAD requests. This is basic reachability probing, not a complete Linux NUD,
+router-advertisement, SLAAC or neighbor-proxy implementation.
+
+The existing IPv4/IPv6 routes, nftables filter/NAT and connection tracking remain
+at IP endpoints. Optional bridge IP filtering uses the same hooks. Only this
+filtering path reassembles fragmented datagrams before L4 matching, then
+restores wire fragments. A plain bridge forwards fragments without inspecting
+transport headers. Virtual gateway endpoints also reassemble wire fragments
+before flow lookup; large native UDP replies are fragmented for Ethernet MTU.
+
+## Linux controls
+
+| Interface | Implemented scope |
 | --- | --- |
-| Route neighbors | IPv4/IPv6 `RTM_GETNEIGH`, add/change/replace/delete, dumps and `RTMGRP_NEIGH` subscriptions on guest veth/bridge interfaces. Explicit failed/incomplete entries block delivery; an incorrect explicit MAC cannot silently reach the intended peer. |
-| AF_PACKET | `SOCK_RAW` and `SOCK_DGRAM`, protocol selection, namespace/interface binding, send/receive, peek/truncation, poll/epoll, receive buffers and `PACKET_IGNORE_OUTGOING`. Creation requires guest `CAP_NET_RAW`. |
-| Socket BPF | Classic `SO_ATTACH_FILTER`, `SO_DETACH_FILTER`, and irreversible `SO_LOCK_FILTER` on AF_PACKET sockets. Verified forward control flow, definite scratch initialization, packet loads, arithmetic and snap lengths. |
-| IP/port firewall | Existing IPv4/IPv6 nftables filter/NAT/connection-tracking implementation. TUN ingress and packet-socket injection enter its actual packet hooks. Capturing ingress precedes an INPUT drop; packet capture is observation, not an acceptance bypass. |
-| TUN | `/dev/net/tun` (character device 10:200), single-queue IPv4/IPv6 `IFF_TUN`, optional `IFF_NO_PI`, automatic `tun%d` naming, `TUNSETIFF`, `TUNGETIFF`, `TUNGETFEATURES`, and zero-offload negotiation. Creating an interface requires guest `CAP_NET_ADMIN`. |
+| `ip link` | veth, bridge, namespace moves for movable links, master attachment, link state and existing interface controls |
+| `bridge link` | AF_BRIDGE port state, hairpin, learning, unicast/multicast/broadcast flood controls |
+| `bridge fdb` | AF_BRIDGE neighbor dump, add/replace/delete; dynamic, static and local entries; MAC moves and lazy aging |
+| `bridge vlan` | AF_BRIDGE SETLINK/DELLINK and dumps, PVID/untagged flags, VLAN ranges |
+| `ip neigh` | IPv4/IPv6 dumps and explicit add/change/replace/delete, plus traffic-learned ARP/NDP cache |
+| AF_PACKET | RAW/DGRAM, actual frame capture/injection, protocol/interface binding, outgoing suppression, promiscuous/all-multicast/multicast membership, peek/truncation and poll/epoll |
+| Classic socket BPF | Verified `SO_ATTACH_FILTER`, detach/lock, actual Ethernet-byte loads and snap lengths |
+| `/dev/net/tun` | Single-queue nonpersistent TUN and TAP, optional PI, ioctl configuration, interface reporting, read/write, poll/epoll and final-close cleanup |
 
-TUN programs configure addresses/routes through the usual Linux interface
-ioctls or rtnetlink. A read returns an outgoing IP datagram; a write injects an
-incoming one. With packet information enabled, the four-byte `tun_pi` header
-uses native-endian flags and a network-endian protocol. Short reads consume one
-datagram and set `TUN_PKT_STRIP` when appropriate. Final close removes the
-nonpersistent interface and its routes; dup/fork retain the original open file.
-The open file pins the namespace in which `/dev/net/tun` was opened.
+Mutating controls require the existing guest capabilities. Manual link/FDB/
+neighbor updates notify the existing rtnetlink subscription groups. Dynamic
+learning and lazy expiration are currently visible through dumps, without
+asynchronous learning/aging multicast notifications. Unsupported bridge options
+(e.g. enabling STP or multicast snooping) return an error instead of advertising
+an implementation.
 
-## Scope boundaries
+With PI enabled, TUN/TAP has the four-byte Linux `tun_pi` header. TUN carries IP;
+TAP carries the complete Ethernet frame and preserves its outer EtherType.
+Final close removes the interface and routes; dup/fork retain the original open
+file and namespace. Persistent interfaces, owner/group delegation, multiqueue,
+vnet headers and checksum/GSO offloads are not advertised.
 
-The fabric is an IP medium. Neighbor discovery is resolved from live guest
-connectivity and reported as `NUD_NOARP`; it does not run host ARP/NDP or a
-simulated Ethernet reachability timer. Explicit neighbor entries override that
-resolution. REACHABLE/STALE/DELAY/PROBE labels can be stored, but no timed NUD
-state machine is claimed. Proxy neighbors, bridge FDB management, and Ethernet
-broadcast/ARP injection are unsupported. Automatic topology-derived NOARP
-entries are reconstructed on query, rather than being a traffic-learned cache.
+## Ownership, wakeups and isolation
 
-Packet capture covers packets processed by the Trames IP fabric, including
-veth and bridge boundaries. It cannot observe traffic carried entirely by native
-BSD sockets. Binding a packet socket to the host-backed direct interface is
-rejected. RAW capture uses a logical Ethernet header on Ethernet-like links;
-on TUN it carries the IP datagram with `ARPHRD_NONE` and no link address.
-Injection supports IPv4/IPv6 unicast on guest links; arbitrary Ethernet frames,
-spoofed RAW source MACs, packet mmap rings, fanout and promiscuous membership
-management are not implemented. TUN packet input inherits the IP stack's
-existing transport/protocol and IPv6 extension-header limitations.
+The original fabric transaction moves frames; switches and neighbor tables own
+their state. Broadcast actions share immutable frame storage. Work queues,
+neighbor pending data and fragment caches are bounded. Stable-MAC FDB hits use
+a read lock and relaxed timestamp update; MAC moves update that bridge's table.
+Absent packet observers, capture skips its observer/queue lock and packet copy.
 
-Classic socket BPF is separate from seccomp BPF and the existing `bpf()`
-capabilities. This change does not implement general networking eBPF, XDP, or
-TC programs. Unsupported ancillary BPF metadata loads are rejected.
+Private Trames networks transport Ethernet through their existing private Unix
+datagram endpoints. Learned unicast avoids directory discovery; floods discover
+peers only within that named network. The transport is internal to Trames and
+requires matching runtime versions at both ends. It never exposes the LAN's L2
+segment. STP/RSTP, distributed loop detection, LACP and multicast snooping are
+not implemented; userspace relays must not form forwarding cycles. The bounded
+work slice/queues contain floods, but do not make a cyclic topology useful.
 
-TAP, persistent TUN interfaces (`ip tuntap add`), owner/group delegation,
-multiqueue, vnet headers, and checksum/GSO offloads are not advertised. Open a
-TUN file and keep it open while using the interface. Actual VPN application
-compatibility and throughput remain to be measured.
+A weak protocol-resource handle registers its actual native/Unix event sources
+and earliest protocol deadline with the existing executor. It can complete ARP
+and deliver a queued UDP datagram after the sending guest task goes to sleep,
+without borrowing that task's CPU or address space. Idle resources have no
+periodic timer. No new polling bus, resource-service thread, task authority,
+guest-memory authority or global guest stop is introduced. Callbacks run after
+fabric/topology locks are released; executor progress runs outside its queue
+mutex. Final namespace-group close retires the subscriptions.
 
-## Ownership and cost
+Native-only applications do not create a fabric/event poller for this facility.
+Their normal TCP byte capability remains independent. Packet sockets cannot
+capture the host's native traffic or bind to the direct host-backed interface.
+Classic socket BPF is separate from seccomp and `bpf()`; this does not add XDP,
+TC or general networking eBPF. Existing IP protocol/extension-header limits
+continue to apply.
 
-Packet queues and filters belong to their original socket or TUN open file.
-The topology retains only weak queue metadata, with no final-close callback
-under its lock. Queue notifications accumulate in the existing fabric
-transaction and fire after the fabric and topology locks are released. A
-reentrant-wake regression checks both conditions. Blocking file I/O and epoll
-use the existing worker resource capabilities and fabric timer, releasing the
-execution slot instead of adding a service thread.
+## Reproducing the Linux ABI check
 
-With no AF_PACKET observers, the observation path checks an atomic active count
-and does not acquire an observer/queue lock or allocate/copy a packet. Neighbor
-queries derive NOARP entries without inserting a new mutable hot-path cache.
-TUN memory is allocated for the actual interface and queued datagrams, not for
-unused network address space. The ordinary native TCP byte capability is
-unchanged.
-
-## Validation checkpoint — 2026-11-17
-
-- Local runtime workflow: all eight shell steps pass; 1,623 tests pass and 31
-  retain their existing skip conditions.
-- Tests cover actual UDP over TUN in both directions, PI/no-PI, IPv6, final-close
-  cleanup, namespace isolation, AF_PACKET capture/injection, BPF control flow,
-  scratch state, filtering/snap lengths, IP/port firewall enforcement, syscall
-  pointer preflight, and notification reentry.
-- The standalone Linux ARM64 fixture passes under the interpreter with one and
-  two CPUs. A second guest thread sends while the first blocks in epoll.
-  Interface ioctls, guest-pointer `sock_fprog` import, TUN reads/writes, and the
-  UDP reply are exercised through the real syscall ABI.
-- Mac product workflow checks 1–10 pass, and the Dev app builds successfully.
-  The same standalone fixture also passes with two CPUs through the signed Mac
-  hardware executor in a disposable minimal rootfs/store. The interpreter-side
-  Linux kernel conformance suite passes 490 tests (three existing skips).
-- `trames-ffi` checks successfully for `aarch64-apple-ios`. This is compile
-  coverage, not a claim of a physical-iPad VPN acceptance run.
-
-From the iPad repository, reproduce the standalone fixture with:
+The standalone fixture exercises interface ioctls, socket BPF, epoll, TUN UDP
+round trips, TAP, bridge/VLAN rtnetlink controls and opaque frame forwarding:
 
 ```sh
 python3 runtime/scripts/build-packet-fixture.py target/packet-tun/packet-tun
@@ -98,6 +112,9 @@ target/debug/trames-run --network full --cpus 1 --max-instructions 100000000 tar
 target/debug/trames-run --network full --cpus 2 --max-instructions 100000000 target/packet-tun/packet-tun
 ```
 
-ABI references: [Linux packet sockets](https://man7.org/linux/man-pages/man7/packet.7.html),
-[classic socket BPF](https://docs.kernel.org/networking/filter.html), and
-[Linux TUN/TAP](https://docs.kernel.org/networking/tuntap.html).
+References: [Linux bridge](https://docs.kernel.org/networking/bridge.html),
+[packet sockets](https://man7.org/linux/man-pages/man7/packet.7.html),
+[classic socket BPF](https://docs.kernel.org/networking/filter.html),
+[TUN/TAP](https://docs.kernel.org/networking/tuntap.html),
+[ARP](https://www.rfc-editor.org/rfc/rfc826.html),
+[IPv6 neighbor discovery](https://www.rfc-editor.org/rfc/rfc4861.html).

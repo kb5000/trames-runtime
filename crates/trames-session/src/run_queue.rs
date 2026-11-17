@@ -817,6 +817,7 @@ pub(super) struct Epoch<C: Cpu> {
     slot_changed: [Condvar; 32],
     host_events: OnceLock<Result<Arc<trames_vfs::HostEvents>, Arc<std::io::Error>>>,
     host_error: OnceLock<Arc<std::io::Error>>,
+    protocols: trames_shared::HostProtocols,
     pub io_target: Weak<dyn trames_vfs::IoWake>,
     me: Weak<Self>,
     timers: OnceLock<Arc<trames_kernel::timers::Timers>>,
@@ -878,6 +879,7 @@ impl<C: Cpu> Epoch<C> {
             slot_changed: std::array::from_fn(|_| Condvar::new()),
             host_events: OnceLock::new(),
             host_error: OnceLock::new(),
+            protocols: Default::default(),
             io_target: me.clone(),
             me: me.clone(),
             timers: OnceLock::new(),
@@ -1105,6 +1107,7 @@ impl<C: Cpu> Epoch<C> {
         let next = self.next_deadline.load(Ordering::Relaxed);
         (next != u64::MAX && self.deadline_ticks(Instant::now()) >= next)
             || self.timers.get().is_some_and(|t| t.due())
+            || self.protocols.due()
     }
     fn refresh_ready(&self, q: &Queues<C>) {
         let slots = if self.host_pause.load(Ordering::Relaxed) {
@@ -1235,6 +1238,10 @@ impl<C: Cpu> Epoch<C> {
                 wait.bind(&signal);
             }
             snapshot.io_wake = Some(signal);
+            if let Err(error) = snapshot.direct.bind_host_protocol(&self.io_target) {
+                let _ = self.host_error.set(Arc::new(error));
+                self.control.close(crate::execution_control::End::Failed);
+            }
             job.uring = snapshot.direct.uring_background(pid, &self.io_target);
         }
     }
@@ -1764,6 +1771,18 @@ impl<C: Cpu> Epoch<C> {
                 timers.tick();
                 q = self.queues.lock().unwrap();
             }
+            if self.protocols.due() {
+                drop(q);
+                let result = self.protocols.progress(&|| {
+                    trames_vfs::IoWake::host_events(self)?
+                        .ok_or_else(|| std::io::Error::other("missing host events"))
+                });
+                if let Err(error) = result {
+                    let _ = self.host_error.set(Arc::new(error));
+                    self.control.close(crate::execution_control::End::Failed);
+                }
+                q = self.queues.lock().unwrap();
+            }
             let now = Instant::now();
             let expired = q.parked.expired(now);
             for pid in expired {
@@ -1863,6 +1882,7 @@ impl<C: Cpu> Epoch<C> {
                 .next_deadline()
                 .into_iter()
                 .chain(self.timers.get().and_then(|t| t.next_deadline()))
+                .chain(self.protocols.deadline())
                 .min();
             self.next_deadline.store(
                 deadline.map_or(u64::MAX, |d| self.deadline_ticks(d)),
@@ -1883,7 +1903,7 @@ impl<C: Cpu> Epoch<C> {
                 })
             })
             .flatten();
-            let external = q.parked.external();
+            let external = q.parked.external() || self.protocols.external();
             if external && !q.host_waiting && (available.is_none() || !dispatched) {
                 // A parked eventfd can acquire its first native producer on
                 // another worker. Its resource metadata wakes us; initialize
@@ -2336,6 +2356,16 @@ impl<C: Cpu> trames_kernel::timers::TimerWake for Epoch<C> {
 }
 
 impl<C: Cpu> trames_vfs::IoWake for Epoch<C> {
+    fn register_protocol(
+        &self,
+        protocol: Arc<dyn trames_shared::HostProtocol>,
+    ) -> std::io::Result<()> {
+        self.protocols.register(protocol, self.io_target.clone());
+        self.next_deadline.store(0, Ordering::Relaxed);
+        let mut q = self.queues.lock().unwrap();
+        self.notify(&mut q);
+        Ok(())
+    }
     fn host_events(&self) -> std::io::Result<Option<Arc<trames_vfs::HostEvents>>> {
         match self
             .host_events
@@ -2349,6 +2379,12 @@ impl<C: Cpu> trames_vfs::IoWake for Epoch<C> {
         }
     }
     fn wake_io(&self, signal: &Arc<trames_vfs::IoSignal>) {
+        if self.protocols.wake(signal) {
+            self.next_deadline.store(0, Ordering::Relaxed);
+            let mut q = self.queues.lock().unwrap();
+            self.notify(&mut q);
+            return;
+        }
         let mut q = self.queues.lock().unwrap();
         if self.control.stopped() {
             return;

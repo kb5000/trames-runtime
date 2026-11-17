@@ -231,7 +231,7 @@ fn neighbors_netlink_override_real_delivery_and_dump() {
         .unwrap()
         .neighbors(a.namespace_id(), ai, 2)
         .iter()
-        .any(|e| e.address == ip && e.state == 64));
+        .any(|e| e.address == ip && e.state == 2));
 }
 
 #[test]

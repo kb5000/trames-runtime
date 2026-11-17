@@ -6,11 +6,13 @@ use crate::{
     NetError, Network,
 };
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+#[path = "rtnetlink_ethernet.rs"]
+mod ethernet;
 type Result<T> = std::result::Result<T, NetError>;
 fn u32v(v: &[u8]) -> Result<u32> {
     Ok(u32::from_le_bytes(v.try_into().map_err(|_| NetError(22))?))
 }
-fn attrs(mut bytes: &[u8]) -> Result<Vec<(u16, &[u8])>> {
+fn repeated_attrs(mut bytes: &[u8]) -> Result<Vec<(u16, &[u8])>> {
     let mut out = vec![];
     while !bytes.is_empty() {
         if bytes.len() < 4 {
@@ -18,7 +20,7 @@ fn attrs(mut bytes: &[u8]) -> Result<Vec<(u16, &[u8])>> {
         }
         let n = u16::from_le_bytes(bytes[..2].try_into().unwrap()) as usize;
         let kind = u16::from_le_bytes(bytes[2..4].try_into().unwrap()) & 0x3fff;
-        if n < 4 || n > bytes.len() || out.iter().any(|(k, _)| *k == kind) {
+        if n < 4 || n > bytes.len() {
             return Err(NetError(22));
         }
         out.push((kind, &bytes[4..n]));
@@ -28,6 +30,14 @@ fn attrs(mut bytes: &[u8]) -> Result<Vec<(u16, &[u8])>> {
         bytes = bytes.get((n + 3) & !3..).ok_or(NetError(22))?;
     }
     Ok(out)
+}
+fn attrs(bytes: &[u8]) -> Result<Vec<(u16, &[u8])>> {
+    let a = repeated_attrs(bytes)?;
+    let mut seen = std::collections::BTreeSet::new();
+    if a.iter().any(|(k, _)| !seen.insert(*k)) {
+        return Err(NetError(22));
+    }
+    Ok(a)
 }
 fn get<'a>(attrs: &[(u16, &'a [u8])], kind: u16) -> Option<&'a [u8]> {
     attrs.iter().find_map(|(k, v)| (*k == kind).then_some(*v))
@@ -106,17 +116,46 @@ pub(crate) fn link_data(g: &Topology, d: &Device) -> Vec<u8> {
     if let DeviceKind::Veth { peer } = d.kind {
         attr(&mut data, 5, &peer.to_le_bytes());
     }
-    if matches!(d.kind, DeviceKind::Bridge | DeviceKind::Veth { .. }) {
+    if matches!(
+        d.kind,
+        DeviceKind::Bridge | DeviceKind::Veth { .. } | DeviceKind::Tun | DeviceKind::Tap
+    ) {
         let mut info = vec![];
         attr(
             &mut info,
             1,
             if d.kind == DeviceKind::Bridge {
                 b"bridge\0"
+            } else if matches!(d.kind, DeviceKind::Tun | DeviceKind::Tap) {
+                b"tun\0"
             } else {
                 b"veth\0"
             },
         );
+        if let Ok(config) = g.bridge_config(d.namespace, d.index) {
+            let mut options = vec![];
+            attr(&mut options, 4, &config.ageing.to_le_bytes());
+            attr(&mut options, 5, &0u32.to_le_bytes());
+            attr(&mut options, 7, &[u8::from(config.vlan_filtering)]);
+            attr(&mut options, 8, &0x8100u16.to_be_bytes());
+            attr(&mut options, 23, &[0]);
+            attr(&mut info, 2 | 0x8000, &options);
+        }
+        if let Some(tun) = g.tunnel(d.namespace, d.index) {
+            let mut options = vec![];
+            for (kind, value) in [
+                (3, if d.kind == DeviceKind::Tap { 2 } else { 1 }),
+                (4, u8::from(tun.flags & 0x1000 == 0)),
+                (5, 0),
+                (6, 0),
+                (7, 0),
+            ] {
+                attr(&mut options, kind, &[value]);
+            }
+            attr(&mut options, 8, &1u32.to_le_bytes());
+            attr(&mut options, 9, &0u32.to_le_bytes());
+            attr(&mut info, 2 | 0x8000, &options);
+        }
         attr(&mut data, 18, &info);
     }
     let s = d.stats;
@@ -220,6 +259,18 @@ pub(crate) fn request(
     let mut execute = || -> Result<()> {
         if flags & !(1 | 4 | 0x100 | 0x200 | 0x400) != 0 {
             return Err(NetError(95));
+        }
+        if ethernet::request(
+            &mut graph,
+            ns,
+            request,
+            seq,
+            port,
+            admin,
+            &mut out,
+            &mut changes,
+        )? {
+            return Ok(());
         }
         match kind {
             28..=30 => {
@@ -443,12 +494,13 @@ pub(crate) fn request(
                             if target.is_some() {
                                 return Err(NetError(95));
                             }
-                            if let Some(data) = get(&info, 2) {
-                                if !data.is_empty() {
-                                    return Err(NetError(95));
-                                }
-                            }
-                            next.create_bridge(ns, name)?
+                            let config = ethernet::bridge_config(
+                                get(&info, 2).unwrap_or(&[]),
+                                Default::default(),
+                            )?;
+                            let index = next.create_bridge(ns, name)?;
+                            next.configure_bridge(ns, index, config)?;
+                            index
                         }
                         b"veth" => {
                             let info = attrs(get(&info, 2).ok_or(NetError(22))?)?;
