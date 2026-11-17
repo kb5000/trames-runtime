@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Build the standalone Linux packet/TUN ABI fixture with the pinned Rust musl target."""
+"""Build a Linux ARM64 ABI fixture: OUTPUT [SOURCE], defaulting to packet-tun.rs."""
 import pathlib
 import subprocess
 import sys
@@ -10,5 +10,6 @@ sysroot = pathlib.Path(subprocess.check_output(['rustc', '--print', 'sysroot'], 
 host = next(line[6:] for line in subprocess.check_output(['rustc', '-vV'], cwd=root, text=True).splitlines() if line.startswith('host: '))
 linker = sysroot / 'lib/rustlib' / host / 'bin/rust-lld'
 output.parent.mkdir(parents=True, exist_ok=True)
-subprocess.run(['rustc', '--edition=2024', '--target=aarch64-unknown-linux-musl', '-C', f'linker={linker}', '-C', 'link-self-contained=yes', '-C', 'target-feature=+crt-static', '-C', 'opt-level=1', str(root / 'tests/fixtures/packet-tun.rs'), '-o', str(output)], cwd=root, check=True)
+source = pathlib.Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else root / 'tests/fixtures/packet-tun.rs'
+subprocess.run(['rustc', '--edition=2024', '--target=aarch64-unknown-linux-musl', '-C', f'linker={linker}', '-C', 'link-self-contained=yes', '-C', 'target-feature=+crt-static', '-C', 'opt-level=1', str(source), '-o', str(output)], cwd=root, check=True)
 print(output)

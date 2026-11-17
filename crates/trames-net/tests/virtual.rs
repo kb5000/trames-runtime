@@ -120,6 +120,40 @@ fn udp_large_fragmentation_zero_truncation_and_connected_filter() {
     }
 }
 #[test]
+fn queued_large_udp_preserves_an_in_progress_ipv4_fragmenter() {
+    let f = Fabric::new().unwrap();
+    let a = net(&f, 2);
+    let b = net(&f, 3);
+    for v6 in [false, true] {
+        let receiver = socket(&a, v6, false);
+        receiver.set_option(1, 8, 256 * 1024).unwrap();
+        let address = parse(if v6 {
+            "[fd00::2]:2346"
+        } else {
+            "10.0.0.2:2346"
+        });
+        receiver.bind(address).unwrap();
+        let sender = socket(&b, v6, false);
+        sender.set_option(1, 7, 256 * 1024).unwrap();
+        sender.connect(address).unwrap();
+        // Each IPv4 datagram needs more than one bounded fabric slice. Enqueue
+        // the next datagram before its predecessor has finished transmitting.
+        for id in 0..4u8 {
+            let payload = vec![id; 60000];
+            assert_eq!(
+                until(&sender, || sender.send(&payload, 0, None)),
+                payload.len()
+            );
+        }
+        for id in 0..4u8 {
+            assert_eq!(
+                until(&receiver, || receiver.recv(65535, 0)).data,
+                vec![id; 60000]
+            );
+        }
+    }
+}
+#[test]
 fn policy_quota_teardown_and_reused_environment_id() {
     let f = Fabric::new().unwrap();
     let a = net(&f, 2);

@@ -3,6 +3,9 @@ use super::*;
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 pub(super) const MTU: usize = 1500;
 const QUEUE: usize = 96;
+// Bound retained fragment memory, rather than letting a few lost datagrams
+// monopolize all reassembly slots until the IP timeout.
+const FRAGMENT_BYTES: usize = 512 * 1024;
 #[derive(Default)]
 pub(crate) struct Port {
     pub rx: VecDeque<Vec<u8>>,
@@ -18,6 +21,13 @@ struct Fragments {
     end: Option<usize>,
     poisoned: bool,
     expires: Instant,
+    updated: Instant,
+    received: usize,
+}
+impl Fragments {
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.header.len() + self.data.len() + self.covered.len()
+    }
 }
 impl Port {
     pub fn receive_packet(&mut self, p: Vec<u8>) -> bool {
@@ -79,20 +89,39 @@ impl Port {
         if n == 0 || more && !n.is_multiple_of(8) || offset + n > maximum {
             return false;
         }
+        let now = Instant::now();
+        let extent = offset + n;
+        let extra = self.fragments.iter().find(|f| f.key == key).map_or(
+            std::mem::size_of::<Fragments>() + header_len + extent * 2,
+            |f| extent.saturating_sub(f.data.len()) * 2,
+        );
+        let mut retained: usize = self.fragments.iter().map(Fragments::bytes).sum();
+        while retained + extra > FRAGMENT_BYTES {
+            let Some(oldest) = self
+                .fragments
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.key != key)
+                .min_by_key(|(_, f)| f.updated)
+                .map(|(i, _)| i)
+            else {
+                return false;
+            };
+            retained -= self.fragments.remove(oldest).bytes();
+        }
         let i = match self.fragments.iter().position(|f| f.key == key) {
             Some(i) => i,
             None => {
-                if self.fragments.len() == 2 {
-                    return false;
-                }
                 self.fragments.push(Fragments {
                     key,
                     header: p[..header_len].to_vec(),
-                    data: vec![0; 65535],
-                    covered: vec![false; 65535],
+                    data: Vec::new(),
+                    covered: Vec::new(),
                     end: None,
                     poisoned: false,
-                    expires: Instant::now() + Duration::from_secs(60),
+                    expires: now + Duration::from_secs(60),
+                    updated: now,
+                    received: 0,
                 });
                 self.fragments.len() - 1
             }
@@ -102,7 +131,9 @@ impl Port {
             return false;
         }
         if f.header.len() != header_len
-            || f.covered[offset..offset + n].iter().any(|b| *b)
+            || f.covered
+                .get(offset..extent.min(f.covered.len()))
+                .is_some_and(|range| range.iter().any(|b| *b))
             || f.end.is_some_and(|end| offset + n > end)
             || !more && f.end.is_some_and(|end| end != offset + n)
         {
@@ -111,7 +142,10 @@ impl Port {
         }
         if !more {
             f.end = Some(offset + n);
-            if f.covered[offset + n..].iter().any(|b| *b) {
+            if f.covered
+                .get(extent..)
+                .is_some_and(|range| range.iter().any(|b| *b))
+            {
                 f.poisoned = true;
                 return false;
             }
@@ -119,10 +153,19 @@ impl Port {
         if offset == 0 {
             f.header.copy_from_slice(&p[..header_len]);
         }
-        f.data[offset..offset + n].copy_from_slice(&p[data_offset..]);
-        f.covered[offset..offset + n].fill(true);
+        if extent > f.data.len() {
+            let extra = extent - f.data.len();
+            f.data.reserve_exact(extra);
+            f.covered.reserve_exact(extra);
+            f.data.resize(extent, 0);
+            f.covered.resize(extent, false);
+        }
+        f.updated = now;
+        f.data[offset..extent].copy_from_slice(&p[data_offset..]);
+        f.covered[offset..extent].fill(true);
+        f.received += n;
         if let Some(end) = f.end {
-            if f.covered[..end].iter().all(|b| *b) {
+            if f.received == end {
                 let mut f = self.fragments.remove(i);
                 if version == 4 {
                     f.header[2..4].copy_from_slice(&((header_len + end) as u16).to_be_bytes());
@@ -413,6 +456,41 @@ mod tests {
             }
             assert!(port.rx.is_empty());
             assert!(port.fragments[0].poisoned);
+        }
+    }
+    #[test]
+    fn fragment_pressure_evicts_incomplete_datagrams_and_recovers() {
+        for v6 in [false, true] {
+            let (original, frames) = fragments(v6);
+            let mut port = Port::default();
+            let set_id = |mut p: Vec<u8>, id: u32| {
+                if v6 {
+                    p[44..48].copy_from_slice(&id.to_be_bytes());
+                } else {
+                    p[4..6].copy_from_slice(&(id as u16).to_be_bytes());
+                    smoltcp::wire::Ipv4Packet::new_unchecked(&mut p).fill_checksum();
+                }
+                p
+            };
+            // Lose the last fragment of many unrelated datagrams. Neither
+            // pressure nor an overlap-poisoned entry may close admission.
+            for id in 0..512 {
+                assert!(port.receive_packet(set_id(frames[0].clone(), id)));
+                assert!(!port.receive_packet(set_id(frames[0].clone(), id)));
+                assert!(
+                    port.fragments.iter().map(Fragments::bytes).sum::<usize>() <= FRAGMENT_BYTES
+                );
+            }
+            assert!(port.fragments.len() < 512);
+            for frame in &frames {
+                assert!(port.receive_packet(set_id(frame.clone(), 600)));
+            }
+            let mut expected = original;
+            if !v6 {
+                expected[4..6].copy_from_slice(&600u16.to_be_bytes());
+                smoltcp::wire::Ipv4Packet::new_unchecked(&mut expected).fill_checksum();
+            }
+            assert_eq!(port.rx.pop_front().unwrap(), expected);
         }
     }
     #[test]

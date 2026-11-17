@@ -672,7 +672,10 @@ impl Interface {
 
                 inner
                     .dispatch_ip(t, meta, response, &mut self.fragmenter)
-                    .map_err(|_| EgressError::Dispatch)?;
+                    .map_err(|err| match err {
+                        DispatchError::Exhausted => EgressError::Exhausted,
+                        _ => EgressError::Dispatch,
+                    })?;
 
                 result = PollResult::SocketStateChanged;
 
@@ -1209,6 +1212,12 @@ impl InterfaceInner {
                 if total_ip_len > self.caps.ip_mtu() {
                     #[cfg(feature = "proto-ipv4-fragmentation")]
                     {
+                        // The single fragmentation buffer belongs to the in-flight
+                        // datagram until its final fragment is emitted. A later
+                        // socket send must retain its queue entry and retry.
+                        if !frag.is_empty() && !frag.finished() {
+                            return Err(DispatchError::Exhausted);
+                        }
                         net_debug!("start fragmentation");
 
                         // Calculate how much we will send now (including the Ethernet header).
@@ -1316,6 +1325,8 @@ impl InterfaceInner {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 enum DispatchError {
+    /// The fragmentation buffer still contains an earlier datagram.
+    Exhausted,
     /// No route to dispatch this packet. Retrying won't help unless
     /// configuration is changed.
     NoRoute,
