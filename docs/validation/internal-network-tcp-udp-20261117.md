@@ -1,5 +1,7 @@
 # Internal TCP/UDP measurements — 2026-11-17
 
+Historical baseline: see [the subsequent fixes and remeasurement](internal-network-fixes-20261117.md). The transport and fixed UDP queue defects described below have since been repaired; these original samples are preserved.
+
 The internal stack is functional, but these measurements expose two transport/queue defects and a parallel scaling limit. Private-link TCP bulk transfer is not healthy; its incomplete samples must not be presented as successful throughput.
 
 ## Conditions and reproduction

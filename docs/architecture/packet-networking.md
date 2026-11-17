@@ -76,13 +76,40 @@ neighbor pending data and fragment caches are bounded. Stable-MAC FDB hits use
 a read lock and relaxed timestamp update; MAC moves update that bridge's table.
 Absent packet observers, capture skips its observer/queue lock and packet copy.
 
-Private Trames networks transport Ethernet through their existing private Unix
-datagram endpoints. Learned unicast avoids directory discovery; floods discover
+Private Trames networks transport length-framed Ethernet through nonblocking
+Unix streams. Each peer owns its connection, partial-write offset and bounded
+2 MiB pending-frame queue. A frame is retained across short writes; actual
+writable readiness resumes a blocked connection. Receive decoding preserves
+partial frames and accepts full-size IP datagrams instead of truncating them
+at 4 KiB. The existing executor observes one stable resource event source;
+no connection-broker thread is added. Learned unicast avoids directory discovery; floods discover
 peers only within that named network. The transport is internal to Trames and
 requires matching runtime versions at both ends. It never exposes the LAN's L2
 segment. STP/RSTP, distributed loop detection, LACP and multicast snooping are
 not implemented; userspace relays must not form forwarding cycles. The bounded
 work slice/queues contain floods, but do not make a cyclic topology useful.
+
+Virtual UDP applies SO_RCVBUF/SO_SNDBUF before bind and to live sockets.
+Packet descriptors derive from the byte budget (including zero-length
+messages), rather than an unrelated 16-message limit. Shrinking below occupied
+data preserves that data and blocks further enqueue until it drains. The small
+vendored [smoltcp patch](../../vendor/smoltcp/TRAMES-PATCHES.md) exposes owned-buffer
+resizing and preserves a pending IPv4 fragmenter across subsequent sends.
+A full nonblocking writer advances its own pending protocol work before
+returning EAGAIN, without reacquiring the fabric or borrowing a guest task.
+
+Endpoint fragment caches allocate to received extent and evict the least
+recently updated incomplete datagram under a 512 KiB retained-data budget.
+Losing or poisoning a few datagrams therefore cannot close all admission for
+60 seconds. Overlapping datagrams remain invalid; pressure can discard old
+incomplete work. Pure bridge forwarding still never reassembles packets.
+
+The mutable fabric transaction remains the owner of the shared protocol stack.
+Within it, only dirty nodes, queued ingress and due protocol deadlines poll
+interfaces. Buffered socket reads do not progress unrelated nodes. Empty
+firewall policy and non-translating conntrack hits avoid redundant rule locks,
+route lookups and transport checksum rewrites. This reduces work inside the
+transaction; it does not claim per-flow parallel protocol execution.
 
 A weak protocol-resource handle registers its actual native/Unix event sources
 and earliest protocol deadline with the existing executor. It can complete ARP
@@ -136,12 +163,14 @@ Implementation commit: `3a729258770cad9ed50035aaa4397d3ab8a6cb9a`.
   and ARP completion across separate fabrics while the sender has no network
   wait. No new runtime service thread is used.
 
-The current TCP/UDP benchmark and its limits are recorded in the
-[network performance report](../validation/internal-network-tcp-udp-20261117.md).
+The transport/queue follow-up and current TCP/UDP measurements are recorded in
+[the fix report](../validation/internal-network-fixes-20261117.md). The
+[original baseline](../validation/internal-network-tcp-udp-20261117.md) retains
+the failures that motivated these changes.
 It covers native loopback, shared internal Ethernet and independent fabrics
 joined by private Unix links, with concurrent senders/receivers, RTT, one/four
-flows and UDP loss/burst retention. Incomplete private-link TCP transfers are
-reported explicitly.
+flows and UDP loss/burst retention. Completion status and loss remain explicit;
+shared-fabric lock contention is a remaining scaling limit.
 
 ```sh
 python3 runtime/scripts/benchmark-ethernet.py 3 0.75 3000 > tcp-udp.csv
@@ -149,9 +178,8 @@ python3 runtime/scripts/benchmark-ethernet.py 3 0.75 3000 > tcp-udp.csv
 
 This supersedes the original single-threaded UDP send/consume harness. Its
 figures are a different workload and must not be compared as a before/after
-speedup. The new report records the host/internal MTU difference and known
-queue/backpressure problems; none is hidden behind successful short-packet
-smoke tests.
+speedup. The reports retain the host/internal MTU difference and unpaced UDP loss;
+short-packet smoke tests alone are not bulk-transfer acceptance.
 
 References: [Linux bridge](https://docs.kernel.org/networking/bridge.html),
 [packet sockets](https://man7.org/linux/man-pages/man7/packet.7.html),
