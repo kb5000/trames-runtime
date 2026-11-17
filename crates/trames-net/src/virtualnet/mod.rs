@@ -59,6 +59,8 @@ pub struct LinkStats {
 #[derive(Clone)]
 pub struct Fabric(Arc<FabricState<Inner>>);
 struct Inner {
+    notifications: Vec<Arc<trames_shared::Readiness>>,
+    injected: VecDeque<(u64, u32, [u8; 6], Vec<u8>)>,
     started: Instant,
     next_node: u64,
     nodes: BTreeMap<u64, Node>,
@@ -257,6 +259,8 @@ fn make_node(id: u8, now: smoltcp::time::Instant) -> Result<Node> {
 impl Fabric {
     pub fn new() -> Result<Self> {
         Ok(Self(Arc::new(FabricState::new(Inner {
+            notifications: Vec::new(),
+            injected: VecDeque::new(),
             started: Instant::now(),
             next_node: 1,
             nodes: BTreeMap::new(),
@@ -464,6 +468,11 @@ fn private_ip(a: IpAddr) -> bool {
         IpAddr::V6(a) => a.segments()[..4] == [0xfd00, 0, 0, 0],
     }
 }
+impl crate::shared_state::AfterUnlock for Inner {
+    fn take_notifications(&mut self) -> Vec<Arc<trames_shared::Readiness>> {
+        std::mem::take(&mut self.notifications)
+    }
+}
 impl Inner {
     fn now(&self) -> smoltcp::time::Instant {
         smoltcp::time::Instant::from_millis(
@@ -536,11 +545,15 @@ impl Inner {
         // Bound work per scheduler slice even when a peer produces data continuously.
         for _ in 0..32 {
             self.gateway.service(now, &self.nodes);
-            let mut packets = Vec::new();
+            let mut packets: Vec<_> = self
+                .injected
+                .drain(..)
+                .map(|(key, index, peer, p)| (key, Some(index), peer, p))
+                .collect();
             for (&key, node) in &mut self.nodes {
                 node.iface.poll(now, &mut node.port, &mut node.sockets);
                 while let Some(p) = node.port.tx.pop_front() {
-                    packets.push((key, p));
+                    packets.push((key, None, [0; 6], p));
                 }
             }
             self.gateway.node.iface.poll(
@@ -549,12 +562,12 @@ impl Inner {
                 &mut self.gateway.node.sockets,
             );
             while let Some(p) = self.gateway.node.port.tx.pop_front() {
-                packets.push((0, p));
+                packets.push((0, None, [0; 6], p));
             }
             if packets.is_empty() {
                 break;
             }
-            for (source, mut p) in packets {
+            for (source, injected, peer, mut p) in packets {
                 let lo = packet::header(&p).is_some_and(|h| h.tuple.destination.ip().is_loopback());
                 if let Some(n) = self.nodes.get_mut(&source) {
                     let s = &mut n.links[usize::from(!lo)];
@@ -630,16 +643,29 @@ impl Inner {
                         continue;
                     }
                     let original = crate::conntrack::key(&p);
-                    let incoming = routed_reply.as_ref().map(|r| r.1);
-                    delivery =
-                        view.graph
-                            .read()
-                            .unwrap()
-                            .route_packet(view.namespace, incoming, &mut p);
+                    let incoming = injected.or_else(|| routed_reply.as_ref().map(|r| r.1));
+                    delivery = view.graph.read().unwrap().route_packet_observed(
+                        view.namespace,
+                        incoming,
+                        peer,
+                        &mut p,
+                        &mut self.notifications,
+                    );
                     let Some(route) = delivery else {
                         self.stats.dropped += 1;
                         continue;
                     };
+                    if route.tunnel {
+                        let graph = view.graph.read().unwrap();
+                        let delivered = graph
+                            .tunnel(route.namespace, route.input)
+                            .is_some_and(|port| port.enqueue(&p, &mut self.notifications));
+                        graph.account(route.namespace, route.input, p.len(), true, !delivered);
+                        if !delivered {
+                            self.stats.dropped += 1;
+                        }
+                        continue;
+                    }
                     if route.external {
                         let Some(wire) = crate::conntrack::key(&p) else {
                             self.stats.dropped += 1;
@@ -996,6 +1022,69 @@ impl Drop for Namespace {
 impl Network {
     pub(super) fn fabric(&self) -> Fabric {
         self.0.fabric.clone()
+    }
+    pub(crate) fn inject(&self, interface: u32, packet: &[u8]) -> Result<()> {
+        if self.0.mode == NetworkMode::Off {
+            return Err(NetError(13));
+        }
+        if packet.len() > 65535 || packet::header(packet).is_none() {
+            return Err(NetError(22));
+        }
+        let mut inner = self.0.fabric.0.borrow_mut();
+        if inner.injected.len() >= 96 {
+            return Err(NetError(11));
+        }
+        inner
+            .injected
+            .push_back((self.0.key, interface, [0; 6], packet.to_vec()));
+        inner.tick();
+        Ok(())
+    }
+    pub(crate) fn inject_link(&self, index: u32, mac: [u8; 6], packet: &[u8]) -> Result<()> {
+        let view = self.0.routing.as_ref().ok_or(NetError(95))?;
+        let graph = view.graph.read().unwrap();
+        let device = graph.device(view.namespace, index)?;
+        if !device.up {
+            return Err(NetError(100));
+        }
+        if packet.len() > device.mtu as usize {
+            return Err(NetError(90));
+        }
+        let destination = crate::conntrack::key(packet)
+            .ok_or(NetError(22))?
+            .tuple
+            .destination
+            .ip();
+        let (target, input) = graph.packet_peer(view.namespace, index, destination, mac)?;
+        drop(graph);
+        let mut inner = self.0.fabric.0.borrow_mut();
+        let key = inner
+            .nodes
+            .iter()
+            .find_map(|(&key, n)| {
+                n.owner.upgrade().and_then(|ns| {
+                    ns.routing.as_ref().and_then(|r| {
+                        (r.namespace == target && Arc::ptr_eq(&r.graph, &view.graph)).then_some(key)
+                    })
+                })
+            })
+            .ok_or(NetError(100))?;
+        if inner.injected.len() >= 96 {
+            return Err(NetError(11));
+        }
+        view.graph.read().unwrap().observe(
+            view.namespace,
+            index,
+            mac,
+            packet,
+            true,
+            &mut inner.notifications,
+        );
+        inner
+            .injected
+            .push_back((key, input, device.mac, packet.to_vec()));
+        inner.tick();
+        Ok(())
     }
     pub(super) fn mode(&self) -> NetworkMode {
         self.0.mode

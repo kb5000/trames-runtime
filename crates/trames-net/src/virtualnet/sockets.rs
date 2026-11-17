@@ -799,6 +799,7 @@ impl Socket {
         let state = self.state.borrow();
         if state.read_closed || self.kind == 1 && count == 0 {
             return Ok(Received {
+                packet_address: None,
                 netlink_address: None,
                 credentials: None,
                 packet_info: None,
@@ -811,6 +812,7 @@ impl Socket {
         if self.kind == 1 && state.connection != Connection::Connected {
             if matches!(state.connection, Connection::Failed(_)) && !state.blocking_failed {
                 return Ok(Received {
+                    packet_address: None,
                     netlink_address: None,
                     credentials: None,
                     packet_info: None,
@@ -830,6 +832,7 @@ impl Socket {
                     return Err(NetError(11));
                 }
                 return Ok(Received {
+                    packet_address: None,
                     netlink_address: None,
                     credentials: None,
                     packet_info: None,
@@ -851,6 +854,7 @@ impl Socket {
             drop(state);
             self.fabric().tick();
             Ok(Received {
+                packet_address: None,
                 netlink_address: None,
                 credentials: None,
                 packet_info: None,
@@ -899,6 +903,7 @@ impl Socket {
                         let _ = s.recv();
                     }
                     return Ok(Received {
+                        packet_address: None,
                         netlink_address: None,
                         credentials: None,
                         packet_info,
@@ -1275,6 +1280,7 @@ impl Socket {
         }
         if state.read_closed {
             return Ok(Received {
+                packet_address: None,
                 netlink_address: None,
                 credentials: None,
                 packet_info: None,
@@ -1335,6 +1341,7 @@ impl Socket {
         let (data, peer) = state.icmp_pending.as_ref().ok_or(NetError(11))?;
         let length = data.len();
         let received = Received {
+            packet_address: None,
             netlink_address: None,
             credentials: None,
             packet_info: None,
@@ -1412,6 +1419,7 @@ impl Socket {
         }
         if state.read_closed {
             return Ok(Received {
+                packet_address: None,
                 netlink_address: None,
                 credentials: None,
                 packet_info: None,
@@ -1446,6 +1454,7 @@ impl Socket {
         let (data, peer) = state.icmp_pending.as_ref().unwrap();
         let length = data.len();
         let received = Received {
+            packet_address: None,
             netlink_address: None,
             credentials: None,
             packet_info: None,

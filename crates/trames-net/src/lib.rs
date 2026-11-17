@@ -9,9 +9,12 @@ mod native;
 mod netdev;
 mod netlink;
 mod nftables;
+mod packet_socket;
 mod rtnetlink;
 mod shared_state;
+mod socket_filter;
 mod socket_quota;
+pub mod tun;
 pub use netdev::{Address as DeviceAddress, Device, DeviceKind, Route as DeviceRoute};
 mod virtualnet;
 use crate::shared_state::Cell;
@@ -333,6 +336,14 @@ impl Network {
     }
     pub fn socket(&self, family: u32, kind: u32, protocol: u32) -> Result<Arc<Socket>> {
         let reservation = self.1.socket_count.reserve()?;
+        if family == 17 {
+            return Ok(Socket::wrap(
+                SocketBackend::Packet(packet_socket::Socket::new(self.1.clone(), kind, protocol)?),
+                self.1.clone(),
+                reservation,
+                kind,
+            ));
+        }
         if family == 16 {
             return Ok(Socket::wrap(
                 SocketBackend::Netlink(netlink::Socket::new(
@@ -374,6 +385,7 @@ pub struct Socket {
     changed: Arc<trames_shared::Readiness>,
 }
 enum SocketBackend {
+    Packet(Arc<packet_socket::Socket>),
     Hybrid(Arc<hybrid::Socket>),
     Netlink(Arc<netlink::Socket>),
     Native(Arc<native::Socket>),
@@ -383,7 +395,7 @@ macro_rules! delegate {
     ($gate:ident, $name:ident($($arg:ident:$ty:ty),*) -> $ret:ty) => {
         pub fn $name(&self,$($arg:$ty),*) -> $ret {
             let _operation = self.operation.$gate();
-            match &self.backend {SocketBackend::Hybrid(s)=>s.$name($($arg),*), SocketBackend::Native(s)=>s.$name($($arg),*),SocketBackend::Virtual(s)=>s.$name($($arg),*), SocketBackend::Netlink(s)=>s.$name($($arg),*) }
+            match &self.backend {SocketBackend::Packet(s)=>s.$name($($arg),*), SocketBackend::Hybrid(s)=>s.$name($($arg),*), SocketBackend::Native(s)=>s.$name($($arg),*),SocketBackend::Virtual(s)=>s.$name($($arg),*), SocketBackend::Netlink(s)=>s.$name($($arg),*) }
         }
     }
 }
@@ -532,6 +544,7 @@ impl Socket {
     pub fn poll_epoch(&self) -> Option<[u64; 2]> {
         let _operation = self.operation.read_recursive();
         match &self.backend {
+            SocketBackend::Packet(s) => Some(s.poll_epoch()),
             SocketBackend::Netlink(s) => Some(s.poll_epoch()),
             SocketBackend::Native(s) => s.poll_epoch(),
             SocketBackend::Hybrid(s) => s.poll_epoch(),
@@ -549,7 +562,7 @@ impl Socket {
                 (native.into_iter().map(|(s, _)| s).collect(), fabric)
             }
             SocketBackend::Virtual(s) => (Vec::new(), Some(s.fabric())),
-            SocketBackend::Netlink(_) => (Vec::new(), None),
+            SocketBackend::Packet(_) | SocketBackend::Netlink(_) => (Vec::new(), None),
         };
         let delay = fabric.as_ref().map(|f| f.next_wait());
         let external = fabric.as_ref().and_then(|f| f.external_waiter());
@@ -580,6 +593,7 @@ impl Socket {
     pub fn wait_delay(&self) -> Option<Duration> {
         let _operation = self.operation.read_recursive();
         match &self.backend {
+            SocketBackend::Packet(socket) => socket.wait_delay(),
             SocketBackend::Hybrid(socket) => socket.waiters(5).1.map(|fabric| fabric.next_wait()),
             SocketBackend::Virtual(socket) => Some(socket.fabric().next_wait()),
             _ => None,
@@ -610,12 +624,22 @@ impl Socket {
             SocketBackend::Hybrid(s) => Some(s.info()),
             SocketBackend::Virtual(s) => Some(s.info()),
             SocketBackend::Native(s) => Some(s.info()),
-            SocketBackend::Netlink(_) => None,
+            SocketBackend::Packet(_) | SocketBackend::Netlink(_) => None,
         }?;
         info.namespace_id = self.namespace.id();
         Some(info)
     }
+    /// Imported classic BPF only, never a guest sock_fprog pointer.
+    pub fn attach_filter(&self, instructions: &[u8]) -> Result<()> {
+        match &self.backend {
+            SocketBackend::Packet(s) => s.set_filter(Some(instructions)),
+            _ => Err(NetError(92)),
+        }
+    }
     pub fn set_option_bytes(&self, level: u32, name: u32, value: &[u8]) -> Result<()> {
+        if let SocketBackend::Packet(s) = &self.backend {
+            return s.set_option_bytes(level, name, value);
+        }
         if let SocketBackend::Hybrid(s) = &self.backend {
             let _operation = self.operation.write();
             return s.set_option_bytes(level, name, value);
@@ -696,6 +720,9 @@ impl Socket {
         }
     }
     pub fn bind_bytes(&self, bytes: &[u8]) -> Result<()> {
+        if let SocketBackend::Packet(s) = &self.backend {
+            return s.bind_bytes(bytes);
+        }
         if let SocketBackend::Netlink(s) = &self.backend {
             {
                 let _operation = self.operation.write();
@@ -718,6 +745,9 @@ impl Socket {
         self.bind_bytes(bytes)
     }
     pub fn connect_bytes(&self, bytes: &[u8]) -> Result<()> {
+        if matches!(self.backend, SocketBackend::Packet(_)) {
+            return Err(NetError(95));
+        }
         if let SocketBackend::Netlink(s) = &self.backend {
             {
                 let _operation = self.operation.write();
@@ -728,6 +758,9 @@ impl Socket {
         }
     }
     pub fn local_bytes(&self) -> Result<Vec<u8>> {
+        if let SocketBackend::Packet(s) = &self.backend {
+            return s.local_bytes();
+        }
         if let SocketBackend::Netlink(s) = &self.backend {
             {
                 let _operation = self.operation.read_recursive();
@@ -748,6 +781,9 @@ impl Socket {
         }
     }
     pub fn received_address(&self, received: &Received) -> Vec<u8> {
+        if let Some(address) = received.packet_address {
+            return address.to_vec();
+        }
         if matches!(self.backend, SocketBackend::Netlink(_)) {
             received
                 .netlink_address
@@ -781,6 +817,9 @@ impl Socket {
         net_admin: bool,
         resolve: &dyn Fn(u32) -> Result<Network>,
     ) -> Result<usize> {
+        if let SocketBackend::Packet(s) = &self.backend {
+            return s.send_bytes(bytes, flags, destination);
+        }
         if let SocketBackend::Netlink(s) = &self.backend {
             let mut wakes = netlink::Notifications::default();
             let result = {
@@ -810,12 +849,13 @@ impl Socket {
         signal: &Arc<trames_shared::IoSignal>,
     ) -> Option<trames_shared::IoSubscription> {
         match &self.backend {
+            SocketBackend::Packet(socket) => Some(socket.subscribe(signal)),
             SocketBackend::Netlink(socket) => Some(socket.subscribe(signal)),
             _ => None,
         }
     }
     pub fn send(&self, bytes: &[u8], flags: u32, address: Option<SocketAddr>) -> Result<usize> {
-        if self.is_netlink() {
+        if self.is_netlink() || matches!(self.backend, SocketBackend::Packet(_)) {
             if address.is_some() {
                 return Err(NetError(97));
             }
@@ -826,7 +866,7 @@ impl Socket {
             SocketBackend::Native(socket) => socket.send(bytes, flags, address),
             SocketBackend::Hybrid(socket) => socket.send(bytes, flags, address),
             SocketBackend::Virtual(socket) => socket.send(bytes, flags, address),
-            SocketBackend::Netlink(_) => unreachable!(),
+            SocketBackend::Packet(_) | SocketBackend::Netlink(_) => unreachable!(),
         }
     }
     delegate!(
@@ -847,7 +887,7 @@ impl Socket {
         let reservation = self.namespace.socket_count.reserve()?;
         let (backend, peer) = match &self.backend {
             SocketBackend::Hybrid(s) => s.accept()?,
-            SocketBackend::Netlink(_) => return Err(NetError(95)),
+            SocketBackend::Packet(_) | SocketBackend::Netlink(_) => return Err(NetError(95)),
             SocketBackend::Native(s) => {
                 let (s, peer) = s.accept()?;
                 (SocketBackend::Native(s), peer)
@@ -888,7 +928,7 @@ pub fn wait_with_fds(
                     }
                 }
             }
-            SocketBackend::Netlink(_) => {}
+            SocketBackend::Packet(_) | SocketBackend::Netlink(_) => {}
             SocketBackend::Native(s) => native.push((s.clone(), *events)),
             SocketBackend::Virtual(s) => {
                 let f = s.fabric();
@@ -930,3 +970,6 @@ mod shared_network_tests;
 
 #[cfg(test)]
 mod managed_network_tests;
+
+#[cfg(test)]
+mod packet_tests;

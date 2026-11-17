@@ -108,16 +108,41 @@ impl<T> State<T> {
 }
 /// The userspace packet stack has one actual mutable fabric transaction. It
 /// does not protect independent fabrics or the native TCP byte path.
-#[derive(Default)]
-pub(crate) struct FabricState<T>(Mutex<T>);
-impl<T> FabricState<T> {
+pub(crate) trait AfterUnlock {
+    fn take_notifications(&mut self) -> Vec<std::sync::Arc<trames_shared::Readiness>>;
+}
+pub(crate) struct FabricState<T: AfterUnlock>(Mutex<T>);
+pub(crate) struct FabricGuard<'a, T: AfterUnlock>(Option<parking_lot::MutexGuard<'a, T>>);
+impl<T: AfterUnlock> std::ops::Deref for FabricGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.0.as_ref().unwrap()
+    }
+}
+impl<T: AfterUnlock> std::ops::DerefMut for FabricGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.0.as_mut().unwrap()
+    }
+}
+impl<T: AfterUnlock> Drop for FabricGuard<'_, T> {
+    fn drop(&mut self) {
+        let mut wakes = self.0.as_mut().unwrap().take_notifications();
+        drop(self.0.take());
+        wakes.sort_unstable_by_key(std::sync::Arc::as_ptr);
+        wakes.dedup_by(|a, b| std::sync::Arc::ptr_eq(a, b));
+        for source in wakes {
+            source.notify_locked();
+        }
+    }
+}
+impl<T: AfterUnlock> FabricState<T> {
     pub fn new(value: T) -> Self {
         Self(Mutex::new(value))
     }
-    pub fn borrow(&self) -> parking_lot::MutexGuard<'_, T> {
-        self.0.lock()
+    pub fn borrow(&self) -> FabricGuard<'_, T> {
+        FabricGuard(Some(self.0.lock()))
     }
-    pub fn borrow_mut(&self) -> parking_lot::MutexGuard<'_, T> {
-        self.0.lock()
+    pub fn borrow_mut(&self) -> FabricGuard<'_, T> {
+        FabricGuard(Some(self.0.lock()))
     }
 }

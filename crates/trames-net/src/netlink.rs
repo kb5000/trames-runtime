@@ -59,7 +59,22 @@ impl Default for Namespace {
 }
 impl Namespace {
     pub fn notify(&self, changes: Vec<(u64, u16, u32, Vec<u8>)>) {
-        notify(&self.listeners, changes);
+        let mut wakes = Notifications::default();
+        self.link_wakes(&changes, &mut wakes);
+        notify_deferred(&self.listeners, changes, &mut wakes);
+        wakes.flush();
+    }
+    fn link_wakes(&self, changes: &[(u64, u16, u32, Vec<u8>)], wakes: &mut Notifications) {
+        let graph = self.graph.read().unwrap();
+        for (ns, kind, _, data) in changes {
+            if matches!(kind, 16 | 17) && data.len() >= 8 {
+                graph.link_wakes(
+                    *ns,
+                    u32::from_le_bytes(data[4..8].try_into().unwrap()),
+                    &mut wakes.0,
+                );
+            }
+        }
     }
     pub fn isolated(&self, loopback: std::sync::Arc<crate::netdev::Loopback>) -> Result<Self> {
         let reservation = self.quota.reserve().map_err(|_| NetError(28))?;
@@ -147,7 +162,7 @@ impl Drop for Namespace {
         if let Some(stack) = self.stack.take() {
             stack.finish();
         }
-        let changes = {
+        let changes: Vec<_> = {
             let mut graph = self.graph.write().unwrap();
             let removed = graph.removed_with_space(self.id());
             graph.remove_space(self.id());
@@ -156,7 +171,10 @@ impl Drop for Namespace {
                 .map(|d| (d.namespace, 17, 1, crate::rtnetlink::link_data(&graph, &d)))
                 .collect()
         };
-        notify(&self.listeners, changes);
+        let mut wakes = Notifications::default();
+        self.link_wakes(&changes, &mut wakes);
+        notify_deferred(&self.listeners, changes, &mut wakes);
+        wakes.flush();
     }
 }
 pub(super) struct Socket {
@@ -256,6 +274,7 @@ impl Notifications {
         }
     }
 }
+#[cfg(test)]
 fn notify(listeners: &Arc<SharedState<Vec<Weak<Socket>>>>, changes: Vec<(u64, u16, u32, Vec<u8>)>) {
     let mut wakes = Notifications::default();
     notify_deferred(listeners, changes, &mut wakes);
@@ -323,7 +342,7 @@ impl Socket {
             // ND_USEROPT is a valid subscription too. This guest network has
             // no router-advertisement producer, so it remains quiet until one
             // exists, like a Linux interface receiving no advertisements.
-            0 => 1 | 0x10 | 0x40 | 0x80 | 0x100 | 0x400 | (1 << 19),
+            0 => 1 | 4 | 0x10 | 0x40 | 0x80 | 0x100 | 0x400 | (1 << 19),
             // Container devices are provisioned before listeners start. This
             // is the guest's actual quiet uevent channel, not the host's device
             // stream. Device injection and synthetic broadcasts are unsupported.
@@ -513,7 +532,7 @@ impl Socket {
             && requests.iter().any(|r| {
                 matches!(
                     u16::from_le_bytes(r[4..6].try_into().unwrap()),
-                    16 | 17 | 19 | 20 | 21 | 24 | 25 | 32 | 33
+                    16 | 17 | 19 | 20 | 21 | 24 | 25 | 28 | 29 | 32 | 33
                 )
             })
         {
@@ -537,7 +556,7 @@ impl Socket {
             // side-effect free and are checked against the exact response size.
             if matches!(
                 u16::from_le_bytes(request[4..6].try_into().unwrap()),
-                16 | 17 | 19 | 20 | 21 | 24 | 25 | 32 | 33
+                16 | 17 | 19 | 20 | 21 | 24 | 25 | 28 | 29 | 32 | 33
             ) && (self.replies.borrow().len() + replies.len() >= 128
                 || self
                     .replies
@@ -558,6 +577,7 @@ impl Socket {
                 resolve,
             )?;
             wakes.1.extend(r.retained_namespaces);
+            self.namespace.link_wakes(&r.changes, wakes);
             notify_deferred(&self.namespace.listeners, r.changes, wakes);
             let generated = r.messages;
             if replies.len() + generated.len() > 128 {
@@ -628,6 +648,7 @@ impl Socket {
         let bytes = &packet.data;
         let result = Received {
             packet_info: None,
+            packet_address: None,
             netlink_address: Some(packet.source),
             credentials: self.pass_credentials.get().then_some([0, 0, 0]),
             data: bytes[..bytes.len().min(count)].to_vec(),

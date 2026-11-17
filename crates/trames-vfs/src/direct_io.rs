@@ -235,6 +235,7 @@ pub trait DirectPoll: Send + Sync {
 }
 #[derive(Clone)]
 enum ByteResource {
+    Tun(Arc<trames_net::tun::Connection>),
     Console(console::ConsoleEndpoint),
     Cgroup(Arc<cgroup::CgroupFile>, Option<cgroup::CgroupAccess>),
     TcpPoll(trames_net::TcpPoll),
@@ -552,6 +553,7 @@ impl DirectFd {
             }
         } else {
             match &open.control {
+                Some(events::SharedControl::Tun(file)) => ByteResource::Tun(file.clone()),
                 Some(events::SharedControl::Sync(file)) => {
                     ByteResource::PollOnly(file.poll_handle())
                 }
@@ -686,6 +688,7 @@ impl DirectFd {
             (ByteResource::SocketPoll(a), ByteResource::SocketPoll(b)) => {
                 std::sync::Weak::ptr_eq(a, b)
             }
+            (ByteResource::Tun(a), ByteResource::Tun(b)) => Arc::ptr_eq(a, b),
             (ByteResource::Kmsg(a), ByteResource::Kmsg(b)) => a.same_log(b),
             (ByteResource::Bridge(a), ByteResource::Bridge(b)) => std::sync::Weak::ptr_eq(a, b),
             (ByteResource::Epoll(a), _) => {
@@ -779,6 +782,7 @@ impl DirectFd {
                 tcp.poll_event_fd().map(Into::into),
                 signal,
             )],
+            ByteResource::Tun(file) => file.subscribe(signal).into_iter().collect(),
             ByteResource::Mounts(watch) => vec![watch.subscribe(signal)],
             ByteResource::Cgroup(file, _) => vec![file.subscribe(signal)],
             ByteResource::Bpf
@@ -1178,6 +1182,9 @@ impl DirectFd {
     }
     pub fn next_deadline(&self) -> Option<std::time::Instant> {
         match &self.resource {
+            ByteResource::Tun(file) => file
+                .wait_delay()
+                .and_then(|d| std::time::Instant::now().checked_add(d)),
             ByteResource::Timer(timer) => timer.deadline(),
             ByteResource::SocketPoll(socket) => socket
                 .upgrade()
@@ -1248,6 +1255,7 @@ impl DirectFd {
                     s.poll_epoch().unwrap_or([0; 2]),
                 )
             }),
+            ByteResource::Tun(file) => file.poll(events),
             ByteResource::Mounts(watch) => watch.peek(events),
             ByteResource::Bpf => (0, [0; 2]),
             ByteResource::Regular | ByteResource::SimpleDevice(_) | ByteResource::Device(_) => {
@@ -1515,6 +1523,7 @@ impl DirectFd {
                     })
             }
             ByteResource::Cgroup(_, None) => return None,
+            ByteResource::Tun(file) => file.read(count).map_err(|e| Errno(e.0)),
             ByteResource::Kmsg(log) => log.read(count),
             ByteResource::Device(device) => {
                 // The original sequential VFS read completes empty buffers
@@ -1631,6 +1640,7 @@ impl DirectFd {
                 Ok(count)
             }
             ByteResource::Cgroup(_, None) => Err(Errno(95)),
+            ByteResource::Tun(file) => file.write(bytes).map_err(|e| Errno(e.0)),
             ByteResource::Kmsg(log) => log.write(bytes),
             ByteResource::Device(device) => device.write(bytes),
             ByteResource::Bridge(bridge) => bridge

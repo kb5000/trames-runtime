@@ -1271,6 +1271,13 @@ impl Vfs {
         pending: u64,
         reader: Option<&Arc<dyn SignalReader>>,
     ) -> u16 {
+        if let Some(events::SharedControl::Tun(file)) = &o.control {
+            return if o.flags.get() & O_PATH != 0 {
+                32
+            } else {
+                file.poll(events).0
+            };
+        }
         if let Some(events::SharedControl::Binder(process)) = &o.control {
             return if o.flags.get() & O_PATH != 0 {
                 32
@@ -2705,6 +2712,9 @@ impl Vfs {
         };
         let binder_control = if flags & O_PATH == 0 {
             match node.borrow().content {
+                Content::Device(pseudo::Device::Tun) => {
+                    Some(events::SharedControl::Tun(self.network.open_tun()))
+                }
                 Content::Device(pseudo::Device::Binder(device)) => {
                     Some(events::SharedControl::Binder(self.binder.open(
                         device as usize,
@@ -3067,6 +3077,17 @@ impl Vfs {
         };
         write.commit(&bytes)
     }
+    pub fn tun_file(&self, fd: u32) -> Result<Option<Arc<trames_net::tun::Connection>>> {
+        let d = self.descriptor(fd)?;
+        let o = d.open.borrow();
+        if o.flags.get() & O_PATH != 0 {
+            return Err(Errno(9));
+        }
+        Ok(match &o.control {
+            Some(events::SharedControl::Tun(file)) => Some(file.clone()),
+            _ => None,
+        })
+    }
     pub fn read(&mut self, fd: u32, count: usize) -> Result<Vec<u8>> {
         self.refresh_pseudo_fd(fd)?;
         let descriptor = self.descriptor(fd)?;
@@ -3079,6 +3100,11 @@ impl Vfs {
         }
         if o.flags.get() & O_PATH != 0 || o.flags.get() & 3 == 1 {
             return Err(Errno(9));
+        }
+        if let Some(events::SharedControl::Tun(file)) = &o.control {
+            let file = file.clone();
+            drop(o);
+            return file.read(count).map_err(|e| Errno(e.0));
         }
         if let Some(file) = &o.mount_file {
             let mut position = o.file_position.lock().unwrap();
@@ -3178,6 +3204,11 @@ impl Vfs {
         }
         if o.flags.get() & 3 == 0 {
             return Err(Errno(9));
+        }
+        if let Some(events::SharedControl::Tun(file)) = &o.control {
+            let file = file.clone();
+            drop(o);
+            return file.write(bytes).map_err(|e| Errno(e.0));
         }
         if let Some(log) = &o.kernel_log {
             return log.write(bytes);

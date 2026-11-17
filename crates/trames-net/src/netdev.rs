@@ -49,12 +49,18 @@ pub(crate) use policy::{Context as RouteContext, Entry as PolicyRoute, Rule};
 const MAX_LINKS: usize = 256;
 const MAX_ADDRESSES: usize = 6; // Plus the two loopback addresses in smoltcp.
 const MAX_ROUTES: usize = 64;
+#[path = "neighbors.rs"]
+mod neighbors;
+#[path = "netdev_packet.rs"]
+mod packet;
+pub(crate) use neighbors::Entry as NeighborEntry;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceKind {
     Loopback,
     Direct,
     Veth { peer: u32 },
     Bridge,
+    Tun,
 }
 #[derive(Clone, Debug)]
 pub struct Device {
@@ -143,6 +149,9 @@ pub struct Route {
 #[derive(Clone)]
 struct Space {
     lo: Option<Arc<Loopback>>,
+    packets: Arc<crate::packet_socket::Hub>,
+    tunnels: BTreeMap<u32, std::sync::Weak<crate::tun::Port>>,
+    neighbors: BTreeMap<(u32, IpAddr), NeighborEntry>,
     routes: Vec<Route>,
     direct: bool,
     managed_uplink: bool,
@@ -352,6 +361,9 @@ impl Topology {
             id,
             Space {
                 lo,
+                packets: Arc::default(),
+                tunnels: BTreeMap::new(),
+                neighbors: BTreeMap::new(),
                 routes: vec![],
                 direct: false,
                 managed_uplink: false,
@@ -713,7 +725,7 @@ impl Topology {
         if !self.spaces.contains_key(&target) {
             return Err(NetError(2));
         }
-        if target != id && old.kind == DeviceKind::Bridge {
+        if target != id && matches!(old.kind, DeviceKind::Bridge | DeviceKind::Tun) {
             return Err(NetError(22));
         }
         if target != id && master.is_some_and(|m| m != 0) {
@@ -735,6 +747,11 @@ impl Topology {
         d.namespace = target;
         d.name = newname.to_vec();
         if target != id {
+            self.spaces
+                .get_mut(&id)
+                .unwrap()
+                .neighbors
+                .retain(|(i, _), _| *i != index);
             d.up = false;
             d.master = None;
             d.addresses.clear();
@@ -788,12 +805,14 @@ impl Topology {
             {
                 self.devices.remove(&key);
                 if let Some(s) = self.spaces.get_mut(&key.0) {
+                    s.neighbors.retain(|(i, _), _| *i != peer);
                     s.routes.retain(|r| r.device != peer);
                     s.policy.forget_device(peer);
                 }
             }
         }
         if let Some(s) = self.spaces.get_mut(&id) {
+            s.neighbors.retain(|(i, _), _| *i != index);
             s.routes.retain(|r| r.device != index);
             s.policy.forget_device(index);
         }

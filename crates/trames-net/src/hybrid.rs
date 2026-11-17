@@ -191,8 +191,10 @@ impl Socket {
         }
         let graph = self.namespace.graph.read().unwrap();
         if graph.devices(self.namespace.id()).iter().any(|d| {
-            matches!(d.kind, DeviceKind::Bridge | DeviceKind::Veth { .. })
-                && d.addresses.iter().any(|a| a.ip == address)
+            matches!(
+                d.kind,
+                DeviceKind::Bridge | DeviceKind::Veth { .. } | DeviceKind::Tun
+            ) && d.addresses.iter().any(|a| a.ip == address)
         }) {
             return true;
         }
@@ -200,7 +202,12 @@ impl Socket {
             .source(self.namespace.id(), address)
             .ok()
             .and_then(|(_, index, _)| graph.device(self.namespace.id(), index).ok())
-            .is_some_and(|d| matches!(d.kind, DeviceKind::Bridge | DeviceKind::Veth { .. }))
+            .is_some_and(|d| {
+                matches!(
+                    d.kind,
+                    DeviceKind::Bridge | DeviceKind::Veth { .. } | DeviceKind::Tun
+                )
+            })
     }
     pub fn quiescent_tcp(&self) -> bool {
         (self.idle_tcp() || self.path.get() == Path::Native)

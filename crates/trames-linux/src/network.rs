@@ -67,6 +67,25 @@ pub(super) fn control(
             .map_err(net)
         }),
         208 => {
+            if a[1] as u32 == 1 && a[2] as u32 == 27 {
+                socket.set_option_bytes(1, 27, &[]).map_err(net)?;
+                return Ok(0);
+            }
+            if a[1] as u32 == 1 && a[2] as u32 == 26 {
+                if a[4] as u32 != 16 {
+                    return Err(Errno(22));
+                }
+                let fprog = memory.read_array::<16>(a[3]).map_err(|_| Errno(14))?;
+                let len = u16::from_le_bytes([fprog[0], fprog[1]]) as usize;
+                if len == 0 || len > 4096 {
+                    return Err(Errno(22));
+                }
+                let pointer = u64::from_le_bytes(fprog[8..16].try_into().unwrap());
+                let mut bytes = vec![0; len * 8];
+                memory.read(pointer, &mut bytes).map_err(|_| Errno(14))?;
+                socket.attach_filter(&bytes).map_err(net)?;
+                return Ok(0);
+            }
             if a[1] == 1 && matches!(a[2], 20 | 21 | 66 | 67) {
                 let timeout = timeout_option(memory, a)?;
                 socket.set_io_timeout(matches!(a[2], 20 | 66), timeout);
@@ -566,10 +585,10 @@ impl Linux {
                     let flags = u16::from_le_bytes(entry[16..18].try_into().unwrap());
                     // netd preserves IFF_NOARP when raising the guest IP-only
                     // uplink. Accept the link's existing intrinsic flag.
-                    let noarp = if device.kind == trames_net::DeviceKind::Direct {
-                        0x80
-                    } else {
-                        0
+                    let noarp = match device.kind {
+                        trames_net::DeviceKind::Direct => 0x80,
+                        trames_net::DeviceKind::Tun => 0x90,
+                        _ => 0,
                     };
                     if flags & !(1 | 2 | 8 | 0x40 | noarp | 0x1000) != 0 {
                         return Err(Errno(95));
@@ -583,7 +602,10 @@ impl Linux {
                     entry[16..18].copy_from_slice(
                         &(if loopback {
                             772u16
-                        } else if device.kind == trames_net::DeviceKind::Direct {
+                        } else if matches!(
+                            device.kind,
+                            trames_net::DeviceKind::Direct | trames_net::DeviceKind::Tun
+                        ) {
                             65534
                         } else {
                             1
@@ -599,8 +621,15 @@ impl Linux {
                 0x8913 => {
                     let flags: u16 = if loopback {
                         8 | if device.up { 0x41 } else { 0 }
-                    } else if device.kind == trames_net::DeviceKind::Direct {
-                        0x80 | if device.up { 0x41 } else { 0 }
+                    } else if matches!(
+                        device.kind,
+                        trames_net::DeviceKind::Direct | trames_net::DeviceKind::Tun
+                    ) {
+                        (if device.kind == trames_net::DeviceKind::Tun {
+                            0x90
+                        } else {
+                            0x80
+                        }) | if device.up { 0x41 } else { 0 }
                     } else {
                         0x1002
                             | u16::from(device.up)
@@ -1026,6 +1055,73 @@ mod tests {
         assert_eq!(
             linux.network_syscall(206, [999, 0, 0, 0, 0, 0], &mut memory),
             Err(Errno(9))
+        );
+    }
+}
+
+#[cfg(test)]
+mod packet_filter_tests {
+    use super::*;
+    use trames_memory::{Memory, Permissions, PAGE_SIZE};
+    #[test]
+    fn classic_filter_import_never_dereferences_guest_pointers_in_the_backend() {
+        let mut linux = Linux::new(0x10000);
+        linux
+            .vfs
+            .configure_network(trames_vfs::NetworkMode::Full)
+            .unwrap();
+        let fd = linux.vfs.socket(17, 3, 0x0300).unwrap();
+        let socket = linux.vfs.socket_fd(fd).unwrap();
+        let factory = linux.vfs.descriptor_factory();
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        let mut fprog = [0; 16];
+        fprog[0] = 1;
+        fprog[8..16].copy_from_slice(&0x9000u64.to_le_bytes());
+        memory.write(0x1000, &fprog).unwrap();
+        assert_eq!(
+            control(
+                &factory,
+                &socket,
+                208,
+                [fd as u64, 1, 26, 0x1000, 16, 0],
+                &mut memory
+            ),
+            Some(Err(Errno(14)))
+        );
+        fprog[8..16].copy_from_slice(&0x1100u64.to_le_bytes());
+        memory.write(0x1000, &fprog).unwrap();
+        memory.write(0x1100, &[6, 0, 0, 0, 64, 0, 0, 0]).unwrap();
+        assert_eq!(
+            control(
+                &factory,
+                &socket,
+                208,
+                [fd as u64, 1, 26, 0x1000, 16, 0],
+                &mut memory
+            ),
+            Some(Ok(0))
+        );
+        // Linux ignores the pointer/length for SO_DETACH_FILTER.
+        assert_eq!(
+            control(
+                &factory,
+                &socket,
+                208,
+                [fd as u64, 1, 27, u64::MAX, 0, 0],
+                &mut memory
+            ),
+            Some(Ok(0))
+        );
+        assert_eq!(
+            control(
+                &factory,
+                &socket,
+                208,
+                [fd as u64, 1, 27, 0, 0, 0],
+                &mut memory
+            ),
+            Some(Err(Errno(2)))
         );
     }
 }

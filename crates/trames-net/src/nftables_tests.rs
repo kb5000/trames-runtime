@@ -616,3 +616,73 @@ fn captured_tcp_uses_live_policy_and_retains_original_socket_after_close() {
         "weak capabilities must not pin namespace lifetime"
     );
 }
+
+#[test]
+fn tun_and_packet_injection_obey_ip_port_firewall_and_tap_precedes_input_drop() {
+    use crate::routing_tests::{assign, bridge, pair};
+    let root = Network::new(NetworkMode::Full);
+    let a = root.isolated().unwrap();
+    let b = root.isolated().unwrap();
+    let br = bridge(&root, b"fw-packet");
+    let ai = pair(&root, &a, b"fw-a", br);
+    let bi = pair(&root, &b, b"fw-b", br);
+    assign(&a, ai, "192.0.2.10", 24);
+    assign(&b, bi, "192.0.2.20", 24);
+    let tun = b.open_tun();
+    tun.attach(b"tun0", 0x1001, true).unwrap();
+    let ti = b
+        .devices()
+        .into_iter()
+        .find(|d| d.name == b"tun0")
+        .unwrap()
+        .index;
+    assign(&b, ti, "198.51.100.1", 24);
+    let tap = b.socket(17, 2, 0x0800u16.to_be() as u32).unwrap();
+    let rx = b.socket(2, 2, 0).unwrap();
+    rx.bind("0.0.0.0:7002".parse().unwrap()).unwrap();
+    let mut payload = vec![];
+    number(&mut payload, 1, 1);
+    number(&mut payload, 2, 2);
+    number(&mut payload, 3, 2);
+    number(&mut payload, 4, 2);
+    let mut v = vec![];
+    attr(&mut v, 1, &7002u16.to_be_bytes());
+    let mut cmp = vec![];
+    number(&mut cmp, 1, 1);
+    number(&mut cmp, 2, 0);
+    attr(&mut cmp, 3 | 0x8000, &v);
+    let mut e = expression("payload", &payload);
+    e.extend(expression("cmp", &cmp));
+    e.extend(verdict(0, None));
+    assert_eq!(
+        errno(&batch(
+            &b.1,
+            &[
+                table("packet-fw"),
+                chain("packet-fw", "input", Some(1), 0, 1),
+                rule("packet-fw", "input", &e)
+            ]
+        )),
+        0
+    );
+    let dropped = crate::packet_tests::udp4("198.51.100.2", "198.51.100.1", 7001, 7002, b"drop");
+    tun.write(&dropped).unwrap();
+    assert_eq!(rx.poll(1), Ok(0));
+    assert_eq!(tap.recv(100, 0).unwrap().data, dropped);
+    let mut allowed =
+        crate::packet_tests::udp4("198.51.100.2", "198.51.100.1", 7001, 7003, b"allow");
+    let rx_allowed = b.socket(2, 2, 0).unwrap();
+    rx_allowed.bind("0.0.0.0:7003".parse().unwrap()).unwrap();
+    tun.write(&allowed).unwrap();
+    assert_eq!(rx_allowed.recv(100, 0).unwrap().data, b"allow");
+    let _ = tap.recv(100, 0).unwrap();
+    let injector = a.socket(17, 2, 0x0800u16.to_be() as u32).unwrap();
+    let mac = b.devices().into_iter().find(|d| d.index == bi).unwrap().mac;
+    let destination = crate::packet_socket::address(ai, 0x800, 0, mac);
+    allowed = crate::packet_tests::udp4("192.0.2.10", "192.0.2.20", 7001, 7002, b"drop raw");
+    injector
+        .send_bytes(&allowed, 0, Some(&destination))
+        .unwrap();
+    assert_eq!(rx.poll(1), Ok(0));
+    assert_eq!(tap.recv(100, 0).unwrap().data, allowed);
+}

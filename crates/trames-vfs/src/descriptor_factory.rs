@@ -196,8 +196,7 @@ impl DescriptorFactory {
                 return Err(Errno(13));
             }
         }
-        if matches!(family, 2 | 10)
-            && kind & 0xf == 3
+        if (family == 17 || matches!(family, 2 | 10) && kind & 0xf == 3)
             && !self.credentials.has_cap(capabilities::NET_RAW)
         {
             return Err(Errno(1));

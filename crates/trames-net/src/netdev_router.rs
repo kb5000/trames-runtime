@@ -11,6 +11,7 @@ pub(crate) struct Delivery {
     pub input: u32,
     pub output: u32,
     pub external: bool,
+    pub tunnel: bool,
 }
 #[derive(Clone, Copy)]
 pub(crate) struct NativeForward {
@@ -148,15 +149,44 @@ impl Topology {
         incoming: Option<u32>,
         packet: &mut [u8],
     ) -> Option<Delivery> {
+        self.route_packet_inner(source, incoming, [0; 6], packet, None)
+    }
+    pub fn route_packet_observed(
+        &self,
+        source: u64,
+        incoming: Option<u32>,
+        peer: [u8; 6],
+        packet: &mut [u8],
+        wakes: &mut Vec<Arc<trames_shared::Readiness>>,
+    ) -> Option<Delivery> {
+        self.route_packet_inner(source, incoming, peer, packet, Some(wakes))
+    }
+    fn route_packet_inner(
+        &self,
+        source: u64,
+        incoming: Option<u32>,
+        peer: [u8; 6],
+        packet: &mut [u8],
+        mut wakes: Option<&mut Vec<Arc<trames_shared::Readiness>>>,
+    ) -> Option<Delivery> {
         let mut ns = source;
         let mut input = incoming;
+        let mut peer_mac = peer;
         let mut visited = BTreeSet::new();
         let mut first = 0;
         for _ in 0..16 {
             if !visited.insert(ns) {
                 return None;
             }
+            if let (Some(index), Some(wakes)) = (input, wakes.as_deref_mut()) {
+                self.observe(ns, index, peer_mac, packet, false, wakes);
+            }
             let (out, gateway, mut track) = self.route_namespace(ns, input, packet, false)?;
+            if out != 0 {
+                if let Some(wakes) = wakes.as_deref_mut() {
+                    self.observe(ns, out, [0; 6], packet, true, wakes);
+                }
+            }
             if first == 0 {
                 first = out;
             }
@@ -166,6 +196,7 @@ impl Topology {
                     input: input.unwrap_or(1),
                     output: first,
                     external: false,
+                    tunnel: false,
                 });
             }
             let destination = conntrack::key(packet)?.tuple.destination.ip();
@@ -187,9 +218,19 @@ impl Topology {
                     input: 1,
                     output: first,
                     external: false,
+                    tunnel: false,
                 });
             }
             let d = self.device(ns, out).ok()?;
+            if d.kind == DeviceKind::Tun {
+                return Some(Delivery {
+                    namespace: ns,
+                    input: out,
+                    output: first,
+                    external: false,
+                    tunnel: true,
+                });
+            }
             if d.kind == DeviceKind::Direct {
                 // Forwarded egress requires an actual source NAT binding. A
                 // route or ip_forward alone never opens the host network.
@@ -201,6 +242,7 @@ impl Topology {
                     input: out,
                     output: first,
                     external: true,
+                    tunnel: false,
                 });
             }
             let next = gateway.unwrap_or(destination);
@@ -208,10 +250,24 @@ impl Topology {
             if let Some((bridge_ns, bridge_index)) =
                 bridge.filter(|(b, _)| *b != ns && *b != target)
             {
+                let target_device = self.device(target, target_input).ok()?;
+                let frame = [d.mac, target_device.mac];
+                if let Some(wakes) = wakes.as_deref_mut() {
+                    if let DeviceKind::Veth { peer } = d.kind {
+                        self.observe_frame(bridge_ns, peer, frame, packet, false, wakes);
+                    }
+                    self.observe_frame(bridge_ns, bridge_index, frame, packet, false, wakes);
+                }
                 if self.spaces[&bridge_ns].bridge_filter[usize::from(destination.is_ipv6())] {
                     self.bridge_packet(bridge_ns, bridge_index, packet)?;
                 }
+                if let (DeviceKind::Veth { peer }, Some(wakes)) =
+                    (target_device.kind, wakes.as_deref_mut())
+                {
+                    self.observe_frame(bridge_ns, peer, frame, packet, true, wakes);
+                }
             }
+            peer_mac = d.mac;
             ns = target;
             input = Some(target_input);
         }
@@ -232,7 +288,27 @@ impl Topology {
         state.finish(t, ok);
         ok.then_some(())
     }
-    fn neighbor_path(&self, id: u64, out: u32, address: IpAddr) -> Option<Neighbor> {
+    pub(super) fn neighbor_path(&self, id: u64, out: u32, address: IpAddr) -> Option<Neighbor> {
+        let result = self.resolve_neighbor_path(id, out, address)?;
+        if let Some(entry) = self.spaces[&id].neighbors.get(&(out, address)) {
+            if entry.state & (1 | 32) != 0 {
+                return None;
+            }
+            if entry.mac.is_some_and(|mac| {
+                self.device((result.0).0, (result.0).1)
+                    .is_ok_and(|d| d.mac != mac)
+            }) {
+                return None;
+            }
+        }
+        Some(result)
+    }
+    pub(super) fn resolve_neighbor_path(
+        &self,
+        id: u64,
+        out: u32,
+        address: IpAddr,
+    ) -> Option<Neighbor> {
         let mut todo = vec![((id, out), None)];
         let mut visited = BTreeSet::new();
         while let Some((key, bridge)) = todo.pop() {

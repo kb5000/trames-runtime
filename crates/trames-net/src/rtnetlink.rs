@@ -59,7 +59,7 @@ pub(crate) fn link_data(g: &Topology, d: &Device) -> Vec<u8> {
     data[2..4].copy_from_slice(
         &(match d.kind {
             DeviceKind::Loopback => 772u16,
-            DeviceKind::Direct => 65534,
+            DeviceKind::Direct | DeviceKind::Tun => 65534,
             _ => 1,
         })
         .to_le_bytes(),
@@ -68,7 +68,7 @@ pub(crate) fn link_data(g: &Topology, d: &Device) -> Vec<u8> {
     let carrier = g.carrier(d);
     let flags = match d.kind {
         DeviceKind::Loopback => 8 | if d.up { 0x41 } else { 0 },
-        DeviceKind::Direct => 0x80 | if d.up { 0x41 } else { 0 },
+        DeviceKind::Direct | DeviceKind::Tun => 0x90 | if d.up { 0x41 } else { 0 },
         _ => 0x1002 | u32::from(d.up) | if carrier { 0x10040 } else { 0 },
     };
     data[8..12].copy_from_slice(&flags.to_le_bytes());
@@ -188,25 +188,26 @@ pub(crate) fn request(
     // BusyBox/iproute2 may request a dump using only struct rtgenmsg (one
     // family byte), while Go sends the complete per-message structure.
     let padded;
-    let request = if dump && matches!(request.len(), 17 | 20) && matches!(kind, 18 | 22 | 26 | 34) {
-        padded = {
-            let mut data = request.to_vec();
-            data.resize(
-                if kind == 18 {
-                    32
-                } else if kind == 22 {
-                    24
-                } else {
-                    28
-                },
-                0,
-            );
-            data
+    let request =
+        if dump && matches!(request.len(), 17 | 20) && matches!(kind, 18 | 22 | 26 | 30 | 34) {
+            padded = {
+                let mut data = request.to_vec();
+                data.resize(
+                    if kind == 18 {
+                        32
+                    } else if kind == 22 {
+                        24
+                    } else {
+                        28
+                    },
+                    0,
+                );
+                data
+            };
+            &padded[..]
+        } else {
+            request
         };
-        &padded[..]
-    } else {
-        request
-    };
     let mut namespaces = std::collections::BTreeMap::new();
     for fd in namespace_fds(request, admin) {
         namespaces.entry(fd).or_insert_with(|| resolve(fd));
@@ -221,6 +222,61 @@ pub(crate) fn request(
             return Err(NetError(95));
         }
         match kind {
+            28..=30 => {
+                if request.len() < 28 {
+                    return Err(NetError(22));
+                }
+                let family = request[16];
+                if !matches!(family, 0 | 2 | 10) {
+                    return Err(NetError(97));
+                }
+                let index = u32v(&request[20..24])?;
+                let a = attrs(&request[28..])?;
+                let destination = get(&a, 1).map(|v| ip(family, v)).transpose()?;
+                if kind == 30 {
+                    if !dump && destination.is_none() {
+                        return Err(NetError(22));
+                    }
+                    let entries = graph.neighbors(ns, index, family);
+                    let mut found = false;
+                    for entry in entries
+                        .into_iter()
+                        .filter(|e| destination.is_none_or(|d| e.address == d))
+                    {
+                        found = true;
+                        out.push(message(
+                            28,
+                            if dump { 2 } else { 0 },
+                            seq,
+                            port,
+                            &neighbor_data(entry),
+                        ));
+                    }
+                    if !dump && !found {
+                        return Err(NetError(2));
+                    }
+                    return Ok(());
+                }
+                if !admin {
+                    return Err(NetError(1));
+                }
+                if a.iter().any(|(k, _)| !matches!(k, 1 | 2))
+                    || request[26] != 0
+                    || request[27] != 0
+                {
+                    return Err(NetError(95));
+                }
+                let entry = crate::netdev::NeighborEntry {
+                    index,
+                    address: destination.ok_or(NetError(22))?,
+                    mac: get(&a, 2)
+                        .map(|v| <[u8; 6]>::try_from(v).map_err(|_| NetError(22)))
+                        .transpose()?,
+                    state: u16::from_le_bytes(request[24..26].try_into().unwrap()),
+                };
+                let entry = graph.neighbor(ns, entry, kind == 28, flags)?;
+                changes.push((ns, kind, 4, neighbor_data(entry)));
+            }
             32..=34 => {
                 if request.len() < 28 {
                     return Err(NetError(22));
@@ -772,6 +828,18 @@ pub(crate) fn request(
         changes,
         retained_namespaces,
     })
+}
+pub(crate) fn neighbor_data(e: crate::netdev::NeighborEntry) -> Vec<u8> {
+    let mut data = vec![0; 12];
+    data[0] = if e.address.is_ipv4() { 2 } else { 10 };
+    data[4..8].copy_from_slice(&e.index.to_le_bytes());
+    data[8..10].copy_from_slice(&e.state.to_le_bytes());
+    data[11] = 1; // RTN_UNICAST
+    attr(&mut data, 1, &octets(e.address));
+    if let Some(mac) = e.mac {
+        attr(&mut data, 2, &mac);
+    }
+    data
 }
 pub(crate) fn address_data(d: &Device, a: Address) -> Vec<u8> {
     let mut data = vec![

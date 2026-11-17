@@ -1034,6 +1034,7 @@ impl PseudoFs {
 }
 #[derive(Clone, Copy)]
 pub(super) enum Device {
+    Tun,
     SwSync,
     Binder(u8),
     Render,
@@ -1064,6 +1065,7 @@ impl Device {
             0x103 => Content::Null,
             0x500 => Content::Terminal,
             value => Content::Device(match value {
+                0x0ac8 => Self::Tun,
                 0x105 => Self::Zero,
                 0x107 => Self::Full,
                 0x108 => Self::Random,
@@ -1079,6 +1081,7 @@ impl Device {
     }
     pub(super) fn rdev(self) -> u64 {
         match self {
+            Self::Tun => 0x0ac8,
             Self::SwSync => 0xf200,
             Self::Binder(device) => 0xf100 + device as u64,
             Self::Unregistered(rdev) => rdev as u64,
@@ -1098,7 +1101,7 @@ impl Device {
     pub(super) fn read(self, count: usize) -> Result<Vec<u8>> {
         let mut data = vec![0; count.min(storage::MAX_TRANSFER)];
         match self {
-            Self::Binder(_) | Self::SwSync => return Err(Errno(22)),
+            Self::Tun | Self::Binder(_) | Self::SwSync => return Err(Errno(22)),
             Self::Unregistered(_) => return Err(Errno(6)),
             Self::Render => return Err(Errno(22)),
             Self::Zero | Self::Full => {}
@@ -1113,7 +1116,7 @@ impl Device {
     }
     pub(super) fn write(self, data: &[u8]) -> Result<usize> {
         match self {
-            Self::Binder(_) | Self::SwSync => Err(Errno(22)),
+            Self::Tun | Self::Binder(_) | Self::SwSync => Err(Errno(22)),
             Self::Unregistered(_) => Err(Errno(6)),
             Self::Render => Err(Errno(22)),
             Self::Full => Err(Errno(28)),
@@ -1728,6 +1731,8 @@ impl Vfs {
                     | b"/dev/stdout"
                     | b"/dev/stderr"
                     | b"/dev/kmsg"
+                    | b"/dev/net"
+                    | b"/dev/net/tun"
                     | b"/dev/binder"
                     | b"/dev/hwbinder"
                     | b"/dev/vndbinder"
@@ -1855,6 +1860,8 @@ impl Vfs {
                 return Ok(link(format!("/proc/self/fd/{fd}").into_bytes()));
             }
             b"/dev/trames" if self.bridge.is_some()=>return Ok(directory()),
+            b"/dev/net" => return Ok(Some((Content::Directory, 0o40755))),
+            b"/dev/net/tun" => return Ok(Some((Content::Device(Device::Tun), 0o20666))),
             b"/dev/kmsg" => return Ok(Some((Content::Device(Device::Kmsg),0o20600))),
             b"/dev/binder" => return Ok(Some((Content::Device(Device::Binder(0)),0o20666))),
             b"/dev/sw_sync" | b"/sys/kernel/debug/sync/sw_sync" => return Ok(Some((Content::Device(Device::SwSync),0o20666))),
@@ -2467,7 +2474,10 @@ impl Vfs {
                         "{}\n",
                         if lo {
                             772
-                        } else if d.kind == trames_net::DeviceKind::Direct {
+                        } else if matches!(
+                            d.kind,
+                            trames_net::DeviceKind::Direct | trames_net::DeviceKind::Tun
+                        ) {
                             65534
                         } else {
                             1
@@ -2492,8 +2502,11 @@ impl Vfs {
                         "0x{:x}\n",
                         if lo {
                             8 | u32::from(d.up)
-                        } else if d.kind == trames_net::DeviceKind::Direct {
-                            0x11
+                        } else if matches!(
+                            d.kind,
+                            trames_net::DeviceKind::Direct | trames_net::DeviceKind::Tun
+                        ) {
+                            0x90 | u32::from(d.up)
                         } else {
                             0x1002 | u32::from(d.up)
                         }
@@ -2590,10 +2603,12 @@ impl Vfs {
                 "hwbinder",
                 "vndbinder",
                 "sw_sync",
+                "net",
             ]
             .iter()
             .map(|s| s.as_bytes().to_vec())
             .collect(),
+            b"/dev/net" => vec![b"tun".to_vec()],
             b"/dev/dri" | b"/sys/class/drm" => vec![b"renderD128".to_vec()],
             b"/sys/dev/char" => vec![b"226:128".to_vec()],
             b"/sys/devices/platform" => vec![b"trames".to_vec()],

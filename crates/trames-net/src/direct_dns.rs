@@ -324,6 +324,7 @@ impl Endpoint {
             return Err(NetError(71));
         }
         let empty = || Received {
+            packet_address: None,
             netlink_address: None,
             credentials: None,
             packet_info: None,
@@ -369,6 +370,7 @@ impl Endpoint {
             self.pump();
         }
         Ok(Received {
+            packet_address: None,
             netlink_address: None,
             credentials: None,
             packet_info: None,
