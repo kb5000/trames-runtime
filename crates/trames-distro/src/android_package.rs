@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Cold Android composition: pinned upstream ZIP/ext4 images plus a small
 //! adapter archive. No mounted image, block emulator or runtime I/O wrapper.
+use crate::progress::{ProgressReader, Reporter};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -102,6 +103,16 @@ pub fn install(
     vfs: &mut Vfs,
     expected: Option<&str>,
 ) -> Result<String> {
+    install_with_progress(source, images, vfs, expected, &mut Reporter::new(None))
+}
+pub fn install_with_progress(
+    source: &Path,
+    images: &Path,
+    vfs: &mut Vfs,
+    expected: Option<&str>,
+    progress: &mut Reporter<'_>,
+) -> Result<String> {
+    progress.event("adapters", "", 0, 0, 0)?;
     let mut compressed = Vec::new();
     File::open(source)?
         .take(LIMIT + 1)
@@ -183,22 +194,27 @@ pub fn install(
         }
     }
     for (image, prefix) in plan.images.iter().zip(["", "/vendor"]) {
+        progress.event("verify", &image.filename, 0, image.size, 0)?;
         let mut input = File::open(images.join(&image.filename))?;
         if input.metadata()?.len() != image.size {
             return Err("upstream Android ZIP size mismatch".into());
         }
         let mut hash = Sha256::new();
         let mut buffer = [0; 65536];
+        let mut verified_bytes = 0;
         loop {
             let n = input.read(&mut buffer)?;
             if n == 0 {
                 break;
             }
             hash.update(&buffer[..n]);
+            verified_bytes += n as u64;
+            progress.update("verify", &image.filename, "", verified_bytes, image.size, 0)?;
         }
         if format!("{:x}", hash.finalize()) != image.sha256 {
             return Err("upstream Android ZIP SHA-256 mismatch".into());
         }
+        progress.event("verified", &image.filename, image.size, image.size, 0)?;
         input.seek(SeekFrom::Start(0))?;
         let mut zip = zip::ZipArchive::new(input)?;
         if zip.len() != 1 {
@@ -211,11 +227,29 @@ pub fn install(
         // One seekable image at a time, unlinked immediately. No host file tree
         // and no multi-gigabyte buffer; cancellation/error drops the temporary.
         let mut raw = crate::rootfs::temporary()?;
-        if io::copy(&mut (&mut entry).take(image.image_size + 1), &mut raw)? != image.image_size {
+        progress.event("unpack", &image.image_name, 0, image.image_size, 0)?;
+        let mut tracked = ProgressReader {
+            inner: (&mut entry).take(image.image_size + 1),
+            reporter: progress,
+            stage: "unpack",
+            item: &image.image_name,
+            path: "",
+            completed: 0,
+            total: image.image_size,
+            files: 0,
+        };
+        if io::copy(&mut tracked, &mut raw)? != image.image_size {
             return Err("truncated upstream Android image".into());
         }
+        progress.event(
+            "unpacked",
+            &image.image_name,
+            image.image_size,
+            image.image_size,
+            0,
+        )?;
         raw.seek(SeekFrom::Start(0))?;
-        import_ext4(raw, prefix, vfs)?;
+        import_ext4(raw, prefix, vfs, progress, &image.image_name)?;
     }
     for (name, bytes) in payload {
         let path = format!("/{name}");
@@ -232,12 +266,20 @@ pub fn install(
             if executable { 0o755 } else { 0o644 },
         )?;
     }
+    progress.event("sync", "", 0, 0, 0)?;
     vfs.sync()?;
     crate::android::validate_image(vfs)?;
     Ok(digest)
 }
 
-fn import_ext4(raw: File, prefix: &str, vfs: &mut Vfs) -> Result<()> {
+fn import_ext4(
+    raw: File,
+    prefix: &str,
+    vfs: &mut Vfs,
+    progress: &mut Reporter<'_>,
+    image: &str,
+) -> Result<()> {
+    progress.event("import", image, 0, 0, 0)?;
     let fs = ext4_view::Ext4::load(Box::new(raw))?;
     let mut pending = vec![ext4_view::PathBuf::try_from("/")?];
     let mut hardlinks = BTreeMap::<u32, Vec<u8>>::new();
@@ -280,6 +322,14 @@ fn import_ext4(raw: File, prefix: &str, vfs: &mut Vfs) -> Result<()> {
                 continue;
             }
             let guest = [prefix.as_bytes(), bytes].concat();
+            progress.update(
+                "import",
+                image,
+                &String::from_utf8_lossy(&guest),
+                total,
+                0,
+                count as u64,
+            )?;
             let metadata = entry.metadata()?;
             if metadata.is_dir() {
                 if !seen_dirs.insert(entry.inode_number()) {
@@ -300,11 +350,19 @@ fn import_ext4(raw: File, prefix: &str, vfs: &mut Vfs) -> Result<()> {
                     if total > available {
                         return Err("Android image exceeds available storage".into());
                     }
-                    if vfs.import_reader(
-                        &guest,
-                        &mut fs.open(&path)?,
-                        metadata.mode() & 0o111 != 0,
-                    )? != metadata.len()
+                    let current = String::from_utf8_lossy(&guest);
+                    let mut tracked = ProgressReader {
+                        inner: fs.open(&path)?,
+                        reporter: progress,
+                        stage: "import",
+                        item: image,
+                        path: &current,
+                        completed: total - metadata.len(),
+                        total: 0,
+                        files: count as u64,
+                    };
+                    if vfs.import_reader(&guest, &mut tracked, metadata.mode() & 0o111 != 0)?
+                        != metadata.len()
                     {
                         return Err("truncated Android image file".into());
                     }
@@ -319,6 +377,7 @@ fn import_ext4(raw: File, prefix: &str, vfs: &mut Vfs) -> Result<()> {
     for (path, metadata) in directories.iter().rev() {
         attributes(vfs, path, metadata)?;
     }
+    progress.event("imported", image, total, total, count as u64)?;
     Ok(())
 }
 fn attributes(vfs: &mut Vfs, path: &[u8], metadata: &ext4_view::Metadata) -> Result<()> {
@@ -513,7 +572,23 @@ mod tests {
         .unwrap();
         raw.flush().unwrap();
         let mut vfs = Vfs::default();
-        import_ext4(raw, "", &mut vfs).unwrap();
+        let mut stages = Vec::new();
+        let mut callback = |p: &crate::progress::InstallProgress| {
+            stages.push((p.stage, p.completed, p.files));
+            Ok(())
+        };
+        import_ext4(
+            raw,
+            "",
+            &mut vfs,
+            &mut Reporter::new(Some(&mut callback)),
+            "fixture",
+        )
+        .unwrap();
+        assert_eq!(stages.first().unwrap().0, "import");
+        assert_eq!(stages.last().unwrap().0, "imported");
+        assert!(stages.last().unwrap().1 > 0);
+        assert!(stages.last().unwrap().2 > 0);
         let stat = vfs.stat_at(AT_FDCWD, b"/bin/tool").unwrap();
         assert_eq!(
             u32::from_le_bytes(stat[16..20].try_into().unwrap()) & 0o7777,

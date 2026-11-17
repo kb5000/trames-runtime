@@ -5,6 +5,7 @@ pub mod android_package;
 pub mod boot;
 pub mod environment;
 pub mod packages;
+pub mod progress;
 pub mod rootfs;
 pub mod systemd;
 pub mod terminals;
