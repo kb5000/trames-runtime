@@ -240,7 +240,7 @@ impl MessageIo for OwnerMessage<'_> {
         self.nonblocking
     }
     fn recv(&mut self, count: usize, flags: u32) -> Option<Result<trames_vfs::LocalReceived>> {
-        Some(self.socket.recv(count, flags))
+        Some(self.socket.recv_message(count, flags))
     }
     fn send(
         &mut self,
@@ -311,7 +311,7 @@ impl MessageIo for OwnerMessage<'_> {
         self.vfs.pid_namespace().local(global)
     }
     fn global_pid(&self, local: u32) -> Result<u32> {
-        self.vfs.global_pid(local)
+        self.vfs.credential_pid(local)
     }
     fn send_rights(&self, fds: &[u32]) -> Option<Result<trames_vfs::LocalRights>> {
         Some(self.vfs.send_rights(fds))
@@ -390,8 +390,13 @@ pub(crate) fn prepare_message<I: MessageIo>(
                 let uid = u32_at(memory, control + offset + 20)?;
                 let gid = u32_at(memory, control + offset + 24)?;
                 let c = io.credentials();
-                let global = io.global_pid(pid)?;
-                if (global != identity[0] && !c.has_cap(trames_vfs::capabilities::SYS_ADMIN))
+                if uid == u32::MAX || gid == u32::MAX {
+                    return Err(Errno(22));
+                }
+                // Permission precedes PID lookup, as for Linux SCM_CREDENTIALS.
+                // Ordinary self credentials need no process-directory lookup.
+                if (pid != io.local_pid(identity[0])
+                    && !c.has_cap(trames_vfs::capabilities::SYS_ADMIN))
                     || (![c.uid, c.euid, c.suid].contains(&uid)
                         && !c.has_cap(trames_vfs::capabilities::SETUID))
                     || (![c.gid, c.egid, c.sgid].contains(&gid)
@@ -399,6 +404,11 @@ pub(crate) fn prepare_message<I: MessageIo>(
                 {
                     return Err(Errno(1));
                 }
+                let global = if pid == io.local_pid(identity[0]) {
+                    identity[0]
+                } else {
+                    io.global_pid(pid)?
+                };
                 identity = [global, uid, gid];
                 explicit = true;
             } else {
@@ -629,7 +639,9 @@ impl Message {
         let word = |at| u64::from_le_bytes(header[at..at + 8].try_into().unwrap());
         let name = word(0);
         let control = word(32);
-        let control_size = word(40);
+        // A NULL receive control pointer disables ancillary copyout regardless
+        // of the advertised size; transport still consumes/truncates rights.
+        let control_size = if receive && control == 0 { 0 } else { word(40) };
         if control_size > crate::MAX_WRITE as u64 {
             return Err(Errno(22));
         }
@@ -679,6 +691,147 @@ mod tests {
     use super::*;
     use trames_memory::{Permissions, PAGE_SIZE};
 
+    #[test]
+    fn null_control_and_zero_length_messages_preserve_original_rights_and_payload_boundaries() {
+        for worker in [false, true] {
+            for kind in [1, 2, 5] {
+                for null_control in [false, true] {
+                    let mut v = trames_vfs::Vfs::default();
+                    let [tx, rx] = v.socketpair(1, kind, 0).unwrap();
+                    let event = v.eventfd(42, 0).unwrap();
+                    let mut m = Memory::default();
+                    m.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+                    let mut header = [0; 56];
+                    for (offset, value) in [(16, 0x1100u64), (24, 1), (32, 0x1300), (40, 24)] {
+                        header[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+                    }
+                    m.write(0x1000, &header).unwrap();
+                    m.write_array(0x1100, 0x1200u64.to_le_bytes()).unwrap();
+                    m.write_array(0x1108, 1u64.to_le_bytes()).unwrap();
+                    m.write(0x1200, b"x").unwrap();
+                    let mut control = Vec::new();
+                    push_control(&mut control, 1, 1, &event.to_le_bytes());
+                    m.write(0x1300, &control).unwrap();
+                    let call = |v: &mut trames_vfs::Vfs, number: u32, args, m: &mut Memory| {
+                        if worker {
+                            crate::DirectSyscalls::new(v.direct_descriptors())
+                                .with_resources(v.descriptor_factory())
+                                .invoke(number, args, m)
+                                .expect("accepted Unix message")
+                        } else {
+                            Linux::network_vfs(v, number as u64, args, m)
+                        }
+                    };
+                    assert_eq!(
+                        call(&mut v, 211, [tx as u64, 0x1000, 0, 0, 0, 0], &mut m),
+                        Ok(1)
+                    );
+                    v.close(event).unwrap();
+                    assert_eq!(v.eventfd(99, 0).unwrap(), event);
+                    if null_control {
+                        m.write_array(0x1020, 0u64.to_le_bytes()).unwrap();
+                    } else {
+                        // read(0) leaves ancillary state untouched; recvmsg(0)
+                        // receives it while retaining the stream's payload byte.
+                        if kind == 1 {
+                            assert_eq!(v.read(rx, 0).unwrap(), b"");
+                        }
+                        m.write_array(0x1018, 0u64.to_le_bytes()).unwrap();
+                    }
+                    assert_eq!(
+                        call(
+                            &mut v,
+                            212,
+                            [rx as u64, 0x1000, 0x40000000, 0, 0, 0],
+                            &mut m
+                        ),
+                        Ok(u64::from(null_control))
+                    );
+                    let flags = u32::from_le_bytes(m.read_array(0x1030).unwrap());
+                    if null_control {
+                        assert_eq!(m.read_u64(0x1028).unwrap(), 0);
+                        assert_eq!(flags, 8);
+                    } else {
+                        assert_eq!(flags, if kind == 1 { 0 } else { 0x20 });
+                        let passed = u32::from_le_bytes(m.read_array(0x1310).unwrap());
+                        assert_ne!(v.flags(passed).unwrap() & trames_vfs::O_CLOEXEC, 0);
+                        assert_eq!(v.read(passed, 8).unwrap(), 42u64.to_le_bytes());
+                        if kind == 1 {
+                            m.write(0x1000, &header).unwrap();
+                            assert_eq!(
+                                call(&mut v, 212, [rx as u64, 0x1000, 0, 0, 0, 0], &mut m),
+                                Ok(1)
+                            );
+                            assert_eq!(m.read_array::<1>(0x1200).unwrap(), [b'x']);
+                            assert_eq!(m.read_u64(0x1028).unwrap(), 0);
+                        }
+                    }
+                    assert_eq!(v.read(event, 8).unwrap(), 99u64.to_le_bytes());
+                    assert_eq!(
+                        call(&mut v, 212, [rx as u64, 0x1000, 0x40, 0, 0, 0], &mut m),
+                        Err(Errno(11))
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn explicit_credentials_reject_nonexistent_pid_after_permission_checks() {
+        for worker in [false, true] {
+            let mut v = trames_vfs::Vfs::default();
+            v.set_lock_owner(1);
+            let privileged = v.credentials.clone();
+            let [tx, rx] = v.socketpair(1, 2, 0).unwrap();
+            let mut m = Memory::default();
+            m.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+            for (offset, value) in [(16, 0x1100u64), (24, 1), (32, 0x1300), (40, 32)] {
+                m.write_array(0x1000 + offset, value.to_le_bytes()).unwrap();
+            }
+            m.write_array(0x1100, 0x1200u64.to_le_bytes()).unwrap();
+            m.write_array(0x1108, 1u64.to_le_bytes()).unwrap();
+            m.write(0x1200, b"x").unwrap();
+            for identity in [
+                [u32::MAX, 1000, 1000],
+                [77, 1000, 1000],
+                [1, u32::MAX, 1000],
+            ] {
+                let mut control = Vec::new();
+                let credentials: Vec<_> = identity.into_iter().flat_map(u32::to_le_bytes).collect();
+                push_control(&mut control, 1, 2, &credentials);
+                m.write(0x1300, &control).unwrap();
+                for root in [false, true] {
+                    v.credentials = if root {
+                        privileged.clone()
+                    } else {
+                        trames_vfs::Credentials::user(1000, 1000)
+                    };
+                    let args = [tx as u64, 0x1000, 0, 0, 0, 0];
+                    let result = if worker {
+                        crate::DirectSyscalls::new(v.direct_descriptors())
+                            .with_resources(v.descriptor_factory())
+                            .invoke(211, args, &mut m)
+                            .unwrap()
+                    } else {
+                        Linux::network_vfs(&mut v, 211, args, &mut m)
+                    };
+                    assert_eq!(
+                        result,
+                        Err(Errno(if identity[1] == u32::MAX {
+                            22
+                        } else if root {
+                            3
+                        } else {
+                            1
+                        }))
+                    );
+                    assert_eq!(
+                        v.local_socket(rx).unwrap().unwrap().recv(1, 0).err(),
+                        Some(Errno(11))
+                    );
+                }
+            }
+        }
+    }
     #[test]
     fn large_stream_messages_short_write_on_owner_and_worker_and_keep_rights_once() {
         use crate::DirectSyscalls;

@@ -15,6 +15,8 @@ See [the first Mac results and fix/rerun checkpoint](../../docs/validation/gviso
 The [network ABI repair checkpoint](../../docs/validation/gvisor-network-abi-fixes-20261117.md)
 records a complete ancillary-message matrix and focused network/security reruns
 after the broad inventory.
+The [ancillary completion checkpoint](../../docs/validation/gvisor-unix-ancillary-20261117.md)
+closes its remaining 84 Unix control-message failures and expands the message API check.
 
 ## Build on native ARM64 Linux
 

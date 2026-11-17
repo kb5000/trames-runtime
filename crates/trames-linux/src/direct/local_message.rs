@@ -118,7 +118,7 @@ impl crate::network::unix::MessageIo for Message<'_> {
         self.factory.local_pid(global)
     }
     fn global_pid(&self, local: u32) -> Result<u32, Errno> {
-        self.factory.local_global_pid(local)
+        self.factory.local_credential_pid(local)
     }
     fn send_rights(&self, fds: &[u32]) -> Option<Result<Self::Rights, Errno>> {
         self.factory.send_local_rights(fds)

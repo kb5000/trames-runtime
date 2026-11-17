@@ -1,0 +1,354 @@
+{
+  "schema_version": 1,
+  "cases": 3232,
+  "native_counts": {
+    "passed": 3131,
+    "skipped": 78,
+    "no_result": 23
+  },
+  "trames_counts": {
+    "passed": 2955,
+    "failed": 169,
+    "skipped": 78,
+    "timeout": 30
+  },
+  "native_passed_cases": 3131,
+  "outcomes_on_native_passed": {
+    "passed": 2932,
+    "failed": 169,
+    "timeout": 30
+  },
+  "strict_pass_fraction": 0.9364420312999042,
+  "groups": [
+    {
+      "name": "partial_bad_buffer",
+      "cases": 1,
+      "native": {
+        "passed": 1
+      },
+      "trames": {
+        "passed": 1
+      }
+    },
+    {
+      "name": "raw_socket",
+      "cases": 1,
+      "native": {
+        "passed": 1
+      },
+      "trames": {
+        "failed": 1
+      }
+    },
+    {
+      "name": "socket_abstract",
+      "cases": 852,
+      "native": {
+        "passed": 811,
+        "skipped": 22,
+        "no_result": 19
+      },
+      "trames": {
+        "passed": 830,
+        "skipped": 22
+      }
+    },
+    {
+      "name": "socket_abstract_non_blocking",
+      "cases": 6,
+      "native": {
+        "passed": 6
+      },
+      "trames": {
+        "passed": 6
+      }
+    },
+    {
+      "name": "socket_unix_dgram_local",
+      "cases": 216,
+      "native": {
+        "passed": 216
+      },
+      "trames": {
+        "passed": 84,
+        "failed": 126,
+        "timeout": 6
+      }
+    },
+    {
+      "name": "socket_unix_seqpacket_local",
+      "cases": 108,
+      "native": {
+        "passed": 108
+      },
+      "trames": {
+        "passed": 84,
+        "timeout": 6,
+        "failed": 18
+      }
+    },
+    {
+      "name": "socket_unix_stream",
+      "cases": 12,
+      "native": {
+        "passed": 12
+      },
+      "trames": {
+        "passed": 12
+      }
+    },
+    {
+      "name": "socket_ip_tcp_loopback",
+      "cases": 96,
+      "native": {
+        "passed": 86,
+        "no_result": 4,
+        "skipped": 6
+      },
+      "trames": {
+        "passed": 72,
+        "skipped": 6,
+        "failed": 18
+      }
+    },
+    {
+      "name": "socket_ip_tcp_loopback_non_blocking",
+      "cases": 8,
+      "native": {
+        "passed": 8
+      },
+      "trames": {
+        "passed": 8
+      }
+    },
+    {
+      "name": "socket_ip_udp_loopback",
+      "cases": 132,
+      "native": {
+        "passed": 126,
+        "skipped": 6
+      },
+      "trames": {
+        "passed": 120,
+        "skipped": 6,
+        "failed": 6
+      }
+    },
+    {
+      "name": "socket_ip_udp_loopback_non_blocking",
+      "cases": 4,
+      "native": {
+        "passed": 4
+      },
+      "trames": {
+        "passed": 4
+      }
+    },
+    {
+      "name": "socket_domain",
+      "cases": 192,
+      "native": {
+        "passed": 180,
+        "skipped": 12
+      },
+      "trames": {
+        "passed": 180,
+        "skipped": 12
+      }
+    },
+    {
+      "name": "socket_domain_non_blocking",
+      "cases": 6,
+      "native": {
+        "passed": 6
+      },
+      "trames": {
+        "passed": 6
+      }
+    },
+    {
+      "name": "socket_filesystem",
+      "cases": 852,
+      "native": {
+        "passed": 830,
+        "skipped": 22
+      },
+      "trames": {
+        "passed": 830,
+        "skipped": 22
+      }
+    },
+    {
+      "name": "socket_filesystem_non_blocking",
+      "cases": 6,
+      "native": {
+        "passed": 6
+      },
+      "trames": {
+        "passed": 6
+      }
+    },
+    {
+      "name": "socket_netlink_route",
+      "cases": 2,
+      "native": {
+        "passed": 2
+      },
+      "trames": {
+        "passed": 2
+      }
+    },
+    {
+      "name": "socket_stream_local",
+      "cases": 36,
+      "native": {
+        "passed": 36
+      },
+      "trames": {
+        "passed": 36
+      }
+    },
+    {
+      "name": "socket_stream_blocking_local",
+      "cases": 6,
+      "native": {
+        "passed": 6
+      },
+      "trames": {
+        "timeout": 6
+      }
+    },
+    {
+      "name": "socket_stream_blocking_tcp",
+      "cases": 12,
+      "native": {
+        "passed": 12
+      },
+      "trames": {
+        "timeout": 12
+      }
+    },
+    {
+      "name": "socket_stream_nonblock_local",
+      "cases": 6,
+      "native": {
+        "passed": 6
+      },
+      "trames": {
+        "passed": 6
+      }
+    },
+    {
+      "name": "socket_non_stream_blocking_local",
+      "cases": 12,
+      "native": {
+        "passed": 12
+      },
+      "trames": {
+        "passed": 12
+      }
+    },
+    {
+      "name": "socket_non_stream_blocking_udp",
+      "cases": 4,
+      "native": {
+        "passed": 4
+      },
+      "trames": {
+        "passed": 4
+      }
+    },
+    {
+      "name": "socket_unix_pair",
+      "cases": 660,
+      "native": {
+        "passed": 650,
+        "skipped": 10
+      },
+      "trames": {
+        "passed": 650,
+        "skipped": 10
+      }
+    },
+    {
+      "name": "udp_socket",
+      "cases": 2,
+      "native": {
+        "passed": 2
+      },
+      "trames": {
+        "passed": 2
+      }
+    }
+  ],
+  "upstream_revision": "89cacadae21eca4270a8f7c79281d0426d33ac5f",
+  "base_runtime_revision": "ee7ceff919156e32f9f20c2f9f80f7555e25dbed",
+  "new_native_confirmed_passes": 84,
+  "regressions_on_previously_passing_cases": 0,
+  "categories": [
+    {
+      "area": "Unix ancillary matrix",
+      "cases": 1944,
+      "counts": {
+        "passed": 1914,
+        "skipped": 30
+      },
+      "native_passing": 1895,
+      "trames_on_native_passing": {
+        "passed": 1895
+      }
+    },
+    {
+      "area": "recvmmsg",
+      "cases": 180,
+      "counts": {
+        "passed": 132,
+        "skipped": 48
+      },
+      "native_passing": 132,
+      "trames_on_native_passing": {
+        "passed": 132
+      }
+    },
+    {
+      "area": "sendmmsg",
+      "cases": 96,
+      "counts": {
+        "passed": 96
+      },
+      "native_passing": 96,
+      "trames_on_native_passing": {
+        "passed": 96
+      }
+    }
+  ],
+  "baseline_policy": "Prior ee7ceff repair records when the case was in that 2697-case selection; original full inventory records otherwise. No combined full-suite pass rate is inferred.",
+  "original_passing_xml_verified": 2955,
+  "runner_sha256": "f7c5e7888d5da67014af887532aa1b3542fcba1ea882fab098e71c54d1e7178e",
+  "source_files": {
+    "crates/trames-linux/src/direct/local_message.rs": "153a94d2f81320c2ac9721a8465141664e836072aad7b3b842bcc172f060e913",
+    "crates/trames-linux/src/network/unix.rs": "db9ab24184521e0200146ba67b7217f5210817059fc3749b715a88be01080a31",
+    "crates/trames-vfs/src/descriptor_factory.rs": "9acfe15b302ea4981628671932b55037511adc5fd87af5b2c2881ab4543a6e25",
+    "crates/trames-vfs/src/ipc.rs": "20716ef6bbd9e42fc0cff5f4fcceae2883a945a5512707345bb9c0db5db5975e",
+    "crates/trames-vfs/src/ipc/channel.rs": "64f53a0690fc41f848776ef15712c2367e825f879401eeb5cb224e5f836eb39a",
+    "crates/trames-vfs/src/ipc/shared_rights.rs": "0576b089d2c4c978181cb94818c438a5abf0c4231f4228ede38b5bfcced9da8e",
+    "crates/trames-vfs/src/pid_namespace.rs": "04656f3ce1ed2d3a0e897c2aa0941708f92521df5c4ce7431d60416beae81135"
+  },
+  "validation": {
+    "runtime_macos_ci_steps_passed": 8,
+    "runtime_linux_ci_steps_passed": 8,
+    "interpreter_passed": 490,
+    "interpreter_ignored": 3,
+    "ipad_arm64_check": "passed",
+    "additional_zero_length_peek_regression": "passed"
+  },
+  "local_evidence": {
+    "raw": "target/gvisor-ancillary-completion-20261117/trames",
+    "audited": "target/gvisor-ancillary-completion-20261117/audited",
+    "reference": "target/gvisor-ancillary-completion-20261117/reference",
+    "macos_ci": "target/gvisor-ancillary-completion-20261117/runtime-macos-ci",
+    "linux_ci": "target/local-ci/io/gvisor-ancillary-completion-20261117/runtime-linux-ci",
+    "interpreter": "target/gvisor-ancillary-completion-20261117/interpreter-conformance.log",
+    "ipad_check": "target/gvisor-ancillary-completion-20261117/ipad-check.log"
+  }
+}

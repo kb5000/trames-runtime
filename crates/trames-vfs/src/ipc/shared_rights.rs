@@ -174,7 +174,7 @@ impl channel::Resource {
         count: usize,
         flags: u32,
     ) -> Option<Result<LocalReceived<SharedRights>>> {
-        self.recv_portable(side, count, flags).map(|result| {
+        self.recv_message(side, count, flags).map(|result| {
             result.map(|received| {
                 let rights = match received.rights {
                     Some(rights) => rights.into_shared().expect("portable receive preflight"),

@@ -1,5 +1,9 @@
 # gVisor network ABI repairs — 2026-11-17
 
+Follow-up: the [complete Unix ancillary-message matrix](gvisor-unix-ancillary-20261117.md)
+now closes all 84 Unix failures listed below. This document retains the earlier
+checkpoint's counts.
+
 This follows the [14,530-case inventory](gvisor-expanded-20261117.md). It repairs
 the receive/ancillary-message dependency class, TCP diagnostics and connection
 readiness, namespace inspection prerequisites, and the identified seccomp

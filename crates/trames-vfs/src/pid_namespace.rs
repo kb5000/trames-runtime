@@ -274,7 +274,35 @@ impl PidNamespace {
         format!("pid:[{}]", self.id()).into_bytes()
     }
 }
+/// SCM_CREDENTIALS names an existing PID, not just a translatable number.
+/// Consult the original indexed provider; never enumerate task views or CPU state.
+pub(super) fn credential_pid(
+    namespace: &PidNamespace,
+    source: Option<&Arc<dyn ProcSource>>,
+    caller: u32,
+    local: u32,
+) -> Result<u32> {
+    let global = namespace.global(local).ok_or(Errno(3))?;
+    if global == caller
+        || source
+            .and_then(|source| source.task(global))
+            .is_some_and(|task| task.present())
+    {
+        Ok(global)
+    } else {
+        Err(Errno(3))
+    }
+}
 impl Vfs {
+    pub fn credential_pid(&self, local: u32) -> Result<u32> {
+        let source = self.pseudo.borrow().source.clone();
+        credential_pid(
+            self.pid_namespace(),
+            source.as_ref(),
+            self.lock_owner,
+            local,
+        )
+    }
     pub fn pid_namespace(&self) -> &PidNamespace {
         &self.pid_ns
     }
@@ -347,6 +375,50 @@ impl Vfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn credential_pid_uses_original_namespace_and_liveness_without_proc_projection() {
+        struct Task(std::sync::atomic::AtomicBool);
+        impl ProcTask for Task {
+            fn identity(&self) -> u64 {
+                77
+            }
+            fn pid(&self) -> u32 {
+                77
+            }
+            fn present(&self) -> bool {
+                self.0.load(Ordering::Relaxed)
+            }
+            fn observe(&self, _: ProcRefresh, _: Option<usize>) -> Option<ProcessInfo> {
+                panic!("PID lookup must not project metadata")
+            }
+            fn memory_report(&self) -> Option<trames_memory::MemoryReport> {
+                None
+            }
+        }
+        struct Source(Arc<Task>);
+        impl ProcSource for Source {
+            fn task(&self, pid: u32) -> Option<Arc<dyn ProcTask>> {
+                (pid == 77).then(|| self.0.clone() as Arc<dyn ProcTask>)
+            }
+            fn observe(&self, _: ProcQuery<'_>) -> RuntimeInfo {
+                panic!("PID lookup must not enumerate tasks")
+            }
+        }
+        let root = PidNamespace::default();
+        let child = PidNamespace::new(Some(root.clone()), root.0.registry.clone()).unwrap();
+        let _caller = child.allocate(55).unwrap();
+        let _target = child.allocate(77).unwrap();
+        let task = Arc::new(Task(std::sync::atomic::AtomicBool::new(true)));
+        let source: Arc<dyn ProcSource> = Arc::new(Source(task.clone()));
+        assert_eq!(credential_pid(&root, Some(&source), 55, 77), Ok(77));
+        assert_eq!(credential_pid(&child, Some(&source), 55, 2), Ok(77));
+        assert_eq!(credential_pid(&child, None, 55, 1), Ok(55));
+        assert_eq!(credential_pid(&root, Some(&source), 55, 78), Err(Errno(3)));
+        assert_eq!(credential_pid(&child, Some(&source), 55, 77), Err(Errno(3)));
+        task.0.store(false, Ordering::Relaxed);
+        assert_eq!(credential_pid(&child, Some(&source), 55, 2), Err(Errno(3)));
+    }
+
     #[test]
     fn root_translation_and_allocation_do_not_take_map_or_registry_locks() {
         let root = PidNamespace::default();

@@ -12,6 +12,7 @@ pub struct DescriptorFactory {
     credentials: Credentials,
     local_identity: [u32; 3],
     pid_namespace: PidNamespace,
+    proc_source: Option<Arc<dyn ProcSource>>,
     terminal_task: Option<Arc<dyn pty::TerminalTask>>,
     devices: cgroup::DeviceAuthority,
     pub(super) cgroups: Arc<SharedCell<cgroup::Cgroups>>,
@@ -43,6 +44,7 @@ impl Vfs {
             credentials: self.credentials.clone(),
             local_identity: self.local_sender_credentials(),
             pid_namespace: self.pid_namespace().clone(),
+            proc_source: self.pseudo.borrow().source.clone(),
             terminal_task: self.terminal_task(),
             devices: self.device_access(),
             cgroups: self.cgroups.clone(),
@@ -179,8 +181,13 @@ impl DescriptorFactory {
     pub fn local_pid(&self, global: u32) -> u32 {
         self.pid_namespace.local(global)
     }
-    pub fn local_global_pid(&self, local: u32) -> Result<u32> {
-        self.pid_namespace.global(local).ok_or(Errno(3))
+    pub fn local_credential_pid(&self, local: u32) -> Result<u32> {
+        crate::pid_namespace::credential_pid(
+            &self.pid_namespace,
+            self.proc_source.as_ref(),
+            self.local_identity[0],
+            local,
+        )
     }
     pub(super) fn open_id(&self) -> u64 {
         next_id(&self.ids)

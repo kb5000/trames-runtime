@@ -502,6 +502,12 @@ impl LocalSocket {
     }
 
     pub fn recv(&self, count: usize, flags: u32) -> Result<LocalReceived> {
+        self.recv_mode(count, flags, false)
+    }
+    pub fn recv_message(&self, count: usize, flags: u32) -> Result<LocalReceived> {
+        self.recv_mode(count, flags, true)
+    }
+    fn recv_mode(&self, count: usize, flags: u32, message: bool) -> Result<LocalReceived> {
         if flags & !(2 | 8 | 0x20 | 0x40 | 0x100 | 0x4000 | 0x40000000) != 0 {
             return Err(Errno(95));
         }
@@ -512,10 +518,12 @@ impl LocalSocket {
             return Err(Errno(if self.kind == 2 { 11 } else { 22 }));
         }
         let binding = self.channel.borrow();
-        let received = binding
-            .resource
-            .recv(self.side(), count, flags, true)
-            .expect("owner may receive rights")?;
+        let received = if message {
+            binding.resource.recv_message(self.side(), count, flags)
+        } else {
+            binding.resource.recv(self.side(), count, flags, true)
+        }
+        .expect("owner may receive rights")?;
         let rights = received.rights.map_or_else(LocalRights::default, |rights| {
             rights
                 .into_shared()

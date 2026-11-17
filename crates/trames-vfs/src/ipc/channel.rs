@@ -307,7 +307,7 @@ impl Resource {
         flags: u32,
         allow_rights: bool,
     ) -> Option<Result<Received>> {
-        self.recv_mode(side, count, flags, allow_rights)
+        self.recv_mode(side, count, flags, allow_rights, false)
     }
     pub(crate) fn recv_portable(
         &self,
@@ -315,7 +315,15 @@ impl Resource {
         count: usize,
         flags: u32,
     ) -> Option<Result<Received>> {
-        self.recv_mode(side, count, flags, true)
+        self.recv_mode(side, count, flags, true, false)
+    }
+    pub(crate) fn recv_message(
+        &self,
+        side: usize,
+        count: usize,
+        flags: u32,
+    ) -> Option<Result<Received>> {
+        self.recv_mode(side, count, flags, true, true)
     }
     fn recv_mode(
         &self,
@@ -323,6 +331,7 @@ impl Resource {
         count: usize,
         flags: u32,
         ancillary: bool,
+        message: bool,
     ) -> Option<Result<Received>> {
         // Linux accepts the output-only MSG_CTRUNC bit on input. Android's
         // ReceiveFileDescriptorVector passes it on every Zygote receive.
@@ -337,6 +346,32 @@ impl Resource {
             let peer = 1 - side;
             let eof = data.read_closed[side] || !data.alive[peer] || data.write_closed[peer];
             let queue = &mut data.queues[side];
+            if self.kind == 1 && count == 0 && message {
+                let mut rights = None;
+                let mut credentials = None;
+                let mut timestamp = None;
+                if let Some(packet) = queue.front_mut() {
+                    // recvmsg(0) detaches SCM_RIGHTS without consuming payload.
+                    // PEEK duplicates the same original OFDs and leaves metadata.
+                    rights = if flags & 2 != 0 {
+                        packet.rights.clone()
+                    } else {
+                        packet.rights.take()
+                    };
+                    credentials = packet.credentials;
+                    timestamp = packet.timestamp;
+                }
+                return Some(Ok(Received {
+                    data: Vec::new(),
+                    length: 0,
+                    truncated: false,
+                    rights,
+                    credentials,
+                    timestamp,
+                    source: Vec::new(),
+                    options,
+                }));
+            }
             if (self.kind == 1 && count == 0) || (eof && queue.is_empty() && self.kind != 2) {
                 return Some(Ok(Received {
                     data: Vec::new(),
@@ -582,6 +617,40 @@ mod tests {
         assert_eq!(rx.send(b"x", 0x4000), Err(Errno(32)));
         assert_ne!(vfs.poll(b, 0x2001) & 16, 0);
         assert!(snapshot.get(a).is_none());
+    }
+    #[test]
+    fn zero_length_peeks_alias_original_rights_and_consumption_detaches_only_metadata() {
+        let mut v = Vfs::default();
+        let [tx, rx] = v.socketpair(1, 1, 0).unwrap();
+        let event = v.eventfd(42, 0).unwrap();
+        let sender = v.local_socket(tx).unwrap().unwrap();
+        sender
+            .send_rights(b"xyz", 0, v.send_rights(&[event]).unwrap())
+            .unwrap();
+        let receiver = v.direct_descriptors().get(rx).unwrap();
+        let factory = v.descriptor_factory();
+        let mut aliases = Vec::new();
+        for _ in 0..2 {
+            let peek = receiver.recv_local_message(0, 2).unwrap().unwrap();
+            assert!(peek.data.is_empty());
+            let (fds, truncated) = factory.receive_local_rights(peek.rights, 1, true);
+            assert!(!truncated);
+            assert_eq!(fds.len(), 1);
+            aliases.push(fds[0]);
+            assert_eq!(v.readable_bytes(rx), Ok(Some(3)));
+        }
+        v.close(event).unwrap();
+        let message = receiver.recv_local_message(0, 0).unwrap().unwrap();
+        let (fds, truncated) = factory.receive_local_rights(message.rights, 1, false);
+        assert!(!truncated);
+        assert_eq!(fds.len(), 1);
+        aliases.push(fds[0]);
+        let payload = receiver.recv_local_message(3, 0).unwrap().unwrap();
+        assert_eq!(payload.data, b"xyz");
+        assert!(payload.rights.is_empty());
+        assert_eq!(v.read(aliases[0], 8).unwrap(), 42u64.to_le_bytes());
+        v.write(aliases[1], &5u64.to_le_bytes()).unwrap();
+        assert_eq!(v.read(aliases[2], 8).unwrap(), 5u64.to_le_bytes());
     }
     #[test]
     fn shared_rights_keep_original_peek_and_partial_delivery_on_workers() {
