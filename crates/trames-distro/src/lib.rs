@@ -2,6 +2,7 @@
 //! Pinned distribution verification and checked import into the private VFS.
 pub mod android;
 pub mod android_package;
+pub mod bionic;
 pub mod boot;
 pub mod environment;
 pub mod packages;
