@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Checked, bounded string search/copy; original fallback before any writes.
-use crate::native::{Error, Registry, Return, MAX_STRING_BYTES as MAX_BYTES};
+//! Complete string requests; original backing fallback before any writes.
+use crate::native::{Error, Registry, Return};
+pub(crate) mod search;
+#[cfg(test)]
+const MAX_BYTES: usize = 1024 * 1024;
 #[cfg(test)]
 use trames_memory::Memory;
 use trames_memory::{NativeMemory, PAGE_SIZE};
@@ -26,12 +29,12 @@ pub(crate) fn execute(
             fallback: false,
         })
     };
+    if matches!(function, 29 | 30) {
+        return bounded_copy(registry, memory, function == 30, a);
+    }
     let copy = function >= 14;
     let bounded = function >= 16;
-    if bounded && length > MAX_BYTES as u64 {
-        return fallback();
-    }
-    let limit = if bounded { length as usize } else { MAX_BYTES };
+    let limit = if bounded { length as usize } else { usize::MAX };
     let source = if copy { src } else { dst };
     let mut offset = 0;
     let mut last = None;
@@ -65,9 +68,6 @@ pub(crate) fn execute(
         }
         offset += count;
     }
-    if !terminated && !bounded {
-        return fallback();
-    }
     if !copy {
         return done(if function == 13 {
             source.wrapping_add(offset as u64)
@@ -85,7 +85,12 @@ pub(crate) fn execute(
         Err(error) => return Err(error.into()),
     }
     let copied = if terminated { offset + 1 } else { offset };
-    registry.record_transfer(memory.copy_with(dst, src, copied, trames_native::copy)?);
+    let Some(transfer) =
+        (unsafe { memory.copy_raw_with(dst, src, copied, trames_native::copy_raw)? })
+    else {
+        return fallback();
+    };
+    registry.record_transfer(transfer);
     if total > copied {
         registry.record_transfer(memory.fill_with(
             dst.wrapping_add(copied as u64),
@@ -126,33 +131,81 @@ fn concatenate(
         }
         Ok((offset, false))
     };
-    let (end, terminated) = scan(dst, MAX_BYTES)?;
-    if !terminated {
-        return fallback();
-    }
-    let (copied, terminated) = scan(
-        src,
-        if bounded {
-            length.min(MAX_BYTES as u64) as usize
-        } else {
-            MAX_BYTES
-        },
-    )?;
-    if !terminated && (!bounded || length > MAX_BYTES as u64) {
-        return fallback();
-    }
+    let (end, _) = scan(dst, usize::MAX)?;
+    let (copied, _) = scan(src, if bounded { length as usize } else { usize::MAX })?;
     let output = dst.wrapping_add(end as u64);
     match memory.native_output_range(output, copied + 1) {
         Ok(true) => {}
         Ok(false) => return fallback(),
         Err(error) => return Err(error.into()),
     }
-    registry.record_transfer(memory.copy_with(output, src, copied, trames_native::copy)?);
+    let Some(transfer) =
+        (unsafe { memory.copy_raw_with(output, src, copied, trames_native::copy_raw)? })
+    else {
+        return fallback();
+    };
+    registry.record_transfer(transfer);
     registry.record_transfer(
         memory.fill_with(output.wrapping_add(copied as u64), 1, |bytes| bytes.fill(0))?,
     );
     Ok(Return {
         value: dst,
+        fallback: false,
+    })
+}
+
+fn bounded_copy(
+    registry: &mut Registry,
+    memory: &mut impl NativeMemory,
+    append: bool,
+    [dst, src, n]: [u64; 3],
+) -> Result<Return, Error> {
+    let fallback = || {
+        Ok(Return {
+            value: 0,
+            fallback: true,
+        })
+    };
+    let mut scan = |s: u64, bound: usize| -> Result<usize, Error> {
+        let mut offset = 0;
+        while offset < bound {
+            let at = s.wrapping_add(offset as u64);
+            let count = (bound - offset)
+                .min((PAGE_SIZE - (at & 0x00ff_ffff_ffff_ffff) % PAGE_SIZE) as usize);
+            let (nul, direct) = memory.with_read_chunk(at, count, trames_native::first_zero)?;
+            registry.record_read(count, direct);
+            if let Some(i) = nul {
+                return Ok(offset + i);
+            }
+            offset += count;
+        }
+        Ok(offset)
+    };
+    let end = if append { scan(dst, n as usize)? } else { 0 };
+    let len = scan(src, usize::MAX)?;
+    if end < n as usize {
+        let copied = len.min(n as usize - end - 1);
+        let output = dst.wrapping_add(end as u64);
+        if !memory.native_output_range(output, copied + 1)? {
+            return Ok(Return {
+                value: 0,
+                fallback: true,
+            });
+        }
+        let Some(transfer) =
+            (unsafe { memory.copy_raw_with(output, src, copied, trames_native::copy_raw)? })
+        else {
+            return fallback();
+        };
+        registry.record_transfer(transfer);
+        registry.record_transfer(
+            memory.fill_with(output.wrapping_add(copied as u64), 1, |b| {
+                trames_native::fill(b, 0)
+            })?,
+        );
+    }
+    Ok(Return {
+        value: (end as u64).wrapping_add(len as u64),
         fallback: false,
     })
 }
@@ -204,11 +257,7 @@ mod tests {
         m.write(0x4ffd, b"ab\0").unwrap();
         assert!(execute(&mut r, &mut m, 18, [0x4ffd, 0x3ffe, 0]).is_err());
         assert_eq!(m.read_array::<3>(0x4ffd).unwrap(), *b"ab\0");
-        assert!(
-            execute(&mut r, &mut m, 16, [1, 1, MAX_BYTES as u64 + 1])
-                .unwrap()
-                .fallback
-        );
+        assert!(execute(&mut r, &mut m, 16, [1, 1, MAX_BYTES as u64 + 1]).is_err());
     }
 
     #[test]
@@ -287,10 +336,6 @@ mod tests {
                 .unwrap()
                 .fallback
         );
-        assert!(
-            execute(&mut r, &mut m, 16, [0, 0, MAX_BYTES as u64 + 1])
-                .unwrap()
-                .fallback
-        );
+        assert!(execute(&mut r, &mut m, 16, [0, 0, MAX_BYTES as u64 + 1]).is_err());
     }
 }

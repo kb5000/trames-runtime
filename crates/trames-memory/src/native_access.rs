@@ -65,6 +65,37 @@ pub trait NativeMemory: CpuMemory {
         len: usize,
         operation: impl FnOnce(&[u8], &[u8]) -> T,
     ) -> Result<(T, bool, bool), NativeAccessError>;
+    /// Complete native operation. Implementations may merge physically
+    /// contiguous CPU-owned mappings without manufacturing cross-page slices.
+    ///
+    /// # Safety
+    /// The callback only accesses its complete supplied ranges, accepts overlap,
+    /// retains no pointer/reference, and obeys the existing CPU memory model.
+    unsafe fn copy_raw_with(
+        &mut self,
+        dst: u64,
+        src: u64,
+        len: usize,
+        copy: unsafe fn(*mut u8, *const u8, usize),
+    ) -> Result<Option<Transfer>, NativeAccessError> {
+        self.copy_with(dst, src, len, |d, s| unsafe {
+            copy(d.as_mut_ptr(), s.as_ptr(), d.len());
+        })
+        .map(Some)
+    }
+    /// # Safety
+    /// `fill` only writes its supplied range and retains no pointer/reference.
+    unsafe fn fill_raw_with(
+        &mut self,
+        dst: u64,
+        value: u8,
+        len: usize,
+        fill: unsafe fn(*mut u8, u8, usize),
+    ) -> Result<Transfer, NativeAccessError> {
+        self.fill_with(dst, len, |d| unsafe {
+            fill(d.as_mut_ptr(), value, d.len());
+        })
+    }
     fn fill_with(
         &mut self,
         address: u64,
@@ -80,6 +111,18 @@ pub trait NativeMemory: CpuMemory {
     ) -> Result<Transfer, NativeAccessError>;
 }
 impl NativeMemory for Memory {
+    unsafe fn copy_raw_with(
+        &mut self,
+        dst: u64,
+        src: u64,
+        len: usize,
+        copy: unsafe fn(*mut u8, *const u8, usize),
+    ) -> Result<Option<Transfer>, NativeAccessError> {
+        self.copy_native_impl(dst, src, len, true, |d, s| unsafe {
+            copy(d.as_mut_ptr(), s.as_ptr(), d.len());
+        })
+        .map_err(Into::into)
+    }
     fn native_read_pages_enabled(&self) -> bool {
         self.shared.is_none() && self.cpu_borrow_safe
     }
@@ -433,14 +476,30 @@ impl Memory {
         destination: u64,
         source: u64,
         len: usize,
-        mut copy: impl FnMut(&mut [u8], &[u8]),
+        copy: impl FnMut(&mut [u8], &[u8]),
     ) -> Result<Transfer, MemoryError> {
+        Ok(self
+            .copy_native_impl(destination, source, len, false, copy)?
+            .expect("ordinary memory copy"))
+    }
+    fn copy_native_impl(
+        &mut self,
+        destination: u64,
+        source: u64,
+        len: usize,
+        native_only: bool,
+        mut copy: impl FnMut(&mut [u8], &[u8]),
+    ) -> Result<Option<Transfer>, MemoryError> {
         let destination = destination & 0x00ffffffffffffff;
         let source = source & 0x00ffffffffffffff;
         if let Some(shared) = &self.shared {
-            return shared
-                .borrow_mut()
-                .copy_with(destination, source, len, copy);
+            return shared.borrow_mut().copy_native_impl(
+                destination,
+                source,
+                len,
+                native_only,
+                copy,
+            );
         }
         let direct = |page: &Page| {
             page.backing
@@ -451,10 +510,21 @@ impl Memory {
         let destination_direct = self.checked_pages(destination, len, Access::Write, direct)?;
         let mut stats = Transfer::default();
         if len == 0 {
-            return Ok(stats);
+            return Ok(Some(stats));
         }
         if !source_direct || !destination_direct {
-            let mut input = vec![0; len];
+            // Preserve the original alias snapshot when needed. Allocation
+            // failure selects original native code before writes, without an
+            // arbitrary byte policy or terminating the host allocator.
+            let mut input = Vec::new();
+            if input.try_reserve_exact(len).is_err() {
+                return if native_only {
+                    Ok(None)
+                } else {
+                    Err(MemoryError::Limit)
+                };
+            }
+            input.resize(len, 0);
             self.read(source, &mut input)?;
             stats.buffered_read = len as u64;
             let mut offset = 0;
@@ -470,7 +540,7 @@ impl Memory {
                 }
                 offset += count;
             }
-            return Ok(stats);
+            return Ok(Some(stats));
         }
         let backwards = destination > source && destination < source + len as u64;
         let mut remaining = len;
@@ -537,7 +607,7 @@ impl Memory {
             stats.direct_write += count as u64;
             remaining -= count;
         }
-        Ok(stats)
+        Ok(Some(stats))
     }
 }
 

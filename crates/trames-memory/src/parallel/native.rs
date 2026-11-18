@@ -4,10 +4,11 @@ use super::*;
 
 #[derive(Clone, Copy)]
 enum Gate {
-    Read,
     Write,
     Output,
     Retryable,
+    PrivateRead,
+    PrivateWrite,
 }
 impl View {
     #[inline]
@@ -37,7 +38,12 @@ impl View {
                 Gate::Write => defer |= !frame.native_one_shot.load(Ordering::Relaxed),
                 Gate::Output => eligible &= frame.native_one_shot.load(Ordering::Relaxed),
                 Gate::Retryable => eligible &= frame.native_retryable.load(Ordering::Relaxed),
-                Gate::Read => {}
+                Gate::PrivateRead | Gate::PrivateWrite => {
+                    eligible &= frame.private_access & PrivateMode::Exclusive as u8 != 0;
+                    if matches!(gate, Gate::PrivateWrite) {
+                        defer |= !frame.native_one_shot.load(Ordering::Relaxed);
+                    }
+                }
             }
         }
         if defer {
@@ -45,6 +51,210 @@ impl View {
         } else {
             Ok(eligible)
         }
+    }
+    // Maximal compatible run in one retained host allocation. No fixed byte
+    // limit, new lock, or slice spanning distinct guest pages/allocations.
+    fn private_run(
+        &self,
+        address: u64,
+        len: usize,
+        access: Access,
+        backwards: bool,
+    ) -> Result<Option<(*mut u8, usize)>, NativeAccessError> {
+        let (mut total, mut allocation, mut geometry, mut low) =
+            (0usize, std::ptr::null_mut::<u8>(), 0usize, 0usize);
+        while total < len {
+            let (at, count) = if backwards {
+                let end = address + (len - total) as u64;
+                let count = (len - total).min(((end - 1) % PAGE_SIZE + 1) as usize);
+                (end - count as u64, count)
+            } else {
+                let at = address + total as u64;
+                (at, (len - total).min((PAGE_SIZE - at % PAGE_SIZE) as usize))
+            };
+            let (frame, offset) = self.reached(at, count, access)?;
+            if frame.bytes.mutable().is_none() {
+                break;
+            }
+            let mut guard = self.frame_guard(frame, offset, count);
+            let Some((base, size, position)) = guard.private_mapping(offset) else {
+                break;
+            };
+            if total != 0
+                && (base != allocation
+                    || size != geometry
+                    || if backwards {
+                        position + count != low
+                    } else {
+                        position != low + total
+                    })
+            {
+                break;
+            }
+            if total == 0 {
+                allocation = base;
+                geometry = size;
+                low = position;
+            }
+            if backwards {
+                low = position;
+            }
+            if access == Access::Write {
+                self.changed(frame, &mut guard, offset, count);
+            }
+            total += count;
+        }
+        Ok((total != 0).then(|| (allocation.wrapping_add(low), total)))
+    }
+    // Bound discovery by both actual endpoint allocations before walking any
+    // run. A shifted overlapping move can otherwise re-walk a whole source
+    // allocation merely to copy the destination's last few boundary bytes.
+    fn private_limit(
+        &self,
+        address: u64,
+        len: usize,
+        access: Access,
+        backwards: bool,
+    ) -> Result<usize, NativeAccessError> {
+        let at = if backwards {
+            address + len as u64 - 1
+        } else {
+            address
+        };
+        let (frame, offset) = self.reached(at, 1, access)?;
+        let guard = self.frame_guard(frame, offset, 1);
+        Ok(guard
+            .private_mapping(offset)
+            .map_or(0, |(_, size, position)| {
+                len.min(if backwards {
+                    position + 1
+                } else {
+                    size - position
+                })
+            }))
+    }
+    fn copy_native_impl(
+        &mut self,
+        destination: u64,
+        source: u64,
+        len: usize,
+        native_only: bool,
+        mut copy: impl FnMut(&mut [u8], &[u8]),
+    ) -> Result<Option<Transfer>, NativeAccessError> {
+        let destination = destination & 0x00ffffffffffffff;
+        let source = source & 0x00ffffffffffffff;
+        // The cold per-frame uniqueness certificate also proves no physical
+        // aliases when peer workers prevent an unlocked private epoch. This
+        // skips alias indexing, not the CPU's existing shared-page byte guards.
+        let unique_source = self.native_range(source, len, Access::Read, Gate::PrivateRead)?;
+        let unique_destination =
+            self.native_range(destination, len, Access::Write, Gate::PrivateWrite)?;
+        if len == 0 {
+            return Ok(Some(Transfer::default()));
+        }
+        // Virtual overlap is directional. A repeated backing identity at another
+        // virtual address instead needs a source snapshot, preserving alias moves.
+        let mut aliased = false;
+        if self.snapshot.has_aliases && !(unique_source && unique_destination) {
+            let mut identities = std::collections::HashMap::new();
+            if identities
+                .try_reserve(len / PAGE_SIZE as usize + 2)
+                .is_err()
+            {
+                return if native_only {
+                    Ok(None)
+                } else {
+                    Err(MemoryError::Limit.into())
+                };
+            }
+            for base in (source & !(PAGE_SIZE - 1)..source + len as u64).step_by(PAGE_SIZE as usize)
+            {
+                let id = self.frame(base, Access::Read)?.bytes.identity;
+                if identities.insert(id, base).is_some() {
+                    aliased = true;
+                }
+            }
+            for base in (destination & !(PAGE_SIZE - 1)..destination + len as u64)
+                .step_by(PAGE_SIZE as usize)
+            {
+                let id = self.frame(base, Access::Write)?.bytes.identity;
+                if identities.get(&id).is_some_and(|s| *s != base) {
+                    aliased = true;
+                }
+            }
+        }
+        if aliased {
+            if native_only {
+                return Ok(None);
+            }
+            let mut input = Vec::new();
+            input
+                .try_reserve_exact(len)
+                .map_err(|_| MemoryError::Limit)?;
+            input.resize(len, 0);
+            self.read(source, &mut input)?;
+            let mut offset = 0;
+            while offset < len {
+                let at = destination + offset as u64;
+                let count = (len - offset).min((PAGE_SIZE - at % PAGE_SIZE) as usize);
+                self.write_chunk(at, count, |out| copy(out, &input[offset..offset + count]))?;
+                offset += count;
+            }
+            return Ok(Some(Transfer {
+                buffered_read: len as u64,
+                direct_write: len as u64,
+                ..Transfer::default()
+            }));
+        }
+        let backwards = destination > source && destination < source + len as u64;
+        let mut remaining = len;
+        while remaining != 0 {
+            let (d, s, count) = if backwards {
+                let de = destination + remaining as u64;
+                let se = source + remaining as u64;
+                let count = remaining
+                    .min(((de - 1) % PAGE_SIZE + 1) as usize)
+                    .min(((se - 1) % PAGE_SIZE + 1) as usize);
+                (de - count as u64, se - count as u64, count)
+            } else {
+                let d = destination + (len - remaining) as u64;
+                let s = source + (len - remaining) as u64;
+                let count = remaining
+                    .min((PAGE_SIZE - d % PAGE_SIZE) as usize)
+                    .min((PAGE_SIZE - s % PAGE_SIZE) as usize);
+                (d, s, count)
+            };
+            let (df, di) = self.reached(d, count, Access::Write)?;
+            self.ensure_resident(df)?;
+            let (sf, si) = self.reached(s, count, Access::Read)?;
+            let dst = &df.bytes;
+            let src = &sf.bytes;
+            if Arc::ptr_eq(dst, src) {
+                let mut guard = self.page_guard_pair(dst, df.private_access, si, di, count);
+                self.changed(df, &mut guard, di, count);
+                guard.copy_within(si, di, count);
+            } else if let Some(bytes) = &src.constant {
+                self.write_chunk(d, count, |out| copy(out, &bytes[si..si + count]))?;
+            } else {
+                let (mut dg, sg) = if dst.identity < src.identity {
+                    let dg = self.page_guard(dst, df.private_access, di, count);
+                    let sg = self.page_guard(src, sf.private_access, si, count);
+                    (dg, sg)
+                } else {
+                    let sg = self.page_guard(src, sf.private_access, si, count);
+                    let dg = self.page_guard(dst, df.private_access, di, count);
+                    (dg, sg)
+                };
+                self.changed(df, &mut dg, di, count);
+                copy(dg.write(di, count), sg.read(si, count));
+            }
+            remaining -= count;
+        }
+        Ok(Some(Transfer {
+            direct_read: len as u64,
+            direct_write: len as u64,
+            ..Transfer::default()
+        }))
     }
     fn write_chunk<T>(
         &self,
@@ -167,6 +377,139 @@ impl NativeMemory for View {
         };
         Ok((result, true, true))
     }
+    unsafe fn copy_raw_with(
+        &mut self,
+        destination: u64,
+        source: u64,
+        len: usize,
+        copy: unsafe fn(*mut u8, *const u8, usize),
+    ) -> Result<Option<Transfer>, NativeAccessError> {
+        if len == 0 {
+            return Ok(Some(Transfer::default()));
+        }
+        let destination = destination & 0x00ff_ffff_ffff_ffff;
+        let source = source & 0x00ff_ffff_ffff_ffff;
+        // Overlap already has a fast union-guard memmove in the CPU page
+        // transport. Keep that path inside this one complete native entry;
+        // discovering two overlapping runs costs more than it saves.
+        if destination.abs_diff(source) < len as u64 {
+            return self.copy_native_impl(destination, source, len, true, |d, s| unsafe {
+                copy(d.as_mut_ptr(), s.as_ptr(), d.len());
+            });
+        }
+        let raw = if self.private_mode == PrivateMode::Exclusive {
+            let sf = self.frame(source, Access::Read)?;
+            let df = self.frame(destination, Access::Write)?;
+            if sf.private_access & 1 != 0 && df.private_access & 1 != 0 {
+                let read = self.native_range(source, len, Access::Read, Gate::PrivateRead)?;
+                let write =
+                    self.native_range(destination, len, Access::Write, Gate::PrivateWrite)?;
+                read && write
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !raw {
+            return self.copy_native_impl(destination, source, len, true, |d, s| unsafe {
+                copy(d.as_mut_ptr(), s.as_ptr(), d.len());
+            });
+        }
+        let backwards = destination > source && destination - source < len as u64;
+        let mut remaining = len;
+        while remaining != 0 {
+            let offset = if backwards { 0 } else { len - remaining };
+            let d = destination + offset as u64;
+            let s = source + offset as u64;
+            let limit = self
+                .private_limit(s, remaining, Access::Read, backwards)?
+                .min(self.private_limit(d, remaining, Access::Write, backwards)?);
+            if limit == 0 {
+                self.copy_with(d, s, remaining, |d, s| unsafe {
+                    copy(d.as_mut_ptr(), s.as_ptr(), d.len());
+                })?;
+                break;
+            }
+            let source_at = if backwards {
+                s + (remaining - limit) as u64
+            } else {
+                s
+            };
+            let Some((input, available)) =
+                self.private_run(source_at, limit, Access::Read, backwards)?
+            else {
+                self.copy_with(d, s, remaining, |d, s| unsafe {
+                    copy(d.as_mut_ptr(), s.as_ptr(), d.len());
+                })?;
+                break;
+            };
+            let dest_at = if backwards {
+                d + (remaining - available) as u64
+            } else {
+                d
+            };
+            let Some((output, count)) =
+                self.private_run(dest_at, available, Access::Write, backwards)?
+            else {
+                self.copy_with(d, s, remaining, |d, s| unsafe {
+                    copy(d.as_mut_ptr(), s.as_ptr(), d.len());
+                })?;
+                break;
+            };
+            // SAFETY: the original exclusive-private admission covers every
+            // reached frame; both allocation owners remain in this live View.
+            // There are no Rust byte slices and callback handles actual overlap.
+            let input = if backwards {
+                input.wrapping_add(available - count)
+            } else {
+                input
+            };
+            unsafe {
+                copy(output, input, count);
+            }
+            remaining -= count;
+        }
+        Ok(Some(Transfer {
+            direct_read: len as u64,
+            direct_write: len as u64,
+            ..Transfer::default()
+        }))
+    }
+    unsafe fn fill_raw_with(
+        &mut self,
+        address: u64,
+        value: u8,
+        len: usize,
+        fill: unsafe fn(*mut u8, u8, usize),
+    ) -> Result<Transfer, NativeAccessError> {
+        if self.private_mode != PrivateMode::Exclusive {
+            return self.fill_with(address, len, |d| unsafe {
+                fill(d.as_mut_ptr(), value, d.len());
+            });
+        }
+        let address = address & 0x00ff_ffff_ffff_ffff;
+        self.native_range(address, len, Access::Write, Gate::Write)?;
+        let mut offset = 0;
+        while offset < len {
+            let at = address + offset as u64;
+            let Some((output, count)) = self.private_run(at, len - offset, Access::Write, false)?
+            else {
+                self.fill_with(at, len - offset, |d| unsafe {
+                    fill(d.as_mut_ptr(), value, d.len());
+                })?;
+                break;
+            };
+            unsafe {
+                fill(output, value, count);
+            }
+            offset += count;
+        }
+        Ok(Transfer {
+            direct_write: len as u64,
+            ..Transfer::default()
+        })
+    }
     fn fill_with(
         &mut self,
         address: u64,
@@ -192,101 +535,11 @@ impl NativeMemory for View {
         destination: u64,
         source: u64,
         len: usize,
-        mut copy: impl FnMut(&mut [u8], &[u8]),
+        copy: impl FnMut(&mut [u8], &[u8]),
     ) -> Result<Transfer, NativeAccessError> {
-        let destination = destination & 0x00ffffffffffffff;
-        let source = source & 0x00ffffffffffffff;
-        self.native_range(source, len, Access::Read, Gate::Read)?;
-        self.native_range(destination, len, Access::Write, Gate::Write)?;
-        if len == 0 {
-            return Ok(Transfer::default());
-        }
-        // Virtual overlap is directional. A repeated backing identity at another
-        // virtual address instead needs a source snapshot, preserving alias moves.
-        let mut identities = BTreeMap::new();
-        let mut aliased = false;
-        if self.snapshot.has_aliases {
-            for base in (source & !(PAGE_SIZE - 1)..source + len as u64).step_by(PAGE_SIZE as usize)
-            {
-                let id = self.frame(base, Access::Read)?.bytes.identity;
-                if identities.insert(id, base).is_some() {
-                    aliased = true;
-                }
-            }
-            for base in (destination & !(PAGE_SIZE - 1)..destination + len as u64)
-                .step_by(PAGE_SIZE as usize)
-            {
-                let id = self.frame(base, Access::Write)?.bytes.identity;
-                if identities.get(&id).is_some_and(|s| *s != base) {
-                    aliased = true;
-                }
-            }
-        }
-        if aliased {
-            let mut input = vec![0; len];
-            self.read(source, &mut input)?;
-            let mut offset = 0;
-            while offset < len {
-                let at = destination + offset as u64;
-                let count = (len - offset).min((PAGE_SIZE - at % PAGE_SIZE) as usize);
-                self.write_chunk(at, count, |out| copy(out, &input[offset..offset + count]))?;
-                offset += count;
-            }
-            return Ok(Transfer {
-                buffered_read: len as u64,
-                direct_write: len as u64,
-                ..Transfer::default()
-            });
-        }
-        let backwards = destination > source && destination < source + len as u64;
-        let mut remaining = len;
-        while remaining != 0 {
-            let (d, s, count) = if backwards {
-                let de = destination + remaining as u64;
-                let se = source + remaining as u64;
-                let count = remaining
-                    .min(((de - 1) % PAGE_SIZE + 1) as usize)
-                    .min(((se - 1) % PAGE_SIZE + 1) as usize);
-                (de - count as u64, se - count as u64, count)
-            } else {
-                let d = destination + (len - remaining) as u64;
-                let s = source + (len - remaining) as u64;
-                let count = remaining
-                    .min((PAGE_SIZE - d % PAGE_SIZE) as usize)
-                    .min((PAGE_SIZE - s % PAGE_SIZE) as usize);
-                (d, s, count)
-            };
-            let (df, di) = self.reached(d, count, Access::Write)?;
-            self.ensure_resident(df)?;
-            let (sf, si) = self.reached(s, count, Access::Read)?;
-            let dst = &df.bytes;
-            let src = &sf.bytes;
-            if Arc::ptr_eq(dst, src) {
-                let mut guard = self.page_guard_pair(dst, df.private_access, si, di, count);
-                self.changed(df, &mut guard, di, count);
-                guard.copy_within(si, di, count);
-            } else if let Some(bytes) = &src.constant {
-                self.write_chunk(d, count, |out| copy(out, &bytes[si..si + count]))?;
-            } else {
-                let (mut dg, sg) = if dst.identity < src.identity {
-                    let dg = self.page_guard(dst, df.private_access, di, count);
-                    let sg = self.page_guard(src, sf.private_access, si, count);
-                    (dg, sg)
-                } else {
-                    let sg = self.page_guard(src, sf.private_access, si, count);
-                    let dg = self.page_guard(dst, df.private_access, di, count);
-                    (dg, sg)
-                };
-                self.changed(df, &mut dg, di, count);
-                copy(dg.write(di, count), sg.read(si, count));
-            }
-            remaining -= count;
-        }
-        Ok(Transfer {
-            direct_read: len as u64,
-            direct_write: len as u64,
-            ..Transfer::default()
-        })
+        Ok(self
+            .copy_native_impl(destination, source, len, false, copy)?
+            .expect("ordinary worker copy"))
     }
 }
 
@@ -357,7 +610,7 @@ mod tests {
 
     #[test]
     fn independent_atomic_pairs_share_one_page_without_torn_reads() {
-        use std::sync::{atomic::AtomicUsize, Arc, Barrier};
+        use std::sync::{Arc, Barrier, atomic::AtomicUsize};
         let mut memory = Memory::default();
         memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         for rank in 0..4 {
@@ -637,9 +890,10 @@ mod tests {
         for offset in [16, 32, 48] {
             let token = view.exclusive_read(0x1000 + offset, &mut bytes).unwrap();
             view.fill_with(0x1000, 8, |b| b.fill(6)).unwrap();
-            assert!(view
-                .exclusive_write(0x1000 + offset, &[5; 8], Some(token))
-                .unwrap());
+            assert!(
+                view.exclusive_write(0x1000 + offset, &[5; 8], Some(token))
+                    .unwrap()
+            );
         }
         let first = view.exclusive_read(0x1000, &mut bytes).unwrap();
         view.fill_with(0x1100, 8, |b| b.fill(8)).unwrap();

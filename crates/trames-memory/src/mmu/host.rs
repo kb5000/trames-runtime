@@ -71,6 +71,9 @@ pub(super) fn page_size() -> Option<usize> {
     (size.is_power_of_two() && (4096..=65536).contains(&size)).then_some(size)
 }
 impl Mapping {
+    pub(crate) fn native_allocation(&self) -> (*mut u8, usize) {
+        (self.kernel.as_ptr(), WINDOW)
+    }
     pub fn new() -> Option<Self> {
         Self::with_budget(&BUDGET)
     }

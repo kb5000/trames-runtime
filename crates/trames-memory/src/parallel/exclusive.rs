@@ -299,3 +299,95 @@ fn native_unwind_ends_private_borrows_and_keeps_dirty_and_monitor_effects() {
     memory.commit_parallel().unwrap();
     assert_eq!(memory.read_array::<8>(0x40000).unwrap(), [19; 8]);
 }
+
+#[test]
+fn raw_bulk_merges_real_mapping_runs_and_preserves_overlapping_moves() {
+    thread_local! { static LARGEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+    unsafe fn copy(dst: *mut u8, src: *const u8, len: usize) {
+        LARGEST.with(|n| n.set(n.get().max(len)));
+        // SAFETY: caller supplies live epoch-owned ranges and permits overlap.
+        unsafe {
+            std::ptr::copy(src, dst, len);
+        }
+    }
+    unsafe fn fill(dst: *mut u8, value: u8, len: usize) {
+        LARGEST.with(|n| n.set(n.get().max(len)));
+        // SAFETY: complete writable epoch-owned range.
+        unsafe {
+            std::ptr::write_bytes(dst, value, len);
+        }
+    }
+    let mut memory = Memory::default();
+    memory
+        .map(0x40000, PAGE_SIZE * 64, Permissions::RW)
+        .unwrap();
+    let input: Vec<_> = (0..65567).map(|i| (i * 73) as u8).collect();
+    memory.write(0x40003, &input).unwrap();
+    memory
+        .write(0x60000, &vec![0x91; 20 * PAGE_SIZE as usize])
+        .unwrap();
+    let mut registry = Registry::default();
+    let mut view = memory.parallel_view(&mut registry).unwrap();
+    admit(&mut view);
+    let before = locks(&view);
+
+    // SAFETY: these callbacks only use supplied ranges, retain no pointers, and
+    // the View has the same exclusive-private admission as scalar CPU access.
+    unsafe {
+        view.copy_raw_with(0x60005, 0x40003, input.len(), copy)
+            .unwrap()
+            .unwrap();
+    }
+    let mut output = vec![0; input.len()];
+    view.read(0x60005, &mut output).unwrap();
+    assert_eq!(output, input);
+    assert!(LARGEST.with(|n| n.get()) > PAGE_SIZE as usize);
+    unsafe {
+        view.copy_raw_with(0x60008, 0x60005, input.len() - 3, copy)
+            .unwrap()
+            .unwrap();
+    }
+    view.read(0x60008, &mut output[..input.len() - 3]).unwrap();
+    assert_eq!(&output[..input.len() - 3], &input[..input.len() - 3]);
+    unsafe {
+        view.copy_raw_with(0x60005, 0x60008, input.len() - 3, copy)
+            .unwrap()
+            .unwrap();
+    }
+    view.read(0x60005, &mut output[..input.len() - 3]).unwrap();
+    assert_eq!(&output[..input.len() - 3], &input[..input.len() - 3]);
+    unsafe {
+        view.fill_raw_with(0x40003, 0x53, input.len(), fill)
+            .unwrap();
+    }
+    view.read(0x40003, &mut output).unwrap();
+    assert!(output.iter().all(|&x| x == 0x53));
+    assert_eq!(locks(&view), before);
+    drop(view);
+    memory.commit_parallel().unwrap();
+    assert_eq!(memory.read_array::<3>(0x40000).unwrap(), [0; 3]);
+}
+
+#[test]
+fn fresh_zero_snapshots_are_private_without_publishing_mutable_bytes_to_the_root() {
+    let mut parent = Memory::default();
+    parent
+        .map(0x40000, 16 * PAGE_SIZE, Permissions::RW)
+        .unwrap();
+    let mut child = parent.clone();
+    let mut registry = Registry::default();
+    let mut view = child.parallel_view(&mut registry).unwrap();
+    admit(&mut view);
+    assert_ne!(
+        view.frame(0x40000, Access::Write).unwrap().private_access & 1,
+        0
+    );
+    let before = locks(&view);
+    view.fill_with(0x40000, 16 * PAGE_SIZE as usize, |b| b.fill(0x5a))
+        .unwrap();
+    assert_eq!(locks(&view), before);
+    drop(view);
+    child.commit_parallel().unwrap();
+    assert_eq!(parent.read_array::<8>(0x40000).unwrap(), [0; 8]);
+    assert_eq!(child.read_array::<8>(0x40000).unwrap(), [0x5a; 8]);
+}

@@ -2,7 +2,7 @@
 #include "shim/stdio.h"
 #include "shim/stdint.h"
 #include "shim/floatscan.h"
-struct trames_parse_result { uint64_t bits, consumed; int error, exhausted; };
+struct trames_parse_result { uint64_t bits, consumed; int error, exhausted; uint64_t fpsr; };
 extern unsigned long long trames_native_intscan(FILE *, unsigned, int, unsigned long long);
 void trames_native_parse_integer(const unsigned char *bytes, size_t len, unsigned base, int is_signed, struct trames_parse_result *result) {
     FILE f={.bytes=bytes,.len=len};
@@ -40,8 +40,12 @@ void trames_native_parse_float(const unsigned char *bytes, size_t len, int preci
     result->consumed=f.pos>=f.origin ? f.pos-f.origin : 0;
     result->error=f.error; result->exhausted=f.exhausted;
 #if defined(__aarch64__)
+    __asm__ volatile("mrs %0, fpsr" : "=r"(result->fpsr));
     __asm__ volatile("msr fpcr, %0\n msr fpsr, %1" : : "r"(fpcr), "r"(fpsr) : "memory");
 #else
+    unsigned flags;
+    __asm__ volatile("stmxcsr %0" : "=m"(flags));
+    result->fpsr=((flags&1)?1:0)|((flags&4)?2:0)|((flags&8)?4:0)|((flags&16)?8:0)|((flags&32)?16:0);
     __asm__ volatile("fldenv %0\n ldmxcsr %1" : : "m"(x87), "m"(csr) : "memory");
 #endif
     host_errno=saved_errno;

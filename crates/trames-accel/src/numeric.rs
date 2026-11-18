@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Bounded musl floating conversion over checked guest pages.
-use crate::native::{Error, Metrics, Return, MAX_BYTES};
+//! Complete musl floating conversion over reached guest pages.
+use crate::native::{Error, Metrics, Return};
 #[cfg(test)]
 use trames_memory::Memory;
 use trames_memory::{NativeMemory, PAGE_SIZE};
@@ -17,6 +17,23 @@ pub(crate) fn parse(
         return Err(Error::InvalidEntry);
     }
     let result = parse_with(memory, source, output, metrics, false, |bytes| {
+        trames_native::parse::floating(bytes, precision == 0)
+    })?;
+    if !result.fallback {
+        metrics.numeric_conversions = metrics.numeric_conversions.saturating_add(1);
+    }
+    Ok(result)
+}
+/// New paired-musl entry returns guest FP flags as well as end/errno.
+pub(crate) fn parse_complete(
+    memory: &mut impl NativeMemory,
+    [source, output, precision]: [u64; 3],
+    metrics: &mut Metrics,
+) -> Result<Return, Error> {
+    if precision > 1 {
+        return Err(Error::InvalidEntry);
+    }
+    let result = parse_with_output::<24>(memory, source, output, metrics, false, |bytes| {
         trames_native::parse::floating(bytes, precision == 0)
     })?;
     if !result.fallback {
@@ -72,23 +89,33 @@ pub(crate) fn parse_with_output<const OUTPUT_BYTES: usize>(
     let mut input = Vec::new();
     let mut supplied = first;
     if parsed.needs_more {
-        let (_, direct) =
-            memory.with_read_chunk(base, first, |bytes| input.extend_from_slice(bytes))?;
+        let (copied, direct) = memory.with_read_chunk(base, first, |bytes| {
+            if input.try_reserve(bytes.len()).is_err() {
+                return false;
+            }
+            input.extend_from_slice(bytes);
+            true
+        })?;
+        if !copied {
+            return fallback();
+        }
         record_read(metrics, first, direct);
     }
     while parsed.needs_more {
-        if supplied >= MAX_BYTES {
-            return fallback();
-        }
         let at = base
             .checked_add(supplied as u64)
             .ok_or(Error::InvalidEntry)?;
-        let count = supplied
-            .max(64)
-            .min(MAX_BYTES - supplied)
-            .min((PAGE_SIZE - at % PAGE_SIZE) as usize);
-        let (_, direct) =
-            memory.with_read_chunk(at, count, |bytes| input.extend_from_slice(bytes))?;
+        let count = supplied.max(64).min((PAGE_SIZE - at % PAGE_SIZE) as usize);
+        let (copied, direct) = memory.with_read_chunk(at, count, |bytes| {
+            if input.try_reserve(bytes.len()).is_err() {
+                return false;
+            }
+            input.extend_from_slice(bytes);
+            true
+        })?;
+        if !copied {
+            return fallback();
+        }
         record_read(metrics, count, direct);
         supplied += count;
         parsed = parser(&input);
@@ -104,6 +131,12 @@ fn commit<const OUTPUT_BYTES: usize>(
     supplied: usize,
     metrics: &mut Metrics,
 ) -> Result<Return, Error> {
+    if parsed.errno == 12 {
+        return Ok(Return {
+            value: 0,
+            fallback: true,
+        });
+    }
     if parsed.consumed > supplied || !matches!(parsed.errno, 0 | 22 | 34) {
         return Err(Error::InvalidEntry);
     }
@@ -136,6 +169,7 @@ fn record_read(metrics: &mut Metrics, count: usize, direct: bool) {
 }
 #[cfg(test)]
 mod tests {
+    const MAX_BYTES: usize = 65536;
     use super::*;
     use trames_memory::Permissions;
     #[test]
@@ -163,28 +197,29 @@ mod tests {
         assert_eq!(r.value, 1f64.to_bits());
     }
     #[test]
-    fn ceilings_do_not_publish_partial_results_and_resident_shared_output_succeeds() {
+    fn reached_faults_do_not_publish_partial_results_and_long_inputs_complete() {
         let mut m = Memory::default();
         m.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         m.map(0x4000, MAX_BYTES as u64, Permissions::RW).unwrap();
         m.write(0x1000, &[17; 16]).unwrap();
         m.write(0x4000, &vec![b'1'; MAX_BYTES]).unwrap();
         let mut metrics = Metrics::default();
-        assert!(
-            parse(&mut m, [0x4000, 0x1000, 1], &mut metrics)
-                .unwrap()
-                .fallback
-        );
+        assert!(parse(&mut m, [0x4000, 0x1000, 1], &mut metrics).is_err());
         assert_eq!(m.read_array::<16>(0x1000).unwrap(), [17; 16]);
+        m.map(0x4000 + MAX_BYTES as u64, PAGE_SIZE, Permissions::RW)
+            .unwrap();
+        m.write(0x4000 + MAX_BYTES as u64, b"!\0").unwrap();
+        let long = parse(&mut m, [0x4000, 0x1000, 1], &mut metrics).unwrap();
+        assert!(!long.fallback);
+        assert_eq!(long.value, f64::INFINITY.to_bits());
+        assert_eq!(m.read_u64(0x1000).unwrap(), 0x4000 + MAX_BYTES as u64);
         m.map_shared_anonymous(0x1000, PAGE_SIZE, Permissions::RW, true)
             .unwrap();
         m.write(0x1000, &[17; 16]).unwrap();
-        assert!(
-            parse(&mut m, [0x4000, 0x1000, 0], &mut metrics)
-                .unwrap()
-                .fallback
-        );
-        assert_eq!(m.read_array::<16>(0x1000).unwrap(), [17; 16]);
+        let single = parse(&mut m, [0x4000, 0x1000, 0], &mut metrics).unwrap();
+        assert!(!single.fallback);
+        assert_eq!(single.value, f32::INFINITY.to_bits() as u64);
+        assert_eq!(m.read_u64(0x1000).unwrap(), 0x4000 + MAX_BYTES as u64);
         m.write(0x4000, b"12.5!\0").unwrap();
         let result = parse(&mut m, [0x4000, 0x1000, 1], &mut metrics).unwrap();
         assert!(!result.fallback);

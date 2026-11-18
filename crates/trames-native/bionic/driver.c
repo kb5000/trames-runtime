@@ -28,7 +28,8 @@ void trames_bionic_parse_float(const unsigned char *bytes, size_t len, int singl
 #endif
     TramesGdtoaState state = {0}, *saved_state = trames_gdtoa_state;
     trames_gdtoa_state = &state;
-    char input[len + 1], *end;
+    char *input = trames_gdtoa_malloc(len + 1), *end;
+    if (!input) { out->bits = out->consumed = 0; out->error = ENOMEM; out->exhausted = 0; goto finished; }
     memcpy(input, bytes, len); input[len] = 0;
     errno = 0;
     if (single) {
@@ -39,6 +40,7 @@ void trames_bionic_parse_float(const unsigned char *bytes, size_t len, int singl
         out->bits = value.bits;
     }
     out->consumed = (uint64_t)(end - input); out->error = errno; out->exhausted = 0;
+finished: ;
 #if defined(__aarch64__)
     __asm__ volatile("mrs %0, fpsr" : "=r"(out->fpsr));
 #else

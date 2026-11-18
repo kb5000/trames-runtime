@@ -232,9 +232,10 @@ copy/scan/parser transports, not these scalar metadata accesses.
    Original guest wrappers can remain while compatible allocator entry points
    become native. Add profiling evidence before broadening the default profile.
 
-The existing 1 MiB pure-copy limit is not an allocation-size limit. Metadata
-work and any realloc/calloc payload movement need their own bounded/resumable
-contract; larger allocations must remain supported through original cold paths.
+Pure copy/fill now process complete requests without a byte ceiling; this is
+independent of allocation size. Allocator metadata mutation and cold syscalls
+still need their own resumable contract. Larger allocations remain supported
+through original cold paths.
 
 ## Acceptance
 

@@ -7,6 +7,7 @@ struct RawResult {
     consumed: u64,
     error: i32,
     exhausted: i32,
+    fpsr: u64,
 }
 unsafe extern "C" {
     fn trames_native_parse_integer(
@@ -65,7 +66,7 @@ pub fn floating(bytes: &[u8], single: bool) -> ParsedFloat {
         consumed: raw.consumed as usize,
         errno: raw.error,
         needs_more: raw.exhausted != 0,
-        fpsr: 0,
+        fpsr: raw.fpsr,
     }
 }
 #[cfg(test)]

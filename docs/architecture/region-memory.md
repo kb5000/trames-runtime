@@ -144,8 +144,10 @@ After a short bounded spin, overlapping waiters yield the host thread rather
 than busy-loop indefinitely. This is a region lock, not a claim of lock-free or
 starvation-free execution. A bulk operation touching the whole page needs every
 bit, but acquires that mask in one operation. Different regions of one page can
-progress while a smaller native borrow is held. Native functions remain bounded;
-kernel mutation and mapped persistence still use joined checkpoints.
+progress while a smaller native borrow is held. Pure memory/string functions
+process complete requests without a byte ceiling; borrow spans follow actual
+page/allocation geometry. Kernel mutation and mapped persistence still use
+joined checkpoints.
 
 The module's `unsafe impl Sync` has one invariant: every non-atomic byte and local
 reservation-row access has exclusive or immutable range ownership, from a live
@@ -1256,3 +1258,24 @@ metadata and merges the bitmap once; a later member error preserves an accepted
 prefix. Private write publication, provider commits and hardware byte ownership
 are unchanged. This is not deferred whole-VM dirty tracking, and does not put an
 extra synchronization step on ordinary guest loads or stores.
+
+## Complete native ranges (2026-11-18)
+
+Pure copy/fill can coalesce adjacent mappings in one retained host allocation
+under the same sole-executor private epoch used by CPU instructions. The cold
+private-frame classifier is unchanged. COW peers, retained readonly forks,
+registered pins and shared frames keep their existing exclusion. No native-only
+permission, per-call refcount query or new service thread is introduced.
+
+Disjoint run discovery uses both endpoint allocation boundaries before walking
+pages. Raw callbacks receive bounded pointers into retained allocations, never
+slices covering unrelated pages. Overlapping moves keep the existing fast
+union-guard CPU memmove within the complete native entry; discovering two
+coalesced overlapping runs was slower in the paired benchmark. The pinned
+memcpy alone is not a large-overlap memmove. Shared ranges keep the existing
+region guards. Existing cold uniqueness certificates skip alias indexing even
+when peer workers prevent unlocked access; they do not grant new byte authority.
+Other ranges use a call-owned hash index instead of a tree. Physical aliases
+select original native-call fallback before effects; ordinary CPU copy APIs
+retain their source snapshot semantics. Allocation failures are handled before
+guest writes.

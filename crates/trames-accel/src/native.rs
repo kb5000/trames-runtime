@@ -9,7 +9,7 @@ use trames_memory::{MemoryError, NativeAccessError, NativeMemory, Transfer, PAGE
 pub const AUXV_KEY: u64 = 0x5452_0001;
 /// Optional function bitmap: bit (id - 1). Absent on old hosts.
 pub const FEATURES_AUXV_KEY: u64 = 0x5452_0002;
-pub const FUNCTION_COUNT: usize = 19;
+pub const FUNCTION_COUNT: usize = 32;
 pub const FEATURES: u64 = (1 << FUNCTION_COUNT) - 1;
 pub const PROFILE: u64 = 0x0001_0001; // protocol 1, pure module 1
 pub const INSTRUCTION: u32 = 0xd44a8a40; // HLT #0x5452, opt-in virtual encoding
@@ -17,10 +17,13 @@ pub const VULKAN_PROFILE: u64 = 0x0001_0006;
 pub const AUDIO_PROFILE: u64 = 0x0001_0008;
 pub const VIDEO_PROFILE: u64 = 0x0001_0007;
 pub const MAX_BYTES: usize = 64 * 1024;
-/// Bulk operations remain bounded inside a NativeCall execution/checkpoint.
-/// Larger operations fall back before any effects; no partial replay.
-pub const MAX_BULK_BYTES: usize = 1024 * 1024;
-pub const MAX_STRING_BYTES: usize = 1024 * 1024;
+// Bulk and string requests have no artificial byte ceiling. The original CPU
+// memory model handles reached mappings; only backing/semantic admission can
+// request an original-code fallback before writes, never the request length.
+#[cfg(test)]
+const MAX_BULK_BYTES: usize = 1024 * 1024;
+#[cfg(test)]
+const MAX_STRING_BYTES: usize = 1024 * 1024;
 #[derive(Default, Debug, Serialize)]
 pub struct Metrics {
     pub calls: u64,
@@ -454,45 +457,38 @@ impl Registry {
         a: [u64; 3],
     ) -> Result<Return, Error> {
         let (dst, src, length) = (a[0], a[1], a[2]);
-        let fallback = || {
-            Ok(Return {
-                value: dst,
-                fallback: true,
-            })
-        };
         let done = |value| {
             Ok(Return {
                 value,
                 fallback: false,
             })
         };
-        let ceiling = if matches!(function, 1..=4 | 6 | 7) {
-            MAX_BULK_BYTES
-        } else {
-            MAX_STRING_BYTES
-        };
-        if matches!(function, 1..=3 | 7) && length > ceiling as u64 {
-            return fallback();
-        }
-        let len = length.min(ceiling as u64) as usize;
+        let len = length as usize;
         match function {
             1 | 2 => {
                 if len == 0 || (function == 2 && dst == src) {
                     return done(dst);
                 }
-                let transfer = memory.copy_with(dst, src, len, trames_native::copy)?;
+                let Some(transfer) =
+                    (unsafe { memory.copy_raw_with(dst, src, len, trames_native::copy_raw)? })
+                else {
+                    return Ok(Return {
+                        value: dst,
+                        fallback: true,
+                    });
+                };
                 self.record_transfer(transfer);
                 done(dst)
             }
             3 => {
                 let transfer =
-                    memory.fill_with(dst, len, |bytes| trames_native::fill(bytes, src as u8))?;
+                    unsafe { memory.fill_raw_with(dst, src as u8, len, trames_native::fill_raw)? };
                 self.record_transfer(transfer);
                 done(dst)
             }
             4 | 9 | 10 => {
                 // Compare only reached page fragments; mismatch/NUL ends the scan.
-                let limit = if function == 9 { MAX_STRING_BYTES } else { len };
+                let limit = if function == 9 { usize::MAX } else { len };
                 let mut offset = 0;
                 while offset < limit {
                     let la = (dst & 0x00ffffffffffffff) + offset as u64;
@@ -515,19 +511,15 @@ impl Registry {
                     }
                     offset += count;
                 }
-                if function == 9 || length > ceiling as u64 {
-                    fallback()
-                } else {
-                    done(0)
-                }
+                done(0)
             }
             5 | 8 => {
                 // strnlen may stop before a huge bound. Only a scan exhausted at
                 // the native limit requests the untouched original implementation.
                 let limit = if function == 8 {
-                    src.min(MAX_STRING_BYTES as u64) as usize
+                    src as usize
                 } else {
-                    MAX_STRING_BYTES
+                    usize::MAX
                 };
                 let mut offset = 0;
                 while offset < limit {
@@ -541,17 +533,15 @@ impl Registry {
                     }
                     offset += count;
                 }
-                if function == 8 && src <= MAX_STRING_BYTES as u64 {
-                    done(src)
-                } else {
-                    fallback()
-                }
+                done(src)
             }
             6 | 7 => {
                 let mut remaining = len;
                 while remaining != 0 {
                     let (offset, count) = if function == 7 {
-                        let end = (dst & 0x00ffffffffffffff) + remaining as u64;
+                        let end = (dst & 0x00ffffffffffffff)
+                            .checked_add(remaining as u64)
+                            .ok_or(MemoryError::InvalidRange)?;
                         let count = remaining.min(((end - 1) % PAGE_SIZE + 1) as usize);
                         (remaining - count, count)
                     } else {
@@ -576,13 +566,24 @@ impl Registry {
                     }
                     remaining -= count;
                 }
-                if length > ceiling as u64 {
-                    fallback()
-                } else {
-                    done(0)
-                }
+                done(0)
             }
-            11..=19 => crate::strings::execute(self, memory, function, a),
+            11..=19 | 29 | 30 => crate::strings::execute(self, memory, function, a),
+            20..=27 => crate::strings::search::execute(memory, function - 19, a),
+            28 => {
+                let Some(transfer) =
+                    (unsafe { memory.copy_raw_with(dst, src, len, trames_native::copy_raw)? })
+                else {
+                    return Ok(Return {
+                        value: dst,
+                        fallback: true,
+                    });
+                };
+                self.record_transfer(transfer);
+                done(dst.wrapping_add(length))
+            }
+            31 => crate::integer::plain(memory, a),
+            32 => crate::numeric::parse_complete(memory, a, &mut self.metrics),
             _ => unreachable!("signed-in pure profile"),
         }
     }
@@ -671,6 +672,11 @@ mod tests {
         seed.write(0x5ff0 + 150, &[0]).unwrap();
         seed.write(0x4100, &[b'p'; 300]).unwrap();
         seed.write(0x4100 + 128, &[0]).unwrap();
+        let request = [0x5ff0u64, 150, 0x4100, 16];
+        for (i, value) in request.iter().enumerate() {
+            seed.write_array(0x4000 + i as u64 * 8, value.to_le_bytes())
+                .unwrap();
+        }
         for function in 1..=FUNCTION_COUNT as u64 {
             let args = match function {
                 1 | 4 | 9 | 10 | 14..=19 => [0x4100, 0x5ff0, 256],
@@ -680,6 +686,12 @@ mod tests {
                 6 | 7 => [0x5ff0, b'a' as u64, 256],
                 8 => [0x5ff0, u64::MAX, 0],
                 11..=13 => [0x5ff0, b'z' as u64, 0],
+                20 => [0x4000, 0, 0],
+                21..=26 => [0x5ff0, 0x4100, 0],
+                27 => [0x5ff0, 0x4100, 150],
+                28..=30 => [0x4100, 0x5ff0, 256],
+                31 => [0x5ff0, 64, 0],
+                32 => [0x4100, 0x4800, 1],
                 _ => unreachable!(),
             };
             let pc = 0x100c + (function - 1) * 32;
@@ -704,7 +716,31 @@ mod tests {
     }
 
     #[test]
-    fn huge_compare_search_bounds_stop_early_or_fall_back_only_at_ceiling() {
+    fn multi_megabyte_copy_retires_one_native_entry_and_reverse_overflow_is_a_fault() {
+        let mut m = memory(1);
+        let n = 2 * 1024 * 1024 + 37;
+        m.map(0x10000, 6 * 1024 * 1024, Permissions::RW).unwrap();
+        let data: Vec<_> = (0..n).map(|i| (i * 37) as u8).collect();
+        m.write(0x10000, &data).unwrap();
+        let mut r = Registry::default();
+        let out = r
+            .invoke(&mut m, 0x100c, PROFILE, 1, [0x310000, 0x10000, n as u64])
+            .unwrap();
+        assert!(!out.fallback);
+        assert_eq!(r.metrics.calls, 1);
+        assert_eq!(r.metrics.function_calls[0], 1);
+        let mut bytes = vec![0; n];
+        m.read(0x310000, &mut bytes).unwrap();
+        assert_eq!(bytes, data);
+        let mut reverse = memory(7);
+        assert!(matches!(
+            Registry::default().invoke(&mut reverse, 0x100c, PROFILE, 7, [0x3000, 1, u64::MAX]),
+            Err(Error::Memory(MemoryError::InvalidRange))
+        ));
+    }
+
+    #[test]
+    fn huge_compare_search_bounds_stop_early_and_complete_past_old_ceiling() {
         let mut m = memory(10);
         let mut r = Registry::default();
         m.write(0x2ffe, b"x\0").unwrap();
@@ -731,11 +767,14 @@ mod tests {
             .unwrap();
         m.fill_with(0x10000, MAX_STRING_BYTES * 2, |b| b.fill(1))
             .unwrap();
+        m.write_array(0x10ffff, [0]).unwrap();
+        m.write_array(0x20ffff, [0]).unwrap();
         let result = r
             .invoke(&mut m, 0x100c, PROFILE, 10, [0x10000, 0x110000, u64::MAX])
             .unwrap();
-        assert!(result.fallback);
-        assert_eq!(r.metrics.function_fallbacks[9], 1);
+        assert!(!result.fallback);
+        assert_eq!(result.value, 0);
+        assert_eq!(r.metrics.function_fallbacks[9], 0);
     }
 
     #[test]
@@ -784,11 +823,9 @@ mod tests {
                 .value,
             0x20ffff
         );
-        assert!(
-            r.execute(&mut m, 1, [1, 1, MAX_BULK_BYTES as u64 + 1])
-                .unwrap()
-                .fallback
-        );
+        assert!(r
+            .execute(&mut m, 1, [1, 1, MAX_BULK_BYTES as u64 + 1])
+            .is_err());
         m.unmap(0x200000, PAGE_SIZE).unwrap();
         assert!(r
             .execute(&mut m, 3, [0x110000, 0, MAX_BULK_BYTES as u64])
@@ -797,7 +834,7 @@ mod tests {
     }
 
     #[test]
-    fn rejection_and_limit_fallback_have_no_memory_effects() {
+    fn rejection_and_invalid_large_ranges_have_no_memory_effects() {
         let mut m = memory(1);
         let mut r = Registry::default();
         m.write(0x2000, b"before").unwrap();
@@ -811,17 +848,15 @@ mod tests {
                 Err(Error::InvalidEntry)
             ));
         }
-        assert!(
-            r.invoke(
+        assert!(r
+            .invoke(
                 &mut m,
                 0x100c,
                 PROFILE,
                 1,
                 [1, 2, MAX_BULK_BYTES as u64 + 1]
             )
-            .unwrap()
-            .fallback
-        );
+            .is_err());
         assert_eq!(m.read_array::<6>(0x2000).unwrap(), *b"before");
         // Caller bytes are revalidated after executable mutation, not just once.
         m.protect(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
@@ -831,7 +866,7 @@ mod tests {
             r.invoke(&mut m, 0x100c, PROFILE, 1, [0x2000, 0x3000, 6]),
             Err(Error::InvalidEntry)
         ));
-        assert_eq!(r.metrics.fallbacks, 1);
+        assert_eq!(r.metrics.fallbacks, 0);
         assert_eq!(r.metrics.rejected, 4);
     }
     #[test]
@@ -1043,7 +1078,7 @@ mod tests {
         assert_eq!(r.metrics.direct_bytes_written, 6);
     }
     #[test]
-    fn searches_stop_at_reached_pages_preserve_tags_and_large_bounds_fall_back() {
+    fn searches_stop_at_reached_pages_preserve_tags_and_fault_at_reached_unmapped_pages() {
         let mut r = Registry::default();
         for function in [6, 7] {
             let mut m = memory(function);
@@ -1062,17 +1097,15 @@ mod tests {
                 0
             );
             if function == 7 {
-                assert!(
-                    r.invoke(
+                assert!(r
+                    .invoke(
                         &mut m,
                         0x100c,
                         PROFILE,
                         function,
                         [1, 1, MAX_BULK_BYTES as u64 + 1]
                     )
-                    .unwrap()
-                    .fallback
-                );
+                    .is_err());
             }
         }
         let mut m = memory(6);

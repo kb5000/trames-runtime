@@ -1050,7 +1050,7 @@ mod accelerator_tests {
         assert_eq!(r.metrics.native.calls, 1);
     }
     #[test]
-    fn budget_checkpoint_fallback_and_fault_do_not_fake_retirement() {
+    fn budget_checkpoint_and_fault_do_not_fake_retirement() {
         let mut r = runtime(32, Permissions::RW);
         assert!(matches!(
             r.run(&mut trames_linux::CapturedOutput::default(), 3),
@@ -1059,18 +1059,22 @@ mod accelerator_tests {
         assert_eq!(r.metrics.native.calls, 0);
         assert_eq!(r.cpu.pc, 0x100c);
         assert_eq!(r.memory.read_array::<32>(0x2000).unwrap(), [0; 32]);
-        let mut r = runtime(
-            trames_accel::native::MAX_BULK_BYTES as u64 + 1,
-            Permissions::R,
+        // The former size ceiling is gone: oversized requests reach the CPU's
+        // ordinary permission fault without retiring the HLT or writing bytes.
+        let mut r = runtime((1 << 20) + 1, Permissions::R);
+        assert_eq!(
+            r.run(&mut trames_linux::CapturedOutput::default(), 4)
+                .unwrap(),
+            Exit {
+                code: 139,
+                instructions: 3
+            }
         );
-        assert!(matches!(
-            r.run(&mut trames_linux::CapturedOutput::default(), 4),
-            Err(RuntimeError::BudgetExceeded(4))
-        ));
-        assert_eq!(r.metrics.native.fallbacks, 1);
-        assert_eq!(r.cpu.pc, 0x1010);
+        assert_eq!(r.metrics.native.fallbacks, 0);
+        assert_eq!(r.metrics.native.faults, 1);
+        assert_eq!(r.cpu.pc, 0x100c);
         assert_eq!(r.cpu.x(0), 0x2000);
-        assert_eq!(r.cpu.x(1), 1);
+        assert_eq!(r.cpu.x(1), 0x91);
         let mut r = runtime(32, Permissions::R);
         let exit = r
             .run(&mut trames_linux::CapturedOutput::default(), 4)

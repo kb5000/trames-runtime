@@ -17,6 +17,53 @@ unsafe extern "C" {
     fn trames_native_memcpy(dst: *mut u8, src: *const u8, len: usize) -> *mut u8;
     fn trames_native_memset(dst: *mut u8, value: i32, len: usize) -> *mut u8;
 }
+/// Complete raw move; disjoint ranges use the pinned original Arm memcpy.
+///
+/// # Safety
+/// Both complete ranges are live, source is readable, destination writable.
+/// The caller supplies the CPU memory model's lifetime/concurrency authority;
+/// no pointer escapes and no Rust references may alias concurrent byte writes.
+pub unsafe fn copy_raw(dst: *mut u8, src: *const u8, len: usize) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if dst.cast_const() == src || len == 0 {
+            return;
+        }
+        let overlap = (dst as usize).wrapping_sub(src as usize) < len
+            || (src as usize).wrapping_sub(dst as usize) < len;
+        if !overlap {
+            unsafe {
+                trames_native_memcpy(dst, src, len);
+            }
+            return;
+        }
+        // The pinned memcpy is not memmove for large overlaps. The caller's
+        // private epoch or existing shared-page guard excludes conflicting host
+        // byte accesses, so LLVM's raw memmove can use the optimized host path.
+        // No Rust byte reference, extra lock or ordering barrier is introduced.
+        unsafe {
+            std::ptr::copy(src, dst, len);
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    unsafe {
+        std::ptr::copy(src, dst, len);
+    }
+}
+/// Fill a complete raw range under the same authority as `copy_raw`.
+///
+/// # Safety
+/// The entire range is live/writable, with no conflicting Rust byte references.
+pub unsafe fn fill_raw(dst: *mut u8, value: u8, len: usize) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        trames_native_memset(dst, value.into(), len);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    unsafe {
+        std::ptr::write_bytes(dst, value, len);
+    }
+}
 pub fn copy(dst: &mut [u8], src: &[u8]) {
     assert_eq!(dst.len(), src.len());
     #[cfg(target_arch = "aarch64")]
@@ -82,6 +129,34 @@ pub fn first_byte(bytes: &[u8], byte: u8) -> Option<usize> {
             .position(|&b| b == byte)
             .map(|n| offset + n)
     }
+}
+
+/// First byte outside a single-character acceptance set.
+pub fn first_not_byte(bytes: &[u8], byte: u8) -> Option<usize> {
+    #[cfg(target_arch = "aarch64")]
+    let mut offset = 0;
+    #[cfg(not(target_arch = "aarch64"))]
+    let offset = 0;
+    #[cfg(target_arch = "aarch64")]
+    while offset + 16 <= bytes.len() {
+        // SAFETY: baseline NEON, with the complete vector inside the supplied
+        // scoped CPU-owned range; no reference or pointer survives the call.
+        let different = unsafe {
+            use core::arch::aarch64::*;
+            vminvq_u8(vceqq_u8(
+                vld1q_u8(bytes.as_ptr().add(offset)),
+                vdupq_n_u8(byte),
+            )) != 255
+        };
+        if different {
+            break;
+        }
+        offset += 16;
+    }
+    bytes[offset..]
+        .iter()
+        .position(|&c| c != byte)
+        .map(|i| offset + i)
 }
 
 /// Reverse bounded search, with word skips and exact unsigned-byte matching.
@@ -218,6 +293,32 @@ pub fn first_zero(bytes: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
     #[test]
+    fn raw_overlap_moves_match_both_directions_for_every_short_tail() {
+        for len in (0..260).chain([4095, 4096, 4097, 65567]) {
+            for gap in [0, 1, 3, 7, 16, 63, 127] {
+                for backwards in [false, true] {
+                    let mut actual: Vec<_> = (0..len + gap + 32).map(|i| (i * 73) as u8).collect();
+                    let mut expected = actual.clone();
+                    let (src, dst) = if backwards {
+                        (8, 8 + gap)
+                    } else {
+                        (8 + gap, 8)
+                    };
+                    expected.copy_within(src..src + len, dst);
+                    // SAFETY: both initialized Vec ranges are live, overlap is
+                    // intentional, and no Rust byte reference survives the call.
+                    unsafe {
+                        copy_raw(actual.as_mut_ptr().add(dst), actual.as_ptr().add(src), len);
+                    }
+                    assert_eq!(
+                        actual, expected,
+                        "len={len}, gap={gap}, backwards={backwards}"
+                    );
+                }
+            }
+        }
+    }
+    #[test]
     fn word_search_and_string_compare_match_unsigned_byte_references() {
         for byte in 0..=255 {
             for len in 0usize..=80 {
@@ -265,18 +366,22 @@ mod tests {
                     &src[15 - align..15 - align + len],
                 );
                 assert_eq!(&dst[align..align + len], &src[15 - align..15 - align + len]);
-                assert!(dst[..align]
-                    .iter()
-                    .chain(&dst[align + len..])
-                    .all(|&b| b == 0xac));
+                assert!(
+                    dst[..align]
+                        .iter()
+                        .chain(&dst[align + len..])
+                        .all(|&b| b == 0xac)
+                );
                 for value in [0, 0x80, 255] {
                     dst.fill(0xac);
                     fill(&mut dst[align..align + len], value);
                     assert!(dst[align..align + len].iter().all(|&b| b == value));
-                    assert!(dst[..align]
-                        .iter()
-                        .chain(&dst[align + len..])
-                        .all(|&b| b == 0xac));
+                    assert!(
+                        dst[..align]
+                            .iter()
+                            .chain(&dst[align + len..])
+                            .all(|&b| b == 0xac)
+                    );
                 }
                 assert_eq!(first_zero(&src), None);
                 assert_eq!(compare(&src, &src), 0);
@@ -288,5 +393,21 @@ mod tests {
             assert_eq!(first_zero(&bytes), Some(index));
         }
         assert_eq!(compare(&[255], &[1]), 254);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn single_character_spans_stop_at_every_vector_and_scalar_position() {
+    for byte in [0, 1, 97, 255] {
+        for len in 0..80 {
+            let mut data = vec![byte; len];
+            assert_eq!(first_not_byte(&data, byte), None);
+            for at in 0..len {
+                data[at] = byte.wrapping_add(1);
+                assert_eq!(first_not_byte(&data, byte), Some(at));
+                data[at] = byte;
+            }
+        }
     }
 }

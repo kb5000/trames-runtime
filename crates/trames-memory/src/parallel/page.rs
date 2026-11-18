@@ -3,8 +3,8 @@
 use crate::PAGE_SIZE;
 use std::{
     cell::UnsafeCell,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     sync::OnceLock,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 const REGION: usize = 64;
@@ -84,7 +84,8 @@ unsafe impl Sync for ReservationRows {}
 // first monitor initialization is published by OnceLock. Each reservation
 // row/override byte otherwise uses the same exclusive byte ownership;
 // page-wide epochs/masks are atomic and resets hold every region. No whole-page
-// mutable reference or bare pointer escapes this module.
+// mutable reference escapes a guard. Private allocation geometry is exposed
+// only under the existing exclusive/immutable epoch proof.
 unsafe impl Sync for MutablePage {}
 
 fn mask(offset: usize, len: usize) -> u64 {
@@ -642,6 +643,34 @@ impl<'a> Guard<'a> {
     fn covers(&self, offset: usize, len: usize) {
         assert_eq!(mask(offset, len) & !self.mask, 0, "unguarded byte range");
     }
+    /// Mapping geometry only; no byte reference crosses page allocations.
+    /// Private epoch admission keeps all matching pages stable until the
+    /// synchronous native call ends. Guarded/shared pages cannot use this API.
+    pub(crate) fn private_mapping(&self, offset: usize) -> Option<(*mut u8, usize, usize)> {
+        if self.is_locked() {
+            return None;
+        }
+        match self.page().storage() {
+            Bytes::Mapped {
+                owner,
+                offset: page,
+                ..
+            } => {
+                let (base, len) = owner.native_allocation();
+                Some((base, len, page + offset))
+            }
+            Bytes::External {
+                mapping: Some((base, len)),
+                pointer,
+                ..
+            } => Some((
+                std::ptr::with_exposed_provenance_mut(*base),
+                *len,
+                pointer - base + offset,
+            )),
+            _ => None,
+        }
+    }
     pub fn read(&self, offset: usize, len: usize) -> &[u8] {
         self.covers(offset, len);
         // SAFETY: UnsafeCell is transparent over u8; bounds and ownership of
@@ -934,7 +963,7 @@ mod tests {
         assert_ne!(page.lock(0, 16).reservation(0), token);
     }
     use std::{
-        sync::{mpsc, Arc},
+        sync::{Arc, mpsc},
         time::Duration,
     };
 

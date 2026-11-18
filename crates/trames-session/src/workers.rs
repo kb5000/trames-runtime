@@ -4606,24 +4606,25 @@ mod tests {
     }
 
     #[test]
-    fn native_fallback_retires_once_but_fault_refunds_its_credit() {
+    fn native_oversized_and_protection_faults_refund_their_credit() {
         let mut pool = Pool::new(1);
         pool.ensure(0).unwrap();
         let control = Arc::new(Control::new(4));
         let (work, mut memory) = native_work(
             3,
-            [0x2000, 7, trames_accel::native::MAX_BULK_BYTES as u64 + 1],
+            [0x2000, 7, (1 << 20) + 1],
             Permissions::RW,
             control.clone(),
         );
         pool.dispatch(0, work).unwrap();
         let done = pool.complete().unwrap();
-        assert_eq!(done.instructions, 4);
-        assert_eq!(done.cpu.pc, 0x1010);
+        assert_eq!(done.instructions, 3);
+        assert_eq!(done.cpu.pc, 0x100c);
         assert_eq!(done.cpu.x(0), 0x2000);
-        assert_eq!(done.cpu.x(1), 1);
-        assert_eq!(done.native.fallbacks, 1);
-        assert_eq!(control.remaining.load(Ordering::Relaxed), 0);
+        assert_eq!(done.cpu.x(1), 7);
+        assert_eq!(done.native.fallbacks, 0);
+        assert_eq!(done.native.faults, 1);
+        assert_eq!(control.remaining.load(Ordering::Relaxed), 1);
         memory.commit_parallel().unwrap();
         assert_eq!(memory.read_array::<128>(0x2000).unwrap(), [0; 128]);
         let control = Arc::new(Control::new(4));

@@ -30,6 +30,56 @@ pub(crate) fn parse(
     }
     Ok(result)
 }
+/// musl atoi/atol/atoll accumulate negatively with width wrapping and leave
+/// errno unchanged. Their overflow behavior differs from saturating strtoll.
+pub(crate) fn plain(
+    memory: &impl NativeMemory,
+    [source, bits, _]: [u64; 3],
+) -> Result<Return, Error> {
+    if !matches!(bits, 32 | 64) {
+        return Err(Error::InvalidEntry);
+    }
+    let (mut state, mut negative, mut value, mut offset) = (0u8, false, 0u64, 0u64);
+    loop {
+        let at = source.wrapping_add(offset);
+        let count = (trames_memory::PAGE_SIZE
+            - (at & 0x00ff_ffff_ffff_ffff) % trames_memory::PAGE_SIZE) as usize;
+        let (done, _) = memory.with_read_chunk(at, count, |bytes| {
+            for &c in bytes {
+                if state == 0 {
+                    if c == b' ' || (b'\t'..=b'\r').contains(&c) {
+                        continue;
+                    }
+                    state = 1;
+                    if matches!(c, b'+' | b'-') {
+                        negative = c == b'-';
+                        continue;
+                    }
+                }
+                if !c.is_ascii_digit() {
+                    return true;
+                }
+                value = value.wrapping_mul(10).wrapping_sub((c - b'0') as u64);
+            }
+            false
+        })?;
+        if done {
+            if !negative {
+                value = 0u64.wrapping_sub(value);
+            }
+            return Ok(Return {
+                value: if bits == 32 {
+                    value as u32 as u64
+                } else {
+                    value
+                },
+                fallback: false,
+            });
+        }
+        offset += count as u64;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
