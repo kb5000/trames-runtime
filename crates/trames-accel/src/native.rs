@@ -25,6 +25,10 @@ pub const MAX_STRING_BYTES: usize = 1024 * 1024;
 pub struct Metrics {
     pub calls: u64,
     pub worker_calls: u64,
+    pub bionic_calls: u64,
+    pub bionic_operations: [u64; 13],
+    pub bionic_fallbacks: [u64; 13],
+    pub bionic_nanoseconds: [u64; 13],
     pub checkpoint_retries: u64,
     pub function_calls: [u64; FUNCTION_COUNT],
     pub function_fallbacks: [u64; FUNCTION_COUNT],
@@ -66,6 +70,24 @@ pub struct Metrics {
 impl Metrics {
     /// Worker-local counters join here after every view user has stopped.
     pub fn merge(&mut self, other: Self) {
+        self.bionic_calls = self.bionic_calls.saturating_add(other.bionic_calls);
+        for (a, b) in self
+            .bionic_operations
+            .iter_mut()
+            .zip(other.bionic_operations)
+        {
+            *a = a.saturating_add(b);
+        }
+        for (a, b) in self.bionic_fallbacks.iter_mut().zip(other.bionic_fallbacks) {
+            *a = a.saturating_add(b);
+        }
+        for (a, b) in self
+            .bionic_nanoseconds
+            .iter_mut()
+            .zip(other.bionic_nanoseconds)
+        {
+            *a = a.saturating_add(b);
+        }
         self.allocator_calls = self.allocator_calls.saturating_add(other.allocator_calls);
         self.allocator_load_callbacks = self
             .allocator_load_callbacks
@@ -215,6 +237,8 @@ impl Registry {
         function: u64,
     ) -> Result<bool, Error> {
         let allowed = (module == PROFILE && (1..=FUNCTION_COUNT as u64).contains(&function))
+            || (module == crate::bionic::PROFILE
+                && (1..=crate::bionic::FUNCTION_COUNT).contains(&function))
             || (module == crate::callbacks::PROFILE && function == 1)
             || (module == crate::numeric::PROFILE && function == 1)
             || (module == crate::integer::PROFILE && function == 1)
@@ -342,7 +366,15 @@ impl Registry {
         self.metrics.calls = self.metrics.calls.saturating_add(1);
         let _scope = scope();
         let began = Instant::now();
-        let result = if module == crate::callbacks::PROFILE {
+        let result = if module == PROFILE {
+            let count = &mut self.metrics.function_calls[function as usize - 1];
+            *count = count.saturating_add(1);
+            self.execute(memory, function, a)
+        } else if module == crate::bionic::PROFILE {
+            self.metrics.bionic_calls = self.metrics.bionic_calls.saturating_add(1);
+            self.metrics.bionic_operations[function as usize - 1] += 1;
+            crate::bionic::execute(memory, function, a, &mut self.metrics)
+        } else if module == crate::callbacks::PROFILE {
             self.metrics.callback_calls = self.metrics.callback_calls.saturating_add(1);
             crate::callbacks::step(memory, a, &mut self.metrics)
         } else if module == crate::allocator::PROFILE {
@@ -355,16 +387,19 @@ impl Registry {
             self.metrics.numeric_calls = self.metrics.numeric_calls.saturating_add(1);
             crate::numeric::parse(memory, a, &mut self.metrics)
         } else {
-            let count = &mut self.metrics.function_calls[function as usize - 1];
-            *count = count.saturating_add(1);
-            self.execute(memory, function, a)
+            unreachable!("authorized native profile")
         };
-        self.metrics.nanoseconds = self
-            .metrics
-            .nanoseconds
-            .saturating_add(began.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        let elapsed = began.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        if module == crate::bionic::PROFILE {
+            self.metrics.bionic_nanoseconds[function as usize - 1] =
+                self.metrics.bionic_nanoseconds[function as usize - 1].saturating_add(elapsed);
+        }
+        self.metrics.nanoseconds = self.metrics.nanoseconds.saturating_add(elapsed);
         match &result {
             Ok(Return { fallback: true, .. }) => {
+                if module == crate::bionic::PROFILE {
+                    self.metrics.bionic_fallbacks[function as usize - 1] += 1;
+                }
                 self.metrics.fallbacks = self.metrics.fallbacks.saturating_add(1);
                 if module == PROFILE {
                     let counter = &mut self.metrics.function_fallbacks[function as usize - 1];

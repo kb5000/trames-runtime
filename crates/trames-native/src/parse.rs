@@ -41,6 +41,7 @@ pub fn integer(bytes: &[u8], base: u32, signed: bool) -> ParsedFloat {
         consumed: raw.consumed as usize,
         errno: raw.error,
         needs_more: raw.exhausted != 0,
+        fpsr: 0,
     }
 }
 #[derive(Debug)]
@@ -49,6 +50,7 @@ pub struct ParsedFloat {
     pub consumed: usize,
     pub errno: i32,
     pub needs_more: bool,
+    pub fpsr: u64,
 }
 pub fn floating(bytes: &[u8], single: bool) -> ParsedFloat {
     let mut raw = RawResult::default();
@@ -63,6 +65,7 @@ pub fn floating(bytes: &[u8], single: bool) -> ParsedFloat {
         consumed: raw.consumed as usize,
         errno: raw.error,
         needs_more: raw.exhausted != 0,
+        fpsr: 0,
     }
 }
 #[cfg(test)]
@@ -143,6 +146,7 @@ mod tests {
                 (old_csr, wanted_csr)
             };
             let result = floating(b"1.25!\0", false);
+            let bionic = bionic_floating(b"1.234567890123456789e100!\0", false);
             let after_errno = *errno;
             *errno = original_errno;
             #[cfg(target_arch = "aarch64")]
@@ -161,9 +165,30 @@ mod tests {
             };
             assert!(state_matches);
             assert_eq!(after_errno, 13);
+            assert_eq!(bionic.consumed, 24);
+            assert_eq!(bionic.errno, 0);
             assert_eq!(result.bits, 1.25f64.to_bits());
             assert_eq!(result.consumed, 4);
         }
+    }
+    #[test]
+    fn bionic_gdtoa_concurrent_calls_own_their_caches() {
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..128 {
+                        let result = bionic_floating(b"1.234567890123456789e100!\0", false);
+                        assert_eq!(
+                            (result.bits, result.consumed, result.errno),
+                            (1.234_567_890_123_456_9e100f64.to_bits(), 24, 0)
+                        );
+                        let result = bionic_floating(b"nan(0x123)!\0", false);
+                        assert_eq!(result.consumed, 10);
+                        assert!(f64::from_bits(result.bits).is_nan());
+                    }
+                });
+            }
+        });
     }
     #[test]
     fn bounded_cursor_handles_decimal_hex_special_values_and_incomplete_tokens() {
@@ -195,5 +220,38 @@ mod tests {
             let p = floating(b"1e10000!\0", single);
             assert_eq!(p.errno, 34);
         }
+    }
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct BionicResult {
+    bits: u64,
+    consumed: u64,
+    error: i32,
+    exhausted: i32,
+    fpsr: u64,
+}
+unsafe extern "C" {
+    fn trames_bionic_parse_float(
+        bytes: *const u8,
+        len: usize,
+        single: i32,
+        result: *mut BionicResult,
+    );
+}
+pub fn bionic_floating(bytes: &[u8], single: bool) -> ParsedFloat {
+    let mut raw = BionicResult::default();
+    // SAFETY: Private bounded input and result; the native driver owns and frees
+    // all scratch state, preserves host errno/FP state and invokes no guest code.
+    unsafe {
+        trames_bionic_parse_float(bytes.as_ptr(), bytes.len(), i32::from(single), &mut raw);
+    }
+    ParsedFloat {
+        bits: raw.bits,
+        consumed: raw.consumed as usize,
+        errno: raw.error,
+        needs_more: false,
+        fpsr: raw.fpsr,
     }
 }

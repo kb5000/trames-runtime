@@ -32,6 +32,16 @@ pub(crate) fn parse_with(
     no_input: bool,
     parser: impl Fn(&[u8]) -> trames_native::parse::ParsedFloat,
 ) -> Result<Return, Error> {
+    parse_with_output::<OUTPUT_BYTES>(memory, source, output, metrics, no_input, parser)
+}
+pub(crate) fn parse_with_output<const OUTPUT_BYTES: usize>(
+    memory: &mut impl NativeMemory,
+    source: u64,
+    output: u64,
+    metrics: &mut Metrics,
+    no_input: bool,
+    parser: impl Fn(&[u8]) -> trames_native::parse::ParsedFloat,
+) -> Result<Return, Error> {
     let fallback = || {
         Ok(Return {
             value: 0,
@@ -43,7 +53,7 @@ pub(crate) fn parse_with(
     }
     // Invalid integer bases finish without dereferencing even a null input.
     if no_input {
-        return commit(memory, source, output, parser(&[]), 0, metrics);
+        return commit::<OUTPUT_BYTES>(memory, source, output, parser(&[]), 0, metrics);
     }
     let base = source & 0x00ff_ffff_ffff_ffff;
     let page_limit = (PAGE_SIZE - base % PAGE_SIZE) as usize;
@@ -84,9 +94,9 @@ pub(crate) fn parse_with(
         parsed = parser(&input);
         metrics.numeric_replays = metrics.numeric_replays.saturating_add(1);
     }
-    commit(memory, source, output, parsed, supplied, metrics)
+    commit::<OUTPUT_BYTES>(memory, source, output, parsed, supplied, metrics)
 }
-fn commit(
+fn commit<const OUTPUT_BYTES: usize>(
     memory: &mut impl NativeMemory,
     source: u64,
     output: u64,
@@ -102,7 +112,10 @@ fn commit(
         .ok_or(Error::InvalidEntry)?;
     let mut bytes = [0; OUTPUT_BYTES];
     bytes[..8].copy_from_slice(&end.to_le_bytes());
-    bytes[8..].copy_from_slice(&(parsed.errno as u64).to_le_bytes());
+    bytes[8..16].copy_from_slice(&(parsed.errno as u64).to_le_bytes());
+    if OUTPUT_BYTES >= 24 {
+        bytes[16..24].copy_from_slice(&parsed.fpsr.to_le_bytes());
+    }
     memory.write(output, &bytes)?;
     metrics.numeric_result_bytes = metrics
         .numeric_result_bytes

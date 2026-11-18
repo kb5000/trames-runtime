@@ -254,3 +254,23 @@ costs and regressions; source reuse alone is not proof of a speedup.
 [Validation](../validation/native-allocator.md) records the actual batch and its
 measured limits. Cold allocator/kernel operations remain original guest code;
 this is not a fully native allocator release.
+
+
+## Bionic jemalloc cache experiment (2026-11-18)
+
+The shared native module `0x10009` includes optional cache pop/push operations
+11/12 for the pinned Android 13 libc layout. They are internal block adapters,
+not a host allocator replacement. The caller has already selected its original
+guest TSD/cache and class; the host updates the original guest cache, low-water
+mark, ticker and statistics on that executing worker. The original arena,
+refill/flush, mutex, teardown and fork paths remain authoritative. No extra
+allocator lock, coordinator, host-heap alias or architecture dispatch is added.
+
+The static guest builder leaves these blocks untouched by default. Its
+`--jemalloc` experiment must be selected explicitly. The pinned image defaults
+to disabled thread caching; the test fixture enables only its own thread cache
+through original jemalloc control. Comparisons use identical cache policy.
+NativeCall overhead exceeded the tiny original cache-hit blocks, so this
+experiment does not justify enabling it for production. Cache enablement and
+whole-allocator native lowering are separate changes and are not implied by
+this experiment. Memory ownership and the original cache policy are preserved.

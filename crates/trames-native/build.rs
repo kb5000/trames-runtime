@@ -119,6 +119,7 @@ fn compile_parser() {
 }
 fn main() {
     compile_parser();
+    compile_bionic();
     if env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("aarch64") {
         return;
     }
@@ -176,4 +177,90 @@ fn main() {
         )
         .expect("write static assembly");
     }
+}
+
+fn compile_bionic() {
+    let target = env::var("TARGET").unwrap();
+    let host = env::var("HOST").unwrap();
+    let apple = target.contains("apple");
+    let out = Path::new(&env::var_os("OUT_DIR").unwrap()).join("bionic");
+    println!("cargo:rerun-if-changed=bionic");
+    println!("cargo:rerun-if-changed=upstream/bionic-android13");
+    assert!(Command::new("python3")
+        .arg("bionic/generate.py")
+        .arg(&out)
+        .status()
+        .unwrap()
+        .success());
+    let compiler_key = format!("CC_{}", target.replace('-', "_"));
+    println!("cargo:rerun-if-env-changed={compiler_key}");
+    let cc = env::var(&compiler_key).unwrap_or_else(|_| {
+        if apple {
+            "clang".into()
+        } else if target != host && target.starts_with("aarch64") {
+            "aarch64-linux-gnu-gcc".into()
+        } else {
+            "cc".into()
+        }
+    });
+    let names = [
+        "misc", "gmisc", "smisc", "sum", "ulp", "hd_init", "hexnan", "gethex", "strtod", "strtodg",
+        "strtord", "strtof", "driver",
+    ];
+    for name in names {
+        let mut command = Command::new(&cc);
+        if apple && target != host {
+            command.arg(if target.ends_with("-sim") {
+                "--target=arm64-apple-ios17.0-simulator"
+            } else {
+                "--target=arm64-apple-ios17.0"
+            });
+        }
+        command.args([
+            "-O2",
+            "-fPIC",
+            "-fno-builtin",
+            "-fvisibility=hidden",
+            "-ffp-contract=off",
+            "-frounding-math",
+            "-DOmit_Private_Memory",
+            "-DHonor_FLT_ROUNDS",
+            "-DMALLOC=trames_gdtoa_malloc",
+            "-DFREE=trames_gdtoa_free",
+            "-Dstrtod=trames_bionic_strtod_native",
+            "-Dstrtof=trames_bionic_strtof_native",
+            "-include",
+            "bionic/shim.h",
+            "-Ibionic",
+            "-I",
+        ]);
+        command
+            .arg(&out)
+            .arg("-c")
+            .arg(if name == "driver" {
+                Path::new("bionic/driver.c").to_owned()
+            } else {
+                out.join(format!("{name}.c"))
+            })
+            .arg("-o")
+            .arg(out.join(format!("{name}.o")));
+        assert!(command.status().expect("native Bionic compiler").success());
+    }
+    let archive_key = format!("AR_{}", target.replace('-', "_"));
+    println!("cargo:rerun-if-env-changed={archive_key}");
+    let ar = env::var(&archive_key).unwrap_or_else(|_| {
+        if apple && !host.contains("apple") {
+            "llvm-ar".into()
+        } else {
+            "ar".into()
+        }
+    });
+    let mut command = Command::new(ar);
+    command.arg("crs").arg(out.join("libtrames_bionic.a"));
+    for name in names {
+        command.arg(out.join(format!("{name}.o")));
+    }
+    assert!(command.status().unwrap().success());
+    println!("cargo:rustc-link-search=native={}", out.display());
+    println!("cargo:rustc-link-lib=static=trames_bionic");
 }

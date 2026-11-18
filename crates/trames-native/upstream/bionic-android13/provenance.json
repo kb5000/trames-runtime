@@ -1,0 +1,25 @@
+{
+  "tag": "android-13.0.0_r83",
+  "repository": "https://android.googlesource.com/platform/bionic",
+  "sources_archive_sha256": "4a40be8a1948c319e5e8022e5c3250207201282601ff29f1f454dbae69656af5",
+  "headers_archive_sha256": "ebb29d237ff24a91ff5b336326f3e65897883a5e3d4b81d2d039babd9fd1cc72",
+  "files": {
+    "arith.h": "ab94601187dca2b144fcc17e2768c670fc99969c5519ff6e05336c11111b3d25",
+    "gd_qnan.h": "3f0f669b63120cd951bed3ce618fb055684359a472fdde61a54778a823097a41",
+    "gdtoa.h": "7368ce941c118180fc14e698e17d66ad47a52abb80d19d1fadf02afcdf26eca4",
+    "gdtoa_fltrnds.h": "370f7621e16c280350e9b350048f53a6425fc8b6d4dc700f8583169f4a881208",
+    "gdtoaimp.h": "d2c18f90dbb7f711a3b22b6dd7804a82f095d11741955eecfaa1bb44ff4e4db3",
+    "gethex.c": "fb2b02844289f804e202826919119f48c10a25df2b268b8b0bf2ad47b5be69b2",
+    "gmisc.c": "39a52bd7651ae5281bc9a1e7b3d2a81f51ade634593772cd7f9237d6057902d8",
+    "hd_init.c": "5d787a46e06719178356de20ccc4e9f65961e723351b5c8a43a63b95832c7247",
+    "hexnan.c": "982f08614289beaa17172cb1ae85d2a95035bbbcdbb73817eb7896da16eda2dd",
+    "misc.c": "fd5481a6571bd9c0d65d2d73a408546e48c9f05fd1f9ecd4ace695de8d76d648",
+    "smisc.c": "0f1a095daf34407d8b2ef5b55d6e25c49f896b9a64d6e2fc32ecf5e0e1b0d371",
+    "strtod.c": "2040fe285e8cfe163ea3698691a77d6982d8b21bbbc3533e19dac3959368e148",
+    "strtodg.c": "ff64601a4b23fefdf5459f72195616935c742c21d47bcdbcffb0a3b104c3f30a",
+    "strtof.c": "176000d0ff3812e3cf62c132b9d20e654b70f66ba2cdd8995d3bf8f0fec8a919",
+    "strtord.c": "2750fa3bff541ff0d8ed13f9a6099acc6c3f89a20e9f87fab53216197acceaf3",
+    "sum.c": "cdc1aed326017dbbaa84f0476e48035efd8355d8bfbdb2c45599132a882ef6c1",
+    "ulp.c": "69e25108aa7c6d0c8ff0a63da291cc83fa4c25b60bc65b8d6ff82e9e3b2132e1"
+  }
+}
