@@ -3,6 +3,7 @@
 pub mod allocator;
 pub mod bionic;
 pub mod callbacks;
+pub mod glibc;
 pub mod integer;
 pub mod native;
 pub mod numeric;

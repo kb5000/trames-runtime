@@ -148,6 +148,7 @@ mod tests {
             };
             let result = floating(b"1.25!\0", false);
             let bionic = bionic_floating(b"1.234567890123456789e100!\0", false);
+            let glibc = glibc_floating(b"1.234567890123456789e100!\0", false);
             let after_errno = *errno;
             *errno = original_errno;
             #[cfg(target_arch = "aarch64")]
@@ -168,6 +169,8 @@ mod tests {
             assert_eq!(after_errno, 13);
             assert_eq!(bionic.consumed, 24);
             assert_eq!(bionic.errno, 0);
+            assert_eq!(glibc.consumed, 24);
+            assert_eq!(glibc.errno, 0);
             assert_eq!(result.bits, 1.25f64.to_bits());
             assert_eq!(result.consumed, 4);
         }
@@ -234,6 +237,12 @@ struct BionicResult {
     fpsr: u64,
 }
 unsafe extern "C" {
+    fn trames_glibc_parse_float(
+        bytes: *const u8,
+        len: usize,
+        single: i32,
+        result: *mut BionicResult,
+    );
     fn trames_bionic_parse_float(
         bytes: *const u8,
         len: usize,
@@ -247,6 +256,22 @@ pub fn bionic_floating(bytes: &[u8], single: bool) -> ParsedFloat {
     // all scratch state, preserves host errno/FP state and invokes no guest code.
     unsafe {
         trames_bionic_parse_float(bytes.as_ptr(), bytes.len(), i32::from(single), &mut raw);
+    }
+    ParsedFloat {
+        bits: raw.bits,
+        consumed: raw.consumed as usize,
+        errno: raw.error,
+        needs_more: false,
+        fpsr: raw.fpsr,
+    }
+}
+
+pub(crate) fn glibc_floating(bytes: &[u8], single: bool) -> ParsedFloat {
+    let mut raw = BionicResult::default();
+    // SAFETY: call-owned bounded text/result; no guest pointers or callbacks.
+    // The driver frees scratch and restores the caller's errno/FP state.
+    unsafe {
+        trames_glibc_parse_float(bytes.as_ptr(), bytes.len(), i32::from(single), &mut raw);
     }
     ParsedFloat {
         bits: raw.bits,

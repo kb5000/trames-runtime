@@ -15,7 +15,11 @@ fn fallback() -> Result<Return, Error> {
     })
 }
 fn fold(c: u8) -> u8 {
-    if c.is_ascii_uppercase() { c + 32 } else { c }
+    if c.is_ascii_uppercase() {
+        c + 32
+    } else {
+        c
+    }
 }
 fn chunk(at: u64, left: usize) -> usize {
     left.min((PAGE_SIZE - (at & 0x00ff_ffff_ffff_ffff) % PAGE_SIZE) as usize)

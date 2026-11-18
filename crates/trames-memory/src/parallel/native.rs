@@ -610,7 +610,7 @@ mod tests {
 
     #[test]
     fn independent_atomic_pairs_share_one_page_without_torn_reads() {
-        use std::sync::{Arc, Barrier, atomic::AtomicUsize};
+        use std::sync::{atomic::AtomicUsize, Arc, Barrier};
         let mut memory = Memory::default();
         memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         for rank in 0..4 {
@@ -890,10 +890,9 @@ mod tests {
         for offset in [16, 32, 48] {
             let token = view.exclusive_read(0x1000 + offset, &mut bytes).unwrap();
             view.fill_with(0x1000, 8, |b| b.fill(6)).unwrap();
-            assert!(
-                view.exclusive_write(0x1000 + offset, &[5; 8], Some(token))
-                    .unwrap()
-            );
+            assert!(view
+                .exclusive_write(0x1000 + offset, &[5; 8], Some(token))
+                .unwrap());
         }
         let first = view.exclusive_read(0x1000, &mut bytes).unwrap();
         view.fill_with(0x1100, 8, |b| b.fill(8)).unwrap();

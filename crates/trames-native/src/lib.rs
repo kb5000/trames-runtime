@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Signed-in pure host routines. No guest addresses, runtime code or host state.
 pub mod allocator;
+pub mod glibc;
 pub mod parse;
 #[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(
@@ -366,22 +367,18 @@ mod tests {
                     &src[15 - align..15 - align + len],
                 );
                 assert_eq!(&dst[align..align + len], &src[15 - align..15 - align + len]);
-                assert!(
-                    dst[..align]
-                        .iter()
-                        .chain(&dst[align + len..])
-                        .all(|&b| b == 0xac)
-                );
+                assert!(dst[..align]
+                    .iter()
+                    .chain(&dst[align + len..])
+                    .all(|&b| b == 0xac));
                 for value in [0, 0x80, 255] {
                     dst.fill(0xac);
                     fill(&mut dst[align..align + len], value);
                     assert!(dst[align..align + len].iter().all(|&b| b == value));
-                    assert!(
-                        dst[..align]
-                            .iter()
-                            .chain(&dst[align + len..])
-                            .all(|&b| b == 0xac)
-                    );
+                    assert!(dst[..align]
+                        .iter()
+                        .chain(&dst[align + len..])
+                        .all(|&b| b == 0xac));
                 }
                 assert_eq!(first_zero(&src), None);
                 assert_eq!(compare(&src, &src), 0);

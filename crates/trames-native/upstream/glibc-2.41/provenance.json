@@ -1,0 +1,15 @@
+{
+  "version": "2.41-12+deb13u4",
+  "source_url": "https://deb.debian.org/debian/pool/main/g/glibc/glibc_2.41.orig.tar.xz",
+  "source_sha256": "f24aa441021121a79266f0d75242706cab8843a47901fefe74527491807f1998",
+  "debian_patch_sha256": "dda4153511bfd543502d18e5bc9323110996fe9c531f14ae3fad6eb17f027c7d",
+  "files": {
+    "stdlib/strtol_l.c": "f06ec561c184f51382c06b7c4f5cd96afde2bdb6477a57ade4ae7f1b45df23cb",
+    "stdlib/strtod_l.c": "0ba62d7ae98e8f55208c7a761f4f2b9ac2913b84c8036239fa0476616b50b9be",
+    "stdlib/strtod_nan_main.c": "414e763b110f041457bc71314e2151bde113645cc987301f84e4cfdbf5b6075c",
+    "locale/bits/types/__locale_t.h": "d2513e510029ea0f2fc3868e9f1c990173b2df593d40bb8957b63c8035a1eb35",
+    "sysdeps/generic/tininess.h": "e204bd16a1ea3362287acc27cafb2614407e52b28989ba0921c5652a664e5511",
+    "COPYING.LIB": "dc626520dcd53a22f727af3ee42c770e56c97a64fe3adb063799d8ab032fe551"
+  },
+  "implementation": "C-locale integer grammar translated to Rust; finite FP and exact rounding flags use pinned gdtoa strtodg; glibc NaN payload and AArch64 tininess-before-rounding are applied explicitly. Other locales/FP controls remain original guest code."
+}

@@ -3,8 +3,8 @@
 use crate::PAGE_SIZE;
 use std::{
     cell::UnsafeCell,
-    sync::OnceLock,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::OnceLock,
 };
 
 const REGION: usize = 64;
@@ -963,7 +963,7 @@ mod tests {
         assert_ne!(page.lock(0, 16).reservation(0), token);
     }
     use std::{
-        sync::{Arc, mpsc},
+        sync::{mpsc, Arc},
         time::Duration,
     };
 
