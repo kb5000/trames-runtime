@@ -18,6 +18,10 @@ after the broad inventory.
 The [ancillary completion checkpoint](../../docs/validation/gvisor-unix-ancillary-20261117.md)
 closes its remaining 84 Unix control-message failures and expands the message API check.
 
+The [Unix endpoint checkpoint](../../docs/validation/gvisor-unix-endpoints-20261119.md)
+repairs RAW creation, shutdown/readiness, zero-length receives, reset errors and
+datagram reconnect/accept semantics, with paired hot-path measurements.
+
 ## Build on native ARM64 Linux
 
 Install a C++17 compiler, CMake, Ninja, Python 3 and ordinary static glibc/libstdc++

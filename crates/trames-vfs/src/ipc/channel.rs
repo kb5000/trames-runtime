@@ -19,6 +19,7 @@ struct Data {
     alive: [bool; 2],
     read_closed: [bool; 2],
     write_closed: [bool; 2],
+    error: [u32; 2],
     epochs: [[u64; 2]; 2],
     passcred: [bool; 2],
     timestamp: [u32; 2],
@@ -62,6 +63,7 @@ impl Resource {
                 alive: [connected || kind == 2; 2],
                 read_closed: [false; 2],
                 write_closed: [false; 2],
+                error: [0; 2],
                 epochs: [[0; 2]; 2],
                 passcred: [false; 2],
                 timestamp: [0; 2],
@@ -147,9 +149,15 @@ impl Resource {
         self.change(|data| {
             if how != 1 {
                 data.read_closed[side] = true;
+                if self.kind != 2 {
+                    data.write_closed[1 - side] = true;
+                }
             }
             if how != 0 {
                 data.write_closed[side] = true;
+                if self.kind != 2 {
+                    data.read_closed[1 - side] = true;
+                }
             }
             for epoch in &mut data.epochs {
                 for counter in epoch {
@@ -160,8 +168,25 @@ impl Resource {
         Ok(())
     }
     pub fn close(&self, side: usize) {
+        self.close_mode(side, false);
+    }
+    pub(super) fn abort(&self, side: usize) {
+        self.close_mode(side, true);
+    }
+    fn close_mode(&self, side: usize, reset: bool) {
         let packets = self.change(|data| {
+            if self.kind != 2 && (reset || !data.queues[side].is_empty()) {
+                data.error[1 - side] = 104;
+            }
             data.alive[side] = false;
+            data.read_closed[side] = true;
+            data.write_closed[side] = true;
+            if self.kind != 2 {
+                // Shutdown/close publish the endpoint's own receive state.
+                // Ordinary read/poll need not infer it again from the peer.
+                data.read_closed[1 - side] = true;
+                data.write_closed[1 - side] = true;
+            }
             data.used[side] = 0;
             for counter in &mut data.epochs[1 - side] {
                 *counter = counter.wrapping_add(1);
@@ -169,6 +194,9 @@ impl Resource {
             std::mem::take(&mut data.queues[side])
         });
         drop(packets); // Final close and owning-graph retirement run outside Data.
+    }
+    pub(super) fn take_error(&self, side: usize) -> u32 {
+        std::mem::take(&mut self.data.lock().unwrap().error[side])
     }
     pub fn send_check(&self, side: usize, flags: u32) -> Result<()> {
         if flags & !(0x40 | 0x4000 | 0x40000000) != 0 {
@@ -325,6 +353,14 @@ impl Resource {
     ) -> Option<Result<Received>> {
         self.recv_mode(side, count, flags, true, true)
     }
+    pub(crate) fn recv_message_bytes(
+        &self,
+        side: usize,
+        count: usize,
+        flags: u32,
+    ) -> Option<Result<Received>> {
+        self.recv_mode(side, count, flags, false, true)
+    }
     fn recv_mode(
         &self,
         side: usize,
@@ -344,13 +380,35 @@ impl Resource {
         self.change(|data| {
             let options = [u32::from(data.passcred[side]), data.timestamp[side]];
             let peer = 1 - side;
-            let eof = data.read_closed[side] || !data.alive[peer] || data.write_closed[peer];
+            let eof = data.read_closed[side];
             let queue = &mut data.queues[side];
+            // read(0) does not wait or consume a pending error. Socket receive
+            // APIs instead inspect the queue, error and shutdown state.
+            if self.kind == 1 && count == 0 && !message {
+                return Some(Ok(Received::empty(options)));
+            }
+            if queue.is_empty() {
+                let error = std::mem::take(&mut data.error[side]);
+                return Some(if error != 0 {
+                    Err(Errno(error))
+                } else if eof {
+                    Ok(Received::empty(options))
+                } else {
+                    Err(Errno(11))
+                });
+            }
             if self.kind == 1 && count == 0 && message {
                 let mut rights = None;
                 let mut credentials = None;
                 let mut timestamp = None;
                 if let Some(packet) = queue.front_mut() {
+                    if !ancillary
+                        && (packet.rights.is_some()
+                            || packet.credentials.is_some()
+                            || packet.timestamp.is_some())
+                    {
+                        return None;
+                    }
                     // recvmsg(0) detaches SCM_RIGHTS without consuming payload.
                     // PEEK duplicates the same original OFDs and leaves metadata.
                     rights = if flags & 2 != 0 {
@@ -371,21 +429,6 @@ impl Resource {
                     source: Vec::new(),
                     options,
                 }));
-            }
-            if (self.kind == 1 && count == 0) || (eof && queue.is_empty() && self.kind != 2) {
-                return Some(Ok(Received {
-                    data: Vec::new(),
-                    length: 0,
-                    truncated: false,
-                    rights: None,
-                    credentials: None,
-                    timestamp: None,
-                    source: Vec::new(),
-                    options,
-                }));
-            }
-            if queue.is_empty() {
-                return Some(Err(Errno(11)));
             }
             if self.kind != 1 {
                 let packet = queue.front().expect("packet");
@@ -482,11 +525,11 @@ impl Resource {
     pub fn poll(&self, side: usize, events: u16) -> (u16, [u64; 2]) {
         let data = self.data.lock().unwrap();
         let peer = 1 - side;
-        let eof = data.read_closed[side] || !data.alive[peer] || data.write_closed[peer];
+        let eof = data.read_closed[side];
         let queue = &data.queues[side];
         let send_queue = &data.queues[peer];
         let room = data.send_limit[side].saturating_sub(data.used[peer]);
-        let ready = (if !queue.is_empty() || (eof && self.kind != 2) {
+        let ready = (if !queue.is_empty() || eof {
             events & 1
         } else {
             0
@@ -497,16 +540,28 @@ impl Resource {
             events & 4
         } else {
             0
-        }) | (if eof && self.kind != 2 {
-            events & 0x2000
-        } else {
-            0
-        }) | (if !data.alive[peer] || (eof && data.write_closed[side]) {
-            16
-        } else {
-            0
-        });
+        }) | (if eof { events & 0x2000 } else { 0 })
+            | (if !data.alive[peer] || (eof && data.write_closed[side]) {
+                16
+            } else {
+                0
+            })
+            | if data.error[side] != 0 { 8 } else { 0 };
         (ready, data.epochs[side])
+    }
+}
+impl Received {
+    fn empty(options: [u32; 2]) -> Self {
+        Self {
+            data: Vec::new(),
+            length: 0,
+            truncated: false,
+            rights: None,
+            credentials: None,
+            timestamp: None,
+            source: Vec::new(),
+            options,
+        }
     }
 }
 impl Data {
@@ -527,6 +582,136 @@ impl Data {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn raw_unix_sockets_are_datagrams_before_publication_and_keep_fd_flags() {
+        let mut v = Vfs::default();
+        let flags = 3 | O_NONBLOCK | O_CLOEXEC;
+        let fd = v.socket(1, flags, 0).unwrap();
+        assert_eq!(v.local_socket(fd).unwrap().unwrap().kind(), 2);
+        assert_ne!(v.flags(fd).unwrap() & O_NONBLOCK, 0);
+        assert_eq!(v.fd_flags_snapshot().fcntl(fd, 1, 0), Ok(1));
+        let [a, b] = v.socketpair(1, flags, 0).unwrap();
+        assert_eq!(v.local_socket(a).unwrap().unwrap().kind(), 2);
+        let direct = v.direct_descriptors();
+        assert_eq!(direct.get(a).unwrap().write(b"packet"), Ok(6));
+        assert_eq!(direct.get(b).unwrap().read(2), Ok(b"pa".to_vec()));
+        assert_eq!(direct.get(b).unwrap().read(9), Err(Errno(11)));
+        assert_eq!(v.socket(1, flags, 2), Err(Errno(93)));
+        assert_eq!(v.socket(1, 4, 0), Err(Errno(94)));
+    }
+    #[test]
+    fn addressed_datagrams_can_reconnect_to_the_same_or_a_new_peer_but_cannot_accept() {
+        let mut v = Vfs::default();
+        let a = v.socket(1, 2, 0).unwrap();
+        let b = v.socket(1, 2, 0).unwrap();
+        let c = v.socket(1, 3, 0).unwrap();
+        let first = v.local_socket(a).unwrap().unwrap();
+        let second = v.local_socket(b).unwrap().unwrap();
+        let sender = v.local_socket(c).unwrap().unwrap();
+        let address_a = b"\x01\x00\0reconnect-a";
+        let address_b = b"\x01\x00\0reconnect-b";
+        v.local_bind(&first, address_a).unwrap();
+        v.local_bind(&second, address_b).unwrap();
+        assert_eq!(v.local_accept(&first, 0), Err(Errno(95)));
+        assert_eq!(v.local_accept(&first, 4), Err(Errno(22)));
+        for address in [address_a, address_a, address_b] {
+            v.local_connect(&sender, address).unwrap();
+            assert_eq!(sender.name(true).unwrap(), address);
+            assert_eq!(sender.send(b"x", 0), Ok(1));
+            let receiver = if address == address_a {
+                &first
+            } else {
+                &second
+            };
+            assert_eq!(receiver.recv(1, 0).unwrap().data, b"x");
+        }
+        assert_eq!(first.recv(1, 0).err(), Some(Errno(11)));
+    }
+    #[test]
+    fn shutdown_notifies_existing_waiters_and_propagates_only_on_connected_transports() {
+        struct Wake;
+        impl IoWake for Wake {
+            fn wake_io(&self, _: &Arc<IoSignal>) {}
+        }
+        let target: Arc<dyn IoWake> = Arc::new(Wake);
+        for kind in [1, 2, 5] {
+            let resource = Resource::new(kind, true);
+            let signal = IoSignal::new(1, Arc::downgrade(&target));
+            let _subscription = resource.readiness.subscribe(&signal);
+            resource.shutdown(0, 0).unwrap();
+            assert!(signal.ready());
+            assert_eq!(resource.poll(0, 0x2005).0, 0x2005);
+            assert_eq!(resource.poll(1, 0).0, 0);
+            assert_eq!(resource.send_credentials(1, b"x", 0, None), Err(Errno(32)));
+            resource.shutdown(0, 1).unwrap();
+            assert_eq!(resource.poll(0, 0x2005).0, 0x2015);
+            assert_eq!(resource.poll(1, 0).0, if kind == 2 { 0 } else { 16 });
+            let received = resource.recv_message(1, 0, 0x40).unwrap();
+            if kind == 2 {
+                assert!(matches!(received, Err(Errno(11))));
+            } else {
+                assert!(received.unwrap().data.is_empty());
+            }
+        }
+    }
+    #[test]
+    fn empty_zero_length_message_waits_but_plain_read_does_not_consume_pending_error() {
+        let data = Resource::new(1, true);
+        for flags in [0, 2, 0x20, 0x22] {
+            assert!(matches!(
+                data.recv_message(0, 0, flags),
+                Some(Err(Errno(11)))
+            ));
+            assert!(matches!(
+                data.recv_message_bytes(0, 0, flags),
+                Some(Err(Errno(11)))
+            ));
+            assert!(data
+                .recv(0, 0, flags, false)
+                .unwrap()
+                .unwrap()
+                .data
+                .is_empty());
+        }
+        data.send_credentials(0, b"unread", 0, None).unwrap();
+        data.shutdown(1, 2).unwrap();
+        assert!(data.recv_message(0, 1, 0).unwrap().unwrap().data.is_empty());
+        data.close(1);
+        assert_ne!(data.poll(0, 0).0 & 8, 0);
+        assert!(data.recv(0, 0, 0, false).unwrap().unwrap().data.is_empty());
+        assert!(matches!(data.recv(0, 1, 0, false), Some(Err(Errno(104)))));
+        assert_eq!(data.take_error(0), 0);
+        assert_eq!(data.poll(0, 0).0, 16);
+        assert!(data.recv_message(0, 1, 0).unwrap().unwrap().data.is_empty());
+    }
+    #[test]
+    fn closing_listener_resets_only_its_unaccepted_connections_and_error_is_consumed_once() {
+        let mut v = Vfs::default();
+        for accepted in [false, true] {
+            let listener = v.socket(1, 1, 0).unwrap();
+            let endpoint = v.local_socket(listener).unwrap().unwrap();
+            v.local_bind(&endpoint, &[1, 0, 0, if accepted { b'a' } else { b'b' }])
+                .unwrap();
+            endpoint.listen(1).unwrap();
+            let client = v.socket(1, 1, 0).unwrap();
+            let peer = v.local_socket(client).unwrap().unwrap();
+            v.local_connect(&peer, &endpoint.name(false).unwrap())
+                .unwrap();
+            let server = accepted.then(|| v.local_accept(&endpoint, 0).unwrap().0);
+            drop(endpoint);
+            v.close(listener).unwrap();
+            if let Some(server) = server {
+                assert_eq!(peer.take_error(), 0);
+                assert_eq!(v.write(client, b"ok"), Ok(2));
+                assert_eq!(v.read(server, 2), Ok(b"ok".to_vec()));
+            } else {
+                assert_ne!(v.poll(client, 0) & 8, 0);
+                assert_eq!(peer.take_error(), 104);
+                assert_eq!(peer.take_error(), 0);
+                assert_eq!(v.read(client, 1), Ok(Vec::new()));
+            }
+        }
+    }
     #[test]
     fn unix_sender_budget_ignores_receive_buffer_and_growing_it_unblocks_poll() {
         for kind in [1, 2, 5] {

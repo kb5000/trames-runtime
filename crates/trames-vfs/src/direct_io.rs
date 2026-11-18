@@ -1599,7 +1599,7 @@ impl DirectFd {
         let received = if self.is_addressed_datagram() {
             data.recv_portable(side, count, flags)
         } else {
-            data.recv(side, count, flags, false)
+            data.recv_message_bytes(side, count, flags)
         };
         received.map(|r| {
             r.map(|r| {

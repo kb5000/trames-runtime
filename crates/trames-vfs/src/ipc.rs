@@ -152,6 +152,7 @@ pub struct LocalResource {
     passcred: std::sync::atomic::AtomicBool,
     timestamp: std::sync::atomic::AtomicU32,
     timeouts: SharedCell<[Option<std::time::Duration>; 2]>,
+    linger: SharedCell<[u32; 2]>,
     datagram_peer: SharedCell<std::sync::Weak<LocalResource>>,
 }
 /// One accepted complete Unix OFD, independent of later close/numeric reuse.
@@ -265,6 +266,7 @@ impl LocalResource {
             passcred: std::sync::atomic::AtomicBool::new(false),
             timestamp: std::sync::atomic::AtomicU32::new(0),
             timeouts: SharedCell::new([None, None]),
+            linger: SharedCell::new([0; 2]),
             datagram_peer: SharedCell::new(std::sync::Weak::new()),
         })
     }
@@ -273,6 +275,16 @@ impl LocalResource {
     }
     pub fn io_timeout(&self, receive: bool) -> Option<std::time::Duration> {
         self.timeouts.borrow()[usize::from(receive)]
+    }
+    pub fn set_linger(&self, mut value: [u32; 2]) {
+        value[0] = u32::from(value[0] != 0);
+        self.linger.set(value);
+    }
+    pub fn linger(&self) -> [u32; 2] {
+        self.linger.get()
+    }
+    pub fn take_error(&self) -> u32 {
+        self.channel.borrow().resource.take_error(self.side())
     }
     pub(super) fn pair(a: &Arc<Self>, b: &Arc<Self>) {
         let mut resource = channel::Resource::with_readiness(
@@ -575,6 +587,15 @@ impl LocalResource {
 impl Drop for LocalResource {
     fn drop(&mut self) {
         drop(self.pathname_binding.take());
+        let listener = self.listener.borrow_mut().take();
+        if let Some(listener) = listener {
+            // Only unaccepted connections are reset. The accepted endpoint and
+            // all queued rights leave the listener before final-close callbacks.
+            for pending in &listener.pending {
+                pending.channel.borrow().resource.abort(pending.side());
+            }
+            drop(listener);
+        }
         self.channel.borrow().resource.close(self.side());
     }
 }

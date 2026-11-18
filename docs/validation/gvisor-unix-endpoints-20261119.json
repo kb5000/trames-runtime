@@ -1,0 +1,2144 @@
+{
+  "date": "2026-11-19",
+  "runtime_base": "7f408e32bcefd3744d17bb20317c857cd67ca5af",
+  "gvisor_revision": "89cacadae21eca4270a8f7c79281d0426d33ac5f",
+  "comparison": {
+    "schema_version": 1,
+    "cases": 6093,
+    "native_counts": {
+      "passed": 5826,
+      "skipped": 248,
+      "no_result": 19
+    },
+    "trames_counts": {
+      "passed": 5433,
+      "failed": 424,
+      "skipped": 212,
+      "timeout": 24
+    },
+    "native_passed_cases": 5826,
+    "outcomes_on_native_passed": {
+      "passed": 5414,
+      "failed": 388,
+      "timeout": 24
+    },
+    "strict_pass_fraction": 0.9292825266048746,
+    "groups": [
+      {
+        "name": "socket_abstract",
+        "cases": 1464,
+        "native": {
+          "passed": 1387,
+          "skipped": 58,
+          "no_result": 19
+        },
+        "trames": {
+          "passed": 1302,
+          "failed": 108,
+          "skipped": 46,
+          "timeout": 8
+        }
+      },
+      {
+        "name": "socket_abstract_non_blocking",
+        "cases": 18,
+        "native": {
+          "passed": 18
+        },
+        "trames": {
+          "passed": 18
+        }
+      },
+      {
+        "name": "socket_unix_dgram_local",
+        "cases": 648,
+        "native": {
+          "passed": 648
+        },
+        "trames": {
+          "passed": 616,
+          "failed": 32
+        }
+      },
+      {
+        "name": "socket_unix_dgram_non_blocking",
+        "cases": 6,
+        "native": {
+          "passed": 6
+        },
+        "trames": {
+          "passed": 6
+        }
+      },
+      {
+        "name": "socket_unix_seqpacket_local",
+        "cases": 336,
+        "native": {
+          "passed": 336
+        },
+        "trames": {
+          "passed": 336
+        }
+      },
+      {
+        "name": "socket_unix_stream",
+        "cases": 216,
+        "native": {
+          "passed": 216
+        },
+        "trames": {
+          "passed": 216
+        }
+      },
+      {
+        "name": "socket_unix_stream_listener_close",
+        "cases": 2,
+        "native": {
+          "passed": 2
+        },
+        "trames": {
+          "passed": 2
+        }
+      },
+      {
+        "name": "socket_domain",
+        "cases": 636,
+        "native": {
+          "passed": 612,
+          "skipped": 24
+        },
+        "trames": {
+          "passed": 532,
+          "failed": 72,
+          "skipped": 24,
+          "timeout": 8
+        }
+      },
+      {
+        "name": "socket_domain_non_blocking",
+        "cases": 18,
+        "native": {
+          "passed": 18
+        },
+        "trames": {
+          "passed": 18
+        }
+      },
+      {
+        "name": "socket_filesystem",
+        "cases": 1464,
+        "native": {
+          "passed": 1406,
+          "skipped": 58
+        },
+        "trames": {
+          "passed": 1302,
+          "failed": 108,
+          "skipped": 46,
+          "timeout": 8
+        }
+      },
+      {
+        "name": "socket_filesystem_non_blocking",
+        "cases": 18,
+        "native": {
+          "passed": 18
+        },
+        "trames": {
+          "passed": 18
+        }
+      },
+      {
+        "name": "socket_unix_unbound_dgram",
+        "cases": 52,
+        "native": {
+          "passed": 52
+        },
+        "trames": {
+          "passed": 52
+        }
+      },
+      {
+        "name": "socket_unix_unbound_abstract",
+        "cases": 60,
+        "native": {
+          "passed": 58,
+          "skipped": 2
+        },
+        "trames": {
+          "passed": 40,
+          "failed": 18,
+          "skipped": 2
+        }
+      },
+      {
+        "name": "socket_unix_unbound_filesystem",
+        "cases": 18,
+        "native": {
+          "passed": 18
+        },
+        "trames": {
+          "passed": 12,
+          "failed": 6
+        }
+      },
+      {
+        "name": "socket_unix_pair",
+        "cases": 913,
+        "native": {
+          "passed": 819,
+          "skipped": 94
+        },
+        "trames": {
+          "passed": 791,
+          "skipped": 82,
+          "failed": 40
+        }
+      },
+      {
+        "name": "socket_unix_unbound_seqpacket",
+        "cases": 16,
+        "native": {
+          "passed": 16
+        },
+        "trames": {
+          "passed": 16
+        }
+      },
+      {
+        "name": "socket_unix_unbound_stream",
+        "cases": 208,
+        "native": {
+          "passed": 196,
+          "skipped": 12
+        },
+        "trames": {
+          "failed": 40,
+          "passed": 156,
+          "skipped": 12
+        }
+      }
+    ]
+  },
+  "new_native_confirmed_passes": 430,
+  "new_by_group": {
+    "socket_abstract": 12,
+    "socket_domain": 12,
+    "socket_filesystem": 12,
+    "socket_unix_dgram_local": 332,
+    "socket_unix_stream": 48,
+    "socket_unix_stream_listener_close": 2,
+    "socket_unix_unbound_dgram": 12
+  },
+  "regressions": 0,
+  "baseline_precedence": [
+    "target/gvisor-expanded-20261117/trames-audited",
+    "target/gvisor-gap-fixes-20261117/accepted-audited",
+    "target/gvisor-ancillary-completion-20261117/audited",
+    "target/gvisor-multi-area-20261117/audited",
+    "target/gvisor-multi-area-20261117/copy-audited"
+  ],
+  "newly_passing": [
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.LingerSocketOption/0"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.LingerSocketOption/1"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.LingerSocketOption/10"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.LingerSocketOption/11"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.LingerSocketOption/2"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.LingerSocketOption/3"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.LingerSocketOption/4"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.LingerSocketOption/5"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.LingerSocketOption/6"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.LingerSocketOption/7"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.LingerSocketOption/8"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.LingerSocketOption/9"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.LingerSocketOption/0"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.LingerSocketOption/1"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.LingerSocketOption/10"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.LingerSocketOption/11"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.LingerSocketOption/2"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.LingerSocketOption/3"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.LingerSocketOption/4"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.LingerSocketOption/5"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.LingerSocketOption/6"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.LingerSocketOption/7"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.LingerSocketOption/8"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.LingerSocketOption/9"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.LingerSocketOption/0"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.LingerSocketOption/1"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.LingerSocketOption/10"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.LingerSocketOption/11"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.LingerSocketOption/2"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.LingerSocketOption/3"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.LingerSocketOption/4"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.LingerSocketOption/5"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.LingerSocketOption/6"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.LingerSocketOption/7"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.LingerSocketOption/8"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.LingerSocketOption/9"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.IncreasedSocketSendBufUnblocksWrites/14"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.IncreasedSocketSendBufUnblocksWrites/15"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.IncreasedSocketSendBufUnblocksWrites/2"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.IncreasedSocketSendBufUnblocksWrites/3"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.PollOutAfterWriteShutdownIsCapacityBased/14"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.PollOutAfterWriteShutdownIsCapacityBased/15"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.PollOutAfterWriteShutdownIsCapacityBased/2"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.PollOutAfterWriteShutdownIsCapacityBased/3"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.WriteOneSideClosed/10"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.WriteOneSideClosed/11"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.WriteOneSideClosed/14"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.WriteOneSideClosed/15"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.WriteOneSideClosed/18"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.WriteOneSideClosed/19"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.WriteOneSideClosed/2"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.WriteOneSideClosed/22"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.WriteOneSideClosed/23"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.WriteOneSideClosed/3"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.WriteOneSideClosed/6"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.WriteOneSideClosed/7"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncNotFull/10"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncNotFull/11"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncNotFull/14"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncNotFull/15"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncNotFull/18"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncNotFull/19"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncNotFull/2"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncNotFull/22"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncNotFull/23"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncNotFull/3"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncNotFull/6"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncNotFull/7"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncSameSize/10"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncSameSize/11"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncSameSize/14"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncSameSize/15"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncSameSize/18"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncSameSize/19"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncSameSize/2"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncSameSize/22"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncSameSize/23"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncSameSize/3"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncSameSize/6"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncSameSize/7"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncTruncation/10"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncTruncation/11"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncTruncation/14"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncTruncation/15"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncTruncation/18"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncTruncation/19"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncTruncation/2"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncTruncation/22"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncTruncation/23"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncTruncation/3"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncTruncation/6"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncTruncation/7"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncTruncationRecvmsgMsghdrFlagMsgTrunc/10"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncTruncationRecvmsgMsghdrFlagMsgTrunc/11"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncTruncationRecvmsgMsghdrFlagMsgTrunc/14"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncTruncationRecvmsgMsghdrFlagMsgTrunc/15"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncTruncationRecvmsgMsghdrFlagMsgTrunc/18"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncTruncationRecvmsgMsghdrFlagMsgTrunc/19"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncTruncationRecvmsgMsghdrFlagMsgTrunc/2"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncTruncationRecvmsgMsghdrFlagMsgTrunc/22"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncTruncationRecvmsgMsghdrFlagMsgTrunc/23"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncTruncationRecvmsgMsghdrFlagMsgTrunc/3"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncTruncationRecvmsgMsghdrFlagMsgTrunc/6"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.MsgTruncTruncationRecvmsgMsghdrFlagMsgTrunc/7"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsgTruncMsgPeekZeroLen/10"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsgTruncMsgPeekZeroLen/11"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsgTruncMsgPeekZeroLen/14"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsgTruncMsgPeekZeroLen/15"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsgTruncMsgPeekZeroLen/18"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsgTruncMsgPeekZeroLen/19"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsgTruncMsgPeekZeroLen/2"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsgTruncMsgPeekZeroLen/22"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsgTruncMsgPeekZeroLen/23"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsgTruncMsgPeekZeroLen/3"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsgTruncMsgPeekZeroLen/6"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsgTruncMsgPeekZeroLen/7"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsgTruncZeroLen/10"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsgTruncZeroLen/11"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsgTruncZeroLen/14"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsgTruncZeroLen/15"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsgTruncZeroLen/18"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsgTruncZeroLen/19"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsgTruncZeroLen/2"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsgTruncZeroLen/22"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsgTruncZeroLen/23"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsgTruncZeroLen/3"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsgTruncZeroLen/6"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsgTruncZeroLen/7"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsghdrFlagMsgTrunc/10"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsghdrFlagMsgTrunc/11"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsghdrFlagMsgTrunc/14"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsghdrFlagMsgTrunc/15"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsghdrFlagMsgTrunc/18"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsghdrFlagMsgTrunc/19"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsghdrFlagMsgTrunc/2"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsghdrFlagMsgTrunc/22"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsghdrFlagMsgTrunc/23"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsghdrFlagMsgTrunc/3"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsghdrFlagMsgTrunc/6"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgMsghdrFlagMsgTrunc/7"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgTruncPeekDontwaitZeroLen/10"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgTruncPeekDontwaitZeroLen/11"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgTruncPeekDontwaitZeroLen/14"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgTruncPeekDontwaitZeroLen/15"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgTruncPeekDontwaitZeroLen/18"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgTruncPeekDontwaitZeroLen/19"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgTruncPeekDontwaitZeroLen/2"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgTruncPeekDontwaitZeroLen/22"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgTruncPeekDontwaitZeroLen/23"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgTruncPeekDontwaitZeroLen/3"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgTruncPeekDontwaitZeroLen/6"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.RecvmsgTruncPeekDontwaitZeroLen/7"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SendMsgTooLarge/10"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SendMsgTooLarge/11"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SendMsgTooLarge/14"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SendMsgTooLarge/15"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SendMsgTooLarge/18"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SendMsgTooLarge/19"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SendMsgTooLarge/2"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SendMsgTooLarge/22"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SendMsgTooLarge/23"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SendMsgTooLarge/3"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SendMsgTooLarge/6"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SendMsgTooLarge/7"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SinglePeek/10"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SinglePeek/11"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SinglePeek/14"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SinglePeek/15"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SinglePeek/18"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SinglePeek/19"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SinglePeek/2"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SinglePeek/22"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SinglePeek/23"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SinglePeek/3"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SinglePeek/6"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SinglePeek/7"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SingleRecv/10"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SingleRecv/11"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SingleRecv/14"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SingleRecv/15"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SingleRecv/18"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SingleRecv/19"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SingleRecv/2"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SingleRecv/22"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SingleRecv/23"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SingleRecv/3"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SingleRecv/6"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SingleRecv/7"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SplitRecv/10"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SplitRecv/11"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SplitRecv/14"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SplitRecv/15"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SplitRecv/18"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SplitRecv/19"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SplitRecv/2"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SplitRecv/22"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SplitRecv/23"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SplitRecv/3"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SplitRecv/6"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/NonStreamSocketPairTest.SplitRecv/7"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.FragmentedRecvMsg/10"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.FragmentedRecvMsg/11"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.FragmentedRecvMsg/14"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.FragmentedRecvMsg/15"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.FragmentedRecvMsg/18"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.FragmentedRecvMsg/19"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.FragmentedRecvMsg/2"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.FragmentedRecvMsg/22"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.FragmentedRecvMsg/23"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.FragmentedRecvMsg/3"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.FragmentedRecvMsg/6"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.FragmentedRecvMsg/7"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.FragmentedSendMsg/10"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.FragmentedSendMsg/11"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.FragmentedSendMsg/14"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.FragmentedSendMsg/15"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.FragmentedSendMsg/18"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.FragmentedSendMsg/19"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.FragmentedSendMsg/2"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.FragmentedSendMsg/22"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.FragmentedSendMsg/23"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.FragmentedSendMsg/3"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.FragmentedSendMsg/6"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.FragmentedSendMsg/7"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PeerWriteShutdown/10"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PeerWriteShutdown/11"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PeerWriteShutdown/14"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PeerWriteShutdown/15"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PeerWriteShutdown/18"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PeerWriteShutdown/19"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PeerWriteShutdown/2"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PeerWriteShutdown/22"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PeerWriteShutdown/23"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PeerWriteShutdown/3"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PeerWriteShutdown/6"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PeerWriteShutdown/7"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PollAfterFullShutdown/0"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PollAfterFullShutdown/1"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PollAfterFullShutdown/10"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PollAfterFullShutdown/11"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PollAfterFullShutdown/12"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PollAfterFullShutdown/13"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PollAfterFullShutdown/14"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PollAfterFullShutdown/15"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PollAfterFullShutdown/16"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PollAfterFullShutdown/17"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PollAfterFullShutdown/18"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PollAfterFullShutdown/19"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PollAfterFullShutdown/2"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PollAfterFullShutdown/20"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PollAfterFullShutdown/21"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PollAfterFullShutdown/22"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PollAfterFullShutdown/23"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PollAfterFullShutdown/3"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PollAfterFullShutdown/4"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PollAfterFullShutdown/5"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PollAfterFullShutdown/6"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PollAfterFullShutdown/7"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PollAfterFullShutdown/8"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.PollAfterFullShutdown/9"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ReadShutdownWakesRdHupOnlyPoller/0"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ReadShutdownWakesRdHupOnlyPoller/1"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ReadShutdownWakesRdHupOnlyPoller/10"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ReadShutdownWakesRdHupOnlyPoller/11"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ReadShutdownWakesRdHupOnlyPoller/12"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ReadShutdownWakesRdHupOnlyPoller/13"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ReadShutdownWakesRdHupOnlyPoller/14"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ReadShutdownWakesRdHupOnlyPoller/15"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ReadShutdownWakesRdHupOnlyPoller/16"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ReadShutdownWakesRdHupOnlyPoller/17"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ReadShutdownWakesRdHupOnlyPoller/18"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ReadShutdownWakesRdHupOnlyPoller/19"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ReadShutdownWakesRdHupOnlyPoller/2"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ReadShutdownWakesRdHupOnlyPoller/20"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ReadShutdownWakesRdHupOnlyPoller/21"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ReadShutdownWakesRdHupOnlyPoller/22"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ReadShutdownWakesRdHupOnlyPoller/23"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ReadShutdownWakesRdHupOnlyPoller/3"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ReadShutdownWakesRdHupOnlyPoller/4"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ReadShutdownWakesRdHupOnlyPoller/5"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ReadShutdownWakesRdHupOnlyPoller/6"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ReadShutdownWakesRdHupOnlyPoller/7"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ReadShutdownWakesRdHupOnlyPoller/8"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ReadShutdownWakesRdHupOnlyPoller/9"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.RecvMsgTooLarge/10"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.RecvMsgTooLarge/11"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.RecvMsgTooLarge/14"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.RecvMsgTooLarge/15"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.RecvMsgTooLarge/18"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.RecvMsgTooLarge/19"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.RecvMsgTooLarge/2"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.RecvMsgTooLarge/22"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.RecvMsgTooLarge/23"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.RecvMsgTooLarge/3"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.RecvMsgTooLarge/6"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.RecvMsgTooLarge/7"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.SendTimeout/10"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.SendTimeout/11"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.SendTimeout/14"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.SendTimeout/15"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.SendTimeout/18"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.SendTimeout/19"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.SendTimeout/2"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.SendTimeout/22"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.SendTimeout/23"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.SendTimeout/3"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.SendTimeout/6"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.SendTimeout/7"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ShutdownWakesHangupOnlyPoller/10"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ShutdownWakesHangupOnlyPoller/11"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ShutdownWakesHangupOnlyPoller/14"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ShutdownWakesHangupOnlyPoller/15"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ShutdownWakesHangupOnlyPoller/18"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ShutdownWakesHangupOnlyPoller/19"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ShutdownWakesHangupOnlyPoller/2"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ShutdownWakesHangupOnlyPoller/22"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ShutdownWakesHangupOnlyPoller/23"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ShutdownWakesHangupOnlyPoller/3"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ShutdownWakesHangupOnlyPoller/6"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ShutdownWakesHangupOnlyPoller/7"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.WriteShutdownPeerRdHupWakeup/10"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.WriteShutdownPeerRdHupWakeup/11"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.WriteShutdownPeerRdHupWakeup/14"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.WriteShutdownPeerRdHupWakeup/15"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.WriteShutdownPeerRdHupWakeup/18"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.WriteShutdownPeerRdHupWakeup/19"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.WriteShutdownPeerRdHupWakeup/2"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.WriteShutdownPeerRdHupWakeup/22"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.WriteShutdownPeerRdHupWakeup/23"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.WriteShutdownPeerRdHupWakeup/3"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.WriteShutdownPeerRdHupWakeup/6"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.WriteShutdownPeerRdHupWakeup/7"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvEmptyQueue/10"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvEmptyQueue/11"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvEmptyQueue/14"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvEmptyQueue/15"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvEmptyQueue/18"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvEmptyQueue/19"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvEmptyQueue/2"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvEmptyQueue/22"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvEmptyQueue/23"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvEmptyQueue/3"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvEmptyQueue/6"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvEmptyQueue/7"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvPeerShutdown/10"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvPeerShutdown/11"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvPeerShutdown/14"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvPeerShutdown/15"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvPeerShutdown/18"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvPeerShutdown/19"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvPeerShutdown/2"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvPeerShutdown/22"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvPeerShutdown/23"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvPeerShutdown/3"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvPeerShutdown/6"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvPeerShutdown/7"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvPendingMessage/10"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvPendingMessage/11"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvPendingMessage/14"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvPendingMessage/15"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvPendingMessage/18"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvPendingMessage/19"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvPendingMessage/2"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvPendingMessage/22"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvPendingMessage/23"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvPendingMessage/3"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvPendingMessage/6"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/UnixNonStreamSocketPairTest.ZeroLengthRecvPendingMessage/7"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.PeerShutdownWakesHangupOnlyPoller/0"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.PeerShutdownWakesHangupOnlyPoller/1"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.PeerShutdownWakesHangupOnlyPoller/10"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.PeerShutdownWakesHangupOnlyPoller/11"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.PeerShutdownWakesHangupOnlyPoller/2"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.PeerShutdownWakesHangupOnlyPoller/3"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.PeerShutdownWakesHangupOnlyPoller/4"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.PeerShutdownWakesHangupOnlyPoller/5"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.PeerShutdownWakesHangupOnlyPoller/6"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.PeerShutdownWakesHangupOnlyPoller/7"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.PeerShutdownWakesHangupOnlyPoller/8"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.PeerShutdownWakesHangupOnlyPoller/9"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.ReadOneSideClosedWithUnreadData/0"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.ReadOneSideClosedWithUnreadData/1"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.ReadOneSideClosedWithUnreadData/10"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.ReadOneSideClosedWithUnreadData/11"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.ReadOneSideClosedWithUnreadData/2"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.ReadOneSideClosedWithUnreadData/3"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.ReadOneSideClosedWithUnreadData/4"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.ReadOneSideClosedWithUnreadData/5"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.ReadOneSideClosedWithUnreadData/6"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.ReadOneSideClosedWithUnreadData/7"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.ReadOneSideClosedWithUnreadData/8"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.ReadOneSideClosedWithUnreadData/9"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.SetAndGetSocketLinger/0"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.SetAndGetSocketLinger/1"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.SetAndGetSocketLinger/10"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.SetAndGetSocketLinger/11"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.SetAndGetSocketLinger/2"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.SetAndGetSocketLinger/3"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.SetAndGetSocketLinger/4"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.SetAndGetSocketLinger/5"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.SetAndGetSocketLinger/6"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.SetAndGetSocketLinger/7"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.SetAndGetSocketLinger/8"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.SetAndGetSocketLinger/9"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.ZeroLengthRecvEmptyQueue/0"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.ZeroLengthRecvEmptyQueue/1"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.ZeroLengthRecvEmptyQueue/10"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.ZeroLengthRecvEmptyQueue/11"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.ZeroLengthRecvEmptyQueue/2"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.ZeroLengthRecvEmptyQueue/3"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.ZeroLengthRecvEmptyQueue/4"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.ZeroLengthRecvEmptyQueue/5"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.ZeroLengthRecvEmptyQueue/6"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.ZeroLengthRecvEmptyQueue/7"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.ZeroLengthRecvEmptyQueue/8"
+    },
+    {
+      "suite": "socket_unix_stream",
+      "case": "AllUnixDomainSockets/StreamUnixSocketPairTest.ZeroLengthRecvEmptyQueue/9"
+    },
+    {
+      "suite": "socket_unix_stream_listener_close",
+      "case": "UnixStreamListenerCloseTest.PendingConnectionGetsECONNRESET"
+    },
+    {
+      "suite": "socket_unix_stream_listener_close",
+      "case": "UnixStreamListenerCloseTest.SOErrorReturnsECONNRESET"
+    },
+    {
+      "suite": "socket_unix_unbound_dgram",
+      "case": "AllUnixDomainSockets/UnboundDgramUnixSocketPairTest.Accept/0"
+    },
+    {
+      "suite": "socket_unix_unbound_dgram",
+      "case": "AllUnixDomainSockets/UnboundDgramUnixSocketPairTest.Accept/1"
+    },
+    {
+      "suite": "socket_unix_unbound_dgram",
+      "case": "AllUnixDomainSockets/UnboundDgramUnixSocketPairTest.Accept/2"
+    },
+    {
+      "suite": "socket_unix_unbound_dgram",
+      "case": "AllUnixDomainSockets/UnboundDgramUnixSocketPairTest.Accept/3"
+    },
+    {
+      "suite": "socket_unix_unbound_dgram",
+      "case": "AllUnixDomainSockets/UnboundDgramUnixSocketPairTest.DoubleConnect/0"
+    },
+    {
+      "suite": "socket_unix_unbound_dgram",
+      "case": "AllUnixDomainSockets/UnboundDgramUnixSocketPairTest.DoubleConnect/1"
+    },
+    {
+      "suite": "socket_unix_unbound_dgram",
+      "case": "AllUnixDomainSockets/UnboundDgramUnixSocketPairTest.DoubleConnect/2"
+    },
+    {
+      "suite": "socket_unix_unbound_dgram",
+      "case": "AllUnixDomainSockets/UnboundDgramUnixSocketPairTest.DoubleConnect/3"
+    },
+    {
+      "suite": "socket_unix_unbound_dgram",
+      "case": "AllUnixDomainSockets/UnboundDgramUnixSocketPairTest.PollAfterFullShutdown/0"
+    },
+    {
+      "suite": "socket_unix_unbound_dgram",
+      "case": "AllUnixDomainSockets/UnboundDgramUnixSocketPairTest.PollAfterFullShutdown/1"
+    },
+    {
+      "suite": "socket_unix_unbound_dgram",
+      "case": "AllUnixDomainSockets/UnboundDgramUnixSocketPairTest.PollAfterFullShutdown/2"
+    },
+    {
+      "suite": "socket_unix_unbound_dgram",
+      "case": "AllUnixDomainSockets/UnboundDgramUnixSocketPairTest.PollAfterFullShutdown/3"
+    }
+  ],
+  "performance": {
+    "method": "Two warmups, 15 alternating process pairs, same source/profile/dependencies; ns per send/read roundtrip or one poll. No conformance workers, CI or builds running.",
+    "rounds": 15,
+    "iterations": 300000,
+    "summary": {
+      "stream-64": {
+        "before_ns": 51.242,
+        "after_ns": 50.601,
+        "median_delta_percent": -1.2509269739666595,
+        "paired_median_percent": 0.22982944236120684,
+        "paired_p10_percent": -2.1873322597960265,
+        "paired_p90_percent": 6.141821300483397,
+        "before_range": [
+          49.602,
+          52.803
+        ],
+        "after_range": [
+          49.593,
+          71.07
+        ]
+      },
+      "stream-4096": {
+        "before_ns": 114.632,
+        "after_ns": 114.988,
+        "median_delta_percent": 0.31055900621117516,
+        "paired_median_percent": 0.6035684661948926,
+        "paired_p10_percent": -0.7172042075980212,
+        "paired_p90_percent": 4.2722538620965755,
+        "before_range": [
+          111.179,
+          116.209
+        ],
+        "after_range": [
+          113.672,
+          142.664
+        ]
+      },
+      "dgram-64": {
+        "before_ns": 48.415,
+        "after_ns": 46.514,
+        "median_delta_percent": -3.9264690695032467,
+        "paired_median_percent": -3.7632964990188866,
+        "paired_p10_percent": -6.880836152241276,
+        "paired_p90_percent": -0.8077918253150185,
+        "before_range": [
+          47.264,
+          49.772
+        ],
+        "after_range": [
+          45.141,
+          55.222
+        ]
+      },
+      "dgram-4096": {
+        "before_ns": 111.033,
+        "after_ns": 108.214,
+        "median_delta_percent": -2.5388848360397342,
+        "paired_median_percent": -2.5451892680554478,
+        "paired_p10_percent": -5.575700200057165,
+        "paired_p90_percent": 4.170261191975189,
+        "before_range": [
+          108.962,
+          113.251
+        ],
+        "after_range": [
+          105.374,
+          122.873
+        ]
+      },
+      "seqpacket-64": {
+        "before_ns": 48.577,
+        "after_ns": 46.576,
+        "median_delta_percent": -4.119233382053233,
+        "paired_median_percent": -4.152776062888419,
+        "paired_p10_percent": -6.039812067260131,
+        "paired_p90_percent": -2.071047885383104,
+        "before_range": [
+          47.287,
+          51.221
+        ],
+        "after_range": [
+          45.495,
+          50.211
+        ]
+      },
+      "recvmsg-stream-64": {
+        "before_ns": 62.129,
+        "after_ns": 61.902,
+        "median_delta_percent": -0.3653688293711377,
+        "paired_median_percent": 1.3021294403579686,
+        "paired_p10_percent": -3.5526629097547446,
+        "paired_p90_percent": 5.973028119619972,
+        "before_range": [
+          60.562,
+          64.398
+        ],
+        "after_range": [
+          59.541,
+          68.569
+        ]
+      },
+      "poll-empty": {
+        "before_ns": 5.49,
+        "after_ns": 5.512,
+        "median_delta_percent": 0.4007285974499064,
+        "paired_median_percent": -0.34351835111191553,
+        "paired_p10_percent": -1.6806722689075682,
+        "paired_p90_percent": 2.665941240478764,
+        "before_range": [
+          5.384,
+          6.894
+        ],
+        "after_range": [
+          5.362,
+          5.704
+        ]
+      }
+    },
+    "identity": {
+      "baseline_runtime": "7f408e32bcefd3744d17bb20317c857cd67ca5af",
+      "candidate_base": "7f408e32bcefd3744d17bb20317c857cd67ca5af",
+      "benchmark_source_sha256": "e2070c3be534429a38fcbb42958b878f0bae91e306b483f29bb7102905159909",
+      "binary_sha256": {
+        "before": "56aaa58a80b9e04c571bbe97c456ec5e30acd687b332b3847d6bc21a203664f7",
+        "after": "62adfcc47fd482dfd98a063cf7e231ce1c130e2cf9e4f6059400b0c5235216f6"
+      },
+      "candidate_sources": {
+        "crates/trames-linux/src/network/unix.rs": "f6f5e0dc76ee513c3ce454a8a249642a02959433c04b855761bf0e6632ccd796",
+        "crates/trames-vfs/src/descriptor_factory.rs": "8d3283c68ce2ac7bf44c88eeb41b8d2ced44896d7ddd706d72830f748462f6ad",
+        "crates/trames-vfs/src/direct_io.rs": "45bdef6f4b7746c5fbb974788543265c5b7bed925718c6ba5fba5ca0fb19ef91",
+        "crates/trames-vfs/src/ipc.rs": "e28c38bd5030e0bb983268f33c36fea9efa3147ab7c1c55d88c7cff7badec3c1",
+        "crates/trames-vfs/src/ipc/channel.rs": "99270a4a31abd23962b7427c05adb9bcabc166cf66fb3617588475a759253bd6",
+        "crates/trames-vfs/src/ipc/control.rs": "93141586739fa8cd124971a9cf9987b4b9327c63c88b93db1b8a92512d7aa14b",
+        "crates/trames-vfs/src/ipc/shared_graph_tests.rs": "55e9a6781551a464a571dfe33e61b58c723fbfc233caac2074f5de66cae68e18"
+      },
+      "compiler": "rustc 1.101.0-nightly (4ebd25825 2026-10-15)\nbinary: rustc\ncommit-hash: 4ebd258257737d5b7635c116fa7d281627a7e937\ncommit-date: 2026-10-15\nhost: aarch64-apple-darwin\nrelease: 1.101.0-nightly\nLLVM version: 23.1.4\n",
+      "dependency_lock_sha256": {
+        "before": "fd6ff2d895dfbf5d3a3081c44fc648ab4b82aa7e4ec735f53486880bf81322c6",
+        "after": "fd6ff2d895dfbf5d3a3081c44fc648ab4b82aa7e4ec735f53486880bf81322c6"
+      }
+    }
+  },
+  "checks": {
+    "runtime_macos": {
+      "passed": 8,
+      "total": 8
+    },
+    "runtime_linux_arm64": {
+      "passed": 8,
+      "total": 8
+    },
+    "ipad_compile": "passed",
+    "ipad_interpreter_unix": {
+      "passed": 11,
+      "failed": 0
+    },
+    "linux_test_stack": {
+      "bytes": 8388608,
+      "scope": "Rust debug test harness only; unchanged production settings.",
+      "baseline_verification": "Both unmodified 7f408e3 and candidate overflow the netlink namespace fixture at the default stack with SMOLTCP_IFACE_MAX_ADDR_COUNT=16 and workspace feature unification.",
+      "evidence": "target/local-ci/io/gvisor-unix-20261119/stack-compare.json"
+    }
+  },
+  "evidence_root": "target/gvisor-unix-20261119",
+  "runner_sha256": "d10639a22ecf8bb757691ee5736585f5489ebc7efb7c2b282ee0c0e4accd5046",
+  "inputs_sha256": {
+    "crates/trames-linux/src/network/unix.rs": "f6f5e0dc76ee513c3ce454a8a249642a02959433c04b855761bf0e6632ccd796",
+    "crates/trames-vfs/src/descriptor_factory.rs": "8d3283c68ce2ac7bf44c88eeb41b8d2ced44896d7ddd706d72830f748462f6ad",
+    "crates/trames-vfs/src/direct_io.rs": "45bdef6f4b7746c5fbb974788543265c5b7bed925718c6ba5fba5ca0fb19ef91",
+    "crates/trames-vfs/src/ipc.rs": "e28c38bd5030e0bb983268f33c36fea9efa3147ab7c1c55d88c7cff7badec3c1",
+    "crates/trames-vfs/src/ipc/channel.rs": "99270a4a31abd23962b7427c05adb9bcabc166cf66fb3617588475a759253bd6",
+    "crates/trames-vfs/src/ipc/control.rs": "93141586739fa8cd124971a9cf9987b4b9327c63c88b93db1b8a92512d7aa14b",
+    "crates/trames-vfs/src/ipc/shared_graph_tests.rs": "55e9a6781551a464a571dfe33e61b58c723fbfc233caac2074f5de66cae68e18",
+    "crates/trames-vfs/examples/unix-io.rs": "e2070c3be534429a38fcbb42958b878f0bae91e306b483f29bb7102905159909"
+  },
+  "limits": [
+    "Affected Unix selection, not a new overall score for the 14530-case inventory.",
+    "Addressed-datagram sender budgeting and the record-queue bound remain incomplete.",
+    "Generic socket controls, credential coalescing and the existing receive-timeout gaps remain.",
+    "Physical iPad behavior was not tested; installed apps and existing environments were not changed."
+  ]
+}

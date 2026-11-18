@@ -59,17 +59,19 @@ impl DescriptorFactory {
     pub fn files(&self) -> &SharedFiles {
         &self.files
     }
-    fn local_parameters(kind: u32, protocol: u32) -> Result<()> {
+    fn local_parameters(kind: u32, protocol: u32) -> Result<u32> {
         if kind & !(0xf | O_CLOEXEC | O_NONBLOCK) != 0 {
             return Err(Errno(22));
         }
-        if !matches!(kind & 0xf, 1 | 2 | 5) {
+        if !matches!(kind & 0xf, 1 | 2 | 3 | 5) {
             return Err(Errno(94));
         }
         if protocol != 0 {
             return Err(Errno(93));
         }
-        Ok(())
+        // Linux unix_create normalizes SOCK_RAW to SOCK_DGRAM once, before
+        // publishing the endpoint. There is no extra dispatch on packet I/O.
+        Ok(if kind & 0xf == 3 { 2 } else { kind & 0xf })
     }
     fn new_local(&self, kind: u32) -> Result<Arc<ipc::LocalResource>> {
         ipc::LocalResource::allocate(
@@ -84,9 +86,9 @@ impl DescriptorFactory {
         )
     }
     pub fn local_create(&self, kind: u32, protocol: u32) -> Result<u32> {
-        Self::local_parameters(kind, protocol)?;
+        let socket_type = Self::local_parameters(kind, protocol)?;
         let reserved = self.files.reserve()?;
-        let core = self.new_local(kind & 0xf)?;
+        let core = self.new_local(socket_type)?;
         let descriptor = Vfs::local_description(self.open_id(), self.owner, core, kind);
         reserved.publish(descriptor, None)
     }
@@ -100,10 +102,10 @@ impl DescriptorFactory {
         if family != 1 {
             return Err(Errno(97));
         }
-        Self::local_parameters(kind, protocol)?;
+        let socket_type = Self::local_parameters(kind, protocol)?;
         let reserved = self.files.reserve_pair()?;
-        let a = self.new_local(kind & 0xf)?;
-        let b = self.new_local(kind & 0xf)?;
+        let a = self.new_local(socket_type)?;
+        let b = self.new_local(socket_type)?;
         ipc::LocalResource::pair(&a, &b);
         let descriptors =
             [a, b].map(|socket| Vfs::local_description(self.open_id(), self.owner, socket, kind));

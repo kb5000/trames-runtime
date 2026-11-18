@@ -52,6 +52,7 @@ impl LocalConnection {
         self.client.credentials.set(self.identity);
         *accepted.name.borrow_mut() = peer.name.borrow().clone();
         *accepted.timeouts.borrow_mut() = *peer.timeouts.borrow();
+        accepted.linger.set(peer.linger.get());
         accepted.set_reuse(16, peer.reuse(16))?;
         let timestamp = peer.timestamp.load(Ordering::Relaxed);
         if timestamp != 0 {
@@ -71,7 +72,7 @@ impl LocalConnection {
 }
 impl LocalResource {
     fn check_connect(&self) -> Result<()> {
-        if self.connected() {
+        if self.connected() && !self.addressed_datagram() {
             return Err(Errno(106));
         }
         if self.listening() {
@@ -222,14 +223,17 @@ impl DescriptorFactory {
         prepare: impl FnOnce(&mut C, usize) -> Result<P>,
         output: impl FnOnce(&mut C, P, &[u8]) -> Result<()>,
     ) -> Result<(u32, Vec<u8>)> {
+        if flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
+            return Err(Errno(22));
+        }
+        if socket.kind == 2 {
+            return Err(Errno(95));
+        }
         let mut listener = socket.listener.borrow_mut();
         let pending = &mut listener.as_mut().ok_or(Errno(22))?.pending;
         let front = pending.front().ok_or(Errno(11))?;
         let name = front.peer_name.borrow().clone();
         let prepared = prepare(context, name.len())?;
-        if flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
-            return Err(Errno(22));
-        }
         let reserved = self.files.reserve()?;
         let accepted = pending.pop_front().expect("selected accepted endpoint");
         socket.listen_epoch.fetch_add(1, Ordering::Relaxed);

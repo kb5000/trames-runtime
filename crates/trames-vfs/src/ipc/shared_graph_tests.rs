@@ -50,6 +50,7 @@ fn owning_rights_include_unaccepted_listener_children_without_a_connect_graph_lo
     drop(server);
     v.close(listener).unwrap();
     assert!(pending.upgrade().is_none());
+    assert_eq!(v.read(client, 1), Err(Errno(104)));
     assert_eq!(v.read(client, 1).unwrap(), b"");
 }
 

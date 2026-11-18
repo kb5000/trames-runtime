@@ -33,7 +33,7 @@ impl Linux {
                 .expect("Unix address ABI"),
             207 if socket.kind() == 1 => local::recv(a, memory, |count| {
                 socket
-                    .recv(count, a[3] as u32 | nonblocking)
+                    .recv_message(count, a[3] as u32 | nonblocking)
                     .map(|r| r.data)
             }),
             63..=66 | 206 | 207 => packet_transfer(
@@ -142,6 +142,17 @@ pub(crate) fn control(
                 socket.set_io_timeout(matches!(a[2], 20 | 66), timeout_option(memory, a)?);
                 return Ok(0);
             }
+            if a[2] == 13 {
+                if (a[4] as u32) < 8 || a[4] as u32 > i32::MAX as u32 {
+                    return Err(Errno(22));
+                }
+                let value = memory.read_array::<8>(a[3]).map_err(|_| Errno(14))?;
+                socket.set_linger([
+                    u32::from_le_bytes(value[..4].try_into().unwrap()),
+                    u32::from_le_bytes(value[4..].try_into().unwrap()),
+                ]);
+                return Ok(0);
+            }
             if (a[4] as u32) < 4 || a[4] as u32 > i32::MAX as u32 {
                 return Err(Errno(22));
             }
@@ -158,6 +169,18 @@ pub(crate) fn control(
         209 => {
             if a[1] != 1 {
                 return Err(Errno(92));
+            }
+            if a[2] == 4 {
+                return read_option(memory, a, || Ok(socket.take_error().to_le_bytes()));
+            }
+            if a[2] == 13 {
+                return read_option(memory, a, || {
+                    let [enabled, seconds] = socket.linger();
+                    let mut bytes = [0; 8];
+                    bytes[..4].copy_from_slice(&enabled.to_le_bytes());
+                    bytes[4..].copy_from_slice(&seconds.to_le_bytes());
+                    Ok(bytes)
+                });
             }
             if matches!(a[2], 20 | 21 | 66 | 67) {
                 return read_option(memory, a, || {
@@ -185,7 +208,6 @@ pub(crate) fn control(
             let value: u32 = match a[2] {
                 2 | 15 | 16 | 29 | 35 | 63 | 64 => socket.reuse(a[2] as u32),
                 3 => socket.kind(),
-                4 => 0,
                 7 | 8 => socket.buffer_size(a[2] == 8) as u32,
                 30 => u32::from(socket.listening()),
                 38 => 0,
@@ -734,6 +756,71 @@ impl Message {
 mod tests {
     use super::*;
     use trames_memory::{Permissions, PAGE_SIZE};
+
+    #[test]
+    fn unix_linger_and_pending_error_share_the_original_owner_and_worker_control_abi() {
+        for worker in [false, true] {
+            let call = |vfs: &mut trames_vfs::Vfs, n: u64, a: [u64; 6], m: &mut Memory| {
+                if worker {
+                    let direct = crate::DirectSyscalls::new(vfs.direct_descriptors())
+                        .with_resources(vfs.descriptor_factory());
+                    if n == 212 {
+                        direct.invoke(n as u32, a, m)
+                    } else {
+                        direct.invoke_socket_control(n as u32, a, m)
+                    }
+                    .expect("Unix control worker")
+                } else {
+                    Linux::network_vfs(vfs, n, a, m)
+                }
+            };
+            let mut v = trames_vfs::Vfs::default();
+            let [tx, rx] = v.socketpair(1, 1, 0).unwrap();
+            let mut m = Memory::default();
+            m.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+            let linger = [1, 0, 0, 0, 5, 0, 0, 0];
+            m.write(0x1000, &linger).unwrap();
+            assert_eq!(
+                call(&mut v, 208, [tx as u64, 1, 13, 0x1000, 7, 0], &mut m),
+                Err(Errno(22))
+            );
+            assert_eq!(
+                call(&mut v, 208, [tx as u64, 1, 13, 0x1000, 8, 0], &mut m),
+                Ok(0)
+            );
+            m.write_array(0x1100, 8u32.to_le_bytes()).unwrap();
+            assert_eq!(
+                call(&mut v, 209, [tx as u64, 1, 13, 0x1200, 0x1100, 0], &mut m),
+                Ok(0)
+            );
+            assert_eq!(m.read_array::<8>(0x1200).unwrap(), linger);
+            v.write(tx, b"unread").unwrap();
+            v.close(rx).unwrap();
+            m.write_array(0x1100, 4u32.to_le_bytes()).unwrap();
+            assert_eq!(
+                call(&mut v, 209, [tx as u64, 1, 4, 0xdead, 0x1100, 0], &mut m),
+                Err(Errno(14))
+            );
+            assert_eq!(
+                call(&mut v, 209, [tx as u64, 1, 4, 0x1200, 0x1100, 0], &mut m),
+                Ok(0)
+            );
+            assert_eq!(m.read_array::<4>(0x1200).unwrap(), 104u32.to_le_bytes());
+            assert_eq!(
+                call(&mut v, 209, [tx as u64, 1, 4, 0x1200, 0x1100, 0], &mut m),
+                Ok(0)
+            );
+            assert_eq!(m.read_array::<4>(0x1200).unwrap(), 0u32.to_le_bytes());
+            // recvmsg(0), including the no-control fast path, waits on empty
+            // live sockets rather than reporting an EOF that never happened.
+            let [a, _b] = v.socketpair(1, 1, 0).unwrap();
+            m.write(0x1300, &[0; 56]).unwrap();
+            assert_eq!(
+                call(&mut v, 212, [a as u64, 0x1300, 0x40, 0, 0, 0], &mut m),
+                Err(Errno(11))
+            );
+        }
+    }
 
     #[test]
     fn null_control_and_zero_length_messages_preserve_original_rights_and_payload_boundaries() {
