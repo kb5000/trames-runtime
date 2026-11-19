@@ -994,7 +994,7 @@ impl DirectSyscalls {
         std::mem::swap(&mut *self.scratch.borrow_mut(), buffer);
     }
     pub fn supports_call(&self, number: u32, args: [u64; 6]) -> bool {
-        if matches!(number, 186..=193) {
+        if matches!(number, 186..=195) {
             return self.resources.is_some();
         }
         if matches!(number, 28 | 86 | 87) && self.paths.is_some() {
@@ -1466,7 +1466,7 @@ impl DirectSyscalls {
         if matches!(number, 25 | 28 | 32) {
             self.record_fd_control();
         }
-        if matches!(number, 25 | 32 | 116 | 186..=193) {
+        if matches!(number, 25 | 32 | 116 | 186..=195) {
             return IoAttempt::Complete(result);
         }
         if crate::event_wait(number) {
@@ -1534,6 +1534,10 @@ impl DirectSyscalls {
         target: &Weak<dyn IoWake>,
         saved_deadline: Option<Instant>,
     ) -> Option<IoAttempt> {
+        if matches!(number, 194 | 195) {
+            let result = crate::shm::control(self.resources.as_ref()?, number, args, memory, pid);
+            return Some(self.complete(number, args, result));
+        }
         if matches!(number, 186..=193) {
             return self.start_message(number, args, memory, pid, target);
         }

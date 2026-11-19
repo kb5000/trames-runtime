@@ -367,7 +367,7 @@ impl Birth {
         let memory = if shared_vm {
             p.memory.share()
         } else {
-            p.memory.try_fork().map_err(|_| Errno(11))?
+            p.memory.try_fork_for(id).map_err(|_| Errno(11))?
         };
         let mut child = p.fork_state(
             memory,

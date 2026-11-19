@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Sparse, bounded guest address spaces. Guest addresses are never host pointers.
 mod anonymous;
+mod attachments;
 mod backing;
+pub use attachments::SegmentAttachment;
+pub use backing::SharedAnonymousPages;
 mod cpu_memory;
 mod hardware;
 pub use hardware::{HardwarePageInfo, HardwareWriteFrame};
@@ -252,6 +255,7 @@ pub struct Memory {
     pages: BTreeMap<u64, usize>,
     // Anonymous PROT_NONE ranges own virtual addresses, without resident pages.
     reservations: BTreeMap<u64, u64>,
+    attachments: attachments::Mappings,
     vma_policy: vma_policy::Policy,
     locks: locking::Locks,
     future_lock: Option<bool>,
@@ -302,9 +306,12 @@ impl Memory {
     /// from the shared total. A failed charge drops all tentative child owners
     /// and leaves the parent's translation/epoch state intact.
     pub fn try_fork(&self) -> Result<Self, MemoryError> {
+        self.try_fork_for(0)
+    }
+    pub fn try_fork_for(&self, pid: u32) -> Result<Self, MemoryError> {
         // fork always takes a COW snapshot, including when its parent has threads.
         if let Some(shared) = &self.shared {
-            return shared.borrow().try_fork();
+            return shared.borrow().try_fork_for(pid);
         }
         // Retained guarded Views require an isolated child copy, not parent
         // COW aliases. Keep the parent's unchanged snapshot/dirty journal and
@@ -384,6 +391,7 @@ impl Memory {
             parallel_anonymous_changes: Vec::new(),
             anonymous_retired: Vec::new(),
             reservations: self.reservations.clone(),
+            attachments: Default::default(),
             vma_policy: self.vma_policy.clone(),
             locks: Default::default(),
             future_lock: None,
@@ -447,6 +455,7 @@ impl Memory {
             cloned.insert_owned_page(base, page);
         }
         cloned.apply_fork_policy(&self.vma_policy)?;
+        cloned.attachments = self.attachments.fork(&self.vma_policy.nofork, pid);
         // Commit only after every child charge succeeded. No tentative child
         // can execute while it shares a still-writable parent CPU alias.
         self.invalidate_translations();
@@ -537,6 +546,7 @@ impl Memory {
             mmu: mmu::Arena::default(),
             pages: BTreeMap::new(),
             reservations: BTreeMap::new(),
+            attachments: Default::default(),
             vma_policy: Default::default(),
             locks: Default::default(),
             future_lock: None,
@@ -936,6 +946,7 @@ impl Memory {
         }
         let end = Self::mapping_end(address, len)?;
         self.remove_reservations(address, end)?;
+        self.attachments.remove(address, end);
         self.vma_policy.remove(address, end);
         self.locks.remove(address, end);
         self.invalidate_proc_reads(address, end);
@@ -1044,6 +1055,7 @@ impl Memory {
         }
         let end = Self::mapping_end(address, len)?;
         self.check_mapped_range(address, end)?;
+        self.attachments.check_protect(address, end, permissions)?;
         for (&base, &frame) in self.pages.range(address..end) {
             let p = self.frames[frame].as_ref().expect("page");
             if permissions.execute && p.backing.as_ref().is_some_and(|b| !b.object.executable()) {

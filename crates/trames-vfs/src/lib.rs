@@ -17,6 +17,7 @@ mod path_queries;
 mod sysv_ipc;
 pub mod sysv_message;
 pub mod sysv_semaphore;
+pub mod sysv_shm;
 pub use path_queries::PathQueries;
 mod fs_data;
 #[cfg(all(feature = "hostfs", unix))]

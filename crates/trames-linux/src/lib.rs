@@ -54,6 +54,7 @@ pub use pty::{
     pty_control, pty_control_request, terminal_control, terminal_query, terminal_query_request,
 };
 mod record_locks;
+mod shm;
 mod state;
 mod syslog;
 mod system_info;

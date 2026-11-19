@@ -494,7 +494,9 @@ impl Memory {
         Self::mapping_end(new, new_len)?;
         let policy = self.vma_policy.moved(old, old_len, new, new_len);
         let moved_locks = self.locks.moved(old, old_len, new, new_len);
+        let moved = self.attachments.moved(old, old_len, new, new_len);
         self.remap_inner(old, old_len, new, new_len, fixed)?;
+        self.attachments.0.extend(moved);
         self.locks
             .finish_move(old, old_len, new, new_len, moved_locks);
         self.vma_policy.remove(old, old + old_len);
@@ -654,12 +656,18 @@ impl Memory {
                 page.bytes = Arc::new(PageBytes::Zero);
                 page.charge = Charge::new(&self.account);
                 if let Some(b) = &mut page.backing {
-                    b.object = last
-                        .backing
-                        .as_ref()
-                        .expect("backed")
-                        .object
-                        .next_page((i + 1 - original_count) as u64)?;
+                    b.object = if let Some(expected) = self
+                        .attachments
+                        .extension(old_end, (i + 1 - original_count) as u64)
+                    {
+                        expected?
+                    } else {
+                        last.backing
+                            .as_ref()
+                            .expect("backed")
+                            .object
+                            .next_page((i + 1 - original_count) as u64)?
+                    };
                     b.private_copy = false;
                 }
                 pages.push(page);
@@ -693,12 +701,43 @@ struct AnonymousPage {
     identity: u64,
 }
 impl AnonymousPage {
-    fn allocate() -> Arc<dyn PageBacking> {
+    fn new() -> Arc<Self> {
         Arc::new(Self {
             bytes: std::sync::Arc::new(SharedPage::zero()),
             revision: AtomicU64::new(0),
             identity: new_backing_identity(),
         })
+    }
+}
+/// A named segment shares the ordinary anonymous page provider across independent
+/// attachments, and retains modified pages between detach and reattach.
+#[derive(Default)]
+pub struct SharedAnonymousPages(std::sync::Mutex<Vec<Arc<AnonymousPage>>>);
+impl SharedAnonymousPages {
+    pub fn mapping(&self, count: usize) -> Vec<Arc<dyn PageBacking>> {
+        let mut pages = self.0.lock().unwrap();
+        if pages.len() < count {
+            pages.resize_with(count, AnonymousPage::new);
+        }
+        pages[..count]
+            .iter()
+            .map(|p| p.clone() as Arc<dyn PageBacking>)
+            .collect()
+    }
+    pub fn page(&self, index: usize) -> Option<Arc<dyn PageBacking>> {
+        self.0
+            .lock()
+            .unwrap()
+            .get(index)
+            .map(|p| p.clone() as Arc<dyn PageBacking>)
+    }
+    pub fn resident_pages(&self) -> u64 {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| !p.bytes.unmaterialized_zero())
+            .count() as u64
     }
 }
 struct RetainedPageSource(std::sync::Arc<SharedPage>);
@@ -788,7 +827,7 @@ impl PageBacking for AnonymousPage {
         true
     }
     fn next_page(&self, _: u64) -> Result<Arc<dyn PageBacking>, MemoryError> {
-        Ok(Self::allocate())
+        Ok(Self::new())
     }
 }
 impl Memory {
@@ -802,7 +841,7 @@ impl Memory {
         Self::mapping_end(address, len)?;
         self.check_backed_mapping(address, len, fixed)?;
         let objects = (0..len / PAGE_SIZE)
-            .map(|_| AnonymousPage::allocate())
+            .map(|_| AnonymousPage::new() as Arc<dyn PageBacking>)
             .collect();
         self.map_backed(address, objects, true, permissions, fixed)
     }

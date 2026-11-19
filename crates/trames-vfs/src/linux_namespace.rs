@@ -50,6 +50,7 @@ impl Drop for RootNetwork {
 }
 pub(super) struct IpcNamespace {
     pub messages: crate::sysv_message::Messages,
+    pub shm: crate::sysv_shm::Segments,
     pub semaphores: crate::sysv_semaphore::Semaphores,
     pub(super) user_namespace: UserNamespace,
     inode: u64,
@@ -61,6 +62,7 @@ impl Default for IpcNamespace {
         Self {
             messages: Default::default(),
             semaphores: Default::default(),
+            shm: Default::default(),
             user_namespace: UserNamespace::default(),
             inode: NEXT_INODE.fetch_add(1, Ordering::Relaxed),
             mqueue: Default::default(),
@@ -454,6 +456,7 @@ impl Vfs {
         self.ipc_namespace = Arc::new(IpcNamespace {
             messages: Default::default(),
             semaphores: Default::default(),
+            shm: Default::default(),
             user_namespace: self.credentials.user_namespace.clone(),
             inode,
             mqueue: Default::default(),

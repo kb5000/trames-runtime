@@ -13,6 +13,8 @@ pub(crate) enum Call {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Memory {
+    Attach,
+    Detach,
     Break,
     Unmap,
     Remap,
@@ -26,6 +28,8 @@ pub(crate) enum Memory {
 impl Call {
     pub fn decode(number: u32, args: [u64; 6]) -> Option<Self> {
         Some(match number {
+            196 => Self::Memory(Memory::Attach),
+            197 => Self::Memory(Memory::Detach),
             214 => Self::Memory(Memory::Break),
             215 => Self::Memory(Memory::Unmap),
             216 => Self::Memory(Memory::Remap),
@@ -80,6 +84,8 @@ impl Call {
 impl Memory {
     pub fn number(self) -> u32 {
         match self {
+            Self::Attach => 196,
+            Self::Detach => 197,
             Self::Break => 214,
             Self::Unmap => 215,
             Self::Remap => 216,
@@ -94,9 +100,9 @@ impl Memory {
     pub fn index(self) -> usize {
         match self {
             Self::Break => 0,
-            Self::Unmap => 1,
+            Self::Detach | Self::Unmap => 1,
             Self::Remap => 2,
-            Self::Map => 3,
+            Self::Attach | Self::Map => 3,
             Self::Protect => 4,
             Self::Lock { .. } => 9,
             Self::Residency => 5,

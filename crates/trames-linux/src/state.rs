@@ -872,6 +872,68 @@ impl Linux {
     fn mmap(&mut self, a: [u64; 6], memory: &mut Memory) -> Result<u64> {
         self.mmap_impl(a, memory, false)
     }
+    fn attach_shm(&mut self, a: [u64; 6], memory: &mut Memory) -> Result<u64> {
+        let flags = a[2] as u32;
+        let fixed = flags & 0o40000 != 0;
+        let mut address = a[1];
+        if flags & 0o20000 != 0 {
+            address &= !(PAGE_SIZE - 1);
+        }
+        if !address.is_multiple_of(PAGE_SIZE)
+            || (fixed && address == 0)
+            || (a[1] != 0 && address == 0)
+        {
+            return Err(Errno(22));
+        }
+        let write = flags & 0o10000 == 0;
+        let execute = flags & 0o100000 != 0;
+        let factory = self.vfs.descriptor_factory();
+        let pid = crate::shm::actor(&factory, self.vfs.process_context());
+        let segment = factory.shm_attach(
+            a[0] as u32,
+            4 | (u32::from(write) << 1) | u32::from(execute),
+            pid,
+        )?;
+        let len = Self::page_length(segment.size()).map_err(|_| Errno(12))?;
+        if address != 0 && !fixed && !memory.is_free(address, len) {
+            return Err(Errno(22));
+        }
+        let prot = 1 | (u64::from(write) << 1) | (u64::from(execute) << 2);
+        let plan = self.prepare_mmap(
+            [
+                address,
+                len,
+                prot,
+                0x21 | if address != 0 { 0x10 } else { 0 },
+                0,
+                0,
+            ],
+            memory,
+        )?;
+        let address = plan.address;
+        let lock = self.admit_locked_mapping(memory, address, len, false)?;
+        memory
+            .map_backed(address, segment.pages(), true, plan.permissions, fixed)
+            .map_err(Self::memory_errno)?;
+        let segment = segment.commit();
+        memory.track_attachment(
+            address,
+            len,
+            Permissions {
+                read: true,
+                write,
+                execute: true,
+            },
+            segment,
+        );
+        if let Some(on_fault) = lock {
+            let _ = memory.set_range_lock(address, len, Some(on_fault));
+        }
+        if plan.advance_cursor {
+            self.heap.set_cursor(address + len)
+        }
+        Ok(address)
+    }
     fn mmap_impl(&mut self, a: [u64; 6], memory: &mut Memory, live: bool) -> Result<u64> {
         let plan = if let Some(pending) = self.mmap_pending.take() {
             assert_eq!(pending.args, a, "original accepted mmap");
@@ -1281,6 +1343,16 @@ impl Linux {
                     }
                 }),
             427 => self.uring_register(a, memory),
+            194..=195 => crate::shm::control(
+                &self.vfs.descriptor_factory(), number as u32, a, memory, self.vfs.process_context(),
+            ),
+            196 => self.attach_shm(a, memory),
+            197 => {
+                let group = self.vfs.local_sender_credentials()[0];
+                let pid = if group == 0 { self.vfs.process_context() } else { group };
+                memory.detach_segment(a[0], pid).map_err(Self::memory_errno)?;
+                Ok(0)
+            },
             186..=193 => crate::direct::message::call(&self.vfs.descriptor_factory(), number as u32, a, memory, self.vfs.process_context()),
             280 => self.bpf_syscall(a, memory),
             number @ 160..=162 => {
