@@ -40,6 +40,7 @@ impl SignalMask {
     }
 }
 pub(super) enum SharedControl {
+    MessageQueue(Arc<posix_mq::Queue>),
     Tun(Arc<trames_net::tun::Connection>, UserNamespace),
     Sync(Arc<sync_file::File>),
     Binder(Arc<binder::Connection>),
@@ -73,7 +74,9 @@ impl SharedControl {
                 }
                 Anonymous::Sync(file.clone())
             }
-            Self::Tun(..) | Self::Cgroup(_) | Self::Binder(_) => return None,
+            Self::MessageQueue(_) | Self::Tun(..) | Self::Cgroup(_) | Self::Binder(_) => {
+                return None
+            }
             Self::Uring(ring) => Anonymous::Uring(ring.clone()),
             Self::Signal(mask) => Anonymous::Signal(mask.clone()),
             Self::Bpf(program) => Anonymous::Bpf(program.clone()),
@@ -321,6 +324,9 @@ impl Vfs {
         Self::poll_epoch_with(o, None)
     }
     fn poll_epoch_with(o: &OpenDescription, reader: Option<&Arc<dyn SignalReader>>) -> [u64; 2] {
+        if let Some(SharedControl::MessageQueue(q)) = &o.control {
+            return q.poll(0).1;
+        }
         if let Some(SharedControl::Tun(file, _)) = &o.control {
             return file.poll(0).1;
         }
@@ -640,6 +646,24 @@ pub(super) fn anonymous_descriptor(id: u64, flags: u32, anonymous: Anonymous) ->
     } else {
         2
     };
+    let control = SharedControl::capture(&anonymous);
+    resource_descriptor(
+        id,
+        access | flags & (O_NONBLOCK | O_CLOEXEC),
+        FdKind::Anonymous,
+        None,
+        control,
+        Some(anonymous),
+    )
+}
+pub(super) fn resource_descriptor(
+    id: u64,
+    flags: u32,
+    kind: FdKind,
+    node: Option<NodeRef>,
+    control: Option<SharedControl>,
+    anonymous: Option<Anonymous>,
+) -> Descriptor {
     let descriptor = Descriptor {
         open: OpenHandle::new(OpenDescription {
             shared: Arc::new(SharedOpenDescription {
@@ -660,16 +684,16 @@ pub(super) fn anonymous_descriptor(id: u64, flags: u32, anonymous: Anonymous) ->
                 file_authority: Default::default(),
                 tcp_publication: Default::default(),
                 socket_control: None,
-                control: SharedControl::capture(&anonymous),
+                control,
                 read_node: None,
                 id,
                 owner: (0, 0),
-                kind: FdKind::Anonymous,
-                flags: (access | (flags & O_NONBLOCK)).into(),
+                kind,
+                flags: (flags & !O_CLOEXEC).into(),
                 file_position: Arc::default(),
                 flock: std::sync::OnceLock::new(),
                 ofd_records: Default::default(),
-                node: None,
+                node,
                 pipe: None,
                 pty: None,
                 local: None,
@@ -677,7 +701,7 @@ pub(super) fn anonymous_descriptor(id: u64, flags: u32, anonymous: Anonymous) ->
                 kernel_log: None,
                 notification: None,
             }),
-            anonymous: Some(anonymous),
+            anonymous,
 
             namespace: None,
             mount: None,

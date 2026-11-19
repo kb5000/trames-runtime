@@ -1281,78 +1281,29 @@ impl Vfs {
                         (flags & ATTRS) | if readonly { MS_RDONLY } else { 0 },
                     )
                 }
-                b"mqueue" if self.ipc_namespace.mqueue.get().is_some() => {
+                b"mqueue" => {
                     if data.is_some_and(|d| !d.is_empty()) {
                         return Err(Errno(95));
                     }
-                    let fs = self.ipc_namespace.mqueue.get().unwrap().clone();
+                    let fs = self.mqueue_fs()?;
                     let root = fs.borrow().paths[b"/".as_slice()].clone();
                     (fs, root, b"/".to_vec(), Kind::Mqueue, flags & ATTRS)
                 }
-                b"tmpfs" | b"mqueue" => {
-                    let mqueue = kind == Some(b"mqueue");
-                    let (limit, nodes, mode, uid, gid) = if mqueue {
-                        if data.is_some_and(|d| !d.is_empty()) {
-                            return Err(Errno(95));
-                        }
-                        (0, 1, 0o1777, None, None)
-                    } else {
-                        tmpfs_options(
-                            data.unwrap_or_default(),
-                            self.pseudo.borrow().runtime.memory_limit as u64,
-                        )?
-                    };
-                    let id = new_mount_id()?;
-                    let inode = id << 32;
-                    let root = Arc::new(Inode::new(Node {
-                        identity: 0,
-                        record_locks: std::sync::OnceLock::new(),
-                        whole_locks: std::sync::OnceLock::new(),
-                        notifications: inotify::Marks::default(),
-                        path_hint: SharedCell::default(),
-                        device: id,
-                        content: Content::Directory,
-                        mode: 0o40000 | mode,
-                        uid: uid.unwrap_or(self.credentials.fsuid),
-                        gid: gid.unwrap_or(self.credentials.fsgid),
-                        volatile: false,
-                        inode,
-                        links: 1,
-                        times: [storage::Timestamp::now(); 3],
-                        xattrs: BTreeMap::new(),
-                        seals: None,
-                    }));
-                    let fs = FsHandle::with_page_accounting(
-                        Filesystem {
-                            shared_budget: trames_shared::SharedBudget::new(
-                                memfd::MEMFD_BYTES as usize,
-                            ),
-                            paths: BTreeMap::from([(b"/".to_vec(), root.clone())]),
-                            inodes: vec![Arc::downgrade(&root)],
-                            next_inode: inode + 1,
-                            limits: StorageLimits {
-                                file_bytes: limit,
-                                nodes,
-                            },
-                            disk: None,
-                            volume: None,
-                        },
-                        !mqueue,
-                    );
-                    let (fs, root) = if mqueue {
-                        let shared = self.ipc_namespace.mqueue.get_or_init(|| fs).clone();
-                        let root = shared.borrow().paths[b"/".as_slice()].clone();
-                        (shared, root)
-                    } else {
-                        (fs, root)
-                    };
-                    (
-                        fs,
-                        root,
-                        b"/".to_vec(),
-                        if mqueue { Kind::Mqueue } else { Kind::Tmpfs },
-                        flags & ATTRS,
-                    )
+                b"tmpfs" => {
+                    let (limit, nodes, mode, uid, gid) = tmpfs_options(
+                        data.unwrap_or_default(),
+                        self.pseudo.borrow().runtime.memory_limit as u64,
+                    )?;
+                    let fs = ram_filesystem(
+                        limit,
+                        nodes,
+                        mode,
+                        uid.unwrap_or(self.credentials.fsuid),
+                        gid.unwrap_or(self.credentials.fsgid),
+                        true,
+                    )?;
+                    let root = fs.borrow().paths[b"/".as_slice()].clone();
+                    (fs, root, b"/".to_vec(), Kind::Tmpfs, flags & ATTRS)
                 }
                 b"cgroup2" => {
                     if data.is_some_and(|d| !d.is_empty()) {
@@ -1623,6 +1574,52 @@ impl Vfs {
         self.pseudo_children(path)
     }
 }
+pub(super) fn ram_filesystem(
+    limit: u64,
+    nodes: usize,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    tmpfs: bool,
+) -> Result<FsHandle> {
+    let id = new_mount_id()?;
+    let inode = id << 32;
+    let root = Arc::new(Inode::new(Node {
+        identity: 0,
+        record_locks: std::sync::OnceLock::new(),
+        whole_locks: std::sync::OnceLock::new(),
+        notifications: inotify::Marks::default(),
+        path_hint: SharedCell::default(),
+        device: id,
+        content: Content::Directory,
+        mode: 0o40000 | mode,
+        uid,
+        gid,
+        volatile: false,
+        inode,
+        links: 1,
+        times: [storage::Timestamp::now(); 3],
+        xattrs: BTreeMap::new(),
+        seals: None,
+    }));
+    let fs = FsHandle::with_page_accounting(
+        Filesystem {
+            shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
+            paths: BTreeMap::from([(b"/".to_vec(), root.clone())]),
+            inodes: vec![Arc::downgrade(&root)],
+            next_inode: inode + 1,
+            limits: StorageLimits {
+                file_bytes: limit,
+                nodes,
+            },
+            disk: None,
+            volume: None,
+        },
+        tmpfs,
+    );
+    Ok(fs)
+}
+
 pub(super) fn new_mount_id() -> Result<u64> {
     NEXT_MOUNT
         .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {

@@ -3,6 +3,13 @@
 use super::*;
 
 pub enum NamespaceCall {
+    MqOpen {
+        name: Vec<u8>,
+        flags: u32,
+        mode: u32,
+        attr: Option<[i64; 2]>,
+    },
+    MqUnlink(Vec<u8>),
     Memfd(MemfdParameters),
     Mount {
         source: Option<Vec<u8>>,
@@ -100,7 +107,7 @@ pub enum NamespaceCall {
 impl NamespaceCall {
     fn paths(&self) -> Vec<(i32, Option<&[u8]>, bool)> {
         match self {
-            Self::Memfd(_) => Vec::new(),
+            Self::Memfd(_) | Self::MqOpen { .. } | Self::MqUnlink(_) => Vec::new(),
             Self::Mount {
                 source,
                 target,
@@ -187,6 +194,17 @@ impl NamespaceCall {
     }
     pub fn execute(&self, v: &mut Vfs) -> Result<FileValue> {
         match self {
+            Self::MqOpen {
+                name,
+                flags,
+                mode,
+                attr,
+            } => {
+                return v
+                    .mq_open(name, *flags, *mode, *attr)
+                    .map(|fd| FileValue::Count(fd.into()))
+            }
+            Self::MqUnlink(name) => v.mq_unlink(name)?,
             Self::Memfd(parameters) => {
                 return parameters.create(v).map(|fd| FileValue::Count(fd as u64))
             }

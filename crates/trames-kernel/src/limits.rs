@@ -10,7 +10,7 @@ use trames_vfs::{
 };
 type Pair = (u64, u64);
 pub struct Limits {
-    values: Mutex<[Pair; 7]>, // FSIZE, CORE, NOFILE, NICE, DATA, AS, MEMLOCK.
+    values: Mutex<[Pair; 8]>, // FSIZE, CORE, NOFILE, NICE, DATA, AS, MEMLOCK, MSGQUEUE.
     file_size: FileSizeLimit,
     nofile: DescriptorLimit,
     nr_open: trames_vfs::DescriptorCeiling,
@@ -33,6 +33,10 @@ impl Limits {
                     vfs.memory_resource_limits().locked(),
                     vfs.memory_resource_limits().locked(),
                 ),
+                (
+                    vfs.memory_resource_limits().message_queue(),
+                    trames_vfs::posix_mq::DEFAULT_BYTES,
+                ),
             ]),
             file_size: vfs.file_size_limit_handle(),
             nofile: vfs.descriptor_limit_handle(),
@@ -43,7 +47,7 @@ impl Limits {
     pub fn fork(&self, vfs: &Vfs) -> Arc<Self> {
         let values = *self.values.lock().unwrap();
         let child = Self::new(vfs);
-        for (resource, value) in [1, 4, 7, 13, 2, 9, 8].into_iter().zip(values) {
+        for (resource, value) in [1, 4, 7, 13, 2, 9, 8, 12].into_iter().zip(values) {
             child.set(resource, value);
         }
         child
@@ -68,7 +72,7 @@ impl Limits {
         match resource {
             1 => self.file_size.set(soft),
             7 => self.nofile.set(soft as u32),
-            2 | 8 | 9 => self.vm.set(resource, soft),
+            2 | 8 | 9 | 12 => self.vm.set(resource, soft),
             _ => {}
         }
     }
@@ -119,7 +123,7 @@ impl Limits {
             trames_vfs::MutableLimits::index(resource).map_or((ceiling, ceiling), |i| values[i]);
         if let Some(value) = next {
             if value.1 > previous.1 && !privileged
-                || !matches!(resource, 1 | 2 | 4 | 9) && value.1 > ceiling
+                || !matches!(resource, 1 | 2 | 4 | 9 | 12) && value.1 > ceiling
             {
                 return Err(Errno(1));
             }

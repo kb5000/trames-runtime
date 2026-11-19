@@ -205,15 +205,17 @@ impl StatusFlags {
         Ok(())
     }
     pub(super) fn nonblocking(&self, enabled: bool) -> Result<()> {
+        self.swap_nonblocking(enabled).map(drop)
+    }
+    pub(super) fn swap_nonblocking(&self, enabled: bool) -> Result<u32> {
         if self.fixed & O_PATH != 0 {
             return Err(Errno(9));
         }
-        if enabled {
-            self.mutable.bits.fetch_or(O_NONBLOCK, Ordering::Relaxed);
+        Ok(if enabled {
+            self.mutable.bits.fetch_or(O_NONBLOCK, Ordering::Relaxed)
         } else {
-            self.mutable.bits.fetch_and(!O_NONBLOCK, Ordering::Relaxed);
-        }
-        Ok(())
+            self.mutable.bits.fetch_and(!O_NONBLOCK, Ordering::Relaxed)
+        })
     }
 }
 

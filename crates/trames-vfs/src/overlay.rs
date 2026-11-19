@@ -743,6 +743,7 @@ impl Vfs {
                     Content::Terminal => Content::Terminal,
                     Content::Device(d) => Content::Device(*d),
                     Content::Fifo(p) => Content::Fifo(p.clone()),
+                    Content::MessageQueue(_) => return Err(Errno(95)),
                     Content::Socket(s) => Content::Socket(s.clone()),
                 };
                 let copy = Arc::new(Inode::new(Node {

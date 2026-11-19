@@ -9,6 +9,7 @@ mod tests;
 
 #[derive(Clone)]
 enum Accepted {
+    Posix(Arc<super::posix_queue::Request>),
     Message(Arc<Request>),
     Semaphore(Arc<trames_vfs::sysv_semaphore::Request>, Option<Instant>),
 }
@@ -21,6 +22,7 @@ pub struct RetainedMessage {
 impl RetainedMessage {
     fn attempt(&self, memory: &mut impl CpuMemory) -> Result<u64, Errno> {
         let reply = match &self.request {
+            Accepted::Posix(request) => return request.attempt(memory, self.args),
             Accepted::Message(request) => request.attempt()?,
             Accepted::Semaphore(request, _) => return request.attempt().map(|()| 0),
         };
@@ -39,6 +41,9 @@ impl RetainedMessage {
         }
     }
     fn waits(&self, error: Errno) -> bool {
+        if let Accepted::Posix(request) = &self.request {
+            return error.0 == 11 && !request.nonblocking();
+        }
         if let Accepted::Semaphore(request, deadline) = &self.request {
             return error.0 == 11
                 && request.waiting()
@@ -78,6 +83,15 @@ fn import(
     memory: &impl CpuMemory,
     pid: u32,
 ) -> Result<RetainedMessage, Errno> {
+    if matches!(number, 182 | 183) {
+        return Ok(RetainedMessage {
+            request: Accepted::Posix(Arc::new(super::posix_queue::Request::import(
+                factory, number, args, memory,
+            )?)),
+            number,
+            args,
+        });
+    }
     let process = factory.local_sender_credentials()[0];
     let pid = if process == 0 { pid } else { process };
     if number >= 192 {
@@ -130,7 +144,10 @@ pub(crate) fn call(
             if group == 0 { pid } else { group },
         );
     }
-    if number <= 187 {
+    if number == 185 {
+        return super::posix_queue::attributes(factory, args, memory);
+    }
+    if matches!(number, 186 | 187) {
         return control(factory, number, args, memory);
     }
     import(factory, number, args, memory, pid)?.attempt(memory)
@@ -145,7 +162,7 @@ impl DirectSyscalls {
         target: &Weak<dyn IoWake>,
     ) -> Option<IoAttempt> {
         let factory = self.resources.as_ref()?;
-        if matches!(number, 186 | 187 | 190 | 191) {
+        if matches!(number, 185 | 186 | 187 | 190 | 191) {
             return Some(self.complete(number, args, call(factory, number, args, memory, pid)));
         }
         Some(match import(factory, number, args, memory, pid) {
@@ -166,6 +183,7 @@ impl DirectSyscalls {
         }
         let signal = IoSignal::new(pid, target.clone());
         let (subscription, deadline) = match &message.request {
+            Accepted::Posix(r) => (r.file.queue.subscribe(&signal), r.deadline),
             Accepted::Message(r) => (r.subscribe(&signal), None),
             Accepted::Semaphore(r, deadline) => (r.subscribe(&signal), *deadline),
         };

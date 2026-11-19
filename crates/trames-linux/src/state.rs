@@ -1328,7 +1328,7 @@ impl Linux {
     ) -> Result<u64>;
         pub fn has_syscall;
         {
-            5..=17 | 33..=41 | 43 | 44 | 49..=55 | 88 | 276 | 279 | 452 => {
+            5..=17 | 33..=41 | 43 | 44 | 49..=55 | 88 | 180 | 181 | 276 | 279 | 452 => {
                 crate::direct::namespace::owner(number as u32, a, memory, &mut self.vfs)
             },
             92 => Self::personality(a[0]),
@@ -1353,7 +1353,7 @@ impl Linux {
                 memory.detach_segment(a[0], pid).map_err(Self::memory_errno)?;
                 Ok(0)
             },
-            186..=193 => crate::direct::message::call(&self.vfs.descriptor_factory(), number as u32, a, memory, self.vfs.process_context()),
+            182 | 183 | 185..=193 => crate::direct::message::call(&self.vfs.descriptor_factory(), number as u32, a, memory, self.vfs.process_context()),
             280 => self.bpf_syscall(a, memory),
             number @ 160..=162 => {
                 crate::uts_call(&self.vfs.uts_capability(), number as u32, a, memory)

@@ -27,13 +27,14 @@ impl FileSizeLimit {
 }
 /// Per-process Linux VM policy. Limits do not reserve or commit guest pages.
 #[derive(Clone)]
-pub struct MemoryResourceLimits(Arc<[AtomicU64; 3]>);
+pub struct MemoryResourceLimits(Arc<[AtomicU64; 4]>);
 impl Default for MemoryResourceLimits {
     fn default() -> Self {
         Self(Arc::new([
             AtomicU64::new(u64::MAX),
             AtomicU64::new(u64::MAX),
             AtomicU64::new(64 * 1024),
+            AtomicU64::new(super::posix_mq::DEFAULT_BYTES),
         ]))
     }
 }
@@ -44,6 +45,9 @@ impl MemoryResourceLimits {
     pub fn locked(&self) -> u64 {
         self.0[2].load(Ordering::Relaxed)
     }
+    pub fn message_queue(&self) -> u64 {
+        self.0[3].load(Ordering::Relaxed)
+    }
     pub fn address_space(&self) -> u64 {
         self.0[1].load(Ordering::Relaxed)
     }
@@ -52,6 +56,7 @@ impl MemoryResourceLimits {
             2 => 0,
             9 => 1,
             8 => 2,
+            12 => 3,
             _ => unreachable!("memory resource"),
         };
         self.0[index].store(value, Ordering::Relaxed);
@@ -61,6 +66,7 @@ impl MemoryResourceLimits {
             AtomicU64::new(self.data()),
             AtomicU64::new(self.address_space()),
             AtomicU64::new(self.locked()),
+            AtomicU64::new(self.message_queue()),
         ]))
     }
 }
@@ -92,7 +98,7 @@ impl DescriptorLimit {
 
 /// Current mutable pairs from one original process-limit transaction.
 #[derive(Clone, Copy, Debug)]
-pub struct MutableLimits(pub [(u64, u64); 7]);
+pub struct MutableLimits(pub [(u64, u64); 8]);
 impl MutableLimits {
     pub fn index(resource: u64) -> Option<usize> {
         match resource {
@@ -103,6 +109,7 @@ impl MutableLimits {
             2 => Some(4),
             9 => Some(5),
             8 => Some(6),
+            12 => Some(7),
             _ => None,
         }
     }
@@ -123,7 +130,8 @@ impl FixedLimits {
             0 | 1 | 8 | 10 | 15 => u64::MAX,
             2 | 5 | 9 => self.address_space,
             3 => self.stack,
-            4 | 12 | 14 => 0,
+            4 | 14 => 0,
+            12 => super::posix_mq::DEFAULT_BYTES,
             13 => 40,
             6 => self.tasks,
             7 => crate::MAX_FDS as u64,

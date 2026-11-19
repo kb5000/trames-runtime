@@ -235,6 +235,7 @@ pub trait DirectPoll: Send + Sync {
 }
 #[derive(Clone)]
 enum ByteResource {
+    MessageQueue(Arc<posix_mq::Queue>),
     Tun(Arc<trames_net::tun::Connection>),
     Console(console::ConsoleEndpoint),
     Cgroup(Arc<cgroup::CgroupFile>, Option<cgroup::CgroupAccess>),
@@ -553,6 +554,9 @@ impl DirectFd {
             }
         } else {
             match &open.control {
+                Some(events::SharedControl::MessageQueue(q)) => {
+                    ByteResource::MessageQueue(q.clone())
+                }
                 Some(events::SharedControl::Tun(file, _)) => ByteResource::Tun(file.clone()),
                 Some(events::SharedControl::Sync(file)) => {
                     ByteResource::PollOnly(file.poll_handle())
@@ -784,6 +788,7 @@ impl DirectFd {
             )],
             ByteResource::Tun(file) => file.subscribe(signal).into_iter().collect(),
             ByteResource::Mounts(watch) => vec![watch.subscribe(signal)],
+            ByteResource::MessageQueue(q) => vec![q.subscribe(signal)],
             ByteResource::Cgroup(file, _) => vec![file.subscribe(signal)],
             ByteResource::Bpf
             | ByteResource::Regular
@@ -1282,6 +1287,7 @@ impl DirectFd {
                     s.poll_epoch().unwrap_or([0; 2]),
                 )
             }),
+            ByteResource::MessageQueue(q) => q.poll(events),
             ByteResource::Tun(file) => file.poll(events),
             ByteResource::Mounts(watch) => watch.peek(events),
             ByteResource::Bpf => (0, [0; 2]),
@@ -1415,6 +1421,10 @@ impl DirectFd {
             self.check_read_access()?;
             return device.read(count);
         }
+        if let ByteResource::MessageQueue(q) = &self.resource {
+            self.check_read_access()?;
+            return Ok(q.status(offset, count));
+        }
         if let ByteResource::Cgroup(file, Some(caller)) = &self.resource {
             self.check_read_access()?;
             return file.cgroup_read(caller, offset, count)?.ok_or(Errno(19));
@@ -1442,6 +1452,9 @@ impl DirectFd {
             }
             return device.write(bytes);
         }
+        if let ByteResource::MessageQueue(_) = &self.resource {
+            return Err(Errno(if self.flags & 3 == 0 { 9 } else { 22 }));
+        }
         if let ByteResource::Cgroup(file, Some(caller)) = &self.resource {
             if self.flags & O_PATH != 0 || self.flags & 3 == 0 {
                 return Err(Errno(9));
@@ -1464,6 +1477,7 @@ impl DirectFd {
                 | ByteResource::Device(_)
                 | ByteResource::Bridge(_)
                 | ByteResource::Cgroup(..)
+                | ByteResource::MessageQueue(_)
         )
     }
     pub fn byte_seek(&self, offset: i64, whence: u32) -> Result<u64> {
@@ -1473,7 +1487,7 @@ impl DirectFd {
         match &self.resource {
             ByteResource::Kmsg(log) => log.seek(offset, whence),
             ByteResource::SimpleDevice(_) | ByteResource::Device(_) => Ok(0),
-            ByteResource::Cgroup(..) => {
+            ByteResource::Cgroup(..) | ByteResource::MessageQueue(_) => {
                 let mut position = self
                     ._file
                     .as_ref()
@@ -1483,7 +1497,15 @@ impl DirectFd {
                     .lock()
                     .unwrap();
                 let value = match whence {
-                    0 | 2 => offset as i128, // kernfs control attributes have i_size == 0
+                    0 => offset as i128,
+                    2 => {
+                        offset as i128
+                            + if matches!(self.resource, ByteResource::MessageQueue(_)) {
+                                80
+                            } else {
+                                0
+                            }
+                    }
                     1 => position.value as i128 + offset as i128,
                     _ => return Err(Errno(22)),
                 };
@@ -1552,6 +1574,9 @@ impl DirectFd {
                     })
             }
             ByteResource::Cgroup(_, None) => return None,
+            ByteResource::MessageQueue(q) => {
+                Ok(q.read(&self._file.as_ref()?.open.file_position, count))
+            }
             ByteResource::Tun(file) => file.read(count).map_err(|e| Errno(e.0)),
             ByteResource::Kmsg(log) => log.read(count),
             ByteResource::Device(device) => {
@@ -1669,6 +1694,7 @@ impl DirectFd {
                 Ok(count)
             }
             ByteResource::Cgroup(_, None) => Err(Errno(95)),
+            ByteResource::MessageQueue(_) => Err(Errno(22)),
             ByteResource::Tun(file) => file.write(bytes).map_err(|e| Errno(e.0)),
             ByteResource::Kmsg(log) => log.write(bytes),
             ByteResource::Device(device) => device.write(bytes),

@@ -14,6 +14,7 @@ mod cgroup;
 pub use cgroup::{CgroupBirth, CgroupTask};
 mod fs_context;
 mod path_queries;
+pub mod posix_mq;
 mod sysv_ipc;
 pub mod sysv_message;
 pub mod sysv_semaphore;
@@ -379,6 +380,7 @@ impl OpenDescription {
     }
 }
 enum Content {
+    MessageQueue(Arc<posix_mq::Queue>),
     Directory,
     File(storage::FileData),
     Symlink(Vec<u8>),
@@ -1299,6 +1301,9 @@ impl Vfs {
         pending: u64,
         reader: Option<&Arc<dyn SignalReader>>,
     ) -> u16 {
+        if let Some(events::SharedControl::MessageQueue(q)) = &o.control {
+            return q.poll(events).0;
+        }
         if let Some(events::SharedControl::Tun(file, _)) = &o.control {
             return if o.flags.get() & O_PATH != 0 {
                 32
@@ -2261,7 +2266,11 @@ impl Vfs {
         }
         let node = self.node(&p)?;
         self.check_remove(&p)?;
-        let is_dir = matches!(node.borrow().content, Content::Directory);
+        let (is_dir, is_queue) = match node.borrow().content {
+            Content::Directory => (true, false),
+            Content::MessageQueue(_) => (false, true),
+            _ => (false, false),
+        };
         if directory != is_dir {
             return Err(Errno(if is_dir { 21 } else { 20 }));
         }
@@ -2272,7 +2281,14 @@ impl Vfs {
                 Err(Errno(1))
             };
         }
-        self.check_parent_write(&p)?;
+        if is_queue {
+            p.writable()?;
+            if !self.allowed(&self.node(&p.parent())?.borrow(), 3) {
+                return Err(Errno(13));
+            }
+        } else {
+            self.check_parent_write(&p)?;
+        }
         let filesystem = p.filesystem(self);
         #[cfg(all(feature = "hostfs", unix))]
         if let Some(host) = &filesystem.host {
@@ -2521,7 +2537,7 @@ impl Vfs {
                     if !query.original
                         && !pty
                         && !controlling_tty
-                        && !matches!(n.content, Content::Fifo(_))
+                        && !matches!(n.content, Content::Fifo(_) | Content::MessageQueue(_))
                         && node.simple_device.is_none()
                         && !matches!(n.content, Content::Device(device) if device.source_open())
                         && !(matches!(n.content, Content::Directory)
@@ -2765,6 +2781,9 @@ impl Vfs {
         };
         let binder_control = if flags & O_PATH == 0 {
             match node.borrow().content {
+                Content::MessageQueue(ref q) => {
+                    Some(events::SharedControl::MessageQueue(q.clone()))
+                }
                 Content::Device(pseudo::Device::Tun) => Some(events::SharedControl::Tun(
                     self.network.open_tun(),
                     self.root_network.user_namespace.clone(),
@@ -3158,6 +3177,9 @@ impl Vfs {
         if o.flags.get() & O_PATH != 0 || o.flags.get() & 3 == 1 {
             return Err(Errno(9));
         }
+        if let Some(events::SharedControl::MessageQueue(q)) = &o.control {
+            return Ok(q.read(&o.file_position, count));
+        }
         if let Some(events::SharedControl::Tun(file, _)) = &o.control {
             let file = file.clone();
             drop(o);
@@ -3242,6 +3264,7 @@ impl Vfs {
         let node = o.data_node().ok_or(Errno(9))?;
         let n = node.borrow();
         let result = match &n.content {
+            Content::MessageQueue(q) => Ok(q.read(&o.file_position, count)),
             Content::File(b) => {
                 let mut position = o.file_position.lock().unwrap();
                 let out = b.read_at(position.value, count)?;
@@ -3271,6 +3294,9 @@ impl Vfs {
         }
         if o.flags.get() & 3 == 0 {
             return Err(Errno(9));
+        }
+        if let Some(events::SharedControl::MessageQueue(_)) = &o.control {
+            return Err(Errno(22));
         }
         if let Some(events::SharedControl::Tun(file, _)) = &o.control {
             let file = file.clone();
@@ -3431,6 +3457,7 @@ impl Vfs {
         let count = bytes.len().min(storage::MAX_TRANSFER);
         let bytes = &bytes[..count];
         let result = match &mut n.content {
+            Content::MessageQueue(_) => Err(Errno(22)),
             Content::Null => Ok(bytes.len()),
             Content::Device(device) => device.write(bytes),
             Content::Fifo(_) => Err(Errno(29)),
@@ -3573,6 +3600,7 @@ impl Vfs {
         let node = o.data_node().ok_or(Errno(29))?;
         let n = node.borrow();
         let result = match &n.content {
+            Content::MessageQueue(q) => Ok(q.status(offset, count)),
             Content::File(b) => b.read_at(offset, count),
             Content::Null => Ok(Vec::new()),
             Content::Device(device) => device.read(count),
@@ -3650,6 +3678,7 @@ impl Vfs {
         } else {
             match &n.content {
                 Content::File(b) => b.len(),
+                Content::MessageQueue(_) => 80,
                 Content::Directory => 0,
                 Content::Socket(_) => return Err(Errno(6)),
                 Content::Symlink(_) => return Err(Errno(40)),
@@ -3709,6 +3738,7 @@ impl Vfs {
         };
         out[32..40].copy_from_slice(&rdev.to_le_bytes());
         let size = match &node.content {
+            Content::MessageQueue(_) => 80,
             Content::File(b) if !node.volatile => b.len(),
             Content::Symlink(_) if node.volatile && node.device == 2 => 0,
             Content::Symlink(target) => target.len() as u64,

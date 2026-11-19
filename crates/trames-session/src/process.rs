@@ -2734,7 +2734,9 @@ impl<C: Cpu> Kernel<C> {
                     &Arc::downgrade(&self.byte_target),
                 ),
             )
-        } else if trames_linux::DirectSyscalls::aio_call(number) || matches!(number, 186..=193) {
+        } else if trames_linux::DirectSyscalls::aio_call(number)
+            || matches!(number, 182 | 183 | 185..=193)
+        {
             let direct = trames_linux::DirectSyscalls::new(p.linux.vfs.direct_descriptors())
                 .with_aio(p.linux.aio.clone(), p.linux.vfs.native_events())
                 .with_resources(p.linux.vfs.descriptor_factory())

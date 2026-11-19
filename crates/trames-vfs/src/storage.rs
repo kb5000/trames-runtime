@@ -741,7 +741,7 @@ impl Filesystem {
             return Ok(false);
         };
         let offset = snapshot.metadata[index].1;
-        let metadata = inode_metadata_bytes(&n);
+        let metadata = inode_metadata_bytes(&n)?;
         drop(n);
         let old: [u8; 64] = snapshot.bytes[offset..offset + 64].try_into().unwrap();
         if old == metadata {
@@ -788,7 +788,7 @@ impl Filesystem {
             let n = node.borrow();
             metadata.push((ino, out.len() + 8));
             out.extend(ino.to_le_bytes());
-            out.extend(inode_metadata_bytes(&n));
+            out.extend(inode_metadata_bytes(&n)?);
             if let Content::Symlink(target) = &n.content {
                 out.extend((target.len() as u32).to_le_bytes());
                 out.extend(target);
@@ -837,13 +837,14 @@ impl Filesystem {
         Ok(())
     }
 }
-fn inode_metadata_bytes(n: &Node) -> [u8; 64] {
+fn inode_metadata_bytes(n: &Node) -> Result<[u8; 64]> {
     let mut bytes = [0; 64];
     let metadata = n.file_metadata();
     bytes[..4].copy_from_slice(&metadata.mode.to_le_bytes());
     bytes[4..8].copy_from_slice(&n.uid.to_le_bytes());
     bytes[8..12].copy_from_slice(&n.gid.to_le_bytes());
     bytes[12] = match n.content {
+        Content::MessageQueue(_) => return Err(Errno(95)),
         Content::Directory => 0,
         Content::File(_) => 1,
         Content::Null => 2,
@@ -859,7 +860,7 @@ fn inode_metadata_bytes(n: &Node) -> [u8; 64] {
         bytes[at..at + 8].copy_from_slice(&time.seconds.to_le_bytes());
         bytes[at + 8..at + 12].copy_from_slice(&time.nanos.to_le_bytes());
     }
-    bytes
+    Ok(bytes)
 }
 struct Decoder<'a> {
     data: &'a [u8],

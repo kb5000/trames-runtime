@@ -55,6 +55,7 @@ pub(super) struct IpcNamespace {
     pub(super) user_namespace: UserNamespace,
     inode: u64,
     pub mqueue: std::sync::OnceLock<FsHandle>,
+    pub queue_accounts: Arc<posix_mq::Accounts>,
     live: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl Default for IpcNamespace {
@@ -66,6 +67,7 @@ impl Default for IpcNamespace {
             user_namespace: UserNamespace::default(),
             inode: NEXT_INODE.fetch_add(1, Ordering::Relaxed),
             mqueue: Default::default(),
+            queue_accounts: Default::default(),
             live: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
         }
     }
@@ -460,6 +462,7 @@ impl Vfs {
             user_namespace: self.credentials.user_namespace.clone(),
             inode,
             mqueue: Default::default(),
+            queue_accounts: self.ipc_namespace.queue_accounts.clone(),
             live,
         });
         Ok(())
