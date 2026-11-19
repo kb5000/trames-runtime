@@ -1027,8 +1027,17 @@ impl Linux {
         let shared = flags & 3 != 2;
         // Linux currently treats MAP_STACK as an advisory no-op. glibc uses
         // it for thread-stack reservations even when the initial prot is NONE.
-        const ALLOWED: u64 =
-            3 | 0x10 | 0x20 | 0x800 | 0x1000 | 0x2000 | 0x4000 | 0x8000 | 0x20000 | 0x100000;
+        const ALLOWED: u64 = 3
+            | 0x10
+            | 0x20
+            | 0x800
+            | 0x1000
+            | 0x2000
+            | 0x4000
+            | 0x8000
+            | 0x10000
+            | 0x20000
+            | 0x100000;
         if a[2] & !7 != 0
             || flags & !ALLOWED != 0
             || flags & 3 == 0
@@ -1180,6 +1189,10 @@ impl Linux {
         }
         if let Some(on_fault) = lock {
             let _ = memory.set_range_lock(address, len, Some(on_fault));
+        }
+        if flags & (0x8000 | 0x10000) == 0x8000 && lock != Some(false) && !reservation {
+            // MAP_POPULATE is best effort, including short file mappings.
+            let _ = memory.populate_range(address, len);
         }
         // A successful caller-chosen hint must not move the ordinary search
         // cursor. Scudo deliberately probes randomized high addresses; moving

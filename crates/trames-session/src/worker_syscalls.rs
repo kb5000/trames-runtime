@@ -754,7 +754,7 @@ impl Snapshot {
         match cpu.x(8) as u32 {
             number if trames_kernel::scheduling::call(number) => true,
             93 | 94 => self.exit_files.is_some(),
-            142 => true,
+            142 | 153 | 165 => true,
             96 => self.io_signals.thread_addresses().is_some(),
             167 => match cpu.x(0) {
                 1 | 2 => self.io_signals.parentage().is_some(),
@@ -914,6 +914,20 @@ impl Snapshot {
                 self.cpus,
                 number,
                 std::array::from_fn(|i| cpu.x(i)),
+                memory,
+            ),
+            153 => trames_kernel::usage::times(
+                &self.io_signals,
+                &self.children,
+                self.started.elapsed(),
+                cpu.x(0),
+                memory,
+            ),
+            165 => trames_kernel::usage::getrusage(
+                &self.io_signals,
+                &self.children,
+                cpu.x(0) as i32,
+                cpu.x(1),
                 memory,
             ),
             92 => trames_linux::Linux::personality(cpu.x(0)),

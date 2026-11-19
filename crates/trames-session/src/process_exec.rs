@@ -145,6 +145,10 @@ impl<C: Cpu> Kernel<C> {
         p.cpu = runtime.cpu;
         p.space.retire();
         p.space = Default::default();
+        p.signals
+            .io
+            .lifecycle()
+            .retain_image_peak(p.memory.peak_resident_bytes());
         let old_memory = std::mem::replace(&mut p.memory, runtime.memory);
         p.family.mark_exec();
         p.signals.exec();

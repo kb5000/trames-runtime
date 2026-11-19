@@ -1386,6 +1386,10 @@ impl<C: Cpu> Kernel<C> {
     #[cfg(all(test, trames_interpreter_conformance))]
     fn collect_exit_projection(&mut self, pid: u32, p: &mut Process<C>, status: i32) {
         Self::clear_exit_resources(p);
+        p.signals
+            .io
+            .lifecycle()
+            .retain_image_peak(p.memory.peak_resident_bytes());
         if p.memory.coordinator_ownership().1 == 1 {
             p.memory.retire_memory_report();
         }
@@ -1462,6 +1466,11 @@ impl<C: Cpu> Kernel<C> {
                 };
                 self.wake_futex(&thread, address, 1, u32::MAX);
                 self.close_exit_files(&mut thread);
+                thread
+                    .signals
+                    .io
+                    .lifecycle()
+                    .retain_image_peak(thread.memory.peak_resident_bytes());
                 thread.memory = Memory::default();
                 Self::release_vfork(&mut thread);
                 thread.signals.io.finish_exit(id);
@@ -2103,6 +2112,8 @@ impl<C: Cpu> Kernel<C> {
             @dynamic number if trames_kernel::scheduling::call(number) => {
                 self.scheduling(p, number, a).map(Some)
             },
+            153 => trames_kernel::usage::times(&p.signals.io, &p.children, self.started.elapsed(), a[0], &mut p.memory).map(Some),
+            165 => trames_kernel::usage::getrusage(&p.signals.io, &p.children, a[0] as i32, a[1], &mut p.memory).map(Some),
             236 => Self::mempolicy(p, a),
             142 => self.reboot_guest(pid, p, a),
             93 | 94 => {
@@ -6431,7 +6442,7 @@ mod tests {
         k.per_cpu.resize(8, Duration::ZERO);
         let mut cpu = process();
         cpu.signals.io.scheduling.set_affinity(255);
-        // One real owner syscall per round, with no guest byte effects.
+        // One five-instruction loop per bounded round, with no guest byte effects.
         // getrusage(RUSAGE_SELF, NULL) returns EFAULT through the normal path.
         let code: Vec<_> = [
             0xd2800000u32,
@@ -6463,12 +6474,14 @@ mod tests {
         k.processes.insert(1, cpu);
         let mut io = trames_linux::CapturedOutput::default();
         for _ in 0..16 {
-            assert!(k.parallel_round(&mut io, u64::MAX).unwrap());
+            let end = k.instructions + 5;
+            assert!(k.parallel_round(&mut io, end).unwrap());
         }
         let before = (k.instructions, k.syscalls, k.parallel_rounds);
         let began = Instant::now();
         for _ in 0..ROUNDS {
-            assert!(black_box(&mut k).parallel_round(&mut io, u64::MAX).unwrap());
+            let end = k.instructions + 5;
+            assert!(black_box(&mut k).parallel_round(&mut io, end).unwrap());
         }
         let seconds = began.elapsed().as_secs_f64();
         assert_eq!(k.syscalls - before.1, ROUNDS);

@@ -171,6 +171,7 @@ impl Store {
                         })
                     });
             }
+            self.account.peak_bytes();
             native.ranges.remove(&base);
             native.refused.insert(base);
             return Ok(None);
@@ -349,6 +350,7 @@ impl Anonymous {
         pages
     }
     pub fn prune(&self, changes: &[Retirement]) {
+        let mut sampled_account = None;
         for change in changes {
             if let Some(native) = &change.store.native {
                 let mut native = native.lock().unwrap();
@@ -364,6 +366,13 @@ impl Anonymous {
                         .iter()
                         .any(|(_, r)| Arc::ptr_eq(&r.store, &change.store))
                     {
+                        // Observe hardware residency before the first native extent of
+                        // this mm disappears. Batched retirement samples the mm once.
+                        let account = Arc::as_ptr(&change.store.account);
+                        if sampled_account != Some(account) {
+                            change.store.account.peak_bytes();
+                            sampled_account = Some(account);
+                        }
                         native.ranges.remove(&base);
                     }
                 }

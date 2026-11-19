@@ -17,6 +17,7 @@ pub struct Children {
     entries: Mutex<BTreeMap<u32, Weak<Child>>>,
     changed: Arc<Readiness>,
     reaped: AtomicBool,
+    collected: Mutex<crate::usage::Usage>,
 }
 #[derive(Default)]
 pub struct Child(Mutex<State>);
@@ -48,8 +49,20 @@ struct State {
     exited: bool,
     reaped: bool,
     presence: crate::task::Visibility,
+    group_usage: Weak<crate::task_control::Group>,
+    children_usage: Weak<Children>,
+    exit_usage: crate::usage::Usage,
 }
 impl Child {
+    pub(crate) fn bind_usage(
+        &self,
+        group: &Arc<crate::task_control::Group>,
+        children: &Arc<Children>,
+    ) {
+        let mut state = self.0.lock().unwrap();
+        state.group_usage = Arc::downgrade(group);
+        state.children_usage = Arc::downgrade(children);
+    }
     pub fn uid(&self) -> u32 {
         self.0.lock().unwrap().credentials.read().uid
     }
@@ -162,10 +175,14 @@ impl Child {
         &self,
         status: Option<i32>,
         auto_reap: bool,
+        usage: Option<crate::usage::Usage>,
     ) -> Option<(Notice, i32)> {
         let mut state = self.0.lock().unwrap();
         if state.reaped || status.is_some() == state.exited {
             return None;
+        }
+        if let Some(usage) = usage {
+            state.exit_usage = usage;
         }
         let status = status.or(state.event)?;
         state.exited = true;
@@ -245,6 +262,10 @@ impl Wait {
         }
     }
     fn matches(&self, child: &State, namespace: &PidNamespace, group: u32) -> bool {
+        // An exited group can no longer generate stop or continue events.
+        if child.exited && self.options() & 4 == 0 {
+            return false;
+        }
         if self.number == 260 {
             let target = self.args[0] as i32;
             target == -1
@@ -262,6 +283,9 @@ impl Wait {
     }
 }
 impl Children {
+    pub(crate) fn usage(&self) -> crate::usage::Usage {
+        *self.collected.lock().unwrap()
+    }
     pub fn take_reaped(&self) -> bool {
         self.reaped.load(Ordering::Relaxed) && self.reaped.swap(false, Ordering::Relaxed)
     }
@@ -296,6 +320,7 @@ impl Children {
             if !state.reaped && state.exited && Weak::ptr_eq(&state.parent, &Arc::downgrade(self)) {
                 state.reaped = true;
                 state.event = None;
+                self.collected.lock().unwrap().include(state.exit_usage);
                 state.presence.reap();
                 changed = true;
             }
@@ -333,10 +358,19 @@ impl Children {
             };
             let local = namespace.local(state.id);
             let uid = state.credentials.read().uid;
+            let mut usage = state.exit_usage;
+            let usage_pointer = if request.number == 260 {
+                request.args[3]
+            } else {
+                request.args[4]
+            };
+            let live_usage = (!state.exited && usage_pointer != 0)
+                .then(|| (state.group_usage.upgrade(), state.children_usage.upgrade()));
             if options & 0x01000000 == 0 {
                 state.reaped = state.exited;
                 state.event = None;
                 if state.reaped {
+                    self.collected.lock().unwrap().include(usage);
                     self.reaped.store(true, Ordering::Relaxed);
                     state.presence.reap();
                 }
@@ -348,6 +382,17 @@ impl Children {
             if options & 0x01000000 == 0 {
                 self.changed.notify_locked();
             }
+            if let Some((Some(group), children)) = live_usage {
+                usage = group.usage();
+                if let Some(task) = group.live_task() {
+                    if let Some(mm) = task.proc_view.memory_report() {
+                        usage.peak_bytes = usage.peak_bytes.max(mm.peak_resident_bytes());
+                    }
+                }
+                if let Some(children) = children {
+                    usage.include(children.usage());
+                }
+            }
             let a = request.args;
             if request.number == 260 {
                 if a[1] != 0 {
@@ -356,13 +401,13 @@ impl Children {
                         .map_err(|_| Errno(14))?;
                 }
                 if a[3] != 0 {
-                    memory.write_array(a[3], [0; 144]).map_err(|_| Errno(14))?;
+                    usage.write(memory, a[3])?;
                 }
             } else {
                 // Linux waitid copies rusage before siginfo. A copyout error
                 // does not undo an already consumed event (except WNOWAIT).
                 if a[4] != 0 {
-                    memory.write_array(a[4], [0; 144]).map_err(|_| Errno(14))?;
+                    usage.write(memory, a[4])?;
                 }
                 if a[2] != 0 {
                     let mut bytes = [0; 128];

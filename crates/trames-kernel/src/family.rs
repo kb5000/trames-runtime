@@ -203,6 +203,10 @@ impl State {
             .binding
             .control
             .bind_metadata(&entry.binding.child, id);
+        entry
+            .binding
+            .child
+            .bind_usage(&entry.binding.control, &entry.binding.children);
         entry.binding.child.attach_quiet(
             resources.as_ref().map(|r| &r.0),
             resources.as_ref().map(|r| &r.1),
@@ -409,6 +413,7 @@ impl Families {
                         .as_ref()
                         .and_then(|f| state.original(f))
                         .is_some_and(|e| e.binding.control.auto_reap_children()),
+                    None,
                 ) {
                     exits.push((
                         notice,
@@ -476,7 +481,13 @@ impl Families {
                     host.store(status, Ordering::Relaxed);
                     host_notices.extend(current.host_ready.get().cloned());
                 }
-                if let Some((notice, status)) = entry.binding.child.finish_quiet(Some(status), auto)
+                let mut usage = entry.binding.control.usage();
+                usage.include(entry.binding.children.usage());
+                if let Some((notice, status)) =
+                    entry
+                        .binding
+                        .child
+                        .finish_quiet(Some(status), auto, Some(usage))
                 {
                     exits.push((
                         notice,

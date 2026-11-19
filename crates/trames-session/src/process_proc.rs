@@ -239,6 +239,13 @@ impl<C: Cpu> Process<C> {
             cwd_directory,
             root_directory,
             mapped_bytes: resident_bytes,
+            peak_resident_bytes: if demand.residency() {
+                self.memory
+                    .memory_report()
+                    .peak_with_residency(resident_bytes)
+            } else {
+                0
+            },
             virtual_bytes: self.memory.virtual_bytes(),
             start_stack: self
                 .memory

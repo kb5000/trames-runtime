@@ -224,6 +224,13 @@ impl MemoryReport {
             account.resident_bytes()
         }
     }
+    pub fn peak_resident_bytes(&self) -> usize {
+        let account = self.0.state.read().unwrap().account.clone();
+        account.peak_bytes()
+    }
+    pub fn peak_with_residency(&self, resident: usize) -> usize {
+        self.0.state.read().unwrap().account.record_peak(resident)
+    }
     pub fn maps(&self) -> Arc<[u8]> {
         let layout = self.0.state.read().unwrap().clone();
         layout

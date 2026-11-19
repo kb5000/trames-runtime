@@ -13,4 +13,5 @@ pub mod task;
 pub mod task_control;
 pub mod task_parent;
 pub mod timers;
+pub mod usage;
 pub mod vfork;

@@ -564,6 +564,14 @@ impl<C: Cpu> Lifecycle<C> {
         p.linux.vfs.collect_retired_descriptors();
         Kernel::<C>::clear_exit_resources(p);
         let last_mm = p.memory.coordinator_ownership().1 == 1;
+        // Sibling threads keep observing the same mm. Sample native residency
+        // only when this mm or this thread group is actually going away.
+        if last_mm || !p.signals.io.lifecycle().has_live_members() {
+            p.signals
+                .io
+                .lifecycle()
+                .retain_image_peak(p.memory.peak_resident_bytes());
+        }
         if last_mm {
             p.memory.retire_memory_report();
         }

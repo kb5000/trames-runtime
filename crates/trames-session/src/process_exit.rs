@@ -133,6 +133,10 @@ impl<C: Cpu> Kernel<C> {
     fn finish_source_memory(&mut self, pid: u32, status: i32) -> Result<(), RuntimeError> {
         let borrowed = {
             let p = &self.processes.read(&pid);
+            p.signals
+                .io
+                .lifecycle()
+                .retain_image_peak(p.memory.peak_resident_bytes());
             if p.memory.coordinator_ownership().1 == 1 {
                 p.memory.retire_memory_report();
             }

@@ -605,6 +605,7 @@ process_metadata! {
     executable: Vec<u8>,
     executable_file: Option<std::sync::Weak<ExecutableFile>>,
     mapped_bytes: usize,
+    peak_resident_bytes: usize,
     virtual_bytes: u64,
     user_ticks: u64,
     start_ticks: u64,
@@ -801,6 +802,7 @@ impl ProcessView {
             info.virtual_bytes = memory.virtual_bytes();
             if demand.residency() {
                 info.mapped_bytes = residency.unwrap_or_else(|| memory.resident_bytes());
+                info.peak_resident_bytes = memory.peak_with_residency(info.mapped_bytes);
             }
             if demand.mappings() {
                 info.maps = memory.maps().to_vec();

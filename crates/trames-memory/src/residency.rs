@@ -30,14 +30,27 @@ impl Budget {
             .map_err(|_| MemoryError::Limit)
     }
 }
+type NativeRanges = std::sync::Mutex<BTreeMap<usize, std::sync::Weak<dyn crate::HardwareRange>>>;
 pub(super) struct Account {
     local: Arc<Budget>,
+    peak: AtomicUsize,
     total: Option<Arc<Budget>>,
-    native: std::sync::Mutex<BTreeMap<usize, std::sync::Weak<dyn crate::HardwareRange>>>,
+    native: std::sync::OnceLock<NativeRanges>,
 }
 impl Account {
     pub(super) fn resident_bytes(&self) -> usize {
         self.local.used.load(Ordering::Relaxed) + self.native_resident()
+    }
+    pub(super) fn record_peak(&self, bytes: usize) -> usize {
+        let peak = self.peak.load(Ordering::Relaxed);
+        if bytes > peak {
+            self.peak.fetch_max(bytes, Ordering::Relaxed).max(bytes)
+        } else {
+            peak
+        }
+    }
+    pub(super) fn peak_bytes(&self) -> usize {
+        self.record_peak(self.resident_bytes())
     }
     pub(super) fn native_allowed(&self) -> bool {
         self.local.limit.load(Ordering::Relaxed) >= ADDRESS_LIMIT as usize
@@ -47,24 +60,29 @@ impl Account {
                 .is_none_or(|b| b.limit.load(Ordering::Relaxed) >= ADDRESS_LIMIT as usize)
     }
     pub(super) fn register_native(&self, range: &Arc<dyn crate::HardwareRange>) {
-        let mut native = self.native.lock().unwrap();
+        let mut native = self.native.get_or_init(Default::default).lock().unwrap();
         native.insert(
             Arc::as_ptr(range) as *const () as usize,
             Arc::downgrade(range),
         );
     }
     fn has_native(&self) -> bool {
-        self.native
-            .lock()
-            .unwrap()
-            .values()
-            .any(|r| r.strong_count() != 0)
+        self.native.get().is_some_and(|ranges| {
+            ranges
+                .lock()
+                .unwrap()
+                .values()
+                .any(|r| r.strong_count() != 0)
+        })
     }
     fn native_resident(&self) -> usize {
+        let Some(native) = self.native.get() else {
+            return 0;
+        };
         let ranges: Vec<_> = {
-            let mut native = self.native.lock().unwrap();
-            native.retain(|_, r| r.strong_count() != 0);
-            native
+            let mut ranges = native.lock().unwrap();
+            ranges.retain(|_, r| r.strong_count() != 0);
+            ranges
                 .values()
                 .filter_map(std::sync::Weak::upgrade)
                 .collect()
@@ -89,6 +107,7 @@ impl Account {
 
     pub(super) fn new(limit: usize) -> Arc<Self> {
         Arc::new(Self {
+            peak: AtomicUsize::new(0),
             local: Budget::new(limit),
             total: None,
             native: Default::default(),
@@ -96,6 +115,7 @@ impl Account {
     }
     fn fork(&self) -> Arc<Self> {
         Arc::new(Self {
+            peak: AtomicUsize::new(0),
             local: Budget::new(self.local.limit.load(Ordering::Relaxed)),
             total: self.total.clone(),
             native: Default::default(),
@@ -112,7 +132,10 @@ impl Account {
         Ok(())
     }
     fn release(&self, bytes: usize) {
-        self.local.used.fetch_sub(bytes, Ordering::Relaxed);
+        // The count immediately before a release captures the charged high-water
+        // mark without changing first-touch or already-resident guest accesses.
+        let before = self.local.used.fetch_sub(bytes, Ordering::Relaxed);
+        self.record_peak(before);
         if let Some(total) = &self.total {
             total.used.fetch_sub(bytes, Ordering::Relaxed);
         }
@@ -251,9 +274,16 @@ impl Memory {
         }
         self.account.resident_bytes()
     }
+    pub fn peak_resident_bytes(&self) -> usize {
+        if let Some(shared) = &self.shared {
+            return shared.borrow().peak_resident_bytes();
+        }
+        self.account.peak_bytes()
+    }
     /// Bind a fresh runtime to one aggregate guest budget before workers start.
     pub fn set_total_limit(&mut self, limit: usize) -> Result<(), MemoryError> {
         self.bind_account(Arc::new(Account {
+            peak: AtomicUsize::new(0),
             local: Budget::new(self.limit),
             total: Some(Budget::new(limit)),
             native: Default::default(),
@@ -265,6 +295,7 @@ impl Memory {
             return self.inherit_total_limit(&shared.borrow());
         }
         self.bind_account(Arc::new(Account {
+            peak: AtomicUsize::new(0),
             local: Budget::new(self.limit),
             total: old.account.total.clone(),
             native: Default::default(),
@@ -274,6 +305,7 @@ impl Memory {
         if let Some(shared) = &self.shared {
             return shared.borrow_mut().bind_account(account);
         }
+        let previous_peak = self.account.peak_bytes();
         self.adopt_anonymous();
         self.parallel_cache = None;
         let mut charges = Vec::new();
@@ -290,6 +322,7 @@ impl Memory {
         self.anonymous = self.anonymous.fork(&account);
         self.sparse_pages.get_mut().clear();
         self.invalidate_translations();
+        account.record_peak(previous_peak);
         self.account = account;
         Ok(())
     }
@@ -301,6 +334,7 @@ impl Memory {
             return Err(MemoryError::InvalidRange);
         }
         self.bind_account(Arc::new(Account {
+            peak: AtomicUsize::new(0),
             local: Budget::new(limit),
             total: self.account.total.clone(),
             native: Default::default(),

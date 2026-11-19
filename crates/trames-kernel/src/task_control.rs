@@ -8,7 +8,7 @@ use crate::{
 use std::{
     collections::BTreeMap,
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, Weak,
     },
 };
@@ -16,6 +16,7 @@ use std::{
 #[derive(Default)]
 pub struct Group {
     job_ids: AtomicU64,
+    image_peak: AtomicUsize,
     controlling: std::sync::OnceLock<Weak<trames_vfs::ControllingTerminal>>,
     stopped: AtomicBool,
     stop_generation: AtomicU64,
@@ -579,6 +580,20 @@ impl Group {
             .fold(state.retired_cpu, |total, task| {
                 total.saturating_add(task.proc_view.elapsed())
             })
+    }
+    pub fn retain_image_peak(&self, bytes: usize) {
+        if bytes > self.image_peak() {
+            self.image_peak.fetch_max(bytes, Ordering::Relaxed);
+        }
+    }
+    pub(crate) fn image_peak(&self) -> usize {
+        self.image_peak.load(Ordering::Relaxed)
+    }
+    pub(crate) fn usage(&self) -> crate::usage::Usage {
+        crate::usage::Usage {
+            cpu: self.cpu_time(),
+            peak_bytes: self.image_peak(),
+        }
     }
     pub fn tasks(&self) -> Vec<Arc<IoTask>> {
         self.state.lock().unwrap().tasks()

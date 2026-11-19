@@ -132,17 +132,24 @@ impl Memory {
             }
         }
         if !on_fault {
-            self.populate_locked(start, end)?;
+            self.populate_range(start, end - start)?;
         }
         Ok(())
     }
-    fn populate_locked(&self, start: u64, end: u64) -> Result<(), MemoryError> {
+    /// Fault accessible pages without changing the VMA's locking policy.
+    pub fn populate_range(&self, start: u64, len: u64) -> Result<(), MemoryError> {
+        if let Some(s) = &self.shared {
+            return s.borrow().populate_range(start, len);
+        }
+        let end = Self::mapping_end(start, len)?;
         for base in (start..end).step_by(PAGE_SIZE as usize) {
             let desc = self
                 .page_for_access_unchecked(base)
                 .ok_or(MemoryError::Unmapped(base))?;
             let access = if desc.permissions.read {
                 Access::Read
+            } else if desc.permissions.write {
+                Access::Write
             } else {
                 Access::Execute
             };
