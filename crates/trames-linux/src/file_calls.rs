@@ -127,7 +127,7 @@ impl CopyParameters {
     }
 }
 pub(crate) fn vector_flags(flags: u64) -> Result<()> {
-    if flags & !6 != 0 {
+    if flags & !7 != 0 {
         Err(Errno(95))
     } else {
         Ok(())
@@ -184,7 +184,15 @@ impl Linux {
         io: &mut impl crate::execution_io::Output,
     ) -> Result<u64> {
         match number {
-            213 | 223 => crate::file_advice::call(number as u32, a, self.vfs.stat_fd(a[0] as u32)),
+            213 | 223 => crate::file_advice::call(
+                number as u32,
+                a,
+                self.vfs.cache_fd_type(a[0] as u32, number == 213),
+            ),
+            84 => self
+                .vfs
+                .sync_file_range(a[0] as u32, a[1], a[2], a[3] as u32)
+                .map(|()| 0),
             267 => {
                 self.vfs.sync_filesystem_fd(a[0] as u32)?;
                 Ok(0)

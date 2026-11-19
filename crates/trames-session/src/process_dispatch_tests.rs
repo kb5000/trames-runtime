@@ -50,8 +50,8 @@ fn final_dispatch_family_and_canonical_errors_complete_on_source() {
         }
         let mut calls = Vec::new();
         for number in [
-            22, 28, 31, 46, 47, 67, 68, 69, 70, 71, 76, 82, 83, 86, 87, 92, 98, 267, 285, 286, 287,
-            425, 441,
+            22, 28, 31, 46, 47, 67, 68, 69, 70, 71, 76, 82, 83, 84, 86, 87, 92, 98, 267, 285, 286,
+            287, 425, 441,
         ] {
             let args = [u64::MAX; 6];
             for (register, value) in args.iter().enumerate() {
@@ -87,7 +87,7 @@ fn final_dispatch_family_and_canonical_errors_complete_on_source() {
             (98, [0x1000, 2, 0, 0, 0, 0], -38),
             (67, [u32::MAX as u64, 0x1000, 1, 0, 0, 0], -9),
             (82, [u32::MAX as u64, 0, 0, 0, 0, 0], -9),
-            (287, [u32::MAX as u64, 0, 0, 0, 0, 1], -95),
+            (287, [u32::MAX as u64, 0, 0, 0, 0, 8], -95),
             (47, [u32::MAX as u64, 0, i64::MAX as u64, 1, 0, 0], -27),
             (57, [3, 0, 0, 0, 0, 0], 0),
             (24, [5, 3, 0, 0, 0, 0], 3),

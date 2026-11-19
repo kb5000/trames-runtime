@@ -3973,6 +3973,21 @@ impl Vfs {
         stat[56..60].copy_from_slice(&4096u32.to_le_bytes());
         stat
     }
+    /// Cache operations need the open mode and file type from the same OFD.
+    fn cache_file_type(&self, open: &OpenDescription, reading: bool) -> Result<u32> {
+        let flags = open.flags.get();
+        if flags & O_PATH != 0 || reading && flags & 1 != 0 {
+            return Err(Errno(9));
+        }
+        if let Some(node) = open.metadata_node() {
+            return Ok(node.borrow().mode & 0o170000);
+        }
+        let stat = self.stat_open(open)?;
+        Ok(u32::from_le_bytes(stat[16..20].try_into().unwrap()) & 0o170000)
+    }
+    pub fn cache_fd_type(&self, fd: u32, reading: bool) -> Result<u32> {
+        self.cache_file_type(&self.descriptor(fd)?.open.borrow(), reading)
+    }
     fn stat_open(&self, o: &OpenDescription) -> Result<[u8; 128]> {
         if let Some(namespace) = &o.namespace_resource {
             return Ok(Self::namespace_stat(namespace.id()));

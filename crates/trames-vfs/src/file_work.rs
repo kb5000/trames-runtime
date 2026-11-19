@@ -160,6 +160,15 @@ impl FileTarget {
             return true;
         }
         let open = &self.0.open;
+        if let FileCommand::SyncRange { flags, .. } = operation {
+            if *flags == 0 || open.flags.get() & O_PATH != 0 {
+                return false;
+            }
+            #[cfg(all(feature = "hostfs", unix))]
+            if open.host_file.is_some() {
+                return true;
+            }
+        }
         let Some(node) = &open.node else {
             return false;
         };
@@ -178,9 +187,10 @@ impl FileTarget {
             FileCommand::Seals(add) => add.is_some_and(|add| add & 8 != 0) && data.mapped_work(),
             FileCommand::Read { .. } => persistent,
             FileCommand::Write { .. } | FileCommand::WriteSync { .. } => persistent,
-            FileCommand::Sync { .. } | FileCommand::SyncFilesystem | FileCommand::SyncAll => {
-                persistent || data.mapped_work()
-            }
+            FileCommand::Sync { .. }
+            | FileCommand::SyncRange { .. }
+            | FileCommand::SyncFilesystem
+            | FileCommand::SyncAll => persistent || data.mapped_work(),
             FileCommand::Truncate(_) | FileCommand::TruncateOpen | FileCommand::Allocate { .. } => {
                 persistent || data.mapped_work()
             }
@@ -256,6 +266,11 @@ pub enum FileCommand {
     },
     Sync {
         data_only: bool,
+    },
+    SyncRange {
+        offset: u64,
+        length: u64,
+        flags: u32,
     },
     SyncFilesystem,
     SyncAll,
@@ -544,10 +559,12 @@ impl FileWork {
     pub fn queued(mut self) -> Self {
         if self.namespace.is_none()
             && self.sync_targets.is_none()
-            && matches!(
-                self.command,
-                FileCommand::SyncAll | FileCommand::SyncFilesystem
-            )
+            && (matches!(self.command, FileCommand::SyncAll)
+                || matches!(self.command, FileCommand::SyncFilesystem)
+                    && self
+                        .target
+                        .as_ref()
+                        .is_some_and(|t| t.status_flags() & O_PATH == 0))
         {
             self.sync_targets = Some(
                 self.paths
@@ -949,6 +966,13 @@ impl FileCommand {
             FileCommand::Seals(add) => v
                 .seals(fd, *add)
                 .map(|value| FileValue::Count(value as u64)),
+            FileCommand::SyncRange {
+                offset,
+                length,
+                flags,
+            } => v
+                .sync_file_range(fd, *offset, *length, *flags)
+                .map(|()| FileValue::Count(0)),
             FileCommand::SyncAll => v.sync().map(|()| FileValue::Count(0)),
             FileCommand::SyncFilesystem => v.sync_filesystem_fd(fd).map(|()| FileValue::Count(0)),
         }

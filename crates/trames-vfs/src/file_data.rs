@@ -542,6 +542,12 @@ impl PlainFile {
         self.publish_length(length);
         Ok(())
     }
+    pub(super) fn sync_range(&self, offset: u64, length: u64, flags: u32) -> Result<()> {
+        if let Bytes::Disk(d) = &*self.bytes.read().unwrap() {
+            storage::sync_backing_range(d.open(false)?.as_ref(), offset, length, flags)?;
+        }
+        Ok(())
+    }
     pub fn sync(&self, data_only: bool) -> Result<()> {
         if let Bytes::Disk(d) = &*self.bytes.read().unwrap() {
             let file = d.open(false)?;

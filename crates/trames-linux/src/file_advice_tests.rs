@@ -16,6 +16,7 @@ fn source_and_solo_file_advice_share_fd_type_range_and_unused_operand_precedence
         .vfs
         .open_at(-100, b"/file", trames_vfs::O_PATH, 0)
         .unwrap();
+    let write_only = linux.vfs.open_at(-100, b"/file", 1, 0).unwrap();
     let directory = linux.vfs.open_at(-100, b"/", 0, 0).unwrap();
     let [pipe, _] = linux.vfs.pipe(0).unwrap();
     linux.vfs.seek(file, 3, 0).unwrap();
@@ -43,12 +44,15 @@ fn source_and_solo_file_advice_share_fd_type_range_and_unused_operand_precedence
             ],
             Ok(0),
         ),
-        (213, [path as u64, 0, 0, 0, 0, 0], Ok(0)),
-        (223, [path as u64, 0, 0, 5, 0, 0], Ok(0)),
+        (213, [path as u64, 0, 0, 0, 0, 0], Err(Errno(9))),
+        (223, [path as u64, 0, 0, 5, 0, 0], Err(Errno(9))),
         (223, [file as u64, 0, 0, 6, 0, 0], Err(Errno(22))),
         (223, [file as u64, 0, 0, 0x100000000, 0, 0], Err(Errno(22))),
         (223, [file as u64, 0, u64::MAX, 0, 0, 0], Err(Errno(22))),
         (213, [file as u64, u64::MAX, 0, 0, 0, 0], Err(Errno(22))),
+        (223, [pipe as u64, 0, 0, 6, 0, 0], Err(Errno(29))),
+        (213, [write_only as u64, 0, 0, 0, 0, 0], Err(Errno(9))),
+        (223, [write_only as u64, 0, 0, 0, 0, 0], Ok(0)),
         (223, [directory as u64, 0, 0, 0, 0, 0], Err(Errno(22))),
         (213, [pipe as u64, 0, 0, 0, 0, 0], Err(Errno(22))),
         (

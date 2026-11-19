@@ -8,10 +8,13 @@ pub(crate) fn entry(number: u32) -> bool {
 pub(crate) fn call(
     number: u32,
     args: [u64; 6],
-    stat: Result<[u8; 128], Errno>,
+    file_type: Result<u32, Errno>,
 ) -> Result<u64, Errno> {
-    let stat = stat?;
-    if u32::from_le_bytes(stat[16..20].try_into().expect("mode")) & 0o170000 != 0o100000 {
+    let kind = file_type?;
+    if number == 223 && kind == 0o010000 {
+        return Err(Errno(29));
+    }
+    if kind != 0o100000 {
         return Err(Errno(22));
     }
     if args[1] > i64::MAX as u64 || number == 223 && (args[2] > i64::MAX as u64 || args[3] > 5) {

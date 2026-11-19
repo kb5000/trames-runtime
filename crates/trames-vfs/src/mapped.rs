@@ -569,7 +569,26 @@ impl MappedData {
         self.writers.active()
     }
     pub(super) fn sync(&self, data_only: bool) -> Result<()> {
-        for (&base, page) in self.pages.borrow().iter() {
+        self.flush_range(0, u64::MAX)?;
+        self.data.borrow().sync(data_only)
+    }
+    pub(super) fn sync_range(&self, offset: u64, length: u64, flags: u32) -> Result<()> {
+        self.flush_requested_range(offset, length, flags)?;
+        self.data.borrow().sync_range(offset, length, flags)
+    }
+    pub(super) fn flush_requested_range(&self, offset: u64, length: u64, flags: u32) -> Result<()> {
+        if flags & 2 != 0 {
+            let end = if length == 0 {
+                u64::MAX
+            } else {
+                offset + length - 1
+            };
+            self.flush_range(offset, end)?;
+        }
+        Ok(())
+    }
+    fn flush_range(&self, start: u64, end: u64) -> Result<()> {
+        for (&base, page) in self.pages.borrow().range((start & !(PAGE_SIZE - 1))..=end) {
             if let Some(page) = page.upgrade() {
                 if self.has_writers() && !page.deferred() {
                     page.dirty.store(true, Ordering::Relaxed);
@@ -577,7 +596,7 @@ impl MappedData {
                 self.flush(base, &page)?;
             }
         }
-        self.data.borrow().sync(data_only)
+        Ok(())
     }
     pub(super) fn truncate(&self, length: u64) -> Result<()> {
         if length == self.len() {

@@ -1451,7 +1451,7 @@ impl Linux {
             number @ 160..=162 => {
                 crate::uts_call(&self.vfs.uts_capability(), number as u32, a, memory)
             },
-            71 | 76 | 213 | 223 | 267 | 285 | 286 | 287 | 437 => {
+            71 | 76 | 84 | 213 | 223 | 267 | 285 | 286 | 287 | 437 => {
                 self.file_syscall(number, a, memory, io)
             },
             69 | 70 => self.positioned_vector(a, memory, number == 70),

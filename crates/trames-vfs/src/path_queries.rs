@@ -605,6 +605,17 @@ impl PathQueries {
     pub fn stat_at(&self, dirfd: i32, path: &[u8], nofollow: bool) -> Option<Result<[u8; 128]>> {
         self.query(|v| v.stat_at_flags(dirfd, path, nofollow))
     }
+    pub fn cache_fd_type(&self, fd: u32, reading: bool) -> Result<u32> {
+        let view = self.view.borrow();
+        let descriptor = view
+            .query
+            .as_ref()
+            .unwrap()
+            .files
+            .observation_descriptor(fd)?;
+        let open = descriptor.open.borrow();
+        view.cache_file_type(&open, reading)
+    }
     pub fn stat_fd(&self, fd: u32) -> Option<Result<[u8; 128]>> {
         self.stat_fd_with_mount(fd).map(|r| r.map(|(stat, _)| stat))
     }

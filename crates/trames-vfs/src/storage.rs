@@ -440,12 +440,44 @@ impl FileData {
             _ => Ok(()),
         }
     }
+    pub(super) fn sync_range(&self, offset: u64, length: u64, flags: u32) -> Result<()> {
+        match self {
+            Self::Mapped(data) => data.sync_range(offset, length, flags),
+            Self::Plain(data) => data.sync_range(offset, length, flags),
+            Self::Lower(_) | Self::Shared(_) => Ok(()),
+        }
+    }
     pub fn orphan(&mut self, value: bool) {
         match self {
             Self::Plain(data) => data.orphan(value),
             Self::Mapped(data) => data.orphan(value),
             _ => {}
         }
+    }
+}
+
+// Apple filesystems expose a file-wide data flush. Keep the stronger wait
+// confined to this explicit syscall; guest mapped-page writeback is ranged.
+pub(super) fn sync_backing_range(
+    file: &std::fs::File,
+    offset: u64,
+    length: u64,
+    flags: u32,
+) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let result =
+            unsafe { libc::sync_file_range(file.as_raw_fd(), offset as i64, length as i64, flags) };
+        if result < 0 {
+            return Err(host_errno(std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (offset, length, flags);
+        file.sync_data().map_err(host_errno)
     }
 }
 
@@ -1502,9 +1534,46 @@ impl Vfs {
         }
         filesystems.into_values().map(FilesystemSync::new).collect()
     }
+    pub fn sync_file_range(&self, fd: u32, offset: u64, length: u64, flags: u32) -> Result<()> {
+        let descriptor = self.descriptor(fd)?;
+        let open = descriptor.open.borrow();
+        if open.flags.get() & O_PATH != 0 {
+            return Err(Errno(9));
+        }
+        if flags & !7 != 0 || offset > i64::MAX as u64 || length > i64::MAX as u64 - offset {
+            return Err(Errno(22));
+        }
+        if !matches!(
+            self.cache_file_type(&open, false)?,
+            0o100000 | 0o040000 | 0o120000 | 0o060000
+        ) {
+            return Err(Errno(29));
+        }
+        if flags == 0 {
+            return Ok(());
+        }
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(host) = &open.host_file {
+            if let Some(node) = &open.node {
+                if let Content::File(FileData::Mapped(data)) = &node.borrow().content {
+                    data.flush_requested_range(offset, length, flags)?;
+                }
+            }
+            return sync_backing_range(&host.file, offset, length, flags);
+        }
+        if let Some(node) = &open.node {
+            if let Content::File(data) = &node.borrow().content {
+                return data.sync_range(offset, length, flags);
+            }
+        }
+        Ok(())
+    }
     pub fn sync_filesystem_fd(&self, fd: u32) -> Result<()> {
         let descriptor = self.descriptor(fd)?;
         let open = descriptor.open.borrow();
+        if open.flags.get() & O_PATH != 0 {
+            return Err(Errno(9));
+        }
         let filesystem = open.mount.as_ref().map_or(&self.fs, |m| &m.fs).clone();
         drop(open);
         Self::sync_filesystem(&filesystem)

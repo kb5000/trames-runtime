@@ -269,7 +269,7 @@ impl DirectSyscalls {
     pub fn file_call(number: u32) -> bool {
         namespace::supported(number)
             || crate::file_advice::entry(number)
-            || matches!(number, 45..=47 | 56 | 62..=71 | 76 | 80..=83 | 227 | 267 | 285..=287 | 437)
+            || matches!(number, 45..=47 | 56 | 62..=71 | 76 | 80..=84 | 227 | 267 | 285..=287 | 437)
     }
     pub fn file_entry(number: u32, args: [u64; 6]) -> bool {
         Self::file_call(number) || number == 25 && matches!(args[1], 1033 | 1034)
@@ -613,7 +613,11 @@ impl DirectSyscalls {
             return Some(self.complete(
                 number,
                 args,
-                crate::file_advice::call(number, args, vfs.stat_fd(args[0] as u32)),
+                crate::file_advice::call(
+                    number,
+                    args,
+                    vfs.cache_fd_type(args[0] as u32, number == 213),
+                ),
             ));
         }
         if number == 227 {
@@ -734,7 +738,7 @@ impl DirectSyscalls {
             };
             (file, command, output)
         } else {
-            if !matches!(number, 46 | 47 | 62..=70 | 80 | 82 | 83 | 267 | 286 | 287) {
+            if !matches!(number, 46 | 47 | 62..=70 | 80 | 82..=84 | 267 | 286 | 287) {
                 return None;
             }
             if matches!(number, 286 | 287) {
@@ -1094,6 +1098,14 @@ pub(super) fn import(
             },
             FileOutput::None,
         )),
+        84 => Ok((
+            Command::SyncRange {
+                offset: a[1],
+                length: a[2],
+                flags: a[3] as u32,
+            },
+            FileOutput::None,
+        )),
         267 => Ok((Command::SyncFilesystem, FileOutput::None)),
         _ => unreachable!("file ABI classified before import"),
     }
@@ -1106,10 +1118,13 @@ impl DirectSyscalls {
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
         if crate::file_advice::entry(number) {
-            let stat = self.paths.as_ref()?.stat_fd(a[0] as u32)?;
+            let kind = self
+                .paths
+                .as_ref()?
+                .cache_fd_type(a[0] as u32, number == 213);
             self.completed.set(self.completed.get() + 1);
             self.file_completed.set(self.file_completed.get() + 1);
-            return Some(crate::file_advice::call(number, a, stat));
+            return Some(crate::file_advice::call(number, a, kind));
         }
         if number == 25 && matches!(a[1], 1033 | 1034) {
             if self.file_prepared(number, a) {
@@ -1158,7 +1173,7 @@ impl DirectSyscalls {
             let work = trames_vfs::FileWork::sync_all(self.paths.as_ref()?.retain_context());
             return self.prepare_open_work(number, a, work, memory);
         }
-        if !matches!(number, 46 | 47 | 62..=70 | 80 | 82 | 83 | 267 | 286 | 287) {
+        if !matches!(number, 46 | 47 | 62..=70 | 80 | 82..=84 | 267 | 286 | 287) {
             return None;
         }
         if self.file_prepared(number, a) {
@@ -1174,7 +1189,7 @@ impl DirectSyscalls {
                 Ok(file) => file,
                 Err(error) => return Some(Err(fd_error(number, a, error))),
             };
-            if matches!(number, 82 | 83 | 267) {
+            if matches!(number, 82..=84 | 267) {
                 trames_vfs::FileAccess::Full(original.filesystem_target())
             } else {
                 match self.files.accept_or_return(original) {

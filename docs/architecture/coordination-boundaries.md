@@ -4245,6 +4245,10 @@ io_uring maintenance escalation sites remain; the overall objective stays active
 
 ## 97. Original file-cache advice and live descriptor metadata — 2026-11-10
 
+The [November 20 compatibility update](../validation/gvisor-file-cache-20261120.md)
+revised the access-mode and FIFO errors described in this historical entry.
+The same open file description supplies the mode and type for the operation.
+
 The existing readahead (213) and fadvise64 (223) family still returned to joined
 Linux dispatch to perform a regular-file stat and validate arguments. Source and
 solo now use one original-stat/type/range/advice body. Calling-worker dispatch

@@ -1390,6 +1390,45 @@ fn explicit_reset_refuses_live_stores_and_clears_unsupported_metadata() {
 }
 
 #[test]
+fn sync_file_range_flushes_only_intersecting_mapped_pages() {
+    use trames_memory::{Memory, Permissions, PAGE_SIZE};
+    let dir = Temp::new();
+    let mut v = dir.open();
+    let fd = v.open_at(AT_FDCWD, b"/ranged", 0x42, 0o600).unwrap();
+    v.truncate_fd(fd, PAGE_SIZE * 3).unwrap();
+    let object = fs::read_dir(dir.0.join("objects"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let pages = v.mapping_pages(fd, 0, PAGE_SIZE * 3, true, true).unwrap();
+    let mut m = Memory::default();
+    m.map_backed(0x1000, pages, true, Permissions::RW, false)
+        .unwrap();
+    for i in 0..3 {
+        m.write_array(0x1000 + i * PAGE_SIZE, [b'A' + i as u8])
+            .unwrap();
+    }
+    let heads = || {
+        let bytes = fs::read(&object).unwrap();
+        [
+            bytes[0],
+            bytes[PAGE_SIZE as usize],
+            bytes[2 * PAGE_SIZE as usize],
+        ]
+    };
+    v.sync_file_range(fd, 0, 0, 5).unwrap();
+    assert_eq!(heads(), [0, 0, 0]);
+    v.sync_file_range(fd, PAGE_SIZE + 17, 1, 7).unwrap();
+    assert_eq!(heads(), [0, b'B', 0]);
+    v.sync_file_range(fd, PAGE_SIZE * 2, 0, 2).unwrap();
+    assert_eq!(heads(), [0, b'B', b'C']);
+    v.sync_file_range(fd, PAGE_SIZE - 1, 2, 2).unwrap();
+    assert_eq!(heads(), *b"ABC");
+    assert_eq!(v.seek(fd, 0, 1), Ok(0));
+}
+#[test]
 fn direct_native_mapped_writes_survive_disk_sync_unmap_and_reopen() {
     use trames_memory::{Memory, Permissions, PAGE_SIZE};
     let dir = Temp::new();
