@@ -99,11 +99,17 @@ fn original_mqueue_mounts_share_live_paths_metadata_and_directory_cursors() {
         query.open_at_resolve(AT_FDCWD, b"/b/queue", 0x42, 0o600, 0, &files),
         Some(Err(Errno(30)))
     );
+    // Readdir can change atime. The retained description and both original
+    // mount paths must observe the same metadata before detach.
+    let listed = query.stat_fd(fd).unwrap().unwrap();
+    assert_eq!(listed[..72], a[..72]);
+    assert_eq!(listed[88..], a[88..]);
+    assert_eq!(query.stat_at(AT_FDCWD, b"/b", false), Some(Ok(listed)));
     // Detached OFDs retain the old mount; a replacement mount affects new paths.
     owner.umount(b"/a", 2).unwrap();
     owner.mount(None, b"/a", Some(b"tmpfs"), 0, None).unwrap();
-    assert_eq!(query.stat_fd(fd), Some(Ok(a)));
-    assert_eq!(query.stat_at(fd as i32, b".", false), Some(Ok(a)));
+    assert_eq!(query.stat_fd(fd), Some(Ok(listed)));
+    assert_eq!(query.stat_at(fd as i32, b".", false), Some(Ok(listed)));
     assert_ne!(
         query.stat_at(AT_FDCWD, b"/a", false).unwrap().unwrap()[..16],
         a[..16]

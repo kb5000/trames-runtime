@@ -275,3 +275,40 @@ fn directory_walk_and_concurrent_creation_finish_without_nested_namespace_reads(
     }
     epoch.finish();
 }
+
+#[test]
+fn partial_copy_commits_only_whole_entries_and_eof_never_touches_guest_memory() {
+    let mut v = Vfs::default();
+    v.mkdir_at(AT_FDCWD, b"/empty", 0o755).unwrap();
+    let fd = v.open_at(AT_FDCWD, b"/empty", O_DIRECTORY, 0).unwrap();
+    let q = v.path_queries();
+    assert_eq!(
+        q.getdents_to(fd, 4096, |_, _| Err(Errno(14))),
+        Some(Err(Errno(14)))
+    );
+    let first = q
+        .getdents_to(fd, 4096, |pos, data| {
+            if pos + data.len() <= 24 {
+                Ok(())
+            } else {
+                Err(Errno(14))
+            }
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(names(&first), [b".".to_vec()]);
+    let mut copies = 0;
+    let rest = q
+        .getdents_to(fd, 4096, |_, _| {
+            copies += 1;
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(names(&rest), [b"..".to_vec()]);
+    assert_eq!(copies, 1);
+    assert_eq!(
+        q.getdents_to(fd, 4096, |_, _| panic!("EOF must not copy")),
+        Some(Ok(vec![]))
+    );
+}

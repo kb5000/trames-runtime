@@ -6,7 +6,17 @@ pub(super) const RENAME_EXCHANGE: u32 = 2;
 
 impl Vfs {
     pub fn link_at(&mut self, oldfd: i32, old: &[u8], newfd: i32, new: &[u8]) -> Result<()> {
-        let source = self.resolve_final(oldfd, old, false)?;
+        self.link_at_follow(oldfd, old, newfd, new, false)
+    }
+    pub(super) fn link_at_follow(
+        &mut self,
+        oldfd: i32,
+        old: &[u8],
+        newfd: i32,
+        new: &[u8],
+        follow: bool,
+    ) -> Result<()> {
+        let source = self.resolve_final(oldfd, old, follow)?;
         let dest = self.resolve_final(newfd, new, false)?;
         self.check_parent_write(&dest)?;
         self.link_resolved(&source, &dest, false)
@@ -59,8 +69,8 @@ impl Vfs {
         if target.as_ref().is_some_and(|n| Arc::ptr_eq(n, &src)) {
             return Ok(());
         }
-        self.check_parent_write(&source)?;
-        self.check_parent_write(&dest)?;
+        let old_parent = self.check_parent_write(&source)?;
+        let new_parent = self.check_parent_write(&dest)?;
         self.check_remove(&source)?;
         if target.is_some() {
             self.check_remove(&dest)?;
@@ -108,6 +118,7 @@ impl Vfs {
                 }
             }
         }
+        let parent_times = directory::EntryTimes::lock(Some(&old_parent), Some(&new_parent));
         let mut fs = filesystem.borrow_mut();
         let mut moves = Vec::new();
         let mut plan = |from: &ResolvedPath,
@@ -156,7 +167,7 @@ impl Vfs {
         let now = storage::Timestamp::now();
         let src_ctime = std::mem::replace(&mut src.borrow_mut().times[2], now);
         let other_ctime = exchanged.map(|n| std::mem::replace(&mut n.borrow_mut().times[2], now));
-        if let Err(e) = fs.checkpoint() {
+        if let Err(e) = parent_times.commit(now, || fs.checkpoint()) {
             for (_, to, _) in &moves {
                 fs.paths.remove(to);
             }
@@ -174,6 +185,7 @@ impl Vfs {
             return Err(e);
         }
         drop(fs);
+        drop(parent_times);
         if let Some(n) = overwritten {
             self.notification_link(&dest, n, false);
             inotify::notify(n, inotify::ATTRIB, None);
@@ -339,7 +351,10 @@ impl Vfs {
         times: Option<[[i64; 2]; 2]>,
         flags: u32,
     ) -> Result<()> {
-        if flags & !0x100 != 0 || path.is_none() && flags != 0 {
+        if times.is_some_and(|t| t.iter().all(|pair| pair[1] == UTIME_OMIT)) {
+            return Ok(());
+        }
+        if flags & !0x1100 != 0 || path.is_none() && dirfd != AT_FDCWD && flags != 0 {
             return Err(Errno(22));
         }
         let now = storage::Timestamp::now();
@@ -347,8 +362,8 @@ impl Vfs {
         if let Some(times) = times {
             for i in 0..2 {
                 values[i] = match times[i][1] {
-                    1_073_741_823 => Some(now),
-                    1_073_741_822 => None,
+                    UTIME_NOW => Some(now),
+                    UTIME_OMIT => None,
                     nanos if (0..1_000_000_000).contains(&nanos) => Some(storage::Timestamp {
                         seconds: times[i][0],
                         nanos: nanos as u32,
@@ -357,7 +372,22 @@ impl Vfs {
                 };
             }
         }
+        let empty_path = path == Some(&[][..]) && flags & 0x1000 != 0;
+        let path = if dirfd == AT_FDCWD && flags & 0x1000 != 0 && path.is_none_or(|p| p.is_empty())
+        {
+            Some(b".".as_slice())
+        } else if empty_path {
+            None
+        } else {
+            path
+        };
         if path.is_none() {
+            if dirfd == AT_FDCWD {
+                return Err(Errno(14));
+            }
+            if !empty_path && self.flags(dirfd as u32)? & O_PATH != 0 {
+                return Err(Errno(9));
+            }
             self.fd_writable(dirfd as u32)?;
         }
         let (node, link) = match path {
@@ -375,7 +405,7 @@ impl Vfs {
                 let descriptor = self.descriptor(dirfd as u32)?;
                 let open = descriptor.open.borrow();
                 (
-                    open.node.clone().ok_or(Errno(22))?,
+                    open.metadata_node().ok_or(Errno(22))?,
                     open.notification
                         .as_ref()
                         .and_then(|lease| lease.link.clone()),
@@ -384,8 +414,20 @@ impl Vfs {
         };
         let _metadata = node.metadata.lock().unwrap();
         self.pseudo_immutable(&node)?;
-        if values.iter().all(Option::is_none) {
-            return Ok(());
+        {
+            let n = node.borrow();
+            let owner = self.credentials.fsuid == n.uid
+                || self
+                    .credentials
+                    .inode_cap(capabilities::FOWNER, n.uid, n.gid);
+            if !owner {
+                if times.is_some_and(|t| !t.iter().all(|pair| pair[1] == UTIME_NOW)) {
+                    return Err(Errno(1));
+                }
+                if !self.allowed(&n, 2) {
+                    return Err(Errno(13));
+                }
+            }
         }
         #[cfg(all(feature = "hostfs", unix))]
         if let Some(host) = self.host_for_node(&node) {

@@ -234,6 +234,8 @@ pub const O_DIRECTORY: u32 = 0x4000;
 pub const O_NOFOLLOW: u32 = 0x8000;
 pub const O_DIRECT: u32 = 0x10000;
 pub const O_LARGEFILE: u32 = 0x20000;
+pub const UTIME_NOW: i64 = 1_073_741_823;
+pub const UTIME_OMIT: i64 = 1_073_741_822;
 pub const O_NOATIME: u32 = 0x40000;
 pub const O_CLOEXEC: u32 = 0x80000;
 pub const O_NONBLOCK: u32 = 0x800;
@@ -1241,7 +1243,7 @@ impl Vfs {
         self.import_reader(path, &mut bytes.as_slice(), true)
             .map(|_| ())
     }
-    fn check_parent_write(&self, path: &ResolvedPath) -> Result<()> {
+    fn check_parent_write(&self, path: &ResolvedPath) -> Result<NodeRef> {
         path.writable()?;
         if Self::cgroup_mount(path)
             || path
@@ -1254,10 +1256,11 @@ impl Vfs {
         if self.pseudo_readonly(&path.key) && self.uses_pseudo(path) {
             return Err(Errno(30));
         }
-        if !self.allowed(&self.node(&path.parent())?.borrow(), 3) {
+        let parent = self.node(&path.parent())?;
+        if !self.allowed(&parent.borrow(), 3) {
             return Err(Errno(13));
         }
-        Ok(())
+        Ok(parent)
     }
     pub fn poll(&self, fd: u32, events: u16) -> u16 {
         self.poll_signals(fd, events, 0)
@@ -1502,6 +1505,7 @@ impl Vfs {
         if inherited.is_some() && matches!(content, Content::Directory) {
             mode |= 0o2000;
         }
+        let parent_times = directory::EntryTimes::lock(parent.as_deref(), None);
         let mut fs = filesystem.borrow_mut();
         if exclusive && fs.paths.contains_key(&path.key) {
             return Err(Errno(17));
@@ -1530,6 +1534,7 @@ impl Vfs {
         if let Content::File(data) = &content {
             data.sync(false)?;
         }
+        let now = storage::Timestamp::now();
         let node = Arc::new(Inode::new(Node {
             identity: 0,
             record_locks: std::sync::OnceLock::new(),
@@ -1547,13 +1552,13 @@ impl Vfs {
             volatile: false,
             inode,
             links: 1,
-            times: [storage::Timestamp::now(); 3],
+            times: [now; 3],
             xattrs,
             seals: None,
         }));
         fs.track_inode(&node)?;
         fs.paths.insert(path.key.clone(), node.clone());
-        if let Err(e) = fs.checkpoint() {
+        if let Err(e) = parent_times.commit(now, || fs.checkpoint()) {
             fs.paths.remove(&path.key);
             fs.inodes.pop();
             fs.next_inode = old_next;
@@ -1563,6 +1568,7 @@ impl Vfs {
             data.orphan(false);
         }
         drop(fs);
+        drop(parent_times);
         self.notification_link(&path, &node, true);
         self.notification_entry(
             &path,
@@ -2170,24 +2176,37 @@ impl Vfs {
         if let Some(host) = &filesystem.host {
             host.link(&host_source, &dest.key)?;
         }
-        let old_mode = source.borrow().mode;
-        {
+        let parent = filesystem.borrow().paths.get(&dest.parent().key).cloned();
+        let parent_times = directory::EntryTimes::lock(parent.as_deref(), None);
+        let now = storage::Timestamp::now();
+        let source_metadata = source.metadata.lock().unwrap();
+        let (old_mode, old_ctime) = {
             let mut n = source.borrow_mut();
+            let old = (n.mode, n.times[2]);
             n.links += 1;
+            n.times[2] = now;
             if executable {
                 n.mode |= 0o111;
             }
-        }
+            old
+        };
         let mut fs = filesystem.borrow_mut();
         fs.paths.insert(dest.key.clone(), source.clone());
-        if let Err(e) = fs.checkpoint() {
+        if let Err(e) = parent_times.commit(now, || fs.checkpoint()) {
             fs.paths.remove(&dest.key);
             let mut n = source.borrow_mut();
             n.links -= 1;
-            n.mode = old_mode;
+            if executable {
+                n.mode = old_mode;
+            }
+            if n.times[2] == now {
+                n.times[2] = old_ctime;
+            }
             return Err(e);
         }
         drop(fs);
+        drop(source_metadata);
+        drop(parent_times);
         self.notification_link(dest, &source, true);
         source
             .borrow()
@@ -2248,13 +2267,20 @@ impl Vfs {
     }
     pub fn unlink_at(&mut self, dirfd: i32, path: &[u8], directory: bool) -> Result<()> {
         let p = self.resolve_final(dirfd, path, false)?;
+        if directory {
+            match path.rsplit(|&b| b == b'/').find(|part| !part.is_empty()) {
+                Some(b".") => return Err(Errno(22)),
+                Some(b"..") => return Err(Errno(39)),
+                _ => {}
+            }
+        }
         let filesystem = p.filesystem(self);
         let _namespace = filesystem.namespace.lock().unwrap();
         if self.is_mount_root(&p) {
             return Err(Errno(16));
         }
         let node = self.node(&p)?;
-        self.check_remove(&p)?;
+        let parent = self.check_remove(&p)?;
         let (is_dir, is_queue) = match node.borrow().content {
             Content::Directory => (true, false),
             Content::MessageQueue(_) => (false, true),
@@ -2320,15 +2346,29 @@ impl Vfs {
                 return Err(Errno(39));
             }
         }
-        node.borrow_mut().links -= 1;
+        let parent_times = directory::EntryTimes::lock(Some(&parent), None);
+        let now = storage::Timestamp::now();
+        let node_metadata = node.metadata.lock().unwrap();
+        let old_ctime = {
+            let mut n = node.borrow_mut();
+            n.links -= 1;
+            std::mem::replace(&mut n.times[2], now)
+        };
         let mut fs = filesystem.borrow_mut();
         fs.paths.remove(&p.key);
-        if let Err(e) = fs.checkpoint() {
-            node.borrow_mut().links += 1;
+        if let Err(e) = parent_times.commit(now, || fs.checkpoint()) {
+            let mut n = node.borrow_mut();
+            n.links += 1;
+            if n.times[2] == now {
+                n.times[2] = old_ctime;
+            }
+            drop(n);
             fs.paths.insert(p.key.clone(), node.clone());
             return Err(e);
         }
         drop(fs);
+        drop(node_metadata);
+        drop(parent_times);
         self.notification_link(&p, &node, false);
         if !is_dir {
             let mut n = node.borrow_mut();
@@ -4011,20 +4051,46 @@ impl Vfs {
         Ok(())
     }
     pub fn getdents(&mut self, fd: u32, count: usize) -> Result<Vec<u8>> {
-        let d = self.descriptor(fd)?;
-        self.getdents_description(&d, count)
+        self.getdents_to(fd, count, |_, _| Ok(()))
     }
-    fn getdents_description(&self, d: &Descriptor, count: usize) -> Result<Vec<u8>> {
+    pub fn getdents_to(
+        &self,
+        fd: u32,
+        count: usize,
+        mut copy: impl FnMut(usize, &[u8]) -> Result<()>,
+    ) -> Result<Vec<u8>> {
+        let d = self.descriptor(fd)?;
+        self.getdents_description(&d, count, &mut copy)
+    }
+    fn getdents_description(
+        &self,
+        d: &Descriptor,
+        count: usize,
+        copy: &mut directory::CopyDirents<'_>,
+    ) -> Result<Vec<u8>> {
         let o = d.open.borrow();
-        let result = self.read_directory_entries(&o, count);
+        if count > i32::MAX as usize {
+            return Err(Errno(22));
+        }
+        let result = self.read_directory_entries(&o, count, copy);
         if result.is_ok() {
+            if o.flags.get() & O_NOATIME == 0 {
+                if let Some(node) = &o.node {
+                    mounts::accessed(&mut node.borrow_mut(), o.mount.as_deref());
+                }
+            }
             if let Some(lease) = &o.notification {
                 lease.path_event(inotify::ACCESS);
             }
         }
         result
     }
-    fn read_directory_entries(&self, o: &OpenDescription, count: usize) -> Result<Vec<u8>> {
+    fn read_directory_entries(
+        &self,
+        o: &OpenDescription,
+        count: usize,
+        copy: &mut directory::CopyDirents<'_>,
+    ) -> Result<Vec<u8>> {
         if o.flags.get() & O_PATH != 0 {
             return Err(Errno(9));
         }
@@ -4046,7 +4112,14 @@ impl Vfs {
             let children = host.children(&p.key)?;
             let inode = node.borrow().inode;
             let parent = self.node(&self.parent_location(&p)?)?.borrow().inode;
-            return Self::encode_host_directory(o, count, children, inode, parent);
+            return directory::encode(
+                &o.file_position,
+                count,
+                (inode, parent),
+                children,
+                false,
+                copy,
+            );
         }
         let inode = node.borrow().inode;
         let parent = self.node(&self.parent_location(&p)?)?.borrow().inode;
@@ -4063,13 +4136,15 @@ impl Vfs {
             let kind = ((n.mode & 0o170000) >> 12) as u8;
             children.insert(name, (n.inode, kind));
         }
-        let mut entries = vec![(b".".to_vec(), inode, 4u8), (b"..".to_vec(), parent, 4)];
-        entries.extend(
-            children
-                .into_iter()
-                .map(|(name, (inode, kind))| (name, inode, kind)),
-        );
-        directory::encode(&o.file_position, count, &entries)
+        let numbered = directory::proc_fds(&p.key) && self.uses_pseudo(&p);
+        directory::encode(
+            &o.file_position,
+            count,
+            (inode, parent),
+            children,
+            numbered,
+            copy,
+        )
     }
 }
 #[cfg(test)]

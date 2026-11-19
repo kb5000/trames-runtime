@@ -1453,14 +1453,7 @@ impl Linux {
                 Ok(0)
             },
             62 => self.fd_query(62, a, memory),
-            61 => {
-                let count = a[2].min(MAX_WRITE as u64) as usize;
-                self.vfs.fd_kind(a[0] as u32)?;
-                Self::check(memory, a[1], count, Access::Write)?;
-                let bytes = self.vfs.getdents(a[0] as u32, count)?;
-                memory.write(a[1], &bytes).map_err(|_| Errno(14))?;
-                Ok(bytes.len() as u64)
-            },
+            61 => self.vfs.getdents_to(a[0] as u32, crate::path_queries::dirent_count(a[2]), crate::path_queries::copy_dirents(memory, a[1])).map(|bytes| bytes.len() as u64),
             79 => {
                 let (stat, _) = self.prepare_stat(a, memory);
                 Self::finish_stat(a, memory, stat)

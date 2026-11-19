@@ -91,6 +91,7 @@ pub(super) fn import(
                 return Err(Errno(22));
             }
             Call::Link {
+                follow: a[4] & 0x400 != 0,
                 oldfd: a[0] as i32,
                 old: Linux::path(memory, a[1])?,
                 newfd: a[2] as i32,
@@ -144,14 +145,6 @@ pub(super) fn import(
             empty: false,
         },
         88 => {
-            if a[3] & !0x100 != 0 {
-                return Err(Errno(22));
-            }
-            let path = if a[1] == 0 {
-                None
-            } else {
-                Some(Linux::path(memory, a[1])?)
-            };
             let times = if a[2] == 0 {
                 None
             } else {
@@ -165,6 +158,16 @@ pub(super) fn import(
                     }
                 }
                 Some(values)
+            };
+            let omit =
+                times.is_some_and(|t| t.iter().all(|pair| pair[1] == trames_vfs::UTIME_OMIT));
+            if !omit && a[3] as u32 & !0x1100 != 0 {
+                return Err(Errno(22));
+            }
+            let path = if omit || a[1] == 0 {
+                None
+            } else {
+                Some(Linux::path(memory, a[1])?)
             };
             Call::Times {
                 fd: a[0] as i32,

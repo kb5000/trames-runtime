@@ -5,6 +5,23 @@ use crate::Linux;
 use trames_memory::{Access, CpuMemory};
 use trames_vfs::{Errno, PathQueries, AT_FDCWD};
 type Result<T> = std::result::Result<T, Errno>;
+pub(super) fn dirent_count(raw: u64) -> usize {
+    let count = raw as u32 as usize;
+    if count > i32::MAX as usize {
+        count
+    } else {
+        count.min(crate::MAX_WRITE)
+    }
+}
+pub(super) fn copy_dirents(
+    memory: &mut impl CpuMemory,
+    base: u64,
+) -> impl FnMut(usize, &[u8]) -> Result<()> + '_ {
+    move |offset, bytes| {
+        let address = base.checked_add(offset as u64).ok_or(Errno(14))?;
+        memory.write(address, bytes).map_err(|_| Errno(14))
+    }
+}
 pub(super) fn call(
     q: &PathQueries,
     number: u32,
@@ -12,16 +29,10 @@ pub(super) fn call(
     memory: &mut impl CpuMemory,
 ) -> Option<Result<u64>> {
     match number {
-        61 => {
-            let count = a[2].min(crate::MAX_WRITE as u64) as usize;
-            let bytes = q.getdents(a[0] as u32, count, || {
-                Linux::check(memory, a[1], count, Access::Write)
-            })?;
-            Some(bytes.and_then(|bytes| {
-                memory.write(a[1], &bytes).map_err(|_| Errno(14))?;
-                Ok(bytes.len() as u64)
-            }))
-        }
+        61 => Some(
+            q.getdents_to(a[0] as u32, dirent_count(a[2]), copy_dirents(memory, a[1]))?
+                .map(|bytes| bytes.len() as u64),
+        ),
         62 => Some(q.seek_fd(a[0] as u32, a[1] as i64, a[2] as u32)),
         27 => {
             let path = match Linux::path(memory, a[1]) {

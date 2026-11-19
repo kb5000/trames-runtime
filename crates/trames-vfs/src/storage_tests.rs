@@ -1008,6 +1008,7 @@ fn failed_namespace_commit_rolls_back_create_alias_rename_chmod_and_unlink() {
     let dir = Temp::new();
     let mut v = dir.open();
     v.import_file(b"/a", b"original".to_vec()).unwrap();
+    let parent = v.stat_at(AT_FDCWD, b"/").unwrap();
     let before = v.stat_at(AT_FDCWD, b"/a").unwrap();
     fs::create_dir(dir.0.join("manifest.new")).unwrap();
     assert!(v.open_at(AT_FDCWD, b"/b", 0x42, 0o600).is_err());
@@ -1016,6 +1017,7 @@ fn failed_namespace_commit_rolls_back_create_alias_rename_chmod_and_unlink() {
     assert!(v.chmod_at(AT_FDCWD, b"/a", 0o000).is_err());
     assert!(v.unlink_at(AT_FDCWD, b"/a", false).is_err());
     assert_eq!(v.stat_at(AT_FDCWD, b"/a").unwrap(), before);
+    assert_eq!(v.stat_at(AT_FDCWD, b"/").unwrap(), parent);
     for path in [b"/b".as_slice(), b"/alias", b"/new"] {
         assert_eq!(v.stat_at(AT_FDCWD, path), Err(Errno(2)));
     }

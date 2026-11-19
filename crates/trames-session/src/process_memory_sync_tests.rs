@@ -119,8 +119,14 @@ fn guest_msync_shared_aliases_private_and_unrelated_mms_complete_on_source() {
         for (pid, p) in [(1, root), (2, alias), (3, independent)] {
             k.processes.insert(pid, p);
         }
+        // All three tasks store their completion marker before parking on a
+        // futex. Let this one cohort reach that state under host load.
         assert!(k
-            .parallel_round(&mut trames_linux::CapturedOutput::default(), 1_000_000)
+            .parallel_epoch(
+                &mut trames_linux::CapturedOutput::default(),
+                1_000_000,
+                true
+            )
             .unwrap());
         eprintln!(
             "msync CPUs={cpus} slots={slots} filter={filtered} cohorts={} returned={:?} scopes={}",

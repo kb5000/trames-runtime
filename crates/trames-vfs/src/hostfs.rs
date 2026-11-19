@@ -961,21 +961,6 @@ impl Vfs {
     pub(super) fn host_for_node(&self, node: &NodeRef) -> Option<Arc<HostFile>> {
         node.host.get().cloned()
     }
-    pub(super) fn encode_host_directory(
-        o: &OpenDescription,
-        count: usize,
-        children: BTreeMap<Vec<u8>, (u64, u8)>,
-        inode: u64,
-        parent: u64,
-    ) -> Result<Vec<u8>> {
-        let mut entries = vec![(b".".to_vec(), inode, 4u8), (b"..".to_vec(), parent, 4)];
-        entries.extend(
-            children
-                .into_iter()
-                .map(|(name, (inode, kind))| (name, inode, kind)),
-        );
-        directory::encode(&o.file_position, count, &entries)
-    }
     /// Cold embedding control on the original namespace. Cloning a view retains
     /// its shared resources; it neither forks a guest nor stops execution slots.
     pub fn mount_host_authorized(

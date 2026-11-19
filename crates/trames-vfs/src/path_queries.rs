@@ -513,7 +513,18 @@ impl PathQueries {
             view.begin_proc_query();
             let descriptor = view.descriptor(fd)?;
             preflight()?;
-            view.getdents_description(&descriptor, count)
+            view.getdents_description(&descriptor, count, &mut |_, _| Ok(()))
+        })
+    }
+    pub fn getdents_to(
+        &self,
+        fd: u32,
+        count: usize,
+        copy: impl FnMut(usize, &[u8]) -> Result<()>,
+    ) -> Option<Result<Vec<u8>>> {
+        self.query(|view| {
+            view.begin_proc_query();
+            view.getdents_to(fd, count, copy)
         })
     }
     pub fn directory_seek(&self, fd: u32, offset: i64, whence: u32) -> Option<Result<u64>> {

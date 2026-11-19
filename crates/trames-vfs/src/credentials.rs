@@ -487,7 +487,7 @@ impl Vfs {
             Err(Errno(13))
         }
     }
-    pub(super) fn check_remove(&self, path: &ResolvedPath) -> Result<()> {
+    pub(super) fn check_remove(&self, path: &ResolvedPath) -> Result<NodeRef> {
         if self.is_mount_root(path) {
             return Err(Errno(16));
         }
@@ -501,7 +501,8 @@ impl Vfs {
         {
             return Err(Errno(1));
         }
-        Ok(())
+        drop(p);
+        Ok(parent)
     }
     pub(super) fn allowed(&self, node: &Node, bits: u32) -> bool {
         self.credentials.allows_node(node, bits)

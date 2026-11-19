@@ -48,6 +48,7 @@ pub enum NamespaceCall {
         directory: bool,
     },
     Link {
+        follow: bool,
         oldfd: i32,
         old: Vec<u8>,
         newfd: i32,
@@ -136,8 +137,9 @@ impl NamespaceCall {
                 old,
                 newfd,
                 new,
-            }
-            | Self::Rename {
+                follow,
+            } => vec![(*oldfd, Some(old), *follow), (*newfd, Some(new), false)],
+            Self::Rename {
                 oldfd,
                 old,
                 newfd,
@@ -150,9 +152,21 @@ impl NamespaceCall {
             | Self::Chown {
                 fd, path, nofollow, ..
             } => vec![(*fd, path.as_deref(), !nofollow)],
+            Self::Times { times: Some(t), .. } if t.iter().all(|pair| pair[1] == UTIME_OMIT) => {
+                Vec::new()
+            }
             Self::Times {
                 fd, path, flags, ..
-            } => vec![(*fd, path.as_deref(), flags & 0x100 == 0)],
+            } => {
+                let path = match path.as_deref() {
+                    None | Some(b"") if flags & 0x1000 != 0 && *fd == AT_FDCWD => {
+                        Some(b".".as_slice())
+                    }
+                    Some(b"") if flags & 0x1000 != 0 => None,
+                    p => p,
+                };
+                vec![(*fd, path, flags & 0x100 == 0)]
+            }
             Self::Xattr {
                 fd, path, follow, ..
             }
@@ -241,7 +255,8 @@ impl NamespaceCall {
                 old,
                 newfd,
                 new,
-            } => v.link_at(*oldfd, old, *newfd, new)?,
+                follow,
+            } => v.link_at_follow(*oldfd, old, *newfd, new, *follow)?,
             Self::Rename {
                 oldfd,
                 old,
