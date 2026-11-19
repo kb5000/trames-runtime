@@ -76,6 +76,9 @@ impl FsHandle {
     pub fn overlay_device(&self) -> Option<u64> {
         self.overlay.as_ref().map(|overlay| overlay.device)
     }
+    pub(super) fn overlay_depth(&self) -> usize {
+        self.overlay.as_ref().map_or(0, |overlay| overlay.depth)
+    }
     pub fn has_overlay(&self) -> bool {
         self.overlay.is_some()
     }

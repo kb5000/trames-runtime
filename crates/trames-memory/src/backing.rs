@@ -435,6 +435,9 @@ impl Memory {
         }
         let end = Self::mapping_end(address, len)?;
         self.check_mapped_range(address, end)?;
+        if self.locks.overlaps(address, end) {
+            return Err(MemoryError::InvalidRange);
+        }
         self.invalidate_proc_reads(address, end);
         self.retire_sparse(address, end);
         self.retire_anonymous_range(address, end);
@@ -490,7 +493,10 @@ impl Memory {
         Self::mapping_end(old, old_len)?;
         Self::mapping_end(new, new_len)?;
         let policy = self.vma_policy.moved(old, old_len, new, new_len);
+        let moved_locks = self.locks.moved(old, old_len, new, new_len);
         self.remap_inner(old, old_len, new, new_len, fixed)?;
+        self.locks
+            .finish_move(old, old_len, new, new_len, moved_locks);
         self.vma_policy.remove(old, old + old_len);
         self.vma_policy.remove(new, new + new_len);
         self.vma_policy.extend(policy);

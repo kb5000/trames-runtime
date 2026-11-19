@@ -10,7 +10,7 @@ use trames_vfs::{
 };
 type Pair = (u64, u64);
 pub struct Limits {
-    values: Mutex<[Pair; 6]>, // FSIZE, CORE, NOFILE, NICE, DATA, AS.
+    values: Mutex<[Pair; 7]>, // FSIZE, CORE, NOFILE, NICE, DATA, AS, MEMLOCK.
     file_size: FileSizeLimit,
     nofile: DescriptorLimit,
     nr_open: trames_vfs::DescriptorCeiling,
@@ -29,6 +29,10 @@ impl Limits {
                 (0, 0),
                 (vfs.memory_resource_limits().data(), u64::MAX),
                 (vfs.memory_resource_limits().address_space(), u64::MAX),
+                (
+                    vfs.memory_resource_limits().locked(),
+                    vfs.memory_resource_limits().locked(),
+                ),
             ]),
             file_size: vfs.file_size_limit_handle(),
             nofile: vfs.descriptor_limit_handle(),
@@ -39,7 +43,7 @@ impl Limits {
     pub fn fork(&self, vfs: &Vfs) -> Arc<Self> {
         let values = *self.values.lock().unwrap();
         let child = Self::new(vfs);
-        for (resource, value) in [1, 4, 7, 13, 2, 9].into_iter().zip(values) {
+        for (resource, value) in [1, 4, 7, 13, 2, 9, 8].into_iter().zip(values) {
             child.set(resource, value);
         }
         child
@@ -48,30 +52,23 @@ impl Limits {
         vfs.bind_resource_limits(self.file_size.clone(), self.nofile.clone());
         vfs.bind_memory_resource_limits(self.vm.clone());
     }
-    fn index(resource: u64) -> Option<usize> {
-        match resource {
-            1 => Some(0),
-            4 => Some(1),
-            7 => Some(2),
-            13 => Some(3),
-            2 => Some(4),
-            9 => Some(5),
-            _ => None,
-        }
+    pub fn snapshot(&self) -> trames_vfs::MutableLimits {
+        trames_vfs::MutableLimits(*self.values.lock().unwrap())
     }
     pub fn get(&self, resource: u64) -> Pair {
-        self.values.lock().unwrap()[Self::index(resource).expect("mutable resource")]
+        self.values.lock().unwrap()
+            [trames_vfs::MutableLimits::index(resource).expect("mutable resource")]
     }
     pub fn set(&self, resource: u64, value: Pair) {
         let mut values = self.values.lock().unwrap();
-        values[Self::index(resource).expect("mutable resource")] = value;
+        values[trames_vfs::MutableLimits::index(resource).expect("mutable resource")] = value;
         self.enforce(resource, value.0);
     }
     fn enforce(&self, resource: u64, soft: u64) {
         match resource {
             1 => self.file_size.set(soft),
             7 => self.nofile.set(soft as u32),
-            2 | 9 => self.vm.set(resource, soft),
+            2 | 8 | 9 => self.vm.set(resource, soft),
             _ => {}
         }
     }
@@ -118,14 +115,15 @@ impl Limits {
             None
         };
         let mut values = self.values.lock().unwrap();
-        let previous = Self::index(resource).map_or((ceiling, ceiling), |i| values[i]);
+        let previous =
+            trames_vfs::MutableLimits::index(resource).map_or((ceiling, ceiling), |i| values[i]);
         if let Some(value) = next {
             if value.1 > previous.1 && !privileged
                 || !matches!(resource, 1 | 2 | 4 | 9) && value.1 > ceiling
             {
                 return Err(Errno(1));
             }
-            if Self::index(resource).is_none() && value != previous {
+            if trames_vfs::MutableLimits::index(resource).is_none() && value != previous {
                 return Err(Errno(95));
             }
         }
@@ -136,7 +134,7 @@ impl Limits {
             memory.write_array(old, bytes).map_err(|_| Errno(14))?;
         }
         if let Some(value) = next {
-            if let Some(i) = Self::index(resource) {
+            if let Some(i) = trames_vfs::MutableLimits::index(resource) {
                 values[i] = value;
                 self.enforce(resource, value.0);
             }
@@ -144,27 +142,7 @@ impl Limits {
         Ok(0)
     }
 }
-#[derive(Clone, Copy)]
-pub struct Fixed {
-    pub address_space: u64,
-    pub stack: u64,
-    pub tasks: u64,
-}
-impl Fixed {
-    fn value(self, resource: u64) -> Result<u64, Errno> {
-        Ok(match resource {
-            0 | 1 | 10 | 15 => u64::MAX,
-            2 | 5 | 9 => self.address_space,
-            3 => self.stack,
-            4 | 8 | 12 | 14 => 0,
-            13 => 40,
-            6 => self.tasks,
-            7 => trames_vfs::MAX_FDS as u64,
-            11 => 64,
-            _ => return Err(Errno(22)),
-        })
-    }
-}
+pub use trames_vfs::FixedLimits as Fixed;
 struct Target {
     presence: crate::task::Visibility,
     limits: Weak<Limits>,

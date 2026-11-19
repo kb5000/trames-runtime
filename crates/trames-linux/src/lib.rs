@@ -34,6 +34,7 @@ pub use task_name::task_name_call;
 mod host_files;
 pub use host_files::{HostFileAdmission, HostFileLayout, HostFileTask};
 mod heap;
+mod memory_lock;
 mod memory_queries;
 mod memory_sync;
 mod process_memory;

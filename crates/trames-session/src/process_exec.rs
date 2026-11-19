@@ -200,6 +200,7 @@ impl<C: Cpu> Kernel<C> {
                 };
                 self.wake_futex(&t, address, 1, u32::MAX);
                 t.linux.vfs.release_descriptors();
+                t.linux.vfs.retire_sem_undo(t.tgid);
                 t.linux.vfs.retire_context();
                 t.space.retire();
                 if id != p.tgid {

@@ -12,6 +12,7 @@ pub use hardware_shared::{HardwareRange, HardwareStorage, HardwareWait, SharedMa
 pub fn host_mapping_granule() -> usize {
     mmu::host_mapping_granule()
 }
+mod locking;
 mod mmu;
 use mmu::PageBytes;
 mod native_access;
@@ -242,6 +243,8 @@ pub struct Memory {
     // Anonymous PROT_NONE ranges own virtual addresses, without resident pages.
     reservations: BTreeMap<u64, u64>,
     vma_policy: vma_policy::Policy,
+    locks: locking::Locks,
+    future_lock: Option<bool>,
     anonymous: anonymous::Anonymous,
     sparse_pages: RefCell<BTreeMap<u64, Arc<Page>>>,
     parallel_anonymous_dirty: bool,
@@ -372,6 +375,8 @@ impl Memory {
             anonymous_retired: Vec::new(),
             reservations: self.reservations.clone(),
             vma_policy: self.vma_policy.clone(),
+            locks: Default::default(),
+            future_lock: None,
             frames,
             free_frames: self.free_frames.clone(),
             translations: std::array::from_fn(|_| Cell::new(Translation::EMPTY)),
@@ -523,6 +528,8 @@ impl Memory {
             pages: BTreeMap::new(),
             reservations: BTreeMap::new(),
             vma_policy: Default::default(),
+            locks: Default::default(),
+            future_lock: None,
             anonymous: anonymous::Anonymous::default(),
             sparse_pages: RefCell::new(BTreeMap::new()),
             parallel_anonymous_dirty: false,
@@ -920,6 +927,7 @@ impl Memory {
         let end = Self::mapping_end(address, len)?;
         self.remove_reservations(address, end)?;
         self.vma_policy.remove(address, end);
+        self.locks.remove(address, end);
         self.invalidate_proc_reads(address, end);
         self.retire_sparse(address, end);
         self.retire_anonymous_range(address, end);

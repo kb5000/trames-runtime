@@ -1241,7 +1241,11 @@ pub(crate) fn execute<C: Cpu>(
                         &epoch.as_ref().unwrap().io_target,
                     );
                     match attempt {
-                        Ok(value) => {
+                        Ok(None) => {
+                            vm_checkpoint = true;
+                            break 'entry Some(result);
+                        }
+                        Ok(Some(value)) => {
                             let elapsed = began.elapsed();
                             job.stats.additive_mmaps += 1;
                             job.stats.additive_time += elapsed;

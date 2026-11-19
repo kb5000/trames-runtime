@@ -96,6 +96,7 @@ const ALLOWED: u64 = CLONE_NEWUSER
     | CLONE_NEWPID
     | CLONE_NEWNET
     | CLONE_NEWIPC
+    | 0x40000 // CLONE_SYSVSEM
     | CLONE_NEWCGROUP
     | FILES
     | FS;
@@ -300,7 +301,7 @@ impl TaskNamespaces {
             {
                 return Err(Errno(22));
             }
-            if flags & !(FILES | FS | CLONE_NEWUSER) != 0
+            if flags & !(FILES | FS | CLONE_NEWUSER | 0x40000) != 0
                 && flags & CLONE_NEWUSER == 0
                 && !self
                     .view
@@ -478,6 +479,9 @@ impl Change {
                 }
                 if flags & CLONE_NEWCGROUP != 0 {
                     view.unshare_cgroup()?;
+                }
+                if flags & (0x40000 | CLONE_NEWIPC) != 0 {
+                    view.retire_sem_undo(view.lock_owner);
                 }
             }
             Change::CloseRange(first, last, flags) => view.close_range(first, last, flags)?,

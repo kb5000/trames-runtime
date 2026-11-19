@@ -544,6 +544,7 @@ impl<C: Cpu> Lifecycle<C> {
             let files = p.linux.vfs.file_table_owner();
             let context = p.linux.vfs.context_owner();
             let futex = crate::futex::Authority::new(self.futexes.clone(), p.vm_id);
+            p.linux.vfs.retire_sem_undo(p.tgid);
             let exit = crate::worker_syscalls::ExitResources {
                 task: &task,
                 files: &files,

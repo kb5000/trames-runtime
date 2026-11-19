@@ -216,6 +216,7 @@ impl<C: Cpu> Lifecycle<C> {
                         }
                     }
                     t.linux.vfs.release_descriptors();
+                    t.linux.vfs.retire_sem_undo(t.tgid);
                     t.linux.vfs.retire_context();
                     t.space.retire();
                     Kernel::release_vfork(t);

@@ -8,14 +8,23 @@ use trames_vfs::sysv_message::{Reply, Request, MSGMAX};
 mod tests;
 
 #[derive(Clone)]
+enum Accepted {
+    Message(Arc<Request>),
+    Semaphore(Arc<trames_vfs::sysv_semaphore::Request>, Option<Instant>),
+}
+#[derive(Clone)]
 pub struct RetainedMessage {
-    request: Arc<Request>,
+    request: Accepted,
     number: u32,
     args: [u64; 6],
 }
 impl RetainedMessage {
     fn attempt(&self, memory: &mut impl CpuMemory) -> Result<u64, Errno> {
-        match self.request.attempt()? {
+        let reply = match &self.request {
+            Accepted::Message(request) => request.attempt()?,
+            Accepted::Semaphore(request, _) => return request.attempt().map(|()| 0),
+        };
+        match reply {
             Reply::Sent => Ok(0),
             Reply::Received { kind, data } => {
                 // Linux consumes an accepted receive even when copyout faults.
@@ -30,6 +39,11 @@ impl RetainedMessage {
         }
     }
     fn waits(&self, error: Errno) -> bool {
+        if let Accepted::Semaphore(request, deadline) = &self.request {
+            return error.0 == 11
+                && request.waiting()
+                && !deadline.is_some_and(|d| Instant::now() >= d);
+        }
         if self.number == 189 {
             error.0 == 11 && self.args[3] & 0x800 == 0
         } else {
@@ -66,6 +80,14 @@ fn import(
 ) -> Result<RetainedMessage, Errno> {
     let process = factory.local_sender_credentials()[0];
     let pid = if process == 0 { pid } else { process };
+    if number >= 192 {
+        let (request, deadline) = super::semaphore::import(factory, number, args, memory, pid)?;
+        return Ok(RetainedMessage {
+            request: Accepted::Semaphore(Arc::new(request), deadline),
+            number,
+            args,
+        });
+    }
     let request = if number == 189 {
         if args[2] > MSGMAX as u64 {
             return Err(Errno(22));
@@ -86,7 +108,7 @@ fn import(
         )?
     };
     Ok(RetainedMessage {
-        request: Arc::new(request),
+        request: Accepted::Message(Arc::new(request)),
         number,
         args,
     })
@@ -98,6 +120,16 @@ pub(crate) fn call(
     memory: &mut impl CpuMemory,
     pid: u32,
 ) -> Result<u64, Errno> {
+    if matches!(number, 190 | 191) {
+        let group = factory.local_sender_credentials()[0];
+        return super::semaphore::control(
+            factory,
+            number,
+            args,
+            memory,
+            if group == 0 { pid } else { group },
+        );
+    }
     if number <= 187 {
         return control(factory, number, args, memory);
     }
@@ -113,8 +145,8 @@ impl DirectSyscalls {
         target: &Weak<dyn IoWake>,
     ) -> Option<IoAttempt> {
         let factory = self.resources.as_ref()?;
-        if number <= 187 {
-            return Some(self.complete(number, args, control(factory, number, args, memory)));
+        if matches!(number, 186 | 187 | 190 | 191) {
+            return Some(self.complete(number, args, call(factory, number, args, memory, pid)));
         }
         Some(match import(factory, number, args, memory, pid) {
             Ok(message) => self.start_retained_message(message, memory, pid, target),
@@ -133,7 +165,11 @@ impl DirectSyscalls {
             result => return self.complete(message.number, message.args, result),
         }
         let signal = IoSignal::new(pid, target.clone());
-        let subscriptions = vec![message.request.subscribe(&signal)];
+        let (subscription, deadline) = match &message.request {
+            Accepted::Message(r) => (r.subscribe(&signal), None),
+            Accepted::Semaphore(r, deadline) => (r.subscribe(&signal), *deadline),
+        };
+        let subscriptions = vec![subscription];
         // Subscribe before the deciding retry. Queue removal, data arrival and
         // capacity release cannot be lost between EAGAIN and parking.
         match message.attempt(memory) {
@@ -149,7 +185,7 @@ impl DirectSyscalls {
             target: target.clone(),
             binder: None,
             aio: None,
-            deadline: None,
+            deadline,
             flock: None,
             record: None,
             retained_byte: None,

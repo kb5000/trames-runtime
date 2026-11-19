@@ -290,7 +290,7 @@ impl Mount {
             },
         }
     }
-    // Overlay sources are validated Root/Tmpfs directory capabilities. Their
+    // Overlay layers retain validated directory capabilities. Their
     // byte/storage identity is independent of the current namespace ancestry.
     pub(super) fn layer_projection(identity: Arc<MountIdentity>) -> Arc<Self> {
         let parent = Arc::new(SharedCell::new(None));

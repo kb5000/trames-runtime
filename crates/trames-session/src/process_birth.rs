@@ -376,6 +376,9 @@ impl Birth {
             a[0] & 0x800 != 0,
             Arc::new(slot.into_presence()),
         );
+        if a[0] & 0x40000 != 0 {
+            child.linux.vfs.share_sem_undo_from(&p.linux.vfs);
+        }
         if a[0] & (1 << 32) != 0 {
             // Reset before any PID, signal policy or family publication.
             child.signals.actions = child.signals.actions.exec();

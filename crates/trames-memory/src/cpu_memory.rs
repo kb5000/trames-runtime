@@ -28,6 +28,9 @@ impl<M> std::ops::DerefMut for CpuSlice<'_, M> {
 pub trait CpuMemory {
     /// VMA inheritance changes require original mapping custody. A worker View
     /// declines before effects and uses the existing affected-mm transaction.
+    fn range_locked(&self, _address: u64, _length: u64) -> bool {
+        false
+    }
     fn advise_fork(
         &mut self,
         _address: u64,
@@ -188,6 +191,9 @@ impl CpuMemory for Memory {
         advice: u32,
     ) -> Option<Result<(), MemoryError>> {
         Some(Memory::advise_fork(self, address, len, advice))
+    }
+    fn range_locked(&self, address: u64, length: u64) -> bool {
+        self.locked_bytes_in(address, length) != 0
     }
     fn prepare_sync(
         &self,

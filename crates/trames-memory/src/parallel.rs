@@ -599,6 +599,7 @@ fn prepare_frame(
 }
 
 pub(super) struct Snapshot {
+    locks: locking::Locks,
     pub(super) anonymous: anonymous::Anonymous,
     hardware: bool,
     hardware_generation: u64,
@@ -1054,6 +1055,11 @@ impl View {
     }
 }
 impl CpuMemory for View {
+    fn range_locked(&self, address: u64, length: u64) -> bool {
+        self.snapshot
+            .locks
+            .overlaps(address, address.saturating_add(length))
+    }
     fn prepare_sync(&self, address: u64, len: u64) -> Option<Result<SyncRange, MemoryError>> {
         self.prepare_writeback(address, len)
     }
@@ -1630,6 +1636,7 @@ impl Memory {
             backing_revision,
             identity: self.identity,
             original_identity: self.original_identity,
+            locks: self.locks.clone(),
             code_revision: self.code_revision,
             pages,
             // Backing-epoch refreshes can retain the same ConcurrentPages in

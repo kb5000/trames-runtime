@@ -6,6 +6,7 @@ use super::*;
 pub struct DescriptorFactory {
     pub(super) files: SharedFiles,
     ids: Arc<OpenIds>,
+    pub(super) sem_undo: sysv_semaphore::UndoMember,
     pub(super) ipc_namespace: Arc<linux_namespace::IpcNamespace>,
     owner: (u32, u32),
     network: trames_net::Network,
@@ -40,6 +41,7 @@ impl Vfs {
             files: self.shared_files(),
             ids: self.next_open.clone(),
             ipc_namespace: self.ipc_namespace.clone(),
+            sem_undo: self.sem_undo.clone(),
             owner: (self.credentials.fsuid, self.credentials.fsgid),
             network: self.network.clone(),
             local_network: self.root_network.clone(),

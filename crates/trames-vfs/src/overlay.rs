@@ -112,6 +112,7 @@ fn snapshot(paths: &Tree) -> BTreeMap<Vec<u8>, Entry> {
         .collect()
 }
 pub(super) struct Overlay {
+    pub(super) depth: usize,
     // Metadata/FsHandle observers retain no semantic layer use. Namespace
     // owners and real OFD/fs/image users share a lease only while needed.
     layer_uses: std::sync::Mutex<std::sync::Weak<LayerUses>>,
@@ -584,16 +585,17 @@ impl Vfs {
         if lower.is_empty() || lower.len() > 500 || upper.is_some() != work.is_some() {
             return Err(Errno(22));
         }
-        let layer = |path: &[u8]| -> Result<Layer> {
+        let layer = |path: &[u8], lower_layer: bool| -> Result<Layer> {
             let at = self.mount_location(path, true)?;
             let fs = at.filesystem(self);
-            if fs.has_overlay()
-                || !matches!(
-                    at.mount.as_ref().map(|m| m.kind),
-                    Some(mounts::Kind::Root | mounts::Kind::Tmpfs)
-                )
-            {
-                return Err(Errno(95));
+            match at.mount.as_ref().map(|m| m.kind) {
+                Some(mounts::Kind::Root | mounts::Kind::Tmpfs) => {}
+                Some(mounts::Kind::Overlay) if lower_layer => {
+                    if fs.overlay_depth() >= 2 {
+                        return Err(Errno(40));
+                    }
+                }
+                _ => return Err(Errno(95)),
             }
             let n = self.node(&at)?;
             if !matches!(n.borrow().content, Content::Directory) {
@@ -611,9 +613,12 @@ impl Vfs {
                 fs,
             })
         };
-        let lowers = lower.iter().map(|p| layer(p)).collect::<Result<Vec<_>>>()?;
-        let upper = upper.as_deref().map(layer).transpose()?;
-        let work = work.as_deref().map(layer).transpose()?;
+        let lowers = lower
+            .iter()
+            .map(|p| layer(p, true))
+            .collect::<Result<Vec<_>>>()?;
+        let upper = upper.as_deref().map(|p| layer(p, false)).transpose()?;
+        let work = work.as_deref().map(|p| layer(p, false)).transpose()?;
         let overlaps = |a: &Layer, b: &Layer| {
             a.fs.same_data(&b.fs) && (below(&a.at, &b.at) || below(&b.at, &a.at))
         };
@@ -679,6 +684,11 @@ impl Vfs {
             return Err(Errno(28));
         }
         let o = Arc::new(Overlay {
+            depth: 1 + lowers
+                .iter()
+                .map(|l| l.fs.overlay_depth())
+                .max()
+                .unwrap_or(0),
             layer_uses: Default::default(),
             device: NEXT_DEVICE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             lowers,

@@ -184,6 +184,7 @@ impl Vfs {
         view.network = self.network.clone();
         view.root_network = self.root_network.clone();
         view.ipc_namespace = self.ipc_namespace.clone();
+        view.sem_undo = self.sem_undo.clone();
         view.pid_children = self.pid_children.clone();
         view.cgroups = self.cgroups.clone();
         view.pid = self.pid;

@@ -791,6 +791,7 @@ impl Snapshot {
         }
         self.direct
             .cancel_task_uring(memory.instruction_identity().0, pid);
+        self.direct.retire_sem_undo(self.io_signals.tgid());
         Some(
             ExitResources {
                 task: &self.io_signals,

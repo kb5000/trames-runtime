@@ -9,18 +9,17 @@ pub(crate) fn additive<C: Cpu>(
     pid: u32,
     args: [u64; 6],
     target: &std::sync::Weak<dyn trames_shared::IoWake>,
-) -> Result<u64, tasks::AdmissionWait> {
+) -> Result<Option<u64>, tasks::AdmissionWait> {
     let _permit = tasks::admit_one(task, pid, target)?.expect("original additive task");
     let p = &mut *task.write();
     p.linux.vfs.sync_task_namespaces();
     p.linux.vfs.set_process_context(pid);
     p.linux.vfs.set_lock_owner(p.tgid);
-    let result = p
-        .linux
-        .mmap_additive(args, &mut p.memory)
-        .expect("accepted additive mapping");
+    let Some(result) = p.linux.mmap_additive(args, &mut p.memory) else {
+        return Ok(None);
+    };
     p.memory.memory_report();
-    Ok(result.unwrap_or_else(super::super::error))
+    Ok(Some(result.unwrap_or_else(super::super::error)))
 }
 
 impl<C: Cpu> Lifecycle<C> {

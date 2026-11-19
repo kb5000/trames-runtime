@@ -15,6 +15,9 @@ pub(crate) fn prepare(memory: &impl CpuMemory, args: [u64; 6]) -> Option<Result<
         Ok(length) => length,
         Err(error) => return Some(Err(error)),
     };
+    if args[2] & 2 != 0 && memory.range_locked(args[0], length) {
+        return Some(Err(Errno(16)));
+    }
     Some(
         memory
             .prepare_sync(args[0], length)?

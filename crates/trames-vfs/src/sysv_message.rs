@@ -2,6 +2,7 @@
 //! System V message queues owned by the original IPC namespace. The directory
 //! protects identity publication only; transfer and waits use one queue's lock.
 use super::*;
+use crate::sysv_ipc::{now, Permissions};
 use std::{collections::VecDeque, sync::Mutex};
 #[cfg(test)]
 #[path = "sysv_message_tests.rs"]
@@ -25,11 +26,7 @@ struct Queue {
     ready: Arc<Readiness>,
 }
 struct State {
-    uid: u32,
-    gid: u32,
-    cuid: u32,
-    cgid: u32,
-    mode: u32,
+    permissions: Permissions,
     limit: usize,
     bytes: usize,
     messages: VecDeque<Message>,
@@ -47,32 +44,6 @@ struct Message {
     kind: i64,
     data: Vec<u8>,
 }
-fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-impl State {
-    fn allowed(&self, c: &Credentials, bits: u32, owner: &UserNamespace) -> bool {
-        let shift = if c.euid == self.uid || c.euid == self.cuid {
-            6
-        } else if c.egid == self.gid
-            || c.egid == self.cgid
-            || c.groups.contains(&self.gid)
-            || c.groups.contains(&self.cgid)
-        {
-            3
-        } else {
-            0
-        };
-        self.mode >> shift & bits == bits || c.has_ns_cap(owner, capabilities::IPC_OWNER)
-    }
-    fn controls(&self, c: &Credentials, owner: &UserNamespace) -> bool {
-        c.euid == self.uid || c.euid == self.cuid || c.has_ns_cap(owner, capabilities::SYS_ADMIN)
-    }
-}
-
 /// Accepted operation retains its original queue even if the ID is removed.
 /// No directory lookup, guest pointer import or message copy is replayed.
 pub struct Request {
@@ -105,7 +76,10 @@ impl Request {
         }
         let result = match &self.operation {
             Operation::Send(message) => {
-                if !state.allowed(&self.credentials, 2, &self.queue.owner) {
+                if !state
+                    .permissions
+                    .allowed(&self.credentials, 2, &self.queue.owner)
+                {
                     return Err(Errno(13));
                 }
                 if message.data.len() > state.limit.saturating_sub(state.bytes)
@@ -125,7 +99,10 @@ impl Request {
                 length,
                 flags,
             } => {
-                if !state.allowed(&self.credentials, 4, &self.queue.owner) {
+                if !state
+                    .permissions
+                    .allowed(&self.credentials, 4, &self.queue.owner)
+                {
                     return Err(Errno(13));
                 }
                 let index = if flags & 0x4000 != 0 {
@@ -194,12 +171,11 @@ impl DescriptorFactory {
                 }
                 let queue = &directory.queues[&id];
                 let bits = ((flags >> 6) | (flags >> 3) | flags) & 7;
-                if !queue
-                    .state
-                    .lock()
-                    .unwrap()
-                    .allowed(&self.credentials, bits, &queue.owner)
-                {
+                if !queue.state.lock().unwrap().permissions.allowed(
+                    &self.credentials,
+                    bits,
+                    &queue.owner,
+                ) {
                     return Err(Errno(13));
                 }
                 return Ok(id);
@@ -219,11 +195,7 @@ impl DescriptorFactory {
             owner: self.ipc_namespace.user_namespace.clone(),
             ready: Arc::default(),
             state: Mutex::new(State {
-                uid: c.euid,
-                gid: c.egid,
-                cuid: c.euid,
-                cgid: c.egid,
-                mode: flags & 0o777,
+                permissions: Permissions::new(c, flags),
                 limit: MSGMNB,
                 bytes: 0,
                 messages: VecDeque::new(),
@@ -333,7 +305,7 @@ impl DescriptorFactory {
             return Err(Errno(43));
         }
         let c = &self.credentials;
-        if matches!(command, 0 | 1) && !state.controls(c, &queue.owner) {
+        if matches!(command, 0 | 1) && !state.permissions.controls(c, &queue.owner) {
             return Err(Errno(1));
         }
         match command {
@@ -346,7 +318,7 @@ impl DescriptorFactory {
                 if state.dead {
                     return Err(Errno(43));
                 }
-                if !state.controls(c, &queue.owner) {
+                if !state.permissions.controls(c, &queue.owner) {
                     return Err(Errno(1));
                 }
                 state.dead = true;
@@ -371,9 +343,9 @@ impl DescriptorFactory {
                 }
                 let uid = c.mapped_id(false, word(4))?;
                 let gid = c.mapped_id(true, word(8))?;
-                state.uid = uid;
-                state.gid = gid;
-                state.mode = word(20) & 0o777;
+                state.permissions.uid = uid;
+                state.permissions.gid = gid;
+                state.permissions.mode = word(20) & 0o777;
                 state.limit = usize::try_from(limit).map_err(|_| Errno(22))?;
                 state.changed = now();
                 drop(state);
@@ -381,17 +353,17 @@ impl DescriptorFactory {
                 Ok((0, Vec::new()))
             }
             2 | 11 | 13 => {
-                if command != 13 && !state.allowed(c, 4, &queue.owner) {
+                if command != 13 && !state.permissions.allowed(c, 4, &queue.owner) {
                     return Err(Errno(13));
                 }
                 let mut bytes = vec![0; 120];
                 for (i, value) in [
                     (0, queue.key as u32),
-                    (4, c.local_id(false, state.uid)),
-                    (8, c.local_id(true, state.gid)),
-                    (12, c.local_id(false, state.cuid)),
-                    (16, c.local_id(true, state.cgid)),
-                    (20, state.mode),
+                    (4, c.local_id(false, state.permissions.uid)),
+                    (8, c.local_id(true, state.permissions.gid)),
+                    (12, c.local_id(false, state.permissions.cuid)),
+                    (16, c.local_id(true, state.permissions.cgid)),
+                    (20, state.permissions.mode),
                     (96, self.pid_namespace.local(state.sender)),
                     (100, self.pid_namespace.local(state.receiver)),
                 ] {

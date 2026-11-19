@@ -805,9 +805,8 @@ pub struct ProcessInfo {
     pub terminal_number: u32,
     pub fds: Vec<FdInfo>,
     pub auxiliary: Vec<u8>,
-    pub file_size_limits: Option<(u64, u64)>,
-    pub core_limits: Option<(u64, u64)>,
-    pub nofile_limits: Option<(u64, u64)>,
+    pub mutable_limits: Option<MutableLimits>,
+    pub stack_limit: Option<u64>,
     pub address_space_limit: Option<u64>,
     pub oom: std::sync::Weak<OomTask>,
     pub pending: u64,
@@ -815,6 +814,70 @@ pub struct ProcessInfo {
     pub blocked: u64,
     pub ignored: u64,
     pub caught: u64,
+}
+impl ProcessInfo {
+    fn limit_text(&self, tasks: u64) -> Vec<u8> {
+        use std::fmt::Write;
+        let fixed = FixedLimits {
+            address_space: self.address_space_limit.unwrap_or(512 << 20),
+            stack: self.stack_limit.unwrap_or(1 << 20),
+            tasks,
+        };
+        let columns = [
+            ("Max cpu time", "seconds"),
+            ("Max file size", "bytes"),
+            ("Max data size", "bytes"),
+            ("Max stack size", "bytes"),
+            ("Max core file size", "bytes"),
+            ("Max resident set", "bytes"),
+            ("Max processes", "processes"),
+            ("Max open files", "files"),
+            ("Max locked memory", "bytes"),
+            ("Max address space", "bytes"),
+            ("Max file locks", "locks"),
+            ("Max pending signals", "signals"),
+            ("Max msgqueue size", "bytes"),
+            ("Max nice priority", ""),
+            ("Max realtime priority", ""),
+            ("Max realtime timeout", "us"),
+        ];
+        let display = |v: u64| {
+            if v == u64::MAX {
+                "unlimited".to_owned()
+            } else {
+                v.to_string()
+            }
+        };
+        let mut out = String::from(
+            "Limit                     Soft Limit           Hard Limit           Units\n",
+        );
+        for (resource, (label, units)) in columns.into_iter().enumerate() {
+            let (soft, hard) = self
+                .mutable_limits
+                .and_then(|limits| limits.get(resource as u64))
+                .unwrap_or_else(|| {
+                    let v = match resource {
+                        7 => DEFAULT_MAX_FDS as u64,
+                        8 => 64 * 1024,
+                        13 => 0,
+                        _ => fixed.value(resource as u64).unwrap(),
+                    };
+                    if resource == 4 {
+                        (0, u64::MAX)
+                    } else {
+                        (v, v)
+                    }
+                });
+            writeln!(
+                out,
+                "{label:<25} {:<20} {:<20} {units}",
+                display(soft),
+                display(hard)
+            )
+            .unwrap();
+        }
+        out.into_bytes()
+    }
 }
 #[derive(Clone, Default)]
 pub struct RuntimeInfo {
@@ -2141,22 +2204,7 @@ impl Vfs {
                             format!("Name:\t{name}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t{fd_size}\nGroups:\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{threads}\nSigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\n", p.state, p.tgid, p.pid, p.parent,
                                 self.credentials.local_id(false,c.uid),self.credentials.local_id(false,c.euid),self.credentials.local_id(false,c.suid),self.credentials.local_id(false,c.fsuid),self.credentials.local_id(true,c.gid),self.credentials.local_id(true,c.egid),self.credentials.local_id(true,c.sgid),self.credentials.local_id(true,c.fsgid),c.groups.iter().map(|id|self.credentials.local_id(true,*id).to_string()).collect::<Vec<_>>().join(" "),p.virtual_bytes/1024,p.mapped_bytes/1024,p.pending,p.shared_pending,p.blocked,p.ignored,p.caught).into_bytes()
                         }
-                        b"limits" => {
-                            let (soft, hard) = p.file_size_limits.unwrap_or((u64::MAX, u64::MAX));
-                            let limit = |v: u64| {
-                                if v == u64::MAX {
-                                    "unlimited".to_owned()
-                                } else {
-                                    v.to_string()
-                                }
-                            };
-                            let address_limit = limit(p.address_space_limit.unwrap_or(512 << 20));
-                            let (core_soft, core_hard) = p.core_limits.unwrap_or((0, u64::MAX));
-                            let (fd_soft, fd_hard) = p
-                                .nofile_limits
-                                .unwrap_or((DEFAULT_MAX_FDS as u64, DEFAULT_MAX_FDS as u64));
-                            format!("Limit                     Soft Limit           Hard Limit           Units\nMax open files            {fd_soft:<20} {fd_hard:<20} files\nMax processes             {task_limit:<20} {task_limit:<20} processes\nMax address space         {address_limit:<20} {address_limit:<20} bytes\nMax file size             {:<20} {:<20} bytes\nMax core file size        {:<20} {:<20} bytes\n", limit(soft), limit(hard),limit(core_soft),limit(core_hard)).into_bytes()
-                        }
+                        b"limits" => p.limit_text(task_limit as u64),
                         _ => return Ok(None),
                     };
                     return Ok(regular(value));

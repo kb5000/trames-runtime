@@ -63,7 +63,7 @@ struct Report {
     backend_error: Option<String>,
     workers: crate::run_queue::Stats,
     exit_groups: Vec<Arc<trames_kernel::task_control::Group>>,
-    mapping_calls: [u64; 9],
+    mapping_calls: [u64; 10],
     mapping_batch: [u64; 3],
     mapping_syscalls: u64,
     batch_cpu: [Duration; 32],

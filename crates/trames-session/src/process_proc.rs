@@ -264,9 +264,8 @@ impl<C: Cpu> Process<C> {
             } else {
                 Vec::new()
             },
-            file_size_limits: Some(self.limits.get(1)),
-            core_limits: Some(self.limits.get(4)),
-            nofile_limits: Some(self.limits.get(7)),
+            mutable_limits: Some(self.limits.snapshot()),
+            stack_limit: Some(crate::STACK_SIZE),
             address_space_limit: Some(if limits.is_host_managed() {
                 u64::MAX
             } else {
@@ -714,7 +713,10 @@ mod tests {
             let task = &snapshot.processes[0];
             assert_eq!(task.nice, 9);
             assert_eq!(task.blocked, 1 << 9);
-            assert_eq!(task.nofile_limits, Some((16, MAX_FDS as u64)));
+            assert_eq!(
+                task.mutable_limits.unwrap().get(7),
+                Some((16, MAX_FDS as u64))
+            );
             assert_eq!(task.mapped_bytes, PAGE_SIZE as usize);
             let snapshot = source.observe(trames_vfs::ProcQuery::new(
                 b"/proc/1/fd",

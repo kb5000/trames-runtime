@@ -832,12 +832,17 @@ impl Linux {
         {
             return current;
         }
-        if new_end > old_end
-            && memory
-                .map(old_end, new_end - old_end, Permissions::RW)
-                .is_err()
-        {
-            return current;
+        if new_end > old_end {
+            let len = new_end - old_end;
+            let Ok(lock) = self.admit_locked_mapping(memory, old_end, len, false) else {
+                return current;
+            };
+            if memory.map(old_end, len, Permissions::RW).is_err() {
+                return current;
+            }
+            if let Some(on_fault) = lock {
+                let _ = memory.set_range_lock(old_end, len, Some(on_fault));
+            }
         }
         if new_end < old_end && memory.unmap(new_end, old_end - new_end).is_err() {
             return current;
@@ -856,12 +861,13 @@ impl Linux {
         })
     }
     pub fn mmap_is_additive(a: [u64; 6]) -> bool {
-        a[2] == 3 && a[3] & 0x23 == 0x22 && a[3] & (0x10 | 0x100000) == 0
+        a[2] == 3 && a[3] & 0x23 == 0x22 && a[3] & (0x10 | 0x2000 | 0x100000) == 0
     }
     /// Pure new private-anonymous ownership; reuse the ordinary mmap ABI
     /// validation/address allocator, publishing only after the full preflight.
     pub fn mmap_additive(&mut self, a: [u64; 6], memory: &mut Memory) -> Option<Result<u64>> {
-        Self::mmap_is_additive(a).then(|| self.mmap_impl(a, memory, true))
+        (Self::mmap_is_additive(a) && memory.future_lock().is_none())
+            .then(|| self.mmap_impl(a, memory, true))
     }
     fn mmap(&mut self, a: [u64; 6], memory: &mut Memory) -> Result<u64> {
         self.mmap_impl(a, memory, false)
@@ -1069,6 +1075,7 @@ impl Linux {
             layout: _,
             lease: _lease,
         } = plan;
+        let lock = self.admit_locked_mapping(memory, address, len, flags & 0x2000 != 0)?;
         let shared = flags & 3 != 2;
         let file = match file {
             Some(file) if file.anonymous_zero(shared, permissions.write)? => None,
@@ -1109,6 +1116,9 @@ impl Linux {
                     .map_err(Self::memory_errno)?;
             }
         }
+        if let Some(on_fault) = lock {
+            let _ = memory.set_range_lock(address, len, Some(on_fault));
+        }
         // A successful caller-chosen hint must not move the ordinary search
         // cursor. Scudo deliberately probes randomized high addresses; moving
         // every later allocation there creates enormous sparse region spans.
@@ -1144,9 +1154,21 @@ impl Linux {
         } else {
             return Err(Errno(12));
         };
+        let tail_lock = if new_len > old_len {
+            let end = a[0].checked_add(old_len).ok_or(Errno(22))?;
+            memory.lock_mode_at(end - 1)
+        } else {
+            None
+        };
+        if tail_lock.is_some() {
+            self.admit_lock_growth(memory, new_len - old_len)?;
+        }
         memory
             .remap(a[0], old_len, address, new_len, fixed)
             .map_err(Self::memory_errno)?;
+        if tail_lock == Some(false) {
+            let _ = memory.set_range_lock(address + old_len, new_len - old_len, tail_lock);
+        }
         if address != a[0] && !fixed && !reservation {
             self.heap.set_cursor(address + new_len);
         }
@@ -1259,7 +1281,7 @@ impl Linux {
                     }
                 }),
             427 => self.uring_register(a, memory),
-            186..=189 => crate::direct::message::call(&self.vfs.descriptor_factory(), number as u32, a, memory, self.vfs.process_context()),
+            186..=193 => crate::direct::message::call(&self.vfs.descriptor_factory(), number as u32, a, memory, self.vfs.process_context()),
             280 => self.bpf_syscall(a, memory),
             number @ 160..=162 => {
                 crate::uts_call(&self.vfs.uts_capability(), number as u32, a, memory)
@@ -1521,6 +1543,7 @@ impl Linux {
                 memory.unmap(a[0], len).map_err(Self::memory_errno)?;
                 Ok(0)
             },
+            228..=231 | 284 => self.memory_lock(number, a, memory),
             226 => {
                 if a[2] & !7 != 0 {
                     return Err(Errno(22));

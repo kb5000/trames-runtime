@@ -157,9 +157,7 @@ impl trames_vfs::ProcTask for IoTask {
         }
         if demand.content() {
             if let Some(limits) = self.proc_limits.get() {
-                info.file_size_limits = Some(limits.get(1));
-                info.core_limits = Some(limits.get(4));
-                info.nofile_limits = Some(limits.get(7));
+                info.mutable_limits = Some(limits.snapshot());
             }
             if let Some(cgroup) = self.cgroup() {
                 info.cgroup = cgroup.path();

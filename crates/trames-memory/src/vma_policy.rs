@@ -6,7 +6,7 @@ use super::*;
 mod tests;
 
 #[derive(Clone, Default)]
-pub(super) struct Ranges(BTreeMap<u64, u64>);
+pub(super) struct Ranges(pub(super) BTreeMap<u64, u64>);
 impl Ranges {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()

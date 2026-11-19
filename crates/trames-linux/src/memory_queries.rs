@@ -64,26 +64,35 @@ fn mempolicy(memory: &mut impl CpuMemory, a: [u64; 6]) -> Result<u64, Errno> {
 }
 
 fn mincore(memory: &mut impl CpuMemory, a: [u64; 6]) -> Option<Result<u64, Errno>> {
-    if a[1] == 0 {
-        return Some(if a[0].is_multiple_of(PAGE_SIZE) {
-            Ok(0)
-        } else {
-            Err(Errno(22))
-        });
+    if !a[0].is_multiple_of(PAGE_SIZE) {
+        return Some(Err(Errno(22)));
     }
-    let len = match Linux::page_length(a[1]) {
-        Ok(len) => len,
-        Err(error) => return Some(Err(error)),
-    };
-    if len > trames_memory::MAX_DESCRIBED_BYTES as u64 {
+    if a[0]
+        .checked_add(a[1])
+        .is_none_or(|end| end > trames_memory::ADDRESS_LIMIT)
+    {
         return Some(Err(Errno(12)));
     }
-    let resident = memory.resident(a[0], len)?;
-    Some(resident.map_err(Linux::memory_errno).and_then(|resident| {
-        Linux::check(memory, a[2], resident.len(), Access::Write)?;
-        memory.write(a[2], &resident).map_err(|_| Errno(14))?;
-        Ok(0)
-    }))
+    let pages = a[1].div_ceil(PAGE_SIZE);
+    let mut done = 0;
+    while done < pages {
+        // Linux uses a single temporary page for the output bitmap.
+        let count = (pages - done).min(PAGE_SIZE);
+        let resident = match memory.resident(a[0] + done * PAGE_SIZE, count * PAGE_SIZE)? {
+            Ok(v) => v,
+            Err(error) => return Some(Err(Linux::memory_errno(error))),
+        };
+        let Some(out) = a[2].checked_add(done) else {
+            return Some(Err(Errno(14)));
+        };
+        if Linux::check(memory, out, resident.len(), Access::Write).is_err()
+            || memory.write(out, &resident).is_err()
+        {
+            return Some(Err(Errno(14)));
+        }
+        done += count;
+    }
+    Some(Ok(0))
 }
 
 fn advice(memory: &mut impl CpuMemory, a: [u64; 6]) -> Option<Result<u64, Errno>> {
@@ -161,9 +170,9 @@ mod tests {
                     0,
                     0,
                 ],
-                12,
+                22,
             ),
-            (232, [0x4000, u64::MAX, 0, 0, 0, 0], 22),
+            (232, [0x4000, u64::MAX, 0, 0, 0, 0], 12),
             (233, [0x4001, 0, 0, 0, 0, 0], 22),
             (233, [0x4000, 0, 9, 0, 0, 0], 22),
             (233, [0x4000, 0, 0, 0, 0, 0], 0),

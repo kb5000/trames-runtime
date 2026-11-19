@@ -541,6 +541,7 @@ impl<C: Cpu> Process<C> {
         let mut linux = self
             .linux
             .clone_with_resources(shared_files, shared_fs, shared_vm);
+        linux.vfs.sem_undo = Default::default();
         linux.vfs.credentials.caps.no_new_privs =
             self.linux.vfs.credentials.caps.no_new_privs.fork();
         let limits = self.limits.fork(&linux.vfs);
@@ -693,7 +694,7 @@ pub(crate) struct Kernel<C: Cpu> {
     cohort_return_native: BTreeMap<(u64, u64), u64>,
     vm_checkpoint_groups: u64,
     vm_checkpoint_spaces: u64,
-    vm_checkpoint_calls: [u64; 9],
+    vm_checkpoint_calls: [u64; 10],
     vm_checkpoint_time: [Duration; 7],
     vm_checkpoint_wait_bins: [u64; 8],
     vm_checkpoint_batch: [u64; 3],
@@ -1321,6 +1322,7 @@ impl<C: Cpu> Kernel<C> {
             p.linux.vfs.release_process_locks();
         }
         p.linux.vfs.release_descriptors();
+        p.linux.vfs.retire_sem_undo(p.tgid);
         p.linux.vfs.retire_context();
     }
     #[cfg(all(test, trames_interpreter_conformance))]
@@ -2732,7 +2734,7 @@ impl<C: Cpu> Kernel<C> {
                     &Arc::downgrade(&self.byte_target),
                 ),
             )
-        } else if trames_linux::DirectSyscalls::aio_call(number) || matches!(number, 186..=189) {
+        } else if trames_linux::DirectSyscalls::aio_call(number) || matches!(number, 186..=193) {
             let direct = trames_linux::DirectSyscalls::new(p.linux.vfs.direct_descriptors())
                 .with_aio(p.linux.aio.clone(), p.linux.vfs.native_events())
                 .with_resources(p.linux.vfs.descriptor_factory())
@@ -4705,7 +4707,7 @@ pub(super) fn run<C: Cpu>(
         cohort_return_native: BTreeMap::new(),
         vm_checkpoint_groups: 0,
         vm_checkpoint_spaces: 0,
-        vm_checkpoint_calls: [0; 9],
+        vm_checkpoint_calls: [0; 10],
         vm_checkpoint_time: [Duration::ZERO; 7],
         vm_checkpoint_wait_bins: [0; 8],
         vm_checkpoint_batch: [0; 3],
@@ -6604,7 +6606,7 @@ mod tests {
             cohort_return_native: BTreeMap::new(),
             vm_checkpoint_groups: 0,
             vm_checkpoint_spaces: 0,
-            vm_checkpoint_calls: [0; 9],
+            vm_checkpoint_calls: [0; 10],
             vm_checkpoint_time: [Duration::ZERO; 7],
             vm_checkpoint_wait_bins: [0; 8],
             vm_checkpoint_batch: [0; 3],

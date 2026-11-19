@@ -14,7 +14,9 @@ mod cgroup;
 pub use cgroup::{CgroupBirth, CgroupTask};
 mod fs_context;
 mod path_queries;
+mod sysv_ipc;
 pub mod sysv_message;
+pub mod sysv_semaphore;
 pub use path_queries::PathQueries;
 mod fs_data;
 #[cfg(all(feature = "hostfs", unix))]
@@ -42,7 +44,8 @@ mod fd_table;
 mod resource_limits;
 pub use descriptor_factory::DescriptorFactory;
 pub use resource_limits::{
-    DescriptorCeiling, DescriptorLimit, FileSizeLimit, MemoryResourceLimits,
+    DescriptorCeiling, DescriptorLimit, FileSizeLimit, FixedLimits, MemoryResourceLimits,
+    MutableLimits,
 };
 mod open_handle;
 pub use open_handle::OfdIdentity;
@@ -775,6 +778,7 @@ pub struct Vfs {
     root_network: Arc<linux_namespace::RootNetwork>,
     path_bindings: ipc::PathBindings,
     ipc_namespace: Arc<linux_namespace::IpcNamespace>,
+    pub sem_undo: sysv_semaphore::UndoMember,
     cgroup_namespace: Arc<linux_namespace::CgroupNamespace>,
     pid_ns: PidNamespace,
     pid_identity: Option<PidReference>,
@@ -871,6 +875,7 @@ impl Vfs {
             root_network: self.root_network.clone(),
             path_bindings: self.path_bindings.clone(),
             ipc_namespace: self.ipc_namespace.clone(),
+            sem_undo: self.sem_undo.clone(),
             cgroup_namespace: self.cgroup_namespace.clone(),
             pid_ns: self.pid_ns.clone(),
             pid_identity: self.pid_identity.clone(),
@@ -927,6 +932,7 @@ impl Vfs {
             root_network,
             path_bindings: ipc::PathBindings::default(),
             ipc_namespace: Arc::default(),
+            sem_undo: Default::default(),
             cgroup_namespace: Arc::default(),
             pid_ns: pid_ns.clone(),
             pid_identity: None,

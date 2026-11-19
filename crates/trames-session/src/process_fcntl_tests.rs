@@ -137,8 +137,14 @@ fn complete_fd_control_uses_original_credentials_and_seals_without_joined_dispat
         peer.cpu.set_pc(0x6000);
         k.processes.insert(1, root);
         k.processes.insert(2, peer);
+        // Both tasks park on a futex after their work. Observe that idle point
+        // in a single cohort even when host scheduling takes longer than 10 ms.
         assert!(k
-            .parallel_round(&mut trames_linux::CapturedOutput::default(), 1_000_000)
+            .parallel_epoch(
+                &mut trames_linux::CapturedOutput::default(),
+                1_000_000,
+                true
+            )
             .unwrap());
         let root = k.processes.get_mut(&1).unwrap();
         eprintln!("fcntl CPUs={cpus} slots={slots} filter={filtered} cohorts={} returned={:?} marker={:?}",k.parallel_rounds,k.cohort_return_syscalls,root.memory.read_array::<4>(0x2800).unwrap());

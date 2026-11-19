@@ -27,12 +27,13 @@ impl FileSizeLimit {
 }
 /// Per-process Linux VM policy. Limits do not reserve or commit guest pages.
 #[derive(Clone)]
-pub struct MemoryResourceLimits(Arc<[AtomicU64; 2]>);
+pub struct MemoryResourceLimits(Arc<[AtomicU64; 3]>);
 impl Default for MemoryResourceLimits {
     fn default() -> Self {
         Self(Arc::new([
             AtomicU64::new(u64::MAX),
             AtomicU64::new(u64::MAX),
+            AtomicU64::new(64 * 1024),
         ]))
     }
 }
@@ -40,16 +41,26 @@ impl MemoryResourceLimits {
     pub fn data(&self) -> u64 {
         self.0[0].load(Ordering::Relaxed)
     }
+    pub fn locked(&self) -> u64 {
+        self.0[2].load(Ordering::Relaxed)
+    }
     pub fn address_space(&self) -> u64 {
         self.0[1].load(Ordering::Relaxed)
     }
     pub fn set(&self, resource: u64, value: u64) {
-        self.0[usize::from(resource == 9)].store(value, Ordering::Relaxed);
+        let index = match resource {
+            2 => 0,
+            9 => 1,
+            8 => 2,
+            _ => unreachable!("memory resource"),
+        };
+        self.0[index].store(value, Ordering::Relaxed);
     }
     pub(super) fn fork(&self) -> Self {
         Self(Arc::new([
             AtomicU64::new(self.data()),
             AtomicU64::new(self.address_space()),
+            AtomicU64::new(self.locked()),
         ]))
     }
 }
@@ -76,5 +87,48 @@ impl DescriptorLimit {
     }
     pub fn set(&self, value: u32) {
         self.0.store(value.min(super::MAX_FDS), Ordering::Relaxed);
+    }
+}
+
+/// Current mutable pairs from one original process-limit transaction.
+#[derive(Clone, Copy, Debug)]
+pub struct MutableLimits(pub [(u64, u64); 7]);
+impl MutableLimits {
+    pub fn index(resource: u64) -> Option<usize> {
+        match resource {
+            1 => Some(0),
+            4 => Some(1),
+            7 => Some(2),
+            13 => Some(3),
+            2 => Some(4),
+            9 => Some(5),
+            8 => Some(6),
+            _ => None,
+        }
+    }
+
+    pub fn get(&self, resource: u64) -> Option<(u64, u64)> {
+        Self::index(resource).map(|index| self.0[index])
+    }
+}
+#[derive(Clone, Copy)]
+pub struct FixedLimits {
+    pub address_space: u64,
+    pub stack: u64,
+    pub tasks: u64,
+}
+impl FixedLimits {
+    pub fn value(self, resource: u64) -> Result<u64, crate::Errno> {
+        Ok(match resource {
+            0 | 1 | 8 | 10 | 15 => u64::MAX,
+            2 | 5 | 9 => self.address_space,
+            3 => self.stack,
+            4 | 12 | 14 => 0,
+            13 => 40,
+            6 => self.tasks,
+            7 => crate::MAX_FDS as u64,
+            11 => 64,
+            _ => return Err(crate::Errno(22)),
+        })
     }
 }
