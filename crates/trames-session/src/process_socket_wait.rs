@@ -2412,10 +2412,18 @@ fn unix_packet_bytes_messages_and_capacity_waits_run_on_workers_with_one_entry_d
                     if paired == 0 {
                         p.linux.vfs.local_connect(&source, address).unwrap();
                     }
-                    let filler = if paired == 0 { 128 } else { 4 };
-                    for _ in 0..filler {
-                        p.linux.vfs.write(tx, &[0x55; 512]).unwrap();
+                    let mut filler = 0;
+                    loop {
+                        match p.linux.vfs.write(tx, &[0x55; 512]) {
+                            Ok(512) => {
+                                filler += 1;
+                                assert!(filler <= 128);
+                            }
+                            Err(trames_vfs::Errno(11)) => break,
+                            other => panic!("fill original sender: {other:?}"),
+                        }
                     }
+                    assert!(filler > 0);
                     let calls = filler as u64 + 4;
                     p.memory.write(0x1000, address).unwrap();
                     p.memory.write(0x1030, b"data").unwrap();
@@ -2568,10 +2576,18 @@ fn unix_batch_capacity_waits_release_one_slot_and_preserve_a_single_filter_decis
                     .unwrap()
                     .set_reuse(7, 1024)
                     .unwrap();
-                let filler = if paired == 0 { 128 } else { 4 };
-                for _ in 0..filler {
-                    p.linux.vfs.write(tx, &[0x55; 512]).unwrap();
+                let mut filler = 0;
+                loop {
+                    match p.linux.vfs.write(tx, &[0x55; 512]) {
+                        Ok(512) => {
+                            filler += 1;
+                            assert!(filler <= 128);
+                        }
+                        Err(trames_vfs::Errno(11)) => break,
+                        other => panic!("fill original sender: {other:?}"),
+                    }
                 }
+                assert!(filler > 0);
                 let calls = filler as u64 + 5;
                 p.memory.write(0x1030, b"data").unwrap();
                 for (at, value) in [

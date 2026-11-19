@@ -27,17 +27,23 @@ struct Message<'a> {
     datagram: Option<&'a crate::network::unix::DatagramState>,
     paths: Option<&'a trames_vfs::PathQueries>,
     original_paths: Option<&'a trames_vfs::Vfs>,
+    receive_flags: u32,
 }
 impl crate::network::unix::MessageIo for Message<'_> {
     type Rights = trames_vfs::SharedRights;
     fn kind(&self) -> u32 {
         self.fd.local_kind()
     }
+    fn connected(&self) -> bool {
+        self.fd
+            .local_operation()
+            .is_some_and(|socket| socket.name(true).is_ok())
+    }
     fn send_buffer(&self) -> usize {
         self.fd.local_send_buffer()
     }
     fn nonblocking(&self) -> u32 {
-        if self.fd.nonblocking() {
+        if self.fd.nonblocking() || self.receive_flags & 0x40 != 0 {
             0x40
         } else {
             0
@@ -192,6 +198,7 @@ impl DirectSyscalls {
             datagram: datagram.as_ref(),
             paths: self.paths.as_ref(),
             original_paths: None,
+            receive_flags: 0,
         };
         Some(
             crate::network::unix::prepare_transfer(byte_number(number), args, memory, &io)?.map(
@@ -357,6 +364,7 @@ impl DirectSyscalls {
                     datagram: datagram.as_ref(),
                     paths: self.paths.as_ref(),
                     original_paths,
+                    receive_flags: socket_flags(number, args),
                 },
             )
         } else {
@@ -381,6 +389,7 @@ impl DirectSyscalls {
                 datagram: None,
                 paths: self.paths.as_ref(),
                 original_paths: None,
+                receive_flags: 0,
                 identity: self
                     .local_identity
                     .unwrap_or_else(|| factory.local_sender_credentials()),
@@ -583,6 +592,82 @@ mod tests {
                 IoAttempt::Complete(Err(Errno(11)))
             ));
         }
+    }
+    #[test]
+    fn stream_waitall_and_low_water_timeout_return_the_original_queued_prefix() {
+        for number in [63, 207, 212] {
+            let mut v = Vfs::default();
+            let [tx, rx] = v.socketpair(1, 1, 0).unwrap();
+            let d = direct(&v);
+            let mut m = memory();
+            let socket = v.local_socket(rx).unwrap().unwrap();
+            socket.set_io_timeout(true, Some(Duration::from_secs(30)));
+            if number == 63 {
+                socket.set_reuse(18, 4).unwrap();
+            }
+            v.write(tx, b"ab").unwrap();
+            header(&mut m, 0);
+            let args = match number {
+                212 => [rx as u64, 0x1000, 0x100, 0, 0, 0],
+                _ => [
+                    rx as u64,
+                    0x1200,
+                    4,
+                    if number == 207 { 0x100 } else { 0 },
+                    0,
+                    0,
+                ],
+            };
+            let target: Arc<dyn IoWake> = Arc::new(Target);
+            let mut wait = blocked(
+                d.start(number, args, &mut m, 1, &Arc::downgrade(&target), None)
+                    .unwrap(),
+            );
+            assert!(wait.deadline.is_some());
+            v.close(rx).unwrap();
+            assert_eq!(v.eventfd(91, 0).unwrap(), rx);
+            wait.deadline = Some(Instant::now());
+            assert!(
+                matches!(
+                    d.resume_owned_byte(wait, &mut m),
+                    IoAttempt::Complete(Ok(2))
+                ),
+                "receive ABI {number}"
+            );
+            assert_eq!(m.read_array::<2>(0x1200).unwrap(), *b"ab");
+            assert_eq!(v.read(rx, 8).unwrap(), 91u64.to_le_bytes());
+        }
+    }
+    #[test]
+    fn low_water_timeout_discards_ancillary_metadata_on_the_original_plain_read() {
+        let mut v = Vfs::default();
+        let [tx, rx] = v.socketpair(1, 1, 0).unwrap();
+        let d = direct(&v);
+        let mut m = memory();
+        let socket = v.local_socket(rx).unwrap().unwrap();
+        socket.set_io_timeout(true, Some(Duration::from_secs(30)));
+        socket.set_reuse(18, 4).unwrap();
+        socket.set_reuse(16, 1).unwrap();
+        v.write(tx, b"ab").unwrap();
+        let target: Arc<dyn IoWake> = Arc::new(Target);
+        let mut wait = blocked(
+            d.start_local_transfer(
+                None,
+                63,
+                [rx as u64, 0x1200, 4, 0, 0, 0],
+                &v,
+                &mut m,
+                1,
+                &Arc::downgrade(&target),
+            )
+            .unwrap(),
+        );
+        wait.deadline = Some(Instant::now());
+        assert!(matches!(
+            d.resume_owned_byte(wait, &mut m),
+            IoAttempt::Complete(Ok(2))
+        ));
+        assert_eq!(m.read_array::<2>(0x1200).unwrap(), *b"ab");
     }
     #[test]
     fn unix_owning_rights_preserve_fault_before_dequeue_and_original_fd_after_reuse() {
@@ -1057,16 +1142,24 @@ mod tests {
             let (mut v, tx, rx) = datagrams();
             let receiver = v.local_socket(rx).unwrap().unwrap();
             receiver.set_reuse(8, 256).unwrap();
-            for _ in 0..128 {
-                v.local_send_to(
+            let mut filled = 0;
+            loop {
+                match v.local_send_to(
                     &v.local_socket(tx).unwrap().unwrap(),
                     &[0x55; 512],
-                    0,
+                    0x40,
                     Some(b"\x01\x00/target\0"),
                     Default::default(),
-                )
-                .unwrap();
+                ) {
+                    Ok(512) => {
+                        filled += 1;
+                        assert!(filled <= 128);
+                    }
+                    Err(Errno(11)) => break,
+                    result => panic!("fill original sender: {result:?}"),
+                }
             }
+            assert!(filled > 0);
 
             let d = datagram_direct(&v);
             let mut m = memory();
@@ -1103,7 +1196,7 @@ mod tests {
                     IoAttempt::Complete(Err(Errno(111)))
                 ));
             } else {
-                for _ in 0..128 {
+                for _ in 0..filled {
                     assert_eq!(receiver.recv(512, 0).unwrap().data, [0x55; 512]);
                 }
                 assert!(
@@ -1344,16 +1437,24 @@ mod tests {
         let (mut v, tx, rx) = datagrams();
         let receiver = v.local_socket(rx).unwrap().unwrap();
         receiver.set_reuse(8, 256).unwrap();
-        for _ in 0..128 {
-            v.local_send_to(
+        let mut filled = 0;
+        loop {
+            match v.local_send_to(
                 &v.local_socket(tx).unwrap().unwrap(),
                 &[0x55; 512],
-                0,
+                0x40,
                 Some(b"\x01\x00/target\0"),
                 Default::default(),
-            )
-            .unwrap();
+            ) {
+                Ok(512) => {
+                    filled += 1;
+                    assert!(filled <= 128);
+                }
+                Err(Errno(11)) => break,
+                result => panic!("fill original sender: {result:?}"),
+            }
         }
+        assert!(filled > 0);
 
         let event = v.eventfd(77, 0).unwrap();
         let d = datagram_direct(&v);
@@ -1378,7 +1479,7 @@ mod tests {
         )
         .unwrap();
         m.write(0x1200, b"next").unwrap();
-        for _ in 0..128 {
+        for _ in 0..filled {
             assert_eq!(receiver.recv(512, 0).unwrap().data, [0x55; 512]);
         }
         assert!(wait.signal.ready());

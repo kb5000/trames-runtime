@@ -1,0 +1,2487 @@
+{
+  "date": "2026-11-19",
+  "runtime_base": "8f6f44a7ee2e6a17e56e1922deb79e65b9a8896a",
+  "gvisor_revision": "89cacadae21eca4270a8f7c79281d0426d33ac5f",
+  "comparison": {
+    "schema_version": 1,
+    "cases": 6093,
+    "native_counts": {
+      "passed": 5826,
+      "skipped": 248,
+      "no_result": 19
+    },
+    "trames_counts": {
+      "passed": 5773,
+      "skipped": 248,
+      "failed": 72
+    },
+    "native_passed_cases": 5826,
+    "outcomes_on_native_passed": {
+      "passed": 5754,
+      "failed": 72
+    },
+    "strict_pass_fraction": 0.9876416065911432,
+    "groups": [
+      {
+        "name": "socket_abstract",
+        "cases": 1464,
+        "native": {
+          "passed": 1387,
+          "skipped": 58,
+          "no_result": 19
+        },
+        "trames": {
+          "passed": 1382,
+          "skipped": 58,
+          "failed": 24
+        }
+      },
+      {
+        "name": "socket_abstract_non_blocking",
+        "cases": 18,
+        "native": {
+          "passed": 18
+        },
+        "trames": {
+          "passed": 18
+        }
+      },
+      {
+        "name": "socket_unix_dgram_local",
+        "cases": 648,
+        "native": {
+          "passed": 648
+        },
+        "trames": {
+          "passed": 648
+        }
+      },
+      {
+        "name": "socket_unix_dgram_non_blocking",
+        "cases": 6,
+        "native": {
+          "passed": 6
+        },
+        "trames": {
+          "passed": 6
+        }
+      },
+      {
+        "name": "socket_unix_seqpacket_local",
+        "cases": 336,
+        "native": {
+          "passed": 336
+        },
+        "trames": {
+          "passed": 336
+        }
+      },
+      {
+        "name": "socket_unix_stream",
+        "cases": 216,
+        "native": {
+          "passed": 216
+        },
+        "trames": {
+          "passed": 216
+        }
+      },
+      {
+        "name": "socket_unix_stream_listener_close",
+        "cases": 2,
+        "native": {
+          "passed": 2
+        },
+        "trames": {
+          "passed": 2
+        }
+      },
+      {
+        "name": "socket_domain",
+        "cases": 636,
+        "native": {
+          "passed": 612,
+          "skipped": 24
+        },
+        "trames": {
+          "passed": 588,
+          "skipped": 24,
+          "failed": 24
+        }
+      },
+      {
+        "name": "socket_domain_non_blocking",
+        "cases": 18,
+        "native": {
+          "passed": 18
+        },
+        "trames": {
+          "passed": 18
+        }
+      },
+      {
+        "name": "socket_filesystem",
+        "cases": 1464,
+        "native": {
+          "passed": 1406,
+          "skipped": 58
+        },
+        "trames": {
+          "passed": 1382,
+          "skipped": 58,
+          "failed": 24
+        }
+      },
+      {
+        "name": "socket_filesystem_non_blocking",
+        "cases": 18,
+        "native": {
+          "passed": 18
+        },
+        "trames": {
+          "passed": 18
+        }
+      },
+      {
+        "name": "socket_unix_unbound_dgram",
+        "cases": 52,
+        "native": {
+          "passed": 52
+        },
+        "trames": {
+          "passed": 52
+        }
+      },
+      {
+        "name": "socket_unix_unbound_abstract",
+        "cases": 60,
+        "native": {
+          "passed": 58,
+          "skipped": 2
+        },
+        "trames": {
+          "passed": 58,
+          "skipped": 2
+        }
+      },
+      {
+        "name": "socket_unix_unbound_filesystem",
+        "cases": 18,
+        "native": {
+          "passed": 18
+        },
+        "trames": {
+          "passed": 18
+        }
+      },
+      {
+        "name": "socket_unix_pair",
+        "cases": 913,
+        "native": {
+          "passed": 819,
+          "skipped": 94
+        },
+        "trames": {
+          "passed": 819,
+          "skipped": 94
+        }
+      },
+      {
+        "name": "socket_unix_unbound_seqpacket",
+        "cases": 16,
+        "native": {
+          "passed": 16
+        },
+        "trames": {
+          "passed": 16
+        }
+      },
+      {
+        "name": "socket_unix_unbound_stream",
+        "cases": 208,
+        "native": {
+          "passed": 196,
+          "skipped": 12
+        },
+        "trames": {
+          "passed": 196,
+          "skipped": 12
+        }
+      }
+    ]
+  },
+  "new_native_confirmed_passes": 340,
+  "new_by_group": {
+    "socket_abstract": 80,
+    "socket_domain": 56,
+    "socket_filesystem": 80,
+    "socket_unix_dgram_local": 32,
+    "socket_unix_pair": 28,
+    "socket_unix_unbound_abstract": 18,
+    "socket_unix_unbound_filesystem": 6,
+    "socket_unix_unbound_stream": 40
+  },
+  "regressions": [],
+  "newly_passing": [
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/10",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/11",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/7",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/8",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/9",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.GetSocketRcvbufOption/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.GetSocketRcvbufOption/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.GetSocketRcvbufOption/10",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.GetSocketRcvbufOption/11",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.GetSocketRcvbufOption/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.GetSocketRcvbufOption/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.GetSocketRcvbufOption/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.GetSocketRcvbufOption/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.GetSocketRcvbufOption/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.GetSocketRcvbufOption/7",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.GetSocketRcvbufOption/8",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.GetSocketRcvbufOption/9",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.KeepAliveSocketOption/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.KeepAliveSocketOption/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.KeepAliveSocketOption/10",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.KeepAliveSocketOption/11",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.KeepAliveSocketOption/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.KeepAliveSocketOption/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.KeepAliveSocketOption/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.KeepAliveSocketOption/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.KeepAliveSocketOption/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.KeepAliveSocketOption/7",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.KeepAliveSocketOption/8",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.KeepAliveSocketOption/9",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.RecvTimeoutNegSecRecv/0",
+      "before": "timeout"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.RecvTimeoutNegSecRecv/6",
+      "before": "timeout"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.RecvTimeoutRecvOneSecondSucceeds/0",
+      "before": "timeout"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.RecvTimeoutRecvOneSecondSucceeds/6",
+      "before": "timeout"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.RecvTimeoutRecvSucceeds/0",
+      "before": "timeout"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.RecvTimeoutRecvSucceeds/6",
+      "before": "timeout"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.RecvTimeoutWaitAll/0",
+      "before": "timeout"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.RecvTimeoutWaitAll/6",
+      "before": "timeout"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/10",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/11",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/7",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/8",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/9",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/UnixSocketPairTest.InvalidGetSockOptLevel/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/UnixSocketPairTest.InvalidGetSockOptLevel/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/UnixSocketPairTest.InvalidGetSockOptLevel/10",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/UnixSocketPairTest.InvalidGetSockOptLevel/11",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/UnixSocketPairTest.InvalidGetSockOptLevel/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/UnixSocketPairTest.InvalidGetSockOptLevel/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/UnixSocketPairTest.InvalidGetSockOptLevel/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/UnixSocketPairTest.InvalidGetSockOptLevel/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/UnixSocketPairTest.InvalidGetSockOptLevel/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/UnixSocketPairTest.InvalidGetSockOptLevel/7",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/UnixSocketPairTest.InvalidGetSockOptLevel/8",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/UnixSocketPairTest.InvalidGetSockOptLevel/9",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/UnixSocketPairTest.InvalidSetSockOptLevel/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/UnixSocketPairTest.InvalidSetSockOptLevel/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/UnixSocketPairTest.InvalidSetSockOptLevel/10",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/UnixSocketPairTest.InvalidSetSockOptLevel/11",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/UnixSocketPairTest.InvalidSetSockOptLevel/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/UnixSocketPairTest.InvalidSetSockOptLevel/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/UnixSocketPairTest.InvalidSetSockOptLevel/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/UnixSocketPairTest.InvalidSetSockOptLevel/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/UnixSocketPairTest.InvalidSetSockOptLevel/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/UnixSocketPairTest.InvalidSetSockOptLevel/7",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/UnixSocketPairTest.InvalidSetSockOptLevel/8",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/UnixSocketPairTest.InvalidSetSockOptLevel/9",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/10",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/11",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/7",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/8",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/9",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.GetSocketRcvbufOption/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.GetSocketRcvbufOption/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.GetSocketRcvbufOption/10",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.GetSocketRcvbufOption/11",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.GetSocketRcvbufOption/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.GetSocketRcvbufOption/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.GetSocketRcvbufOption/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.GetSocketRcvbufOption/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.GetSocketRcvbufOption/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.GetSocketRcvbufOption/7",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.GetSocketRcvbufOption/8",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.GetSocketRcvbufOption/9",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.KeepAliveSocketOption/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.KeepAliveSocketOption/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.KeepAliveSocketOption/10",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.KeepAliveSocketOption/11",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.KeepAliveSocketOption/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.KeepAliveSocketOption/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.KeepAliveSocketOption/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.KeepAliveSocketOption/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.KeepAliveSocketOption/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.KeepAliveSocketOption/7",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.KeepAliveSocketOption/8",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.KeepAliveSocketOption/9",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.RecvTimeoutNegSecRecv/0",
+      "before": "timeout"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.RecvTimeoutNegSecRecv/6",
+      "before": "timeout"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.RecvTimeoutRecvOneSecondSucceeds/0",
+      "before": "timeout"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.RecvTimeoutRecvOneSecondSucceeds/6",
+      "before": "timeout"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.RecvTimeoutRecvSucceeds/0",
+      "before": "timeout"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.RecvTimeoutRecvSucceeds/6",
+      "before": "timeout"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.RecvTimeoutWaitAll/0",
+      "before": "timeout"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.RecvTimeoutWaitAll/6",
+      "before": "timeout"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/10",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/11",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/7",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/8",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/9",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/10",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/11",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/7",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/8",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.GetSetSocketRcvlowatOption/9",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.GetSocketRcvbufOption/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.GetSocketRcvbufOption/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.GetSocketRcvbufOption/10",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.GetSocketRcvbufOption/11",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.GetSocketRcvbufOption/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.GetSocketRcvbufOption/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.GetSocketRcvbufOption/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.GetSocketRcvbufOption/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.GetSocketRcvbufOption/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.GetSocketRcvbufOption/7",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.GetSocketRcvbufOption/8",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.GetSocketRcvbufOption/9",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.KeepAliveSocketOption/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.KeepAliveSocketOption/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.KeepAliveSocketOption/10",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.KeepAliveSocketOption/11",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.KeepAliveSocketOption/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.KeepAliveSocketOption/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.KeepAliveSocketOption/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.KeepAliveSocketOption/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.KeepAliveSocketOption/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.KeepAliveSocketOption/7",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.KeepAliveSocketOption/8",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.KeepAliveSocketOption/9",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.RecvTimeoutNegSecRecv/0",
+      "before": "timeout"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.RecvTimeoutNegSecRecv/6",
+      "before": "timeout"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.RecvTimeoutRecvOneSecondSucceeds/0",
+      "before": "timeout"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.RecvTimeoutRecvOneSecondSucceeds/6",
+      "before": "timeout"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.RecvTimeoutRecvSucceeds/0",
+      "before": "timeout"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.RecvTimeoutRecvSucceeds/6",
+      "before": "timeout"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.RecvTimeoutWaitAll/0",
+      "before": "timeout"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.RecvTimeoutWaitAll/6",
+      "before": "timeout"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/10",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/11",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/7",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/8",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetAndGetBooleanSocketOptions/9",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/UnixSocketPairTest.InvalidGetSockOptLevel/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/UnixSocketPairTest.InvalidGetSockOptLevel/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/UnixSocketPairTest.InvalidGetSockOptLevel/10",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/UnixSocketPairTest.InvalidGetSockOptLevel/11",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/UnixSocketPairTest.InvalidGetSockOptLevel/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/UnixSocketPairTest.InvalidGetSockOptLevel/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/UnixSocketPairTest.InvalidGetSockOptLevel/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/UnixSocketPairTest.InvalidGetSockOptLevel/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/UnixSocketPairTest.InvalidGetSockOptLevel/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/UnixSocketPairTest.InvalidGetSockOptLevel/7",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/UnixSocketPairTest.InvalidGetSockOptLevel/8",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/UnixSocketPairTest.InvalidGetSockOptLevel/9",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/UnixSocketPairTest.InvalidSetSockOptLevel/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/UnixSocketPairTest.InvalidSetSockOptLevel/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/UnixSocketPairTest.InvalidSetSockOptLevel/10",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/UnixSocketPairTest.InvalidSetSockOptLevel/11",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/UnixSocketPairTest.InvalidSetSockOptLevel/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/UnixSocketPairTest.InvalidSetSockOptLevel/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/UnixSocketPairTest.InvalidSetSockOptLevel/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/UnixSocketPairTest.InvalidSetSockOptLevel/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/UnixSocketPairTest.InvalidSetSockOptLevel/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/UnixSocketPairTest.InvalidSetSockOptLevel/7",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/UnixSocketPairTest.InvalidSetSockOptLevel/8",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/UnixSocketPairTest.InvalidSetSockOptLevel/9",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.IncreasedSocketSendBufUnblocksWrites/10",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.IncreasedSocketSendBufUnblocksWrites/11",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.IncreasedSocketSendBufUnblocksWrites/16",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.IncreasedSocketSendBufUnblocksWrites/17",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.IncreasedSocketSendBufUnblocksWrites/18",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.IncreasedSocketSendBufUnblocksWrites/19",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.IncreasedSocketSendBufUnblocksWrites/20",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.IncreasedSocketSendBufUnblocksWrites/21",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.IncreasedSocketSendBufUnblocksWrites/22",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.IncreasedSocketSendBufUnblocksWrites/23",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.IncreasedSocketSendBufUnblocksWrites/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.IncreasedSocketSendBufUnblocksWrites/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.IncreasedSocketSendBufUnblocksWrites/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.IncreasedSocketSendBufUnblocksWrites/7",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.IncreasedSocketSendBufUnblocksWrites/8",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.IncreasedSocketSendBufUnblocksWrites/9",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.PollOutAfterWriteShutdownIsCapacityBased/10",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.PollOutAfterWriteShutdownIsCapacityBased/11",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.PollOutAfterWriteShutdownIsCapacityBased/16",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.PollOutAfterWriteShutdownIsCapacityBased/17",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.PollOutAfterWriteShutdownIsCapacityBased/18",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.PollOutAfterWriteShutdownIsCapacityBased/19",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.PollOutAfterWriteShutdownIsCapacityBased/20",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.PollOutAfterWriteShutdownIsCapacityBased/21",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.PollOutAfterWriteShutdownIsCapacityBased/22",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.PollOutAfterWriteShutdownIsCapacityBased/23",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.PollOutAfterWriteShutdownIsCapacityBased/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.PollOutAfterWriteShutdownIsCapacityBased/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.PollOutAfterWriteShutdownIsCapacityBased/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.PollOutAfterWriteShutdownIsCapacityBased/7",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.PollOutAfterWriteShutdownIsCapacityBased/8",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_dgram_local",
+      "case": "DgramUnixSockets/DgramUnixSocketPairTest.PollOutAfterWriteShutdownIsCapacityBased/9",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_pair",
+      "case": "AllUnixDomainSockets/UnixSocketPairTest.InvalidGetSockOptLevel/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_pair",
+      "case": "AllUnixDomainSockets/UnixSocketPairTest.InvalidGetSockOptLevel/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_pair",
+      "case": "AllUnixDomainSockets/UnixSocketPairTest.InvalidGetSockOptLevel/10",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_pair",
+      "case": "AllUnixDomainSockets/UnixSocketPairTest.InvalidGetSockOptLevel/11",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_pair",
+      "case": "AllUnixDomainSockets/UnixSocketPairTest.InvalidGetSockOptLevel/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_pair",
+      "case": "AllUnixDomainSockets/UnixSocketPairTest.InvalidGetSockOptLevel/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_pair",
+      "case": "AllUnixDomainSockets/UnixSocketPairTest.InvalidGetSockOptLevel/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_pair",
+      "case": "AllUnixDomainSockets/UnixSocketPairTest.InvalidGetSockOptLevel/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_pair",
+      "case": "AllUnixDomainSockets/UnixSocketPairTest.InvalidGetSockOptLevel/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_pair",
+      "case": "AllUnixDomainSockets/UnixSocketPairTest.InvalidGetSockOptLevel/7",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_pair",
+      "case": "AllUnixDomainSockets/UnixSocketPairTest.InvalidGetSockOptLevel/8",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_pair",
+      "case": "AllUnixDomainSockets/UnixSocketPairTest.InvalidGetSockOptLevel/9",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_pair",
+      "case": "AllUnixDomainSockets/UnixSocketPairTest.InvalidSetSockOptLevel/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_pair",
+      "case": "AllUnixDomainSockets/UnixSocketPairTest.InvalidSetSockOptLevel/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_pair",
+      "case": "AllUnixDomainSockets/UnixSocketPairTest.InvalidSetSockOptLevel/10",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_pair",
+      "case": "AllUnixDomainSockets/UnixSocketPairTest.InvalidSetSockOptLevel/11",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_pair",
+      "case": "AllUnixDomainSockets/UnixSocketPairTest.InvalidSetSockOptLevel/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_pair",
+      "case": "AllUnixDomainSockets/UnixSocketPairTest.InvalidSetSockOptLevel/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_pair",
+      "case": "AllUnixDomainSockets/UnixSocketPairTest.InvalidSetSockOptLevel/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_pair",
+      "case": "AllUnixDomainSockets/UnixSocketPairTest.InvalidSetSockOptLevel/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_pair",
+      "case": "AllUnixDomainSockets/UnixSocketPairTest.InvalidSetSockOptLevel/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_pair",
+      "case": "AllUnixDomainSockets/UnixSocketPairTest.InvalidSetSockOptLevel/7",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_pair",
+      "case": "AllUnixDomainSockets/UnixSocketPairTest.InvalidSetSockOptLevel/8",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_pair",
+      "case": "AllUnixDomainSockets/UnixSocketPairTest.InvalidSetSockOptLevel/9",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_pair",
+      "case": "AllUnixDomainSockets/UnixSocketPeerCredTest.AfterConnectServerPeerCred/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_pair",
+      "case": "AllUnixDomainSockets/UnixSocketPeerCredTest.AfterConnectServerPeerCred/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_pair",
+      "case": "AllUnixDomainSockets/UnixSocketPeerCredTest.PeerCredAfterListen/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_pair",
+      "case": "AllUnixDomainSockets/UnixSocketPeerCredTest.PeerCredAfterListen/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_abstract",
+      "case": "AllUnixDomainSockets/UnboundAbstractUnixSocketPairTest.AutoBindAddrInUse/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_abstract",
+      "case": "AllUnixDomainSockets/UnboundAbstractUnixSocketPairTest.AutoBindAddrInUse/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_abstract",
+      "case": "AllUnixDomainSockets/UnboundAbstractUnixSocketPairTest.AutoBindAddrInUse/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_abstract",
+      "case": "AllUnixDomainSockets/UnboundAbstractUnixSocketPairTest.AutoBindAddrInUse/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_abstract",
+      "case": "AllUnixDomainSockets/UnboundAbstractUnixSocketPairTest.AutoBindAddrInUse/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_abstract",
+      "case": "AllUnixDomainSockets/UnboundAbstractUnixSocketPairTest.AutoBindAddrInUse/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_abstract",
+      "case": "AllUnixDomainSockets/UnboundAbstractUnixSocketPairTest.AutoBindSuccess/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_abstract",
+      "case": "AllUnixDomainSockets/UnboundAbstractUnixSocketPairTest.AutoBindSuccess/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_abstract",
+      "case": "AllUnixDomainSockets/UnboundAbstractUnixSocketPairTest.AutoBindSuccess/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_abstract",
+      "case": "AllUnixDomainSockets/UnboundAbstractUnixSocketPairTest.AutoBindSuccess/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_abstract",
+      "case": "AllUnixDomainSockets/UnboundAbstractUnixSocketPairTest.AutoBindSuccess/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_abstract",
+      "case": "AllUnixDomainSockets/UnboundAbstractUnixSocketPairTest.AutoBindSuccess/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_abstract",
+      "case": "AllUnixDomainSockets/UnboundAbstractUnixSocketPairTest.BindConnectInSubNamespace/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_abstract",
+      "case": "AllUnixDomainSockets/UnboundAbstractUnixSocketPairTest.BindConnectInSubNamespace/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_abstract",
+      "case": "AllUnixDomainSockets/UnboundAbstractUnixSocketPairTest.BindConnectInSubNamespace/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_abstract",
+      "case": "AllUnixDomainSockets/UnboundAbstractUnixSocketPairTest.BindConnectInSubNamespace/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_abstract",
+      "case": "AllUnixDomainSockets/UnboundAbstractUnixSocketPairTest.BindConnectInSubNamespace/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_abstract",
+      "case": "AllUnixDomainSockets/UnboundAbstractUnixSocketPairTest.BindConnectInSubNamespace/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_filesystem",
+      "case": "AllUnixDomainSockets/UnboundFilesystemUnixSocketPairTest.OpenSocketWithTruncate/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_filesystem",
+      "case": "AllUnixDomainSockets/UnboundFilesystemUnixSocketPairTest.OpenSocketWithTruncate/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_filesystem",
+      "case": "AllUnixDomainSockets/UnboundFilesystemUnixSocketPairTest.OpenSocketWithTruncate/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_filesystem",
+      "case": "AllUnixDomainSockets/UnboundFilesystemUnixSocketPairTest.OpenSocketWithTruncate/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_filesystem",
+      "case": "AllUnixDomainSockets/UnboundFilesystemUnixSocketPairTest.OpenSocketWithTruncate/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_filesystem",
+      "case": "AllUnixDomainSockets/UnboundFilesystemUnixSocketPairTest.OpenSocketWithTruncate/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnboundUnixStreamSocketPairTest.SendtoWithoutConnect/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnboundUnixStreamSocketPairTest.SendtoWithoutConnect/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnboundUnixStreamSocketPairTest.SendtoWithoutConnect/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnboundUnixStreamSocketPairTest.SendtoWithoutConnect/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnboundUnixStreamSocketPairTest.SendtoWithoutConnect/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnboundUnixStreamSocketPairTest.SendtoWithoutConnect/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnboundUnixStreamSocketPairTest.SendtoWithoutConnect/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnboundUnixStreamSocketPairTest.SendtoWithoutConnect/7",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnboundUnixStreamSocketPairTest.SendtoWithoutConnectIgnoresAddr/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnboundUnixStreamSocketPairTest.SendtoWithoutConnectIgnoresAddr/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnboundUnixStreamSocketPairTest.SendtoWithoutConnectIgnoresAddr/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnboundUnixStreamSocketPairTest.SendtoWithoutConnectIgnoresAddr/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnboundUnixStreamSocketPairTest.SendtoWithoutConnectIgnoresAddr/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnboundUnixStreamSocketPairTest.SendtoWithoutConnectIgnoresAddr/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnboundUnixStreamSocketPairTest.SendtoWithoutConnectIgnoresAddr/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnboundUnixStreamSocketPairTest.SendtoWithoutConnectIgnoresAddr/7",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnixStreamSocketPairTest.CoalescedCredsNoPasscred/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnixStreamSocketPairTest.CoalescedCredsNoPasscred/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnixStreamSocketPairTest.CoalescedCredsNoPasscred/10",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnixStreamSocketPairTest.CoalescedCredsNoPasscred/11",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnixStreamSocketPairTest.CoalescedCredsNoPasscred/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnixStreamSocketPairTest.CoalescedCredsNoPasscred/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnixStreamSocketPairTest.CoalescedCredsNoPasscred/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnixStreamSocketPairTest.CoalescedCredsNoPasscred/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnixStreamSocketPairTest.CoalescedCredsNoPasscred/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnixStreamSocketPairTest.CoalescedCredsNoPasscred/7",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnixStreamSocketPairTest.CoalescedCredsNoPasscred/8",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnixStreamSocketPairTest.CoalescedCredsNoPasscred/9",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnixStreamSocketPairTest.CoalescedDifferingCreds/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnixStreamSocketPairTest.CoalescedDifferingCreds/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnixStreamSocketPairTest.CoalescedDifferingCreds/10",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnixStreamSocketPairTest.CoalescedDifferingCreds/11",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnixStreamSocketPairTest.CoalescedDifferingCreds/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnixStreamSocketPairTest.CoalescedDifferingCreds/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnixStreamSocketPairTest.CoalescedDifferingCreds/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnixStreamSocketPairTest.CoalescedDifferingCreds/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnixStreamSocketPairTest.CoalescedDifferingCreds/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnixStreamSocketPairTest.CoalescedDifferingCreds/7",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnixStreamSocketPairTest.CoalescedDifferingCreds/8",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_unix_unbound_stream",
+      "case": "AllUnixDomainSockets/UnixStreamSocketPairTest.CoalescedDifferingCreds/9",
+      "before": "failed"
+    }
+  ],
+  "remaining": {
+    "SetSocketRecvBufForceAboveMax": 36,
+    "SetSocketRecvBufForceWithoutCapability": 36
+  },
+  "baseline": "Complete audited-accepted results from the Unix endpoint checkpoint, same 6093 exact cases and native oracle.",
+  "performance": {
+    "identity": {
+      "baseline_runtime": "8f6f44a7ee2e6a17e56e1922deb79e65b9a8896a",
+      "baseline_binary_sha256": "757dfeb2220da38953181c8d502754ca15a2ada5a9472600eb12307cf3167ec0",
+      "candidate_binary_sha256": "b44b20e497a4e654b4c50698331b33a220e04d4fa02b1995ca667e54bcdad91c",
+      "source_sha256": "14113835d78b2a77389376ef2bbd9a175ad1792c6edbcdaeb68f3355b25e9fb2",
+      "compiler": "rustc 1.101.0-nightly (4ebd25825 2026-10-15)\nbinary: rustc\ncommit-hash: 4ebd258257737d5b7635c116fa7d281627a7e937\ncommit-date: 2026-10-15\nhost: aarch64-apple-darwin\nrelease: 1.101.0-nightly\nLLVM version: 23.1.4\n",
+      "profiles": {
+        "overflow-checks": true,
+        "lto": "thin",
+        "incremental": false
+      },
+      "locks_identical": true,
+      "candidate_source_sha256": {
+        "crates/trames-linux/src/direct.rs": "1aca986a6f317edbc306e389e60ff7e19cbc7c73e9c3cefa7c244386b9b064d5",
+        "crates/trames-linux/src/direct/local_message.rs": "a26f69d66ee69200e4dce056898062b059ba6caea2fda60b371143b913bfd2da",
+        "crates/trames-linux/src/ioctl.rs": "f39fbfc47d4268b8cd511f93330722252b8af2dd70107f06f7958dac677a7b19",
+        "crates/trames-linux/src/network/local.rs": "ea3d2cde5d032bb2d36d860b865686a6cc1ba4c411706966dcff06c164aba503",
+        "crates/trames-linux/src/network/unix.rs": "de6564c1f8d1d463763b28072cc00f5de4ff4b6792dc8b5bf3a5cc865c8f3704",
+        "crates/trames-linux/src/network/unix/packet.rs": "02091f6ee1304bc886f8a07764da82c0eb03108ca7df7b06d4e79dab577bfb12",
+        "crates/trames-session/src/process_socket_wait.rs": "405355543a88f2cafa31d30ff859163b14bc17ea998fe4d902b69bb95de4c082",
+        "crates/trames-vfs/src/descriptor_factory.rs": "8ef3450cc4bbcba3b223f031821dbb837bd693382b4ff1365fb725f5a57b7d77",
+        "crates/trames-vfs/src/direct_io.rs": "aaa9d4de9fab6fcbfd3583f8b6aa7dbc9003af579e7ce986f4c5c6dc19cc14fe",
+        "crates/trames-vfs/src/ipc.rs": "3751761b82abce058388e90ce254bc855bf17da4b172b7a489c9e63be9dbcb77",
+        "crates/trames-vfs/src/ipc/channel.rs": "926b18f996f58983a7ba8fa6eebdb0754ce37c26f7e4d503ca7e704a4b6d9c42",
+        "crates/trames-vfs/src/ipc/control.rs": "d1efde74a2d2ab3027197f9953747236f55de7b224e17f8711d372faf7bb2fa9",
+        "crates/trames-vfs/src/ipc/datagram.rs": "1d8ba9492dde4cf0405da1f6c5a4878fc28b3debe1536b84f82d4e7cc58a96d7",
+        "crates/trames-vfs/src/lib.rs": "017a4b2ceed7151ea7865dde8ca3040d9f581c8606b207b2ed235006ab07f56a"
+      }
+    },
+    "measurements": {
+      "source_sha256": "14113835d78b2a77389376ef2bbd9a175ad1792c6edbcdaeb68f3355b25e9fb2",
+      "rounds": 15,
+      "iterations": 300000,
+      "method": "Two warmups, 15 alternating process pairs, same source/profile/dependencies; ns per send/read roundtrip or one poll. No conformance workers, CI or builds running.",
+      "samples": {
+        "before": [
+          {
+            "stream-64": 50.788,
+            "stream-4096": 113.775,
+            "dgram-64": 45.074,
+            "dgram-4096": 105.861,
+            "seqpacket-64": 46.42,
+            "recvmsg-stream-64": 59.911,
+            "addressed-dgram-64": 121.1,
+            "addressed-dgram-4096": 183.147,
+            "poll-empty": 5.422
+          },
+          {
+            "stream-64": 51.787,
+            "stream-4096": 115.306,
+            "dgram-64": 45.4,
+            "dgram-4096": 106.194,
+            "seqpacket-64": 46.406,
+            "recvmsg-stream-64": 61.729,
+            "addressed-dgram-64": 120.977,
+            "addressed-dgram-4096": 181.119,
+            "poll-empty": 5.406
+          },
+          {
+            "stream-64": 50.514,
+            "stream-4096": 113.644,
+            "dgram-64": 46.356,
+            "dgram-4096": 109.269,
+            "seqpacket-64": 45.856,
+            "recvmsg-stream-64": 60.947,
+            "addressed-dgram-64": 119.795,
+            "addressed-dgram-4096": 188.247,
+            "poll-empty": 5.446
+          },
+          {
+            "stream-64": 52.114,
+            "stream-4096": 129.523,
+            "dgram-64": 50.592,
+            "dgram-4096": 130.62,
+            "seqpacket-64": 55.182,
+            "recvmsg-stream-64": 76.216,
+            "addressed-dgram-64": 138.326,
+            "addressed-dgram-4096": 195.979,
+            "poll-empty": 6.402
+          },
+          {
+            "stream-64": 51.861,
+            "stream-4096": 112.068,
+            "dgram-64": 48.375,
+            "dgram-4096": 111.958,
+            "seqpacket-64": 48.642,
+            "recvmsg-stream-64": 62.757,
+            "addressed-dgram-64": 123.199,
+            "addressed-dgram-4096": 183.572,
+            "poll-empty": 5.491
+          },
+          {
+            "stream-64": 51.383,
+            "stream-4096": 114.175,
+            "dgram-64": 45.699,
+            "dgram-4096": 108.54,
+            "seqpacket-64": 45.834,
+            "recvmsg-stream-64": 60.675,
+            "addressed-dgram-64": 120.737,
+            "addressed-dgram-4096": 187.803,
+            "poll-empty": 5.4
+          },
+          {
+            "stream-64": 49.742,
+            "stream-4096": 112.966,
+            "dgram-64": 46.907,
+            "dgram-4096": 108.672,
+            "seqpacket-64": 46.359,
+            "recvmsg-stream-64": 61.538,
+            "addressed-dgram-64": 119.551,
+            "addressed-dgram-4096": 183.633,
+            "poll-empty": 5.527
+          },
+          {
+            "stream-64": 51.196,
+            "stream-4096": 116.538,
+            "dgram-64": 46.984,
+            "dgram-4096": 107.751,
+            "seqpacket-64": 45.831,
+            "recvmsg-stream-64": 62.659,
+            "addressed-dgram-64": 121.311,
+            "addressed-dgram-4096": 186.545,
+            "poll-empty": 5.624
+          },
+          {
+            "stream-64": 49.812,
+            "stream-4096": 116.189,
+            "dgram-64": 45.991,
+            "dgram-4096": 108.821,
+            "seqpacket-64": 46.409,
+            "recvmsg-stream-64": 62.005,
+            "addressed-dgram-64": 121.843,
+            "addressed-dgram-4096": 188.27,
+            "poll-empty": 5.392
+          },
+          {
+            "stream-64": 49.845,
+            "stream-4096": 115.227,
+            "dgram-64": 44.947,
+            "dgram-4096": 107.971,
+            "seqpacket-64": 46.333,
+            "recvmsg-stream-64": 59.453,
+            "addressed-dgram-64": 121.435,
+            "addressed-dgram-4096": 187.699,
+            "poll-empty": 5.444
+          },
+          {
+            "stream-64": 49.388,
+            "stream-4096": 109.965,
+            "dgram-64": 46.135,
+            "dgram-4096": 108.209,
+            "seqpacket-64": 45.914,
+            "recvmsg-stream-64": 60.385,
+            "addressed-dgram-64": 120.493,
+            "addressed-dgram-4096": 184.711,
+            "poll-empty": 5.349
+          },
+          {
+            "stream-64": 49.508,
+            "stream-4096": 112.56,
+            "dgram-64": 47.134,
+            "dgram-4096": 109.675,
+            "seqpacket-64": 45.577,
+            "recvmsg-stream-64": 62.332,
+            "addressed-dgram-64": 122.454,
+            "addressed-dgram-4096": 187.544,
+            "poll-empty": 5.591
+          },
+          {
+            "stream-64": 50.708,
+            "stream-4096": 115.801,
+            "dgram-64": 48.754,
+            "dgram-4096": 107.752,
+            "seqpacket-64": 47.742,
+            "recvmsg-stream-64": 61.346,
+            "addressed-dgram-64": 123.716,
+            "addressed-dgram-4096": 187.701,
+            "poll-empty": 5.685
+          },
+          {
+            "stream-64": 51.274,
+            "stream-4096": 116.631,
+            "dgram-64": 47.972,
+            "dgram-4096": 109.97,
+            "seqpacket-64": 46.064,
+            "recvmsg-stream-64": 62.655,
+            "addressed-dgram-64": 119.635,
+            "addressed-dgram-4096": 190.195,
+            "poll-empty": 5.5
+          },
+          {
+            "stream-64": 49.751,
+            "stream-4096": 116.518,
+            "dgram-64": 46.301,
+            "dgram-4096": 109.644,
+            "seqpacket-64": 45.644,
+            "recvmsg-stream-64": 61.733,
+            "addressed-dgram-64": 121.897,
+            "addressed-dgram-4096": 188.184,
+            "poll-empty": 5.504
+          }
+        ],
+        "after": [
+          {
+            "stream-64": 50.65,
+            "stream-4096": 111.275,
+            "dgram-64": 48.723,
+            "dgram-4096": 107.642,
+            "seqpacket-64": 47.134,
+            "recvmsg-stream-64": 63.549,
+            "addressed-dgram-64": 115.276,
+            "addressed-dgram-4096": 177.063,
+            "poll-empty": 5.44
+          },
+          {
+            "stream-64": 50.382,
+            "stream-4096": 115.557,
+            "dgram-64": 47.897,
+            "dgram-4096": 108.707,
+            "seqpacket-64": 53.244,
+            "recvmsg-stream-64": 63.56,
+            "addressed-dgram-64": 113.771,
+            "addressed-dgram-4096": 177.856,
+            "poll-empty": 5.442
+          },
+          {
+            "stream-64": 51.856,
+            "stream-4096": 113.467,
+            "dgram-64": 47.553,
+            "dgram-4096": 107.956,
+            "seqpacket-64": 47.128,
+            "recvmsg-stream-64": 60.489,
+            "addressed-dgram-64": 118.384,
+            "addressed-dgram-4096": 178.79,
+            "poll-empty": 5.478
+          },
+          {
+            "stream-64": 51.167,
+            "stream-4096": 113.752,
+            "dgram-64": 47.974,
+            "dgram-4096": 110.527,
+            "seqpacket-64": 47.554,
+            "recvmsg-stream-64": 61.549,
+            "addressed-dgram-64": 118.695,
+            "addressed-dgram-4096": 178.789,
+            "poll-empty": 5.742
+          },
+          {
+            "stream-64": 53.31,
+            "stream-4096": 112.362,
+            "dgram-64": 49.056,
+            "dgram-4096": 108.656,
+            "seqpacket-64": 48.542,
+            "recvmsg-stream-64": 64.55,
+            "addressed-dgram-64": 118.771,
+            "addressed-dgram-4096": 177.041,
+            "poll-empty": 5.532
+          },
+          {
+            "stream-64": 53.889,
+            "stream-4096": 118.086,
+            "dgram-64": 49.364,
+            "dgram-4096": 111.835,
+            "seqpacket-64": 48.013,
+            "recvmsg-stream-64": 61.998,
+            "addressed-dgram-64": 116.308,
+            "addressed-dgram-4096": 175.311,
+            "poll-empty": 5.404
+          },
+          {
+            "stream-64": 50.097,
+            "stream-4096": 116.319,
+            "dgram-64": 49.183,
+            "dgram-4096": 107.567,
+            "seqpacket-64": 47.805,
+            "recvmsg-stream-64": 62.648,
+            "addressed-dgram-64": 117.385,
+            "addressed-dgram-4096": 176.44,
+            "poll-empty": 5.528
+          },
+          {
+            "stream-64": 49.506,
+            "stream-4096": 111.883,
+            "dgram-64": 49.544,
+            "dgram-4096": 108.423,
+            "seqpacket-64": 48.473,
+            "recvmsg-stream-64": 63.517,
+            "addressed-dgram-64": 115.742,
+            "addressed-dgram-4096": 176.957,
+            "poll-empty": 5.447
+          },
+          {
+            "stream-64": 54.048,
+            "stream-4096": 117.709,
+            "dgram-64": 46.731,
+            "dgram-4096": 109.097,
+            "seqpacket-64": 47.019,
+            "recvmsg-stream-64": 63.687,
+            "addressed-dgram-64": 116.475,
+            "addressed-dgram-4096": 176.02,
+            "poll-empty": 5.374
+          },
+          {
+            "stream-64": 53.031,
+            "stream-4096": 114.944,
+            "dgram-64": 47.476,
+            "dgram-4096": 109.575,
+            "seqpacket-64": 47.603,
+            "recvmsg-stream-64": 62.917,
+            "addressed-dgram-64": 114.485,
+            "addressed-dgram-4096": 174.996,
+            "poll-empty": 5.395
+          },
+          {
+            "stream-64": 52.47,
+            "stream-4096": 116.161,
+            "dgram-64": 48.081,
+            "dgram-4096": 110.44,
+            "seqpacket-64": 47.129,
+            "recvmsg-stream-64": 61.165,
+            "addressed-dgram-64": 116.004,
+            "addressed-dgram-4096": 175.601,
+            "poll-empty": 5.387
+          },
+          {
+            "stream-64": 52.419,
+            "stream-4096": 113.746,
+            "dgram-64": 47.761,
+            "dgram-4096": 109.568,
+            "seqpacket-64": 47.989,
+            "recvmsg-stream-64": 62.213,
+            "addressed-dgram-64": 115.943,
+            "addressed-dgram-4096": 176.535,
+            "poll-empty": 5.415
+          },
+          {
+            "stream-64": 52.956,
+            "stream-4096": 120.162,
+            "dgram-64": 47.708,
+            "dgram-4096": 112.193,
+            "seqpacket-64": 48.581,
+            "recvmsg-stream-64": 64.249,
+            "addressed-dgram-64": 121.834,
+            "addressed-dgram-4096": 179.876,
+            "poll-empty": 5.476
+          },
+          {
+            "stream-64": 50.5,
+            "stream-4096": 117.517,
+            "dgram-64": 47.801,
+            "dgram-4096": 112.089,
+            "seqpacket-64": 47.43,
+            "recvmsg-stream-64": 64.607,
+            "addressed-dgram-64": 116.317,
+            "addressed-dgram-4096": 182.721,
+            "poll-empty": 5.663
+          },
+          {
+            "stream-64": 52.42,
+            "stream-4096": 116.286,
+            "dgram-64": 47.409,
+            "dgram-4096": 109.41,
+            "seqpacket-64": 47.232,
+            "recvmsg-stream-64": 63.891,
+            "addressed-dgram-64": 114.861,
+            "addressed-dgram-4096": 174.707,
+            "poll-empty": 5.447
+          }
+        ]
+      },
+      "summary": {
+        "stream-64": {
+          "before_ns": 50.708,
+          "after_ns": 52.419,
+          "median_delta_percent": 3.3742210302121878,
+          "paired_median_percent": 2.794007057326331,
+          "paired_p10_percent": -2.7130360901384543,
+          "paired_p90_percent": 6.391814625338554,
+          "before_range": [
+            49.388,
+            52.114
+          ],
+          "after_range": [
+            49.506,
+            54.048
+          ]
+        },
+        "stream-4096": {
+          "before_ns": 115.227,
+          "after_ns": 115.557,
+          "median_delta_percent": 0.28639121039339965,
+          "paired_median_percent": 0.26234072170467915,
+          "paired_p10_percent": -3.994405258370659,
+          "paired_p90_percent": 3.7659432992806607,
+          "before_range": [
+            109.965,
+            129.523
+          ],
+          "after_range": [
+            111.275,
+            120.162
+          ]
+        },
+        "dgram-64": {
+          "before_ns": 46.356,
+          "after_ns": 47.897,
+          "median_delta_percent": 3.32427301751661,
+          "paired_median_percent": 2.582190007765983,
+          "paired_p10_percent": -2.1454649874882104,
+          "paired_p90_percent": 8.019869143744929,
+          "before_range": [
+            44.947,
+            50.592
+          ],
+          "after_range": [
+            46.731,
+            49.544
+          ]
+        },
+        "dgram-4096": {
+          "before_ns": 108.672,
+          "after_ns": 109.41,
+          "median_delta_percent": 0.6791077738515838,
+          "paired_median_percent": 0.6236601052426405,
+          "paired_p10_percent": -2.9493202808195895,
+          "paired_p90_percent": 3.0357471899760347,
+          "before_range": [
+            105.861,
+            130.62
+          ],
+          "after_range": [
+            107.567,
+            112.193
+          ]
+        },
+        "seqpacket-64": {
+          "before_ns": 46.333,
+          "after_ns": 47.603,
+          "median_delta_percent": 2.7410269138626875,
+          "paired_median_percent": 2.7739009071877208,
+          "paired_p10_percent": -0.205583651987995,
+          "paired_p90_percent": 5.7646571098164845,
+          "before_range": [
+            45.577,
+            55.182
+          ],
+          "after_range": [
+            47.019,
+            53.244
+          ]
+        },
+        "recvmsg-stream-64": {
+          "before_ns": 61.729,
+          "after_ns": 63.517,
+          "median_delta_percent": 2.896531613990194,
+          "paired_median_percent": 2.712684460930559,
+          "paired_p10_percent": -0.7514725909396724,
+          "paired_p90_percent": 5.826451146283618,
+          "before_range": [
+            59.453,
+            76.216
+          ],
+          "after_range": [
+            60.489,
+            64.607
+          ]
+        },
+        "addressed-dgram-64": {
+          "before_ns": 121.311,
+          "after_ns": 116.308,
+          "median_delta_percent": -4.124110756650268,
+          "paired_median_percent": -4.405669591195238,
+          "paired_p10_percent": -5.95650412888401,
+          "paired_p90_percent": -1.5212260338193895,
+          "before_range": [
+            119.551,
+            138.326
+          ],
+          "after_range": [
+            113.771,
+            121.834
+          ]
+        },
+        "addressed-dgram-4096": {
+          "before_ns": 187.699,
+          "after_ns": 176.957,
+          "median_delta_percent": -5.722992663786175,
+          "paired_median_percent": -5.023718837484803,
+          "paired_p10_percent": -7.161607788122271,
+          "paired_p90_percent": -3.3219217349997554,
+          "before_range": [
+            181.119,
+            195.979
+          ],
+          "after_range": [
+            174.707,
+            182.721
+          ]
+        },
+        "poll-empty": {
+          "before_ns": 5.491,
+          "after_ns": 5.447,
+          "median_delta_percent": -0.8013112365689246,
+          "paired_median_percent": 0.018092998009766603,
+          "paired_p10_percent": -3.6763412489006053,
+          "paired_p90_percent": 0.7466763795301423,
+          "before_range": [
+            5.349,
+            6.402
+          ],
+          "after_range": [
+            5.374,
+            5.742
+          ]
+        }
+      }
+    },
+    "source": "// SPDX-License-Identifier: GPL-3.0-or-later\n//! Original Unix shared-resource hot paths, excluding guest boot and teardown.\n//! Run the same example against both runtime revisions, alternate processes and\n//! compare repeated release samples after all conformance workers have stopped.\nuse std::hint::black_box;\nuse std::time::Instant;\nuse trames_vfs::Vfs;\n\nfn main() {\n    let repetitions: usize = std::env::args()\n        .nth(1)\n        .map_or(200_000, |n| n.parse().unwrap());\n    assert!(repetitions > 0);\n    for (name, kind, size, message) in [\n        (\"stream-64\", 1, 64, false),\n        (\"stream-4096\", 1, 4096, false),\n        (\"dgram-64\", 2, 64, false),\n        (\"dgram-4096\", 2, 4096, false),\n        (\"seqpacket-64\", 5, 64, false),\n        (\"recvmsg-stream-64\", 1, 64, true),\n    ] {\n        let mut vfs = Vfs::default();\n        let [tx, rx] = vfs.socketpair(1, kind, 0).unwrap();\n        let fds = vfs.direct_descriptors();\n        let tx = fds.get(tx).unwrap();\n        let rx = fds.get(rx).unwrap();\n        let payload = vec![0x5a; size];\n        let start = Instant::now();\n        for _ in 0..repetitions {\n            assert_eq!(tx.write(black_box(&payload)).unwrap(), size);\n            let bytes = if message {\n                rx.recv_local_message(size, 0).unwrap().unwrap().data\n            } else {\n                rx.read(size).unwrap()\n            };\n            assert_eq!(black_box(&bytes).len(), size);\n        }\n        println!(\n            \"{name}\\t{:.3}\",\n            start.elapsed().as_nanos() as f64 / repetitions as f64\n        );\n        black_box(vfs);\n    }\n    for size in [64, 4096] {\n        let mut vfs = Vfs::default();\n        let tx = vfs.local_create(2, 0).unwrap();\n        let rx = vfs.local_create(2, 0).unwrap();\n        let tx = vfs.local_socket(tx).unwrap().unwrap();\n        let rx = vfs.local_socket(rx).unwrap().unwrap();\n        let name = b\"\\x01\\x00\\0perf-addressed\";\n        vfs.local_bind(&rx, name).unwrap();\n        let payload = vec![0x5a; size];\n        let start = Instant::now();\n        for _ in 0..repetitions {\n            assert_eq!(vfs.local_send_to(&tx, black_box(&payload), 0, Some(name), Default::default()).unwrap(), size);\n            assert_eq!(black_box(rx.recv(size, 0).unwrap().data).len(), size);\n        }\n        println!(\"addressed-dgram-{size}\\t{:.3}\", start.elapsed().as_nanos() as f64 / repetitions as f64);\n        black_box(vfs);\n    }\n    let mut vfs = Vfs::default();\n    let [a, _b] = vfs.socketpair(1, 1, 0).unwrap();\n    let fd = vfs.direct_descriptors().get(a).unwrap();\n    let start = Instant::now();\n    for _ in 0..repetitions * 8 {\n        black_box(fd.poll_ready(black_box(0x2005)).unwrap());\n    }\n    println!(\n        \"poll-empty\\t{:.3}\",\n        start.elapsed().as_nanos() as f64 / (repetitions * 8) as f64\n    );\n    black_box(vfs);\n}\n",
+    "before_manifest": "[package]\nname = \"trames-unix-measure\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[workspace]\n[[bin]]\nname = \"unix-io\"\npath = \"/Users/main/dev/trames/target/gvisor-network-20261119/perf/unix-io.rs\"\n[dependencies]\ntrames-vfs = { path = \"/Users/main/dev/trames-runtime/crates/trames-vfs\" }\n[profile.release]\noverflow-checks = true\nlto = \"thin\"\n[patch.crates-io]\nsmoltcp = { path = \"/Users/main/dev/trames-runtime/vendor/smoltcp\" }\nwayland-backend = { path = \"/Users/main/dev/trames-runtime/vendor/wayland-backend\" }\n",
+    "after_manifest": "[package]\nname = \"trames-unix-measure\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[workspace]\n[[bin]]\nname = \"unix-io\"\npath = \"/Users/main/dev/trames/target/gvisor-network-20261119/perf/unix-io.rs\"\n[dependencies]\ntrames-vfs = { path = \"/Users/main/dev/trames/runtime/crates/trames-vfs\" }\n[profile.release]\noverflow-checks = true\nlto = \"thin\"\n[patch.crates-io]\nsmoltcp = { path = \"/Users/main/dev/trames/runtime/vendor/smoltcp\" }\nwayland-backend = { path = \"/Users/main/dev/trames/runtime/vendor/wayland-backend\" }\n"
+  },
+  "checks": {
+    "runtime_macos": "8/8 local workflow steps passed",
+    "runtime_linux_arm64": "8/8 local workflow steps passed, RUST_MIN_STACK=8388608 for the previously verified test harness requirement",
+    "ipad_compile": "aarch64-apple-ios trames-core check passed",
+    "ipad_interpreter_unix": "11/11 passed",
+    "ipad_ffi": "24/24 passed",
+    "physical_ipad": "not contacted",
+    "installed_environments": "not restarted or replaced"
+  },
+  "evidence_root": "/Users/main/dev/trames/target/gvisor-network-20261119",
+  "runner_sha256": "393aa9811500c44d51c997ae4a09a1d232e261a934f3b08d06f77a90d9dcde78",
+  "source_sha256": {
+    "crates/trames-linux/src/direct.rs": "1aca986a6f317edbc306e389e60ff7e19cbc7c73e9c3cefa7c244386b9b064d5",
+    "crates/trames-linux/src/direct/local_message.rs": "a26f69d66ee69200e4dce056898062b059ba6caea2fda60b371143b913bfd2da",
+    "crates/trames-linux/src/ioctl.rs": "f39fbfc47d4268b8cd511f93330722252b8af2dd70107f06f7958dac677a7b19",
+    "crates/trames-linux/src/network/local.rs": "ea3d2cde5d032bb2d36d860b865686a6cc1ba4c411706966dcff06c164aba503",
+    "crates/trames-linux/src/network/unix.rs": "de6564c1f8d1d463763b28072cc00f5de4ff4b6792dc8b5bf3a5cc865c8f3704",
+    "crates/trames-linux/src/network/unix/packet.rs": "02091f6ee1304bc886f8a07764da82c0eb03108ca7df7b06d4e79dab577bfb12",
+    "crates/trames-session/src/process_socket_wait.rs": "405355543a88f2cafa31d30ff859163b14bc17ea998fe4d902b69bb95de4c082",
+    "crates/trames-vfs/src/descriptor_factory.rs": "8ef3450cc4bbcba3b223f031821dbb837bd693382b4ff1365fb725f5a57b7d77",
+    "crates/trames-vfs/src/direct_io.rs": "aaa9d4de9fab6fcbfd3583f8b6aa7dbc9003af579e7ce986f4c5c6dc19cc14fe",
+    "crates/trames-vfs/src/ipc.rs": "3751761b82abce058388e90ce254bc855bf17da4b172b7a489c9e63be9dbcb77",
+    "crates/trames-vfs/src/ipc/channel.rs": "926b18f996f58983a7ba8fa6eebdb0754ce37c26f7e4d503ca7e704a4b6d9c42",
+    "crates/trames-vfs/src/ipc/control.rs": "d1efde74a2d2ab3027197f9953747236f55de7b224e17f8711d372faf7bb2fa9",
+    "crates/trames-vfs/src/ipc/datagram.rs": "1d8ba9492dde4cf0405da1f6c5a4878fc28b3debe1536b84f82d4e7cc58a96d7",
+    "crates/trames-vfs/src/lib.rs": "017a4b2ceed7151ea7865dde8ca3040d9f581c8606b207b2ed235006ab07f56a"
+  },
+  "limits": [
+    "The remaining 72 failures require CLONE_NEWUSER; no expectations or namespace authorization checks were weakened.",
+    "Receiver record ceiling remains 128; skb truesize and max_dgram_qlen sysctl tunability are not claimed.",
+    "Only the 17 selected Unix groups were rerun; other network families and disabled upstream cases are unchanged.",
+    "Microbenchmarks measure original resources, not guest startup, application performance or aggregate network bandwidth."
+  ]
+}

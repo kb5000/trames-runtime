@@ -107,17 +107,42 @@ impl Vfs {
         bytes: &[u8],
     ) -> Result<()> {
         let _transition = socket.transition.lock().unwrap();
-        let (name, abstract_) = Self::local_address(bytes)?;
         if socket.name.borrow().len() != 2 {
             return Err(Errno(22));
         }
+        let (name, abstract_) = if bytes == [1, 0] {
+            // Allocation belongs to the socket's original network namespace.
+            // Collision probing is confined to this cold bind operation.
+            let mut ns = socket.namespace.borrow_mut();
+            let mut found = None;
+            for _ in 0..(1 << 20) {
+                let id = ns.next_autobind;
+                ns.next_autobind = (id + 1) & 0xfffff;
+                let mut name = vec![1, 0, 0];
+                name.extend_from_slice(format!("{id:05x}").as_bytes());
+                if ns
+                    .abstract_names
+                    .get(&name)
+                    .and_then(std::sync::Weak::upgrade)
+                    .is_none()
+                {
+                    ns.abstract_names
+                        .insert(name.clone(), Arc::downgrade(socket));
+                    found = Some(name);
+                    break;
+                }
+            }
+            (found.ok_or(Errno(28))?, true)
+        } else {
+            Self::local_address(bytes)?
+        };
         if abstract_ {
             let mut ns = socket.namespace.borrow_mut();
             if ns
                 .abstract_names
                 .get(&name)
                 .and_then(std::sync::Weak::upgrade)
-                .is_some()
+                .is_some_and(|bound| !Arc::ptr_eq(&bound, socket))
             {
                 return Err(Errno(98));
             }
@@ -143,6 +168,9 @@ impl Vfs {
             let _ = socket.pathname_binding.set(binding);
         }
         *socket.name.borrow_mut() = name;
+        // Packets queued before bind retain their original unbound address.
+        // Future sends share a new immutable source snapshot.
+        *socket.datagram_source.borrow_mut() = None;
         Ok(())
     }
     pub(crate) fn local_destination_core(

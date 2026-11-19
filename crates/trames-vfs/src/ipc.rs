@@ -148,12 +148,13 @@ pub struct LocalResource {
     listener: SharedCell<Option<Listener>>,
     listen_epoch: AtomicU64,
     kind: u32,
-    reuse: [std::sync::atomic::AtomicU32; 2],
+    reuse: [std::sync::atomic::AtomicU32; 5],
     passcred: std::sync::atomic::AtomicBool,
     timestamp: std::sync::atomic::AtomicU32,
     timeouts: SharedCell<[Option<std::time::Duration>; 2]>,
     linger: SharedCell<[u32; 2]>,
     datagram_peer: SharedCell<std::sync::Weak<LocalResource>>,
+    datagram_source: SharedCell<Option<Arc<channel::DatagramSource>>>,
 }
 /// One accepted complete Unix OFD, independent of later close/numeric reuse.
 #[derive(Clone)]
@@ -191,6 +192,7 @@ struct Listener {
 pub(super) struct LocalNamespace {
     abstract_names: BTreeMap<Vec<u8>, std::sync::Weak<LocalResource>>,
     sockets: Vec<std::sync::Weak<LocalResource>>,
+    next_autobind: u32,
 }
 pub struct LocalReceived<R = LocalRights> {
     pub data: Vec<u8>,
@@ -268,6 +270,7 @@ impl LocalResource {
             timeouts: SharedCell::new([None, None]),
             linger: SharedCell::new([0; 2]),
             datagram_peer: SharedCell::new(std::sync::Weak::new()),
+            datagram_source: SharedCell::default(),
         })
     }
     pub fn set_io_timeout(&self, receive: bool, duration: Option<std::time::Duration>) {
@@ -355,6 +358,7 @@ impl LocalResource {
         } else {
             if let Some(identity) = identity {
                 self.credentials.set(identity);
+                self.peer_credentials.set(identity);
             }
             *listener = Some(Listener {
                 backlog,
@@ -386,11 +390,27 @@ impl LocalResource {
         }
         if matches!(option, 7 | 8 | 32 | 33) {
             let binding = self.channel.borrow();
-            binding
-                .resource
-                .set_buffer_unnotified(self.side(), matches!(option, 8 | 33), value);
+            // Non-force hints have a common 4 MiB ceiling. Force requires
+            // NET_ADMIN and still uses the signed Linux integer ABI.
+            let requested = if matches!(option, 32 | 33) {
+                (value as i32).clamp(0, i32::MAX / 2) as u32
+            } else {
+                value.min(4 * 1024 * 1024)
+            };
+            binding.resource.set_buffer_unnotified(
+                self.side(),
+                matches!(option, 8 | 33),
+                requested,
+            );
             drop(transition);
             binding.resource.readiness.notify_locked();
+            return Ok(());
+        }
+        if option == 18 {
+            self.channel
+                .borrow()
+                .resource
+                .set_low_water(self.side(), value);
             return Ok(());
         }
         if option == 16 {
@@ -404,6 +424,9 @@ impl LocalResource {
         let i = match option {
             2 => 0,
             15 => 1,
+            6 => 2,
+            9 => 3,
+            11 => 4,
             _ => return Err(Errno(92)),
         };
         self.reuse[i].store(u32::from(value != 0), Ordering::Relaxed);
@@ -416,7 +439,17 @@ impl LocalResource {
         if option == 16 {
             return u32::from(self.passcred.load(Ordering::Relaxed));
         }
-        self.reuse[usize::from(option == 15)].load(Ordering::Relaxed)
+        if option == 18 {
+            return self.channel.borrow().resource.low_water(self.side());
+        }
+        let i = match option {
+            15 => 1,
+            6 => 2,
+            9 => 3,
+            11 => 4,
+            _ => 0,
+        };
+        self.reuse[i].load(Ordering::Relaxed)
     }
     pub fn buffer_size(&self, receive: bool) -> usize {
         self.channel

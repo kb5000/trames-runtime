@@ -911,7 +911,7 @@ impl DirectSyscalls {
         Self::supports_fd(number, fd)
             && (number != 29
                 || fd.is_entropy_device() && !matches!(args[1] as u32, 0x5421 | 0x5452)
-                || args[1] as u32 == 0x541b
+                || (args[1] as u32 == 0x541b || args[1] as u32 == 0x5411 && fd.is_unix())
                 || fd.is_pty() && !matches!(args[1] as u32, 0x5421 | 0x5452)
                 || fd.pty_endpoint().is_some()
                     && (crate::pty_control_request(args[1] as u32) || args[1] as u32 == 0x5441))
@@ -1035,6 +1035,11 @@ impl DirectSyscalls {
                     fd.is_entropy_device() && !matches!(args[1] as u32, 0x5421 | 0x5452)
                 })
                 || args[1] as u32 == 0x541b
+                || args[1] as u32 == 0x5411
+                    && self
+                        .descriptors
+                        .get(args[0] as u32)
+                        .is_some_and(|fd| fd.is_unix())
                 || self
                     .descriptors
                     .get(args[0] as u32)
@@ -1340,6 +1345,16 @@ impl DirectSyscalls {
                         }
                     };
                 }
+                if args[1] as u32 == 0x5411 && fd.is_unix() {
+                    Linux::check(memory, args[2], 4, Access::Write)?;
+                    memory
+                        .write_array(
+                            args[2],
+                            (fd.local_outgoing_bytes().expect("Unix OFD") as u32).to_le_bytes(),
+                        )
+                        .map_err(|_| Errno(14))?;
+                    return Ok(0);
+                }
                 if args[1] as u32 != 0x541b {
                     let Some(bytes) = fd.terminal_query(args[1] as u32) else {
                         deferred.set(true);
@@ -1386,6 +1401,16 @@ impl DirectSyscalls {
                 fd.is_eventfd(),
                 write,
             ),
+            206 if args[4] != 0 => Err(Errno(
+                if fd
+                    .local_operation()
+                    .is_some_and(|socket| socket.name(true).is_ok())
+                {
+                    106
+                } else {
+                    95
+                },
+            )),
             206 => crate::network::local::send(args, memory, &mut self.scratch.borrow_mut(), write),
             207 => crate::network::local::recv(args, memory, read),
             210 => fd.shutdown(args[1] as u32).map(|()| 0),
@@ -1670,7 +1695,7 @@ impl DirectSyscalls {
         ))
     }
     fn retain_byte(&self, number: u32, args: [u64; 6]) -> Option<Result<RetainedByte, Errno>> {
-        if !matches!(number, 29 | 63..=70 | 286 | 287) {
+        if !matches!(number, 29 | 63..=70 | 206 | 207 | 286 | 287) {
             return None;
         }
         if number == 29
@@ -1713,7 +1738,7 @@ impl DirectSyscalls {
         if number == 29 && (!fd.is_pty() || !Self::supports_fd_call(number, args, &fd)) {
             return None;
         }
-        if fd.host_console() {
+        if fd.host_console() || matches!(number, 206 | 207) && !fd.is_unix() {
             return None;
         }
         if matches!(number, 67..=70) && !fd.positioned_bytes() {
@@ -2274,9 +2299,34 @@ impl DirectSyscalls {
                 .get(pending.args[0] as u32)
                 .and_then(|fd| fd.next_deadline())
         };
+        if matches!(pending.number, 207 | 212 | 243)
+            && pending.deadline.is_some_and(|d| Instant::now() >= d)
+        {
+            let slot = if pending.number == 212 { 2 } else { 3 };
+            pending.args[slot] |= 0x40;
+        }
         let result = if let Some(fd) = &pending.native_tcp {
             self.transfer_tcp(fd, pending.number, pending.args, memory)
         } else if let Some(file) = &pending.retained_byte {
+            if file.fd.local_kind() == 1
+                && matches!(pending.number, 63 | 65)
+                && pending.deadline.is_some_and(|d| Instant::now() >= d)
+            {
+                // SO_RCVLOWAT can leave a stream prefix queued. Expiration
+                // returns that prefix, using the original OFD and guest ABI.
+                let read = |count| {
+                    file.fd
+                        .recv_local_message(count, 0x40)
+                        .expect("Unix stream")
+                        .map(|received| received.data)
+                };
+                let result = if pending.number == 63 {
+                    Linux::read_transport(pending.args, memory, read)
+                } else {
+                    Linux::readv_transport_mode(pending.args, memory, false, read)
+                };
+                return self.complete_pending(&pending, result, memory);
+            }
             let Some(result) =
                 self.transfer_retained(file, pending.number, pending.args, memory, original_paths)
             else {
@@ -2373,7 +2423,12 @@ impl DirectSyscalls {
                 }
             };
             return match self.transfer_fd(&file.fd, number, args, memory)? {
-                Err(Errno(11)) if self.terminal_stop.get() || !file.fd.nonblocking() => None,
+                Err(Errno(11))
+                    if self.terminal_stop.get()
+                        || !file.fd.nonblocking() && socket_flags(number, args) & 0x40 == 0 =>
+                {
+                    None
+                }
                 result => {
                     let result = self.byte_pipe_signal(&file.fd, number, args, result);
                     self.complete_byte(&file, result);

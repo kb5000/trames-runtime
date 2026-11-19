@@ -4,14 +4,65 @@
 use super::super::*;
 use super::shared_rights::{QueuedRights, SharedRights};
 use crate::readiness::Readiness;
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicU64, AtomicUsize, Ordering},
+    Mutex,
+};
 
+// Keep the queued record aligned for AArch64 vector loads/stores. Sender
+// metadata replaces the old per-packet source Vec rather than enlarging it.
+#[repr(align(16))]
 struct Packet {
     data: Vec<u8>,
     rights: Option<QueuedRights>,
     credentials: Option<[u32; 3]>,
     timestamp: Option<[u64; 2]>,
-    source: Vec<u8>,
+    source: Option<DatagramCharge>,
+}
+
+// Only addressed datagrams need accounting shared across different receivers.
+// A charge owns no endpoint or OFD: queued self-sends cannot create a cycle.
+struct DatagramBudget {
+    used: AtomicUsize,
+    limit: AtomicUsize,
+    epoch: AtomicU64,
+    readiness: Arc<Readiness>,
+}
+pub(super) struct DatagramSource {
+    budget: Arc<DatagramBudget>,
+    name: Vec<u8>,
+}
+struct DatagramCharge {
+    source: Arc<DatagramSource>,
+    bytes: usize,
+}
+impl DatagramSource {
+    fn charge(self: Arc<Self>, length: usize) -> Result<DatagramCharge> {
+        // Even an empty packet consumes queue metadata. Ordinary paired queues
+        // keep their existing single-lock accounting and need no atomic charge.
+        let bytes = length + std::mem::size_of::<Packet>();
+        self.budget
+            .used
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                (used < self.budget.limit.load(Ordering::Relaxed)).then_some(used + bytes)
+            })
+            .map_err(|_| Errno(11))?;
+        Ok(DatagramCharge {
+            source: self,
+            bytes,
+        })
+    }
+}
+impl Drop for DatagramCharge {
+    fn drop(&mut self) {
+        self.source
+            .budget
+            .used
+            .fetch_sub(self.bytes, Ordering::Relaxed);
+        self.source.budget.epoch.fetch_add(1, Ordering::Relaxed);
+        // The packet retires outside the receiving queue lock.
+        self.source.budget.readiness.notify_locked();
+    }
 }
 struct Data {
     queues: [VecDeque<Packet>; 2],
@@ -25,6 +76,7 @@ struct Data {
     timestamp: [u32; 2],
     send_limit: [usize; 2],
     receive_limit: [usize; 2],
+    receive_low_water: [usize; 2],
 }
 pub(crate) struct Received {
     pub data: Vec<u8>,
@@ -41,6 +93,7 @@ pub(crate) struct Resource {
     kind: u32,
     data: Mutex<Data>,
     pub readiness: Arc<Readiness>,
+    datagram_budget: Option<Arc<DatagramBudget>>,
 }
 impl Resource {
     pub fn kind(&self) -> u32 {
@@ -55,6 +108,14 @@ impl Resource {
         readiness: Arc<Readiness>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            datagram_budget: (kind == 2 && !connected).then(|| {
+                Arc::new(DatagramBudget {
+                    used: AtomicUsize::new(0),
+                    limit: AtomicUsize::new(PIPE_CAPACITY),
+                    epoch: AtomicU64::new(0),
+                    readiness: readiness.clone(),
+                })
+            }),
             ends: Default::default(),
             kind,
             data: Mutex::new(Data {
@@ -76,6 +137,7 @@ impl Resource {
                     },
                 ],
                 receive_limit: [PIPE_CAPACITY; 2],
+                receive_low_water: [1; 2],
             }),
             readiness,
         })
@@ -106,6 +168,16 @@ impl Resource {
     pub fn set_timestamp(&self, side: usize, mode: u32) {
         self.data.lock().unwrap().timestamp[side] = mode;
     }
+    pub fn set_low_water(&self, side: usize, value: u32) {
+        self.data.lock().unwrap().receive_low_water[side] = if (value as i32) < 0 {
+            i32::MAX as usize
+        } else {
+            value.max(1) as usize
+        };
+    }
+    pub fn low_water(&self, side: usize) -> u32 {
+        self.data.lock().unwrap().receive_low_water[side] as u32
+    }
     pub fn buffer_size(&self, side: usize, receive: bool) -> usize {
         let data = self.data.lock().unwrap();
         if receive {
@@ -122,6 +194,7 @@ impl Resource {
                 data.receive_limit[from],
                 data.passcred[from],
                 data.timestamp[from],
+                data.receive_low_water[from],
             )
         };
         let mut data = self.data.lock().unwrap();
@@ -129,10 +202,19 @@ impl Resource {
         data.receive_limit[side] = values.1;
         data.passcred[side] = values.2;
         data.timestamp[side] = values.3;
+        data.receive_low_water[side] = values.4;
     }
     pub(super) fn set_buffer_unnotified(&self, side: usize, receive: bool, requested: u32) {
+        // Linux clamps before doubling, including negative force requests.
+        // No backing allocation is reserved by this observable socket hint.
         let bytes = (u64::from(requested) * 2)
-            .clamp(if receive { 256 } else { 2048 }, i32::MAX as u64) as usize;
+            .clamp(if receive { 2304 } else { 2048 }, i32::MAX as u64) as usize;
+        if !receive {
+            if let Some(budget) = &self.datagram_budget {
+                budget.limit.store(bytes, Ordering::Relaxed);
+                budget.epoch.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         let mut data = self.data.lock().unwrap();
         if receive {
             data.receive_limit[side] = bytes;
@@ -211,7 +293,7 @@ impl Resource {
         flags: u32,
         identity: Option<[u32; 3]>,
     ) -> Result<usize> {
-        self.send_ancillary(side, bytes, flags, None, identity, Vec::new(), false)
+        self.send_ancillary(side, bytes, flags, None, identity, false)
     }
     pub(super) fn send_shared(
         &self,
@@ -241,19 +323,45 @@ impl Resource {
         } else {
             (!rights.is_empty()).then_some(QueuedRights::Shared(rights))
         };
-        self.send_ancillary(side, bytes, flags, rights, identity, Vec::new(), explicit)
+        self.send_ancillary(side, bytes, flags, rights, identity, explicit)
     }
+    pub(super) fn datagram_source(&self, name: Vec<u8>) -> Arc<DatagramSource> {
+        Arc::new(DatagramSource {
+            budget: self
+                .datagram_budget
+                .as_ref()
+                .expect("addressed datagram")
+                .clone(),
+            name,
+        })
+    }
+    pub fn outgoing_bytes(&self, side: usize) -> usize {
+        self.datagram_budget.as_ref().map_or_else(
+            || self.data.lock().unwrap().used[1 - side],
+            |budget| budget.used.load(Ordering::Relaxed),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn send_addressed(
         &self,
         bytes: &[u8],
         flags: u32,
         rights: Option<QueuedRights>,
         identity: [u32; 3],
-        source: Vec<u8>,
+        source: Arc<DatagramSource>,
         explicit: bool,
     ) -> Result<usize> {
-        self.send_ancillary(1, bytes, flags, rights, Some(identity), source, explicit)
+        self.send_ancillary_charged::<true>(
+            1,
+            bytes,
+            flags,
+            rights,
+            Some(identity),
+            explicit,
+            Some(source),
+        )
     }
+    #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn send_ancillary(
         &self,
@@ -262,12 +370,25 @@ impl Resource {
         flags: u32,
         rights: Option<QueuedRights>,
         identity: Option<[u32; 3]>,
-        source: Vec<u8>,
         explicit: bool,
     ) -> Result<usize> {
         if flags & !(0x40 | 0x4000 | 0x40000000) != 0 {
             return Err(Errno(95));
         }
+        self.send_ancillary_charged::<false>(side, bytes, flags, rights, identity, explicit, None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn send_ancillary_charged<const ADDRESSED: bool>(
+        &self,
+        side: usize,
+        bytes: &[u8],
+        flags: u32,
+        rights: Option<QueuedRights>,
+        identity: Option<[u32; 3]>,
+        explicit: bool,
+        mut source: Option<Arc<DatagramSource>>,
+    ) -> Result<usize> {
+        debug_assert_eq!(flags & !(0x40 | 0x4000 | 0x40000000), 0);
         self.change(|data| {
             data.send_check(side, self.kind)?;
             if self.kind == 1 && bytes.is_empty() {
@@ -313,12 +434,24 @@ impl Resource {
                     .data
                     .extend_from_slice(&bytes[..count]);
             } else if count != 0 || self.kind != 1 {
+                // Compile distinct paired/addressed entry points. Ordinary
+                // streams and socketpairs never execute sender-budget code.
+                let charge = if ADDRESSED {
+                    Some(
+                        source
+                            .take()
+                            .expect("addressed sender source")
+                            .charge(count)?,
+                    )
+                } else {
+                    None
+                };
                 queue.push_back(Packet {
                     data: bytes[..count].to_vec(),
                     rights: rights.clone(),
                     credentials,
                     timestamp,
-                    source,
+                    source: charge,
                 });
             }
             data.used[peer] += count;
@@ -335,7 +468,11 @@ impl Resource {
         flags: u32,
         allow_rights: bool,
     ) -> Option<Result<Received>> {
-        self.recv_mode(side, count, flags, allow_rights, false)
+        if self.datagram_budget.is_some() {
+            self.recv_mode::<true>(side, count, flags, allow_rights, false)
+        } else {
+            self.recv_mode::<false>(side, count, flags, allow_rights, false)
+        }
     }
     pub(crate) fn recv_portable(
         &self,
@@ -343,7 +480,15 @@ impl Resource {
         count: usize,
         flags: u32,
     ) -> Option<Result<Received>> {
-        self.recv_mode(side, count, flags, true, false)
+        self.recv_mode::<true>(side, count, flags, true, false)
+    }
+    pub(crate) fn recv_paired_portable(
+        &self,
+        side: usize,
+        count: usize,
+        flags: u32,
+    ) -> Option<Result<Received>> {
+        self.recv_mode::<false>(side, count, flags, true, false)
     }
     pub(crate) fn recv_message(
         &self,
@@ -351,7 +496,11 @@ impl Resource {
         count: usize,
         flags: u32,
     ) -> Option<Result<Received>> {
-        self.recv_mode(side, count, flags, true, true)
+        if self.datagram_budget.is_some() {
+            self.recv_mode::<true>(side, count, flags, true, true)
+        } else {
+            self.recv_mode::<false>(side, count, flags, true, true)
+        }
     }
     pub(crate) fn recv_message_bytes(
         &self,
@@ -359,9 +508,9 @@ impl Resource {
         count: usize,
         flags: u32,
     ) -> Option<Result<Received>> {
-        self.recv_mode(side, count, flags, false, true)
+        self.recv_mode::<false>(side, count, flags, false, true)
     }
-    fn recv_mode(
+    fn recv_mode<const ADDRESSED: bool>(
         &self,
         side: usize,
         count: usize,
@@ -377,7 +526,8 @@ impl Resource {
         if self.kind == 1 && flags & 0x100 != 0 && flags & 0x40 == 0 && count > PIPE_CAPACITY {
             return Some(Err(Errno(95)));
         }
-        self.change(|data| {
+        let mut retired = None;
+        let result = self.change(|data| {
             let options = [u32::from(data.passcred[side]), data.timestamp[side]];
             let peer = 1 - side;
             let eof = data.read_closed[side];
@@ -447,11 +597,23 @@ impl Resource {
                     rights: packet.rights.clone(),
                     credentials: packet.credentials,
                     timestamp: packet.timestamp,
-                    source: packet.source.clone(),
+                    source: packet
+                        .source
+                        .as_ref()
+                        .map_or_else(Vec::new, |charge| charge.source.name.clone()),
                     options,
                 };
                 if flags & 2 == 0 {
-                    queue.pop_front();
+                    // The returned rights clone keeps every original OFD
+                    // alive. Only the sender charge can notify on retirement;
+                    // carry that small token out of Data, not a whole Packet.
+                    if ADDRESSED {
+                        retired = queue
+                            .pop_front()
+                            .and_then(|mut packet| packet.source.take());
+                    } else {
+                        queue.pop_front();
+                    }
                     data.used[side] -= length;
                     data.epochs[peer][1] = data.epochs[peer][1].wrapping_add(1);
                 }
@@ -461,8 +623,12 @@ impl Resource {
             let mut rights = None;
             let credentials = queue.front().and_then(|p| p.credentials);
             let timestamp = queue.front().and_then(|p| p.timestamp);
+            let mut boundary = false;
             for packet in queue.iter() {
-                if packet.credentials != credentials || packet.timestamp != timestamp {
+                if data.passcred[side] && packet.credentials != credentials
+                    || packet.timestamp != timestamp
+                {
+                    boundary = true;
                     break;
                 }
                 if !ancillary && (packet.credentials.is_some() || packet.timestamp.is_some()) {
@@ -485,10 +651,16 @@ impl Resource {
                 }
             }
             if flags & 2 == 0 {
-                if flags & 0x100 != 0
+                if (flags & 0x100 != 0 || data.receive_low_water[side] > 1)
                     && flags & 0x40 == 0
                     && !eof
-                    && bytes.len() < count
+                    && !boundary
+                    && bytes.len()
+                        < if flags & 0x100 != 0 {
+                            count
+                        } else {
+                            count.min(data.receive_low_water[side])
+                        }
                     && rights.is_none()
                 {
                     return Some(Err(Errno(11)));
@@ -520,7 +692,9 @@ impl Resource {
                 source: Vec::new(),
                 options,
             }))
-        })
+        });
+        drop(retired);
+        result
     }
     pub fn poll(&self, side: usize, events: u16) -> (u16, [u64; 2]) {
         let data = self.data.lock().unwrap();
@@ -529,25 +703,30 @@ impl Resource {
         let queue = &data.queues[side];
         let send_queue = &data.queues[peer];
         let room = data.send_limit[side].saturating_sub(data.used[peer]);
+        let writable = if let Some(budget) = &self.datagram_budget {
+            budget.used.load(Ordering::Relaxed) <= budget.limit.load(Ordering::Relaxed) / 4
+        } else {
+            room != 0
+                && (send_queue.len() < 128
+                    || self.kind == 1 && send_queue.back().is_some_and(|p| p.rights.is_none()))
+        };
         let ready = (if !queue.is_empty() || eof {
             events & 1
         } else {
             0
-        }) | (if room != 0
-            && (send_queue.len() < 128
-                || self.kind == 1 && send_queue.back().is_some_and(|p| p.rights.is_none()))
-        {
-            events & 4
-        } else {
-            0
-        }) | (if eof { events & 0x2000 } else { 0 })
+        }) | (if writable { events & 4 } else { 0 })
+            | (if eof { events & 0x2000 } else { 0 })
             | (if !data.alive[peer] || (eof && data.write_closed[side]) {
                 16
             } else {
                 0
             })
             | if data.error[side] != 0 { 8 } else { 0 };
-        (ready, data.epochs[side])
+        let mut epochs = data.epochs[side];
+        if let Some(budget) = &self.datagram_budget {
+            epochs[1] = epochs[1].wrapping_add(budget.epoch.load(Ordering::Relaxed));
+        }
+        (ready, epochs)
     }
 }
 impl Received {

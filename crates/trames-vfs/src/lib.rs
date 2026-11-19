@@ -2358,7 +2358,7 @@ impl Vfs {
         } else {
             flags
         };
-        if flags & !ALLOWED != 0 || flags & 3 == 3 || (flags & 0x200 != 0 && flags & 3 == 0) {
+        if flags & !ALLOWED != 0 || flags & 3 == 3 {
             return Err(Errno(22));
         }
         if flags & 0x40 != 0 && path.last() == Some(&b'/') {
@@ -2578,7 +2578,7 @@ impl Vfs {
                     && (self.credentials.euid == 0
                         || self.credentials.has_cap(capabilities::NET_ADMIN)))
                 && ((flags & 3 != 1 && !self.allowed(&n, 4))
-                    || (flags & 3 != 0 && !self.allowed(&n, 2)))
+                    || ((flags & 3 != 0 || flags & 0x200 != 0) && !self.allowed(&n, 2)))
             {
                 return Err(Errno(13));
             }
@@ -2594,7 +2594,7 @@ impl Vfs {
                 return Err(Errno(13));
             }
         }
-        if flags & O_PATH == 0 && flags & 3 != 0 {
+        if flags & O_PATH == 0 && (flags & 3 != 0 || flags & 0x200 != 0) {
             self.overlay_prepare(&p, &node, flags & 0x200 != 0)?;
         }
         let disk_file = if flags & O_PATH == 0 {

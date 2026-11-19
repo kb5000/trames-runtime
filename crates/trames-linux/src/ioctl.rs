@@ -33,6 +33,16 @@ pub(crate) fn call(vfs: &mut Vfs, a: [u64; 6], memory: &mut impl CpuMemory) -> R
             trames_vfs::binder::Started::Read(mut read) => read.finish(memory)?.ok_or(Errno(11)),
         };
     }
+    if a[1] as u32 == 0x5411 {
+        if let Some(file) = vfs.direct_descriptors().get(a[0] as u32) {
+            if let Some(bytes) = file.local_outgoing_bytes() {
+                memory
+                    .write_array(a[2], (bytes as u32).to_le_bytes())
+                    .map_err(|_| Errno(14))?;
+                return Ok(0);
+            }
+        }
+    }
     if a[1] as u32 == 0x541b {
         if let Some(bytes) = vfs.readable_bytes(a[0] as u32)? {
             memory

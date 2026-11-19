@@ -59,7 +59,7 @@ pub(crate) fn send(
     send: impl FnOnce(&[u8]) -> Result<u64>,
 ) -> Result<u64> {
     if a[4] != 0 {
-        return Err(Errno(106));
+        return Err(Errno(95));
     }
     Linux::write_transport(a, memory, scratch, send)
 }

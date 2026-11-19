@@ -66,7 +66,7 @@ impl DescriptorFactory {
         if !matches!(kind & 0xf, 1 | 2 | 3 | 5) {
             return Err(Errno(94));
         }
-        if protocol != 0 {
+        if protocol > 1 {
             return Err(Errno(93));
         }
         // Linux unix_create normalizes SOCK_RAW to SOCK_DGRAM once, before

@@ -22,6 +22,11 @@ The [Unix endpoint checkpoint](../../docs/validation/gvisor-unix-endpoints-20261
 repairs RAW creation, shutdown/readiness, zero-length receives, reset errors and
 datagram reconnect/accept semantics, with paired hot-path measurements.
 
+The [Unix flow-control checkpoint](../../docs/validation/gvisor-unix-flow-control-20261119.md)
+adds real addressed-sender accounting, receive completion, socket options and
+autobind, reaching 98.76% of native-passing Unix cases; 72 user-namespace-dependent
+cases remain, with explicit performance samples and limitations.
+
 ## Build on native ARM64 Linux
 
 Install a C++17 compiler, CMake, Ninja, Python 3 and ordinary static glibc/libstdc++

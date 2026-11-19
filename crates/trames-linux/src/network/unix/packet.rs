@@ -52,6 +52,9 @@ impl PreparedPacket {
     ) -> Result<Self> {
         let sending = matches!(number, 64 | 66 | 206);
         let destination = if number == 206 && a[4] != 0 {
+            if io.kind() == 1 {
+                return Err(Errno(if io.connected() { 106 } else { 95 }));
+            }
             Some(address(memory, a[4], a[5])?)
         } else {
             None

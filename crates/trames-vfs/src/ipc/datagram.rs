@@ -109,7 +109,7 @@ impl LocalDatagram {
         explicit: bool,
     ) -> Result<usize> {
         let receiver = self.receiver()?;
-        let source = self.source.name.borrow().clone();
+        let source = self.source.datagram_source();
         self.channel.resource.send_addressed(
             bytes,
             flags,
@@ -156,6 +156,15 @@ impl LocalSocket {
 }
 
 impl LocalResource {
+    fn datagram_source(&self) -> Arc<channel::DatagramSource> {
+        let mut source = self.datagram_source.borrow_mut();
+        source
+            .get_or_insert_with(|| {
+                self.datagram_resource()
+                    .datagram_source(self.name.borrow().clone())
+            })
+            .clone()
+    }
     fn check_datagram_sender(&self, source: &LocalResource) -> Result<()> {
         if self.connected() {
             let expected = self.datagram_peer.borrow().upgrade();
@@ -180,7 +189,7 @@ impl LocalResource {
         }
         let peer = self.datagram_peer.borrow().upgrade().ok_or(Errno(111))?;
         peer.check_datagram_sender(self)?;
-        let source = self.name.borrow().clone();
+        let source = self.datagram_source();
         let channel = peer.channel.borrow().clone();
         channel.resource.send_addressed(
             bytes,
@@ -311,6 +320,124 @@ impl Vfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn addressed_packets_keep_the_source_name_at_send_time_across_late_bind() {
+        let mut v = Vfs::default();
+        let tx = v.local_create(2, 0).unwrap();
+        let rx = v.local_create(2, 0).unwrap();
+        let sender = v.local_socket(tx).unwrap().unwrap();
+        let receiver = v.local_socket(rx).unwrap().unwrap();
+        let target = b"\x01\x00\0snapshot-target";
+        let name = b"\x01\x00\0snapshot-source";
+        v.local_bind(&receiver, target).unwrap();
+        v.local_send_to(&sender, b"old", 0, Some(target), Default::default())
+            .unwrap();
+        v.local_bind(&sender, name).unwrap();
+        v.local_send_to(&sender, b"new", 0, Some(target), Default::default())
+            .unwrap();
+        assert_eq!(receiver.recv(3, 0).unwrap().source, [1, 0]);
+        assert_eq!(receiver.recv(3, 0).unwrap().source, name);
+        assert_eq!(sender.datagram_resource().outgoing_bytes(0), 0);
+    }
+    #[test]
+    fn addressed_sender_budget_spans_receivers_and_releases_on_receive_or_final_close() {
+        let mut v = Vfs::default();
+        let tx = v.local_create(2, 0).unwrap();
+        let sender = v.local_socket(tx).unwrap().unwrap();
+        sender.set_reuse(7, 1024).unwrap();
+        let mut receivers = Vec::new();
+        for name in [b"\x01\x00\0a", b"\x01\x00\0b"] {
+            let fd = v.local_create(2, 0).unwrap();
+            let socket = v.local_socket(fd).unwrap().unwrap();
+            v.local_bind(&socket, name).unwrap();
+            receivers.push((fd, socket));
+        }
+        for _ in 0..2 {
+            v.local_send_to(
+                &sender,
+                &[1; 1024],
+                0x40,
+                Some(b"\x01\x00\0a"),
+                Default::default(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            v.local_send_to(
+                &sender,
+                b"x",
+                0x40,
+                Some(b"\x01\x00\0b"),
+                Default::default()
+            ),
+            Err(Errno(11))
+        );
+        assert_eq!(sender.poll(4) & 4, 0);
+        sender.set_reuse(7, 4096).unwrap();
+        v.local_send_to(
+            &sender,
+            b"b",
+            0x40,
+            Some(b"\x01\x00\0b"),
+            Default::default(),
+        )
+        .unwrap();
+        let data = sender.datagram_resource();
+        let used = data.outgoing_bytes(0);
+        receivers[0].1.recv(1, 2).unwrap();
+        assert_eq!(data.outgoing_bytes(0), used, "peek retains charge");
+        receivers[0].1.recv(1, 0).unwrap();
+        assert!(
+            data.outgoing_bytes(0) < used,
+            "truncated receive retires whole packet"
+        );
+        let (fd, socket) = receivers.remove(0);
+        v.close(fd).unwrap();
+        drop(socket);
+        assert!(
+            data.outgoing_bytes(0) < 1024,
+            "final receiver close releases its other packet"
+        );
+        receivers[0].1.recv(1, 0).unwrap();
+        assert_eq!(data.outgoing_bytes(0), 0);
+        assert_eq!(sender.poll(4) & 4, 4);
+    }
+    #[test]
+    fn zero_length_self_datagrams_are_charged_and_capacity_probes_do_not_notify() {
+        let mut v = Vfs::default();
+        let fd = v.local_create(2, 0).unwrap();
+        let socket = v.local_socket(fd).unwrap().unwrap();
+        let name = b"\x01\x00\0self-budget";
+        v.local_bind(&socket, name).unwrap();
+        socket.set_reuse(7, 1024).unwrap();
+        let mut filled = 0;
+        loop {
+            match v.local_send_to(&socket, b"", 0x40, Some(name), Default::default()) {
+                Ok(0) => {
+                    filled += 1;
+                    assert!(filled < 128);
+                }
+                Err(Errno(11)) => break,
+                other => panic!("empty packet: {other:?}"),
+            }
+        }
+        let signal = IoSignal::new(1, std::sync::Weak::<Wake>::new());
+        let _sub = socket.subscribe(&signal);
+        assert_eq!(
+            v.local_send_to(&socket, b"", 0x40, Some(name), Default::default()),
+            Err(Errno(11))
+        );
+        assert!(!signal.ready(), "a failed probe is not a readiness event");
+        for _ in 0..filled {
+            socket.recv(0, 0).unwrap();
+        }
+        assert!(signal.ready());
+        assert_eq!(socket.datagram_resource().outgoing_bytes(0), 0);
+    }
+    struct Wake;
+    impl IoWake for Wake {
+        fn wake_io(&self, _: &Arc<IoSignal>) {}
+    }
     #[test]
     fn addressed_credentials_follow_explicit_and_endpoint_requests_at_send_time() {
         for mode in 0..3 {

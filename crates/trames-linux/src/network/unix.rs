@@ -136,7 +136,7 @@ pub(crate) fn control(
         }
         208 => {
             if a[1] != 1 {
-                return Err(Errno(92));
+                return Err(Errno(95));
             }
             if matches!(a[2], 20 | 21 | 66 | 67) {
                 socket.set_io_timeout(matches!(a[2], 20 | 66), timeout_option(memory, a)?);
@@ -168,7 +168,7 @@ pub(crate) fn control(
         }
         209 => {
             if a[1] != 1 {
-                return Err(Errno(92));
+                return Err(Errno(95));
             }
             if a[2] == 4 {
                 return read_option(memory, a, || Ok(socket.take_error().to_le_bytes()));
@@ -206,7 +206,7 @@ pub(crate) fn control(
                 return Ok(0);
             }
             let value: u32 = match a[2] {
-                2 | 15 | 16 | 29 | 35 | 63 | 64 => socket.reuse(a[2] as u32),
+                2 | 6 | 9 | 11 | 15 | 16 | 18 | 29 | 35 | 63 | 64 => socket.reuse(a[2] as u32),
                 3 => socket.kind(),
                 7 | 8 => socket.buffer_size(a[2] == 8) as u32,
                 30 => u32::from(socket.listening()),
@@ -236,6 +236,7 @@ pub(crate) fn control(
 pub(crate) trait MessageIo {
     type Rights: Clone;
     fn kind(&self) -> u32;
+    fn connected(&self) -> bool;
     fn send_buffer(&self) -> usize;
     fn nonblocking(&self) -> u32;
     fn recv(
@@ -281,6 +282,9 @@ impl MessageIo for OwnerMessage<'_> {
     type Rights = trames_vfs::LocalRights;
     fn kind(&self) -> u32 {
         self.socket.kind()
+    }
+    fn connected(&self) -> bool {
+        self.socket.name(true).is_ok()
     }
     fn send_buffer(&self) -> usize {
         self.socket.buffer_size(false)

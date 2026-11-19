@@ -1039,6 +1039,10 @@ impl DirectFd {
             _ => 0,
         }
     }
+    pub fn local_outgoing_bytes(&self) -> Option<usize> {
+        let (data, side) = self.local_data()?;
+        Some(data.outgoing_bytes(side))
+    }
     pub fn local_send_buffer(&self) -> usize {
         self.local_data()
             .map_or(0, |(data, side)| data.buffer_size(side, false))
@@ -1510,10 +1514,12 @@ impl DirectFd {
             if self.flags & O_PATH != 0 || self.flags & 3 == 1 {
                 return Some(Err(Errno(9)));
             }
-            let (data, side) = self.local_data()?;
-            return data
-                .recv_portable(side, count, 0)
-                .map(|r| r.map(|r| r.data));
+            let received = match &self.resource {
+                ByteResource::Unix { data, side } => data.recv_paired_portable(*side, count, 0),
+                ByteResource::UnixDatagram(data) => data.recv_portable(0, count, 0),
+                _ => unreachable!("Unix resource"),
+            };
+            return received.map(|r| r.map(|r| r.data));
         }
         if let ByteResource::SimpleDevice(kind) = self.resource {
             return Some(
