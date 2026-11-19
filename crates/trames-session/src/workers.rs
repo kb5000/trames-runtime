@@ -800,7 +800,9 @@ impl<C: Cpu> Starter<C> {
                                     let call = job.retry.take().unwrap();
                                     let tcp_handoff=call.tcp_liveness.is_some();
                                     let _tcp_liveness=call.tcp_liveness;
-                                    if let Some(aio) = call.aio {
+                                    if let Some(message) = call.message {
+                                        snapshot.direct.start_retained_message(message, work.memory.as_deref_mut().expect("worker view"), work.pid, &epoch.as_ref().unwrap().io_target)
+                                    } else if let Some(aio) = call.aio {
                                         snapshot.direct.start_retained_aio(aio, work.memory.as_deref_mut().expect("worker view"), work.pid, &epoch.as_ref().unwrap().io_target)
                                     } else if let Some(file) = call.file {
                                         snapshot.direct.start_retained_file(file,call.number,call.args,work.memory.as_deref_mut().expect("worker view"),work.pid,&epoch.as_ref().unwrap().io_target)
@@ -1415,6 +1417,7 @@ mod tests {
         );
         job.retry = Some(crate::run_queue::IoCall {
             aio: None,
+            message: None,
             file: None,
             file_checkpoint: None,
             uring: None,

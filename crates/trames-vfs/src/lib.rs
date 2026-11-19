@@ -14,6 +14,7 @@ mod cgroup;
 pub use cgroup::{CgroupBirth, CgroupTask};
 mod fs_context;
 mod path_queries;
+pub mod sysv_message;
 pub use path_queries::PathQueries;
 mod fs_data;
 #[cfg(all(feature = "hostfs", unix))]
@@ -224,6 +225,7 @@ pub const PIPE_CAPACITY: usize = 65536;
 pub const AT_FDCWD: i32 = -100;
 pub const O_DIRECTORY: u32 = 0x4000;
 pub const O_NOFOLLOW: u32 = 0x8000;
+pub const O_DIRECT: u32 = 0x10000;
 pub const O_LARGEFILE: u32 = 0x20000;
 pub const O_NOATIME: u32 = 0x40000;
 pub const O_CLOEXEC: u32 = 0x80000;
@@ -2348,6 +2350,7 @@ impl Vfs {
             | 0x200
             | 0x400
             | 0x800
+            | O_DIRECT
             | O_DIRECTORY
             | O_NOFOLLOW
             | O_LARGEFILE
@@ -2574,6 +2577,12 @@ impl Vfs {
             if matches!(n.content, Content::Directory) && flags & 3 != 0 {
                 return Err(Errno(21));
             }
+            if matches!(n.content, Content::Directory)
+                && flags & O_DIRECT != 0
+                && flags & O_PATH == 0
+            {
+                return Err(Errno(22));
+            }
             if flags & O_DIRECTORY != 0 && !matches!(n.content, Content::Directory) {
                 return Err(Errno(20));
             }
@@ -2604,7 +2613,7 @@ impl Vfs {
         }
         let disk_file = if flags & O_PATH == 0 {
             match &node.borrow().content {
-                Content::File(data) => data.private_lease(flags & 3 != 0)?,
+                Content::File(data) => data.private_lease(flags & 3 != 0 || flags & 0x200 != 0)?,
                 _ => None,
             }
         } else {
@@ -2699,11 +2708,11 @@ impl Vfs {
         } else {
             None
         };
-        let flags = if pipe.is_some() {
+        let flags = if flags & O_PATH == 0 {
             flags | 0x20000
         } else {
             flags
-        }; // Linux O_LARGEFILE on named FIFOs
+        }; // ARM64 openat forces O_LARGEFILE except for O_PATH.
         let notification = if let Some(original) = original {
             inotify::FileClose::reopen(&node, flags, original.notification.as_ref())
         } else {
@@ -4153,11 +4162,11 @@ mod process_tests {
         child.set_status_flags(fd, 2 | O_NONBLOCK).unwrap();
         assert_eq!(
             query_fd_flags(parent.fd_flags_snapshot().get(fd).unwrap(), 3),
-            Ok((2 | O_NONBLOCK) as u64)
+            Ok((2 | O_NONBLOCK | O_LARGEFILE) as u64)
         );
         assert_eq!(
             query_fd_flags(old.get(fd).unwrap(), 3),
-            Ok((2 | O_NONBLOCK) as u64)
+            Ok((2 | O_NONBLOCK | O_LARGEFILE) as u64)
         );
         child.set_cloexec(fd, false).unwrap();
         assert_eq!(

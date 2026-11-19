@@ -472,6 +472,15 @@ impl Vfs {
             path.writable()?;
         }
         let node = view.node(&path)?;
+        if mode & 1 != 0
+            && matches!(node.borrow().content, Content::File(_))
+            && path
+                .mount
+                .as_ref()
+                .is_some_and(|m| m.flags.get() & mounts::MS_NOEXEC != 0)
+        {
+            return Err(Errno(13));
+        }
         if view.allowed(&node.borrow(), mode) {
             Ok(())
         } else {

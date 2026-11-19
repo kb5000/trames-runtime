@@ -26,6 +26,16 @@ impl<M> std::ops::DerefMut for CpuSlice<'_, M> {
 }
 
 pub trait CpuMemory {
+    /// VMA inheritance changes require original mapping custody. A worker View
+    /// declines before effects and uses the existing affected-mm transaction.
+    fn advise_fork(
+        &mut self,
+        _address: u64,
+        _len: u64,
+        _advice: u32,
+    ) -> Option<Result<(), MemoryError>> {
+        None
+    }
     /// Capture original mapped writeback resources, without reading/faulting
     /// bytes. An embedding missing this capability defers before effects.
     fn prepare_sync(
@@ -171,6 +181,14 @@ pub trait CpuMemory {
 }
 
 impl CpuMemory for Memory {
+    fn advise_fork(
+        &mut self,
+        address: u64,
+        len: u64,
+        advice: u32,
+    ) -> Option<Result<(), MemoryError>> {
+        Some(Memory::advise_fork(self, address, len, advice))
+    }
     fn prepare_sync(
         &self,
         address: u64,

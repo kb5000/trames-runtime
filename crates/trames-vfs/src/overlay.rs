@@ -226,6 +226,9 @@ impl Overlay {
         let upper = self.upper.as_ref().ok_or(Errno(30))?;
         Vfs::filesystem_empty_data(&mut upper.fs.borrow_mut())
     }
+    pub(super) fn uncopied_inode(&self, node: &NodeRef) -> bool {
+        self.uncopied.borrow().contains(&pointer(node))
+    }
     fn copy_up(&self, node: &NodeRef, truncate: bool) -> Result<()> {
         let id = pointer(node);
         if !self.uncopied.borrow().contains(&id) {

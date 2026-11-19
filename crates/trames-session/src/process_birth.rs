@@ -255,6 +255,75 @@ impl Birth {
         }
         Ok(())
     }
+    /// Import clone3 once, then use the same original-task birth transaction as
+    /// clone. No guest pointer or partially published child survives validation.
+    pub(super) fn clone_entry<C: Cpu>(
+        &self,
+        pid: u32,
+        p: &mut Process<C>,
+        number: u32,
+        a: [u64; 6],
+    ) -> Result<Child<C>, Errno> {
+        if number == 220 {
+            return self.clone_task(pid, p, a);
+        }
+        assert_eq!(number, 435);
+        if a[1] < 64 {
+            return Err(Errno(22));
+        }
+        if a[1] > trames_memory::PAGE_SIZE {
+            return Err(Errno(7));
+        }
+        let mut bytes = vec![0; a[1] as usize];
+        p.memory.read(a[0], &mut bytes).map_err(|_| Errno(14))?;
+        if bytes
+            .get(88..)
+            .is_some_and(|tail| tail.iter().any(|b| *b != 0))
+        {
+            return Err(Errno(7));
+        }
+        let word = |offset: usize| {
+            let mut value = [0; 8];
+            let count = bytes.len().saturating_sub(offset).min(8);
+            value[..count]
+                .copy_from_slice(&bytes[offset.min(bytes.len())..offset.min(bytes.len()) + count]);
+            u64::from_le_bytes(value)
+        };
+        let flags = word(0);
+        let signal = word(32);
+        const CLEAR_SIGHAND: u64 = 1 << 32;
+        if flags & (0xff | 0x0040_0000) != 0
+            || flags & CLEAR_SIGHAND != 0 && flags & 0x800 != 0
+            || flags & (0x8000 | 0x10000) != 0 && signal != 0
+            || signal > 64
+            || word(64) != 0
+            || word(72) != 0
+            || flags & (1 << 33) != 0
+        {
+            return Err(Errno(22));
+        }
+        let stack = word(40);
+        let size = word(48);
+        if (stack == 0) != (size == 0) {
+            return Err(Errno(22));
+        }
+        let top = stack
+            .checked_add(size)
+            .filter(|top| *top < trames_memory::ADDRESS_LIMIT)
+            .ok_or(Errno(22))?;
+        // CLONE_PARENT inherits its creator's SIGCHLD relationship. Threads
+        // have no independent exit signal; both require zero in clone_args.
+        let signal = if flags & 0x8000 != 0 && flags & 0x10000 == 0 {
+            17
+        } else {
+            signal
+        };
+        self.clone_task(
+            pid,
+            p,
+            [flags | signal, top, word(24), word(56), word(16), 0],
+        )
+    }
     pub(super) fn clone_task<C: Cpu>(
         &self,
         pid: u32,
@@ -268,6 +337,7 @@ impl Birth {
             | 0x10000
             | 0xfc0000
             | 0x1000000
+            | (1 << 32)
             | trames_vfs::CLONE_NEWUSER
             | trames_vfs::CLONE_NEWUTS
             | trames_vfs::CLONE_NEWNS
@@ -288,6 +358,7 @@ impl Birth {
             || (!threaded && a[0] & 255 != 17)
             || (threaded && (a[0] & 0x900 != 0x900 || a[0] & 255 != 0))
             || (a[0] & 0x800 != 0 && !shared_vm)
+            || (a[0] & (1 << 32) != 0 && a[0] & 0x800 != 0)
         {
             return Err(Errno(22));
         }
@@ -305,6 +376,10 @@ impl Birth {
             a[0] & 0x800 != 0,
             Arc::new(slot.into_presence()),
         );
+        if a[0] & (1 << 32) != 0 {
+            // Reset before any PID, signal policy or family publication.
+            child.signals.actions = child.signals.actions.exec();
+        }
         if a[0] & trames_vfs::CLONE_NEWUSER != 0 {
             child.linux.vfs.unshare_user()?;
         }
@@ -438,6 +513,74 @@ impl Birth {
 mod tests {
     use super::*;
     use trames_vfs::ProcSource;
+
+    #[test]
+    fn clone3_import_failures_do_not_reserve_or_publish_children() {
+        let kernel = super::super::tests::kernel();
+        let mut parent = super::super::tests::admitted_process(&kernel);
+        let birth = Birth::capture(&kernel);
+        let created = birth.ids.created();
+        for (address, length, error) in [
+            (0x1000, 0, 22),
+            (0x1000, 63, 22),
+            (0, 88, 14),
+            (0x1000, 4097, 7),
+        ] {
+            assert!(
+                matches!(birth.clone_entry(1, &mut parent, 435, [address, length, 0, 0, 0, 0]), Err(Errno(e)) if e == error)
+            );
+        }
+        parent.memory.write(0x1000, &[0; 96]).unwrap();
+        parent.memory.write(0x1058, &[1]).unwrap();
+        assert!(matches!(
+            birth.clone_entry(1, &mut parent, 435, [0x1000, 96, 0, 0, 0, 0]),
+            Err(Errno(7))
+        ));
+        parent.memory.write(0x1058, &[0]).unwrap();
+        parent
+            .memory
+            .write_array(0x1000, (1u64 << 63).to_le_bytes())
+            .unwrap();
+        assert!(matches!(
+            birth.clone_entry(1, &mut parent, 435, [0x1000, 88, 0, 0, 0, 0]),
+            Err(Errno(22))
+        ));
+        assert_eq!(birth.ids.created(), created);
+    }
+
+    #[test]
+    fn clone3_versions_use_original_birth_tid_tls_stack_and_signal_resources() {
+        for size in [64, 80, 88, 96] {
+            let kernel = super::super::tests::kernel();
+            let mut parent = super::super::tests::admitted_process(&kernel);
+            parent.signals.actions.set_handler(10, 0x7000);
+            parent.signals.actions.set_handler(12, 1);
+            parent.memory.write(0x1000, &[0; 96]).unwrap();
+            for (offset, value) in [
+                (0, (1u64 << 32) | 0x100000 | 0x80000),
+                (24, 0x1800),
+                (32, 17),
+                (40, 0x4000),
+                (48, 0x1000),
+                (56, 0x1234),
+            ] {
+                parent
+                    .memory
+                    .write_array(0x1000 + offset, value.to_le_bytes())
+                    .unwrap();
+            }
+            let child = Birth::capture(&kernel)
+                .clone_entry(1, &mut parent, 435, [0x1000, size, 0, 0, 0, 0])
+                .unwrap();
+            assert_eq!(child.value, Some(child.id as u64));
+            assert_eq!(read_u32(&parent.memory, 0x1800).unwrap(), child.id);
+            assert_eq!(child.process.cpu.sp(), 0x5000);
+            assert_eq!(child.process.cpu.architectural_state().tpidr_el0, 0x1234);
+            assert_eq!(child.process.signals.actions.get(10).handler, 0);
+            assert_eq!(child.process.signals.actions.get(12).handler, 1);
+            assert_eq!(parent.signals.actions.get(10).handler, 0x7000);
+        }
+    }
 
     #[test]
     fn parallel_builders_publish_original_children_without_a_kernel() {

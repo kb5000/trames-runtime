@@ -830,6 +830,28 @@ mod tests {
         owner.close(fd).unwrap();
         epoch.finish();
     }
+
+    #[test]
+    fn readonly_open_truncates_once_without_granting_write_or_ftruncate_authority() {
+        let mut owner = Vfs::default();
+        owner.import_file(b"/file", b"old bytes".to_vec()).unwrap();
+        let query = owner.path_queries();
+        let mut epoch = FileEpoch::default();
+        let files = epoch.capture(&owner, true);
+        assert!(query
+            .open_at_resolve(AT_FDCWD, b"/file", 0x200, 0, 0, &files)
+            .is_none());
+        let FileOutcome::Complete(reply) = query.take_open_work().unwrap().run() else {
+            panic!("original inode truncation");
+        };
+        let FileValue::Count(fd) = reply.result.unwrap() else {
+            panic!("published descriptor");
+        };
+        assert_eq!(owner.pread(fd as u32, 20, 0).unwrap(), b"");
+        assert_eq!(owner.flags(fd as u32).unwrap() & 3, 0);
+        assert!(owner.write(fd as u32, b"forbidden").is_err());
+        assert_eq!(owner.truncate_fd(fd as u32, 1), Err(Errno(22)));
+    }
     #[test]
     fn concurrent_exclusive_create_has_one_inode_and_disjoint_published_fds() {
         let mut owner = Vfs::default();

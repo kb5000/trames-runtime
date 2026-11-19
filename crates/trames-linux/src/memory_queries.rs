@@ -87,7 +87,7 @@ fn mincore(memory: &mut impl CpuMemory, a: [u64; 6]) -> Option<Result<u64, Errno
 }
 
 fn advice(memory: &mut impl CpuMemory, a: [u64; 6]) -> Option<Result<u64, Errno>> {
-    if !a[0].is_multiple_of(PAGE_SIZE) || !matches!(a[2] as u32,0..=3|14..=17) {
+    if !a[0].is_multiple_of(PAGE_SIZE) || !matches!(a[2] as u32,0..=3|10..=11|14..=19) {
         return Some(Err(Errno(22)));
     }
     if a[1] == 0 {
@@ -97,6 +97,14 @@ fn advice(memory: &mut impl CpuMemory, a: [u64; 6]) -> Option<Result<u64, Errno>
         Ok(len) => len,
         Err(error) => return Some(Err(error)),
     };
+    if matches!(a[2] as u32, 10 | 11 | 18 | 19) {
+        return Some(
+            memory
+                .advise_fork(a[0], len, a[2] as u32)?
+                .map(|()| 0)
+                .map_err(Linux::memory_errno),
+        );
+    }
     Some(
         memory
             .validate_mapped(a[0], len)?

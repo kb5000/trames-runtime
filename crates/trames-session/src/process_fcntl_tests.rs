@@ -67,10 +67,15 @@ fn complete_fd_control_uses_original_credentials_and_seals_without_joined_dispat
         };
         let noatime = trames_vfs::O_NOATIME as u64;
         fcntl(owned, 4, noatime, 0);
-        fcntl(alias, 3, 0, (noatime | 2) as i64);
+        fcntl(
+            alias,
+            3,
+            0,
+            (noatime | 2 | trames_vfs::O_LARGEFILE as u64) as i64,
+        );
         fcntl(foreign, 4, noatime, -1);
         fcntl(foreign, 4, noatime | 0x80000000, -1);
-        fcntl(owned, 4, 0x80000000, -22);
+        fcntl(owned, 4, noatime | 0x80000000, 0);
         fcntl(path, 4, u64::MAX, -9);
         fcntl(owned, 12, u64::MAX, -22);
         fcntl(path, 12, u64::MAX, -9);
@@ -150,7 +155,7 @@ fn complete_fd_control_uses_original_credentials_and_seals_without_joined_dispat
         }
         assert_eq!(
             root.linux.vfs.flags(alias).unwrap(),
-            2 | trames_vfs::O_NOATIME
+            2 | trames_vfs::O_NOATIME | trames_vfs::O_LARGEFILE
         );
         assert_eq!(root.linux.vfs.seals(busy, None), Ok(16));
         assert_eq!(root.linux.vfs.seals(seal, None), Ok(15));

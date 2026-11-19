@@ -22,6 +22,8 @@ mod ip_message;
 mod local_message;
 mod locks;
 mod memory_sync;
+pub(crate) mod message;
+pub use message::RetainedMessage;
 pub(crate) mod namespace;
 #[cfg(test)]
 mod netlink;
@@ -42,6 +44,7 @@ fn tcp_wait_fd(tcp: &trames_net::DirectTcp) -> std::io::Result<trames_vfs::HostF
 pub struct PendingIo {
     binder: Option<Box<trames_vfs::binder::Ioctl>>,
     pub aio: Option<RetainedAio>,
+    pub message: Option<RetainedMessage>,
     pub number: u32,
     pub args: [u64; 6],
     pub deadline: Option<Instant>,
@@ -985,6 +988,9 @@ impl DirectSyscalls {
         std::mem::swap(&mut *self.scratch.borrow_mut(), buffer);
     }
     pub fn supports_call(&self, number: u32, args: [u64; 6]) -> bool {
+        if matches!(number, 186..=189) {
+            return self.resources.is_some();
+        }
         if matches!(number, 28 | 86 | 87) && self.paths.is_some() {
             return true;
         }
@@ -1177,6 +1183,7 @@ impl DirectSyscalls {
             PendingIo {
                 binder: None,
                 aio: None,
+                message: None,
                 number,
                 args,
                 deadline,
@@ -1453,7 +1460,7 @@ impl DirectSyscalls {
         if matches!(number, 25 | 28 | 32) {
             self.record_fd_control();
         }
-        if matches!(number, 25 | 32 | 116) {
+        if matches!(number, 25 | 32 | 116 | 186..=189) {
             return IoAttempt::Complete(result);
         }
         if crate::event_wait(number) {
@@ -1521,6 +1528,9 @@ impl DirectSyscalls {
         target: &Weak<dyn IoWake>,
         saved_deadline: Option<Instant>,
     ) -> Option<IoAttempt> {
+        if matches!(number, 186..=189) {
+            return self.start_message(number, args, memory, pid, target);
+        }
         if let Err(e) = self.bind_host_protocol(target) {
             return Some(IoAttempt::HostError(e));
         }
@@ -1677,6 +1687,7 @@ impl DirectSyscalls {
             PendingIo {
                 binder: None,
                 aio: None,
+                message: None,
                 number,
                 args,
                 deadline,
@@ -1807,6 +1818,7 @@ impl DirectSyscalls {
         PendingIo {
             binder: None,
             aio: None,
+            message: None,
             number: wait.number,
             args: wait.args,
             deadline: wait.deadline,
@@ -2080,6 +2092,7 @@ impl DirectSyscalls {
             PendingIo {
                 binder: None,
                 aio: None,
+                message: None,
                 number,
                 args,
                 deadline,
@@ -2127,6 +2140,7 @@ impl DirectSyscalls {
             PendingIo {
                 binder: None,
                 aio: None,
+                message: None,
                 number: 32,
                 args,
                 deadline: None,
@@ -2191,6 +2205,14 @@ impl DirectSyscalls {
         original_paths: Option<&trames_vfs::Vfs>,
     ) -> IoAttempt {
         self.terminal_stop.set(false);
+        if let Some(message) = pending.message.take() {
+            return self.start_retained_message(
+                message,
+                memory,
+                pending.signal.pid,
+                &pending.target,
+            );
+        }
         if pending.binder.is_some() {
             return self.resume_binder(pending, memory);
         }

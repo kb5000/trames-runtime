@@ -52,7 +52,9 @@ struct MutableStatus {
     update: std::sync::Mutex<()>,
     asynchronous: std::sync::OnceLock<Arc<async_io::AsyncState>>,
 }
-const CHANGEABLE: u32 = 0x400 | O_NONBLOCK | O_NOATIME | 0x2000;
+// Direct I/O is a cache policy hint here: the guest has no block filesystem
+// page cache or DMA alignment requirement. Host cache policy is independent.
+const CHANGEABLE: u32 = 0x400 | O_NONBLOCK | O_NOATIME | 0x2000 | O_DIRECT;
 /// One accepted original descriptor for controls needing inode/credential data.
 /// This has no Files root and never resolves a numeric FD after acceptance.
 pub struct DescriptorControl(Descriptor);
@@ -194,10 +196,9 @@ impl StatusFlags {
             .store(flags & CHANGEABLE, Ordering::Relaxed);
         Ok(())
     }
-    pub(super) fn validate(flags: u32) -> Result<()> {
-        if flags & !(CHANGEABLE | 3 | O_DIRECTORY | O_NOFOLLOW | O_LARGEFILE | 0x101000) != 0 {
-            return Err(Errno(22));
-        }
+    pub(super) fn validate(_flags: u32) -> Result<()> {
+        // F_SETFL ignores immutable and unknown bits; openat validates its own
+        // creation flags before constructing this original status word.
         // Immutable authority is stored separately. Replacing the complete
         // mutable word needs one store, not a CAS loop or a resource lock.
         // This flag word publishes no guest bytes or descriptor membership.
@@ -326,7 +327,7 @@ mod tests {
             control.short(fd, 4, O_NOATIME as u64, &owner),
             Err(Errno(1))
         );
-        assert_eq!(v.flags(fd).unwrap(), 2);
+        assert_eq!(v.flags(fd).unwrap(), 2 | O_LARGEFILE);
         // The accepted OFD observes a subsequent owner change on its original
         // inode; it never substitutes a cached opener identity.
         v.chown_fd(fd, 1000, u32::MAX).unwrap();
@@ -344,7 +345,10 @@ mod tests {
             control.short(fd, 4, (O_NOATIME | O_NONBLOCK) as u64, &owner),
             Ok(0)
         );
-        assert_eq!(v.flags(alias).unwrap(), 2 | O_NOATIME | O_NONBLOCK);
+        assert_eq!(
+            v.flags(alias).unwrap(),
+            2 | O_NOATIME | O_NONBLOCK | O_LARGEFILE
+        );
         assert_eq!(v.flags(fd).unwrap(), 2);
         assert_eq!(control.short(fd, 2, 1, &owner), Ok(0));
         assert_eq!(v.flags(fd).unwrap() & O_CLOEXEC, 0);
@@ -365,7 +369,7 @@ mod tests {
         let file = v.open_at(AT_FDCWD, b"/regular", 0x42, 0o600).unwrap();
         let control = v.descriptor_control(file).unwrap();
         assert_eq!(control.short(file, 4, 0x80040000, &user), Err(Errno(1)));
-        assert_eq!(control.short(file, 4, 0x80000000, &user), Err(Errno(22)));
+        assert_eq!(control.short(file, 4, 0x80000000, &user), Ok(0));
         assert_eq!(
             control.short(file, u64::MAX, u64::MAX, &user),
             Err(Errno(22))
@@ -505,12 +509,12 @@ mod tests {
         assert_eq!(v.read(fd, 4).unwrap(), b"Xbcd");
     }
     #[test]
-    fn invalid_status_flags_and_path_descriptors_preserve_original_errors() {
+    fn ignored_status_bits_and_path_descriptors_preserve_original_errors() {
         let mut v = Vfs::default();
         let [reader, _] = v.pipe(0).unwrap();
         let path = v.open_at(AT_FDCWD, b"/", O_PATH, 0).unwrap();
         let flags = v.fd_flags_snapshot();
-        assert_eq!(flags.fcntl(reader, 4, 0x80000000), Err(Errno(22)));
+        assert_eq!(flags.fcntl(reader, 4, 0x80000000), Ok(0));
         assert_eq!(flags.fcntl(path, 4, O_NONBLOCK as u64), Err(Errno(9)));
         assert_eq!(flags.set_nonblocking(path, true), Err(Errno(9)));
         assert_eq!(flags.fcntl(u32::MAX, 4, 0), Err(Errno(9)));

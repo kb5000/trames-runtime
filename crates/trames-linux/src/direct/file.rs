@@ -350,6 +350,7 @@ impl DirectSyscalls {
         let pending = PendingIo {
             binder: None,
             aio: None,
+            message: None,
             number,
             args,
             deadline: None,
@@ -905,6 +906,7 @@ impl DirectSyscalls {
         IoAttempt::Blocked(PendingIo {
             binder: None,
             aio: None,
+            message: None,
             number,
             args,
             deadline: None,
@@ -971,6 +973,7 @@ impl DirectSyscalls {
         IoAttempt::Blocked(PendingIo {
             binder: None,
             aio: None,
+            message: None,
             number,
             args,
             deadline: None,

@@ -487,6 +487,26 @@ impl Memory {
         if let Some(shared) = &self.shared {
             return shared.borrow_mut().remap(old, old_len, new, new_len, fixed);
         }
+        Self::mapping_end(old, old_len)?;
+        Self::mapping_end(new, new_len)?;
+        let policy = self.vma_policy.moved(old, old_len, new, new_len);
+        self.remap_inner(old, old_len, new, new_len, fixed)?;
+        self.vma_policy.remove(old, old + old_len);
+        self.vma_policy.remove(new, new + new_len);
+        self.vma_policy.extend(policy);
+        Ok(())
+    }
+    fn remap_inner(
+        &mut self,
+        old: u64,
+        old_len: u64,
+        new: u64,
+        new_len: u64,
+        fixed: bool,
+    ) -> Result<(), MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow_mut().remap(old, old_len, new, new_len, fixed);
+        }
         let old_end = Self::mapping_end(old, old_len)?;
         let new_end = Self::mapping_end(new, new_len)?;
         if fixed && old == new {

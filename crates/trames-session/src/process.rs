@@ -145,6 +145,7 @@ pub(crate) struct Process<C: Cpu> {
     uring_wait: Option<(u32, Arc<trames_vfs::Uring>, Option<Instant>)>,
     retained_file: Option<trames_linux::FilePending>,
     retained_aio: Option<trames_linux::RetainedAio>,
+    retained_message: Option<trames_linux::RetainedMessage>,
     file_checkpoint: Option<trames_linux::FileCheckpoint>,
     file_entry: Option<(u64, u32, [u64; 6])>,
     layout_wait: Option<tasks::AdmissionWait>,
@@ -293,7 +294,13 @@ impl<C: Cpu> Process<C> {
     /// Original accepted calls can rearm their actual event source. New calls
     /// still use Snapshot::admit and evaluate policy only at their SVC entry.
     fn worker_event_wait(&self, id: u32) -> bool {
-        if self.retained_file.is_some() || self.retained_aio.is_some() {
+        if self.byte_wait.as_ref().is_some_and(|w| w.message.is_some()) {
+            return true;
+        }
+        if self.retained_file.is_some()
+            || self.retained_aio.is_some()
+            || self.retained_message.is_some()
+        {
             return true;
         }
         if self.retained_socket.is_some()
@@ -334,6 +341,9 @@ impl<C: Cpu> Process<C> {
     }
 
     fn worker_io_candidate(&self, id: u32) -> bool {
+        if self.byte_wait.as_ref().is_some_and(|w| w.message.is_some()) {
+            return true;
+        }
         if matches!(
             self.state,
             State::Namespace(_) | State::Policy(_) | State::Barrier(_)
@@ -346,7 +356,10 @@ impl<C: Cpu> Process<C> {
         if self.file_checkpoint.is_some() {
             return false;
         }
-        if self.retained_file.is_some() || self.retained_aio.is_some() {
+        if self.retained_file.is_some()
+            || self.retained_aio.is_some()
+            || self.retained_message.is_some()
+        {
             return true;
         }
         if let Some(poll) = &self.retained_poll {
@@ -553,6 +566,7 @@ impl<C: Cpu> Process<C> {
             uring_wait: None,
             retained_file: None,
             retained_aio: None,
+            retained_message: None,
             file_checkpoint: None,
             file_entry: None,
             layout_wait: None,
@@ -1356,6 +1370,7 @@ impl<C: Cpu> Kernel<C> {
         p.byte_wait = None;
         p.retained_file = None;
         p.retained_aio = None;
+        p.retained_message = None;
         p.pending_open = None;
         p.exec_pending = None;
         p.file_checkpoint = None;
@@ -1834,6 +1849,7 @@ impl<C: Cpu> Kernel<C> {
                 p.byte_wait = None;
                 p.retained_file = None;
                 p.retained_aio = None;
+                p.retained_message = None;
                 p.file_checkpoint = None;
                 p.file_entry = None;
                 p.retained_socket = None;
@@ -2160,10 +2176,10 @@ impl<C: Cpu> Kernel<C> {
                 p.linux.dispatch_untraced(&mut p.cpu, &mut p.memory, io);
                 Ok(Some(p.linux.vfs.visible_pid(pid) as u64))
             },
-            220 => {
+            220 | 435 => {
                 self.reap_waited();
                 birth::Birth::capture(self).publish_family(pid, p);
-                let child = birth::Birth::capture(self).clone_task(pid, p, a)?;
+                let child = birth::Birth::capture(self).clone_entry(pid, p, number, a)?;
                 Ok(child.publish(&self.processes.directory()))
             },
             221 | 281 => {
@@ -2716,15 +2732,23 @@ impl<C: Cpu> Kernel<C> {
                     &Arc::downgrade(&self.byte_target),
                 ),
             )
-        } else if trames_linux::DirectSyscalls::aio_call(number) {
+        } else if trames_linux::DirectSyscalls::aio_call(number) || matches!(number, 186..=189) {
             let direct = trames_linux::DirectSyscalls::new(p.linux.vfs.direct_descriptors())
                 .with_aio(p.linux.aio.clone(), p.linux.vfs.native_events())
+                .with_resources(p.linux.vfs.descriptor_factory())
                 .with_task_signal(p.signals.io.clone())
                 .with_paths(p.linux.vfs.path_queries())
                 .with_file_executor(self.workers.file_executor())
                 .with_file_layouts(self.file_layout_work());
             if let Some(wait) = p.byte_wait.take() {
                 Some(direct.resume(wait, &mut p.memory))
+            } else if let Some(call) = p.retained_message.take() {
+                Some(direct.start_retained_message(
+                    call,
+                    &mut p.memory,
+                    pid,
+                    &Arc::downgrade(&self.byte_target),
+                ))
             } else if let Some(call) = p.retained_aio.take() {
                 Some(direct.start_retained_aio(
                     call,
@@ -4623,6 +4647,7 @@ pub(super) fn run<C: Cpu>(
         uring_wait: None,
         retained_file: None,
         retained_aio: None,
+        retained_message: None,
         file_checkpoint: None,
         file_entry: None,
         layout_wait: None,
@@ -5285,6 +5310,7 @@ mod tests {
         let (request, file) = p.linux.vfs.retain_flock(a, 2).unwrap();
         let call = crate::run_queue::IoCall {
             aio: None,
+            message: None,
             file: None,
             file_checkpoint: None,
             uring: None,
@@ -5882,6 +5908,7 @@ mod tests {
         let (shared, _) = p.linux.vfs.retain_flock(a, 1).unwrap();
         let mut call = crate::run_queue::IoCall {
             aio: None,
+            message: None,
             file: None,
             file_checkpoint: None,
             uring: None,
@@ -6357,6 +6384,7 @@ mod tests {
             uring_wait: None,
             retained_file: None,
             retained_aio: None,
+            retained_message: None,
             file_checkpoint: None,
             file_entry: None,
             layout_wait: None,

@@ -214,6 +214,7 @@ impl WaitState {
 #[derive(Clone)]
 pub(super) struct IoCall {
     pub aio: Option<trames_linux::RetainedAio>,
+    pub message: Option<trames_linux::RetainedMessage>,
     pub number: u32,
     pub args: [u64; 6],
     pub flock: Option<trames_vfs::FlockRequest>,
@@ -243,6 +244,7 @@ impl IoCall {
             file: None,
             file_checkpoint: None,
             aio: None,
+            message: None,
         }
     }
     pub fn from_file_checkpoint(
@@ -263,6 +265,7 @@ impl IoCall {
             file: None,
             file_checkpoint: Some(file),
             aio: None,
+            message: None,
             deadline: None,
         }
     }
@@ -283,6 +286,7 @@ impl IoCall {
             file: None,
             file_checkpoint: None,
             aio: None,
+            message: None,
         }
     }
     pub fn from_socket(call: trames_linux::RetainedSocket) -> Self {
@@ -300,6 +304,7 @@ impl IoCall {
             file: None,
             file_checkpoint: None,
             aio: None,
+            message: None,
         }
     }
 }
@@ -318,6 +323,7 @@ impl From<&trames_linux::PendingIo> for IoCall {
             file: io.file_pending(),
             file_checkpoint: None,
             aio: io.aio.clone(),
+            message: io.message.clone(),
             deadline: io.deadline,
         }
     }

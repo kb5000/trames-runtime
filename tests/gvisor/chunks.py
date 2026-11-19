@@ -83,6 +83,10 @@ def run(args,output,plan,env,runner,name,store,snapshot,cache,timeout):
         stem='chunk-%06d'%serial;serial+=1
         work='/tmp/gvisor-'+stem;guest_xml=work+'/result.xml';xml=output/'logs'/(stem+'.xml')
         wrapper='export TEST_SRCDIR=/opt/gvisor/runfiles RUNFILES_DIR=/opt/gvisor/runfiles; mkdir -p "$1"; cd "$1"; export TEST_TMPDIR="$1"; unset TEST_ON_GVISOR GVISOR_SAVE_TEST; shift; "$@" & child=$!; wait "$child"'
+        if suite=='posix_acl':
+            # Match native Linux's existing tmpfs fixture, without changing the
+            # original binary or treating an unexercised ACL as a passing case.
+            wrapper='mkdir -p /dev/shm; mount -t tmpfs -o mode=1777 tmpfs /dev/shm; '+wrapper
         argv=[runner,'debug','env-run',name,'--no-windows','--no-pty','--','/bin/sh','-ec',wrapper,'trames-gvisor',work,'/opt/gvisor/'+suite+'_test','--gtest_color=no','--gtest_filter='+':'.join(selected),'--gtest_output=xml:'+guest_xml]
         stdout=output/'logs'/(stem+'.stdout');stderr=output/'logs'/(stem+'.stderr')
         budget=lambda case:timeout(suite,case) if case else 30

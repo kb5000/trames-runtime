@@ -6,12 +6,13 @@ use super::*;
 pub struct DescriptorFactory {
     pub(super) files: SharedFiles,
     ids: Arc<OpenIds>,
+    pub(super) ipc_namespace: Arc<linux_namespace::IpcNamespace>,
     owner: (u32, u32),
     network: trames_net::Network,
     local_network: Arc<linux_namespace::RootNetwork>,
-    credentials: Credentials,
+    pub(super) credentials: Credentials,
     local_identity: [u32; 3],
-    pid_namespace: PidNamespace,
+    pub(super) pid_namespace: PidNamespace,
     proc_source: Option<Arc<dyn ProcSource>>,
     terminal_task: Option<Arc<dyn pty::TerminalTask>>,
     devices: cgroup::DeviceAuthority,
@@ -38,6 +39,7 @@ impl Vfs {
         DescriptorFactory {
             files: self.shared_files(),
             ids: self.next_open.clone(),
+            ipc_namespace: self.ipc_namespace.clone(),
             owner: (self.credentials.fsuid, self.credentials.fsgid),
             network: self.network.clone(),
             local_network: self.root_network.clone(),

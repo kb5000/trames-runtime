@@ -507,10 +507,10 @@ impl<C: Cpu> Lifecycle<C> {
             if p.signals.io.lifecycle().termination().is_some() {
                 continue;
             }
-            assert_eq!(
+            assert!(matches!(
                 crate::structural::Call::from_cpu(&job.work.cpu),
-                Some(crate::structural::Call::Clone)
-            );
+                Some(crate::structural::Call::Clone | crate::structural::Call::Clone3)
+            ));
             let began = Instant::now();
             p.linux.vfs.sync_task_namespaces();
             p.linux.vfs.set_process_context(job.work.pid);
@@ -522,7 +522,10 @@ impl<C: Cpu> Lifecycle<C> {
             // reevaluate it or replay a policy action during the custody handoff.
             job.seccomp_entry.take();
             p.signals.finish_io();
-            match self.birth.clone_task(job.work.pid, p, args(&p.cpu)) {
+            match self
+                .birth
+                .clone_entry(job.work.pid, p, p.cpu.x(8) as u32, args(&p.cpu))
+            {
                 Ok(child) => {
                     let id = child.id;
                     let value = child.value;

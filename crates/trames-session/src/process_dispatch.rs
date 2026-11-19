@@ -344,6 +344,10 @@ impl Dispatch {
                 .as_ref()
                 .and_then(trames_linux::PendingIo::file_pending)
                 .or_else(|| p.retained_file.take());
+            let retained_message = previous
+                .as_ref()
+                .and_then(|wait| wait.message.clone())
+                .or_else(|| p.retained_message.take());
             let retained_aio = previous
                 .as_ref()
                 .and_then(|wait| wait.aio.clone())
@@ -353,6 +357,7 @@ impl Dispatch {
                 .or_else(|| p.retained_byte.take());
             job.retry = Some(crate::run_queue::IoCall {
                 aio: retained_aio,
+                message: retained_message,
                 file: retained_file,
                 file_checkpoint: p.file_checkpoint.take(),
                 uring: p.uring_wait.take().map(|(submitted, ring, deadline)| {

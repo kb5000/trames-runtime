@@ -4670,3 +4670,48 @@ English final acceptance and paired product pins are recorded in the iPad
 repository's source-capabilities validation record. Mac Dev alone is deployed;
 stable apps, business environments and physical iPad installs are unchanged.
 No controlled throughput or Firefox latency measurement is claimed.
+
+## 107. Process, file, VMA and message IPC ABI batch — 2026-11-19
+
+`clone3` imports its versioned argument structure once and enters the same
+original-task birth transaction as `clone`. Stack/TLS/TID setup, user/PID and
+other namespace creation, signal inheritance, admission and child publication
+remain shared by HVF and the interpreter. CLEAR_SIGHAND resets the new table
+before publishing a PID or signal policy. This does not implement pidfds,
+caller-selected PIDs or CLONE_INTO_CGROUP. Wait's __WALL option uses the original
+child-event resource. Priority lookup distinguishes unreaped PID ownership
+from CPU eligibility; an exited child remains a credential/priority target
+until it is reaped. Signal delivery still requires its existing live-task rules.
+
+DONTFORK/DOFORK and WIPEONFORK/KEEPONFORK belong to the original address space's
+cold VMA policy. A View declines mutation before effects, then the existing
+affected-mm custody path applies it. Unmap/replacement clears the corresponding
+policy, remap moves/extends it, and fork excludes resident non-inherited pages
+before charging the child. Wiped pages are not eagerly copied or charged.
+Sparse wiping uses intervals, not a virtual-page walk. Normal interpreter,
+native and hardware byte accesses have no added lookup, lock or fence.
+
+System V message queues belong to the original IPC namespace. Its directory
+serializes ID/key publication; each queue synchronizes its own metadata and
+messages. Accepted send/receive requests retain that queue, imported send bytes,
+credentials and PID references. Parking releases the execution slot and
+subscribes before the deciding retry. Cohort handoff, namespace replacement,
+removal and cancellation never re-resolve the numeric ID or re-import a send
+buffer. A removed queue wakes accepted operations with EIDRM. Copyout runs on
+the source executor. MSG_COPY consumes neither messages nor capacity and wakes
+no transfer waiter. This is distinct from the still-unimplemented POSIX mq,
+System V semaphore and System V shared-memory interfaces.
+
+File changes use the existing original-inode/OFD paths: O_RDONLY|O_TRUNC has an
+accepted open-time truncate operation without granting write/ftruncate rights;
+F_SETFL updates mutable bits and ignores unrelated bits; named ARM64 opens
+retain O_LARGEFILE. O_DIRECT is a cache-policy hint on Trames storage, which has
+no Linux block-page cache or DMA alignment contract; it is rejected on directory
+opens and does not promise bypassing the host OS cache. ACL updates retain the
+filesystem-to-inode lock order, preserve no-op lower-overlay operations, and
+use inode-scoped capability checks. None of these paths adds a coordinator,
+resource service thread or polling bus.
+
+The [validation record](../validation/gvisor-core-apis-20261119.md) distinguishes
+the native-equivalent ACL fixture, the complete original sweep, final affected
+group reruns, remaining unsupported APIs and product integration gates.

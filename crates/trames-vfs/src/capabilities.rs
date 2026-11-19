@@ -40,6 +40,7 @@ pub const SETUID: u32 = 7;
 pub const SETPCAP: u32 = 8;
 pub const NET_ADMIN: u32 = 12;
 pub const NET_RAW: u32 = 13;
+pub const IPC_OWNER: u32 = 15;
 pub const SYS_CHROOT: u32 = 18;
 pub const SYS_PTRACE: u32 = 19;
 pub const SYS_ADMIN: u32 = 21;

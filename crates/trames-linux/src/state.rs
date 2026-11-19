@@ -1259,6 +1259,7 @@ impl Linux {
                     }
                 }),
             427 => self.uring_register(a, memory),
+            186..=189 => crate::direct::message::call(&self.vfs.descriptor_factory(), number as u32, a, memory, self.vfs.process_context()),
             280 => self.bpf_syscall(a, memory),
             number @ 160..=162 => {
                 crate::uts_call(&self.vfs.uts_capability(), number as u32, a, memory)

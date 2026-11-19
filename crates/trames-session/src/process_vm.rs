@@ -156,7 +156,7 @@ impl<C: Cpu> Kernel<C> {
                 }
                 if matches!(
                     crate::structural::Call::from_cpu(&p.cpu),
-                    Some(crate::structural::Call::Clone)
+                    Some(crate::structural::Call::Clone | crate::structural::Call::Clone3)
                 ) {
                     // Copy actual signal state before inheriting it. Mapping
                     // custody alone did not need this task-state handoff.
@@ -164,7 +164,8 @@ impl<C: Cpu> Kernel<C> {
                     let a = args(&p.cpu);
                     let call_began = Instant::now();
                     p.trace = std::mem::take(&mut job.work.trace);
-                    self.call(pid, &mut p, 220, a, io);
+                    let number = p.cpu.x(8) as u32;
+                    self.call(pid, &mut p, number, a, io);
                     job.work.trace = std::mem::take(&mut p.trace);
                     self.vm_checkpoint_time[3] += call_began.elapsed();
                     let value = p.cpu.x(0);

@@ -63,7 +63,9 @@ impl IoRoutes {
             }
             _ => return Err(Errno(22)),
         };
-        tasks.retain(|t| t.live() && self.namespace.local(t.pid.load(Ordering::Relaxed)) != 0);
+        // get/setpriority address unreaped zombies too. CPU eligibility is a
+        // different lifetime from original PID/credential/priority ownership.
+        tasks.retain(|t| t.identifies(0, t.tid()) && self.namespace.local(t.tid()) != 0);
         tasks.sort_by_key(|t| t.pid.load(Ordering::Relaxed));
         // Preserve the existing partial-application order, with the caller last.
         if let Some(i) = tasks.iter().position(|t| Arc::ptr_eq(t, source)) {
@@ -245,6 +247,36 @@ mod tests {
         let mut memory = Memory::default();
         memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         memory
+    }
+    #[test]
+    fn priority_keeps_original_zombie_authority_until_reaped_without_a_cpu() {
+        let routes = IoRoutes::default();
+        let source = task(&routes.directory, 1, 1, 0);
+        let target = task(&routes.directory, 2, 1, 1000);
+        target.io.exit();
+        assert!(!target.io.live());
+        assert!(target.presence.present());
+        let mut memory = memory();
+        assert_eq!(
+            routes.scheduling(&source.io, 4, 140, [0, 2, 0, 0, 0, 0], &mut memory),
+            Ok(0)
+        );
+        let mut caller = Credentials::user(0, 0);
+        caller.caps.effective &= !(1 << trames_vfs::capabilities::SYS_NICE);
+        source.io.scheduling.publish_credentials(&caller);
+        assert_eq!(
+            routes.scheduling(&source.io, 4, 140, [0, 2, 0, 0, 0, 0], &mut memory),
+            Err(Errno(1))
+        );
+        assert_eq!(
+            routes.scheduling(&source.io, 4, 141, [0, 2, 0, 0, 0, 0], &mut memory),
+            Ok(20)
+        );
+        target.presence.visibility().reap();
+        assert_eq!(
+            routes.scheduling(&source.io, 4, 141, [0, 2, 0, 0, 0, 0], &mut memory),
+            Err(Errno(3))
+        );
     }
     #[test]
     fn original_target_authority_fault_order_and_unsupported_results() {

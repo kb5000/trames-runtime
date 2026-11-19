@@ -472,6 +472,7 @@ impl DirectSyscalls {
         PendingIo {
             binder: None,
             aio: None,
+            message: None,
             number: call.number,
             args: call.args,
             deadline: call.deadline,

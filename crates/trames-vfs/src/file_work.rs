@@ -181,7 +181,7 @@ impl FileTarget {
             FileCommand::Sync { .. } | FileCommand::SyncFilesystem | FileCommand::SyncAll => {
                 persistent || data.mapped_work()
             }
-            FileCommand::Truncate(_) | FileCommand::Allocate { .. } => {
+            FileCommand::Truncate(_) | FileCommand::TruncateOpen | FileCommand::Allocate { .. } => {
                 persistent || data.mapped_work()
             }
         }
@@ -246,6 +246,9 @@ pub enum FileCommand {
         data_only: bool,
     },
     Truncate(u64),
+    /// Path resolution already checked O_TRUNC write permission. The resulting
+    /// description can still be O_RDONLY; ftruncate retains its separate rule.
+    TruncateOpen,
     Allocate {
         mode: u64,
         offset: u64,
@@ -778,7 +781,7 @@ impl PathQueries {
             .open_work
             .borrow_mut()
             .take()?;
-        let mut work = FileWork::new(self, open.target.clone(), FileCommand::Truncate(0));
+        let mut work = FileWork::new(self, open.target.clone(), FileCommand::TruncateOpen);
         work.open = Some(Box::new(open));
         Some(work)
     }
@@ -944,6 +947,7 @@ impl FileCommand {
             FileCommand::Truncate(length) => {
                 v.truncate_fd(fd, *length).map(|()| FileValue::Count(0))
             }
+            FileCommand::TruncateOpen => v.truncate_open(fd).map(|()| FileValue::Count(0)),
             FileCommand::Allocate {
                 mode,
                 offset,

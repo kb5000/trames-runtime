@@ -57,7 +57,10 @@ impl Vfs {
         }
     }
     fn xattr_allowed(&self, node: &Node, name: &[u8], write: bool) -> Result<()> {
-        if name.is_empty() || name.contains(&0) {
+        if name.is_empty() {
+            return Err(Errno(34));
+        }
+        if name.contains(&0) {
             return Err(Errno(22));
         }
         if name.len() > 255 {
@@ -68,11 +71,15 @@ impl Vfs {
                 return Err(Errno(95));
             }
             if name == acl::DEFAULT && !matches!(node.content, Content::Directory) {
-                return Err(Errno(if write { 13 } else { 61 }));
+                // Linux allows anyone to clear a non-directory's nonexistent
+                // default ACL. set_xattr rejects a nonempty default below.
+                return if write { Ok(()) } else { Err(Errno(61)) };
             }
             if write
                 && self.credentials.fsuid != node.uid
-                && !self.credentials.has_cap(capabilities::FOWNER)
+                && !self
+                    .credentials
+                    .inode_cap(capabilities::FOWNER, node.uid, node.gid)
             {
                 return Err(Errno(1));
             }
@@ -100,7 +107,9 @@ impl Vfs {
                 && matches!(node.content, Content::Directory)
                 && node.mode & 0o1000 != 0
                 && self.credentials.fsuid != node.uid
-                && !self.credentials.has_cap(capabilities::FOWNER)
+                && !self
+                    .credentials
+                    .inode_cap(capabilities::FOWNER, node.uid, node.gid)
             {
                 return Err(Errno(1));
             }
@@ -109,6 +118,9 @@ impl Vfs {
         if !write && (name.starts_with(b"security.") || name.starts_with(b"system.")) {
             // Unimplemented security/system policies report absence.
             return Err(Errno(61));
+        }
+        if !write && !self.allowed(node, 4) {
+            return Err(Errno(13));
         }
         Err(Errno(95))
     }
@@ -155,15 +167,25 @@ impl Vfs {
         // must commit/roll back together. No ordinary byte/metadata read uses
         // this namespace transaction guard.
         let _namespace = fs.namespace.lock().unwrap();
+        let lower_acl_remove = name == acl::ACCESS
+            && value.is_none()
+            && fs
+                .borrow()
+                .overlay
+                .as_ref()
+                .is_some_and(|overlay| overlay.uncopied_inode(&node));
         let _metadata = node.metadata.lock().unwrap();
         self.pseudo_immutable(&node)?;
         let mut n = node.borrow_mut();
         self.xattr_allowed(&n, name, true)?;
         let old = n.xattrs.get(name).cloned();
+        if name == acl::ACCESS && value.is_none() && old.is_none() && lower_acl_remove {
+            return Err(Errno(61));
+        }
         if flags & 1 != 0 && old.is_some() {
             return Err(Errno(17));
         }
-        if (flags & 2 != 0 || value.is_none()) && old.is_none() {
+        if (flags & 2 != 0 || value.is_none() && !acl::name(name)) && old.is_none() {
             return Err(Errno(61));
         }
         let old_times = n.times;
@@ -175,17 +197,26 @@ impl Vfs {
                 acl::normalize(value);
                 if value.len() == 4 {
                     next = None;
+                } else if name == acl::DEFAULT && !matches!(n.content, Content::Directory) {
+                    return Err(Errno(13));
                 } else if name == acl::ACCESS {
                     n.mode = acl::mode(value, n.mode);
-                    if !self.credentials.has_cap(capabilities::FSETID)
-                        && !self.credentials.in_group(n.gid)
-                    {
-                        n.mode &= !0o2000;
-                    }
                     if !acl::extended(value) {
                         next = None;
                     }
                 }
+            }
+            if name == acl::ACCESS
+                && !self
+                    .credentials
+                    .inode_cap(capabilities::FSETID, n.uid, n.gid)
+                && !self.credentials.in_group(n.gid)
+            {
+                n.mode &= !0o2000;
+            }
+            if name == acl::DEFAULT && !matches!(n.content, Content::Directory) && next.is_none() {
+                // No metadata mutation or overlay copy-up for this no-op.
+                return Ok(());
             }
         }
         if let Some(value) = next {

@@ -1,0 +1,1720 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-19",
+  "baseline_runtime": "6d3491f",
+  "gvisor_revision": "89cacadae21eca4270a8f7c79281d0426d33ac5f",
+  "selection": {
+    "groups": 137,
+    "cases": 2998
+  },
+  "baseline_fixture_adjustment": {
+    "group": "posix_acl",
+    "raw_passes": 2129,
+    "equivalent_fixture_passes": 2211,
+    "recovered_fixture_passes": 82,
+    "fixture": "/dev/shm tmpfs, mode=1777; both sides use the same original binaries"
+  },
+  "final": {
+    "cases": 2998,
+    "counts": {
+      "passed": 2312,
+      "failed": 536,
+      "skipped": 120,
+      "no_result": 4,
+      "timeout": 26
+    },
+    "new_passes": 101,
+    "old_pass_regressions": [],
+    "rerun_groups": [
+      "access",
+      "msgqueue",
+      "open",
+      "open_create",
+      "openat2",
+      "overlay",
+      "posix_acl",
+      "priority",
+      "xattr"
+    ]
+  },
+  "native_comparison": {
+    "schema_version": 1,
+    "cases": 2998,
+    "native_counts": {
+      "passed": 2903,
+      "no_result": 1,
+      "skipped": 77,
+      "failed": 12,
+      "timeout": 5
+    },
+    "trames_counts": {
+      "passed": 2312,
+      "failed": 536,
+      "skipped": 120,
+      "no_result": 4,
+      "timeout": 26
+    },
+    "native_passed_cases": 2903,
+    "outcomes_on_native_passed": {
+      "passed": 2309,
+      "failed": 527,
+      "skipped": 44,
+      "timeout": 21,
+      "no_result": 2
+    },
+    "strict_pass_fraction": 0.7953840854288667
+  },
+  "groups": [
+    {
+      "suite": "access",
+      "cases": 19,
+      "before": {
+        "failed": 16,
+        "passed": 3
+      },
+      "after": {
+        "passed": 19
+      }
+    },
+    {
+      "suite": "affinity",
+      "cases": 14,
+      "before": {
+        "failed": 7,
+        "passed": 7
+      },
+      "after": {
+        "failed": 7,
+        "passed": 7
+      }
+    },
+    {
+      "suite": "aio",
+      "cases": 14,
+      "before": {
+        "failed": 12,
+        "passed": 2
+      },
+      "after": {
+        "failed": 12,
+        "passed": 2
+      }
+    },
+    {
+      "suite": "bad",
+      "cases": 2,
+      "before": {
+        "passed": 2
+      },
+      "after": {
+        "passed": 2
+      }
+    },
+    {
+      "suite": "brk",
+      "cases": 1,
+      "before": {
+        "passed": 1
+      },
+      "after": {
+        "passed": 1
+      }
+    },
+    {
+      "suite": "capabilities",
+      "cases": 14,
+      "before": {
+        "passed": 14
+      },
+      "after": {
+        "passed": 14
+      }
+    },
+    {
+      "suite": "chdir",
+      "cases": 4,
+      "before": {
+        "passed": 4
+      },
+      "after": {
+        "passed": 4
+      }
+    },
+    {
+      "suite": "chmod",
+      "cases": 19,
+      "before": {
+        "passed": 19
+      },
+      "after": {
+        "passed": 19
+      }
+    },
+    {
+      "suite": "chown",
+      "cases": 29,
+      "before": {
+        "passed": 28,
+        "skipped": 1
+      },
+      "after": {
+        "passed": 28,
+        "skipped": 1
+      }
+    },
+    {
+      "suite": "chroot",
+      "cases": 12,
+      "before": {
+        "failed": 1,
+        "passed": 11
+      },
+      "after": {
+        "failed": 1,
+        "passed": 11
+      }
+    },
+    {
+      "suite": "close_range",
+      "cases": 14,
+      "before": {
+        "passed": 14
+      },
+      "after": {
+        "passed": 14
+      }
+    },
+    {
+      "suite": "concurrency",
+      "cases": 3,
+      "before": {
+        "no_result": 1,
+        "passed": 2
+      },
+      "after": {
+        "no_result": 1,
+        "passed": 2
+      }
+    },
+    {
+      "suite": "copy_file_range",
+      "cases": 25,
+      "before": {
+        "passed": 25
+      },
+      "after": {
+        "passed": 25
+      }
+    },
+    {
+      "suite": "creat",
+      "cases": 3,
+      "before": {
+        "passed": 3
+      },
+      "after": {
+        "passed": 3
+      }
+    },
+    {
+      "suite": "deleted",
+      "cases": 5,
+      "before": {
+        "passed": 5
+      },
+      "after": {
+        "passed": 5
+      }
+    },
+    {
+      "suite": "dev",
+      "cases": 17,
+      "before": {
+        "passed": 15,
+        "failed": 2
+      },
+      "after": {
+        "passed": 15,
+        "failed": 2
+      }
+    },
+    {
+      "suite": "dup",
+      "cases": 11,
+      "before": {
+        "passed": 11
+      },
+      "after": {
+        "passed": 11
+      }
+    },
+    {
+      "suite": "epoll",
+      "cases": 24,
+      "before": {
+        "passed": 24
+      },
+      "after": {
+        "passed": 24
+      }
+    },
+    {
+      "suite": "eventfd",
+      "cases": 11,
+      "before": {
+        "passed": 8,
+        "skipped": 3
+      },
+      "after": {
+        "passed": 8,
+        "skipped": 3
+      }
+    },
+    {
+      "suite": "exceptions",
+      "cases": 1,
+      "before": {
+        "passed": 1
+      },
+      "after": {
+        "passed": 1
+      }
+    },
+    {
+      "suite": "exec",
+      "cases": 73,
+      "before": {
+        "passed": 57,
+        "failed": 15,
+        "timeout": 1
+      },
+      "after": {
+        "passed": 57,
+        "failed": 15,
+        "timeout": 1
+      }
+    },
+    {
+      "suite": "exec_binary",
+      "cases": 49,
+      "before": {
+        "failed": 32,
+        "passed": 13,
+        "skipped": 4
+      },
+      "after": {
+        "failed": 32,
+        "passed": 13,
+        "skipped": 4
+      }
+    },
+    {
+      "suite": "exit",
+      "cases": 6,
+      "before": {
+        "passed": 6
+      },
+      "after": {
+        "passed": 6
+      }
+    },
+    {
+      "suite": "fadvise64",
+      "cases": 4,
+      "before": {
+        "passed": 2,
+        "failed": 2
+      },
+      "after": {
+        "passed": 2,
+        "failed": 2
+      }
+    },
+    {
+      "suite": "fallocate",
+      "cases": 11,
+      "before": {
+        "passed": 10,
+        "skipped": 1
+      },
+      "after": {
+        "passed": 10,
+        "skipped": 1
+      }
+    },
+    {
+      "suite": "fault",
+      "cases": 2,
+      "before": {
+        "passed": 1,
+        "failed": 1
+      },
+      "after": {
+        "passed": 1,
+        "failed": 1
+      }
+    },
+    {
+      "suite": "fchdir",
+      "cases": 5,
+      "before": {
+        "passed": 5
+      },
+      "after": {
+        "passed": 5
+      }
+    },
+    {
+      "suite": "fcntl",
+      "cases": 97,
+      "before": {
+        "passed": 84,
+        "failed": 13
+      },
+      "after": {
+        "passed": 86,
+        "failed": 11
+      }
+    },
+    {
+      "suite": "fifo",
+      "cases": 7,
+      "before": {
+        "passed": 6,
+        "failed": 1
+      },
+      "after": {
+        "passed": 6,
+        "failed": 1
+      }
+    },
+    {
+      "suite": "flock",
+      "cases": 34,
+      "before": {
+        "passed": 33,
+        "timeout": 1
+      },
+      "after": {
+        "passed": 33,
+        "timeout": 1
+      }
+    },
+    {
+      "suite": "fork",
+      "cases": 24,
+      "before": {
+        "failed": 10,
+        "passed": 14
+      },
+      "after": {
+        "passed": 24
+      }
+    },
+    {
+      "suite": "fpsig_fork",
+      "cases": 1,
+      "before": {
+        "passed": 1
+      },
+      "after": {
+        "passed": 1
+      }
+    },
+    {
+      "suite": "fpsig_nested",
+      "cases": 1,
+      "before": {
+        "failed": 1
+      },
+      "after": {
+        "failed": 1
+      }
+    },
+    {
+      "suite": "fsync",
+      "cases": 6,
+      "before": {
+        "passed": 6
+      },
+      "after": {
+        "passed": 6
+      }
+    },
+    {
+      "suite": "fuse",
+      "cases": 24,
+      "before": {
+        "failed": 23,
+        "skipped": 1
+      },
+      "after": {
+        "failed": 23,
+        "skipped": 1
+      }
+    },
+    {
+      "suite": "futex",
+      "cases": 67,
+      "before": {
+        "passed": 67
+      },
+      "after": {
+        "passed": 67
+      }
+    },
+    {
+      "suite": "getcpu",
+      "cases": 2,
+      "before": {
+        "passed": 2
+      },
+      "after": {
+        "passed": 2
+      }
+    },
+    {
+      "suite": "getcpu_host",
+      "cases": 2,
+      "before": {
+        "passed": 2
+      },
+      "after": {
+        "passed": 2
+      }
+    },
+    {
+      "suite": "getdents",
+      "cases": 23,
+      "before": {
+        "passed": 20,
+        "failed": 3
+      },
+      "after": {
+        "passed": 20,
+        "failed": 3
+      }
+    },
+    {
+      "suite": "getrandom",
+      "cases": 1,
+      "before": {
+        "passed": 1
+      },
+      "after": {
+        "passed": 1
+      }
+    },
+    {
+      "suite": "host_pty",
+      "cases": 3,
+      "before": {
+        "failed": 3
+      },
+      "after": {
+        "failed": 3
+      }
+    },
+    {
+      "suite": "inotify",
+      "cases": 80,
+      "before": {
+        "passed": 48,
+        "timeout": 2,
+        "failed": 29,
+        "skipped": 1
+      },
+      "after": {
+        "passed": 48,
+        "timeout": 2,
+        "failed": 29,
+        "skipped": 1
+      }
+    },
+    {
+      "suite": "ioctl",
+      "cases": 42,
+      "before": {
+        "passed": 32,
+        "failed": 10
+      },
+      "after": {
+        "passed": 32,
+        "failed": 10
+      }
+    },
+    {
+      "suite": "iouring",
+      "cases": 26,
+      "before": {
+        "passed": 22,
+        "skipped": 4
+      },
+      "after": {
+        "passed": 22,
+        "skipped": 4
+      }
+    },
+    {
+      "suite": "kill",
+      "cases": 13,
+      "before": {
+        "skipped": 1,
+        "passed": 11,
+        "failed": 1
+      },
+      "after": {
+        "skipped": 1,
+        "passed": 11,
+        "failed": 1
+      }
+    },
+    {
+      "suite": "link",
+      "cases": 23,
+      "before": {
+        "passed": 18,
+        "skipped": 3,
+        "failed": 2
+      },
+      "after": {
+        "passed": 18,
+        "skipped": 3,
+        "failed": 2
+      }
+    },
+    {
+      "suite": "lseek",
+      "cases": 15,
+      "before": {
+        "passed": 11,
+        "failed": 3,
+        "skipped": 1
+      },
+      "after": {
+        "passed": 11,
+        "failed": 3,
+        "skipped": 1
+      }
+    },
+    {
+      "suite": "madvise",
+      "cases": 18,
+      "before": {
+        "failed": 3,
+        "passed": 15
+      },
+      "after": {
+        "passed": 18
+      }
+    },
+    {
+      "suite": "membarrier",
+      "cases": 4,
+      "before": {
+        "passed": 3,
+        "skipped": 1
+      },
+      "after": {
+        "passed": 3,
+        "skipped": 1
+      }
+    },
+    {
+      "suite": "memfd",
+      "cases": 21,
+      "before": {
+        "passed": 20,
+        "skipped": 1
+      },
+      "after": {
+        "passed": 20,
+        "skipped": 1
+      }
+    },
+    {
+      "suite": "memory_accounting",
+      "cases": 1,
+      "before": {
+        "skipped": 1
+      },
+      "after": {
+        "skipped": 1
+      }
+    },
+    {
+      "suite": "mempolicy",
+      "cases": 9,
+      "before": {
+        "passed": 4,
+        "failed": 5
+      },
+      "after": {
+        "passed": 4,
+        "failed": 5
+      }
+    },
+    {
+      "suite": "mincore",
+      "cases": 5,
+      "before": {
+        "passed": 4,
+        "failed": 1
+      },
+      "after": {
+        "passed": 4,
+        "failed": 1
+      }
+    },
+    {
+      "suite": "mkdir",
+      "cases": 7,
+      "before": {
+        "passed": 7
+      },
+      "after": {
+        "passed": 7
+      }
+    },
+    {
+      "suite": "mknod",
+      "cases": 9,
+      "before": {
+        "passed": 8,
+        "failed": 1
+      },
+      "after": {
+        "passed": 8,
+        "failed": 1
+      }
+    },
+    {
+      "suite": "mlock",
+      "cases": 20,
+      "before": {
+        "failed": 20
+      },
+      "after": {
+        "failed": 20
+      }
+    },
+    {
+      "suite": "mmap",
+      "cases": 118,
+      "before": {
+        "passed": 118
+      },
+      "after": {
+        "passed": 118
+      }
+    },
+    {
+      "suite": "mmap_eternal",
+      "cases": 1,
+      "before": {
+        "timeout": 1
+      },
+      "after": {
+        "timeout": 1
+      }
+    },
+    {
+      "suite": "mount",
+      "cases": 117,
+      "before": {
+        "passed": 76,
+        "failed": 36,
+        "skipped": 4,
+        "no_result": 1
+      },
+      "after": {
+        "passed": 76,
+        "failed": 36,
+        "skipped": 4,
+        "no_result": 1
+      }
+    },
+    {
+      "suite": "mount_fd",
+      "cases": 41,
+      "before": {
+        "skipped": 5,
+        "failed": 36
+      },
+      "after": {
+        "skipped": 5,
+        "failed": 36
+      }
+    },
+    {
+      "suite": "mq",
+      "cases": 19,
+      "before": {
+        "failed": 19
+      },
+      "after": {
+        "failed": 19
+      }
+    },
+    {
+      "suite": "mremap",
+      "cases": 34,
+      "before": {
+        "no_result": 1,
+        "passed": 25,
+        "failed": 8
+      },
+      "after": {
+        "no_result": 1,
+        "passed": 25,
+        "failed": 8
+      }
+    },
+    {
+      "suite": "msgqueue",
+      "cases": 36,
+      "before": {
+        "failed": 32,
+        "skipped": 4
+      },
+      "after": {
+        "passed": 36
+      }
+    },
+    {
+      "suite": "msync",
+      "cases": 110,
+      "before": {
+        "passed": 110
+      },
+      "after": {
+        "passed": 110
+      }
+    },
+    {
+      "suite": "munmap",
+      "cases": 3,
+      "before": {
+        "passed": 3
+      },
+      "after": {
+        "passed": 3
+      }
+    },
+    {
+      "suite": "open",
+      "cases": 42,
+      "before": {
+        "passed": 35,
+        "failed": 6,
+        "timeout": 1
+      },
+      "after": {
+        "passed": 38,
+        "failed": 4
+      }
+    },
+    {
+      "suite": "open_create",
+      "cases": 16,
+      "before": {
+        "passed": 13,
+        "failed": 3
+      },
+      "after": {
+        "passed": 14,
+        "failed": 2
+      }
+    },
+    {
+      "suite": "openat2",
+      "cases": 50,
+      "before": {
+        "passed": 44,
+        "failed": 3,
+        "timeout": 2,
+        "skipped": 1
+      },
+      "after": {
+        "passed": 44,
+        "failed": 3,
+        "timeout": 2,
+        "skipped": 1
+      }
+    },
+    {
+      "suite": "overlay",
+      "cases": 74,
+      "before": {
+        "skipped": 6,
+        "passed": 61,
+        "failed": 7
+      },
+      "after": {
+        "skipped": 6,
+        "passed": 61,
+        "failed": 7
+      }
+    },
+    {
+      "suite": "partial_bad_buffer",
+      "cases": 20,
+      "before": {
+        "passed": 10,
+        "failed": 10
+      },
+      "after": {
+        "passed": 10,
+        "failed": 10
+      }
+    },
+    {
+      "suite": "pause",
+      "cases": 1,
+      "before": {
+        "passed": 1
+      },
+      "after": {
+        "passed": 1
+      }
+    },
+    {
+      "suite": "pidfd",
+      "cases": 34,
+      "before": {
+        "failed": 27,
+        "skipped": 6,
+        "timeout": 1
+      },
+      "after": {
+        "failed": 27,
+        "skipped": 6,
+        "timeout": 1
+      }
+    },
+    {
+      "suite": "pipe",
+      "cases": 160,
+      "before": {
+        "passed": 156,
+        "skipped": 4
+      },
+      "after": {
+        "passed": 156,
+        "skipped": 4
+      }
+    },
+    {
+      "suite": "pipe_external",
+      "cases": 4,
+      "before": {
+        "failed": 4
+      },
+      "after": {
+        "failed": 4
+      }
+    },
+    {
+      "suite": "pivot_root",
+      "cases": 19,
+      "before": {
+        "failed": 10,
+        "passed": 8,
+        "no_result": 1
+      },
+      "after": {
+        "failed": 10,
+        "passed": 8,
+        "no_result": 1
+      }
+    },
+    {
+      "suite": "pointer_auth",
+      "cases": 2,
+      "before": {
+        "skipped": 2
+      },
+      "after": {
+        "skipped": 2
+      }
+    },
+    {
+      "suite": "poll",
+      "cases": 25,
+      "before": {
+        "passed": 15,
+        "timeout": 2,
+        "failed": 8
+      },
+      "after": {
+        "passed": 15,
+        "timeout": 2,
+        "failed": 8
+      }
+    },
+    {
+      "suite": "posix_acl",
+      "cases": 111,
+      "before": {
+        "passed": 82,
+        "failed": 16,
+        "skipped": 13
+      },
+      "after": {
+        "passed": 95,
+        "skipped": 13,
+        "failed": 3
+      }
+    },
+    {
+      "suite": "ppoll",
+      "cases": 9,
+      "before": {
+        "passed": 8,
+        "timeout": 1
+      },
+      "after": {
+        "passed": 8,
+        "timeout": 1
+      }
+    },
+    {
+      "suite": "prctl_setuid",
+      "cases": 6,
+      "before": {
+        "passed": 6
+      },
+      "after": {
+        "passed": 6
+      }
+    },
+    {
+      "suite": "pread64",
+      "cases": 12,
+      "before": {
+        "passed": 11,
+        "failed": 1
+      },
+      "after": {
+        "passed": 11,
+        "failed": 1
+      }
+    },
+    {
+      "suite": "preadv",
+      "cases": 2,
+      "before": {
+        "passed": 2
+      },
+      "after": {
+        "passed": 2
+      }
+    },
+    {
+      "suite": "preadv2",
+      "cases": 10,
+      "before": {
+        "passed": 7,
+        "failed": 3
+      },
+      "after": {
+        "passed": 9,
+        "failed": 1
+      }
+    },
+    {
+      "suite": "priority",
+      "cases": 19,
+      "before": {
+        "passed": 14,
+        "failed": 5
+      },
+      "after": {
+        "passed": 14,
+        "failed": 5
+      }
+    },
+    {
+      "suite": "proc_pid_smaps",
+      "cases": 4,
+      "before": {
+        "skipped": 1,
+        "failed": 3
+      },
+      "after": {
+        "skipped": 1,
+        "failed": 3
+      }
+    },
+    {
+      "suite": "proc_pid_uid_gid_map",
+      "cases": 22,
+      "before": {
+        "passed": 22
+      },
+      "after": {
+        "passed": 22
+      }
+    },
+    {
+      "suite": "pselect",
+      "cases": 11,
+      "before": {
+        "passed": 10,
+        "timeout": 1
+      },
+      "after": {
+        "passed": 10,
+        "timeout": 1
+      }
+    },
+    {
+      "suite": "pty",
+      "cases": 125,
+      "before": {
+        "passed": 95,
+        "skipped": 2,
+        "failed": 20,
+        "timeout": 8
+      },
+      "after": {
+        "passed": 95,
+        "skipped": 2,
+        "failed": 20,
+        "timeout": 8
+      }
+    },
+    {
+      "suite": "pty_root",
+      "cases": 1,
+      "before": {
+        "passed": 1
+      },
+      "after": {
+        "passed": 1
+      }
+    },
+    {
+      "suite": "pwrite64",
+      "cases": 11,
+      "before": {
+        "passed": 10,
+        "failed": 1
+      },
+      "after": {
+        "passed": 10,
+        "failed": 1
+      }
+    },
+    {
+      "suite": "pwritev2",
+      "cases": 11,
+      "before": {
+        "failed": 2,
+        "passed": 9
+      },
+      "after": {
+        "failed": 1,
+        "passed": 10
+      }
+    },
+    {
+      "suite": "read",
+      "cases": 8,
+      "before": {
+        "passed": 7,
+        "failed": 1
+      },
+      "after": {
+        "passed": 7,
+        "failed": 1
+      }
+    },
+    {
+      "suite": "readahead",
+      "cases": 8,
+      "before": {
+        "passed": 5,
+        "skipped": 2,
+        "failed": 1
+      },
+      "after": {
+        "passed": 5,
+        "skipped": 2,
+        "failed": 1
+      }
+    },
+    {
+      "suite": "readv",
+      "cases": 32,
+      "before": {
+        "passed": 30,
+        "failed": 2
+      },
+      "after": {
+        "passed": 30,
+        "failed": 2
+      }
+    },
+    {
+      "suite": "readv_socket",
+      "cases": 23,
+      "before": {
+        "passed": 23
+      },
+      "after": {
+        "passed": 23
+      }
+    },
+    {
+      "suite": "rename",
+      "cases": 44,
+      "before": {
+        "passed": 34,
+        "failed": 10
+      },
+      "after": {
+        "passed": 34,
+        "failed": 10
+      }
+    },
+    {
+      "suite": "rlimits",
+      "cases": 7,
+      "before": {
+        "failed": 1,
+        "skipped": 1,
+        "passed": 5
+      },
+      "after": {
+        "failed": 1,
+        "skipped": 1,
+        "passed": 5
+      }
+    },
+    {
+      "suite": "rtsignal",
+      "cases": 4,
+      "before": {
+        "passed": 4
+      },
+      "after": {
+        "passed": 4
+      }
+    },
+    {
+      "suite": "sched",
+      "cases": 14,
+      "before": {
+        "failed": 8,
+        "passed": 6
+      },
+      "after": {
+        "failed": 8,
+        "passed": 6
+      }
+    },
+    {
+      "suite": "sched_yield",
+      "cases": 1,
+      "before": {
+        "passed": 1
+      },
+      "after": {
+        "passed": 1
+      }
+    },
+    {
+      "suite": "select",
+      "cases": 9,
+      "before": {
+        "passed": 9
+      },
+      "after": {
+        "passed": 9
+      }
+    },
+    {
+      "suite": "semaphore",
+      "cases": 30,
+      "before": {
+        "failed": 30
+      },
+      "after": {
+        "failed": 30
+      }
+    },
+    {
+      "suite": "sendfile",
+      "cases": 22,
+      "before": {
+        "failed": 4,
+        "passed": 16,
+        "skipped": 2
+      },
+      "after": {
+        "failed": 4,
+        "passed": 16,
+        "skipped": 2
+      }
+    },
+    {
+      "suite": "sendfile_socket",
+      "cases": 6,
+      "before": {
+        "failed": 3,
+        "passed": 3
+      },
+      "after": {
+        "failed": 3,
+        "passed": 3
+      }
+    },
+    {
+      "suite": "setgid",
+      "cases": 21,
+      "before": {
+        "skipped": 21
+      },
+      "after": {
+        "skipped": 21
+      }
+    },
+    {
+      "suite": "setns",
+      "cases": 17,
+      "before": {
+        "passed": 17
+      },
+      "after": {
+        "passed": 17
+      }
+    },
+    {
+      "suite": "shm",
+      "cases": 27,
+      "before": {
+        "failed": 26,
+        "skipped": 1
+      },
+      "after": {
+        "failed": 26,
+        "skipped": 1
+      }
+    },
+    {
+      "suite": "sigaction",
+      "cases": 7,
+      "before": {
+        "passed": 5,
+        "failed": 2
+      },
+      "after": {
+        "passed": 5,
+        "failed": 2
+      }
+    },
+    {
+      "suite": "sigaltstack",
+      "cases": 5,
+      "before": {
+        "passed": 4,
+        "skipped": 1
+      },
+      "after": {
+        "passed": 4,
+        "skipped": 1
+      }
+    },
+    {
+      "suite": "signalfd",
+      "cases": 19,
+      "before": {
+        "passed": 19
+      },
+      "after": {
+        "passed": 19
+      }
+    },
+    {
+      "suite": "sigprocmask",
+      "cases": 8,
+      "before": {
+        "passed": 8
+      },
+      "after": {
+        "passed": 8
+      }
+    },
+    {
+      "suite": "sigreturn",
+      "cases": 1,
+      "before": {
+        "passed": 1
+      },
+      "after": {
+        "passed": 1
+      }
+    },
+    {
+      "suite": "sigstop",
+      "cases": 5,
+      "before": {
+        "timeout": 1,
+        "passed": 4
+      },
+      "after": {
+        "timeout": 1,
+        "passed": 4
+      }
+    },
+    {
+      "suite": "sigtimedwait",
+      "cases": 11,
+      "before": {
+        "passed": 11
+      },
+      "after": {
+        "passed": 11
+      }
+    },
+    {
+      "suite": "splice",
+      "cases": 29,
+      "before": {
+        "passed": 19,
+        "failed": 7,
+        "timeout": 3
+      },
+      "after": {
+        "passed": 19,
+        "failed": 7,
+        "timeout": 3
+      }
+    },
+    {
+      "suite": "stat",
+      "cases": 59,
+      "before": {
+        "skipped": 19,
+        "passed": 40
+      },
+      "after": {
+        "skipped": 19,
+        "passed": 40
+      }
+    },
+    {
+      "suite": "stat_times",
+      "cases": 12,
+      "before": {
+        "failed": 4,
+        "passed": 8
+      },
+      "after": {
+        "failed": 4,
+        "passed": 8
+      }
+    },
+    {
+      "suite": "statfs",
+      "cases": 9,
+      "before": {
+        "skipped": 1,
+        "passed": 5,
+        "failed": 3
+      },
+      "after": {
+        "skipped": 1,
+        "passed": 5,
+        "failed": 3
+      }
+    },
+    {
+      "suite": "sticky",
+      "cases": 5,
+      "before": {
+        "passed": 5
+      },
+      "after": {
+        "passed": 5
+      }
+    },
+    {
+      "suite": "symlink",
+      "cases": 33,
+      "before": {
+        "passed": 32,
+        "failed": 1
+      },
+      "after": {
+        "passed": 32,
+        "failed": 1
+      }
+    },
+    {
+      "suite": "sync",
+      "cases": 5,
+      "before": {
+        "passed": 4,
+        "failed": 1
+      },
+      "after": {
+        "passed": 4,
+        "failed": 1
+      }
+    },
+    {
+      "suite": "sync_file_range",
+      "cases": 4,
+      "before": {
+        "failed": 3,
+        "passed": 1
+      },
+      "after": {
+        "failed": 3,
+        "passed": 1
+      }
+    },
+    {
+      "suite": "sysinfo",
+      "cases": 10,
+      "before": {
+        "passed": 9,
+        "failed": 1
+      },
+      "after": {
+        "passed": 9,
+        "failed": 1
+      }
+    },
+    {
+      "suite": "sysret",
+      "cases": 3,
+      "before": {
+        "failed": 3
+      },
+      "after": {
+        "failed": 3
+      }
+    },
+    {
+      "suite": "tgkill",
+      "cases": 3,
+      "before": {
+        "passed": 3
+      },
+      "after": {
+        "passed": 3
+      }
+    },
+    {
+      "suite": "tkill",
+      "cases": 3,
+      "before": {
+        "passed": 3
+      },
+      "after": {
+        "passed": 3
+      }
+    },
+    {
+      "suite": "truncate",
+      "cases": 11,
+      "before": {
+        "passed": 10,
+        "failed": 1
+      },
+      "after": {
+        "passed": 10,
+        "failed": 1
+      }
+    },
+    {
+      "suite": "uidgid",
+      "cases": 26,
+      "before": {
+        "passed": 25,
+        "skipped": 1
+      },
+      "after": {
+        "passed": 25,
+        "skipped": 1
+      }
+    },
+    {
+      "suite": "uname",
+      "cases": 4,
+      "before": {
+        "passed": 4
+      },
+      "after": {
+        "passed": 4
+      }
+    },
+    {
+      "suite": "unlink",
+      "cases": 23,
+      "before": {
+        "passed": 21,
+        "failed": 2
+      },
+      "after": {
+        "passed": 21,
+        "failed": 2
+      }
+    },
+    {
+      "suite": "unshare",
+      "cases": 5,
+      "before": {
+        "failed": 2,
+        "passed": 3
+      },
+      "after": {
+        "failed": 2,
+        "passed": 3
+      }
+    },
+    {
+      "suite": "utimes",
+      "cases": 16,
+      "before": {
+        "passed": 12,
+        "failed": 4
+      },
+      "after": {
+        "passed": 12,
+        "failed": 4
+      }
+    },
+    {
+      "suite": "vdso",
+      "cases": 1,
+      "before": {
+        "skipped": 1
+      },
+      "after": {
+        "skipped": 1
+      }
+    },
+    {
+      "suite": "vfork",
+      "cases": 4,
+      "before": {
+        "passed": 3,
+        "timeout": 1
+      },
+      "after": {
+        "passed": 3,
+        "timeout": 1
+      }
+    },
+    {
+      "suite": "wait",
+      "cases": 64,
+      "before": {
+        "passed": 35,
+        "failed": 25,
+        "timeout": 1,
+        "skipped": 3
+      },
+      "after": {
+        "passed": 47,
+        "failed": 15,
+        "timeout": 1,
+        "skipped": 1
+      }
+    },
+    {
+      "suite": "write",
+      "cases": 36,
+      "before": {
+        "failed": 2,
+        "passed": 34
+      },
+      "after": {
+        "failed": 2,
+        "passed": 34
+      }
+    },
+    {
+      "suite": "xattr",
+      "cases": 47,
+      "before": {
+        "passed": 39,
+        "skipped": 2,
+        "failed": 6
+      },
+      "after": {
+        "passed": 41,
+        "skipped": 2,
+        "failed": 4
+      }
+    }
+  ],
+  "verification": {
+    "full_sweep_cases": 2998,
+    "final_affected_group_cases": 414,
+    "final_affected_groups": [
+      "access",
+      "msgqueue",
+      "open",
+      "open_create",
+      "openat2",
+      "overlay",
+      "posix_acl",
+      "priority",
+      "xattr"
+    ],
+    "unique_passing_original_xml": 2312,
+    "native_linux_reference": "Existing immutable native run; native guest binaries and XML unchanged",
+    "workflow_gates": {
+      "macos": {
+        "passed": 8,
+        "total": 8,
+        "adaptations": []
+      },
+      "native_arm64_linux": {
+        "passed": 8,
+        "total": 8,
+        "adaptations": [
+          "Native ARM64 CLI and musl test executables; pinned QEMU remains the instruction oracle.",
+          "ThreadSanitizer target follows the ARM64 Linux host instead of hosted x86_64."
+        ]
+      }
+    },
+    "ipad_interpreter": {
+      "passed": 500,
+      "ignored_manual_benchmarks": 3,
+      "failed": 0
+    },
+    "ipad_ffi": {
+      "passed": 24,
+      "failed": 0
+    },
+    "ipad_interpreter_clippy": true,
+    "ios_aarch64_check": true,
+    "mac_product_gate": "Recorded by the paired product integration; not included in this runtime-only record"
+  },
+  "runner_sha256": {
+    "baseline": "1af4f023b1d3569f5729aeb95870cc71c992d352e6599856ad1fae3714274d52",
+    "full_sweep": "90a9a933363be354e132a3e5ca4a5a9d25832e231933ad5476b39914e392c916",
+    "final_affected_groups": "d25ae9caec6fc06c7431ffd408e78c208293723754f8d1b8acc0a814271c387f"
+  },
+  "evidence_sha256": {
+    "before-equivalent-fixtures/results.json": "40685240ac56c8ccd8b822e53b9584c44da6423ce8fad466a10158a936bc7a1d",
+    "after/results.json": "02b8abf9c2f9930480f63551b7b36fdf1fae8fa972fc0c344ca785a68ab01a5e",
+    "final-groups/results.json": "dabc886f89f81aa09604878e1d2cbc0b4019d508b746d298d284751d6e83302a",
+    "final/results.json": "3ce252697dcac6903b0cfb6a6953446d7f3801f84a9c8cf10154d49ca36fe780",
+    "full-sweep-source-manifest.json": "37c4baa7384c91768e89cddeb86d096fa716554d3d11ed7d5746765ef8438b5b",
+    "mac-source-manifest.json": "e0ede1bcb3bc37906fe995406b0466e7c927494f9df9d17e0ce3ff078326aaa0",
+    "final-edge.patch": "a0e8f14b8f55a05d7208e0c38e59930176611520932c452d2f07d9f0acb68511"
+  },
+  "deployment": {
+    "installed_mac_apps_changed": false,
+    "running_environments_restarted": false,
+    "physical_ipad_contacted": false
+  },
+  "performance_claim": "No added ordinary byte-access checks, locks or fences. No new controlled throughput or Firefox-latency claim."
+}

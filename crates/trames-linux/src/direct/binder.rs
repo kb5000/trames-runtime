@@ -39,6 +39,7 @@ impl DirectSyscalls {
         Some(self.resume_binder(
             PendingIo {
                 aio: None,
+                message: None,
                 binder: Some(Box::new(request)),
                 number: 29,
                 args,

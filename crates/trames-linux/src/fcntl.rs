@@ -36,7 +36,7 @@ mod tests {
         let mut memory = trames_memory::Memory::default();
         for (fd, cmd, arg, expected) in [
             (file, 4, 0x80040000, Err(Errno(1))),
-            (file, 4, 0x80000000, Err(Errno(22))),
+            (file, 4, 0x80000000, Ok(0)),
             (path, 4, u64::MAX, Err(Errno(9))),
             (file, 12, u64::MAX, Err(Errno(22))),
             (path, 12, u64::MAX, Err(Errno(9))),
@@ -44,7 +44,7 @@ mod tests {
             (file, 0x100000003, 0, Err(Errno(22))),
             (file, 2, 1, Ok(0)),
             (file, 1, 0, Ok(1)),
-            (file, 3, 0, Ok(2)),
+            (file, 3, 0, Ok(2 | trames_vfs::O_LARGEFILE as u64)),
         ] {
             let args = [fd as u64, cmd, arg, 0, 0, 0];
             assert_eq!(short(&linux.vfs.descriptor_factory(), args), Some(expected));

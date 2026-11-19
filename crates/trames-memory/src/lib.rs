@@ -30,6 +30,7 @@ pub use report::{ImageRanges, MemoryReport};
 mod ownership_tests;
 mod root;
 mod slots;
+mod vma_policy;
 use backing::Backed;
 pub use backing::{backing_changed, external_memory_changed, PageBacking, PageSource, SyncRange};
 pub use cpu_memory::{CpuMemory, CpuSlice};
@@ -240,6 +241,7 @@ pub struct Memory {
     pages: BTreeMap<u64, usize>,
     // Anonymous PROT_NONE ranges own virtual addresses, without resident pages.
     reservations: BTreeMap<u64, u64>,
+    vma_policy: vma_policy::Policy,
     anonymous: anonymous::Anonymous,
     sparse_pages: RefCell<BTreeMap<u64, Arc<Page>>>,
     parallel_anonymous_dirty: bool,
@@ -299,15 +301,33 @@ impl Memory {
         let identity = NEXT_SPACE.fetch_add(1, Ordering::Relaxed);
         let mut frames = Slots::new();
         let mut excluded = BTreeSet::new();
+        if !self.vma_policy.nofork.is_empty() {
+            excluded.extend(
+                self.pages
+                    .iter()
+                    .filter(|(base, _)| self.vma_policy.nofork.contains(**base))
+                    .map(|(_, frame)| *frame),
+            );
+        }
+        let mut wiped = BTreeSet::new();
+        if !self.vma_policy.wipe.is_empty() {
+            wiped.extend(
+                self.pages
+                    .iter()
+                    .filter(|(base, _)| self.vma_policy.wipe.contains(**base))
+                    .map(|(_, frame)| *frame),
+            );
+        }
         for source in self.frames.iter() {
             let Some(source) = source else {
                 frames.push(None);
                 continue;
             };
-            if source
-                .backing
-                .as_ref()
-                .is_some_and(|b| !b.object.inherit_on_fork())
+            if excluded.contains(&frames.len())
+                || source
+                    .backing
+                    .as_ref()
+                    .is_some_and(|b| !b.object.inherit_on_fork())
             {
                 excluded.insert(frames.len());
                 frames.push(None);
@@ -316,6 +336,13 @@ impl Memory {
             let pinned = !self.pinned.is_empty() && self.page_pinned(source);
             let resident = source.charge.resident();
             let mut page = source.clone();
+            if wiped.contains(&frames.len()) {
+                page.bytes = Arc::new(PageBytes::Zero);
+                page.charge = Charge::new(&account);
+                page.parallel_dirty = false;
+                frames.push(Some(page));
+                continue;
+            }
             if (retained || pinned) && page.bytes.shared().is_some() {
                 page.bytes = Arc::new(if resident {
                     (*page.bytes).clone()
@@ -344,6 +371,7 @@ impl Memory {
             parallel_anonymous_changes: Vec::new(),
             anonymous_retired: Vec::new(),
             reservations: self.reservations.clone(),
+            vma_policy: self.vma_policy.clone(),
             frames,
             free_frames: self.free_frames.clone(),
             translations: std::array::from_fn(|_| Cell::new(Translation::EMPTY)),
@@ -385,6 +413,9 @@ impl Memory {
         // A retained worker can have reached pages absent from the coordinator's
         // descriptor table. Fork them through the same COW boundary as pages.
         for base in self.anonymous.populated() {
+            if self.vma_policy.nofork.contains(base) || self.vma_policy.wipe.contains(base) {
+                continue;
+            }
             let source = self.sparse_page(base);
             let resident = source.charge.resident();
             let mut page = source.clone();
@@ -400,6 +431,7 @@ impl Memory {
             cloned.anonymous.remove(base, base + PAGE_SIZE);
             cloned.insert_owned_page(base, page);
         }
+        cloned.apply_fork_policy(&self.vma_policy)?;
         // Commit only after every child charge succeeded. No tentative child
         // can execute while it shares a still-writable parent CPU alias.
         self.invalidate_translations();
@@ -490,6 +522,7 @@ impl Memory {
             mmu: mmu::Arena::default(),
             pages: BTreeMap::new(),
             reservations: BTreeMap::new(),
+            vma_policy: Default::default(),
             anonymous: anonymous::Anonymous::default(),
             sparse_pages: RefCell::new(BTreeMap::new()),
             parallel_anonymous_dirty: false,
@@ -886,6 +919,7 @@ impl Memory {
         }
         let end = Self::mapping_end(address, len)?;
         self.remove_reservations(address, end)?;
+        self.vma_policy.remove(address, end);
         self.invalidate_proc_reads(address, end);
         self.retire_sparse(address, end);
         self.retire_anonymous_range(address, end);

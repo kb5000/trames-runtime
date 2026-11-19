@@ -21,8 +21,8 @@ mod direct;
 pub use direct::{
     epoll_parameters, epoll_scatter, Aio, DirectSyscalls, FileBoundary, FileCheckpoint,
     FileExecutor, FileOutput, FilePending, FileResult, IoAttempt, PendingIo, RetainedAio,
-    RetainedByte, RetainedSocket, UringActor, UringBackground, UringEnter, UringEpoch,
-    UringSnapshot,
+    RetainedByte, RetainedMessage, RetainedSocket, UringActor, UringBackground, UringEnter,
+    UringEpoch, UringSnapshot,
 };
 mod file_advice;
 mod file_calls;

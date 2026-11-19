@@ -86,6 +86,12 @@ impl Vfs {
         )
     }
     pub(super) fn resize_fd(&mut self, fd: u32, request: FileResize) -> Result<()> {
+        self.resize_fd_inner(fd, request, false)
+    }
+    pub(super) fn truncate_open(&mut self, fd: u32) -> Result<()> {
+        self.resize_fd_inner(fd, FileResize::Truncate(0), true)
+    }
+    fn resize_fd_inner(&mut self, fd: u32, request: FileResize, opening: bool) -> Result<()> {
         if matches!(request, FileResize::Truncate(_)) && self.flags(fd)? & O_PATH != 0 {
             return Err(Errno(9));
         }
@@ -99,7 +105,7 @@ impl Vfs {
         } else {
             self.fd_available_bytes(fd)?
         };
-        if open.flags.get() & 3 == 0 {
+        if !opening && open.flags.get() & 3 == 0 {
             return Err(Errno(22));
         }
         self.pseudo_immutable(&node)?;

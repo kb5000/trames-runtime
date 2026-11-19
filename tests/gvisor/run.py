@@ -257,6 +257,8 @@ def trames(args, output):
             guest_xml = work+'/result.xml'
             xml = output/'logs'/(str(index)+'.xml')
             wrapper = 'export TEST_SRCDIR=/opt/gvisor/runfiles RUNFILES_DIR=/opt/gvisor/runfiles; mkdir -p "$1"; cd "$1"; export TEST_TMPDIR="$1"; unset TEST_ON_GVISOR GVISOR_SAVE_TEST; shift; exec "$@"'
+            if suite['name']=='posix_acl':
+                wrapper='mkdir -p /dev/shm; mount -t tmpfs -o mode=1777 tmpfs /dev/shm; '+wrapper
             if args.network=='internal':
                 wrapper=wrapper.replace('exec "$@"', '"$@" & child=$!; wait "$child"')
             argv = [runner,'debug','env-run',name,'--no-windows','--no-pty','--','/bin/sh','-ec',wrapper,'trames-gvisor',work,

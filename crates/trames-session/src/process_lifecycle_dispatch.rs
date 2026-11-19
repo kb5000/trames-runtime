@@ -198,6 +198,13 @@ impl<C: Cpu> Lifecycle<C> {
                     &epoch.io_target,
                     call.deadline,
                 ))
+            } else if let Some(message) = call.message {
+                Some(snapshot.direct.start_retained_message(
+                    message,
+                    &mut p.memory,
+                    job.work.pid,
+                    &epoch.io_target,
+                ))
             } else if let Some(aio) = call.aio {
                 Some(snapshot.direct.start_retained_aio(
                     aio,

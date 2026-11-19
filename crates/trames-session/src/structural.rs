@@ -8,6 +8,7 @@ use trames_engine::Cpu;
 pub(crate) enum Call {
     Memory(Memory),
     Clone,
+    Clone3,
     Exec { at: bool },
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +38,7 @@ impl Call {
                 operation: args[1] as u32,
             }),
             220 => Self::Clone,
+            435 => Self::Clone3,
             221 => Self::Exec { at: false },
             281 => Self::Exec { at: true },
             _ => return None,
@@ -61,6 +63,7 @@ impl Call {
         match self {
             Self::Memory(memory) => memory.number(),
             Self::Clone => 220,
+            Self::Clone3 => 435,
             Self::Exec { at: false } => 221,
             Self::Exec { at: true } => 281,
         }

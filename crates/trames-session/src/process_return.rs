@@ -29,6 +29,7 @@ pub(super) fn publish<C: Cpu>(
     p.retained_poll = done.io.as_ref().and_then(|call| call.retained_poll.clone());
     p.retained_file = done.io.as_ref().and_then(|call| call.file.clone());
     p.retained_aio = done.io.as_ref().and_then(|call| call.aio.clone());
+    p.retained_message = done.io.as_ref().and_then(|call| call.message.clone());
     p.file_checkpoint = done
         .io
         .as_ref()

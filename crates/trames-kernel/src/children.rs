@@ -203,7 +203,7 @@ impl Wait {
     pub fn prepare(number: u32, args: [u64; 6]) -> Result<Self, Errno> {
         match number {
             260 => {
-                if args[2] as u32 & !(11 | 0x40000000) != 0 {
+                if args[2] as u32 & !(11 | 0x40000000 | 0x80000000) != 0 {
                     return Err(Errno(22));
                 }
             }
@@ -211,7 +211,7 @@ impl Wait {
                 let which = args[0] as u32;
                 let id = args[1] as i32;
                 let options = args[3] as u32;
-                if options & !(15 | 0x01000000 | 0x40000000) != 0
+                if options & !(15 | 0x01000000 | 0x40000000 | 0x80000000) != 0
                     || options & 14 == 0
                     || which > 2
                     || which != 0 && id < 0

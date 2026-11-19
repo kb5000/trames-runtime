@@ -18,8 +18,11 @@ fn entries(bytes: &[u8]) -> impl Iterator<Item = (u16, u32, u32)> + '_ {
     })
 }
 pub(super) fn validate(bytes: &[u8]) -> Result<()> {
-    if bytes.len() < 4 || (bytes.len() - 4) % 8 != 0 || bytes[..4] != 2u32.to_le_bytes() {
+    if bytes.len() < 4 || (bytes.len() - 4) % 8 != 0 {
         return Err(Errno(22));
+    }
+    if bytes[..4] != 2u32.to_le_bytes() {
+        return Err(Errno(95));
     }
     if bytes.len() == 4 {
         return Ok(());

@@ -1134,6 +1134,7 @@ impl UringSnapshot {
             PendingIo {
                 binder: None,
                 aio: None,
+                message: None,
                 number: 426,
                 args,
                 deadline,
