@@ -2014,6 +2014,7 @@ impl Vfs {
             b"/proc/sys/kernel/threads-max" => return Ok(regular(format!("{task_limit}\n").into_bytes())),
             sysctl::MAX_USER_NAMESPACES => return Ok(Some((file(format!("{}\n", self.user_namespace_limits().max()).into_bytes()), 0o100644))),
             b"/proc/sys/fs/nr_open" => return Ok(Some((file(format!("{}\n", self.descriptor_ceiling().get()).into_bytes()), 0o100644))),
+            b"/proc/sys/fs/suid_dumpable" => return Ok(regular(b"0\n".to_vec())),
             b"/proc/sys/fs/file-max" => return Ok(regular(format!("{}\n", task_limit * MAX_FDS as usize).into_bytes())),
             b"/proc/sys/fs/file-nr" => return Ok(regular(format!("{}\t0\t{}\n", r.processes.iter().map(|p| p.fds.len()).sum::<usize>(), task_limit * MAX_FDS as usize).into_bytes())),
             b"/proc/sys/vm/overcommit_memory" => return Ok(regular(b"2\n".to_vec())),
@@ -2795,7 +2796,11 @@ impl Vfs {
             .map(|s| s.as_bytes().to_vec())
             .collect(),
             b"/proc/sys/kernel/random" => vec![b"uuid".to_vec(), b"boot_id".to_vec()],
-            b"/proc/sys/fs" => vec![b"file-max".to_vec(), b"file-nr".to_vec()],
+            b"/proc/sys/fs" => vec![
+                b"file-max".to_vec(),
+                b"file-nr".to_vec(),
+                b"suid_dumpable".to_vec(),
+            ],
             b"/proc/sys/user" => vec![b"max_user_namespaces".to_vec()],
             b"/proc/sys/vm" => vec![b"overcommit_memory".to_vec()],
             b"/proc/sys/net" => vec![b"ipv4".to_vec(), b"ipv6".to_vec(), b"bridge".to_vec()],

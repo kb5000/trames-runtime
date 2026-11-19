@@ -430,7 +430,7 @@ impl<C: Cpu> Runtime<C> {
         vfs: &trames_vfs::Vfs,
         options: RuntimeOptions,
     ) -> Result<Self, RuntimeError> {
-        Self::load_guest_execfn(bytes, argv, envp, vfs, options, None)
+        Self::load_guest_execfn(bytes, argv, envp, vfs, options, None, None)
     }
     pub(crate) fn load_guest_execfn(
         bytes: &[u8],
@@ -439,16 +439,49 @@ impl<C: Cpu> Runtime<C> {
         vfs: &trames_vfs::Vfs,
         options: RuntimeOptions,
         exec_filename: Option<&[u8]>,
+        accepted: Option<std::sync::Arc<trames_vfs::ExecutableFile>>,
     ) -> Result<Self, RuntimeError> {
+        let elf = Self::load_elf(bytes, vfs, options, accepted.as_deref(), None)?;
+        Self::start_image(elf, argv, envp, vfs, options, exec_filename, accepted)
+    }
+    fn load_elf(
+        bytes: &[u8],
+        vfs: &trames_vfs::Vfs,
+        options: RuntimeOptions,
+        executable: Option<&trames_vfs::ExecutableFile>,
+        mut credentials: Option<&mut trames_vfs::ExecCredentials>,
+    ) -> Result<LoadedElf, RuntimeError> {
         options.memory_limits.validate()?;
         options.memory_limits.configure_shared_memory(vfs);
         if options.video_accelerator {
             vfs.enable_video_device();
         }
-        let mut elf =
-            trames_elf::load_with_interpreter(bytes, options.memory_limits.per_process, |path| {
-                vfs.executable(path).map_err(|e| ElfError::Interpreter(e.0))
-            })?;
+        let main_file = executable.map(|f| vfs.executable_mapping(f));
+        Ok(trames_elf::load_with_files(
+            bytes,
+            options.memory_limits.per_process,
+            main_file.as_ref(),
+            |path| {
+                let file = vfs
+                    .executable_file_at(trames_vfs::AT_FDCWD, path, 0)
+                    .map_err(|e| ElfError::Interpreter(e.0))?;
+                if let Some(creds) = credentials.as_mut() {
+                    creds.include_interpreter(vfs, &file);
+                }
+                let bytes = file.bytes().map_err(|e| ElfError::Interpreter(e.0))?;
+                Ok((bytes, Some(vfs.executable_mapping(&file))))
+            },
+        )?)
+    }
+    fn start_image(
+        mut elf: LoadedElf,
+        argv: &[Vec<u8>],
+        envp: &[Vec<u8>],
+        vfs: &trames_vfs::Vfs,
+        options: RuntimeOptions,
+        exec_filename: Option<&[u8]>,
+        executable: Option<std::sync::Arc<trames_vfs::ExecutableFile>>,
+    ) -> Result<Self, RuntimeError> {
         let mut linux = Linux::new(elf.brk_base);
         linux.arguments = argv.to_vec();
         linux.environment = envp.to_vec();
@@ -465,9 +498,10 @@ impl<C: Cpu> Runtime<C> {
                 .collect::<Vec<_>>()),
         );
         if exec_filename.is_none() {
-            if let Ok(file) =
+            if let Some(file) = executable.or_else(|| {
                 vfs.executable_file_at(trames_vfs::AT_FDCWD, &linux.executable_path, 0)
-            {
+                    .ok()
+            }) {
                 linux.executable_path = vfs.executable_display(&file);
                 linux.executable_file = Some(file);
             } else if let Ok(path) = vfs.resolve(trames_vfs::AT_FDCWD, &linux.executable_path) {
@@ -542,14 +576,15 @@ impl<C: Cpu> Runtime<C> {
         let filename = bytes
             .starts_with(b"#!")
             .then(|| argv.first().cloned().unwrap_or_default());
+        let mut accepted = None;
         let mut bytes = std::borrow::Cow::Borrowed(bytes);
-        for depth in 0..5 {
+        for depth in 0..=5 {
             let Some((interpreter, optional)) = trames_vfs::script_interpreter(&bytes)
                 .map_err(|e| RuntimeError::Elf(ElfError::Interpreter(e.0)))?
             else {
                 break;
             };
-            if depth == 4 {
+            if depth == 5 {
                 return Err(RuntimeError::Elf(ElfError::Interpreter(40)));
             }
             let script =
@@ -571,9 +606,18 @@ impl<C: Cpu> Runtime<C> {
                 file.bytes()
                     .map_err(|e| RuntimeError::Elf(ElfError::Interpreter(e.0)))?,
             );
+            accepted = Some(file);
         }
         let mut runtime = if let Some(filename) = filename {
-            Self::load_guest_execfn(&bytes, &argv, &envp, &vfs, options, Some(&filename))?
+            Self::load_guest_execfn(
+                &bytes,
+                &argv,
+                &envp,
+                &vfs,
+                options,
+                Some(&filename),
+                accepted,
+            )?
         } else {
             Self::load_guest(&bytes, &argv, &envp, &vfs, options)?
         };
@@ -841,6 +885,21 @@ mod tests {
             image.environment.1 < STACK_TOP,
             "AT_EXECFN bytes are outside argv/envp"
         );
+    }
+    #[test]
+    fn exec_string_and_combined_vector_limits_include_nul_and_pointer_slots() {
+        let max_string = trames_linux::image::EXEC_STRING_BYTES;
+        let budget = trames_linux::image::EXEC_ARGUMENT_BYTES;
+        let arg = "a".repeat(max_string - 1);
+        let env = "b".repeat(budget - max_string - 2 * 8 - 1);
+        assert!(initial_stack(
+            &mut elf(),
+            std::slice::from_ref(&arg),
+            std::slice::from_ref(&env)
+        )
+        .is_ok());
+        assert!(initial_stack(&mut elf(), &[arg], &[env + "b"]).is_err());
+        assert!(initial_stack(&mut elf(), &["x".repeat(max_string)], &[]).is_err());
     }
     #[test]
     fn argument_limits_and_nuls_fail() {

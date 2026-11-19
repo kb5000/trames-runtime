@@ -182,6 +182,30 @@ impl Memory {
             self.advance_layout_revision();
         }
     }
+    /// Records file provenance for private pages populated by the ELF loader.
+    pub fn record_image_file(
+        &mut self,
+        start: u64,
+        length: u64,
+        offset: u64,
+        file: MappingFileInfo,
+    ) {
+        if let Some(mm) = &self.shared {
+            return mm
+                .borrow_mut()
+                .record_image_file(start, length, offset, file);
+        }
+        let end = start.checked_add(length).expect("validated image range");
+        Arc::make_mut(&mut self.region_layout).origins.insert(
+            start,
+            Mapping {
+                offset,
+                origin: Origin::File(file),
+                ..Mapping::private(end)
+            },
+        );
+        self.advance_layout_revision();
+    }
     /// PR_SET_VMA_ANON_NAME operates on mapping metadata only.
     pub fn name_anonymous(
         &mut self,

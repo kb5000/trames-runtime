@@ -66,6 +66,9 @@ pub struct ExecCredentials {
     readable: bool,
 }
 impl ExecCredentials {
+    pub fn include_interpreter(&mut self, view: &Vfs, file: &ExecutableFile) {
+        self.readable &= view.allowed(&file.node.borrow(), 4);
+    }
     pub fn no_new_privs(&self) -> bool {
         self.original.caps.no_new_privs.get()
     }

@@ -5,7 +5,10 @@ use trames_execution::Features;
 use trames_memory::{Memory, MemoryError, Permissions, PAGE_SIZE};
 pub const STACK_TOP: u64 = 0x0000_7fff_fff0_0000;
 pub const STACK_SIZE: u64 = 1024 * 1024;
-const INITIAL_ARGUMENT_BYTES: u64 = 64 * 1024;
+// RLIMIT_STACK is fixed at STACK_SIZE on both executors. Linux allows a
+// quarter of this limit for argument bytes and their guest pointer slots.
+pub const EXEC_ARGUMENT_BYTES: usize = STACK_SIZE as usize / 4;
+pub const EXEC_STRING_BYTES: usize = 32 * PAGE_SIZE as usize;
 #[derive(Debug)]
 pub enum ImageError {
     Arguments(&'static str),
@@ -17,6 +20,9 @@ impl From<MemoryError> for ImageError {
     }
 }
 fn push_string(memory: &mut Memory, cursor: &mut u64, string: &[u8]) -> Result<u64, ImageError> {
+    if string.len() >= EXEC_STRING_BYTES {
+        return Err(ImageError::Arguments("argument string too long"));
+    }
     if string.contains(&0) {
         return Err(ImageError::Arguments("NUL in argv or envp"));
     }
@@ -26,8 +32,8 @@ fn push_string(memory: &mut Memory, cursor: &mut u64, string: &[u8]) -> Result<u
         .ok_or(ImageError::Arguments("string size"))?;
     *cursor = cursor
         .checked_sub(len as u64)
-        .filter(|&address| address >= STACK_TOP - INITIAL_ARGUMENT_BYTES)
-        .ok_or(ImageError::Arguments("stack exceeds 64 KiB"))?;
+        .filter(|&address| address >= STACK_TOP - STACK_SIZE)
+        .ok_or(ImageError::Arguments("argument stack exhausted"))?;
     memory.write(*cursor, string)?;
     memory.write(*cursor + string.len() as u64, &[0])?;
     Ok(*cursor)
@@ -44,10 +50,11 @@ pub fn build_initial_stack(
     if argv.is_empty() {
         return Err(ImageError::Arguments("argv[0] is required"));
     }
-    if argv.len() + envp.len() > 4096 {
-        return Err(ImageError::Arguments(
-            "too many arguments or environment entries",
-        ));
+    let mut budget = EXEC_ARGUMENT_BYTES;
+    for value in argv.iter().chain(envp) {
+        budget = budget
+            .checked_sub(value.len() + 1 + 8)
+            .ok_or(ImageError::Arguments("argument list too long"))?;
     }
     elf.memory
         .map(STACK_TOP - STACK_SIZE, STACK_SIZE, Permissions::RW)?;
@@ -119,8 +126,8 @@ pub fn build_initial_stack(
     let sp = cursor
         .checked_sub(words.len() as u64 * 8)
         .map(|v| v & !15)
-        .filter(|&v| v >= STACK_TOP - INITIAL_ARGUMENT_BYTES)
-        .ok_or(ImageError::Arguments("stack exceeds 64 KiB"))?;
+        .filter(|&v| v >= STACK_TOP - STACK_SIZE)
+        .ok_or(ImageError::Arguments("argument stack exhausted"))?;
     elf.memory.set_image_ranges(trames_memory::ImageRanges {
         arguments: (arg_start, arg_end),
         environment: (env_start, env_end),

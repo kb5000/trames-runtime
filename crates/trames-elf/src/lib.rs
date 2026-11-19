@@ -5,7 +5,7 @@ use std::fmt;
 // Keep the low 4 GiB available for runtimes with compressed heap/image pointers
 // (notably ART). This is a guest virtual address, not reserved resident memory.
 pub const INTERPRETER_BASE: u64 = 0x7000_0000_0000;
-use trames_memory::{Memory, MemoryError, Permissions, ADDRESS_LIMIT, PAGE_SIZE};
+use trames_memory::{MappingFileInfo, Memory, MemoryError, Permissions, ADDRESS_LIMIT, PAGE_SIZE};
 
 const EH_SIZE: usize = 64;
 const PH_SIZE: usize = 56;
@@ -92,16 +92,28 @@ pub fn load_with_interpreter(
     memory_limit: usize,
     mut resolve: impl FnMut(&[u8]) -> Result<Vec<u8>, ElfError>,
 ) -> Result<LoadedElf, ElfError> {
+    load_with_files(bytes, memory_limit, None, |path| {
+        resolve(path).map(|b| (b, None))
+    })
+}
+
+pub fn load_with_files(
+    bytes: &[u8],
+    memory_limit: usize,
+    main_file: Option<&MappingFileInfo>,
+    mut resolve: impl FnMut(&[u8]) -> Result<(Vec<u8>, Option<MappingFileInfo>), ElfError>,
+) -> Result<LoadedElf, ElfError> {
     let mut memory = Memory::new(memory_limit);
-    let main = map_image(bytes, &mut memory, 0x4000_0000)?;
+    let main = map_image(bytes, &mut memory, 0x4000_0000, main_file)?;
     let (start_entry, interpreter_base) = if let Some(path) = &main.interpreter {
-        let interpreter = resolve(path)?;
-        let loader = map_image(&interpreter, &mut memory, INTERPRETER_BASE)?;
+        let (interpreter, file) = resolve(path)?;
+        let loader = map_image(&interpreter, &mut memory, INTERPRETER_BASE, file.as_ref())
+            .map_err(|err| match err {
+                ElfError::Invalid(_) | ElfError::Unsupported(_) => ElfError::Interpreter(80),
+                other => other,
+            })?;
         if loader.interpreter.is_some() {
             return Err(ElfError::Invalid("nested PT_INTERP"));
-        }
-        if loader.bias == 0 {
-            return Err(ElfError::Unsupported("interpreter must be ET_DYN"));
         }
         (loader.entry, loader.bias)
     } else {
@@ -125,7 +137,12 @@ struct Image {
     bias: u64,
     end: u64,
 }
-fn map_image(bytes: &[u8], memory: &mut Memory, dynamic_bias: u64) -> Result<Image, ElfError> {
+fn map_image(
+    bytes: &[u8],
+    memory: &mut Memory,
+    dynamic_bias: u64,
+    file: Option<&MappingFileInfo>,
+) -> Result<Image, ElfError> {
     use ElfError::{Invalid, Unsupported};
     if bytes.len() < EH_SIZE || bytes.len() > MAX_ELF_SIZE {
         return Err(Invalid("file size"));
@@ -144,8 +161,8 @@ fn map_image(bytes: &[u8], memory: &mut Memory, dynamic_bias: u64) -> Result<Ima
     if u16_at(bytes, 18) != 183 {
         return Err(Unsupported("machine must be AArch64"));
     }
-    if u32_at(bytes, 20) != 1 || u16_at(bytes, 52) != EH_SIZE as u16 {
-        return Err(Invalid("header version or size"));
+    if u32_at(bytes, 20) != 1 {
+        return Err(Invalid("header version"));
     }
     if u32_at(bytes, 48) != 0 {
         return Err(Invalid("AArch64 e_flags must be zero"));
@@ -182,10 +199,14 @@ fn map_image(bytes: &[u8], memory: &mut Memory, dynamic_bias: u64) -> Result<Ima
                     return Err(Invalid("interpreter size"));
                 }
                 let path = &bytes[offset..end];
-                if path[0] != b'/' || path[size - 1] != 0 || path[..size - 1].contains(&0) {
+                if path[size - 1] != 0 {
                     return Err(Invalid("interpreter path"));
                 }
-                interpreter = Some(path[..size - 1].to_vec());
+                let name = path.split(|&c| c == 0).next().unwrap();
+                if name.is_empty() {
+                    return Err(ElfError::Interpreter(13));
+                }
+                interpreter = Some(name.to_vec());
                 continue;
             }
             1 => {}
@@ -210,9 +231,12 @@ fn map_image(bytes: &[u8], memory: &mut Memory, dynamic_bias: u64) -> Result<Ima
         if filesz != 0
             && offset
                 .checked_add(filesz)
-                .is_none_or(|end| end > bytes.len())
+                .is_none_or(|end| end > bytes.len().next_multiple_of(PAGE_SIZE as usize))
         {
             return Err(Invalid("segment outside file"));
+        }
+        if filesz != 0 && address % PAGE_SIZE != offset as u64 % PAGE_SIZE {
+            return Err(Invalid("segment page offset"));
         }
         if align > 1 && (!align.is_power_of_two() || address % align != offset as u64 % align) {
             return Err(Invalid("segment alignment"));
@@ -234,12 +258,6 @@ fn map_image(bytes: &[u8], memory: &mut Memory, dynamic_bias: u64) -> Result<Ima
             write: flags & 2 != 0,
             execute: flags & 1 != 0,
         };
-        if segments
-            .iter()
-            .any(|s| base < s.base + s.size && s.base < page_end)
-        {
-            return Err(Unsupported("overlapping PT_LOAD pages"));
-        }
         segments.push(Segment {
             offset,
             address,
@@ -257,22 +275,46 @@ fn map_image(bytes: &[u8], memory: &mut Memory, dynamic_bias: u64) -> Result<Ima
     {
         return Err(Invalid("entry is not aligned inside an executable segment"));
     }
-    let phdr = segments.iter().find_map(|s| {
-        if phoff >= s.offset && phend <= s.offset + s.filesz {
-            Some(s.address + (phoff - s.offset) as u64)
-        } else {
-            None
-        }
-    });
+    let mut phdr = None;
     let end = segments
         .iter()
         .map(|s| s.base + s.size)
         .max()
         .ok_or(Invalid("no load segments"))?;
+    // A fixed segment in a single image may replace an earlier segment.
+    // A separately placed PIE interpreter must not replace the main image.
+    if bias != 0 && segments.iter().any(|s| !memory.is_free(s.base, s.size)) {
+        return Err(Invalid("dynamic image address collision"));
+    }
     for s in segments {
-        memory.map(s.base, s.size, Permissions::RW)?;
+        match memory.map(s.base, s.size, Permissions::RW) {
+            Err(MemoryError::Overlap(_)) => memory.map_fixed(s.base, s.size, Permissions::RW)?,
+            other => other?,
+        }
+        if phdr.is_some_and(|p| (s.base..s.base + s.size).contains(&p)) {
+            phdr = None;
+        }
         if s.filesz != 0 {
-            memory.write(s.address, &bytes[s.offset..s.offset + s.filesz])?;
+            // mmap exposes the prefix of the first file page and the last
+            // page up to EOF. BSS starts exactly at p_filesz when present.
+            let start = s.offset & !(PAGE_SIZE as usize - 1);
+            let file_end = s.offset + s.filesz;
+            let end = if s.memsz == s.filesz as u64 {
+                file_end.next_multiple_of(PAGE_SIZE as usize)
+            } else {
+                file_end
+            }
+            .min(bytes.len());
+            if let Some(file) = file {
+                let file_pages = file_end.next_multiple_of(PAGE_SIZE as usize) - start;
+                memory.record_image_file(s.base, file_pages as u64, start as u64, file.clone());
+            }
+            if start < end {
+                memory.write(s.base, &bytes[start..end])?;
+                if start <= phoff && phend <= end {
+                    phdr = Some(s.base + (phoff - start) as u64);
+                }
+            }
         }
         memory.protect(s.base, s.size, s.permissions)?;
     }
@@ -317,8 +359,39 @@ mod tests {
         assert_eq!(e.memory.fetch_u32(e.entry).unwrap(), 0);
     }
     #[test]
+    fn page_aligned_file_prefix_and_bss_have_distinct_provenance() {
+        let mut b = image();
+        b[52..54].fill(0);
+        b[72..80].copy_from_slice(&120u64.to_le_bytes());
+        b[80..88].copy_from_slice(&0x1078u64.to_le_bytes());
+        b[96..104].copy_from_slice(&4u64.to_le_bytes());
+        b[104..112].copy_from_slice(&(2 * PAGE_SIZE).to_le_bytes());
+        let file = MappingFileInfo {
+            device: 1,
+            inode: 7,
+            path: b"/image".as_slice().into(),
+        };
+        let e =
+            load_with_files(&b, 4 * PAGE_SIZE as usize, Some(&file), |_| unreachable!()).unwrap();
+        assert_eq!(e.memory.read_array::<4>(0x1000).unwrap(), *b"\x7fELF");
+        assert_eq!(e.phdr, Some(0x1040));
+        let report = e.memory.memory_report().maps();
+        let maps = std::str::from_utf8(&report).unwrap();
+        let line = maps.lines().find(|l| l.ends_with("/image")).unwrap();
+        let (start, end) = line
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .split_once('-')
+            .unwrap();
+        assert_eq!(u64::from_str_radix(start, 16), Ok(0x1000));
+        assert_eq!(u64::from_str_radix(end, 16), Ok(0x2000));
+        assert_eq!(maps.matches("/image").count(), 1);
+    }
+
+    #[test]
     fn rejects_truncation_and_malformed_segments() {
-        for end in 0..124 {
+        for end in 0..EH_SIZE + PH_SIZE {
             assert!(load(&image()[..end], 4096).is_err(), "prefix {end}");
         }
         let mut b = image();
@@ -406,6 +479,10 @@ mod tests {
         e.memory.write(0x7000_1078, &42u64.to_le_bytes()).unwrap();
         assert_eq!(e.memory.read_u64(0x7000_1078).unwrap(), 42);
         main[192] = b'x';
-        assert!(load_with_interpreter(&main, 8192, |_| Ok(loader.clone())).is_err());
+        load_with_interpreter(&main, 8192, |name| {
+            assert_eq!(name, b"xlib/ld-test.so");
+            Ok(loader.clone())
+        })
+        .unwrap();
     }
 }

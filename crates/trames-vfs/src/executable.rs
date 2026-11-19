@@ -146,6 +146,20 @@ impl Vfs {
             mount: mount.as_ref().map(|mount| mount.shared.clone()),
         })))
     }
+    pub fn executable_mapping(&self, file: &ExecutableFile) -> trames_memory::MappingFileInfo {
+        let path = self.executable_display(file).into();
+        let node = file.node.borrow();
+        let device = file
+            .mount
+            .as_ref()
+            .filter(|m| m.kind == mounts::Kind::Overlay)
+            .map_or(node.device, |m| m.device);
+        trames_memory::MappingFileInfo {
+            path,
+            device,
+            inode: node.inode,
+        }
+    }
     pub fn executable_display(&self, file: &ExecutableFile) -> Vec<u8> {
         let mount = file.mount.as_ref().map(|mount| {
             self.mount_for_path(Some(&OpenMount::Shared(mount.clone())))
@@ -167,21 +181,26 @@ pub fn script_interpreter(bytes: &[u8]) -> Result<Option<ScriptInterpreter>> {
     let Some(bytes) = bytes.strip_prefix(b"#!") else {
         return Ok(None);
     };
-    let line = bytes.split(|&b| b == b'\n').next().ok_or(Errno(8))?;
-    if line.len() > 254 {
+    const HEADER: usize = 256 - 2;
+    let prefix = &bytes[..bytes.len().min(HEADER)];
+    let separator = |c: &u8| matches!(c, b' ' | b'\t');
+    let terminator = prefix.iter().position(|c| matches!(c, b'\n' | 0));
+    let complete = terminator.is_some() || bytes.len() < HEADER;
+    let line = &prefix[..terminator.unwrap_or(prefix.len())];
+    let name_start = line.iter().position(|c| !separator(c)).ok_or(Errno(8))?;
+    let name = &line[name_start..];
+    let sep = name.iter().position(separator);
+    if !complete && sep.is_none() {
         return Err(Errno(8));
     }
-    let line = line.strip_suffix(b"\r").unwrap_or(line);
-    let start = line
-        .iter()
-        .position(|b| !b.is_ascii_whitespace())
-        .ok_or(Errno(8))?;
-    let mut parts = line[start..].splitn(2, |b| b.is_ascii_whitespace());
-    let interpreter = parts.next().unwrap_or_default().to_vec();
-    let argument = parts.next().and_then(|tail| {
-        tail.iter()
-            .position(|b| !b.is_ascii_whitespace())
-            .map(|i| tail[i..].to_vec())
+    let interpreter = name[..sep.unwrap_or(name.len())].to_vec();
+    // Linux reserves the final byte of a full binprm buffer for termination.
+    let argument = sep.and_then(|i| {
+        let end = if complete { name.len() } else { name.len() - 1 };
+        let tail = &name[i..end];
+        let first = tail.iter().position(|c| !separator(c))?;
+        let last = tail.iter().rposition(|c| !separator(c)).unwrap();
+        Some(tail[first..=last].to_vec())
     });
     Ok(Some((interpreter, argument)))
 }
@@ -247,11 +266,20 @@ mod tests {
         assert_eq!(script_interpreter(b"ELF").unwrap(), None);
         assert_eq!(
             script_interpreter(b"#! /bin/env  python -u\r\nbody").unwrap(),
-            Some((b"/bin/env".to_vec(), Some(b"python -u".to_vec())))
+            Some((b"/bin/env".to_vec(), Some(b"python -u\r".to_vec())))
         );
         assert_eq!(
             script_interpreter(b"#!/bin/sh\n").unwrap(),
             Some((b"/bin/sh".to_vec(), None))
+        );
+        assert_eq!(
+            script_interpreter(b"#!\t/bin/sh    one two \t\0unused").unwrap(),
+            Some((b"/bin/sh".to_vec(), Some(b"one two".to_vec())))
+        );
+        let long = [b"#!/bin/sh ".as_slice(), &[b'x'; 512]].concat();
+        assert_eq!(
+            script_interpreter(&long).unwrap().unwrap().1.unwrap().len(),
+            245
         );
         assert_eq!(script_interpreter(b"#! \n"), Err(Errno(8)));
         assert_eq!(

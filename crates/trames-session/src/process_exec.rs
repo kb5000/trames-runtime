@@ -21,8 +21,9 @@ impl<C: Cpu> Kernel<C> {
         clock_origin: Instant,
     ) -> Result<(), Errno> {
         let path = Linux::path(&p.memory, a[0])?;
-        let argv = strings(&p.memory, a[1])?;
-        let envp = strings(&p.memory, a[2])?;
+        let mut budget_bytes = trames_linux::image::EXEC_ARGUMENT_BYTES;
+        let argv = strings(&p.memory, a[1], &mut budget_bytes)?;
+        let envp = strings(&p.memory, a[2], &mut budget_bytes)?;
         Self::exec_strings(p, dirfd, path, argv, envp, flags, budget, clock_origin)
     }
     #[cfg(all(test, trames_interpreter_conformance))]
@@ -76,8 +77,9 @@ impl<C: Cpu> Kernel<C> {
             (a[0] as i32, [a[1], a[2], a[3], 0, 0, 0], a[4] as u32)
         };
         let path = Linux::path(&p.memory, a[0])?;
-        let argv = strings(&p.memory, a[1])?;
-        let envp = strings(&p.memory, a[2])?;
+        let mut budget_bytes = trames_linux::image::EXEC_ARGUMENT_BYTES;
+        let argv = strings(&p.memory, a[1], &mut budget_bytes)?;
+        let envp = strings(&p.memory, a[2], &mut budget_bytes)?;
         Self::prepare_exec_strings(p, dirfd, path, argv, envp, flags, budget, clock_origin)
             .map(Some)
     }
@@ -1393,8 +1395,9 @@ impl Request {
             (a[0] as i32, [a[1], a[2], a[3], 0, 0, 0], a[4] as u32)
         };
         let path = Linux::path(&p.memory, a[0])?;
-        let argv = strings(&p.memory, a[1])?;
-        let envp = strings(&p.memory, a[2])?;
+        let mut budget_bytes = trames_linux::image::EXEC_ARGUMENT_BYTES;
+        let argv = strings(&p.memory, a[1], &mut budget_bytes)?;
+        let envp = strings(&p.memory, a[2], &mut budget_bytes)?;
         let file = p
             .linux
             .vfs
@@ -1469,13 +1472,13 @@ impl Request {
         if argv.is_empty() {
             argv.push(Vec::new());
         }
-        for depth in 0..5 {
+        for depth in 0..=5 {
             let bytes = file.bytes()?;
             if let Some((interpreter, optional)) = trames_vfs::script_interpreter(&bytes)? {
                 if depth == 0 && inaccessible {
                     return Err(Errno(2));
                 }
-                if depth == 4 {
+                if depth == 5 {
                     return Err(Errno(40));
                 }
                 let mut next = vec![interpreter.clone()];
@@ -1494,22 +1497,35 @@ impl Request {
                 continue;
             }
             let mut execute_vfs = vfs;
-            let credentials = execute_vfs.exec_credentials(&file);
-            let no_new_privs = credentials.apply(&mut execute_vfs);
-            let mut runtime = Runtime::<C>::load_guest_execfn(
+            let mut credentials = execute_vfs.exec_credentials(&file);
+            let exec_error = |e| match e {
+                RuntimeError::Arguments(_) => Errno(7),
+                RuntimeError::Memory(_)
+                | RuntimeError::Configuration(_)
+                | RuntimeError::Elf(trames_elf::ElfError::Memory(_)) => Errno(12),
+                RuntimeError::Elf(trames_elf::ElfError::Interpreter(n)) => Errno(n),
+                _ => Errno(8),
+            };
+            // Resolve PT_INTERP as the caller, before installing set-ID credentials.
+            let elf = Runtime::<C>::load_elf(
                 &bytes,
+                &execute_vfs,
+                options,
+                Some(&file),
+                Some(&mut credentials),
+            )
+            .map_err(exec_error)?;
+            let no_new_privs = credentials.apply(&mut execute_vfs);
+            let mut runtime = Runtime::<C>::start_image(
+                elf,
                 &argv,
                 &envp,
                 &execute_vfs,
                 options,
                 Some(&filename),
+                Some(file.clone()),
             )
-            .map_err(|e| match e {
-                RuntimeError::Arguments(_) => Errno(7),
-                RuntimeError::Memory(_) | RuntimeError::Configuration(_) => Errno(12),
-                RuntimeError::Elf(trames_elf::ElfError::Interpreter(n)) => Errno(n),
-                _ => Errno(8),
-            })?;
+            .map_err(exec_error)?;
             crate::clock::initialize::<C>(
                 &mut runtime.memory,
                 &runtime.linux.auxiliary,

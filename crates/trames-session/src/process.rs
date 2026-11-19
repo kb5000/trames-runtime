@@ -801,25 +801,27 @@ fn write_u64(m: &mut Memory, a: u64, v: u64) -> Result<(), Errno> {
     m.write(a, &v.to_le_bytes()).map_err(|_| Errno(14))
 }
 
-fn strings(m: &Memory, address: u64) -> Result<Vec<Vec<u8>>, Errno> {
+fn strings(m: &Memory, address: u64, remaining: &mut usize) -> Result<Vec<Vec<u8>>, Errno> {
     if address == 0 {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    let mut total = 0;
-    for i in 0..4096 {
-        let a = read_u64(m, address.checked_add(i * 8).ok_or(Errno(14))?)?;
+    let mut slot = address;
+    loop {
+        let a = read_u64(m, slot)?;
         if a == 0 {
             return Ok(out);
         }
-        let value = m.read_c_string(a, 65536).map_err(|_| Errno(14))?;
-        total += value.len() + 1;
-        if total > 65536 {
-            return Err(Errno(7));
-        }
+        *remaining = remaining.checked_sub(8).ok_or(Errno(7))?;
+        let limit = (*remaining).min(trames_linux::image::EXEC_STRING_BYTES);
+        let value = m.read_c_string(a, limit).map_err(|e| match e {
+            trames_memory::MemoryError::Limit => Errno(7),
+            _ => Errno(14),
+        })?;
+        *remaining -= value.len() + 1;
         out.push(value);
+        slot = slot.checked_add(8).ok_or(Errno(14))?;
     }
-    Err(Errno(7))
 }
 impl<C: Cpu> Kernel<C> {
     fn publish_task(&self, id: u32, p: &Process<C>) {
