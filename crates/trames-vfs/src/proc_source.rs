@@ -25,6 +25,14 @@ pub(super) struct ProcPath {
     parent: Option<Arc<ProcPath>>,
 }
 impl ProcPath {
+    pub fn member(self: &Arc<Self>, root: &[u8], target: Arc<dyn ProcTask>) -> Arc<Self> {
+        Arc::new(Self {
+            root: root.to_vec(),
+            namespace: self.namespace,
+            target,
+            parent: Some(self.clone()),
+        })
+    }
     pub fn at(self: &Arc<Self>, key: &[u8], namespace: u64) -> Option<Arc<Self>> {
         if namespace == self.namespace && mounts::below(key, &self.root) {
             Some(self.clone())
@@ -73,6 +81,26 @@ impl<'a> ProcQuery<'a> {
     }
 }
 
+/// Numeric entries in procfs use the canonical positive decimal spelling.
+pub fn proc_task_id(part: &[u8]) -> Option<u32> {
+    if !matches!(part.first(), Some(b'1'..=b'9')) {
+        return None;
+    }
+    std::str::from_utf8(part)
+        .ok()?
+        .parse::<i32>()
+        .ok()
+        .map(|id| id as u32)
+}
+
+pub(super) fn proc_fd_number(part: &[u8]) -> Option<u32> {
+    if part == b"0" {
+        Some(0)
+    } else {
+        proc_task_id(part)
+    }
+}
+
 /// An original PID resource, retained independently of numeric lookup. A
 /// ProcSource::task result must not strongly retain a task's Files table: an
 /// opened proc file can itself belong to that table. Kernel ProcPid uses only
@@ -84,6 +112,12 @@ pub trait ProcTask: Send + Sync {
     fn memory_report(&self) -> Option<trames_memory::MemoryReport>;
     fn present(&self) -> bool {
         self.observe(ProcRefresh::Metadata, None).is_some()
+    }
+    fn children(&self, _namespace: &PidNamespace) -> Option<Vec<u32>> {
+        None
+    }
+    fn comm(&self) -> Option<(u32, TaskName)> {
+        None
     }
     fn threads(&self) -> Vec<Arc<dyn ProcTask>> {
         Vec::new()
@@ -209,7 +243,7 @@ impl Vfs {
             .as_ref()
             .and_then(|p| p.at(path, namespace.id()));
         let parts: Vec<_> = rest.split(|b| *b == b'/').collect();
-        let numeric = |part: &[u8]| std::str::from_utf8(part).ok()?.parse::<u32>().ok();
+        let numeric = proc_task_id;
         let pid = match parts.as_slice() {
             [pid] => numeric(pid),
             [_, b"task", tid] => numeric(tid),
@@ -248,18 +282,24 @@ impl Vfs {
         }));
         Ok(())
     }
+    pub(super) fn proc_thread_directory(&self, path: &ResolvedPath) -> Option<Arc<ProcPath>> {
+        let group = path.strip_prefix(b"/proc/")?.strip_suffix(b"/task")?;
+        proc_task_id(group)?;
+        path.proc_binding
+            .as_ref()?
+            .at(path, self.proc_namespace(path).id())
+    }
     pub(super) fn proc_path_identity<P: PathArg + ?Sized>(&self, path: &P) -> u64 {
         let Some(rest) = path.key().strip_prefix(b"/proc/") else {
             return 0;
         };
         let parts: Vec<_> = rest.split(|b| *b == b'/').collect();
         let pid = if parts.get(1) == Some(&b"task".as_slice()) {
-            parts.get(2)
+            parts.get(2).or_else(|| parts.first())
         } else {
             parts.first()
         }
-        .and_then(|part| std::str::from_utf8(part).ok())
-        .and_then(|part| part.parse::<u32>().ok());
+        .and_then(|part| proc_task_id(part));
         if pid.is_none() {
             return 0;
         }
@@ -317,12 +357,11 @@ impl Vfs {
         let identity = binding.as_ref().map_or(0, |p| p.target.identity());
         let parts: Vec<_> = key.split(|b| *b == b'/').collect();
         let target = if parts.get(3) == Some(&b"task".as_slice()) {
-            parts.get(4)
+            parts.get(4).or_else(|| parts.get(2))
         } else {
             parts.get(2)
         }
-        .and_then(|part| std::str::from_utf8(part).ok())
-        .and_then(|part| part.parse::<u32>().ok())
+        .and_then(|part| proc_task_id(part))
         .unwrap_or(0);
         if self.source_observed.get().is_some_and(|observed| {
             observed.target == target
@@ -719,6 +758,9 @@ impl ProcessView {
     pub fn waiting(&self, waiting: bool) {
         self.state
             .store(if waiting { b'S' } else { b'R' } as u32, Ordering::Relaxed);
+    }
+    pub fn task_name(&self) -> Option<TaskName> {
+        self.image.read().unwrap().as_ref()?.resources.name.clone()
     }
     pub fn memory_report(&self) -> Option<trames_memory::MemoryReport> {
         self.image.read().unwrap().as_ref()?.memory.clone()

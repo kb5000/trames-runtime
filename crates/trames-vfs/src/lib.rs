@@ -156,8 +156,8 @@ mod proc_time;
 mod pseudo;
 pub use oom::OomTask;
 pub use proc_source::{
-    ProcCounters, ProcDirectory, ProcQuery, ProcResources, ProcSource, ProcTask, ProcessView,
-    SeccompView,
+    proc_task_id, ProcCounters, ProcDirectory, ProcQuery, ProcResources, ProcSource, ProcTask,
+    ProcessView, SeccompView,
 };
 mod pty;
 pub mod terminal;
@@ -1266,6 +1266,13 @@ impl Vfs {
             return Err(Errno(1));
         }
         if self.pseudo_readonly(&path.key) && self.uses_pseudo(path) {
+            let parent = path.parent();
+            if self.proc_task_directory(&parent) && self.node(path).is_ok() {
+                return Err(Errno(1));
+            }
+            if self.proc_task_directory(path) && !self.allowed(&self.node(&parent)?.borrow(), 3) {
+                return Err(Errno(13));
+            }
             return Err(Errno(30));
         }
         let parent = self.node(&path.parent())?;
@@ -2525,7 +2532,7 @@ impl Vfs {
             if flags & O_PATH == 0 && (flags & 3 != 0 || flags & 0x200 != 0) {
                 p.writable()?;
                 if let Some(control @ sysctl::Control::UserNamespaces(..)) = &network_control {
-                    if !control.authorized(&self.credentials) {
+                    if !control.authorized(&self.credentials, self.lock_owner) {
                         return Err(Errno(13));
                     }
                 }
@@ -2545,6 +2552,13 @@ impl Vfs {
             Ok(node) => {
                 if flags & 0xc0 == 0xc0 {
                     return Err(Errno(17));
+                }
+                if flags & O_PATH == 0
+                    && flags & (3 | 0x240) != 0
+                    && matches!(node.borrow().content, Content::Directory)
+                    && self.proc_task_directory(&p)
+                {
+                    return Err(Errno(21));
                 }
                 check_write()?;
                 let proc_regular = {
@@ -2681,7 +2695,7 @@ impl Vfs {
                 && flags & O_PATH == 0
                 && !network_control
                     .as_ref()
-                    .is_some_and(|control| control.authorized(&self.credentials))
+                    .is_some_and(|control| control.authorized(&self.credentials, self.lock_owner))
                 && ((flags & 3 != 1 && !self.allowed(&n, 4))
                     || ((flags & 3 != 0 || flags & 0x200 != 0) && !self.allowed(&n, 2)))
             {
@@ -3435,9 +3449,17 @@ impl Vfs {
             return Err(Errno(9));
         }
         if let Some(control) = &o.sysctl_control {
+            if matches!(control, sysctl::Control::Comm { .. }) {
+                // Linux comm_write leaves the shared file position unchanged.
+                return control.write(bytes, 0, &self.credentials, self.lock_owner);
+            }
             let mut position = o.file_position.lock().unwrap();
-            let count =
-                control.write(bytes, offset.unwrap_or(position.value), &self.credentials)?;
+            let count = control.write(
+                bytes,
+                offset.unwrap_or(position.value),
+                &self.credentials,
+                self.lock_owner,
+            )?;
             if offset.is_none() {
                 position.value += count as u64;
             }
@@ -3807,6 +3829,28 @@ impl Vfs {
             )
         };
         if directory {
+            if let Some(proc) = inode
+                .proc_node
+                .get()
+                .filter(|proc| proc.path.ends_with(b"/task"))
+            {
+                let at = ResolvedPath {
+                    proc_binding: proc.binding.clone(),
+                    key: proc.path.clone(),
+                    mount: self.mount_for_path(mount),
+                };
+                if let Some(group) = self.proc_thread_directory(&at) {
+                    let ns = self.proc_namespace(&at);
+                    let count = group
+                        .target
+                        .threads()
+                        .iter()
+                        .filter(|task| ns.local(task.pid()) != 0)
+                        .count();
+                    out[20..24].copy_from_slice(&(2 + count as u32).to_le_bytes());
+                    return Ok(out);
+                }
+            }
             // Namespace/checkpoint writers use filesystem -> inode. In
             // particular, never carry the above scalar inode guard into here.
             let (path, mut directories) = {
@@ -4145,13 +4189,38 @@ impl Vfs {
         if prefix != b"/" {
             prefix.push(b'/');
         }
-        for name in self.mounted_pseudo_children(&p)? {
-            let mut child = prefix.clone();
-            child.extend_from_slice(&name);
-            let n = self.node(&child)?;
-            let n = n.borrow();
-            let kind = ((n.mode & 0o170000) >> 12) as u8;
-            children.insert(name, (n.inode, kind));
+        let mut add = |name: Vec<u8>, child: ResolvedPath| -> Result<()> {
+            let node = match self.node(&child) {
+                Err(Errno(2)) if p.starts_with(b"/proc/") || p.as_ref() == b"/proc" => {
+                    return Ok(())
+                }
+                result => result?,
+            };
+            let n = node.borrow();
+            children.insert(name, (n.inode, ((n.mode & 0o170000) >> 12) as u8));
+            Ok(())
+        };
+        if let Some(group) = self.proc_thread_directory(&p) {
+            let ns = self.proc_namespace(&p);
+            // Resolve the original group once. A concurrent exit can invalidate
+            // an entry before its metadata lookup, without hiding its siblings.
+            for peer in group.target.threads() {
+                let tid = ns.local(peer.pid());
+                if tid == 0 {
+                    continue;
+                }
+                let name = tid.to_string().into_bytes();
+                let mut child = prefix.clone();
+                child.extend_from_slice(&name);
+                child.proc_binding = Some(group.member(&child, peer));
+                add(name, child)?;
+            }
+        } else {
+            for name in self.mounted_pseudo_children(&p)? {
+                let mut child = prefix.clone();
+                child.extend_from_slice(&name);
+                add(name, child)?;
+            }
         }
         let numbered = directory::proc_fds(&p.key) && self.uses_pseudo(&p);
         directory::encode(

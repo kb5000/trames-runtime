@@ -1209,6 +1209,19 @@ fn nul_list(values: &[Vec<u8>]) -> Vec<u8> {
         .take(1024 * 1024)
         .collect()
 }
+fn state_description(state: char) -> &'static str {
+    match state {
+        'R' => "running",
+        'S' => "sleeping",
+        'D' => "disk sleep",
+        'T' => "stopped",
+        't' => "tracing stop",
+        'Z' => "zombie",
+        'X' => "dead",
+        'I' => "idle",
+        _ => "unknown",
+    }
+}
 fn comm(p: &ProcessInfo) -> Vec<u8> {
     let mut name: Vec<_> = p.command.iter().copied().take(15).collect();
     if name.is_empty() {
@@ -1319,6 +1332,23 @@ impl Vfs {
             })
             .collect()
     }
+    pub(super) fn proc_task_directory(&self, path: &ResolvedPath) -> bool {
+        let Some(rest) = path.strip_prefix(b"/proc/") else {
+            return false;
+        };
+        let mut parts = rest.split(|b| *b == b'/');
+        if proc_task_id(parts.next().unwrap_or_default()).is_none() {
+            return false;
+        }
+        let task = match parts.next() {
+            None => true,
+            Some(b"task") => {
+                parts.next().and_then(proc_task_id).is_some() && parts.next().is_none()
+            }
+            _ => false,
+        };
+        task && self.uses_pseudo(path)
+    }
     pub(super) fn pseudo_readonly(&self, path: &[u8]) -> bool {
         self.pseudo.borrow().enabled
             && (path == b"/proc"
@@ -1358,12 +1388,8 @@ impl Vfs {
         let (pid_part, fd_part) = if parts.len() == 3 && parts[1] == b"fd" {
             (parts[0], parts[2])
         } else if parts.len() == 5 && parts[1] == b"task" && parts[3] == b"fd" {
-            let group = std::str::from_utf8(parts[0])
-                .ok()
-                .and_then(|s| s.parse::<u32>().ok());
-            let tid = std::str::from_utf8(parts[2])
-                .ok()
-                .and_then(|s| s.parse::<u32>().ok());
+            let group = proc_task_id(parts[0]);
+            let tid = proc_task_id(parts[2]);
             if !self
                 .proc_runtime(actual, &self.pseudo.borrow().runtime)
                 .processes
@@ -1376,12 +1402,8 @@ impl Vfs {
         } else {
             return Ok(None);
         };
-        let pid = std::str::from_utf8(pid_part)
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok());
-        let fd = std::str::from_utf8(fd_part)
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok());
+        let pid = proc_task_id(pid_part);
+        let fd = proc_source::proc_fd_number(fd_part);
         let open = {
             let pseudo = self.pseudo.borrow();
             let runtime = self.proc_runtime(actual, &pseudo.runtime);
@@ -2008,9 +2030,7 @@ impl Vfs {
         }
         if let Some(rest) = path.strip_prefix(b"/proc/") {
             let parts: Vec<_> = rest.split(|b| *b == b'/').collect();
-            let pid = std::str::from_utf8(parts[0])
-                .ok()
-                .and_then(|s| s.parse::<u32>().ok());
+            let pid = proc_task_id(parts[0]);
             if let Some(pid) = pid {
                 let Some(mut p) = r.processes.iter().find(|p| p.pid == pid) else {
                     return Ok(None);
@@ -2020,9 +2040,7 @@ impl Vfs {
                     if parts.len() == 2 {
                         return Ok(directory());
                     }
-                    let tid = std::str::from_utf8(parts[2])
-                        .ok()
-                        .and_then(|s| s.parse::<u32>().ok());
+                    let tid = proc_task_id(parts[2]);
                     let Some(thread) = r
                         .processes
                         .iter()
@@ -2092,7 +2110,8 @@ impl Vfs {
                             );
                             return Ok(Some((file(control.read(0, 4096)?), 0o100644)));
                         }
-                        b"comm" => comm(p),
+                        b"children" if i == 3 => return Ok(regular(Vec::new())),
+                        b"comm" => return Ok(Some((file(comm(p)), 0o100644))),
                         b"cgroup" => {
                             [b"0::".as_slice(), &self.cgroup_view_path(&p.cgroup), b"\n"].concat()
                         }
@@ -2202,7 +2221,7 @@ impl Vfs {
                                 .unwrap_or(0)
                                 .max(64)
                                 .next_power_of_two();
-                            format!("Name:\t{name}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t{fd_size}\nGroups:\t{}\nVmSize:\t{} kB\nVmHWM:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{threads}\nSigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\n", p.state, p.tgid, p.pid, p.parent,
+                            format!("Name:\t{name}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t{fd_size}\nGroups:\t{}\nVmSize:\t{} kB\nVmHWM:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{threads}\nSigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\n", p.state, state_description(p.state), p.tgid, p.pid, p.parent,
                                 self.credentials.local_id(false,c.uid),self.credentials.local_id(false,c.euid),self.credentials.local_id(false,c.suid),self.credentials.local_id(false,c.fsuid),self.credentials.local_id(true,c.gid),self.credentials.local_id(true,c.egid),self.credentials.local_id(true,c.sgid),self.credentials.local_id(true,c.fsgid),c.groups.iter().map(|id|self.credentials.local_id(true,*id).to_string()).collect::<Vec<_>>().join(" "),p.virtual_bytes/1024,p.peak_resident_bytes.max(p.mapped_bytes)/1024,p.mapped_bytes/1024,p.pending,p.shared_pending,p.blocked,p.ignored,p.caught).into_bytes()
                         }
                         b"limits" => p.limit_text(task_limit as u64),
@@ -2211,9 +2230,7 @@ impl Vfs {
                     return Ok(regular(value));
                 }
                 if parts.len() == i + 2 && matches!(key, b"fd" | b"fdinfo") {
-                    let fd = std::str::from_utf8(parts[i + 1])
-                        .ok()
-                        .and_then(|s| s.parse::<u32>().ok());
+                    let fd = proc_source::proc_fd_number(parts[i + 1]);
                     let Some(fd) = p.fds.iter().find(|f| Some(f.fd) == fd) else {
                         return Ok(None);
                     };
@@ -2885,9 +2902,7 @@ impl Vfs {
         }
         if let Some(rest) = path.strip_prefix(b"/proc/") {
             let parts: Vec<_> = rest.split(|b| *b == b'/').collect();
-            let pid = std::str::from_utf8(parts[0])
-                .ok()
-                .and_then(|s| s.parse::<u32>().ok());
+            let pid = proc_task_id(parts[0]);
             if let Some(mut p) = r.processes.iter().find(|p| Some(p.pid) == pid) {
                 let mut depth = 1;
                 if parts.get(1) == Some(&b"task".as_slice()) {
@@ -2900,9 +2915,7 @@ impl Vfs {
                         );
                     }
                     if parts.len() >= 3 {
-                        let tid = std::str::from_utf8(parts[2])
-                            .ok()
-                            .and_then(|s| s.parse::<u32>().ok());
+                        let tid = proc_task_id(parts[2]);
                         if let Some(thread) = r
                             .processes
                             .iter()
@@ -2945,6 +2958,8 @@ impl Vfs {
                     );
                     if depth == 1 {
                         names.push(b"task".to_vec());
+                    } else {
+                        names.push(b"children".to_vec());
                     }
                 }
                 if parts.len() == depth + 1 {

@@ -219,11 +219,11 @@ impl Source {
             .split(|b| *b == b'/')
             .collect();
         let id = if parts.get(1) == Some(&b"task".as_slice()) {
-            parts.get(2)?
+            parts.get(2).or_else(|| parts.first())?
         } else {
             parts.first()?
         };
-        namespace.global(std::str::from_utf8(id).ok()?.parse().ok()?)
+        namespace.global(trames_vfs::proc_task_id(id)?)
     }
 }
 impl trames_linux::SystemStatistics for Source {

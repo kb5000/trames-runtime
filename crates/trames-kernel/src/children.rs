@@ -417,6 +417,31 @@ impl Wait {
     }
 }
 impl Children {
+    pub(crate) fn thread_children(
+        self: &Arc<Self>,
+        tid: u32,
+        namespace: &PidNamespace,
+    ) -> Vec<u32> {
+        let entries = self.entries.lock().unwrap();
+        let mut ids = Vec::new();
+        for child in entries.values().filter_map(Weak::upgrade) {
+            let state = child.0.lock().unwrap();
+            if !state.reaped
+                && state.parent.as_ptr() == Arc::as_ptr(self)
+                && state
+                    .owner
+                    .as_ref()
+                    .is_some_and(|o| o.parent_thread() == tid)
+            {
+                let local = namespace.local(state.id);
+                if local != 0 {
+                    ids.push(local);
+                }
+            }
+        }
+        ids
+    }
+
     /// Include zombies: their original task is already absent from the live
     /// parent-death-signal graph, but their parent thread can still change.
     pub(crate) fn transfer_owner(self: &Arc<Self>, old: u32, new: u32) -> Option<Notice> {

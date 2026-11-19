@@ -180,6 +180,19 @@ impl ProcFile {
                 .as_ref()
                 .map(|m| Mount::query_projection(m.clone(), &mut BTreeMap::new())),
         };
+        if path.ends_with(b"/children") {
+            use std::fmt::Write;
+            let tids = self
+                .target
+                .as_ref()
+                .and_then(|task| task.children(view.proc_namespace(&path)))
+                .ok_or(Errno(3))?;
+            let mut text = String::new();
+            for tid in tids {
+                write!(text, "{tid} ").unwrap();
+            }
+            return Ok(text.into_bytes());
+        }
         let mut query = ProcQuery::new(
             &self.path,
             ProcRefresh::for_path(&self.path),

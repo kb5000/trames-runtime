@@ -472,6 +472,9 @@ impl Vfs {
             path.writable()?;
         }
         let node = view.node(&path)?;
+        if mode & 2 != 0 && view.proc_task_directory(&path) {
+            return Err(Errno(1));
+        }
         if mode & 1 != 0
             && matches!(node.borrow().content, Content::File(_))
             && path

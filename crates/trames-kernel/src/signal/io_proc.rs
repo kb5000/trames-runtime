@@ -38,6 +38,12 @@ impl trames_vfs::ProcTask for ProcPid {
     fn memory_report(&self) -> Option<trames_memory::MemoryReport> {
         trames_vfs::ProcTask::memory_report(&*self.task()?)
     }
+    fn children(&self, ns: &trames_vfs::PidNamespace) -> Option<Vec<u32>> {
+        trames_vfs::ProcTask::children(&*self.task()?, ns)
+    }
+    fn comm(&self) -> Option<(u32, trames_vfs::TaskName)> {
+        trames_vfs::ProcTask::comm(&*self.task()?)
+    }
     fn threads(&self) -> Vec<Arc<dyn trames_vfs::ProcTask>> {
         self.task()
             .map_or_else(Vec::new, |task| trames_vfs::ProcTask::threads(&*task))
@@ -81,6 +87,24 @@ impl trames_vfs::ProcTask for IoTask {
     }
     fn pid(&self) -> u32 {
         self.pid.load(Ordering::Relaxed)
+    }
+    fn children(&self, ns: &trames_vfs::PidNamespace) -> Option<Vec<u32>> {
+        if !self.present() {
+            return None;
+        }
+        Some(
+            self.lifecycle()
+                .wait_children()
+                .map_or_else(Vec::new, |children| {
+                    children.thread_children(self.pid.load(Ordering::Relaxed), ns)
+                }),
+        )
+    }
+    fn comm(&self) -> Option<(u32, trames_vfs::TaskName)> {
+        if !self.present() {
+            return None;
+        }
+        Some((self.tgid(), self.proc_view.task_name()?))
     }
     fn threads(&self) -> Vec<Arc<dyn trames_vfs::ProcTask>> {
         self.proc_group.get().map_or_else(Vec::new, |group| {
