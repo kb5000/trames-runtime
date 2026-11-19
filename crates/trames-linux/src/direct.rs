@@ -3810,7 +3810,7 @@ mod tests {
         }
     }
     #[test]
-    fn file_preflight_and_source_growth_never_consume_a_partial_vector() {
+    fn positioned_write_keeps_the_accessible_prefix_and_source_growth_preserves_position() {
         let mut vfs = Vfs::default();
         vfs.import_file(b"/data", b"abcd".to_vec()).unwrap();
         let fd = vfs.open_at(trames_vfs::AT_FDCWD, b"/data", 2, 0).unwrap();
@@ -3825,9 +3825,10 @@ mod tests {
         }
         assert_eq!(
             direct.invoke_file(70, [fd as u64, 0x1000, 2, 0, 0, 0], &mut m),
-            Some(Err(Errno(14)))
+            Some(Ok(2))
         );
-        assert_eq!(vfs.pread(fd, 8, 0).unwrap(), b"abcd");
+        assert_eq!(vfs.pread(fd, 8, 0).unwrap(), b"12cd");
+        assert_eq!(vfs.seek(fd, 0, 1), Ok(0));
         assert_eq!(
             direct.invoke_file(64, [fd as u64, 0x1100, 8, 0, 0, 0], &mut m),
             Some(Ok(8))

@@ -308,6 +308,9 @@ struct SharedOpenDescription {
     notification: Option<Arc<FileClose>>,
 }
 impl SharedOpenDescription {
+    fn is_regular_file(&self) -> bool {
+        self.node.as_ref().is_some_and(|node| node.regular_file)
+    }
     fn notify_file_io(&self, node: &NodeRef, mask: u32) {
         if let Some(lease) = &self.notification {
             lease.path_event(mask);
@@ -1668,6 +1671,9 @@ impl Vfs {
         let fs = self.fs.borrow();
         let result = node.borrow().path_in(&fs.paths, b"/").ok_or(Errno(2));
         result
+    }
+    pub fn regular_file_fd(&self, fd: u32) -> Result<bool> {
+        Ok(self.descriptor(fd)?.open.borrow().is_regular_file())
     }
     pub fn fd_kind(&self, fd: u32) -> Result<FdKind> {
         Ok(self.descriptor(fd)?.open.borrow().kind.clone())

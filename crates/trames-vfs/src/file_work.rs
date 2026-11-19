@@ -6,6 +6,10 @@ use super::*;
 #[derive(Clone)]
 pub struct FileTarget(pub(super) SharedFd);
 impl FileTarget {
+    pub fn regular_file(&self) -> bool {
+        self.0.open.is_regular_file()
+    }
+
     fn proc_read(&self, command: &FileCommand) -> Option<proc_file::ProcRead> {
         let FileCommand::Read { count, offset } = command else {
             return None;

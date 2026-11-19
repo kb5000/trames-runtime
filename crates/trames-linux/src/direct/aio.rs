@@ -249,6 +249,7 @@ impl DirectSyscalls {
             [fd as u64, u64_at(24), u64_at(32), u64_at(40), 0, 0],
             memory,
             &mut Vec::new(),
+            false,
         )?;
         let event = if u32_at(56) & 1 != 0 {
             Some(self.aio.as_ref().unwrap().1.event(u32_at(60))?)

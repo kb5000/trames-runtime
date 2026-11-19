@@ -506,16 +506,16 @@ fn imported_write_survives_epoch_drop_input_changes_fd_reuse_and_native_completi
     std::fs::remove_dir_all(path).unwrap();
 }
 #[test]
-fn all_vector_destinations_are_checked_before_native_read_advances_the_original_offset() {
+fn first_destination_fault_leaves_disk_read_unsubmitted_and_offset_unchanged() {
     let (path, mut v) = disk();
     v.import_file(b"/data", vec![0xa5; 32768]).unwrap();
     let fd = v.open_at(-100, b"/data", 2, 0).unwrap();
     let mut memory = Memory::default();
     memory.map(0x10000, PAGE_SIZE, Permissions::RW).unwrap();
     for (a, n) in [
-        (0x10000, 0x10100u64),
+        (0x10000, 0x20000u64),
         (0x10008, 2),
-        (0x10010, 0x20000),
+        (0x10010, 0x10100),
         (0x10018, 2),
     ] {
         memory.write_array(a, n.to_le_bytes()).unwrap();

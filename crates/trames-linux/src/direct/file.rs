@@ -753,7 +753,7 @@ impl DirectSyscalls {
             if matches!(number, 63..=70 | 286 | 287) {
                 if let Some(target) = original.nonbyte_target() {
                     let (command, output) =
-                        match import(number, args, memory, &mut self.scratch.borrow_mut()) {
+                        match import(number, args, memory, &mut self.scratch.borrow_mut(), false) {
                             Ok(call) => call,
                             Err(error) => return Some(IoAttempt::Complete(Err(error))),
                         };
@@ -781,11 +781,16 @@ impl DirectSyscalls {
             } else {
                 original.filesystem_target()
             };
-            let (command, output) =
-                match import(number, args, memory, &mut self.scratch.borrow_mut()) {
-                    Ok(call) => call,
-                    Err(error) => return Some(IoAttempt::Complete(Err(error))),
-                };
+            let (command, output) = match import(
+                number,
+                args,
+                memory,
+                &mut self.scratch.borrow_mut(),
+                file.regular_file(),
+            ) {
+                Ok(call) => call,
+                Err(error) => return Some(IoAttempt::Complete(Err(error))),
+            };
             (file, command, output)
         };
         if let Some(result) = file.proc_read_local(&command, memory) {
@@ -1021,6 +1026,7 @@ pub(super) fn import(
     a: [u64; 6],
     memory: &impl CpuMemory,
     scratch: &mut Vec<u8>,
+    regular: bool,
 ) -> Result<(trames_vfs::FileCommand, FileOutput), Errno> {
     use trames_vfs::FileCommand as Command;
     let offset = (matches!(number, 67..=70) || matches!(number, 286 | 287) && a[3] != u64::MAX)
@@ -1028,6 +1034,12 @@ pub(super) fn import(
     if matches!(number, 286 | 287) {
         crate::file_calls::vector_flags(a[5])?;
     }
+    let regular_vectors = |write| {
+        if offset.is_some_and(|off| off > i64::MAX as u64) {
+            return Err(Errno(22));
+        }
+        Linux::file_vector_import::<true>(memory, a, write)
+    };
     match number {
         62 => Ok((
             Command::Seek {
@@ -1037,11 +1049,14 @@ pub(super) fn import(
             FileOutput::None,
         )),
         63 | 67 => {
-            let count = Linux::read_parameters(a, memory)?;
+            let count = Linux::file_scalar_count(memory, a, Access::Write, regular)?;
             Ok((Command::Read { count, offset }, FileOutput::Scalar(a[1])))
         }
         65 | 69 | 286 => {
-            let (parts, count) = if number == 65 || number == 286 && offset.is_none() {
+            let (parts, count) = if regular {
+                let vectors = regular_vectors(false)?;
+                (vectors.parts, vectors.total)
+            } else if number == 65 || number == 286 && offset.is_none() {
                 Linux::readv_parts(memory, a)?
             } else {
                 Linux::positioned_vector_parts(memory, a, false)?
@@ -1049,8 +1064,7 @@ pub(super) fn import(
             Ok((Command::Read { count, offset }, FileOutput::Vectors(parts)))
         }
         64 | 68 => {
-            let count = a[2].min(crate::MAX_WRITE as u64) as usize;
-            Linux::check(memory, a[1], count, Access::Read)?;
+            let count = Linux::file_scalar_count(memory, a, Access::Read, regular)?;
             scratch.resize(count, 0);
             memory.read(a[1], scratch).map_err(|_| Errno(14))?;
             Ok((
@@ -1062,7 +1076,10 @@ pub(super) fn import(
             ))
         }
         66 | 70 | 287 => {
-            if number == 66 || number == 287 && offset.is_none() {
+            if regular {
+                let vectors = regular_vectors(true)?;
+                Linux::gather_parts(memory, &vectors.parts, vectors.total, scratch)?;
+            } else if number == 66 || number == 287 && offset.is_none() {
                 Linux::writev_parameters(a, memory, scratch)?;
             } else {
                 let (parts, count) = Linux::positioned_vector_parts(memory, a, true)?;
@@ -1248,7 +1265,7 @@ impl DirectSyscalls {
             trames_vfs::FileAccess::Full(target) => (None, Some(target)),
             trames_vfs::FileAccess::Descriptor(target) => {
                 let (command, output) =
-                    match import(number, a, memory, &mut self.scratch.borrow_mut()) {
+                    match import(number, a, memory, &mut self.scratch.borrow_mut(), false) {
                         Ok(prepared) => prepared,
                         Err(error) => return Some(Err(error)),
                     };
@@ -1257,8 +1274,13 @@ impl DirectSyscalls {
                 return Some(self.finish_file_reply(reply, output, memory));
             }
         };
-        let (mut command, output) = match import(number, a, memory, &mut self.scratch.borrow_mut())
-        {
+        let (mut command, output) = match import(
+            number,
+            a,
+            memory,
+            &mut self.scratch.borrow_mut(),
+            fast.is_some() || target.as_ref().is_some_and(|file| file.regular_file()),
+        ) {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.completed.set(self.completed.get() + 1);

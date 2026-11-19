@@ -234,6 +234,44 @@ impl Linux {
         }
         memory.check(address, count, access).map_err(|_| Errno(14))
     }
+    /// Regular files can transfer the mapped prefix. check() already walked the
+    /// pages in order, so a precise memory fault needs no second page walk.
+    fn file_buffer_prefix(
+        memory: &impl CpuMemory,
+        address: u64,
+        count: usize,
+        access: Access,
+    ) -> Result<usize> {
+        if address >= ADDRESS_LIMIT || count as u64 > ADDRESS_LIMIT - address {
+            return Err(Errno(14));
+        }
+        match memory.check(address, count, access) {
+            Ok(()) => Ok(count),
+            Err(
+                MemoryError::Unmapped(at)
+                | MemoryError::Bus(at)
+                | MemoryError::Permission { address: at, .. },
+            ) if at >= address && at - address < count as u64 => Ok((at - address) as usize),
+            Err(_) => Err(Errno(14)),
+        }
+    }
+    pub(crate) fn file_scalar_count(
+        memory: &impl CpuMemory,
+        a: [u64; 6],
+        access: Access,
+        regular: bool,
+    ) -> Result<usize> {
+        let count = a[2].min(MAX_WRITE as u64) as usize;
+        if !regular {
+            Self::check(memory, a[1], count, access)?;
+            return Ok(count);
+        }
+        let prefix = Self::file_buffer_prefix(memory, a[1], count, access)?;
+        if prefix == 0 && count != 0 {
+            return Err(Errno(14));
+        }
+        Ok(prefix)
+    }
     pub(super) fn write_bytes(
         &mut self,
         fd: u32,
@@ -274,6 +312,12 @@ impl Linux {
         io: &mut impl crate::execution_io::Output,
     ) -> Result<u64> {
         let fd = a[0] as u32;
+        if self.vfs.regular_file_fd(fd)? {
+            let count = Self::file_scalar_count(memory, a, Access::Write, true)?;
+            let bytes = self.vfs.read(fd, count)?;
+            memory.write(a[1], &bytes).map_err(|_| Errno(14))?;
+            return Ok(bytes.len() as u64);
+        }
         if self.vfs.fd_kind(fd)? == FdKind::Socket {
             if let Some(socket) = self.vfs.local_socket(fd)?.filter(|s| s.kind() != 1) {
                 return Self::local_network_vfs(&mut self.vfs, &socket, 63, a, memory);
@@ -373,6 +417,12 @@ impl Linux {
         memory: &mut impl CpuMemory,
         io: &mut impl crate::execution_io::Output,
     ) -> Result<u64> {
+        if self.vfs.regular_file_fd(a[0] as u32)? {
+            let vectors = Self::file_vector_import::<true>(memory, a, false)?;
+            let bytes = self.vfs.read(a[0] as u32, vectors.total)?;
+            Self::scatter(memory, &vectors.parts, &bytes)?;
+            return Ok(bytes.len() as u64);
+        }
         if let Some(socket) = self
             .vfs
             .local_socket(a[0] as u32)?
@@ -430,6 +480,12 @@ impl Linux {
         io: &mut impl crate::execution_io::Output,
         bytes: &mut Vec<u8>,
     ) -> Result<u64> {
+        if self.vfs.regular_file_fd(a[0] as u32)? {
+            let count = Self::file_scalar_count(memory, a, Access::Read, true)?;
+            bytes.resize(count, 0);
+            memory.read(a[1], bytes).map_err(|_| Errno(14))?;
+            return Ok(self.vfs.write(a[0] as u32, bytes)? as u64);
+        }
         if self.vfs.fd_kind(a[0] as u32)? == FdKind::Socket {
             if let Some(socket) = self
                 .vfs
@@ -477,14 +533,9 @@ impl Linux {
         write: bool,
         bytes: &mut Vec<u8>,
     ) -> Result<u64> {
-        self.vfs.fd_kind(a[0] as u32)?;
-        let count = a[2].min(MAX_WRITE as u64) as usize;
-        Self::check(
-            memory,
-            a[1],
-            count,
-            if write { Access::Read } else { Access::Write },
-        )?;
+        let regular = self.vfs.regular_file_fd(a[0] as u32)?;
+        let access = if write { Access::Read } else { Access::Write };
+        let count = Self::file_scalar_count(memory, a, access, regular)?;
         if write {
             bytes.resize(count, 0);
             memory.read(a[1], bytes).map_err(|_| Errno(14))?;
@@ -565,6 +616,11 @@ impl Linux {
         io: &mut impl crate::execution_io::Output,
         bytes: &mut Vec<u8>,
     ) -> Result<u64> {
+        if self.vfs.regular_file_fd(a[0] as u32)? {
+            let vectors = Self::file_vector_import::<true>(memory, a, true)?;
+            Self::gather_parts(memory, &vectors.parts, vectors.total, bytes)?;
+            return Ok(self.vfs.write(a[0] as u32, bytes)? as u64);
+        }
         if let Some(socket) = self
             .vfs
             .local_socket(a[0] as u32)?
@@ -666,6 +722,13 @@ impl Linux {
         if a[3] > i64::MAX as u64 {
             return Err(Errno(22));
         }
+        Self::file_vector_import::<false>(memory, a, write)
+    }
+    pub(crate) fn file_vector_import<const PARTIAL: bool>(
+        memory: &impl CpuMemory,
+        a: [u64; 6],
+        write: bool,
+    ) -> Result<VectorImport> {
         if a[2] > 1024 {
             return Err(Errno(22));
         }
@@ -673,6 +736,8 @@ impl Linux {
         let mut parts = Vec::new();
         let mut total = 0usize;
         let mut requested = 0u64;
+        let mut faulted = false;
+        let access = if write { Access::Read } else { Access::Write };
         for i in 0..a[2] {
             let vector = memory
                 .read_array::<16>(a[1] + i * 16)
@@ -684,16 +749,29 @@ impl Linux {
                 .filter(|n| *n <= i64::MAX as u64)
                 .ok_or(Errno(22))?;
             let take = length.min((MAX_WRITE - total) as u64) as usize;
-            if take != 0 {
-                Self::check(
-                    memory,
-                    pointer,
-                    take,
-                    if write { Access::Read } else { Access::Write },
-                )?;
-            }
+            let take = if PARTIAL {
+                // Validate every vector descriptor, including those after a short
+                // transfer, without touching their backing pages.
+                if pointer >= ADDRESS_LIMIT || length > ADDRESS_LIMIT - pointer {
+                    return Err(Errno(14));
+                }
+                if faulted || take == 0 {
+                    continue;
+                }
+                let prefix = Self::file_buffer_prefix(memory, pointer, take, access)?;
+                faulted = prefix < take;
+                prefix
+            } else {
+                if take != 0 {
+                    Self::check(memory, pointer, take, access)?;
+                }
+                take
+            };
             parts.push((pointer, take));
             total += take;
+        }
+        if faulted && total == 0 {
+            return Err(Errno(14));
         }
         Ok(VectorImport {
             parts,
@@ -726,9 +804,17 @@ impl Linux {
         write: bool,
         bytes: &mut Vec<u8>,
     ) -> Result<u64> {
-        self.vfs.fd_kind(a[0] as u32)?;
+        let regular = self.vfs.regular_file_fd(a[0] as u32)?;
         let offset = a[3];
-        let (parts, total) = Self::positioned_vector_parts(memory, a, write)?;
+        if offset > i64::MAX as u64 {
+            return Err(Errno(22));
+        }
+        let (parts, total) = if regular {
+            let vectors = Self::file_vector_import::<true>(memory, a, write)?;
+            (vectors.parts, vectors.total)
+        } else {
+            Self::positioned_vector_parts(memory, a, write)?
+        };
         if write {
             Self::gather_parts(memory, &parts, total, bytes)?;
             Ok(self.vfs.pwrite(a[0] as u32, bytes, offset)? as u64)
@@ -1930,7 +2016,7 @@ mod tests {
     }
 
     #[test]
-    fn positioned_vectors_preserve_offset_and_preflight_all_buffers() {
+    fn positioned_vectors_preserve_offset_and_validate_descriptors() {
         let mut l = Linux::new(0x3000);
         let mut m = memory();
         let mut io = CapturedOutput::default();
@@ -1962,6 +2048,39 @@ mod tests {
             l.syscall(69, [fd, 0x1000, 1025, 0, 0, 0], &mut m, &mut io),
             Err(Errno(22))
         );
+    }
+    #[test]
+    fn regular_file_fault_advances_only_the_transferred_prefix() {
+        let mut linux = Linux::new(0x3000);
+        let mut memory = memory();
+        let mut io = CapturedOutput::default();
+        linux.vfs.import_file(b"/file", b"abcdef".to_vec()).unwrap();
+        let fd = linux.vfs.open_at(-100, b"/file", 2, 0).unwrap();
+        let alias = linux.vfs.dup(fd, 0, false).unwrap();
+        for (i, value) in [0x2000u64, 1, 0x2fff, 3, 0x2100, 2].into_iter().enumerate() {
+            memory
+                .write_array(0x1000 + i as u64 * 8, value.to_le_bytes())
+                .unwrap();
+        }
+        let args = [fd as u64, 0x1000, 3, 0, 0, 0];
+        assert_eq!(linux.syscall(65, args, &mut memory, &mut io), Ok(2));
+        assert_eq!(memory.read_array::<1>(0x2000).unwrap(), *b"a");
+        assert_eq!(memory.read_array::<1>(0x2fff).unwrap(), *b"b");
+        assert_eq!(memory.read_array::<2>(0x2100).unwrap(), [0; 2]);
+        assert_eq!(linux.vfs.seek(alias, 0, 1), Ok(2));
+        memory.write(0x2000, b"x").unwrap();
+        memory.write(0x2fff, b"y").unwrap();
+        let mut positioned = args;
+        positioned[3] = 3;
+        assert_eq!(linux.syscall(70, positioned, &mut memory, &mut io), Ok(2));
+        assert_eq!(linux.vfs.pread(alias, 6, 0).unwrap(), b"abcxyf");
+        assert_eq!(linux.vfs.seek(alias, 0, 1), Ok(2));
+        memory.write_array(0x1020, u64::MAX.to_le_bytes()).unwrap();
+        assert_eq!(
+            linux.syscall(65, args, &mut memory, &mut io),
+            Err(Errno(14))
+        );
+        assert_eq!(linux.vfs.seek(alias, 0, 1), Ok(2));
     }
     #[test]
     fn statx_has_real_identity_and_does_not_claim_birth_time() {
