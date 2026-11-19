@@ -993,6 +993,28 @@ pub struct FileCopy {
     stage: Option<(u64, Option<u64>, Vec<u8>)>,
 }
 impl Vfs {
+    pub const MAX_RW_COUNT: u64 = i32::MAX as u64 & !(trames_memory::PAGE_SIZE - 1);
+    /// Linux rw_verify_area validates the requested range before EOF or append
+    /// placement can shorten or redirect a transfer.
+    pub fn check_io_range(offset: u64, count: u64) -> Result<()> {
+        if offset
+            .checked_add(count)
+            .is_some_and(|end| end <= i64::MAX as u64)
+        {
+            Ok(())
+        } else {
+            Err(Errno(22))
+        }
+    }
+    pub fn check_sendfile_modes(input: u32, output: u32) -> Result<()> {
+        if (input | output) & O_PATH != 0 || input & 3 == 1 || output & 3 == 0 {
+            return Err(Errno(9));
+        }
+        if output & 0x400 != 0 {
+            return Err(Errno(22));
+        }
+        Ok(())
+    }
     /// Linux copy_file_range validates the original unsigned range before EOF
     /// shortening. Both embedding and retained native I/O use this prelude.
     pub fn copy_file_range_length(
@@ -1044,8 +1066,8 @@ impl FileCopy {
     }
     fn execute(&mut self, v: &mut Vfs, input: u32, output: u32) -> Result<FileValue> {
         if self.stage.is_none() {
-            if !self.range && v.flags(output)? & 0x400 != 0 {
-                return Err(Errno(22));
+            if !self.range {
+                Vfs::check_sendfile_modes(v.flags(input)?, v.flags(output)?)?;
             }
             let source = v.stat_fd(input)?;
             v.fd_kind(output)?;
@@ -1068,6 +1090,12 @@ impl FileCopy {
             } else {
                 None
             };
+            if !self.range {
+                Vfs::check_io_range(from, self.count)?;
+                if v.regular_file_fd(output)? {
+                    Vfs::check_io_range(v.seek(output, 0, 1)?, self.count.min(Vfs::MAX_RW_COUNT))?;
+                }
+            }
             let bytes = v.pread(
                 input,
                 self.count.min(storage::MAX_TRANSFER as u64) as usize,

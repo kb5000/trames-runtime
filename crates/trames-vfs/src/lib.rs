@@ -3169,6 +3169,18 @@ impl Vfs {
         }
         Ok((source_pipe, dest_pipe))
     }
+    pub fn tee(&mut self, input: u32, output: u32, count: u64, flags: u32) -> Result<u64> {
+        if let Some(result) = StreamTransfer::tee_empty(count, flags) {
+            return result;
+        }
+        let files = self.shared_files();
+        let input = files.query_lookup(input).ok_or(Errno(9))??;
+        let output = files.query_lookup(output).ok_or(Errno(9))??;
+        match StreamTransfer::tee(input, output, count, flags)?.execute(self)? {
+            FileValue::Transfer { count, .. } => Ok(count),
+            _ => unreachable!("pipe transfer"),
+        }
+    }
     pub fn splice(
         &mut self,
         input: u32,
@@ -3339,6 +3351,7 @@ impl Vfs {
             Content::MessageQueue(q) => Ok(q.read(&o.file_position, count)),
             Content::File(b) => {
                 let mut position = o.file_position.lock().unwrap();
+                Self::check_io_range(position.value, count as u64)?;
                 let out = b.read_at(position.value, count)?;
                 position.value += out.len() as u64;
                 Ok(out)
@@ -3506,6 +3519,7 @@ impl Vfs {
                     }
                     let mut position = o.file_position.lock().unwrap();
                     let at = offset.unwrap_or(position.value);
+                    Self::check_io_range(at, bytes.len() as u64)?;
                     let append = o.flags.get() & 0x400 != 0;
                     let result = data.write_limited(at, bytes, append, file_size_limit, || {
                         self.file_size_signal.set(true)
@@ -3550,6 +3564,7 @@ impl Vfs {
                     return Ok(0);
                 }
                 let mut file_position = o.file_position.lock().unwrap();
+                Self::check_io_range(offset.unwrap_or(file_position.value), bytes.len() as u64)?;
                 let position = if o.flags.get() & 0x400 != 0 {
                     b.len()
                 } else {
@@ -3679,6 +3694,9 @@ impl Vfs {
         }
         let node = o.data_node().ok_or(Errno(29))?;
         let n = node.borrow();
+        if node.regular_file {
+            Self::check_io_range(offset, count as u64)?;
+        }
         let result = match &n.content {
             Content::MessageQueue(q) => Ok(q.status(offset, count)),
             Content::File(b) => b.read_at(offset, count),

@@ -456,11 +456,17 @@ impl DirectFile {
             return None;
         }
         let result = if let Some(offset) = offset {
+            if let Err(e) = Vfs::check_io_range(offset, count as u64) {
+                return Some(Err(e));
+            }
             self.data.epoch_read_at(offset, count, cache)?
         } else {
             let mut position = self.try_position()?;
             if position.pending != 0 {
                 return None;
+            }
+            if let Err(e) = Vfs::check_io_range(position.value, count as u64) {
+                return Some(Err(e));
             }
             let result = self.data.epoch_read_at(position.value, count, cache)?;
             if let Ok(bytes) = &result {
@@ -508,6 +514,9 @@ impl DirectFile {
         }
         let append = self.prepared.0.status.get() & 0x400 != 0;
         let result = if let Some(offset) = offset {
+            if let Err(e) = Vfs::check_io_range(offset, bytes.len() as u64) {
+                return Some(Err(e));
+            }
             self.data
                 .write_local(offset, bytes, append, cache)?
                 .map(|(n, _)| n)
@@ -515,6 +524,9 @@ impl DirectFile {
             let mut position = self.try_position()?;
             if position.pending != 0 {
                 return None;
+            }
+            if let Err(e) = Vfs::check_io_range(position.value, bytes.len() as u64) {
+                return Some(Err(e));
             }
             let result = self
                 .data

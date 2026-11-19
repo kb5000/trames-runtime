@@ -398,7 +398,7 @@ impl<C: Cpu> Lifecycle<C> {
         };
         let raw = value.unwrap_or_else(super::super::error);
         if (raw == super::super::error(Errno(32))
-            && matches!(number, 64 | 66 | 71 | 76 | 206 | 211 | 269)
+            && matches!(number, 64 | 66 | 71 | 76..=77 | 206 | 211 | 269)
             && match number {
                 206 => args[3] & 0x4000 == 0,
                 211 => args[2] & 0x4000 == 0,

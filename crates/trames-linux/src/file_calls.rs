@@ -88,6 +88,9 @@ impl CopyParameters {
         if copy && a[5] != 0 {
             return Err(Errno(22));
         }
+        if !copy {
+            Vfs::check_sendfile_modes(vfs.flags(input)?, vfs.flags(output)?)?;
+        }
         let from = regular_file(vfs, input, copy)?;
         vfs.fd_kind(output)?;
         let from_offset = if in_pointer == 0 {
@@ -100,6 +103,9 @@ impl CopyParameters {
                 signed_offset(offset, 22)?
             }
         };
+        if !copy {
+            Vfs::check_io_range(from_offset, count)?;
+        }
         let to_offset = if copy {
             let to = regular_file(vfs, output, true)?;
             if vfs.flags(output)? & 0x400 != 0 {
@@ -221,6 +227,7 @@ impl Linux {
                 }
                 Ok(result)
             }
+            77 => self.vfs.tee(a[0] as u32, a[1] as u32, a[2], a[3] as u32),
             76 => {
                 let input = a[0] as u32;
                 let output = a[2] as u32;

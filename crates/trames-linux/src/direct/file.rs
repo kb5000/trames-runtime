@@ -269,7 +269,7 @@ impl DirectSyscalls {
     pub fn file_call(number: u32) -> bool {
         namespace::supported(number)
             || crate::file_advice::entry(number)
-            || matches!(number, 45..=47 | 56 | 62..=71 | 76 | 80..=84 | 227 | 267 | 285..=287 | 437)
+            || matches!(number, 45..=47 | 56 | 62..=71 | 76..=77 | 80..=84 | 227 | 267 | 285..=287 | 437)
     }
     pub fn file_entry(number: u32, args: [u64; 6]) -> bool {
         Self::file_call(number) || number == 25 && matches!(args[1], 1033 | 1034)
@@ -721,7 +721,12 @@ impl DirectSyscalls {
                 }
             }
         }
-        let (file, command, output) = if matches!(number, 71 | 76 | 285) {
+        if number == 77 {
+            if let Some(result) = trames_vfs::StreamTransfer::tee_empty(args[2], args[3] as u32) {
+                return Some(self.complete(number, args, result));
+            }
+        }
+        let (file, command, output) = if matches!(number, 71 | 76..=77 | 285) {
             let (file, command, output) = match copy_import(
                 &vfs.shared_files(),
                 || vfs.path_queries(),
@@ -1163,7 +1168,12 @@ impl DirectSyscalls {
                 memory,
             );
         }
-        if matches!(number, 71 | 76 | 285) {
+        if number == 77 {
+            if let Some(result) = trames_vfs::StreamTransfer::tee_empty(a[2], a[3] as u32) {
+                return Some(result);
+            }
+        }
+        if matches!(number, 71 | 76..=77 | 285) {
             if self.file_prepared(number, a) {
                 return None;
             }
@@ -1348,6 +1358,24 @@ fn copy_import<Q: std::borrow::Borrow<trames_vfs::PathQueries>>(
     a: [u64; 6],
     memory: &impl CpuMemory,
 ) -> Option<Result<ImportedCopy, Errno>> {
+    if number == 77 {
+        let input = match files.lookup(a[0] as u32)? {
+            Ok(fd) => fd,
+            Err(e) => return Some(Err(e)),
+        };
+        let output = match files.lookup(a[1] as u32)? {
+            Ok(fd) => fd,
+            Err(e) => return Some(Err(e)),
+        };
+        let target = output.filesystem_target();
+        let transfer = trames_vfs::StreamTransfer::tee(input, output, a[2], a[3] as u32)
+            .map(|op| trames_vfs::FileCommand::Transfer(RefCell::new(op)));
+        return Some(Ok((
+            target,
+            transfer,
+            FileOutput::CopyOffsets { from: 0, to: 0 },
+        )));
+    }
     let range = number == 285;
     let splice = number == 76;
     if range && a[5] != 0 || splice && a[5] & !15 != 0 {

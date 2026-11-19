@@ -93,12 +93,18 @@ pub struct StreamTransfer {
     pub(crate) output: SharedFd,
     from: Result<Option<u64>>,
     to: Result<Option<u64>>,
-    count: usize,
-    splice: bool,
+    requested: u64,
+    mode: TransferMode,
     flags: u32,
     stage: Option<Stage>,
     blocked: Option<bool>, // true: output; false: input
     deadline: Option<Instant>,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TransferMode {
+    Sendfile,
+    Splice,
+    Tee,
 }
 pub struct TransferWait {
     pub subscriptions: Vec<IoSubscription>,
@@ -133,13 +139,50 @@ impl StreamTransfer {
             output,
             from,
             to,
-            count: count.min(storage::MAX_TRANSFER as u64) as usize,
-            splice,
+            requested: count,
+            mode: if splice {
+                TransferMode::Splice
+            } else {
+                TransferMode::Sendfile
+            },
             flags,
             stage: None,
             blocked: None,
             deadline: None,
         }
+    }
+    pub fn tee(input: SharedFd, output: SharedFd, count: u64, flags: u32) -> Result<Self> {
+        let mut transfer = Self::new(input, output, Ok(None), Ok(None), count, true, flags);
+        let source = &transfer.input.open;
+        let dest = &transfer.output.open;
+        if source.flags.get() & 3 == 1
+            || source.flags.get() & O_PATH != 0
+            || dest.flags.get() & 3 == 0
+            || dest.flags.get() & O_PATH != 0
+        {
+            return Err(Errno(9));
+        }
+        let (Some(reader), Some(writer)) = (&source.pipe, &dest.pipe) else {
+            return Err(Errno(22));
+        };
+        if Arc::ptr_eq(&reader.data, &writer.data) {
+            return Err(Errno(22));
+        }
+        if (source.flags.get() | dest.flags.get()) & O_NONBLOCK != 0 {
+            transfer.flags |= 2;
+        }
+        transfer.mode = TransferMode::Tee;
+        Ok(transfer)
+    }
+    pub fn tee_empty(count: u64, flags: u32) -> Option<Result<u64>> {
+        if flags & !15 != 0 {
+            Some(Err(Errno(22)))
+        } else {
+            (count == 0).then_some(Ok(0))
+        }
+    }
+    fn count(&self) -> usize {
+        self.requested.min(storage::MAX_TRANSFER as u64) as usize
     }
     fn descriptor(file: &SharedFd) -> Descriptor {
         Descriptor {
@@ -151,7 +194,7 @@ impl StreamTransfer {
         [&self.input, &self.output].iter().any(|f| {
             f.file_target().is_some_and(|target| {
                 target.host_work(&FileCommand::Read {
-                    count: self.count,
+                    count: self.count(),
                     offset: None,
                 })
             })
@@ -166,7 +209,7 @@ impl StreamTransfer {
                 .node
                 .as_ref()
                 .is_some_and(|n| n.active_file_work.load(Ordering::Relaxed) != 0)
-        }) || ((self.count >= 16 * 1024 || self.output.open.flags.get() & 0x1000 != 0)
+        }) || ((self.requested >= 16 * 1024 || self.output.open.flags.get() & 0x1000 != 0)
             && self.host_work())
     }
     pub(crate) fn waits(&self) -> bool {
@@ -175,7 +218,9 @@ impl StreamTransfer {
         };
         let file = if write { &self.output } else { &self.input };
         file.open.flags.get() & O_NONBLOCK == 0
-            && !(self.splice && self.flags & 2 != 0 && file.open.pipe.is_some())
+            && !(self.mode != TransferMode::Sendfile
+                && self.flags & 2 != 0
+                && file.open.pipe.is_some())
             && !self.deadline.is_some_and(|d| Instant::now() >= d)
     }
     fn blocked(&mut self, write: bool) {
@@ -264,7 +309,7 @@ impl StreamTransfer {
     pub(crate) fn execute(&mut self, v: &mut Vfs) -> Result<FileValue> {
         let source = &self.input.open;
         let dest = &self.output.open;
-        if self.splice && self.flags & !15 != 0 {
+        if self.mode != TransferMode::Sendfile && self.flags & !15 != 0 {
             return Err(Errno(22));
         }
         if source.flags.get() & O_PATH != 0
@@ -274,7 +319,7 @@ impl StreamTransfer {
         {
             return Err(Errno(9));
         }
-        if dest.flags.get() & 0x400 != 0 {
+        if self.mode != TransferMode::Tee && dest.flags.get() & 0x400 != 0 {
             return Err(Errno(22));
         }
         let source_pipe = source.pipe.as_ref().map(|p| p.data.clone());
@@ -294,14 +339,26 @@ impl StreamTransfer {
         {
             return Err(Errno(29));
         }
-        if self.splice && source_pipe.is_none() && dest_pipe.is_none()
-            || !self.splice && !from_seekable && dest_pipe.is_none()
+        if self.mode != TransferMode::Sendfile && source_pipe.is_none() && dest_pipe.is_none()
+            || self.mode == TransferMode::Sendfile && !from_seekable && dest_pipe.is_none()
         {
             return Err(Errno(22));
         }
         let from = self.from?;
         let to = self.to?;
-        if self.count == 0 {
+        let start = if from_seekable && self.stage.is_none() {
+            let pos = from.unwrap_or_else(|| source.file_position.snapshot());
+            Vfs::check_io_range(pos, self.requested)?;
+            pos
+        } else {
+            0
+        };
+        if to_seekable {
+            let pos = to.unwrap_or_else(|| dest.file_position.snapshot());
+            Vfs::check_io_range(pos, self.requested.min(Vfs::MAX_RW_COUNT))?;
+        }
+        let count = self.count();
+        if count == 0 {
             return Ok(FileValue::Transfer {
                 count: 0,
                 from: from.unwrap_or(0),
@@ -315,6 +372,13 @@ impl StreamTransfer {
         // EOF in a drained pipe never waits for space in an unrelated sink.
         if let Some(pipe) = &source_pipe {
             let data = pipe.lock().unwrap();
+            if self.mode == TransferMode::Tee
+                && (data.read_reserved || data.bytes.is_empty() && data.writers != 0)
+            {
+                drop(data);
+                self.blocked(false);
+                return Err(Errno(11));
+            }
             if !data.read_reserved && data.bytes.is_empty() && data.writers == 0 {
                 return Ok(FileValue::Transfer {
                     count: 0,
@@ -324,7 +388,7 @@ impl StreamTransfer {
             }
         }
         let mut destination = if let Some(pipe) = dest_pipe {
-            match WriteLease::take(pipe, self.count) {
+            match WriteLease::take(pipe, count) {
                 Ok(lease) => Some(lease),
                 Err(Errno(11)) => {
                     self.blocked(true);
@@ -335,17 +399,10 @@ impl StreamTransfer {
         } else {
             None
         };
-        let count = destination.as_ref().map_or(self.count, |r| r.count);
+        let count = destination.as_ref().map_or(count, |r| r.count);
         if self.stage.is_none() {
             let input = Self::descriptor(&self.input);
-            let from = if from_seekable {
-                match from {
-                    Some(from) => from,
-                    None => Vfs::seek_description(&input, 0, 1)?,
-                }
-            } else {
-                0
-            };
+            let from = start;
             let result = if let Some(pipe) = source_pipe {
                 ReadLease::take(pipe, count).map(|(lease, bytes)| Stage {
                     bytes,
@@ -394,8 +451,18 @@ impl StreamTransfer {
             }
             Err(e) => return Err(e),
         };
-        if let Some(lease) = &stage.read {
-            lease.commit(n);
+        if self.mode != TransferMode::Tee {
+            if let Some(lease) = &stage.read {
+                lease.commit(n);
+            }
+        }
+        if self.mode == TransferMode::Tee && n != 0 {
+            if let Some(node) = &source.node {
+                source.notify_file_io(node, inotify::ACCESS);
+            }
+            if let Some(node) = &dest.node {
+                dest.notify_file_io(node, inotify::MODIFY);
+            }
         }
         let position = stage.from + n as u64;
         if from_seekable && from.is_none() {
@@ -440,6 +507,42 @@ mod tests {
             },
             _ => panic!("ready transfer"),
         }
+    }
+    #[test]
+    fn tee_duplicates_the_unread_prefix_and_never_consumes_input() {
+        let mut v = Vfs::default();
+        let [input, producer] = v.pipe(0).unwrap();
+        let [consumer, output] = v.pipe(0).unwrap();
+        assert_eq!(v.tee(u32::MAX, u32::MAX, 0, 0), Ok(0));
+        assert_eq!(v.tee(u32::MAX, u32::MAX, 0, 16), Err(Errno(22)));
+        v.write(producer, b"abcdef").unwrap();
+        assert_eq!(v.tee(input, output, 2, 0), Ok(2));
+        assert_eq!(v.read(input, 1).unwrap(), b"a");
+        assert_eq!(v.tee(input, output, 20, 0), Ok(5));
+        assert_eq!(v.read(consumer, 20).unwrap(), b"abbcdef");
+        v.close(consumer).unwrap();
+        assert_eq!(v.tee(input, output, 1, 0), Err(Errno(32)));
+        assert_eq!(v.read(input, 20).unwrap(), b"bcdef");
+        v.close(producer).unwrap();
+        let [_reader, other_output] = v.pipe(0).unwrap();
+        assert_eq!(v.tee(input, other_output, 20, 0), Ok(0));
+    }
+    #[test]
+    fn splice_rejects_requested_overflow_before_reserving_a_pipe_prefix() {
+        let mut v = Vfs::default();
+        let [input, producer] = v.pipe(0).unwrap();
+        v.import_file(b"/target", b"old".to_vec()).unwrap();
+        let output = v.open_at(AT_FDCWD, b"/target", 2, 0).unwrap();
+        v.write(producer, b"x").unwrap();
+        let count = storage::MAX_TRANSFER + 8;
+        let to = i64::MAX as u64 - storage::MAX_TRANSFER as u64;
+        assert_eq!(
+            v.splice(input, output, count, None, Some(to)),
+            Err(Errno(22))
+        );
+        assert_eq!(v.read(input, 1).unwrap(), b"x");
+        assert_eq!(v.seek(output, 0, 1), Ok(0));
+        assert_eq!(v.pread(output, 3, 0).unwrap(), b"old");
     }
     #[test]
     fn reservations_preserve_prefix_capacity_and_wake_after_cancellation() {

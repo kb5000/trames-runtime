@@ -1835,6 +1835,7 @@ impl<C: Cpu> Kernel<C> {
                             | 66
                             | 71
                             | 76
+                            | 77
                             | 95
                             | 260
                             | 202
@@ -2354,6 +2355,7 @@ impl<C: Cpu> Kernel<C> {
                     return Ok(None);
                 }
                 let per_call_nonblock = match number {
+                    77 => a[3] & 2 != 0 || p.linux.vfs.flags(a[1] as u32)? & O_NONBLOCK != 0,
                     76 => a[5] & 2 != 0 || p.linux.vfs.flags(a[2] as u32)? & O_NONBLOCK != 0,
                     206 => a[3] & 0x40 != 0,
                     207 => a[3] & (0x40 | 0x2000) != 0,
@@ -2368,7 +2370,7 @@ impl<C: Cpu> Kernel<C> {
                 if ((raw == error(Errno(11))
                     && matches!(
                         number,
-                        63 | 64 | 65 | 66 | 71 | 76 | 202 | 203 | 242 | 206 | 207 | 211 | 212 | 269
+                        63 | 64 | 65 | 66 | 71 | 76 | 77 | 202 | 203 | 242 | 206 | 207 | 211 | 212 | 269
                     )
                     && !per_call_nonblock)
                     || (raw == error(Errno(115)) && number == 203))
@@ -2963,7 +2965,7 @@ impl<C: Cpu> Kernel<C> {
             p.retained_byte = None;
         }
         let signal_pipe = match number {
-            64 | 66 | 71 | 76 => true,
+            64 | 66 | 71 | 76 | 77 => true,
             206 => a[3] & 0x4000 == 0,
             211 => a[2] & 0x4000 == 0,
             269 => a[3] & 0x4000 == 0,
