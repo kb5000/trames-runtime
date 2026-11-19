@@ -802,14 +802,14 @@ impl HostFs {
             )
         })
     }
-    pub fn rename(&self, old: &[u8], new: &[u8], exclusive: bool) -> Result<()> {
+    pub fn rename(&self, old: &[u8], new: &[u8], flags: u32) -> Result<()> {
         self.root.writable()?;
         let (old_dir, old_name) = self.root.parent(old)?;
         let (new_dir, new_name) = self.root.parent(new)?;
-        // SAFETY: anchored parents and valid final components; exclusive rename
-        // uses the native atomic flag rather than a check-then-overwrite race.
+        // SAFETY: both parents are anchored and both names are valid for this call.
+        // Use one native operation so host observers also see an atomic exchange.
         let result = unsafe {
-            if exclusive {
+            if flags != 0 {
                 #[cfg(any(target_os = "macos", target_os = "ios"))]
                 {
                     libc::renameatx_np(
@@ -817,7 +817,11 @@ impl HostFs {
                         old_name.as_ptr(),
                         new_dir.as_raw_fd(),
                         new_name.as_ptr(),
-                        libc::RENAME_EXCL,
+                        if flags == namespace::RENAME_EXCHANGE {
+                            libc::RENAME_SWAP
+                        } else {
+                            libc::RENAME_EXCL
+                        },
                     )
                 }
                 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -827,7 +831,11 @@ impl HostFs {
                         old_name.as_ptr(),
                         new_dir.as_raw_fd(),
                         new_name.as_ptr(),
-                        libc::RENAME_NOREPLACE,
+                        if flags == namespace::RENAME_EXCHANGE {
+                            libc::RENAME_EXCHANGE
+                        } else {
+                            libc::RENAME_NOREPLACE
+                        },
                     )
                 }
                 #[cfg(not(any(
@@ -849,15 +857,18 @@ impl HostFs {
             }
         };
         status(result)?;
-        let mut prefix = old.to_vec();
-        prefix.push(b'/');
         for entry in self.entries.lock().unwrap().values() {
             let mut state = entry.file.state.lock().unwrap();
-            if state.key == old || state.key.starts_with(&prefix) {
-                let mut key = new.to_vec();
-                key.extend_from_slice(&state.key[old.len()..]);
-                state.key = key;
-            }
+            let (from, to) = if mounts::below(&state.key, old) {
+                (old, new)
+            } else if flags == namespace::RENAME_EXCHANGE && mounts::below(&state.key, new) {
+                (new, old)
+            } else {
+                continue;
+            };
+            let mut key = to.to_vec();
+            key.extend_from_slice(&state.key[from.len()..]);
+            state.key = key;
         }
         Ok(())
     }
@@ -1490,6 +1501,38 @@ mod tests {
             0o120000
         );
         assert_eq!(v.read(fd, 8), Err(Errno(9)));
+    }
+    #[test]
+    fn rename_exchange_updates_native_names_and_retained_handles() {
+        let fixture = Fixture::new();
+        for name in ["left", "right"] {
+            let path = fixture.0.join(name);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("file"), name).unwrap();
+        }
+        let mut v = fixture.vfs(false);
+        let fd = v.open_at(AT_FDCWD, b"/host/left/file", 0, 0).unwrap();
+        v.chdir(b"/host/right").unwrap();
+        v.rename_at(
+            AT_FDCWD,
+            b"/host/left",
+            AT_FDCWD,
+            b"/host/right",
+            namespace::RENAME_EXCHANGE,
+        )
+        .unwrap();
+        assert_eq!(v.cwd().unwrap(), b"/host/left");
+        assert_eq!(v.read(fd, 8).unwrap(), b"left");
+        let relative = v.open_at(AT_FDCWD, b"file", 0, 0).unwrap();
+        assert_eq!(v.read(relative, 8).unwrap(), b"right");
+        assert_eq!(
+            std::fs::read(fixture.0.join("right/file")).unwrap(),
+            b"left"
+        );
+        assert_eq!(
+            std::fs::read(fixture.0.join("left/file")).unwrap(),
+            b"right"
+        );
     }
     #[test]
     fn native_directory_emptiness_is_not_inferred_from_a_stale_lookup_cache() {

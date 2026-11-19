@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
+
+pub(super) const RENAME_NOREPLACE: u32 = 1;
+pub(super) const RENAME_EXCHANGE: u32 = 2;
+
 impl Vfs {
     pub fn link_at(&mut self, oldfd: i32, old: &[u8], newfd: i32, new: &[u8]) -> Result<()> {
         let source = self.resolve_final(oldfd, old, false)?;
@@ -7,8 +11,7 @@ impl Vfs {
         self.check_parent_write(&dest)?;
         self.link_resolved(&source, &dest, false)
     }
-    /// Rename a file or subtree with one manifest replacement. Only NOREPLACE is
-    /// supported in addition to the ordinary overwrite semantics.
+    /// Move or exchange complete subtrees under one namespace transaction.
     pub fn rename_at(
         &mut self,
         oldfd: i32,
@@ -17,52 +20,72 @@ impl Vfs {
         new: &[u8],
         flags: u32,
     ) -> Result<()> {
-        if flags & !1 != 0 {
+        if !matches!(flags, 0 | RENAME_NOREPLACE | RENAME_EXCHANGE) {
             return Err(Errno(22));
         }
         let source = self.resolve_final(oldfd, old, false)?;
         let dest = self.resolve_final(newfd, new, false)?;
+        let special_final = |path: &[u8]| {
+            matches!(
+                path.rsplit(|b| *b == b'/').find(|part| !part.is_empty()),
+                None | Some(b"." | b"..")
+            )
+        };
+        if special_final(old) {
+            return Err(Errno(16));
+        }
+        if special_final(new) {
+            return Err(Errno(if flags == RENAME_NOREPLACE { 17 } else { 16 }));
+        }
         if self.is_mount_root(&source) || self.is_mount_root(&dest) {
             return Err(Errno(16));
         }
         if source.mount.as_ref().map(|m| m.id) != dest.mount.as_ref().map(|m| m.id) {
             return Err(Errno(18));
         }
+        source.writable()?;
         let filesystem = source.filesystem(self);
         let _namespace = filesystem.namespace.lock().unwrap();
+        let exchange = flags == RENAME_EXCHANGE;
         let src = self.node(&source)?;
-        self.check_parent_write(&source)?;
-        self.check_parent_write(&dest)?;
-        self.check_remove(&source)?;
-        let target = self.node(&dest).ok();
-        if target.is_some() {
-            self.check_remove(&dest)?;
-        }
-        if target.is_some() && flags == 1 {
+        let target = match self.node(&dest) {
+            Ok(node) => Some(node),
+            Err(Errno(2)) if !exchange => None,
+            Err(error) => return Err(error),
+        };
+        if flags == RENAME_NOREPLACE && target.is_some() {
             return Err(Errno(17));
         }
         if target.as_ref().is_some_and(|n| Arc::ptr_eq(n, &src)) {
             return Ok(());
         }
+        self.check_parent_write(&source)?;
+        self.check_parent_write(&dest)?;
+        self.check_remove(&source)?;
+        if target.is_some() {
+            self.check_remove(&dest)?;
+        }
         let is_dir = matches!(src.borrow().content, Content::Directory);
-        if is_dir
-            && filesystem
-                .borrow()
-                .overlay
-                .as_ref()
-                .is_some_and(|o| o.lower_directory(&source))
+        let target_dir = target
+            .as_ref()
+            .is_some_and(|n| matches!(n.borrow().content, Content::Directory));
+        if exchange && target_dir && mounts::below(&source, &dest) {
+            return Err(Errno(22));
+        }
+        if (is_dir || exchange && target_dir)
+            && filesystem.borrow().overlay.as_ref().is_some_and(|o| {
+                is_dir && o.lower_directory(&source)
+                    || exchange && target_dir && o.lower_directory(&dest)
+            })
         {
             // redirect_dir=off: Linux asks userspace to copy a lower/merged
             // directory tree rather than silently changing lower dentries.
             return Err(Errno(18));
         }
-        let mut prefix = source.clone();
-        prefix.push(b'/');
-        if is_dir && dest.starts_with(&prefix) {
+        if is_dir && mounts::below(&dest, &source) {
             return Err(Errno(22));
         }
-        if let Some(n) = &target {
-            let target_dir = matches!(n.borrow().content, Content::Directory);
+        if !exchange && target.is_some() {
             if is_dir != target_dir {
                 return Err(Errno(if is_dir { 20 } else { 21 }));
             }
@@ -77,52 +100,81 @@ impl Vfs {
                     && filesystem
                         .borrow()
                         .paths
-                        .keys()
-                        .any(|p| p.starts_with(&dest_prefix))
+                        .range(dest_prefix.key.clone()..)
+                        .next()
+                        .is_some_and(|(p, _)| p.starts_with(&dest_prefix))
                 {
                     return Err(Errno(39));
                 }
             }
         }
         let mut fs = filesystem.borrow_mut();
-        let mut replacements = Vec::new();
-        for (path, n) in &fs.paths {
-            if *path == source.key || (is_dir && path.starts_with(&prefix)) {
-                let mut new_path = dest.clone();
-                new_path.extend_from_slice(&path[source.len()..]);
-                if new_path.len() >= MAX_PATH {
-                    return Err(Errno(36));
+        let mut moves = Vec::new();
+        let mut plan = |from: &ResolvedPath,
+                        to: &ResolvedPath,
+                        node: &NodeRef,
+                        directory: bool|
+         -> Result<()> {
+            moves.push((from.key.clone(), to.key.clone(), node.clone()));
+            if directory {
+                let mut prefix = from.key.clone();
+                prefix.push(b'/');
+                for (path, child) in fs
+                    .paths
+                    .range(prefix.clone()..)
+                    .take_while(|(p, _)| p.starts_with(&prefix))
+                {
+                    let mut new_path = to.key.clone();
+                    new_path.extend_from_slice(&path[from.len()..]);
+                    if new_path.len() >= MAX_PATH {
+                        return Err(Errno(36));
+                    }
+                    moves.push((path.clone(), new_path, child.clone()));
                 }
-                replacements.push((path.clone(), new_path, n.clone()));
             }
+            Ok(())
+        };
+        plan(&source, &dest, &src, is_dir)?;
+        let exchanged = target.as_ref().filter(|_| exchange);
+        let overwritten = target.as_ref().filter(|_| !exchange);
+        if let Some(n) = exchanged {
+            plan(&dest, &source, n, target_dir)?;
         }
-        let old_paths = fs.paths.clone();
         #[cfg(all(feature = "hostfs", unix))]
         if let Some(host) = &filesystem.host {
-            host.rename(&source.key, &dest.key, flags == 1)?;
+            host.rename(&source.key, &dest.key, flags)?;
         }
-        if let Some(n) = &target {
+        if let Some(n) = overwritten {
             n.borrow_mut().links -= 1;
-            fs.paths.remove(&dest.key);
         }
-        for (path, _, _) in &replacements {
-            fs.paths.remove(path);
+        for (from, _, _) in &moves {
+            fs.paths.remove(from);
         }
-        for (_, path, n) in replacements {
-            fs.paths.insert(path.key, n);
+        for (_, to, n) in &moves {
+            fs.paths.insert(to.clone(), n.clone());
         }
-        let old_time = src.borrow().times[2];
-        src.borrow_mut().times[2] = storage::Timestamp::now();
+        let now = storage::Timestamp::now();
+        let src_ctime = std::mem::replace(&mut src.borrow_mut().times[2], now);
+        let other_ctime = exchanged.map(|n| std::mem::replace(&mut n.borrow_mut().times[2], now));
         if let Err(e) = fs.checkpoint() {
-            fs.paths = old_paths;
-            src.borrow_mut().times[2] = old_time;
-            if let Some(n) = &target {
+            for (_, to, _) in &moves {
+                fs.paths.remove(to);
+            }
+            for (from, _, n) in moves {
+                fs.paths.insert(from, n);
+            }
+            src.borrow_mut().times[2] = src_ctime;
+            if let Some((n, time)) = exchanged.zip(other_ctime) {
+                n.borrow_mut().times[2] = time;
+            }
+            if let Some(n) = overwritten {
                 n.borrow_mut().links += 1;
+                fs.paths.insert(dest.key.clone(), n.clone());
             }
             return Err(e);
         }
         drop(fs);
-        if let Some(n) = &target {
+        if let Some(n) = overwritten {
             self.notification_link(&dest, n, false);
             inotify::notify(n, inotify::ATTRIB, None);
             let mut n = n.borrow_mut();
@@ -135,18 +187,38 @@ impl Vfs {
                 }
             }
         }
-        let cookie = (self.open_id() as u32).max(1);
-        self.notification_entry(&source, inotify::MOVED_FROM, cookie, is_dir);
-        self.notification_entry(&dest, inotify::MOVED_TO, cookie, is_dir);
-        if let (Some((old_parent, old_name)), Some((new_parent, new_name))) = (
-            self.notification_parent(&source),
-            self.notification_parent(&dest),
-        ) {
-            inotify::move_link(&src, &old_parent, &old_name, &new_parent, &new_name);
+        let old_entry = self.notification_parent(&source);
+        let new_entry = self.notification_parent(&dest);
+        if let (Some((old_parent, old_name)), Some((new_parent, new_name))) =
+            (&old_entry, &new_entry)
+        {
+            inotify::move_link(&src, old_parent, old_name, new_parent, new_name);
+            if let Some(other) = exchanged {
+                inotify::move_link(other, new_parent, new_name, old_parent, old_name);
+            }
         }
-        src.borrow_mut()
-            .notifications
-            .send(inotify::MOVE_SELF, 0, b"", false);
+        let notify_move = |from: &Option<(NodeRef, Vec<u8>)>,
+                           to: &Option<(NodeRef, Vec<u8>)>,
+                           node: &NodeRef,
+                           directory| {
+            let cookie = (self.open_id() as u32).max(1);
+            let kind = if directory { inotify::ISDIR } else { 0 };
+            for (entry, mask) in [(from, inotify::MOVED_FROM), (to, inotify::MOVED_TO)] {
+                if let Some((parent, name)) = entry {
+                    parent
+                        .borrow()
+                        .notifications
+                        .send(mask | kind, cookie, name, false);
+                }
+            }
+            node.borrow()
+                .notifications
+                .send(inotify::MOVE_SELF, 0, b"", false);
+        };
+        notify_move(&old_entry, &new_entry, &src, is_dir);
+        if let Some(other) = exchanged {
+            notify_move(&new_entry, &old_entry, other, target_dir);
+        }
         Ok(())
     }
     fn chmod_node(

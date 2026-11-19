@@ -17,7 +17,7 @@ pub(super) const DELETE: u32 = 512;
 const DELETE_SELF: u32 = 1024;
 pub(super) const MOVE_SELF: u32 = 2048;
 const IGNORED: u32 = 0x8000;
-const ISDIR: u32 = 0x40000000;
+pub(super) const ISDIR: u32 = 0x40000000;
 const ALL: u32 = 0xfff;
 const MAX_EVENTS: usize = 16384;
 

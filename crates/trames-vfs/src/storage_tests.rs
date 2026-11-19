@@ -1133,6 +1133,76 @@ fn subtree_rename_updates_other_process_cwd_and_open_dirfd() {
     assert!(v.stat_at(AT_FDCWD, b"/new/sub/file").is_ok());
 }
 #[test]
+fn rename_exchange_commits_both_subtrees_or_neither() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.import_file(b"/left/leaf", b"leaf".to_vec()).unwrap();
+    v.import_file(b"/right", b"file".to_vec()).unwrap();
+    let fd = v.open_at(AT_FDCWD, b"/right", 0, 0).unwrap();
+    let mut child = v.clone();
+    child.chdir(b"/left").unwrap();
+    let notify = v.inotify_init(O_NONBLOCK).unwrap();
+    let moves = inotify::MOVED_FROM | inotify::MOVED_TO;
+    v.inotify_add(notify, b"/", moves).unwrap();
+    let left = v.stat_at(AT_FDCWD, b"/left").unwrap();
+    let right = v.stat_at(AT_FDCWD, b"/right").unwrap();
+    let exchange = |v: &mut Vfs| {
+        v.rename_at(
+            AT_FDCWD,
+            b"/left",
+            AT_FDCWD,
+            b"/right",
+            namespace::RENAME_EXCHANGE,
+        )
+    };
+    fs::create_dir(dir.0.join("manifest.new")).unwrap();
+    assert!(exchange(&mut v).is_err());
+    assert_eq!(child.cwd().unwrap(), b"/left");
+    assert_eq!(v.stat_at(AT_FDCWD, b"/left").unwrap(), left);
+    assert_eq!(v.stat_at(AT_FDCWD, b"/right").unwrap(), right);
+    assert!(v.stat_at(AT_FDCWD, b"/left/leaf").is_ok());
+    assert_eq!(v.read(notify, 4096), Err(Errno(11)));
+    fs::remove_dir(dir.0.join("manifest.new")).unwrap();
+    exchange(&mut v).unwrap();
+    assert_eq!(child.cwd().unwrap(), b"/right");
+    assert_eq!(v.read(fd, 4).unwrap(), b"file");
+    let events = v.read(notify, 4096).unwrap();
+    let mut pairs = Vec::new();
+    for event in events.chunks_exact(32) {
+        let mask = u32::from_ne_bytes(event[4..8].try_into().unwrap());
+        let cookie = u32::from_ne_bytes(event[8..12].try_into().unwrap());
+        let name = event[16..].split(|&b| b == 0).next().unwrap();
+        pairs.push((mask, cookie, name));
+    }
+    assert_eq!(events.len(), 128);
+    let first = pairs[0].1;
+    let second = pairs[2].1;
+    assert_ne!(first, 0);
+    assert_ne!(second, 0);
+    assert_ne!(first, second);
+    assert_eq!(
+        pairs,
+        [
+            (
+                inotify::MOVED_FROM | inotify::ISDIR,
+                first,
+                b"left".as_slice()
+            ),
+            (inotify::MOVED_TO | inotify::ISDIR, first, b"right"),
+            (inotify::MOVED_FROM, second, b"right"),
+            (inotify::MOVED_TO, second, b"left"),
+        ]
+    );
+    drop(child);
+    drop(v);
+    let mut reopened = dir.open();
+    for (path, bytes) in [(b"/right/leaf".as_slice(), b"leaf"), (b"/left", b"file")] {
+        let fd = reopened.open_at(AT_FDCWD, path, 0, 0).unwrap();
+        assert_eq!(reopened.read(fd, 4).unwrap(), bytes);
+    }
+}
+
+#[test]
 fn replacing_executable_updates_aliases_but_open_descriptions_keep_old_data() {
     let dir = Temp::new();
     let mut v = dir.open();
