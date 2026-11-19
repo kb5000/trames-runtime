@@ -13,6 +13,7 @@ pub struct MappingFileInfo {
 #[derive(Clone, PartialEq, Eq)]
 pub(super) enum Origin {
     Private,
+    Stack,
     SharedAnon(u64),
     File(MappingFileInfo),
     Other,
@@ -182,6 +183,22 @@ impl Memory {
             self.advance_layout_revision();
         }
     }
+    /// The initial Linux stack is a distinct VMA even next to another private RW map.
+    pub fn map_initial_stack(&mut self, start: u64, length: u64) -> Result<(), MemoryError> {
+        if let Some(mm) = &self.shared {
+            return mm.borrow_mut().map_initial_stack(start, length);
+        }
+        self.map(start, length, Permissions::RW)?;
+        Arc::make_mut(&mut self.region_layout).origins.insert(
+            start,
+            Mapping {
+                origin: Origin::Stack,
+                ..Mapping::private(start + length)
+            },
+        );
+        self.advance_layout_revision();
+        Ok(())
+    }
     /// Records file provenance for private pages populated by the ELF loader.
     pub fn record_image_file(
         &mut self,
@@ -237,7 +254,10 @@ impl Memory {
                 }
                 let mut m = match entry {
                     Some((base, m))
-                        if matches!(m.origin, Origin::Private | Origin::SharedAnon(_)) =>
+                        if matches!(
+                            m.origin,
+                            Origin::Private | Origin::Stack | Origin::SharedAnon(_)
+                        ) =>
                     {
                         m.slice(base, lo, hi)
                     }
@@ -266,6 +286,20 @@ impl Memory {
     }
 }
 impl super::report::RegionLayout {
+    pub(super) fn vm_sizes(&self) -> super::report::VmSizes {
+        let mut sizes = super::report::VmSizes::default();
+        for &(a, b, perm) in &self.ranges {
+            self.origins.pieces(a, b, |start, end, entry| {
+                let mapping = entry.map(|(_, m)| m);
+                if mapping.is_some_and(|m| matches!(m.origin, Origin::Stack)) {
+                    sizes.stack += end - start;
+                } else if perm.write && !mapping.is_some_and(|m| m.shared) {
+                    sizes.data += end - start;
+                }
+            });
+        }
+        sizes
+    }
     pub(super) fn maps(&self, stack: Option<u64>) -> Arc<[u8]> {
         let mut text = Vec::new();
         for &(a, b, perm) in &self.ranges {
@@ -345,6 +379,51 @@ mod tests {
 
     fn maps(mm: &Memory) -> String {
         String::from_utf8(mm.memory_report().maps().to_vec()).unwrap()
+    }
+
+    #[test]
+    fn virtual_data_and_stack_follow_mapping_changes_without_faulting_pages() {
+        let mut mm = Memory::default();
+        let p = PAGE_SIZE;
+        mm.map_initial_stack(p, 2 * p).unwrap();
+        mm.map(3 * p, 2 * p, Permissions::RW).unwrap();
+        mm.map_shared_anonymous(5 * p, p, Permissions::RW, false)
+            .unwrap();
+        let report = mm.memory_report();
+        let resident = report.resident_bytes();
+        assert_eq!(
+            report.vm_sizes(),
+            VmSizes {
+                data: 2 * p,
+                stack: 2 * p
+            }
+        );
+        assert_eq!(report.resident_bytes(), resident);
+        let mut child = mm.clone();
+        child.protect(3 * p, p, Permissions::R).unwrap();
+        child.map_fixed(p, p, Permissions::RW).unwrap();
+        assert_eq!(
+            child.memory_report().vm_sizes(),
+            VmSizes {
+                data: 2 * p,
+                stack: p
+            }
+        );
+        child.unmap(2 * p, p).unwrap();
+        assert_eq!(
+            child.memory_report().vm_sizes(),
+            VmSizes {
+                data: 2 * p,
+                stack: 0
+            }
+        );
+        assert_eq!(
+            report.vm_sizes(),
+            VmSizes {
+                data: 2 * p,
+                stack: 2 * p
+            }
+        );
     }
 
     #[test]

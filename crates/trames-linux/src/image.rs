@@ -57,7 +57,7 @@ pub fn build_initial_stack(
             .ok_or(ImageError::Arguments("argument list too long"))?;
     }
     elf.memory
-        .map(STACK_TOP - STACK_SIZE, STACK_SIZE, Permissions::RW)?;
+        .map_initial_stack(STACK_TOP - STACK_SIZE, STACK_SIZE)?;
     let mut cursor = STACK_TOP;
     let mut arguments = Vec::new();
     let mut environment = Vec::new();
@@ -83,6 +83,7 @@ pub fn build_initial_stack(
     let env_end = environment
         .last()
         .map_or(arg_end, |last| last + envp.last().unwrap().len() as u64 + 1);
+    let platform = push_string(&mut elf.memory, &mut cursor, b"aarch64")?;
     cursor -= 16;
     let mut entropy = [0; 16];
     crate::fill_entropy(&mut entropy)
@@ -91,7 +92,8 @@ pub fn build_initial_stack(
     // Static Linux auxv, including real host entropy for the guest stack guard.
     let mut auxv = vec![
         (6u64, PAGE_SIZE),
-        (17, 100), // AT_CLKTCK: the same Linux USER_HZ used by /proc stat.
+        (17, 100),      // AT_CLKTCK: the same Linux USER_HZ used by /proc stat.
+        (15, platform), // AT_PLATFORM points into the new image.
         (16, features.hwcap),
         (26, features.hwcap2),
         (9, elf.entry),

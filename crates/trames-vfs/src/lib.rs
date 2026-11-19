@@ -190,10 +190,11 @@ pub enum EpochIo {
     Stream,
     File,
 }
+const OPEN_ONLY_FLAGS: u32 = O_CREAT | 0x80 | 0x100 | O_TRUNC; // O_EXCL and O_NOCTTY
 pub fn query_fd_flags(flags: u32, command: u64) -> Result<u64> {
     match command {
         1 => Ok(u64::from(flags & O_CLOEXEC != 0)),
-        3 => Ok((flags & !(O_CLOEXEC | 0x40 | 0x80 | 0x100 | 0x200)) as u64),
+        3 => Ok((flags & !(O_CLOEXEC | OPEN_ONLY_FLAGS)) as u64),
         _ => Err(Errno(22)),
     }
 }
@@ -2923,7 +2924,7 @@ impl Vfs {
                     } else {
                         FdKind::Node(p.key.clone())
                     },
-                    flags: (flags & !O_CLOEXEC).into(),
+                    flags: (flags & !(O_CLOEXEC | OPEN_ONLY_FLAGS)).into(),
                     file_position: Arc::default(),
                     flock: std::sync::OnceLock::new(),
                     ofd_records: Default::default(),

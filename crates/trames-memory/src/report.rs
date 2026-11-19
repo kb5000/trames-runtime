@@ -32,7 +32,13 @@ impl Drop for ReportOwner {
         }
     }
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VmSizes {
+    pub data: u64,
+    pub stack: u64,
+}
 struct Layout {
+    vm_sizes: OnceLock<VmSizes>,
     virtual_bytes: u64,
     regions: Arc<RegionLayout>,
     account: Arc<Account>,
@@ -141,6 +147,7 @@ impl Memory {
             // Stack labeling changes the next maps snapshot even when permissions do not.
             let mut state = report.0.state.write().unwrap();
             *state = Arc::new(Layout {
+                vm_sizes: OnceLock::new(),
                 virtual_bytes: state.virtual_bytes,
                 regions: state.regions.clone(),
                 account: state.account.clone(),
@@ -163,6 +170,7 @@ impl Memory {
             }
         }
         let layout = Arc::new(Layout {
+            vm_sizes: OnceLock::new(),
             virtual_bytes: self.virtual_bytes(),
             regions: self.region_layout.clone(),
             account: self.account.clone(),
@@ -242,6 +250,11 @@ impl MemoryReport {
     }
     pub fn peak_with_residency(&self, resident: usize) -> usize {
         self.0.state.read().unwrap().account.record_peak(resident)
+    }
+    /// Classify virtual ranges only on observation, once per published layout.
+    pub fn vm_sizes(&self) -> VmSizes {
+        let layout = self.0.state.read().unwrap().clone();
+        *layout.vm_sizes.get_or_init(|| layout.regions.vm_sizes())
     }
     pub fn maps(&self) -> Arc<[u8]> {
         let layout = self.0.state.read().unwrap().clone();

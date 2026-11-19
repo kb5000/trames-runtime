@@ -148,7 +148,8 @@ pub fn install(memory: &mut Memory) -> Result<u64, MemoryError> {
         .find_free(start, 2 * PAGE_SIZE)
         .ok_or(MemoryError::Limit)?;
     memory.map(base, 2 * PAGE_SIZE, Permissions::RW)?;
-    memory.write(base, &image())?;
+    static IMAGE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    memory.write(base, IMAGE.get_or_init(image))?;
     memory.protect(base, PAGE_SIZE, Permissions::RX)?;
     memory.protect(base + DATA, PAGE_SIZE, Permissions::R)?;
     Ok(base)

@@ -398,10 +398,8 @@ fn initial_stack_bytes<C: Cpu>(
             },
         ),
     ];
-    if C::clock_sample().is_some() {
-        let base = trames_linux::vdso::install(&mut elf.memory)?;
-        extra.push((trames_linux::vdso::AUXV, base));
-    }
+    let base = trames_linux::vdso::install(&mut elf.memory)?;
+    extra.push((trames_linux::vdso::AUXV, base));
     trames_linux::image::build_initial_stack(
         elf,
         argv,

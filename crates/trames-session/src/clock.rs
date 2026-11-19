@@ -21,6 +21,11 @@ pub(super) fn initialize<C: Cpu>(
     for _ in 0..8 {
         let before = Instant::now();
         let Some(sample) = C::clock_sample() else {
+            // An image starts with zero frequency, selecting the syscall branch
+            // before any counter instruction on a software executor.
+            if best.is_none() {
+                return Ok(());
+            }
             break;
         };
         let after = Instant::now();

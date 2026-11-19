@@ -304,7 +304,7 @@ pub(super) fn peer_descriptor(end: &PtyEnd, flags: u32, id: u64, owner: (u32, u3
                 id,
                 owner,
                 kind: FdKind::Terminal,
-                flags: (flags & !O_CLOEXEC).into(),
+                flags: (flags & !(O_CLOEXEC | OPEN_ONLY_FLAGS)).into(),
                 file_position: Arc::default(),
                 flock: std::sync::OnceLock::new(),
                 ofd_records: Default::default(),

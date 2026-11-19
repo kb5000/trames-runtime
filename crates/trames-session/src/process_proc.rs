@@ -239,6 +239,11 @@ impl<C: Cpu> Process<C> {
             cwd_directory,
             root_directory,
             mapped_bytes: resident_bytes,
+            vm_sizes: if demand.residency() {
+                self.memory.memory_report().vm_sizes()
+            } else {
+                Default::default()
+            },
             peak_resident_bytes: if demand.residency() {
                 self.memory
                     .memory_report()

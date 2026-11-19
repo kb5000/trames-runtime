@@ -796,6 +796,7 @@ pub struct ProcessInfo {
     pub mapped_bytes: usize,
     pub peak_resident_bytes: usize,
     pub virtual_bytes: u64,
+    pub vm_sizes: trames_memory::VmSizes,
     pub maps: Vec<u8>,
     pub user_ticks: u64,
     pub start_ticks: u64,
@@ -1627,7 +1628,7 @@ impl Vfs {
                     id: self.open_id(),
                     owner: original.owner,
                     kind: original.kind.clone(),
-                    flags: (flags & !O_CLOEXEC).into(),
+                    flags: (flags & !(O_CLOEXEC | OPEN_ONLY_FLAGS)).into(),
                     file_position: Arc::default(),
                     flock: Default::default(),
                     ofd_records: Default::default(),
@@ -2145,9 +2146,10 @@ impl Vfs {
                         b"mounts" => mounts::table_text(&p.namespaces, false),
                         b"mountinfo" => mounts::table_text(&p.namespaces, true),
                         b"statm" => format!(
-                            "{} {} 0 0 0 0 0\n",
+                            "{} {} 0 0 0 {} 0\n",
                             p.virtual_bytes / 4096,
-                            p.mapped_bytes / 4096
+                            p.mapped_bytes / 4096,
+                            (p.vm_sizes.data + p.vm_sizes.stack) / 4096
                         )
                         .into_bytes(),
                         b"stat" => {
@@ -2165,6 +2167,9 @@ impl Vfs {
                             } else {
                                 fields[5] = "-1".into();
                             }
+                            if p.state == 'Z' {
+                                fields[6] = "4".into();
+                            } // PF_EXITING
                             fields[11] = p.user_ticks.to_string();
                             fields[15] = (20 + p.nice).to_string();
                             fields[16] = p.nice.to_string();
@@ -2238,8 +2243,8 @@ impl Vfs {
                                 .unwrap_or(0)
                                 .max(64)
                                 .next_power_of_two();
-                            format!("Name:\t{name}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t{fd_size}\nGroups:\t{}\nVmSize:\t{} kB\nVmHWM:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{threads}\nSigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\n", p.state, state_description(p.state), p.tgid, p.pid, p.parent,
-                                self.credentials.local_id(false,c.uid),self.credentials.local_id(false,c.euid),self.credentials.local_id(false,c.suid),self.credentials.local_id(false,c.fsuid),self.credentials.local_id(true,c.gid),self.credentials.local_id(true,c.egid),self.credentials.local_id(true,c.sgid),self.credentials.local_id(true,c.fsgid),c.groups.iter().map(|id|self.credentials.local_id(true,*id).to_string()).collect::<Vec<_>>().join(" "),p.virtual_bytes/1024,p.peak_resident_bytes.max(p.mapped_bytes)/1024,p.mapped_bytes/1024,p.pending,p.shared_pending,p.blocked,p.ignored,p.caught).into_bytes()
+                            format!("Name:\t{name}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t{fd_size}\nGroups:\t{}\nVmSize:\t{} kB\nVmData:\t{} kB\nVmStk:\t{} kB\nVmHWM:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{threads}\nSigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\n", p.state, state_description(p.state), p.tgid, p.pid, p.parent,
+                                self.credentials.local_id(false,c.uid),self.credentials.local_id(false,c.euid),self.credentials.local_id(false,c.suid),self.credentials.local_id(false,c.fsuid),self.credentials.local_id(true,c.gid),self.credentials.local_id(true,c.egid),self.credentials.local_id(true,c.sgid),self.credentials.local_id(true,c.fsgid),c.groups.iter().map(|id|self.credentials.local_id(true,*id).to_string()).collect::<Vec<_>>().join(" "),p.virtual_bytes/1024,p.vm_sizes.data/1024,p.vm_sizes.stack/1024,p.peak_resident_bytes.max(p.mapped_bytes)/1024,p.mapped_bytes/1024,p.pending,p.shared_pending,p.blocked,p.ignored,p.caught).into_bytes()
                         }
                         b"limits" => p.limit_text(task_limit as u64),
                         _ => return Ok(None),

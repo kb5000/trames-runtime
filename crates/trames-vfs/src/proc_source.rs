@@ -646,6 +646,7 @@ process_metadata! {
     mapped_bytes: usize,
     peak_resident_bytes: usize,
     virtual_bytes: u64,
+    vm_sizes: trames_memory::VmSizes,
     user_ticks: u64,
     start_ticks: u64,
     terminal_stat: Option<(u32, u32)>,
@@ -842,6 +843,7 @@ impl ProcessView {
         if let Some(memory) = &image.memory {
             info.virtual_bytes = memory.virtual_bytes();
             if demand.residency() {
+                info.vm_sizes = memory.vm_sizes();
                 info.mapped_bytes = residency.unwrap_or_else(|| memory.resident_bytes());
                 info.peak_resident_bytes = memory.peak_with_residency(info.mapped_bytes);
             }

@@ -367,6 +367,14 @@ impl Vfs {
                 if !self.may_inspect(at, &runtime, target) {
                     return Err(Errno(13));
                 }
+                if link
+                    && key == b"ns"
+                    && parts.last().is_some_and(|kind| {
+                        *kind != b"ns" && Self::namespace_target_released(target, kind)
+                    })
+                {
+                    return Err(Errno(2));
+                }
             }
         }
         Ok(())

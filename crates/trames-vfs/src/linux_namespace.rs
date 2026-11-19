@@ -616,6 +616,11 @@ impl Vfs {
             .as_ref()
             .map(NamespaceHandle::kind))
     }
+    pub(super) fn namespace_target_released(process: &ProcessInfo, kind: &[u8]) -> bool {
+        // exit_task_namespaces drops nsproxy. Credentials and the active PID
+        // namespace remain observable until the zombie is reaped.
+        process.state == 'Z' && !matches!(kind, b"user" | b"pid")
+    }
     pub(super) fn namespace_for_path(
         &self,
         path: &ResolvedPath,
@@ -651,6 +656,9 @@ impl Vfs {
             .ok_or(Errno(2))?;
         if !self.may_inspect(path, &runtime, process) {
             return Err(Errno(13));
+        }
+        if Self::namespace_target_released(process, kind) {
+            return Err(Errno(2));
         }
         Ok(Some(match kind {
             b"user" => NamespaceHandle::User(UserNamespace::upgrade(&process.namespaces.user)?),

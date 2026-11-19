@@ -88,7 +88,7 @@ pub use trames_execution::ExecutionInterrupt;
 pub trait Cpu: Registers + Default + Clone + Send + 'static {
     type Engine: Default;
     /// Optional coherent counter for the common Linux monotonic clock vDSO.
-    /// Software engines retain the syscall path without an advertised vDSO.
+    /// Without a counter the vDSO delegates clock reads to Linux syscalls.
     fn clock_sample() -> Option<ClockSample> {
         None
     }

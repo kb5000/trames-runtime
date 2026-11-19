@@ -31,7 +31,7 @@ pub use proc_maps::MappingFileInfo;
 mod report;
 mod reservations;
 mod residency;
-pub use report::{ImageRanges, MemoryReport};
+pub use report::{ImageRanges, MemoryReport, VmSizes};
 #[cfg(test)]
 mod ownership_tests;
 mod root;
