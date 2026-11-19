@@ -128,11 +128,46 @@ impl<C: Cpu> Lifecycle<C> {
                 // The selected mapping ABI has no host terminal/output effects.
                 // Use the same Linux implementation as the joined caller.
                 job.work.trace.begin(pid, number, args(&p.cpu));
-                p.linux.dispatch_untraced(
-                    &mut p.cpu,
-                    &mut p.memory,
-                    &mut trames_linux::CapturedOutput::default(),
-                );
+                if matches!(
+                    call,
+                    crate::structural::Memory::AioSetup | crate::structural::Memory::AioDestroy
+                ) {
+                    let direct = &job
+                        .work
+                        .syscalls
+                        .as_ref()
+                        .expect("original AIO domain")
+                        .direct;
+                    let attempt = direct
+                        .start(
+                            number,
+                            args(&p.cpu),
+                            &mut p.memory,
+                            pid,
+                            &epoch.io_target,
+                            None,
+                        )
+                        .expect("accepted AIO mapping");
+                    match attempt {
+                        trames_linux::IoAttempt::Complete(result) => {
+                            p.cpu.set_x(0, result.unwrap_or_else(super::super::error))
+                        }
+                        trames_linux::IoAttempt::Blocked(wait) => {
+                            // The VMA is already detached. Only this task waits for
+                            // the old batch; peers must resume to finish their copyout.
+                            p.memory.memory_report();
+                            job.io = Some(wait);
+                            break;
+                        }
+                        _ => unreachable!("original AIO mapping authority"),
+                    }
+                } else {
+                    p.linux.dispatch_untraced(
+                        &mut p.cpu,
+                        &mut p.memory,
+                        &mut trames_linux::CapturedOutput::default(),
+                    );
+                }
                 p.memory.memory_report();
                 let elapsed = began.elapsed();
                 if job.work.syscalls.as_ref().is_some_and(|s| s.profile) {

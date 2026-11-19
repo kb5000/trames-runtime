@@ -207,6 +207,10 @@ impl<C: Cpu> Kernel<C> {
                 self.call(pid, &mut p, number, args, io);
                 job.work.trace = std::mem::take(&mut p.trace);
                 self.vm_checkpoint_time[3] += call_began.elapsed();
+                if number == 1 && p.byte_wait.is_some() {
+                    job.io = p.byte_wait.take();
+                    p.state = State::Ready;
+                }
                 assert!(matches!(p.state, State::Ready), "mapping call cannot park");
                 self.vm_local_syscalls += 1;
                 // The compatibility handler can finish the accepted operation,

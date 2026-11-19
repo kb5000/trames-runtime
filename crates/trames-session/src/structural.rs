@@ -13,6 +13,8 @@ pub(crate) enum Call {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Memory {
+    AioSetup,
+    AioDestroy,
     Attach,
     Detach,
     Break,
@@ -28,6 +30,8 @@ pub(crate) enum Memory {
 impl Call {
     pub fn decode(number: u32, args: [u64; 6]) -> Option<Self> {
         Some(match number {
+            0 => Self::Memory(Memory::AioSetup),
+            1 => Self::Memory(Memory::AioDestroy),
             196 => Self::Memory(Memory::Attach),
             197 => Self::Memory(Memory::Detach),
             214 => Self::Memory(Memory::Break),
@@ -84,6 +88,8 @@ impl Call {
 impl Memory {
     pub fn number(self) -> u32 {
         match self {
+            Self::AioSetup => 0,
+            Self::AioDestroy => 1,
             Self::Attach => 196,
             Self::Detach => 197,
             Self::Break => 214,
@@ -100,9 +106,9 @@ impl Memory {
     pub fn index(self) -> usize {
         match self {
             Self::Break => 0,
-            Self::Detach | Self::Unmap => 1,
+            Self::AioDestroy | Self::Detach | Self::Unmap => 1,
             Self::Remap => 2,
-            Self::Attach | Self::Map => 3,
+            Self::AioSetup | Self::Attach | Self::Map => 3,
             Self::Protect => 4,
             Self::Lock { .. } => 9,
             Self::Residency => 5,

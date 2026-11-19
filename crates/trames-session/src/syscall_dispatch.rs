@@ -718,10 +718,9 @@ pub(crate) fn execute<C: Cpu>(
         // neither mm quiescence nor an owner callback.
         // Carry an allowed/deferred decision exactly once.
         if epoch.as_ref().is_some_and(|epoch| epoch.local_vm)
-            && work
-                .syscalls
-                .as_ref()
-                .is_some_and(|snapshot| snapshot.seccomp.mode() != 0 || work.cpu.x(8) as u32 == 427)
+            && work.syscalls.as_ref().is_some_and(|snapshot| {
+                snapshot.seccomp.mode() != 0 || matches!(work.cpu.x(8) as u32, 0 | 1 | 427)
+            })
             && crate::structural::Call::from_cpu(&work.cpu).is_some_and(|call| call.preflight())
             && !(work.cpu.x(8) as u32 == 214 && work.cpu.x(0) == 0)
         {

@@ -450,7 +450,6 @@ impl<C: Cpu> Runtime<C> {
                 vfs.executable(path).map_err(|e| ElfError::Interpreter(e.0))
             })?;
         let mut linux = Linux::new(elf.brk_base);
-        linux.aio.install(&mut elf.memory)?;
         linux.arguments = argv.to_vec();
         linux.environment = envp.to_vec();
         linux.executable_path = argv.first().cloned().unwrap_or_default();

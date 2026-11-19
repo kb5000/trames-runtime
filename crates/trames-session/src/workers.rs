@@ -1979,12 +1979,20 @@ mod tests {
                 pool.ensure(slot).unwrap();
                 pool.launch(slot, epoch.clone()).unwrap();
             }
-            for _ in 0..slots {
-                let event = pool.event_timeout(Duration::from_secs(5)).unwrap();
-                if !matches!(event, Some(Event::EpochStopped(_))) {
+            // This short task can stop the epoch before a later launch. Only
+            // slots actually admitted to the epoch emit a stop acknowledgement.
+            let mut awaiting = epoch.active_slots();
+            assert_ne!(awaiting, 0);
+            while awaiting != 0 {
+                let Some(Event::EpochStopped(slot)) =
+                    pool.event_timeout(Duration::from_secs(5)).unwrap()
+                else {
                     epoch.stop();
-                    panic!("thread registration requested an owner");
-                }
+                    panic!("thread registration did not finish locally, waiting for {awaiting:#x}");
+                };
+                let bit = 1u64 << slot;
+                assert_ne!(awaiting & bit, 0, "unexpected stop acknowledgement");
+                awaiting &= !bit;
             }
             let result = epoch.drain().pop().unwrap();
             assert_eq!(result.cpu.x(8), 93);
@@ -2778,7 +2786,6 @@ mod tests {
         let aio = trames_linux::Aio::default();
         let mut memory = Memory::default();
         memory.map(0x1000, 3 * PAGE_SIZE, Permissions::RW).unwrap();
-        aio.install(&mut memory).unwrap();
         for (i, word) in [0xaa0003f3u32, 0xd2800ba8, 0xd4000001]
             .into_iter()
             .enumerate()

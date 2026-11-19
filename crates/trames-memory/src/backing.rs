@@ -696,13 +696,18 @@ impl Memory {
 }
 
 struct AnonymousPage {
+    fixed_extent: bool,
     bytes: std::sync::Arc<SharedPage>,
     revision: AtomicU64,
     identity: u64,
 }
 impl AnonymousPage {
     fn new() -> Arc<Self> {
+        Self::with_extent(false)
+    }
+    fn with_extent(fixed_extent: bool) -> Arc<Self> {
         Arc::new(Self {
+            fixed_extent,
             bytes: std::sync::Arc::new(SharedPage::zero()),
             revision: AtomicU64::new(0),
             identity: new_backing_identity(),
@@ -714,6 +719,12 @@ impl AnonymousPage {
 #[derive(Default)]
 pub struct SharedAnonymousPages(std::sync::Mutex<Vec<Arc<AnonymousPage>>>);
 impl SharedAnonymousPages {
+    /// Shared kernel queue storage has a fixed extent even after mremap.
+    pub fn fixed_mapping(count: usize) -> Vec<Arc<dyn PageBacking>> {
+        (0..count)
+            .map(|_| AnonymousPage::with_extent(true) as Arc<dyn PageBacking>)
+            .collect()
+    }
     pub fn mapping(&self, count: usize) -> Vec<Arc<dyn PageBacking>> {
         let mut pages = self.0.lock().unwrap();
         if pages.len() < count {
@@ -827,10 +838,40 @@ impl PageBacking for AnonymousPage {
         true
     }
     fn next_page(&self, _: u64) -> Result<Arc<dyn PageBacking>, MemoryError> {
-        Ok(Self::new())
+        if self.fixed_extent {
+            Err(MemoryError::BackingIo(14))
+        } else {
+            Ok(Self::new())
+        }
     }
 }
 impl Memory {
+    /// Unmap only the surviving parts of this original resource. An application
+    /// may have replaced or protected an interior page since queue creation.
+    pub fn unmap_backings(
+        &mut self,
+        address: u64,
+        objects: &[Arc<dyn PageBacking>],
+    ) -> Result<(), MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow_mut().unmap_backings(address, objects);
+        }
+        let mut run = None;
+        for i in 0..=objects.len() {
+            let addr = address + i as u64 * PAGE_SIZE;
+            let original = objects.get(i).is_some_and(|object| {
+                self.page_for_access_unchecked(addr)
+                    .and_then(|p| p.backing.as_ref())
+                    .is_some_and(|b| Arc::ptr_eq(&b.object, object))
+            });
+            if original {
+                run.get_or_insert(addr);
+            } else if let Some(start) = run.take() {
+                self.unmap(start, addr - start)?;
+            }
+        }
+        Ok(())
+    }
     pub fn map_shared_anonymous(
         &mut self,
         address: u64,

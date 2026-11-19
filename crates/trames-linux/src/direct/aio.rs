@@ -14,8 +14,7 @@ use std::{
 pub struct Aio(Arc<Registry>);
 #[derive(Default)]
 struct Registry {
-    base: std::sync::atomic::AtomicU64,
-    contexts: Mutex<BTreeMap<u64, Arc<Context>>>,
+    contexts: Mutex<BTreeMap<u32, Arc<Context>>>,
 }
 #[derive(Clone)]
 pub struct RetainedAio {
@@ -26,6 +25,11 @@ pub struct RetainedAio {
     deadline: Option<Instant>,
 }
 struct Context {
+    slot: u32,
+    identity: u64,
+    ring: Vec<Arc<trames_memory::SharedPage>>,
+    mappings: Vec<Arc<dyn trames_memory::PageBacking>>,
+    slots: u32,
     state: Mutex<State>,
     readiness: Arc<trames_vfs::Readiness>,
 }
@@ -33,9 +37,24 @@ struct State {
     capacity: usize,
     dead: bool,
     active: BTreeSet<u64>,
-    events: VecDeque<[u8; 32]>,
+    tail: u32,
+}
+enum Work {
+    Disk(trames_vfs::FileWork),
+    Pipe(trames_vfs::DirectFd, trames_vfs::FileCommand),
+}
+impl Work {
+    fn buffered_bytes(&self) -> usize {
+        match self {
+            Self::Disk(work) => work.buffered_bytes(),
+            Self::Pipe(_, trames_vfs::FileCommand::Write { bytes, .. }) => bytes.len(),
+            Self::Pipe(_, trames_vfs::FileCommand::Read { count, .. }) => *count,
+            Self::Pipe(_, _) => unreachable!("pipe read/write"),
+        }
+    }
 }
 struct Request {
+    pipe: Option<(trames_vfs::DirectFd, trames_vfs::FileCommand)>,
     object: u64,
     data: u64,
     result: Arc<FileResult>,
@@ -61,38 +80,52 @@ impl Drop for Batch {
         }
     }
 }
+impl Context {
+    fn head(&self) -> u32 {
+        // SAFETY: naturally aligned u32 cells in the first mapped guest page.
+        (unsafe { self.ring[0].load_acquire_u32(8) }) % self.slots
+    }
+    fn pending(&self, head: u32, tail: u32) -> usize {
+        ((tail + self.slots - head) % self.slots) as usize
+    }
+    fn event(&self, index: u32) -> (&trames_memory::SharedPage, usize) {
+        let offset = 32 + index as usize * 32;
+        (&self.ring[offset / 4096], offset % 4096)
+    }
+    fn publish(&self, state: &mut State, bytes: [u8; 32]) {
+        let (page, offset) = self.event(state.tail);
+        page.copy_write(offset, &bytes);
+        state.tail = (state.tail + 1) % self.slots;
+        // SAFETY: the tail cell is aligned and the event is complete.
+        unsafe {
+            self.ring[0].store_release_u32(12, state.tail);
+        }
+    }
+}
 impl Aio {
     pub fn fork(&self) -> Self {
-        let result = Self::default();
-        result.0.base.store(
-            self.0.base.load(std::sync::atomic::Ordering::Relaxed),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        result
+        Self::default()
     }
-    pub fn install(
-        &self,
-        memory: &mut trames_memory::Memory,
-    ) -> Result<(), trames_memory::MemoryError> {
-        let address = memory
-            .find_free(0x7fff_fc00_0000, 4096)
-            .ok_or(trames_memory::MemoryError::Limit)?;
-        memory.map(address, 4096, trames_memory::Permissions::R)?;
-        self.0
-            .base
-            .store(address, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
-    }
-    fn context(&self, id: u64) -> Result<Arc<Context>, Errno> {
-        self.0
+
+    fn context(&self, id: u64, memory: &impl CpuMemory) -> Result<Arc<Context>, Errno> {
+        if id >= trames_memory::ADDRESS_LIMIT || !id.is_multiple_of(trames_memory::PAGE_SIZE) {
+            return Err(Errno(22));
+        }
+        let slot = u32::from_le_bytes(memory.read_array(id).map_err(|_| Errno(22))?);
+        let context = self
+            .0
             .contexts
             .lock()
             .unwrap()
-            .get(&id)
+            .get(&slot)
             .cloned()
-            .ok_or(Errno(22))
+            .ok_or(Errno(22))?;
+        if memory.shared_futex_key(id).ok().flatten() != Some((context.identity, 0, 0)) {
+            return Err(Errno(22));
+        }
+        Ok(context)
     }
-    fn setup(&self, a: [u64; 6], memory: &mut impl CpuMemory) -> Result<u64, Errno> {
+    fn setup(&self, a: [u64; 6], memory: &mut trames_memory::Memory) -> Result<u64, Errno> {
         let count = a[0] as u32;
         if count == 0 {
             return Err(Errno(22));
@@ -104,30 +137,52 @@ impl Aio {
             return Err(Errno(22));
         }
         Linux::check(memory, a[1], 8, Access::Write)?;
-        let base = self.0.base.load(std::sync::atomic::Ordering::Relaxed);
-        if base == 0 {
-            return Err(Errno(12));
-        }
         let mut contexts = self.0.contexts.lock().unwrap();
-        let id = (0..128)
-            .map(|n| base + n * 32)
+        let slot = (0..128)
             .find(|id| !contexts.contains_key(id))
             .ok_or(Errno(11))?;
-        // libaio checks the ring magic before its optional userspace fast path.
-        // These mapped zero headers select its syscall fallback. They reserve
-        // only one demand-zero page per mm, not an mmap on every io_setup.
-        Linux::check(memory, id, 32, Access::Read)?;
+        // The header occupies one event; a spare slot distinguishes full and empty.
+        let pages = ((count as usize + 2) * 32).div_ceil(4096);
+        let length = (pages * 4096) as u64;
+        let id = memory
+            .find_free(0x7fff_fc00_0000, length)
+            .ok_or(Errno(12))?;
+        let mappings = trames_memory::SharedAnonymousPages::fixed_mapping(pages);
+        let identity = mappings[0].parallel_key().unwrap().0;
+        let ring: Vec<_> = mappings.iter().map(|b| b.shared_page().unwrap()).collect();
+        let slots = (length / 32 - 1) as u32;
+        for (i, word) in [slot, slots, 0, 0, 0xa10a10a1, 1, 0, 32]
+            .into_iter()
+            .enumerate()
+        {
+            ring[0].copy_write(i * 4, &word.to_le_bytes());
+        }
         memory
-            .write_array(a[1], id.to_le_bytes())
-            .map_err(|_| Errno(14))?;
+            .map_backed(
+                id,
+                mappings.clone(),
+                true,
+                trames_memory::Permissions::RW,
+                false,
+            )
+            .map_err(Linux::memory_errno)?;
+        if memory.write_array(a[1], id.to_le_bytes()).is_err() {
+            memory.unmap(id, length).map_err(Linux::memory_errno)?;
+            return Err(Errno(14));
+        }
         contexts.insert(
-            id,
+            slot,
             Arc::new(Context {
+                slot,
+                identity,
+                mappings,
+                ring,
+                slots,
                 state: Mutex::new(State {
                     capacity: count as usize,
                     dead: false,
                     active: BTreeSet::new(),
-                    events: VecDeque::new(),
+                    tail: 0,
                 }),
                 readiness: Arc::default(),
             }),
@@ -147,7 +202,7 @@ impl DirectSyscalls {
         &self,
         address: u64,
         memory: &mut impl CpuMemory,
-    ) -> Result<(Request, trames_vfs::FileWork), Errno> {
+    ) -> Result<(Request, Work), Errno> {
         let b = memory.read_array::<64>(address).map_err(|_| Errno(14))?;
         let u32_at = |n| u32::from_le_bytes(b[n..n + 4].try_into().unwrap());
         let u64_at = |n| u64::from_le_bytes(b[n..n + 8].try_into().unwrap());
@@ -170,8 +225,7 @@ impl DirectSyscalls {
             .as_ref()
             .and_then(|f| f.lookup(fd))
             .unwrap_or(Err(Errno(9)))?;
-        let target = file.file_target().ok_or(Errno(22))?;
-        let flags = target.status_flags();
+        let flags = file.filesystem_target().status_flags();
         if flags & trames_vfs::O_PATH != 0
             || matches!(op, 0 | 7) && flags & 3 == 1
             || matches!(op, 1 | 8) && flags & 3 == 0
@@ -201,18 +255,33 @@ impl DirectSyscalls {
         } else {
             None
         };
+        let work = if let Some(target) = file.file_target() {
+            Work::Disk(trames_vfs::FileWork::new(
+                self.paths.as_ref().ok_or(Errno(9))?,
+                target,
+                command,
+            ))
+        } else if let Some(pipe) = file
+            .direct_byte()
+            .filter(|fd| fd.is_pipe() && matches!(op, 0 | 1 | 7 | 8))
+        {
+            Work::Pipe(pipe, command)
+        } else {
+            return Err(Errno(22));
+        };
         memory
             .write_array(address + 8, 0u32.to_le_bytes())
             .map_err(|_| Errno(14))?;
         Ok((
             Request {
+                pipe: None,
                 object: address,
                 data: u64_at(0),
                 result: Arc::default(),
                 output,
                 event,
             },
-            trames_vfs::FileWork::new(self.paths.as_ref().ok_or(Errno(9))?, target, command),
+            work,
         ))
     }
     fn submit_aio(
@@ -251,7 +320,9 @@ impl DirectSyscalls {
                     error = Errno(22);
                     break;
                 }
-                if state.active.len() + state.events.len() >= state.capacity {
+                if state.active.len() + context.pending(context.head(), state.tail)
+                    >= state.capacity
+                {
                     break;
                 }
                 if !state.active.insert(address) {
@@ -260,22 +331,29 @@ impl DirectSyscalls {
                 }
             }
             match self.import_aio(address, memory) {
-                Ok((request, work)) => {
+                Ok((mut request, work)) => {
                     let bytes = work.buffered_bytes();
                     if bytes > crate::MAX_WRITE - staged_bytes {
                         context.state.lock().unwrap().active.remove(&address);
+                        context.readiness.notify_locked();
                         break;
                     }
                     staged_bytes += bytes;
-                    if let Some(executor) = &self.file_executor {
-                        executor.submit_file(work, request.result.clone());
-                    } else {
-                        request.result.complete(work.run());
+                    match work {
+                        Work::Disk(work) => {
+                            if let Some(executor) = &self.file_executor {
+                                executor.submit_file(work, request.result.clone());
+                            } else {
+                                request.result.complete(work.run());
+                            }
+                        }
+                        Work::Pipe(fd, op) => request.pipe = Some((fd, op)),
                     }
                     requests.push_back(request);
                 }
                 Err(e) => {
                     context.state.lock().unwrap().active.remove(&address);
+                    context.readiness.notify_locked();
                     error = e;
                     break;
                 }
@@ -338,11 +416,27 @@ impl DirectSyscalls {
         let (aio, _) = self.aio.as_ref().expect("accepted AIO domain");
         let result = (|| {
             if number == 0 {
-                return Ok(IoAttempt::Complete(aio.setup(a, memory)));
+                return Ok(match memory.mapping_owner() {
+                    Some(mm) => IoAttempt::Complete(aio.setup(a, mm)),
+                    None => IoAttempt::Checkpoint,
+                });
             }
             let context = match &retained {
                 Some(call) => call.context.clone(),
-                None => aio.context(a[0])?,
+                None => {
+                    let context = aio.context(a[0], memory)?;
+                    if number == 1 {
+                        let Some(mm) = memory.mapping_owner() else {
+                            return Ok(IoAttempt::Checkpoint);
+                        };
+                        mm.unmap_backings(a[0], &context.mappings)
+                            .map_err(Linux::memory_errno)?;
+                        context.state.lock().unwrap().dead = true;
+                        aio.0.contexts.lock().unwrap().remove(&context.slot);
+                        context.readiness.notify_locked();
+                    }
+                    context
+                }
             };
             let mut batch_state = retained.and_then(|call| call.batch);
             let signal = IoSignal::new(pid, target.clone());
@@ -390,7 +484,36 @@ impl DirectSyscalls {
                 while remaining != 0 {
                     remaining -= 1;
                     let request = batch.requests.pop_front().unwrap();
-                    let Some(outcome) = request.result.take() else {
+                    let outcome = if let Some((pipe, command)) = &request.pipe {
+                        // Subscribe before checking the original pipe. A blocking
+                        // endpoint returns the slot while readers/writers progress.
+                        subscriptions.extend(pipe.subscribe(&signal));
+                        let result = if context.state.lock().unwrap().dead {
+                            Err(Errno(125))
+                        } else {
+                            match command {
+                                trames_vfs::FileCommand::Read { count, .. } => {
+                                    pipe.read(*count).map(trames_vfs::FileValue::Bytes)
+                                }
+                                trames_vfs::FileCommand::Write { bytes, .. } => pipe
+                                    .write(bytes)
+                                    .map(|n| trames_vfs::FileValue::Count(n as u64)),
+                                _ => unreachable!("pipe read/write"),
+                            }
+                        };
+                        if matches!(result, Err(Errno(11))) && !pipe.nonblocking() {
+                            batch.requests.push_back(request);
+                            continue;
+                        }
+                        Some(trames_vfs::FileOutcome::Complete(trames_vfs::FileReply {
+                            result,
+                            file_size_signal: false,
+                            scratch: None,
+                        }))
+                    } else {
+                        request.result.take()
+                    };
+                    let Some(outcome) = outcome else {
                         subscriptions.push(request.result.subscribe(&signal));
                         if request.result.ready() {
                             remaining += 1;
@@ -426,7 +549,9 @@ impl DirectSyscalls {
                     );
                     let mut state = context.state.lock().unwrap();
                     state.active.remove(&request.object);
-                    state.events.push_back(event);
+                    if !state.dead {
+                        context.publish(&mut state, event);
+                    }
                     drop(state);
                     context.readiness.notify_locked();
                     if let Some(event) = request.event {
@@ -439,24 +564,8 @@ impl DirectSyscalls {
                     return Ok(IoAttempt::Complete(Ok(submitted)));
                 }
             } else if number == 1 {
-                let mut state = context.state.lock().unwrap();
-                let first = !state.dead;
-                state.dead = true;
-                if state.active.is_empty() {
-                    drop(state);
-                    let mut contexts = aio.0.contexts.lock().unwrap();
-                    if !contexts
-                        .get(&a[0])
-                        .is_some_and(|old| Arc::ptr_eq(old, &context))
-                    {
-                        return Err(Errno(22));
-                    }
-                    contexts.remove(&a[0]);
+                if context.state.lock().unwrap().active.is_empty() {
                     return Ok(IoAttempt::Complete(Ok(0)));
-                }
-                drop(state);
-                if first {
-                    context.readiness.notify_locked();
                 }
             } else if number == 3 {
                 let state = context.state.lock().unwrap();
@@ -466,19 +575,28 @@ impl DirectSyscalls {
                     Errno(22)
                 });
             } else {
-                let mut state = context.state.lock().unwrap();
+                let state = context.state.lock().unwrap();
                 if state.dead {
                     return Err(Errno(22));
                 }
-                if state.events.len() >= a[1] as usize
-                    || deadline.is_some_and(|d| Instant::now() >= d)
-                {
-                    let n = state.events.len().min(a[2] as usize);
+                let mut head = context.head();
+                let available = context.pending(head, state.tail);
+                if available >= a[1] as usize || deadline.is_some_and(|d| Instant::now() >= d) {
+                    let n = available.min(a[2] as usize);
                     for i in 0..n {
+                        let (page, offset) = context.event(head);
+                        let mut event = [0; 32];
+                        page.copy_read(offset, &mut event);
                         memory
-                            .write_array(a[3] + i as u64 * 32, *state.events.front().unwrap())
+                            .write_array(a[3] + i as u64 * 32, event)
                             .map_err(|_| Errno(14))?;
-                        state.events.pop_front();
+                        head = (head + 1) % context.slots;
+                    }
+                    if n != 0 {
+                        // SAFETY: fixed aligned head, published after copyout.
+                        unsafe {
+                            context.ring[0].store_release_u32(8, head);
+                        }
                     }
                     return Ok(IoAttempt::Complete(Ok(n as u64)));
                 }
@@ -557,7 +675,6 @@ mod tests {
         let aio = Aio::default();
         let mut memory = Memory::new(1024 * 1024);
         memory.map(0x1000, 0x5000, Permissions::RW).unwrap();
-        aio.install(&mut memory).unwrap();
         let disk = Arc::new(Disk::default());
         let direct = DirectSyscalls::new(v.direct_descriptors())
             .with_aio(aio.clone(), v.native_events())
@@ -623,8 +740,8 @@ mod tests {
         let event = memory.read_array::<32>(0x4000).unwrap();
         assert_eq!(u64::from_le_bytes(event[..8].try_into().unwrap()), 123);
         assert_eq!(u64::from_le_bytes(event[16..24].try_into().unwrap()), 7);
-        assert!(aio.fork().context(context).is_err());
-        assert!(aio.clone().context(context).is_ok());
+        assert!(aio.fork().context(context, &memory).is_err());
+        assert!(aio.clone().context(context, &memory).is_ok());
         cb[16..18].copy_from_slice(&1u16.to_le_bytes());
         memory.write_array(0x2000, cb).unwrap();
         assert_eq!(
@@ -651,7 +768,7 @@ mod tests {
             ),
             Ok(0)
         );
-        assert!(aio.context(context).is_err());
+        assert!(aio.context(context, &memory).is_err());
     }
     #[test]
     fn large_submit_uses_a_bounded_staged_prefix() {
@@ -661,7 +778,6 @@ mod tests {
         let aio = Aio::default();
         let mut memory = Memory::default();
         memory.map(0x1000, 0x83000, Permissions::RW).unwrap();
-        aio.install(&mut memory).unwrap();
         let disk = Arc::new(Disk::default());
         let direct = DirectSyscalls::new(v.direct_descriptors())
             .with_aio(aio, v.native_events())
@@ -741,12 +857,54 @@ mod tests {
         assert_eq!(value(direct.resume(wait, &mut memory)), Ok(1));
     }
     #[test]
+    fn destroy_waits_for_blocked_pipe_and_preserves_replaced_ring_pages() {
+        let mut v = trames_vfs::Vfs::default();
+        let [reader, _writer] = v.pipe(0).unwrap();
+        let aio = Aio::default();
+        let direct =
+            DirectSyscalls::new(v.direct_descriptors()).with_aio(aio.clone(), v.native_events());
+        let wake: Arc<dyn IoWake> = Arc::new(Wake);
+        let target = Arc::downgrade(&wake);
+        let mut memory = Memory::default();
+        memory.map(0x1000, 0x4000, Permissions::RW).unwrap();
+        let setup = [128, 0x1000, 0, 0, 0, 0];
+        aio.setup(setup, &mut memory).unwrap();
+        let id = u64::from_le_bytes(memory.read_array(0x1000).unwrap());
+        memory.map_fixed(id + 4096, 4096, Permissions::RW).unwrap();
+        memory.write_array(id + 4096, *b"keep").unwrap();
+
+        let mut cb = [0; 64];
+        cb[20..24].copy_from_slice(&reader.to_le_bytes());
+        cb[24..32].copy_from_slice(&0x3000u64.to_le_bytes());
+        cb[32..40].copy_from_slice(&1u64.to_le_bytes());
+        memory.write_array(0x2000, cb).unwrap();
+        memory.write_array(0x1800, 0x2000u64.to_le_bytes()).unwrap();
+        let IoAttempt::Blocked(submit) = direct
+            .start(2, [id, 1, 0x1800, 0, 0, 0], &mut memory, 1, &target, None)
+            .unwrap()
+        else {
+            panic!("empty pipe must park");
+        };
+        let IoAttempt::Blocked(destroy) = direct
+            .start(1, [id, 0, 0, 0, 0, 0], &mut memory, 2, &target, None)
+            .unwrap()
+        else {
+            panic!("destroy must wait for accepted copyout");
+        };
+        assert!(submit.signal.ready());
+        assert!(aio.context(id, &memory).is_err());
+        assert_eq!(memory.read_array::<4>(id + 4096).unwrap(), *b"keep");
+        assert_eq!(value(direct.resume(submit, &mut memory)), Ok(1));
+        assert!(destroy.signal.ready());
+        assert_eq!(value(direct.resume(destroy, &mut memory)), Ok(0));
+    }
+
+    #[test]
     fn parked_getevents_retains_destroyed_context_across_numeric_reuse() {
         let v = trames_vfs::Vfs::default();
         let aio = Aio::default();
         let mut memory = Memory::default();
         memory.map(0x1000, 0x3000, Permissions::RW).unwrap();
-        aio.install(&mut memory).unwrap();
         let direct =
             DirectSyscalls::new(v.direct_descriptors()).with_aio(aio.clone(), v.native_events());
         let wake: Arc<dyn IoWake> = Arc::new(Wake);
@@ -786,6 +944,6 @@ mod tests {
         );
         assert_eq!(u64::from_le_bytes(memory.read_array(0x1000).unwrap()), id);
         assert_eq!(value(direct.resume(wait, &mut memory)), Err(Errno(22)));
-        assert!(aio.context(id).is_ok());
+        assert!(aio.context(id, &memory).is_ok());
     }
 }

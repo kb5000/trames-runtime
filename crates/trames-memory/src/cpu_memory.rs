@@ -26,6 +26,11 @@ impl<M> std::ops::DerefMut for CpuSlice<'_, M> {
 }
 
 pub trait CpuMemory {
+    /// Structural syscalls can edit the original mm only after existing CPU
+    /// views have returned. A worker View declines before any side effects.
+    fn mapping_owner(&mut self) -> Option<&mut Memory> {
+        None
+    }
     /// VMA inheritance changes require original mapping custody. A worker View
     /// declines before effects and uses the existing affected-mm transaction.
     fn range_locked(&self, _address: u64, _length: u64) -> bool {
@@ -184,6 +189,9 @@ pub trait CpuMemory {
 }
 
 impl CpuMemory for Memory {
+    fn mapping_owner(&mut self) -> Option<&mut Memory> {
+        Some(self)
+    }
     fn advise_fork(
         &mut self,
         address: u64,
