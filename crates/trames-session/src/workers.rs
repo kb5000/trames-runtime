@@ -1649,7 +1649,7 @@ mod tests {
             } else {
                 [0, 0, 0x2100, 4, 0x2200, 0]
             };
-            let request = trames_kernel::children::Wait::prepare(number, args).unwrap();
+            let request = trames_kernel::children::Wait::prepare(1, number, args).unwrap();
             let mut cpu = Cpu::new(if adopted { 0x1004 } else { 0x1000 }, 0xb000);
             cpu.set_x(8, number as u64);
             cpu.set_x(21, 0x2000);

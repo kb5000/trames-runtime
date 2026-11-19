@@ -826,7 +826,7 @@ mod tests {
     #[test]
     fn clone_and_vfork_complete_on_existing_cpu_slots_without_owner_events() {
         for cpus in [1, 4] {
-            for (flags, children) in [(17, 1), (17 | 0x4100, 1), (0, 0)] {
+            for (flags, children) in [(17, 1), (17 | 0x4100, 1), (0, 1), (65, 0)] {
                 let mut kernel = super::super::tests::kernel();
                 kernel.cpu_count = cpus;
                 kernel.per_cpu = vec![Duration::ZERO; cpus];

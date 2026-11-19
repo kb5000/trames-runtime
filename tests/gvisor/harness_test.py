@@ -35,6 +35,14 @@ class EvidenceTests(unittest.TestCase):
         self.assertIsNone(xml_rows(path,0,['T.Other']))
         path=self.xml('<testcase classname="T" name="Pass"/><testcase classname="T" name="Pass"/>')
         self.assertIsNone(xml_rows(path,0,['T.Pass','T.Pass']))
+    def test_tracee_child_setup_failure_overrides_parent_xml(self):
+        path = self.xml('<testcase classname="WaitTest" name="TraceeWALL"/>')
+        stderr = self.root / 'stderr'
+        stderr.write_text('Check failed: ptrace(PTRACE_TRACEME, 0, nullptr, nullptr) == 0 (errno 38)\n')
+        self.assertEqual(xml_rows(path, 0, ['WaitTest.TraceeWALL'], stderr)[0]['status'], 'fixture_failed')
+        stderr.write_text('')
+        self.assertEqual(xml_rows(path, 0, ['WaitTest.TraceeWALL'], stderr)[0]['status'], 'passed')
+
     def test_global_fixture_failure_never_becomes_a_passing_skip(self):
         path=self.xml('<testcase classname="T" name="A"><skipped/></testcase><testcase classname="" name=""><failure message="missing prerequisite"/></testcase>')
         rows=xml_rows(path,1,['T.A'])

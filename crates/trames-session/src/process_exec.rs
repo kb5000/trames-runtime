@@ -151,6 +151,7 @@ impl<C: Cpu> Kernel<C> {
             .retain_image_peak(p.memory.peak_resident_bytes());
         let old_memory = std::mem::replace(&mut p.memory, runtime.memory);
         p.family.mark_exec();
+        p.wait_event.exec();
         p.signals.exec();
         p.membarrier_registered = Arc::new(std::sync::atomic::AtomicBool::new(false));
         p.state = State::Ready;

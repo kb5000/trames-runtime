@@ -28,17 +28,48 @@ impl Notice {
             parent.changed.notify_locked();
         }
     }
-    pub fn signal(self, info: crate::signal::Info) {
+    pub fn signal(self, signo: u32, info: crate::signal::Info) {
         if let Some(parent) = self.0 {
             parent.changed.notify_locked();
         }
-        if let Some(parent) = self.1.upgrade() {
-            parent.notify_child(info);
+        if signo != 0 {
+            if let Some(parent) = self.1.upgrade() {
+                parent.notify_child(signo, info);
+            }
         }
+    }
+}
+/// The wait class follows the requested signal, even if the parent's later
+/// exec makes Linux substitute SIGCHLD for the delivered notification.
+#[derive(Clone, Copy)]
+pub struct ExitSignal {
+    signo: u32,
+    parent_image: u64,
+}
+impl ExitSignal {
+    pub fn new(signo: u32, parent_image: u64) -> Self {
+        Self {
+            signo,
+            parent_image,
+        }
+    }
+    fn delivered(self, parent_image: u64) -> u32 {
+        if self.signo != 17 && self.parent_image != parent_image {
+            17
+        } else {
+            self.signo
+        }
+    }
+}
+impl Default for ExitSignal {
+    fn default() -> Self {
+        Self::new(17, 0)
     }
 }
 #[derive(Default)]
 struct State {
+    owner: Option<Arc<crate::task_parent::Parentage>>,
+    exit_signal: ExitSignal,
     id: u32,
     group: u32,
     credentials: Arc<trames_vfs::CredentialState>,
@@ -54,6 +85,31 @@ struct State {
     exit_usage: crate::usage::Usage,
 }
 impl Child {
+    pub fn bind_birth(
+        &self,
+        presence: &Arc<crate::task::Presence>,
+        owner: &Arc<crate::task_parent::Parentage>,
+        signal: ExitSignal,
+    ) {
+        let mut state = self.0.lock().unwrap();
+        state.presence = presence.visibility();
+        state.owner = Some(owner.clone());
+        state.exit_signal = signal;
+    }
+    pub fn exit_signal(&self) -> ExitSignal {
+        self.0.lock().unwrap().exit_signal
+    }
+    pub fn exec(&self) {
+        let mut state = self.0.lock().unwrap();
+        if state.exit_signal.signo != 17 {
+            state.exit_signal = ExitSignal::default();
+            let parent = state.parent.upgrade();
+            drop(state);
+            if let Some(parent) = parent {
+                parent.changed.notify_locked();
+            }
+        }
+    }
     pub(crate) fn bind_usage(
         &self,
         group: &Arc<crate::task_control::Group>,
@@ -85,7 +141,14 @@ impl Child {
         let credentials = Arc::new(trames_vfs::CredentialState::new(
             trames_vfs::Credentials::user(uid, 0),
         ));
-        for notice in self.attach_quiet(parent, signal_parent.as_ref(), id, group, &credentials) {
+        for notice in self.attach_quiet(
+            parent,
+            signal_parent.as_ref(),
+            id,
+            group,
+            &credentials,
+            None,
+        ) {
             notice.notify();
         }
     }
@@ -96,10 +159,17 @@ impl Child {
         id: u32,
         group: u32,
         credentials: &Arc<trames_vfs::CredentialState>,
+        adopter: Option<u32>,
     ) -> Vec<Notice> {
         let mut notices = Vec::new();
         let (previous, previous_id) = {
             let mut state = self.0.lock().unwrap();
+            if let Some(tid) = adopter {
+                if let Some(owner) = &state.owner {
+                    owner.set_parent_thread(tid);
+                }
+                state.exit_signal = Default::default();
+            }
             let previous_id = state.id;
             let group_changed = state.group != group;
             state.id = id;
@@ -123,6 +193,9 @@ impl Child {
             notices.push(Notice(Some(old), Weak::new()));
         }
         if let Some(parent) = parent {
+            if let Some(group) = signal_parent {
+                group.bind_wait_children(parent);
+            }
             parent
                 .entries
                 .lock()
@@ -174,9 +247,9 @@ impl Child {
     pub(crate) fn finish_quiet(
         &self,
         status: Option<i32>,
-        auto_reap: bool,
+        parent: Option<(bool, u64)>,
         usage: Option<crate::usage::Usage>,
-    ) -> Option<(Notice, i32)> {
+    ) -> Option<(Notice, u32, i32)> {
         let mut state = self.0.lock().unwrap();
         if state.reaped || status.is_some() == state.exited {
             return None;
@@ -188,6 +261,10 @@ impl Child {
         state.exited = true;
         state.stopped = false;
         state.event = Some(status);
+        let signo = parent.map_or(state.exit_signal.signo, |(_, image)| {
+            state.exit_signal.delivered(image)
+        });
+        let auto_reap = signo == 17 && parent.is_some_and(|(auto, _)| auto);
         let parent = state.parent.upgrade();
         if auto_reap {
             state.reaped = true;
@@ -197,7 +274,7 @@ impl Child {
                 parent.reaped.store(true, Ordering::Relaxed);
             }
         }
-        Some((Notice(parent, state.parent_group.clone()), status))
+        Some((Notice(parent, state.parent_group.clone()), signo, status))
     }
     pub fn clear(&self) {
         self.publish(None, false);
@@ -210,17 +287,22 @@ impl Child {
     }
 }
 
+const WNOTHREAD: u64 = 0x2000_0000;
+const WALL: u64 = 0x4000_0000;
+const WCLONE: u64 = 0x8000_0000;
+
 /// Accepted ABI, retained with the sleeping task rather than replayed by an owner.
 #[derive(Clone, Copy, Debug)]
 pub struct Wait {
+    caller: u32,
     pub number: u32,
     pub args: [u64; 6],
 }
 impl Wait {
-    pub fn prepare(number: u32, args: [u64; 6]) -> Result<Self, Errno> {
+    pub fn prepare(caller: u32, number: u32, args: [u64; 6]) -> Result<Self, Errno> {
         match number {
             260 => {
-                if args[2] as u32 & !(11 | 0x40000000 | 0x80000000) != 0 {
+                if args[2] as u32 & !(11 | (WNOTHREAD | WALL | WCLONE) as u32) != 0 {
                     return Err(Errno(22));
                 }
             }
@@ -228,7 +310,7 @@ impl Wait {
                 let which = args[0] as u32;
                 let id = args[1] as i32;
                 let options = args[3] as u32;
-                if options & !(15 | 0x01000000 | 0x40000000 | 0x80000000) != 0
+                if options & !(15 | 0x01000000 | (WNOTHREAD | WALL | WCLONE) as u32) != 0
                     || options & 14 == 0
                     || which > 2
                     || which != 0 && id < 0
@@ -239,7 +321,11 @@ impl Wait {
             }
             _ => return Err(Errno(38)),
         };
-        Ok(Self { number, args })
+        Ok(Self {
+            caller,
+            number,
+            args,
+        })
     }
     fn options(&self) -> u64 {
         if self.number == 260 {
@@ -263,7 +349,15 @@ impl Wait {
     }
     fn matches(&self, child: &State, namespace: &PidNamespace, group: u32) -> bool {
         // An exited group can no longer generate stop or continue events.
-        if child.exited && self.options() & 4 == 0 {
+        let options = self.options();
+        if child.exited && options & 4 == 0
+            || options & WNOTHREAD != 0
+                && !child
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.parent_thread() == self.caller)
+            || options & WALL == 0 && (options & WCLONE != 0) != (child.exit_signal.signo != 17)
+        {
             return false;
         }
         if self.number == 260 {
@@ -283,6 +377,24 @@ impl Wait {
     }
 }
 impl Children {
+    /// Include zombies: their original task is already absent from the live
+    /// parent-death-signal graph, but their parent thread can still change.
+    pub(crate) fn transfer_owner(self: &Arc<Self>, old: u32, new: u32) -> Option<Notice> {
+        let entries = self.entries.lock().unwrap();
+        let mut moved = false;
+        for child in entries.values().filter_map(Weak::upgrade) {
+            let state = child.0.lock().unwrap();
+            let Some(owner) = &state.owner else { continue };
+            if owner.parent_thread() == old
+                && !state.reaped
+                && state.parent.as_ptr() == Arc::as_ptr(self)
+            {
+                owner.set_parent_thread(new);
+                moved = true;
+            }
+        }
+        moved.then(|| Notice(Some(self.clone()), Weak::new()))
+    }
     pub(crate) fn usage(&self) -> crate::usage::Usage {
         *self.collected.lock().unwrap()
     }
@@ -298,7 +410,7 @@ impl Children {
         for child in entries.values().filter_map(Weak::upgrade) {
             let state = child.0.lock().unwrap();
             if !state.reaped
-                && Weak::ptr_eq(&state.parent, &Arc::downgrade(self))
+                && state.parent.as_ptr() == Arc::as_ptr(self)
                 && request.matches(&state, namespace, group)
             {
                 found = true;
@@ -317,7 +429,7 @@ impl Children {
         let mut changed = false;
         for child in entries.values().filter_map(Weak::upgrade) {
             let mut state = child.0.lock().unwrap();
-            if !state.reaped && state.exited && Weak::ptr_eq(&state.parent, &Arc::downgrade(self)) {
+            if !state.reaped && state.exited && state.parent.as_ptr() == Arc::as_ptr(self) {
                 state.reaped = true;
                 state.event = None;
                 self.collected.lock().unwrap().include(state.exit_usage);
@@ -346,7 +458,7 @@ impl Children {
         for child in entries.values().filter_map(Weak::upgrade) {
             let mut state = child.0.lock().unwrap();
             if state.reaped
-                || !Weak::ptr_eq(&state.parent, &Arc::downgrade(self))
+                || state.parent.as_ptr() != Arc::as_ptr(self)
                 || !request.matches(&state, namespace, group)
             {
                 continue;
@@ -357,7 +469,9 @@ impl Children {
                 continue;
             };
             let local = namespace.local(state.id);
-            let uid = state.credentials.read().uid;
+            // Only waitid with a siginfo destination observes the UID.
+            let siginfo = (request.number == 95 && request.args[2] != 0)
+                .then(|| (request.args[2], state.credentials.read().uid));
             let mut usage = state.exit_usage;
             let usage_pointer = if request.number == 260 {
                 request.args[3]
@@ -409,7 +523,7 @@ impl Children {
                 if a[4] != 0 {
                     usage.write(memory, a[4])?;
                 }
-                if a[2] != 0 {
+                if let Some((destination, uid)) = siginfo {
                     let mut bytes = [0; 128];
                     bytes[..4].copy_from_slice(&17u32.to_le_bytes());
                     bytes[8..12].copy_from_slice(&code.to_le_bytes());
@@ -421,7 +535,9 @@ impl Children {
                         _ => status & 127,
                     };
                     bytes[24..28].copy_from_slice(&value.to_le_bytes());
-                    memory.write_array(a[2], bytes).map_err(|_| Errno(14))?;
+                    memory
+                        .write_array(destination, bytes)
+                        .map_err(|_| Errno(14))?;
                 }
             }
             return Ok(Some(if request.number == 260 {
@@ -463,12 +579,14 @@ mod tests {
     }
     fn wait4(options: u64) -> Wait {
         Wait {
+            caller: 1,
             number: 260,
             args: [u32::MAX as u64, 0x1000, options, 0x1100, 0, 0],
         }
     }
     fn waitid(options: u64) -> Wait {
         Wait {
+            caller: 1,
             number: 95,
             args: [0, 0, 0x1000, options, 0x1100, 0],
         }
@@ -487,7 +605,7 @@ mod tests {
             },
         ] {
             assert_eq!(
-                Wait::prepare(request.number, request.args).unwrap_err(),
+                Wait::prepare(1, request.number, request.args).unwrap_err(),
                 Errno(22)
             );
         }
@@ -558,7 +676,7 @@ mod tests {
         let family = Arc::new(Children::default());
         let child = child(&family, 42, 7);
         let mut memory = memory();
-        let request = Wait::prepare(260, wait4(0).args).unwrap();
+        let request = Wait::prepare(1, 260, wait4(0).args).unwrap();
         memory.unmap(0x1000, PAGE_SIZE).unwrap();
         child.exited(17 << 8);
         assert_eq!(
@@ -581,6 +699,7 @@ mod tests {
             let mut memory = memory();
             memory.write_array(0x1000, [0x55; 128]).unwrap();
             let request = Wait {
+                caller: 1,
                 number,
                 args: if number == 260 {
                     [42, 0x1000, 0, 1, 0, 0]
@@ -607,6 +726,7 @@ mod tests {
         child.exited(0);
         let mut memory = memory();
         let bad = Wait {
+            caller: 1,
             number: 95,
             args: [0, 0, 1, 4 | 0x01000000, 0, 0],
         };
@@ -639,7 +759,7 @@ mod tests {
                 ],
             ),
         ] {
-            let request = Wait::prepare(number, args).unwrap();
+            let request = Wait::prepare(1, number, args).unwrap();
             assert_eq!(
                 family.wait(request, &Default::default(), 1, &mut memory),
                 Ok(Some(0))

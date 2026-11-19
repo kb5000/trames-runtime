@@ -37,7 +37,10 @@ class Progress:
         return self.timeout(self.active)- (time.monotonic()-self.since) if self.active else 30-(time.monotonic()-self.since)
 
 
-def xml_rows(xml, code, expected):
+TRACEE_WAIT = 'WaitTest.TraceeWALL'
+
+
+def xml_rows(xml, code, expected, stderr=None):
     if not xml.is_file() or code not in (0,1):return None
     try:cases=ET.parse(xml).findall('.//testcase')
     except ET.ParseError:return None
@@ -56,6 +59,15 @@ def xml_rows(xml, code, expected):
         status='failed' if failed else 'skipped' if skipped is not None else 'passed'
         messages=[c.get('message','') for c in failed] if failed else [skipped.get('message','')] if skipped is not None else []
         rows.append(dict(case=name,status=status,messages=messages,seconds=float(case.get('time','0'))))
+    # The native-Linux branch also accepts ECHILD. A tracee that aborted in
+    # setup can therefore yield passing parent XML without exercising ptrace.
+    if expected == [TRACEE_WAIT] and rows[0]['status'] == 'passed' and stderr is not None:
+        failure = 'Check failed: ptrace(PTRACE_TRACEME, 0, nullptr, nullptr) == 0'
+        with stderr.open(errors='replace') as stream:
+            for line in stream:
+                if line.startswith(failure):
+                    rows[0].update(status='fixture_failed', messages=[line.rstrip()])
+                    break
     return rows
 
 
@@ -78,6 +90,13 @@ def run(args,output,plan,env,runner,name,store,snapshot,cache,timeout):
         if not selected:return
         if not remaining_budget():record(suite,selected,'not_run_budget',None,None,0);return
         if disk_stopped:record(suite,selected,'not_run_disk_limit',None,None,0);return
+        # TraceeWALL may leave its aborted child for a later wait(-1).
+        if len(selected) > 1 and TRACEE_WAIT in selected:
+            split = selected.index(TRACEE_WAIT)
+            attempt(suite, selected[:split])
+            attempt(suite, [TRACEE_WAIT])
+            attempt(suite, selected[split + 1:])
+            return
         if suite in single and len(selected)>1:
             for case in selected:attempt(suite,[case])
             return
@@ -99,7 +118,7 @@ def run(args,output,plan,env,runner,name,store,snapshot,cache,timeout):
         if not timed:
             exported=subprocess.run([runner,'debug','env-run',name,'--fs','get',guest_xml,str(xml)],env=env,capture_output=True,timeout=20)
             if exported.returncode:(output/'logs'/(stem+'.export-error')).write_bytes(exported.stderr)
-        parsed=xml_rows(xml,code,selected) if not timed else None
+        parsed=xml_rows(xml,code,selected,stderr) if not timed else None
         if parsed is not None:
             for row in parsed:rows.append(dict(row,suite=suite,code=code,log_stem=stem,process_seconds=seconds,chunk_cases=len(selected)))
             checkpoint();print('trames',len(rows),suite,'chunk',len(selected),{r['status'] for r in parsed},flush=True);return

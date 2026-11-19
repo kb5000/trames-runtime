@@ -349,7 +349,7 @@ fn original_job_ids_threads_wait_selection_and_refresh_survive_source_changes() 
     assert!(child.signals.io.process().contains_key(&10));
     child.wait_event.stopped(21);
     let request =
-        trames_kernel::children::Wait::prepare(260, [(-2i32) as u32 as u64, 0x1200, 3, 0, 0, 0])
+        trames_kernel::children::Wait::prepare(1, 260, [(-2i32) as u32 as u64, 0x1200, 3, 0, 0, 0])
             .unwrap();
     let mut memory = super::tests::process().memory;
     assert_eq!(

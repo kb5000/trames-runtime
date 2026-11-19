@@ -805,6 +805,7 @@ pub(crate) fn execute<C: Cpu>(
                 let number = work.cpu.x(8) as u32;
                 if matches!(number, 95 | 260) {
                     let request = match trames_kernel::children::Wait::prepare(
+                        work.pid,
                         number,
                         std::array::from_fn(|i| work.cpu.x(i)),
                     ) {

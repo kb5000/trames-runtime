@@ -1973,8 +1973,8 @@ impl<C: Cpu> Kernel<C> {
             .retain(|id, p| *id != p.tgid || p.signals.presence.present());
     }
     #[cfg(all(test, trames_interpreter_conformance))]
-    fn wait(&mut self, _pid: u32, p: &mut Process<C>, a: [u64; 6]) -> Result<Option<u64>, Errno> {
-        let request = trames_kernel::children::Wait::prepare(260, a)?;
+    fn wait(&mut self, pid: u32, p: &mut Process<C>, a: [u64; 6]) -> Result<Option<u64>, Errno> {
+        let request = trames_kernel::children::Wait::prepare(pid, 260, a)?;
         let result = p.children.wait(
             request,
             p.linux.vfs.pid_namespace(),
@@ -2215,7 +2215,7 @@ impl<C: Cpu> Kernel<C> {
             },
             98 | 102 | 103 | 107..=111 | 137 => self.event_call(pid, p, number, a),
             260 => self.wait(pid, p, a),
-            95 => self.waitid(p, a),
+            95 => self.waitid(pid, p, a),
             167 if prctl::entry(a) => prctl::call(
                 &mut p.cpu, &p.linux.command_name, Some(&p.parentage), Some(&p.family), a, &mut p.memory
             ).expect("original task controls").map(Some),
@@ -9191,7 +9191,7 @@ mod boundary_tests {
         k.exit_one(2, &mut leader, 7 << 8);
         k.processes.insert(2, leader);
         assert!(original.present(), "unreaped leader remains visible");
-        let wait = trames_kernel::children::Wait::prepare(260, [2, 0, 0, 0, 0, 0]).unwrap();
+        let wait = trames_kernel::children::Wait::prepare(1, 260, [2, 0, 0, 0, 0, 0]).unwrap();
         assert_eq!(
             root.children.wait(
                 wait,
@@ -9249,7 +9249,7 @@ mod boundary_tests {
         k.processes.insert(id, child);
         assert!(k.task_capacity.reserve().is_none()); // unreaped zombie
         let request =
-            trames_kernel::children::Wait::prepare(260, [id as u64, 0, 0, 0, 0, 0]).unwrap();
+            trames_kernel::children::Wait::prepare(1, 260, [id as u64, 0, 0, 0, 0, 0]).unwrap();
         assert_eq!(
             parent.children.wait(
                 request,

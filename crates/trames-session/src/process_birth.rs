@@ -100,6 +100,14 @@ impl Birth {
         }
     }
     pub(super) fn publish_task_core<C: Cpu>(&self, id: u32, p: &Process<C>) {
+        self.publish_core_from(id, p, None);
+    }
+    fn publish_core_from<C: Cpu>(
+        &self,
+        id: u32,
+        p: &Process<C>,
+        inherit: Option<&trames_kernel::task_parent::Parentage>,
+    ) {
         p.seccomp.bind(&p.signals.io, id);
         self.publish_proc(id, p);
         p.signals
@@ -123,7 +131,7 @@ impl Birth {
         p.signals
             .io_directory
             .parents
-            .publish(&p.signals.io, id, &p.parentage);
+            .publish_from(&p.signals.io, id, &p.parentage, inherit);
         if p.signals.io.session() == 0 {
             p.signals.io.set_session(p.session());
         }
@@ -195,6 +203,7 @@ impl Birth {
         threaded: bool,
         inherit_job: bool,
         host_terminal: Option<&Arc<trames_vfs::Pty>>,
+        inherit_parent: Option<&Process<C>>,
     ) -> Result<(), Errno> {
         let family = child.family.clone();
         let mut cgroup_birth = None;
@@ -218,7 +227,15 @@ impl Birth {
             admitted?;
             child.bind_signals();
             child.linux.vfs.set_process_context(id);
-            self.publish_task_core(id, child);
+            if let Some(creator) = inherit_parent.filter(|_| !threaded) {
+                child.family.set_parent(creator.family.parent());
+                child.wait_event.bind_birth(
+                    &child.signals.presence,
+                    &child.parentage,
+                    creator.wait_event.exit_signal(),
+                );
+            }
+            self.publish_core_from(id, child, inherit_parent.map(|p| p.parentage.as_ref()));
             if let Some(pair) = host_terminal {
                 // Original membership is visible before the master can signal
                 // this session. Master close and attachment share the tty lock;
@@ -311,13 +328,6 @@ impl Birth {
             .checked_add(size)
             .filter(|top| *top < trames_memory::ADDRESS_LIMIT)
             .ok_or(Errno(22))?;
-        // CLONE_PARENT inherits its creator's SIGCHLD relationship. Threads
-        // have no independent exit signal; both require zero in clone_args.
-        let signal = if flags & 0x8000 != 0 && flags & 0x10000 == 0 {
-            17
-        } else {
-            signal
-        };
         self.clone_task(
             pid,
             p,
@@ -355,7 +365,7 @@ impl Birth {
             || (a[0] & 0x8000 != 0 && p.linux.vfs.visible_pid(p.tgid) == 1)
             || (a[0] & trames_vfs::CLONE_NEWNS != 0 && a[0] & 0x200 != 0)
             || (a[0] & trames_vfs::CLONE_NEWIPC != 0 && a[0] & 0x40000 != 0)
-            || (!threaded && a[0] & 255 != 17)
+            || (a[0] & 255 > 64)
             || (threaded && (a[0] & 0x900 != 0x900 || a[0] & 255 != 0))
             || (a[0] & 0x800 != 0 && !shared_vm)
             || (a[0] & (1 << 32) != 0 && a[0] & 0x800 != 0)
@@ -430,20 +440,11 @@ impl Birth {
         child
             .linux
             .fork_tid(if a[0] & 0x200000 != 0 { a[4] } else { 0 });
-        if !threaded {
-            child.family.set_parent(if a[0] & 0x8000 != 0 {
-                p.family.parent()
-            } else {
-                p.tgid
-            });
+        let inherit_parent = threaded || a[0] & 0x8000 != 0;
+        if !inherit_parent {
+            child.family.set_parent(p.tgid);
+            child.parentage.set_parent_thread(pid);
         }
-        child
-            .parentage
-            .set_parent_thread(if threaded || a[0] & 0x8000 != 0 {
-                p.parentage.parent_thread()
-            } else {
-                pid
-            });
         child.cpu.set_x(0, 0);
         if a[1] != 0 {
             child.cpu.set_sp(a[1]);
@@ -453,8 +454,15 @@ impl Birth {
         }
         // CLONE_THREAD shares the process wait event. Its reap target must
         // remain the leader; a departing worker owns only its thread presence.
-        if !threaded {
-            child.wait_event.bind_presence(&child.signals.presence);
+        if !inherit_parent {
+            child.wait_event.bind_birth(
+                &child.signals.presence,
+                &child.parentage,
+                trames_kernel::children::ExitSignal::new(
+                    (a[0] & 255) as u32,
+                    p.family.exec_generation(),
+                ),
+            );
         }
         // Source callers already admitted this resource without blocking their
         // executor. Joined/bootstrap callers use the same short transaction.
@@ -484,6 +492,7 @@ impl Birth {
             threaded,
             true,
             None,
+            inherit_parent.then_some(&*p),
         )?;
         // Linux stores these user TIDs after task birth and ignores
         // copyout faults. CHILD_CLEARTID only records its address.
@@ -792,7 +801,8 @@ impl Birth {
         p.family.bind_host_status(child.host.status_cell());
         p.family.bind_host_ready(child.host.completion());
         p.vm_id = self.resource_id();
-        p.wait_event.bind_presence(&p.signals.presence);
+        p.wait_event
+            .bind_birth(&p.signals.presence, &p.parentage, Default::default());
         self.admit_child(
             1,
             &child.parent,
@@ -801,6 +811,7 @@ impl Birth {
             false,
             false,
             child.terminal.as_ref(),
+            None,
         )?;
         let directory = p.signals.io_directory.clone();
         child.host.bind_control(Arc::new(move |group, signal| {

@@ -16,6 +16,7 @@ use std::{
 #[derive(Default)]
 pub struct Group {
     job_ids: AtomicU64,
+    wait_children: std::sync::OnceLock<Weak<crate::children::Children>>,
     image_peak: AtomicUsize,
     controlling: std::sync::OnceLock<Weak<trames_vfs::ControllingTerminal>>,
     stopped: AtomicBool,
@@ -64,7 +65,7 @@ struct Publication {
 impl Publication {
     fn publish(self) {
         if let Some(event) = self.event {
-            event.signal(self.info);
+            event.signal(17, self.info);
         }
     }
 }
@@ -559,7 +560,19 @@ impl Group {
         self.live_task()
             .is_some_and(|task| task.auto_reap_children())
     }
-    pub(crate) fn notify_child(&self, info: Info) {
+    pub(crate) fn bind_wait_children(&self, children: &Arc<crate::children::Children>) {
+        self.wait_children.get_or_init(|| Arc::downgrade(children));
+    }
+    pub(crate) fn wait_children(&self) -> Option<Arc<crate::children::Children>> {
+        self.wait_children.get()?.upgrade()
+    }
+    pub(crate) fn notify_child(&self, signo: u32, info: Info) {
+        if signo != 17 {
+            if let Some(task) = self.live_task() {
+                let _ = task.job_signal(signo, true, info, false);
+            }
+            return;
+        }
         let tasks = self.state.lock().unwrap().tasks();
         if let Some(first) = tasks.first() {
             if first.child_signal(info) {

@@ -67,6 +67,17 @@ impl State {
 }
 impl Parents {
     pub fn publish(&self, task: &Arc<IoTask>, tid: u32, parentage: &Arc<Parentage>) {
+        self.publish_from(task, tid, parentage, None);
+    }
+    /// CLONE_PARENT and CLONE_THREAD take the caller's real parent under the
+    /// same graph lock as thread retirement and exec rekeying.
+    pub fn publish_from(
+        &self,
+        task: &Arc<IoTask>,
+        tid: u32,
+        parentage: &Arc<Parentage>,
+        inherit: Option<&Parentage>,
+    ) {
         task.bind_parentage(parentage);
         // Birth and exec publish identity. Ordinary cohort capture does not
         // acquire the relationship lock; reparenting commits its own links.
@@ -75,6 +86,7 @@ impl Parents {
         }
         let mut state = self.0.lock().unwrap();
         let id = key(task);
+        let mut wait_notice = None;
         if let Some(old) = state
             .tasks
             .get(&id)
@@ -84,6 +96,10 @@ impl Parents {
             if state.tids.get(&old) == Some(&id) {
                 state.tids.remove(&old);
             }
+            wait_notice = task
+                .lifecycle()
+                .wait_children()
+                .and_then(|c| c.transfer_owner(old, tid));
             let children = &state.tasks[&id].children;
             for child in children {
                 state.tasks[child].parentage.set_parent_thread(tid);
@@ -101,10 +117,14 @@ impl Parents {
                 children: BTreeSet::new(),
             })
             .tid = tid;
-        let parent_tid = parentage.parent_thread();
+        let parent_tid = inherit.unwrap_or(parentage).parent_thread();
         let parent = state.tids.get(&parent_tid).copied().filter(|&p| p != id);
         state.reparent(id, parent, parent_tid);
         parentage.tid.store(tid, Ordering::Relaxed);
+        drop(state);
+        if let Some(n) = wait_notice {
+            n.notify();
+        }
     }
     pub fn reparent(&self, child: &Arc<IoTask>, parent_tid: u32) {
         let mut state = self.0.lock().unwrap();
@@ -127,7 +147,7 @@ impl Parents {
         choose: impl FnOnce() -> Option<(u32, Arc<IoTask>)>,
         info: Info,
     ) {
-        let notifications = {
+        let (notifications, wait_notice) = {
             let mut state = self.0.lock().unwrap();
             let id = key(task);
             let Some(removed) = state.tasks.remove(&id) else {
@@ -139,12 +159,18 @@ impl Parents {
             if let Some(parent) = removed.parent.and_then(|p| state.tasks.get_mut(&p)) {
                 parent.children.remove(&id);
             }
-            if removed.children.is_empty() {
+            let wait_children = task.lifecycle().wait_children();
+            if removed.children.is_empty() && wait_children.is_none() {
                 return;
             }
             let (next_tid, next) = choose()
                 .filter(|(_, task)| state.tasks.contains_key(&key(task)) && task.live())
                 .map_or((0, None), |(tid, task)| (tid, Some(key(&task))));
+            let wait_notice = if next_tid != 0 && next_tid != removed.tid {
+                wait_children.and_then(|c| c.transfer_owner(removed.tid, next_tid))
+            } else {
+                None
+            };
             let mut notifications = Vec::new();
             for child in removed.children {
                 state.reparent(child, next, next_tid);
@@ -157,8 +183,11 @@ impl Parents {
                     }
                 }
             }
-            notifications
+            (notifications, wait_notice)
         };
+        if let Some(n) = wait_notice {
+            n.notify();
+        }
         for (target, signal) in notifications {
             target.parent_death(signal, info);
         }

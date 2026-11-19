@@ -130,7 +130,7 @@ fn uring_background_does_not_retire_sleep_futex_or_lifecycle_waits_on_one_cpu_sl
             },
             2 => crate::run_queue::WaitState::OwnerEvent,
             3 => crate::run_queue::WaitState::Child(crate::run_queue::ChildWait::new(
-                trames_kernel::children::Wait::prepare(95, [0, 0, 0, 4, 0, 0]).unwrap(),
+                trames_kernel::children::Wait::prepare(1, 95, [0, 0, 0, 4, 0, 0]).unwrap(),
             )),
             _ => crate::run_queue::WaitState::Completion(crate::run_queue::CompletionWait::new(
                 Arc::default(),

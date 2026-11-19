@@ -138,7 +138,10 @@ impl Dispatch {
             ))
         } else if let State::Blocked(number @ (95 | 260), args) = p.state {
             Some(crate::run_queue::WaitState::Child(
-                crate::run_queue::ChildWait::new(trames_kernel::children::Wait { number, args }),
+                crate::run_queue::ChildWait::new(
+                    trames_kernel::children::Wait::prepare(id, number, args)
+                        .expect("previously accepted child wait"),
+                ),
             ))
         } else if let State::Barrier(wait) = &p.state {
             Some(crate::run_queue::WaitState::Barrier(wait.clone()))

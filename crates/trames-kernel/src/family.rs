@@ -21,7 +21,7 @@ pub struct Family {
     parent: AtomicU32,
     subreaper: AtomicBool,
     live: AtomicBool,
-    execed: AtomicBool,
+    exec_generation: AtomicU64,
     metadata: AtomicU64,
     credential_identity: AtomicUsize,
     presence: AtomicUsize,
@@ -38,7 +38,7 @@ impl Default for Family {
             parent: AtomicU32::new(0),
             subreaper: AtomicBool::new(false),
             live: AtomicBool::new(true),
-            execed: AtomicBool::new(false),
+            exec_generation: AtomicU64::new(0),
             metadata: AtomicU64::new(u64::MAX),
             credential_identity: AtomicUsize::new(0),
             presence: AtomicUsize::new(0),
@@ -52,10 +52,13 @@ impl Default for Family {
 }
 impl Family {
     pub fn execed(&self) -> bool {
-        self.execed.load(Ordering::Relaxed)
+        self.exec_generation() != 0
+    }
+    pub fn exec_generation(&self) -> u64 {
+        self.exec_generation.load(Ordering::Relaxed)
     }
     pub fn mark_exec(&self) {
-        self.execed.store(true, Ordering::Relaxed);
+        self.exec_generation.fetch_add(1, Ordering::Relaxed);
     }
     pub fn parent(&self) -> u32 {
         self.parent.load(Ordering::Relaxed)
@@ -155,7 +158,7 @@ impl State {
                 });
             }
         }
-        let notices = self.attach(id, parent);
+        let notices = self.attach(id, parent, None);
         family.metadata.store(metadata, Ordering::Relaxed);
         family
             .credential_identity
@@ -171,7 +174,12 @@ impl State {
     fn parent_of(&self, family: &Arc<Family>) -> Option<Arc<Family>> {
         self.original(family)?.parent.upgrade()
     }
-    fn attach(&mut self, id: u32, parent: Option<Arc<Family>>) -> Vec<crate::children::Notice> {
+    fn attach(
+        &mut self,
+        id: u32,
+        parent: Option<Arc<Family>>,
+        adopter: Option<u32>,
+    ) -> Vec<crate::children::Notice> {
         let family = self.entries[&id].family.clone();
         let previous = self.entries[&id].parent.upgrade();
         if let Some(old) = previous.and_then(|f| self.original(&f).map(|_| f)) {
@@ -213,6 +221,7 @@ impl State {
             id,
             entry.binding.group,
             &entry.binding.credentials,
+            adopter,
         )
     }
 }
@@ -281,7 +290,7 @@ impl Families {
             let parent = entry.parent.upgrade();
             state.entries.get_mut(&id).unwrap().binding.group = group;
             family.metadata.store(group as u64, Ordering::Relaxed);
-            (state.attach(id, parent), result)
+            (state.attach(id, parent, None), result)
         };
         for notice in notices {
             notice.notify();
@@ -402,21 +411,28 @@ impl Families {
                 let Some(_) = child.upgrade().filter(|c| state.original(c).is_some()) else {
                     continue;
                 };
-                notices.extend(state.attach(child_id, reaper.clone()));
+                notices.extend(state.attach(
+                    child_id,
+                    reaper.clone(),
+                    Some(reaper_task.as_ref().map_or(0, |r| r.0)),
+                ));
                 let child_entry = &state.entries[&child_id];
                 for task in child_entry.binding.control.tasks() {
                     parents.reparent(&task, reaper_task.as_ref().map_or(0, |r| r.0));
                 }
-                if let Some((notice, status)) = child_entry.binding.child.finish_quiet(
+                if let Some((notice, signo, status)) = child_entry.binding.child.finish_quiet(
                     None,
-                    reaper
-                        .as_ref()
-                        .and_then(|f| state.original(f))
-                        .is_some_and(|e| e.binding.control.auto_reap_children()),
+                    reaper.as_ref().and_then(|f| state.original(f)).map(|e| {
+                        (
+                            e.binding.control.auto_reap_children(),
+                            e.family.exec_generation(),
+                        )
+                    }),
                     None,
                 ) {
                     exits.push((
                         notice,
+                        signo,
                         exit_info(child_id, child_entry.binding.credentials.read().uid, status),
                     ));
                 }
@@ -426,8 +442,8 @@ impl Families {
         for notice in notices {
             notice.notify();
         }
-        for (notice, info) in exits {
-            notice.signal(info);
+        for (notice, signo, info) in exits {
+            notice.signal(signo, info);
         }
         retirement
     }
@@ -461,10 +477,15 @@ impl Families {
                 let Some(status) = entry.pending else {
                     continue;
                 };
-                let auto = state
+                let signal_parent = state
                     .parent_of(&current)
                     .and_then(|f| state.original(&f))
-                    .is_some_and(|e| e.binding.control.auto_reap_children());
+                    .map(|e| {
+                        (
+                            e.binding.control.auto_reap_children(),
+                            e.family.exec_generation(),
+                        )
+                    });
                 if entry.binding.namespace.is_nested()
                     && entry.binding.namespace.init() == entry.binding.id
                 {
@@ -483,14 +504,15 @@ impl Families {
                 }
                 let mut usage = entry.binding.control.usage();
                 usage.include(entry.binding.children.usage());
-                if let Some((notice, status)) =
+                if let Some((notice, signo, status)) =
                     entry
                         .binding
                         .child
-                        .finish_quiet(Some(status), auto, Some(usage))
+                        .finish_quiet(Some(status), signal_parent, Some(usage))
                 {
                     exits.push((
                         notice,
+                        signo,
                         exit_info(
                             entry.binding.id,
                             entry.binding.credentials.read().uid,
@@ -530,8 +552,8 @@ impl Families {
         for ready in host_notices {
             ready.notify_locked();
         }
-        for (notice, info) in exits {
-            notice.signal(info);
+        for (notice, signo, info) in exits {
+            notice.signal(signo, info);
         }
         reaped
     }
@@ -608,7 +630,7 @@ mod tests {
         }
         fn wait(&self, ns: &PidNamespace) -> Result<Option<u64>, Errno> {
             self.children.wait(
-                Wait::prepare(260, [u32::MAX as u64, 0, 1, 0, 0, 0]).unwrap(),
+                Wait::prepare(1, 260, [u32::MAX as u64, 0, 1, 0, 0, 0]).unwrap(),
                 ns,
                 1,
                 &mut trames_memory::Memory::default(),
