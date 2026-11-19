@@ -26,6 +26,8 @@ pub use pinned::{PinnedBuffer, ReadBuffer};
 mod raw;
 mod read_export;
 pub use read_export::MemoryRead;
+mod proc_maps;
+pub use proc_maps::MappingFileInfo;
 mod report;
 mod reservations;
 mod residency;
@@ -873,6 +875,10 @@ impl Memory {
     fn advance_mapping_revision(&mut self, start: u64, end: u64, permissions: Option<Permissions>) {
         Arc::make_mut(&mut self.region_layout).replace(start, end, permissions);
         self.advance_code_revision();
+        self.advance_layout_revision();
+    }
+
+    fn advance_layout_revision(&mut self) {
         self.layout_revision = self.layout_revision.wrapping_add(1);
         if self.layout_revision == 0 {
             if let Some((generation, _, _)) = &mut *self.report_cache.borrow_mut() {

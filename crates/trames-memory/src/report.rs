@@ -44,10 +44,14 @@ struct Layout {
 /// retains the previous compact value; it never retains a page or execution View.
 #[derive(Clone, Default)]
 pub(super) struct RegionLayout {
+    pub(super) origins: proc_maps::Mappings,
     pub(super) ranges: Vec<(u64, u64, Permissions)>,
 }
 impl RegionLayout {
     pub(super) fn replace(&mut self, start: u64, end: u64, permissions: Option<Permissions>) {
+        if permissions.is_none() {
+            self.origins.remove(start, end);
+        }
         let first = self.ranges.partition_point(|r| r.1 <= start);
         let last = self.ranges.partition_point(|r| r.0 < end);
         let mut replacement = Vec::with_capacity(5);
@@ -134,6 +138,14 @@ impl Memory {
         self.image_ranges = Some(ranges);
         if let Some((_, report, _)) = &*self.report_cache.borrow() {
             *report.0.image.write().unwrap() = Some(ranges);
+            // Stack labeling changes the next maps snapshot even when permissions do not.
+            let mut state = report.0.state.write().unwrap();
+            *state = Arc::new(Layout {
+                virtual_bytes: state.virtual_bytes,
+                regions: state.regions.clone(),
+                account: state.account.clone(),
+                maps: OnceLock::new(),
+            });
         }
     }
     /// Publish at actual mapping/accounting changes. Live residency is queried
@@ -236,21 +248,9 @@ impl MemoryReport {
         layout
             .maps
             .get_or_init(|| {
-                use std::fmt::Write;
-                let mut maps = String::new();
-                for &(start, end, access) in &layout.regions.ranges {
-                    let _ = writeln!(
-                        maps,
-                        "{start:012x}-{end:012x} {}{}{}p 00000000 00:00 0",
-                        if access.read { 'r' } else { '-' },
-                        if access.write { 'w' } else { '-' },
-                        if access.execute { 'x' } else { '-' }
-                    );
-                    if maps.len() >= 1024 * 1024 {
-                        break;
-                    }
-                }
-                maps.into_bytes().into()
+                layout
+                    .regions
+                    .maps(self.image_ranges().map(|r| r.start_stack))
             })
             .clone()
     }

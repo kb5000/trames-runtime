@@ -23,6 +23,7 @@ pub(crate) enum Memory {
     Map,
     Protect,
     Lock { number: u32 },
+    NameVma,
     BindPolicy,
     HomeNode,
     Residency,
@@ -34,6 +35,7 @@ impl Call {
         Some(match number {
             0 => Self::Memory(Memory::AioSetup),
             1 => Self::Memory(Memory::AioDestroy),
+            167 if args[0] == trames_linux::PR_SET_VMA => Self::Memory(Memory::NameVma),
             196 => Self::Memory(Memory::Attach),
             197 => Self::Memory(Memory::Detach),
             214 => Self::Memory(Memory::Break),
@@ -102,6 +104,7 @@ impl Memory {
             Self::Map => 222,
             Self::Protect => 226,
             Self::Lock { number } => number,
+            Self::NameVma => 167,
             Self::BindPolicy => 235,
             Self::HomeNode => 450,
             Self::Residency => 232,
@@ -119,7 +122,9 @@ impl Memory {
             Self::Lock { .. } => 9,
             Self::Residency => 5,
             Self::Advice { discard: true } => 6,
-            Self::BindPolicy | Self::HomeNode | Self::Advice { discard: false } => 7,
+            Self::NameVma | Self::BindPolicy | Self::HomeNode | Self::Advice { discard: false } => {
+                7
+            }
             Self::Register { .. } => 8,
         }
     }

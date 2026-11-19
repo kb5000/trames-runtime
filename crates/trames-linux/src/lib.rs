@@ -4,6 +4,7 @@
 #![recursion_limit = "512"]
 use std::io;
 use trames_execution::Registers;
+pub const PR_SET_VMA: u64 = 0x5356_4d41;
 pub use trames_shared::{HostWait, HostWake};
 pub mod image;
 pub mod vdso;

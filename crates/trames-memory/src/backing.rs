@@ -59,6 +59,12 @@ impl SyncRange {
 /// Implementations synchronize their own metadata and physical byte owners;
 /// Send + Sync does not authorize concurrent structural changes to a Memory.
 pub trait PageBacking: Send + Sync {
+    fn proc_file(&self) -> Option<MappingFileInfo> {
+        None
+    }
+    fn proc_shmem_inode(&self) -> Option<u64> {
+        None
+    }
     /// Cold fork policy for device mappings (Linux VM_DONTCOPY). Thread clones
     /// sharing the same mm keep the original mapping and never consult this.
     fn inherit_on_fork(&self) -> bool {
@@ -365,6 +371,25 @@ impl Memory {
             self.map(address, len, permissions)?;
         }
         self.materialize_descriptors(address, len as usize);
+        let source = &objects[0];
+        let origin = if let Some(info) = source.proc_file() {
+            proc_maps::Origin::File(info)
+        } else if let Some(id) = source.proc_shmem_inode() {
+            proc_maps::Origin::SharedAnon(id)
+        } else {
+            proc_maps::Origin::Other
+        };
+        Arc::make_mut(&mut self.region_layout).origins.insert(
+            address,
+            proc_maps::Mapping {
+                end: address + len,
+                offset: source.parallel_domain_offset().unwrap_or(0),
+                origin,
+                shared: shared_mapping,
+                write_only: false,
+                name: None,
+            },
+        );
         let zero = Arc::new(PageBytes::Zero);
         for (i, (object, charge)) in objects.into_iter().zip(charges).enumerate() {
             let frame = self.pages[&(address + i as u64 * PAGE_SIZE)];
@@ -511,10 +536,14 @@ impl Memory {
                 None => source.object.next_page(offset)?,
             });
         }
+        let origins = self.region_layout.origins.moved(old, PAGE_SIZE, new, len);
         let policy = self.vma_policy.moved(old, PAGE_SIZE, new, len);
         let locks = self.locks.moved(old, PAGE_SIZE, new, len);
         let attachments = self.attachments.moved(old, PAGE_SIZE, new, len);
         self.map_backed(new, objects, true, permissions, false)?;
+        Arc::make_mut(&mut self.region_layout)
+            .origins
+            .extend(origins);
         self.attachments.0.extend(attachments);
         self.vma_policy.extend(policy);
         self.locks.finish_move(new, len, new, len, locks);
@@ -534,10 +563,14 @@ impl Memory {
         }
         Self::mapping_end(old, old_len)?;
         Self::mapping_end(new, new_len)?;
+        let origins = self.region_layout.origins.moved(old, old_len, new, new_len);
         let policy = self.vma_policy.moved(old, old_len, new, new_len);
         let moved_locks = self.locks.moved(old, old_len, new, new_len);
         let moved = self.attachments.moved(old, old_len, new, new_len);
         self.remap_inner(old, old_len, new, new_len, fixed)?;
+        Arc::make_mut(&mut self.region_layout)
+            .origins
+            .extend(origins);
         self.attachments.0.extend(moved);
         self.locks
             .finish_move(old, old_len, new, new_len, moved_locks);
@@ -866,6 +899,9 @@ impl PageSource for RetainedPageSource {
     }
 }
 impl PageBacking for AnonymousPage {
+    fn proc_shmem_inode(&self) -> Option<u64> {
+        Some(self.extent[0].identity)
+    }
     fn sync_required(&self) -> bool {
         false
     }

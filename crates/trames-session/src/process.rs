@@ -641,10 +641,7 @@ impl<C: Cpu> Process<C> {
             .expect("live native address space")
     }
 }
-struct ProcMaps {
-    identity: (u64, u64),
-    bytes: Vec<u8>,
-}
+
 // Joined shared resources notify through guest execution or a worker. Timers
 // also resume at the accepted wait's deadline. Host-backed resources retain
 // their host event path.
@@ -749,7 +746,6 @@ pub(crate) struct Kernel<C: Cpu> {
     syscall_total: Duration,
     syscalls: u64,
     proc_refreshes: u64,
-    proc_maps: RefCell<BTreeMap<u64, ProcMaps>>,
     proc_source: Option<Arc<crate::proc_views::Source>>,
     guest_shutdown: std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(all(test, trames_interpreter_conformance))]
@@ -1142,39 +1138,7 @@ impl<C: Cpu> Kernel<C> {
         Ok(id)
     }
     fn process_maps(&self, p: &Process<C>) -> Vec<u8> {
-        // Mapping edits (including PROT_NONE reservations) advance the code
-        // generation. Ordinary data stores do not. Fork/exec have a new space
-        // identity; shared VM wrappers report their underlying owner's key.
-        // Backing byte/EOF epochs do not change the displayed mapping ranges.
-        let (space, generation, _) = p.memory.instruction_identity();
-        let identity = (space, generation);
-        let mut cache = self.proc_maps.borrow_mut();
-        if let Some(maps) = cache.get(&space).filter(|maps| maps.identity == identity) {
-            return maps.bytes.clone();
-        }
-        let mut maps = String::new();
-        for (start, end, access) in p.memory.regions() {
-            use std::fmt::Write;
-            let _ = writeln!(
-                maps,
-                "{start:012x}-{end:012x} {}{}{}p 00000000 00:00 0",
-                if access.read { 'r' } else { '-' },
-                if access.write { 'w' } else { '-' },
-                if access.execute { 'x' } else { '-' }
-            );
-            if maps.len() >= 1024 * 1024 {
-                break;
-            }
-        }
-        let maps = maps.into_bytes();
-        cache.insert(
-            space,
-            ProcMaps {
-                identity,
-                bytes: maps.clone(),
-            },
-        );
-        maps
+        p.memory.memory_report().maps().to_vec()
     }
     fn process_info(
         &self,
@@ -1238,18 +1202,6 @@ impl<C: Cpu> Kernel<C> {
         observe(p);
         let used: usize = live.iter().map(|owner| resident[owner]).sum();
         let memory = self.memory_limits.reported(used, host);
-        // Bound cached bytes by the current memory-owner set, even after repeated
-        // fork/exec. Never cache fd paths, credentials, names, argv bytes or
-        // other mutable process metadata under a mapping-generation key.
-        let live: std::collections::BTreeSet<_> = self
-            .processes
-            .values()
-            .map(|p| p.memory.instruction_identity().0)
-            .chain(std::iter::once(p.memory.instruction_identity().0))
-            .collect();
-        self.proc_maps
-            .borrow_mut()
-            .retain(|vm, _| live.contains(vm));
         let mut processes: Vec<_> = self
             .processes
             .iter()
@@ -4772,7 +4724,6 @@ pub(super) fn run<C: Cpu>(
         syscall_total: Duration::ZERO,
         syscalls: 0,
         proc_refreshes: 0,
-        proc_maps: RefCell::new(BTreeMap::new()),
         proc_source: None,
         guest_shutdown: Default::default(),
         #[cfg(all(test, trames_interpreter_conformance))]
@@ -6673,7 +6624,6 @@ mod tests {
             syscall_total: Duration::ZERO,
             syscalls: 0,
             proc_refreshes: 0,
-            proc_maps: RefCell::new(BTreeMap::new()),
             proc_source: None,
             guest_shutdown: Default::default(),
             #[cfg(all(test, trames_interpreter_conformance))]
@@ -6739,7 +6689,7 @@ mod tests {
         let mut p = process();
         assert_eq!(
             k.process_maps(&p),
-            b"000000001000-000000009000 rw-p 00000000 00:00 0\n"
+            b"00001000-00009000 rw-p 00000000 00:00 0 \n"
         );
         let mut peer = p.fork();
         peer.memory = p.memory.share();
@@ -6747,20 +6697,20 @@ mod tests {
             .protect(0x2000, PAGE_SIZE, Permissions::R)
             .unwrap();
         let maps = k.process_maps(&p);
-        assert!(String::from_utf8_lossy(&maps).contains("000000002000-000000003000 r--p"));
+        assert!(String::from_utf8_lossy(&maps).contains("00002000-00003000 r--p"));
         assert_eq!(k.process_maps(&peer), maps);
         p.memory.reserve(0x100000, 2 * PAGE_SIZE, false).unwrap();
         let maps = String::from_utf8(k.process_maps(&p)).unwrap();
-        assert!(maps.contains("000000100000-000000102000 ---p"));
+        assert!(maps.contains("00100000-00102000 ---p"));
         p.memory
             .protect(0x100000, PAGE_SIZE, Permissions::RW)
             .unwrap();
         let maps = String::from_utf8(k.process_maps(&peer)).unwrap();
-        assert!(maps.contains("000000100000-000000101000 rw-p"));
+        assert!(maps.contains("00100000-00101000 rw-p"));
         p.memory.unmap(0x100000, 2 * PAGE_SIZE).unwrap();
         assert!(!String::from_utf8(k.process_maps(&p))
             .unwrap()
-            .contains("000000100000-"));
+            .contains("00100000-"));
         let mut child = p.fork();
         child.vm_id = 2;
         child
@@ -6769,7 +6719,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             k.process_maps(&child),
-            b"000000001000-000000009000 rw-p 00000000 00:00 0\n"
+            b"00001000-00009000 rw-p 00000000 00:00 0 \n"
         );
         assert_eq!(k.process_maps(&p), k.process_maps(&peer));
         assert_ne!(k.process_maps(&p), k.process_maps(&child));
@@ -6780,7 +6730,6 @@ mod tests {
         leader.memory = Memory::default();
         assert!(k.process_maps(&leader).is_empty());
         assert_eq!(k.process_maps(&p), k.process_maps(&peer));
-        assert_eq!(k.proc_maps.borrow().len(), 3);
     }
 
     #[test]
@@ -6849,9 +6798,10 @@ mod tests {
         let mut old = p.fork();
         old.vm_id = 2;
         k.process_maps(&old);
-        assert_eq!(k.proc_maps.borrow().len(), 2);
+        let old_report = old.memory.memory_report();
+        drop(old);
         k.refresh_proc(1, &mut p, None);
-        assert_eq!(k.proc_maps.borrow().len(), 1);
+        assert!(!old_report.alive());
     }
 
     #[test]

@@ -712,7 +712,6 @@ mod tests {
         // SAFETY: metadata observers retain no guest bytes or execution View.
         // This is the only byte actor and owner byte access stays stopped.
         assert!(unsafe { view.try_exclusive_private() });
-        let _owner_maps = kernel.proc_maps.borrow_mut();
         std::thread::spawn(move || {
             let snapshot = source.observe(trames_vfs::ProcQuery::new(
                 b"/proc/1/status",
@@ -846,7 +845,7 @@ mod tests {
             .iter()
             .find(|task| task.pid == 2)
             .unwrap();
-        assert!(String::from_utf8_lossy(&task.maps).contains("000000002000-000000003000 r-xp"));
+        assert!(String::from_utf8_lossy(&task.maps).contains("00002000-00003000 r-xp"));
         let snapshot = source.observe(trames_vfs::ProcQuery::new(
             b"/proc/meminfo",
             ProcRefresh::HostMemory,
@@ -974,7 +973,6 @@ mod tests {
                 },
             )
         };
-        let _owner_maps = kernel.proc_maps.borrow_mut();
         let FileOutcome::Complete(reply) =
             std::thread::spawn(move || live_read.run()).join().unwrap()
         else {
@@ -984,7 +982,6 @@ mod tests {
             panic!("status bytes")
         };
         assert!(String::from_utf8_lossy(&status).contains("Name:\tproc-before\n"));
-        drop(_owner_maps);
         drop(cpu);
         first.signals.io.begin_exit(1, 0);
         assert_eq!(

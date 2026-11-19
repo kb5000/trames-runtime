@@ -716,6 +716,26 @@ impl FileMapping {
     }
 }
 impl PageBacking for FileMapping {
+    fn proc_file(&self) -> Option<trames_memory::MappingFileInfo> {
+        let FdKind::Node(path) = &self.open.kind else {
+            return None;
+        };
+        let node = self.node.borrow();
+        let device = self
+            .mount
+            .as_ref()
+            .filter(|m| m.0.kind == mounts::Kind::Overlay)
+            .map_or(node.device, |m| m.0.device);
+        let mut path = path.clone();
+        if node.links == 0 {
+            path.extend_from_slice(b" (deleted)");
+        }
+        Some(trames_memory::MappingFileInfo {
+            device,
+            inode: node.inode,
+            path: path.into(),
+        })
+    }
     fn layout(&self) -> Option<Arc<trames_memory::layout::Layout>> {
         Some(self.node.layout.get_or_init(Default::default).clone())
     }

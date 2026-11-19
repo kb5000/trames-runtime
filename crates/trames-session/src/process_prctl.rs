@@ -4,7 +4,7 @@ use super::*;
 use trames_memory::CpuMemory;
 
 pub(crate) fn entry(a: [u64; 6]) -> bool {
-    !trames_linux::credential_entry(167, a) && !matches!(a[0], 21 | 22)
+    !trames_linux::credential_entry(167, a) && !matches!(a[0], 21 | 22 | trames_linux::PR_SET_VMA)
 }
 pub(crate) fn call<C: Cpu>(
     cpu: &mut C,

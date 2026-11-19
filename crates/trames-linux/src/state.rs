@@ -28,6 +28,7 @@ pub struct MmapPlan {
     offset: u64,
     flags: u64,
     permissions: Permissions,
+    write_only: bool,
     reservation: bool,
     advance_cursor: bool,
     file: Option<trames_vfs::MappingFile>,
@@ -1122,6 +1123,7 @@ impl Linux {
             address,
             length: len,
             offset: a[5],
+            write_only: a[2] & 3 == 2,
             flags,
             permissions,
             reservation,
@@ -1140,6 +1142,7 @@ impl Linux {
         let MmapPlan {
             address,
             length: len,
+            write_only,
             offset,
             flags,
             permissions,
@@ -1190,6 +1193,9 @@ impl Linux {
                     .map_err(Self::memory_errno)?;
             }
         }
+        if write_only {
+            memory.report_write_only(address, len, true);
+        }
         if let Some(on_fault) = lock {
             let _ = memory.set_range_lock(address, len, Some(on_fault));
         }
@@ -1204,6 +1210,39 @@ impl Linux {
             self.heap.set_cursor(address + len);
         }
         Ok(address)
+    }
+    fn set_vma_name(memory: &mut Memory, a: [u64; 6]) -> Result<u64> {
+        if a[1] != 0 {
+            return Err(Errno(22));
+        }
+        let name = if a[4] == 0 {
+            None
+        } else {
+            let bytes = memory.read_c_string(a[4], 80).map_err(|e| {
+                if matches!(e, MemoryError::Limit | MemoryError::InvalidRange) {
+                    Errno(22)
+                } else {
+                    Errno(14)
+                }
+            })?;
+            if bytes
+                .iter()
+                .any(|&ch| !(0x20..=0x7e).contains(&ch) || b"\\`$[]".contains(&ch))
+            {
+                return Err(Errno(22));
+            }
+            Some(bytes.into())
+        };
+        if !a[2].is_multiple_of(PAGE_SIZE) {
+            return Err(Errno(22));
+        }
+        if a[3] != 0 {
+            let len = Self::page_length(a[3])?;
+            memory
+                .name_anonymous(a[2], len, name)
+                .map_err(Self::memory_errno)?;
+        }
+        Ok(0)
     }
     fn mremap(&mut self, a: [u64; 6], memory: &mut Memory) -> Result<u64> {
         let old = a[0];
@@ -1614,6 +1653,7 @@ impl Linux {
             },
             172 => Ok(1),
             173 => Ok(0),
+            167 if a[0] == crate::PR_SET_VMA => Self::set_vma_name(memory, a),
             167 if matches!(a[0], 15 | 16) => crate::task_name_call(&self.command_name, a, memory),
             169 => crate::gettimeofday(memory, a[0], a[1]),
             @dynamic number if crate::credential_entry(number as u32, a) => {
@@ -1690,6 +1730,7 @@ impl Linux {
                         },
                     )
                     .map_err(Self::memory_errno)?;
+                memory.report_write_only(a[0],len,a[2] & 3 == 2);
                 Ok(0)
             },
             @fallback => Err(Errno(38)),
