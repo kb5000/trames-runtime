@@ -901,7 +901,7 @@ impl DirectSyscalls {
         if number == 62 {
             fd.is_kmsg() || fd.positioned_bytes()
         } else if matches!(number, 67..=70) {
-            fd.positioned_bytes()
+            fd.positioned_bytes() || fd.is_inotify()
         } else if matches!(number, 22 | 441) {
             fd.is_epoll()
         } else if matches!(number, 86 | 87) {
@@ -1766,7 +1766,7 @@ impl DirectSyscalls {
         if fd.host_console() || matches!(number, 206 | 207) && !fd.is_unix() {
             return None;
         }
-        if matches!(number, 67..=70) && !fd.positioned_bytes() {
+        if matches!(number, 67..=70) && !Self::supports_fd(number, &fd) {
             return None;
         }
         Some(Ok(RetainedByte {

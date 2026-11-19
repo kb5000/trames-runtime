@@ -268,11 +268,7 @@ impl Vfs {
         if result.as_ref().is_ok_and(|b| !b.is_empty())
             && !(node.borrow().seals.is_some() && o.notification.is_none())
         {
-            inotify::notify(
-                notification_node,
-                inotify::ACCESS,
-                o.notification.as_ref().and_then(|c| c.link.as_ref()),
-            );
+            o.notify_file_io(notification_node, inotify::ACCESS);
         }
     }
 }

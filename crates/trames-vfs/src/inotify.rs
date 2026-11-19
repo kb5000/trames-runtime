@@ -32,12 +32,24 @@ pub(super) struct Marks {
 pub(super) struct Source {
     watchers: std::sync::Mutex<Vec<(std::sync::Weak<Queue>, i32)>>,
     deleted: std::sync::atomic::AtomicBool,
+    interest: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>>,
 }
 impl Source {
+    fn interest(&self) -> &Arc<std::sync::atomic::AtomicBool> {
+        self.interest.get_or_init(Default::default)
+    }
+    fn interested(&self) -> bool {
+        self.interest
+            .get()
+            .is_some_and(|i| i.load(Ordering::Relaxed))
+    }
     fn snapshot(&self) -> Vec<(std::sync::Weak<Queue>, i32)> {
         self.watchers.lock().unwrap().clone()
     }
     fn send(&self, mask: u32, cookie: u32, name: &[u8], unlinked: bool) {
+        if !self.interested() {
+            return;
+        }
         // Queue callbacks may re-enter this inode's notification state. Never
         // notify while holding its registration lock (or a link-state lock).
         for (weak, wd) in self.snapshot() {
@@ -47,7 +59,13 @@ impl Source {
         }
     }
     fn destroy(&self, deleted: bool) {
-        let watchers = std::mem::take(&mut *self.watchers.lock().unwrap());
+        let watchers = {
+            let mut marks = self.watchers.lock().unwrap();
+            if let Some(i) = self.interest.get() {
+                i.store(false, Ordering::Relaxed);
+            }
+            std::mem::take(&mut *marks)
+        };
         Self::destroy_watches(watchers, deleted);
     }
     fn destroy_watches(watchers: Vec<(std::sync::Weak<Queue>, i32)>, deleted: bool) {
@@ -64,12 +82,15 @@ impl Source {
         let mut watchers = self.watchers.lock().unwrap();
         watchers.retain(|(weak, wd)| weak.upgrade().is_some_and(|q| q.contains(*wd)));
         watchers.push((Arc::downgrade(queue), wd));
+        self.interest().store(true, Ordering::Relaxed);
     }
     fn remove(&self, queue: &Arc<Queue>, wd: i32) {
-        self.watchers
-            .lock()
-            .unwrap()
+        let mut marks = self.watchers.lock().unwrap();
+        marks
             .retain(|(weak, w)| *w != wd || !std::sync::Weak::ptr_eq(weak, &Arc::downgrade(queue)));
+        if marks.is_empty() {
+            self.interest().store(false, Ordering::Relaxed);
+        }
     }
 }
 impl Drop for Source {
@@ -80,7 +101,13 @@ impl Drop for Source {
         );
     }
 }
-pub(super) struct Link(std::sync::Mutex<LinkState>);
+pub(super) struct Link {
+    state: std::sync::Mutex<LinkState>,
+    // The initial parent's interest bit can outlive its inode. Once reparented,
+    // resolve the current parent under the link lock.
+    initial_interest: Arc<std::sync::atomic::AtomicBool>,
+    reparented: std::sync::atomic::AtomicBool,
+}
 #[derive(Clone)]
 struct LinkState {
     parent: std::sync::Weak<Source>,
@@ -89,23 +116,28 @@ struct LinkState {
 }
 impl Link {
     fn matches(&self, parent: &Arc<Source>, name: &[u8]) -> bool {
-        let state = self.0.lock().unwrap();
+        let state = self.state.lock().unwrap();
         state.name.as_ref() == name
             && std::sync::Weak::ptr_eq(&state.parent, &Arc::downgrade(parent))
     }
     fn snapshot(&self) -> LinkState {
-        self.0.lock().unwrap().clone()
+        self.state.lock().unwrap().clone()
+    }
+    fn interested(&self) -> bool {
+        self.reparented.load(Ordering::Relaxed) || self.initial_interest.load(Ordering::Relaxed)
     }
     fn send(&self, mask: u32) {
+        if !self.interested() {
+            return;
+        }
         let state = self.snapshot();
         if let Some(parent) = state.parent.upgrade() {
-            parent.send(mask, 0, &state.name, !state.linked);
+            parent.send(mask, 0, &state.name, false);
         }
     }
 }
-/// Frozen path/link selection for a file epoch. Registration generations and
-/// one-shot admission remain live in each shared queue. This hot byte path
-/// retains only weak queue capabilities, not inode or OFD lifetime references.
+/// Snapshot one cgroup change before releasing its inode borrow. Queue
+/// delivery runs afterwards and cannot keep the inode or its watches alive.
 #[derive(Clone, Default)]
 pub(crate) struct Notifications(Vec<Notification>);
 #[derive(Clone)]
@@ -124,7 +156,7 @@ impl Notifications {
         }
     }
 }
-pub(super) fn capture_node(n: &Node, at: Option<&Arc<Link>>) -> Notifications {
+pub(super) fn capture_node(n: &Node) -> Notifications {
     let mut out = Notifications::default();
     let mut add = |source: &Source, name: &[u8], unlinked| {
         for (weak, wd) in source.snapshot() {
@@ -138,19 +170,14 @@ pub(super) fn capture_node(n: &Node, at: Option<&Arc<Link>>) -> Notifications {
             }
         }
     };
+    for link in &n.notifications.links {
+        let state = link.snapshot();
+        if let Some(parent) = state.parent.upgrade() {
+            add(&parent, &state.name, !state.linked);
+        }
+    }
     if let Some(source) = n.notifications.source.get() {
         add(source, b"", false);
-    }
-    let mut parent = |link: &Arc<Link>| {
-        let state = link.snapshot();
-        if let Some(p) = state.parent.upgrade() {
-            add(&p, &state.name, !state.linked);
-        }
-    };
-    if let Some(at) = at {
-        parent(at);
-    } else {
-        n.notifications.links.iter().for_each(parent);
     }
     out
 }
@@ -177,24 +204,45 @@ impl FileClose {
             },
         })
     }
-    pub(super) fn reopen(
+    pub(super) fn path_event(&self, mask: u32) {
+        let mask = mask | (self.mask & ISDIR);
+        let interested = self.source.interested();
+        let mut unlinked = false;
+        if let Some(link) = &self.link {
+            if !interested && !link.interested() {
+                return;
+            }
+            let state = link.snapshot();
+            unlinked = !state.linked;
+            if let Some(parent) = state.parent.upgrade() {
+                parent.send(mask, 0, &state.name, unlinked);
+            }
+        }
+        if interested {
+            self.source.send(mask, 0, b"", unlinked);
+        }
+    }
+    pub(super) fn open<const PATH_TRUNCATE: bool>(
         node: &NodeRef,
         flags: u32,
-        original: Option<&Arc<FileClose>>,
-    ) -> Option<Arc<Self>> {
-        if flags & O_PATH != 0 {
-            return None;
+        link: Option<Arc<Link>>,
+    ) -> Arc<Self> {
+        if PATH_TRUNCATE {
+            return Arc::new(Self {
+                source: node.borrow().notifications.source().clone(),
+                link,
+                mask: 0,
+            });
         }
-        let link = original.and_then(|c| c.link.clone());
-        notify(node, OPEN, link.as_ref());
-        Some(Self::new(&node.borrow(), flags, link))
+        let lease = Self::new(&node.borrow(), flags, link);
+        lease.path_event(OPEN);
+        lease
     }
 }
 impl Drop for FileClose {
     fn drop(&mut self) {
-        self.source.send(self.mask, 0, b"", false);
-        if let Some(link) = &self.link {
-            link.send(self.mask);
+        if self.mask != 0 {
+            self.path_event(self.mask);
         }
         // Dropping source after IN_CLOSE can produce deferred DELETE_SELF and
         // IGNORED. An inode metadata anchor need not live on this worker.
@@ -218,8 +266,6 @@ impl Marks {
         }
     }
     pub(super) fn destroy(&self, deleted: bool) {
-        // Removed directories notify immediately even if an open descriptor
-        // still names them; ordinary files defer to their last actual lease.
         if let Some(source) = self.source.get() {
             source.destroy(deleted);
         }
@@ -319,6 +365,11 @@ impl InotifyInstance {
 impl Drop for InotifyInstance {
     fn drop(&mut self) {
         self.queue.close();
+        for (wd, weak) in std::mem::take(&mut self.registrations.get_mut().unwrap().watches) {
+            if let Some(source) = weak.upgrade() {
+                source.remove(&self.queue, wd);
+            }
+        }
     }
 }
 
@@ -327,7 +378,7 @@ pub(super) fn link(node: &NodeRef, parent: &NodeRef, name: &[u8]) {
     let mut n = node.borrow_mut();
     n.notifications
         .links
-        .retain(|l| l.0.lock().unwrap().parent.strong_count() != 0);
+        .retain(|l| l.state.lock().unwrap().parent.strong_count() != 0);
     if n.notifications
         .links
         .iter()
@@ -335,18 +386,20 @@ pub(super) fn link(node: &NodeRef, parent: &NodeRef, name: &[u8]) {
     {
         return;
     }
-    n.notifications
-        .links
-        .push(Arc::new(Link(std::sync::Mutex::new(LinkState {
+    n.notifications.links.push(Arc::new(Link {
+        initial_interest: parent.interest().clone(),
+        reparented: Default::default(),
+        state: std::sync::Mutex::new(LinkState {
             parent: Arc::downgrade(&parent),
             name: name.into(),
             linked: true,
-        }))));
+        }),
+    }));
 }
 pub(super) fn unlink(node: &NodeRef, parent: &NodeRef, name: &[u8]) {
     let parent = parent.borrow().notifications.source().clone();
     node.borrow_mut().notifications.links.retain(|l| {
-        let mut state = l.0.lock().unwrap();
+        let mut state = l.state.lock().unwrap();
         let remove = state.name.as_ref() == name
             && std::sync::Weak::ptr_eq(&state.parent, &Arc::downgrade(&parent));
         if remove {
@@ -365,10 +418,13 @@ pub(super) fn move_link(
     let old = old.borrow().notifications.source().clone();
     let new = new.borrow().notifications.source().clone();
     for l in &node.borrow().notifications.links {
-        let mut state = l.0.lock().unwrap();
+        let mut state = l.state.lock().unwrap();
         if state.name.as_ref() == old_name
             && std::sync::Weak::ptr_eq(&state.parent, &Arc::downgrade(&old))
         {
+            if !Arc::ptr_eq(&old, &new) {
+                l.reparented.store(true, Ordering::Relaxed);
+            }
             state.parent = Arc::downgrade(&new);
             state.name = name.into();
             return;
@@ -389,7 +445,6 @@ pub(super) fn notify(node: &NodeRef, mask: u32, at: Option<&Arc<Link>>) {
         } else {
             0
         };
-    n.notifications.send(mask, 0, b"", false);
     if let Some(at) = at {
         at.send(mask);
     } else {
@@ -398,6 +453,7 @@ pub(super) fn notify(node: &NodeRef, mask: u32, at: Option<&Arc<Link>>) {
             .iter()
             .for_each(|link| link.send(mask));
     }
+    n.notifications.send(mask, 0, b"", false);
 }
 
 impl Vfs {
@@ -507,26 +563,15 @@ impl Vfs {
             }
         }
     }
-    pub(super) fn notification_open(
-        &self,
-        path: &ResolvedPath,
-        node: &NodeRef,
-        flags: u32,
-    ) -> Option<Arc<FileClose>> {
-        if flags & O_PATH != 0 {
-            return None;
-        }
-        let at = self.notification_parent(path).and_then(|(parent, name)| {
-            let parent = parent.borrow().notifications.source().clone();
-            node.borrow()
-                .notifications
-                .links
-                .iter()
-                .find(|l| l.matches(&parent, &name))
-                .cloned()
-        });
-        notify(node, OPEN, at.as_ref());
-        Some(FileClose::new(&node.borrow(), flags, at))
+    pub(super) fn event_link(&self, path: &ResolvedPath, node: &NodeRef) -> Option<Arc<Link>> {
+        let (parent, name) = self.notification_parent(path)?;
+        let parent = parent.borrow().notifications.source().clone();
+        node.borrow()
+            .notifications
+            .links
+            .iter()
+            .find(|l| l.matches(&parent, &name))
+            .cloned()
     }
 }
 
@@ -679,16 +724,16 @@ mod tests {
         std::thread::spawn(move || drop(alias)).join().unwrap();
         let events = v.read(notify, 4096).unwrap();
         assert_eq!(masks(&events), vec![CLOSE_WRITE, CLOSE_WRITE]);
-        assert_eq!(i32::from_le_bytes(events[..4].try_into().unwrap()), inode);
+        assert_eq!(i32::from_le_bytes(events[..4].try_into().unwrap()), parent);
+        assert_eq!(&events[16..20], b"new\0");
         assert_eq!(
-            i32::from_le_bytes(events[16..20].try_into().unwrap()),
-            parent
+            i32::from_le_bytes(events[32..36].try_into().unwrap()),
+            inode
         );
-        assert_eq!(&events[32..36], b"new\0");
     }
 
     #[test]
-    fn retained_close_defers_inode_deletion_but_not_directory_removal() {
+    fn retained_close_defers_final_deletion_for_files_and_directories() {
         let mut v = Vfs::default();
         let fd = v.open_at(AT_FDCWD, b"/gone", 0x42, 0o600).unwrap();
         let notify = v.inotify_init(O_NONBLOCK).unwrap();
@@ -712,13 +757,14 @@ mod tests {
             .unwrap();
         let close = v.retain_uring_fd(fd).unwrap().close_notification().unwrap();
         v.unlink_at(AT_FDCWD, b"/dir", true).unwrap();
+        assert_eq!(v.read(notify, 4096), Err(Errno(11)));
+        v.close(fd).unwrap();
+        assert_eq!(v.read(notify, 4096), Err(Errno(11)));
+        std::thread::spawn(move || drop(close)).join().unwrap();
         assert_eq!(
             masks(&v.read(notify, 4096).unwrap()),
-            vec![DELETE_SELF, IGNORED]
+            vec![CLOSE_NOWRITE | ISDIR, DELETE_SELF, IGNORED]
         );
-        v.close(fd).unwrap();
-        std::thread::spawn(move || drop(close)).join().unwrap();
-        assert_eq!(v.read(notify, 4096), Err(Errno(11)));
     }
 
     #[test]
@@ -950,12 +996,14 @@ mod tests {
         assert_eq!(v.inotify_remove(fd, old), Err(Errno(22)));
         let new = v.inotify_add(fd, b"/data", MODIFY).unwrap();
         assert_ne!(old, new);
-        // A stale capability cannot accidentally notify a replacement watch.
+        // The original OFD delivers a later write to the replacement watch only.
         assert_eq!(
             files.get(data).unwrap().write(b"b", Some(0), &mut cache),
             Some(Ok(1))
         );
-        assert_eq!(v.read(fd, 1024), Err(Errno(11)));
+        let events = v.read(fd, 1024).unwrap();
+        assert_eq!(masks(&events), vec![MODIFY]);
+        assert_eq!(i32::from_le_bytes(events[..4].try_into().unwrap()), new);
         epoch.finish();
         let mut epoch = FileEpoch::default();
         let files = epoch.capture(&v, true);

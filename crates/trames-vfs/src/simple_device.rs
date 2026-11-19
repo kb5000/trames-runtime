@@ -69,11 +69,7 @@ impl SharedOpenDescription {
             );
         }
         if result.as_ref().is_ok_and(|bytes| !bytes.is_empty()) {
-            inotify::notify(
-                node,
-                inotify::ACCESS,
-                self.notification.as_ref().and_then(|c| c.link.as_ref()),
-            );
+            self.notify_file_io(node, inotify::ACCESS);
         }
         result
     }
@@ -107,11 +103,7 @@ impl SharedOpenDescription {
                 n.times[1] = storage::Timestamp::now();
                 n.times[2] = n.times[1];
             }
-            inotify::notify(
-                node,
-                inotify::MODIFY,
-                self.notification.as_ref().and_then(|c| c.link.as_ref()),
-            );
+            self.notify_file_io(node, inotify::MODIFY);
         }
         if result.is_ok() && self.flags.get() & 0x1000 != 0 {
             return Err(Errno(22));

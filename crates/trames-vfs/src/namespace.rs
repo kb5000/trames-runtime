@@ -149,7 +149,13 @@ impl Vfs {
             .send(inotify::MOVE_SELF, 0, b"", false);
         Ok(())
     }
-    fn chmod_node(&self, node: NodeRef, mode: u32, persistent: bool) -> Result<()> {
+    fn chmod_node(
+        &self,
+        node: NodeRef,
+        mode: u32,
+        persistent: bool,
+        link: Option<&Arc<inotify::Link>>,
+    ) -> Result<()> {
         let _metadata = node.metadata.lock().unwrap();
         self.pseudo_metadata_mutable(&node)?;
         let mut n = node.borrow_mut();
@@ -198,13 +204,14 @@ impl Vfs {
             }
             return Err(e);
         }
-        inotify::notify(&node, inotify::ATTRIB, None);
+        inotify::notify(&node, inotify::ATTRIB, link);
         Ok(())
     }
     pub fn chmod_at(&mut self, dirfd: i32, path: &[u8], mode: u32) -> Result<()> {
         let MetadataTarget { path, node, _magic } = self.metadata_target(dirfd, path, true)?;
         path.writable()?;
-        self.chmod_node(node, mode, true)
+        let link = self.event_link(&path, &node);
+        self.chmod_node(node, mode, true, link.as_ref())
     }
     pub fn chmod_at_flags(
         &mut self,
@@ -218,7 +225,8 @@ impl Vfs {
         if matches!(node.borrow().content, Content::Symlink(_)) {
             return Err(Errno(95));
         }
-        self.chmod_node(node, mode, true)
+        let link = self.event_link(&path, &node);
+        self.chmod_node(node, mode, true, link.as_ref())
     }
     pub fn chmod_fd(&mut self, fd: u32, mode: u32) -> Result<()> {
         if self.flags(fd)? & O_PATH != 0 {
@@ -235,7 +243,14 @@ impl Vfs {
         if matches!(n.borrow().content, Content::Symlink(_)) {
             return Err(Errno(95));
         }
-        self.chmod_node(n, mode, open.node.is_some())
+        self.chmod_node(
+            n,
+            mode,
+            open.node.is_some(),
+            open.notification
+                .as_ref()
+                .and_then(|lease| lease.link.as_ref()),
+        )
     }
     pub fn set_times(
         &mut self,
@@ -273,19 +288,27 @@ impl Vfs {
         if path.is_none() {
             self.fd_writable(dirfd as u32)?;
         }
-        let node = match path {
+        let (node, link) = match path {
             Some(p) => {
-                let p = self.resolve_final(dirfd, p, flags & 0x100 == 0)?;
-                p.writable()?;
-                self.node(&p)?
+                let target = self.metadata_target(dirfd, p, flags & 0x100 == 0)?;
+                target.path.writable()?;
+                let link = target
+                    ._magic
+                    .as_ref()
+                    .and_then(|m| m.file.as_ref()?.notification.as_ref()?.link.clone())
+                    .or_else(|| self.event_link(&target.path, &target.node));
+                (target.node, link)
             }
-            None => self
-                .descriptor(dirfd as u32)?
-                .open
-                .borrow()
-                .node
-                .clone()
-                .ok_or(Errno(22))?,
+            None => {
+                let descriptor = self.descriptor(dirfd as u32)?;
+                let open = descriptor.open.borrow();
+                (
+                    open.node.clone().ok_or(Errno(22))?,
+                    open.notification
+                        .as_ref()
+                        .and_then(|lease| lease.link.clone()),
+                )
+            }
         };
         let _metadata = node.metadata.lock().unwrap();
         self.pseudo_immutable(&node)?;
@@ -313,7 +336,12 @@ impl Vfs {
             node.borrow_mut().times = old;
             return Err(e);
         }
-        inotify::notify(&node, inotify::ATTRIB, None);
+        let mask = match (values[0].is_some(), values[1].is_some()) {
+            (true, false) => inotify::ACCESS,
+            (false, true) => inotify::MODIFY,
+            _ => inotify::ATTRIB,
+        };
+        inotify::notify(&node, mask, link.as_ref());
         Ok(())
     }
 }

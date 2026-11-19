@@ -738,21 +738,9 @@ impl FileWork {
 }
 impl PathQueries {
     pub fn truncate_path_work(&self, path: &[u8], length: u64) -> Option<Result<FileWork>> {
-        struct Capture<'a>(&'a mut Vfs);
-        impl Drop for Capture<'_> {
-            fn drop(&mut self) {
-                self.0.query.as_mut().unwrap().capture_open = false;
-            }
-        }
         let mut view = self.view.borrow_mut();
-        let query = view.query.as_mut().unwrap();
-        query.capture_open = true;
-        query.clear_deferred();
-        let guard = Capture(&mut view);
-        let result = guard
-            .0
-            .open_at_resolve_published(AT_FDCWD, path, 1, 0, 0, None);
-        drop(guard);
+        view.query.as_ref().unwrap().clear_deferred();
+        let result = view.open_at_resolve_published::<true>(AT_FDCWD, path, 1, 0, 0, None);
         let query = view.query.as_ref().unwrap();
         let accepted = query.open_work.borrow_mut().take();
         if let Some(open) = accepted {

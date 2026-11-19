@@ -3,6 +3,7 @@
 use super::*;
 
 pub struct ExecutableFile {
+    notification: Arc<FileClose>,
     _mount_use: Option<mounts::MountUse>,
     #[cfg(all(feature = "hostfs", unix))]
     _host_file: Option<Arc<hostfs::OpenFile>>,
@@ -63,6 +64,7 @@ impl Vfs {
         if flags & !0x1100 != 0 {
             return Err(Errno(22));
         }
+        let mut path_link = None;
         let accepted = if path.is_empty() {
             if flags & 0x1000 == 0 {
                 return Err(Errno(2));
@@ -90,16 +92,20 @@ impl Vfs {
             match magic {
                 Some(ResolvedTarget::Inode(file)) => file,
                 Some(ResolvedTarget::Descriptor(open)) => self.proc_open_node(&open, &resolved)?,
-                None => ResolvedInode {
-                    node: self.node(&resolved)?,
-                    label: self
-                        .path_visible(&resolved)
-                        .unwrap_or_else(|_| resolved.key.clone()),
-                    mount: resolved.mount,
-                    file: None,
-                    _image: None,
-                    _directory: None,
-                },
+                None => {
+                    let node = self.node(&resolved)?;
+                    path_link = self.event_link(&resolved, &node);
+                    ResolvedInode {
+                        node,
+                        label: self
+                            .path_visible(&resolved)
+                            .unwrap_or_else(|_| resolved.key.clone()),
+                        mount: resolved.mount,
+                        file: None,
+                        _image: None,
+                        _directory: None,
+                    }
+                }
             }
         };
         let (node, label, mount) = (&accepted.node, &accepted.label, &accepted.mount);
@@ -126,7 +132,12 @@ impl Vfs {
         let mount_use = mount
             .as_ref()
             .map(|mount| mounts::MountUse::new(mount.identity.clone()));
+        let link = path_link
+            .or_else(|| accepted.file.as_ref()?.notification.as_ref()?.link.clone())
+            .or_else(|| accepted._image.as_ref()?.notification.link.clone());
+        let notification = FileClose::open::<false>(node, 0, link);
         Ok(Some(Arc::new(ExecutableFile {
+            notification,
             _mount_use: mount_use,
             #[cfg(all(feature = "hostfs", unix))]
             _host_file: host_file,
@@ -177,10 +188,14 @@ pub fn script_interpreter(bytes: &[u8]) -> Result<Option<ScriptInterpreter>> {
 
 impl ExecutableFile {
     pub fn bytes(&self) -> Result<Vec<u8>> {
-        match &self.node.borrow().content {
-            Content::File(data) => Vfs::executable_data(data),
-            _ => Err(Errno(13)),
+        let bytes = match &self.node.borrow().content {
+            Content::File(data) => Vfs::executable_data(data)?,
+            _ => return Err(Errno(13)),
+        };
+        if !bytes.is_empty() {
+            self.notification.path_event(inotify::ACCESS);
         }
+        Ok(bytes)
     }
 }
 

@@ -27,7 +27,7 @@ struct FileAuthority {
     stat: [u8; 128],
     flags: u32,
     status: StatusFlags,
-    notifications: inotify::Notifications,
+    notification: std::sync::Weak<FileClose>,
     write_error: Option<Errno>,
     unlimited: bool,
     clear_setid: bool,
@@ -311,8 +311,11 @@ impl FileEpoch {
         }
         let data = data.clone();
         data.activate(n.mode, n.times);
-        let notifications =
-            inotify::capture_node(&n, o.notification.as_ref().and_then(|c| c.link.as_ref()));
+        let notification = o
+            .notification
+            .as_ref()
+            .map(Arc::downgrade)
+            .unwrap_or_default();
         let stat = vfs.stat_node_fields(&n, o.mount.as_ref()).ok()?;
         let write_error = o
             .mount
@@ -330,7 +333,7 @@ impl FileEpoch {
                 stat,
                 flags: o.flags.get(),
                 status: o.flags.clone(),
-                notifications,
+                notification,
                 write_error,
                 unlimited,
                 clear_setid,
@@ -425,6 +428,15 @@ impl DirectFile {
         }
         self.locks.set(requested)
     }
+    fn notify_io(&self, mask: u32) {
+        if let Some(file) = &self.file {
+            if let Some(lease) = &file.open.notification {
+                lease.path_event(mask);
+            }
+        } else if let Some(lease) = self.prepared.0.notification.upgrade() {
+            lease.path_event(mask);
+        }
+    }
     pub fn read(
         &self,
         count: usize,
@@ -461,7 +473,7 @@ impl DirectFile {
                 .accessed(self.prepared.0.readonly, self.prepared.0.relatime);
         }
         if result.as_ref().is_ok_and(|bytes| !bytes.is_empty()) {
-            self.prepared.0.notifications.send(inotify::ACCESS);
+            self.notify_io(inotify::ACCESS);
         }
         Some(result)
     }
@@ -514,7 +526,7 @@ impl DirectFile {
         };
         if result.is_ok_and(|n| n != 0) {
             self.data.modified(self.clear_setid);
-            self.prepared.0.notifications.send(inotify::MODIFY);
+            self.notify_io(inotify::MODIFY);
         }
         Some(result)
     }

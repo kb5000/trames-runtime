@@ -301,7 +301,7 @@ impl ControlEvents {
             if deleted {
                 inotify::notify_removed(&node);
             } else {
-                let notifications = inotify::capture_node(&node.borrow(), None);
+                let notifications = inotify::capture_node(&node.borrow());
                 notifications.send(inotify::MODIFY);
             }
         }

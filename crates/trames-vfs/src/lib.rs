@@ -300,6 +300,20 @@ struct SharedOpenDescription {
     notification: Option<Arc<FileClose>>,
 }
 impl SharedOpenDescription {
+    fn notify_file_io(&self, node: &NodeRef, mask: u32) {
+        if let Some(lease) = &self.notification {
+            lease.path_event(mask);
+        } else {
+            inotify::notify(node, mask, None);
+        }
+    }
+    fn notify_read(&self, bytes: &[u8]) {
+        if !bytes.is_empty() {
+            if let Some(lease) = &self.notification {
+                lease.path_event(inotify::ACCESS);
+            }
+        }
+    }
     fn metadata_node(&self) -> Option<NodeRef> {
         self.node
             .clone()
@@ -2177,8 +2191,11 @@ impl Vfs {
         }
         drop(fs);
         self.notification_link(dest, &source, true);
+        source
+            .borrow()
+            .notifications
+            .send(inotify::ATTRIB, 0, b"", false);
         self.notification_entry(dest, inotify::CREATE, 0, false);
-        inotify::notify(&source, inotify::ATTRIB, None);
         Ok(())
     }
     pub fn executable(&self, path: &[u8]) -> Result<Vec<u8>> {
@@ -2303,18 +2320,20 @@ impl Vfs {
             return Err(e);
         }
         drop(fs);
-        self.notification_entry(&p, inotify::DELETE, 0, is_dir);
         self.notification_link(&p, &node, false);
-        inotify::notify(&node, inotify::ATTRIB, None);
-        let mut n = node.borrow_mut();
-        if n.links == 0 {
-            if is_dir {
-                n.notifications.destroy(true);
-            }
-            if let Content::File(data) = &mut n.content {
-                data.orphan(true);
+        if !is_dir {
+            let mut n = node.borrow_mut();
+            n.notifications.send(inotify::ATTRIB, 0, b"", false);
+            if n.links == 0 {
+                if let Content::File(data) = &mut n.content {
+                    data.orphan(true);
+                }
             }
         }
+        // Release the namespace operation's own reference before the parent
+        // event. An open descriptor may still defer DELETE_SELF until close.
+        drop(node);
+        self.notification_entry(&p, inotify::DELETE, 0, is_dir);
         Ok(())
     }
     fn available(&self, min: u32) -> Result<u32> {
@@ -2331,9 +2350,9 @@ impl Vfs {
         mode: u32,
         policy: u64,
     ) -> Result<u32> {
-        self.open_at_resolve_published(dirfd, path, flags, mode, policy, None)
+        self.open_at_resolve_published::<false>(dirfd, path, flags, mode, policy, None)
     }
-    fn open_at_resolve_published(
+    fn open_at_resolve_published<const PATH_TRUNCATE: bool>(
         &mut self,
         dirfd: i32,
         path: &[u8],
@@ -2636,7 +2655,8 @@ impl Vfs {
                 .transpose()?
                 .flatten(),
         };
-        let truncate = flags & 0x200 != 0
+        let truncate = existed
+            && flags & 0x200 != 0
             && !Self::cgroup_mount(&p)
             && oom.is_none()
             && network_control.is_none();
@@ -2649,7 +2669,7 @@ impl Vfs {
                     n.times[2] = n.times[1];
                 }
             }
-            if flags & 0x200 != 0 {
+            if truncate {
                 self.checkpoint()?;
                 if matches!(node.borrow().content, Content::File(_)) {
                     inotify::notify(&node, inotify::MODIFY, None);
@@ -2719,10 +2739,17 @@ impl Vfs {
         } else {
             flags
         }; // ARM64 openat forces O_LARGEFILE except for O_PATH.
-        let notification = if let Some(original) = original {
-            inotify::FileClose::reopen(&node, flags, original.notification.as_ref())
+        let notification = if flags & O_PATH != 0 {
+            None
         } else {
-            self.notification_open(&p, &node, flags)
+            let link = match original {
+                Some(open) => open
+                    .notification
+                    .as_ref()
+                    .and_then(|lease| lease.link.clone()),
+                None => self.event_link(&p, &node),
+            };
+            Some(FileClose::open::<PATH_TRUNCATE>(&node, flags, link))
         };
         let read_node = if flags & O_PATH == 0 && flags & 3 == 0 {
             match &node.borrow().content {
@@ -2820,12 +2847,12 @@ impl Vfs {
             cloexec: (flags & O_CLOEXEC != 0).into(),
         };
         if let Some(query) = &self.query {
-            if truncate || query.capture_open {
+            if truncate || PATH_TRUNCATE {
                 let OpenHandle::Shared(shared) = &descriptor.open else {
                     return query.defer();
                 };
                 let file = SharedFd::new(shared.clone());
-                let target = if query.capture_open {
+                let target = if PATH_TRUNCATE {
                     Some(file.filesystem_target())
                 } else {
                     file.file_target()
@@ -3136,24 +3163,32 @@ impl Vfs {
             let mut position = o.file_position.lock().unwrap();
             let bytes = file.read(position.value, count);
             position.value += bytes.len() as u64;
+            drop(position);
+            o.notify_read(&bytes);
             return Ok(bytes);
         }
         if let Some(file) = &o.runtime_file {
             let mut position = o.file_position.lock().unwrap();
             let bytes = file.read(position.value, count)?;
             position.value += bytes.len() as u64;
+            drop(position);
+            o.notify_read(&bytes);
             return Ok(bytes);
         }
         if let Some(control) = &o.sysctl_control {
             let mut position = o.file_position.lock().unwrap();
             let data = control.read(position.value, count)?;
             position.value += data.len() as u64;
+            drop(position);
+            o.notify_read(&data);
             return Ok(data);
         }
         if o.oom.is_some() {
             let mut position = o.file_position.lock().unwrap();
             if let Some(data) = Self::oom_read(&o, position.value, count)? {
                 position.value += data.len() as u64;
+                drop(position);
+                o.notify_read(&data);
                 return Ok(data);
             }
         }
@@ -3163,6 +3198,8 @@ impl Vfs {
                 .cgroup_read(&self.cgroup_access(), position.value, count)?
                 .ok_or(Errno(19))?;
             position.value += data.len() as u64;
+            drop(position);
+            o.notify_read(&data);
             return Ok(data);
         }
         if let Some(log) = &o.kernel_log {
@@ -3375,11 +3412,7 @@ impl Vfs {
                     let synchronous = o.flags.get() & 0x1000 != 0;
                     drop(n);
                     if result.as_ref().is_ok_and(|(n, _)| *n != 0) {
-                        inotify::notify(
-                            &node,
-                            inotify::MODIFY,
-                            o.notification.as_ref().and_then(|c| c.link.as_ref()),
-                        );
+                        o.notify_file_io(&node, inotify::MODIFY);
                     }
                     drop(o);
                     if result.is_ok() && synchronous {
@@ -3480,11 +3513,7 @@ impl Vfs {
         if result.is_ok_and(|n| n != 0)
             && !(node.borrow().seals.is_some() && o.notification.is_none())
         {
-            inotify::notify(
-                &node,
-                inotify::MODIFY,
-                o.notification.as_ref().and_then(|c| c.link.as_ref()),
-            );
+            o.notify_file_io(&node, inotify::MODIFY);
         }
         drop(o);
         if result.is_ok() && synchronous {
@@ -3517,18 +3546,24 @@ impl Vfs {
             return Err(Errno(9));
         }
         if let Some(file) = &o.mount_file {
-            return Ok(file.read(offset, count));
+            let data = file.read(offset, count);
+            o.notify_read(&data);
+            return Ok(data);
         }
         if let Some(file) = &o.runtime_file {
-            return file.read(offset, count);
+            return file.read(offset, count).inspect(|data| o.notify_read(data));
         }
         if let Some(control) = &o.sysctl_control {
-            return control.read(offset, count);
+            return control
+                .read(offset, count)
+                .inspect(|data| o.notify_read(data));
         }
         if let Some(data) = Self::oom_read(&o, offset, count)? {
+            o.notify_read(&data);
             return Ok(data);
         }
         if let Some(data) = self.cgroup_read(&o, offset, count)? {
+            o.notify_read(&data);
             return Ok(data);
         }
         let node = o.data_node().ok_or(Errno(29))?;
@@ -3550,7 +3585,9 @@ impl Vfs {
         if self.bridge_fd(fd) || {
             let d = self.descriptor(fd)?;
             let o = d.open.borrow();
-            o.kernel_log.is_some() || o.pipe.is_some()
+            o.kernel_log.is_some()
+                || o.pipe.is_some()
+                || matches!(o.control, Some(events::SharedControl::Inotify(_)))
         } {
             return Err(Errno(29));
         }
@@ -3569,7 +3606,7 @@ impl Vfs {
         self.resize_fd(fd, memfd::FileResize::Truncate(length))
     }
     pub fn truncate_at(&mut self, path: &[u8], length: u64) -> Result<()> {
-        let fd = self.open_at(AT_FDCWD, path, 1, 0)?;
+        let fd = self.open_at_resolve_published::<true>(AT_FDCWD, path, 1, 0, 0, None)?;
         let result = self.truncate_fd(fd, length);
         self.close(fd)?;
         result
@@ -3956,6 +3993,15 @@ impl Vfs {
     }
     fn getdents_description(&self, d: &Descriptor, count: usize) -> Result<Vec<u8>> {
         let o = d.open.borrow();
+        let result = self.read_directory_entries(&o, count);
+        if result.is_ok() {
+            if let Some(lease) = &o.notification {
+                lease.path_event(inotify::ACCESS);
+            }
+        }
+        result
+    }
+    fn read_directory_entries(&self, o: &OpenDescription, count: usize) -> Result<Vec<u8>> {
         if o.flags.get() & O_PATH != 0 {
             return Err(Errno(9));
         }
@@ -3977,7 +4023,7 @@ impl Vfs {
             let children = host.children(&p.key)?;
             let inode = node.borrow().inode;
             let parent = self.node(&self.parent_location(&p)?)?.borrow().inode;
-            return Self::encode_host_directory(&o, count, children, inode, parent);
+            return Self::encode_host_directory(o, count, children, inode, parent);
         }
         let inode = node.borrow().inode;
         let parent = self.node(&self.parent_location(&p)?)?.borrow().inode;

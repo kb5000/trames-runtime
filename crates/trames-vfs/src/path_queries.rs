@@ -17,7 +17,6 @@ pub(super) struct Authority {
     pub(super) original: bool,
     deferred: Arc<std::sync::atomic::AtomicBool>,
     pub(super) file_layout_exclusive: bool,
-    pub(super) capture_open: bool,
     pub(super) open_work: Arc<SharedCell<Option<file_work::PreparedOpen>>>,
     pub(super) namespace_uses: ActiveMounts,
 }
@@ -68,7 +67,6 @@ impl Authority {
             original: false,
             deferred: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             file_layout_exclusive: false,
-            capture_open: false,
             open_work: Default::default(),
             namespace_uses: ActiveMounts::default(),
         }
@@ -84,7 +82,6 @@ impl Authority {
             original: false,
             deferred: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             file_layout_exclusive: false,
-            capture_open: false,
             open_work: Default::default(),
             namespace_uses: ActiveMounts::default(),
         }
@@ -231,7 +228,6 @@ impl Vfs {
                 .map_or_else(|| self.device_access(), |q| q.devices.clone()),
             deferred: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             file_layout_exclusive: false,
-            capture_open: false,
             open_work: Default::default(),
             namespace_uses: ActiveMounts::default(),
         });
@@ -327,7 +323,7 @@ impl PathQueries {
         let operation = |v: &mut Vfs| {
             if let Some(file) = file {
                 v.with_uring_path_fd(file, |v, alias| {
-                    v.open_at_resolve_published(
+                    v.open_at_resolve_published::<false>(
                         alias as i32,
                         path,
                         flags,
@@ -337,7 +333,7 @@ impl PathQueries {
                     )
                 })
             } else {
-                v.open_at_resolve_published(dirfd, path, flags, mode, policy, Some(files))
+                v.open_at_resolve_published::<false>(dirfd, path, flags, mode, policy, Some(files))
             }
         };
         let result = self.uring_query(operation);
@@ -557,7 +553,8 @@ impl PathQueries {
         let mut view = self.view.borrow_mut();
         let deferred = view.query.as_ref().unwrap().deferred.clone();
         deferred.store(false, Ordering::Relaxed);
-        let result = view.open_at_resolve_published(dirfd, path, flags, mode, policy, Some(files));
+        let result =
+            view.open_at_resolve_published::<false>(dirfd, path, flags, mode, policy, Some(files));
         (!deferred.swap(false, Ordering::Relaxed)).then_some(result)
     }
     fn query<T>(&self, operation: impl FnOnce(&Vfs) -> Result<T>) -> Option<Result<T>> {
