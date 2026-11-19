@@ -21,14 +21,25 @@ pub struct Children {
 }
 #[derive(Default)]
 pub struct Child(Mutex<State>);
-pub(crate) struct Notice(Option<Arc<Children>>, Weak<crate::task_control::Group>);
+type OnReap = Box<dyn FnOnce() + Send>;
+pub(crate) struct Notice(
+    Option<Arc<Children>>,
+    Weak<crate::task_control::Group>,
+    Vec<OnReap>,
+);
 impl Notice {
     pub fn notify(self) {
+        for retire in self.2 {
+            retire();
+        }
         if let Some(parent) = self.0 {
             parent.changed.notify_locked();
         }
     }
     pub fn signal(self, signo: u32, info: crate::signal::Info) {
+        for retire in self.2 {
+            retire();
+        }
         if let Some(parent) = self.0 {
             parent.changed.notify_locked();
         }
@@ -79,12 +90,32 @@ struct State {
     stopped: bool,
     exited: bool,
     reaped: bool,
+    on_reap: Option<OnReap>,
     presence: crate::task::Visibility,
     group_usage: Weak<crate::task_control::Group>,
     children_usage: Weak<Children>,
     exit_usage: crate::usage::Usage,
 }
 impl Child {
+    /// Registration can race wait or automatic reaping. Destroy original resources
+    /// outside family/child locks, exactly once in either ordering.
+    pub fn on_reap(&self, retire: Box<dyn FnOnce() + Send>) {
+        let mut state = self.0.lock().unwrap();
+        if state.reaped {
+            drop(state);
+            retire();
+        } else {
+            // A nonleader exec may replace a retired leader and keep its wait event.
+            state.on_reap = Some(match state.on_reap.take() {
+                Some(previous) => Box::new(move || {
+                    previous();
+                    retire();
+                }),
+                None => retire,
+            });
+        }
+    }
+
     pub fn bind_birth(
         &self,
         presence: &Arc<crate::task::Presence>,
@@ -181,7 +212,7 @@ impl Child {
                 drop(state);
                 if group_changed {
                     if let Some(parent) = parent {
-                        notices.push(Notice(Some(parent.clone()), Weak::new()));
+                        notices.push(Notice(Some(parent.clone()), Weak::new(), Vec::new()));
                     }
                 }
                 return notices;
@@ -190,7 +221,7 @@ impl Child {
         };
         if let Some(old) = previous.upgrade() {
             old.entries.lock().unwrap().remove(&previous_id);
-            notices.push(Notice(Some(old), Weak::new()));
+            notices.push(Notice(Some(old), Weak::new(), Vec::new()));
         }
         if let Some(parent) = parent {
             if let Some(group) = signal_parent {
@@ -201,7 +232,7 @@ impl Child {
                 .lock()
                 .unwrap()
                 .insert(id, Arc::downgrade(self));
-            notices.push(Notice(Some(parent.clone()), Weak::new()));
+            notices.push(Notice(Some(parent.clone()), Weak::new(), Vec::new()));
         }
         notices
     }
@@ -211,18 +242,18 @@ impl Child {
             // A consumed exit belongs to this original child, never a later
             // projection refresh or a process that happens to reuse its PID.
             if state.reaped || state.exited {
-                return Notice(None, Weak::new());
+                return Notice(None, Weak::new(), Vec::new());
             }
             let stopped = !exited && status.is_some_and(|s| s != 0xffff);
             if status.is_some() && !exited && state.stopped == stopped {
-                return Notice(None, Weak::new());
+                return Notice(None, Weak::new(), Vec::new());
             }
             state.stopped = stopped;
             state.event = status;
             state.exited = exited;
             (state.parent.upgrade(), state.parent_group.clone())
         };
-        Notice(parent.0, parent.1)
+        Notice(parent.0, parent.1, Vec::new())
     }
     fn publish(&self, status: Option<i32>, exited: bool) {
         self.publish_quiet(status, exited).notify();
@@ -274,7 +305,16 @@ impl Child {
                 parent.reaped.store(true, Ordering::Relaxed);
             }
         }
-        Some((Notice(parent, state.parent_group.clone()), signo, status))
+        let cleanup = if auto_reap {
+            state.on_reap.take().into_iter().collect()
+        } else {
+            Vec::new()
+        };
+        Some((
+            Notice(parent, state.parent_group.clone(), cleanup),
+            signo,
+            status,
+        ))
     }
     pub fn clear(&self) {
         self.publish(None, false);
@@ -393,7 +433,7 @@ impl Children {
                 moved = true;
             }
         }
-        moved.then(|| Notice(Some(self.clone()), Weak::new()))
+        moved.then(|| Notice(Some(self.clone()), Weak::new(), Vec::new()))
     }
     pub(crate) fn usage(&self) -> crate::usage::Usage {
         *self.collected.lock().unwrap()
@@ -427,6 +467,7 @@ impl Children {
     pub(crate) fn reap_exited(self: &Arc<Self>) -> Option<Notice> {
         let entries = self.entries.lock().unwrap();
         let mut changed = false;
+        let mut cleanup = Vec::new();
         for child in entries.values().filter_map(Weak::upgrade) {
             let mut state = child.0.lock().unwrap();
             if !state.reaped && state.exited && state.parent.as_ptr() == Arc::as_ptr(self) {
@@ -434,12 +475,13 @@ impl Children {
                 state.event = None;
                 self.collected.lock().unwrap().include(state.exit_usage);
                 state.presence.reap();
+                cleanup.extend(state.on_reap.take());
                 changed = true;
             }
         }
         if changed {
             self.reaped.store(true, Ordering::Relaxed);
-            Some(Notice(Some(self.clone()), Weak::new()))
+            Some(Notice(Some(self.clone()), Weak::new(), cleanup))
         } else {
             None
         }
@@ -480,6 +522,7 @@ impl Children {
             };
             let live_usage = (!state.exited && usage_pointer != 0)
                 .then(|| (state.group_usage.upgrade(), state.children_usage.upgrade()));
+            let mut cleanup = None;
             if options & 0x01000000 == 0 {
                 state.reaped = state.exited;
                 state.event = None;
@@ -487,12 +530,16 @@ impl Children {
                     self.collected.lock().unwrap().include(usage);
                     self.reaped.store(true, Ordering::Relaxed);
                     state.presence.reap();
+                    cleanup = state.on_reap.take();
                 }
             }
             // A second waiting thread must see the consumed event/ECHILD.
             // Callbacks can enter these objects, so release both locks first.
             drop(state);
             drop(entries);
+            if let Some(retire) = cleanup {
+                retire();
+            }
             if options & 0x01000000 == 0 {
                 self.changed.notify_locked();
             }
@@ -671,6 +718,36 @@ mod tests {
     fn child_for_reuse(family: &Arc<Children>) -> Arc<Child> {
         child(family, 42, 7)
     }
+    #[test]
+    fn reap_cleanup_runs_outside_child_locks_in_both_registration_orders() {
+        for before in [true, false] {
+            let family = Arc::new(Children::default());
+            let child = child(&family, 42, 7);
+            child.exited(0);
+            let (signal, received) = std::sync::mpsc::channel();
+            let original = Arc::downgrade(&child);
+            let mut cleanup = Some(Box::new(move || {
+                assert!(original.upgrade().unwrap().reaped());
+                signal.send(()).unwrap();
+            }) as OnReap);
+            if before {
+                child.on_reap(cleanup.take().unwrap());
+            }
+            let mut memory = memory();
+            let ns = PidNamespace::default();
+            assert_eq!(
+                family.wait(waitid(4 | 0x01000000), &ns, 1, &mut memory),
+                Ok(Some(0))
+            );
+            assert!(received.try_recv().is_err());
+            assert_eq!(family.wait(wait4(0), &ns, 1, &mut memory), Ok(Some(42)));
+            if let Some(cleanup) = cleanup {
+                child.on_reap(cleanup);
+            }
+            assert_eq!(received.try_recv(), Ok(()));
+        }
+    }
+
     #[test]
     fn failed_copyout_still_consumes_the_exit_like_native_linux() {
         let family = Arc::new(Children::default());

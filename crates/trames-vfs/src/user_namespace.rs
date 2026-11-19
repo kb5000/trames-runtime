@@ -16,6 +16,59 @@ pub(super) struct UserSpace {
     creator_setfcap: bool,
     maps: [OnceLock<Vec<Extent>>; 2],
     policy: Mutex<bool>,
+    limits: Arc<UserNamespaceLimits>,
+    // From the immediate parent to the initial namespace, under each creator's UID.
+    charges: Vec<NamespaceCharge>,
+}
+pub(super) struct UserNamespaceLimits {
+    usage: Mutex<NamespaceUsage>,
+}
+struct NamespaceUsage {
+    max: u32,
+    by_uid: BTreeMap<u32, u32>,
+}
+impl UserNamespaceLimits {
+    fn new(max: u32) -> Self {
+        Self {
+            usage: Mutex::new(NamespaceUsage {
+                max,
+                by_uid: BTreeMap::new(),
+            }),
+        }
+    }
+    pub(super) fn max(&self) -> u32 {
+        self.usage.lock().unwrap().max
+    }
+    pub(super) fn set(&self, max: u32) {
+        self.usage.lock().unwrap().max = max;
+    }
+    fn charge(self: &Arc<Self>, uid: u32) -> Result<NamespaceCharge> {
+        let mut usage = self.usage.lock().unwrap();
+        let used = usage.by_uid.get(&uid).copied().unwrap_or(0);
+        if used >= usage.max {
+            return Err(Errno(28));
+        }
+        usage.by_uid.insert(uid, used + 1);
+        Ok(NamespaceCharge {
+            limits: self.clone(),
+            uid,
+        })
+    }
+}
+struct NamespaceCharge {
+    limits: Arc<UserNamespaceLimits>,
+    uid: u32,
+}
+impl Drop for NamespaceCharge {
+    fn drop(&mut self) {
+        let mut usage = self.limits.usage.lock().unwrap();
+        let users = &mut usage.by_uid;
+        let count = users.get_mut(&self.uid).expect("live namespace charge");
+        *count -= 1;
+        if *count == 0 {
+            users.remove(&self.uid);
+        }
+    }
 }
 #[derive(Clone, Copy)]
 struct Extent {
@@ -63,7 +116,7 @@ impl UserNamespace {
             at = parent;
         }
     }
-    pub fn create(credentials: &Credentials) -> Result<Self> {
+    fn create(credentials: &Credentials, limits: &Arc<UserNamespaceLimits>) -> Result<Self> {
         let parent = credentials.user_namespace.clone();
         let depth = parent.0.as_ref().map_or(1, |n| n.depth + 1);
         if depth > 32 {
@@ -73,6 +126,13 @@ impl UserNamespace {
             || parent.from_global(true, credentials.egid).is_none()
         {
             return Err(Errno(1));
+        }
+        let mut charges = Vec::with_capacity(depth as usize);
+        charges.push(limits.charge(credentials.euid)?);
+        if let Some(parent) = &parent.0 {
+            for ancestor in &parent.charges {
+                charges.push(ancestor.limits.charge(ancestor.uid)?);
+            }
         }
         let allowed = parent.groups_policy();
         let id = NEXT
@@ -86,6 +146,8 @@ impl UserNamespace {
             creator_setfcap: credentials.has_local_cap(31),
             maps: Default::default(),
             policy: Mutex::new(allowed),
+            limits: Arc::new(UserNamespaceLimits::new(i32::MAX as u32)),
+            charges,
         }))))
     }
     pub fn to_global(&self, group: bool, id: u32) -> Option<u32> {
@@ -352,6 +414,25 @@ impl MapFile {
 }
 
 impl Vfs {
+    pub(super) fn user_namespace_limits(&self) -> Arc<UserNamespaceLimits> {
+        if let Some(ns) = &self.credentials.user_namespace.0 {
+            return ns.limits.clone();
+        }
+        let pseudo = self.pseudo.borrow();
+        let root;
+        let owner = match &pseudo.publication {
+            Some(publication) => {
+                root = publication.borrow();
+                &*root
+            }
+            None => &*pseudo,
+        };
+        owner
+            .user_namespace_limits
+            .get_or_init(|| Arc::new(UserNamespaceLimits::new((MAX_TASKS / 2) as u32)))
+            .clone()
+    }
+
     pub fn unshare_user(&mut self) -> Result<()> {
         let paths = self.context.paths.borrow();
         if paths
@@ -363,7 +444,7 @@ impl Vfs {
             return Err(Errno(1));
         }
         drop(paths);
-        let namespace = UserNamespace::create(&self.credentials)?;
+        let namespace = UserNamespace::create(&self.credentials, &self.user_namespace_limits())?;
         self.credentials.enter_user_namespace(namespace);
         Ok(())
     }
@@ -452,7 +533,16 @@ mod tests {
     use super::*;
     fn child(parent: &Credentials) -> Credentials {
         let mut c = parent.clone();
-        c.enter_user_namespace(UserNamespace::create(parent).unwrap());
+        c.enter_user_namespace(
+            UserNamespace::create(
+                parent,
+                &parent.user_namespace.0.as_ref().map_or_else(
+                    || Arc::new(UserNamespaceLimits::new(1024)),
+                    |ns| ns.limits.clone(),
+                ),
+            )
+            .unwrap(),
+        );
         c
     }
     fn write(c: &Credentials, kind: MapKind, bytes: &[u8]) -> Result<usize> {
@@ -463,6 +553,59 @@ mod tests {
         write(c, MapKind::Groups, b"deny").unwrap();
         write(c, MapKind::Gid, format!("0 {gid} 1").as_bytes()).unwrap();
     }
+    #[test]
+    fn namespace_quota_is_per_user_and_environment_and_follows_live_handles() {
+        let root = Vfs::default();
+        root.user_namespace_limits().set(1);
+        let mut first = root.clone();
+        first.unshare_user().unwrap();
+        let handle = first.credentials.user_namespace.clone();
+        drop(first);
+        let mut retry = root.clone();
+        assert_eq!(retry.unshare_user(), Err(Errno(28)));
+
+        let mut different_user = root.clone();
+        different_user.credentials = Credentials::user(1000, 1000);
+        different_user.unshare_user().unwrap();
+        let mut independent = Vfs::default();
+        independent.user_namespace_limits().set(0);
+        assert_eq!(independent.unshare_user(), Err(Errno(28)));
+
+        root.user_namespace_limits().set(0);
+        drop(handle);
+        assert_eq!(retry.unshare_user(), Err(Errno(28)));
+        root.user_namespace_limits().set(1);
+        retry.unshare_user().unwrap();
+    }
+
+    #[test]
+    fn concurrent_namespace_creators_share_one_budget() {
+        let limits = Arc::new(UserNamespaceLimits::new(3));
+        let gate = std::sync::Barrier::new(9);
+        let admitted = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        gate.wait();
+                        UserNamespace::create(&Credentials::user(42, 42), &limits)
+                    })
+                })
+                .collect();
+            gate.wait();
+            threads
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(admitted.iter().filter(|r| r.is_ok()).count(), 3);
+        assert!(admitted
+            .iter()
+            .filter_map(|r| r.as_ref().err())
+            .all(|e| *e == Errno(28)));
+        drop(admitted);
+        assert!(limits.usage.lock().unwrap().by_uid.is_empty());
+    }
+
     #[test]
     fn user_namespace_authority_is_scoped_to_owned_descendants() {
         let parent = Credentials::user(1000, 1001);
@@ -620,7 +763,9 @@ mod tests {
             v.credentials.user_namespace
         );
         let mut outsider = Credentials::user(2000, 2000);
-        outsider.enter_user_namespace(UserNamespace::create(&outsider).unwrap());
+        outsider.enter_user_namespace(
+            UserNamespace::create(&outsider, &Arc::new(UserNamespaceLimits::new(1024))).unwrap(),
+        );
         assert_eq!(map.write(b"0 0 1", 0, &outsider), Err(Errno(1)));
     }
     #[test]

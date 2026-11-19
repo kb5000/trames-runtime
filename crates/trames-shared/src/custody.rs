@@ -13,6 +13,12 @@ struct State<T> {
     ready: Arc<Readiness>,
 }
 pub struct Custody<T>(Arc<State<T>>);
+pub struct WeakCustody<T>(std::sync::Weak<State<T>>);
+impl<T> WeakCustody<T> {
+    pub fn matches(&self, target: &Custody<T>) -> bool {
+        self.0.as_ptr() == Arc::as_ptr(&target.0)
+    }
+}
 impl<T> Clone for Custody<T> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
@@ -24,6 +30,9 @@ impl<T> Custody<T> {
             value: ReentrantMutex::new(RefCell::new(value)),
             ready: Arc::default(),
         }))
+    }
+    pub fn downgrade(&self) -> WeakCustody<T> {
+        WeakCustody(Arc::downgrade(&self.0))
     }
     pub fn same(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)

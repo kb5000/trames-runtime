@@ -166,6 +166,21 @@ impl State {
         family.presence.store(presence, Ordering::Relaxed);
         notices
     }
+    fn remove_family(&mut self, id: u32) -> Option<Entry> {
+        let entry = self.entries.remove(&id)?;
+        if let Some(parent) = entry
+            .parent
+            .upgrade()
+            .filter(|p| self.original(p).is_some())
+        {
+            self.entries
+                .get_mut(&parent.id.load(Ordering::Relaxed))
+                .unwrap()
+                .children
+                .remove(&id);
+        }
+        Some(entry)
+    }
     fn original(&self, family: &Arc<Family>) -> Option<&Entry> {
         self.entries
             .get(&family.id.load(Ordering::Relaxed))
@@ -303,6 +318,22 @@ impl Families {
         let _state = self.0.lock().unwrap();
         operation()
     }
+    /// Remove only this original completed and consumed family. Stale observers
+    /// and a replacement using its former numeric PID are independent.
+    pub fn prune_original(&self, family: &Arc<Family>) {
+        let removed = {
+            let mut state = self.0.lock().unwrap();
+            let Some(entry) = state.original(family) else {
+                return;
+            };
+            if family.live() || family.status().is_none() || entry.binding.presence.present() {
+                return;
+            }
+            let id = entry.binding.id;
+            state.remove_family(id)
+        };
+        drop(removed);
+    }
     pub fn prune(&self) {
         let removed = {
             let mut state = self.0.lock().unwrap();
@@ -316,25 +347,9 @@ impl Families {
                     .then_some(id)
                 })
                 .collect();
-            let mut removed = Vec::new();
-            for id in ids {
-                if let Some(entry) = state.entries.remove(&id) {
-                    if let Some(parent) = entry
-                        .parent
-                        .upgrade()
-                        .filter(|f| state.original(f).is_some())
-                    {
-                        state
-                            .entries
-                            .get_mut(&parent.id.load(Ordering::Relaxed))
-                            .unwrap()
-                            .children
-                            .remove(&id);
-                    }
-                    removed.push(entry);
-                }
-            }
-            removed
+            ids.into_iter()
+                .filter_map(|id| state.remove_family(id))
+                .collect::<Vec<_>>()
         };
         drop(removed);
     }

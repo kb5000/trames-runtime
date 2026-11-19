@@ -2524,6 +2524,11 @@ impl Vfs {
         let check_write = || -> Result<()> {
             if flags & O_PATH == 0 && (flags & 3 != 0 || flags & 0x200 != 0) {
                 p.writable()?;
+                if let Some(control @ sysctl::Control::UserNamespaces(..)) = &network_control {
+                    if !control.authorized(&self.credentials) {
+                        return Err(Errno(13));
+                    }
+                }
             }
             if oom.is_none()
                 && network_control.is_none()

@@ -902,6 +902,7 @@ pub struct RuntimeInfo {
 }
 #[derive(Default)]
 pub(super) struct PseudoFs {
+    pub(super) user_namespace_limits: std::sync::OnceLock<Arc<user_namespace::UserNamespaceLimits>>,
     pub(super) nr_open: DescriptorCeiling,
     pub(super) boot_id: Arc<std::sync::OnceLock<Result<Vec<u8>>>>,
     pub(super) video_device: Arc<std::sync::atomic::AtomicBool>,
@@ -1914,7 +1915,7 @@ impl Vfs {
             b"/sys/class/block" | b"/sys/devices/virtual/block" | b"/sys/devices/virtual/block/vda" |
             b"/sys/devices/virtual/block/vda/vda1" | b"/sys/devices/virtual/block/vda/queue" |
             b"/sys/dev" | b"/sys/dev/block" | b"/dev/block" | b"/proc/sys" |
-            b"/proc/sys/kernel" | b"/proc/sys/kernel/random" | b"/proc/sys/fs" | b"/proc/sys/vm" | b"/proc/sys/net" |
+            b"/proc/sys/kernel" | b"/proc/sys/kernel/random" | b"/proc/sys/fs" | b"/proc/sys/vm" | b"/proc/sys/user" | b"/proc/sys/net" |
             b"/proc/sys/net/ipv4" | b"/dev/pts" => return Ok(directory()),
             b"/dev/tty" => return Ok(Some((Content::Terminal, 0o20666))),
             b"/sys/devices/system/cpu/online"|b"/sys/devices/system/cpu/possible"|b"/sys/devices/system/cpu/present"=>return Ok(regular(if r.cpu_count.max(1)==1{b"0\n".to_vec()}else{format!("0-{}\n",r.cpu_count-1).into_bytes()})),
@@ -1989,6 +1990,7 @@ impl Vfs {
             b"/proc/sys/kernel/cap_last_cap" => return Ok(regular(format!("{}\n", capabilities::LAST).into_bytes())),
             b"/proc/sys/kernel/pid_max" => return Ok(regular(b"2147483647\n".to_vec())),
             b"/proc/sys/kernel/threads-max" => return Ok(regular(format!("{task_limit}\n").into_bytes())),
+            sysctl::MAX_USER_NAMESPACES => return Ok(Some((file(format!("{}\n", self.user_namespace_limits().max()).into_bytes()), 0o100644))),
             b"/proc/sys/fs/nr_open" => return Ok(Some((file(format!("{}\n", self.descriptor_ceiling().get()).into_bytes()), 0o100644))),
             b"/proc/sys/fs/file-max" => return Ok(regular(format!("{}\n", task_limit * MAX_FDS as usize).into_bytes())),
             b"/proc/sys/fs/file-nr" => return Ok(regular(format!("{}\t0\t{}\n", r.processes.iter().map(|p| p.fds.len()).sum::<usize>(), task_limit * MAX_FDS as usize).into_bytes())),
@@ -2757,7 +2759,7 @@ impl Vfs {
             b"/sys/class/net" | b"/sys/devices/virtual/net" => {
                 self.network_devices().into_iter().map(|d| d.name).collect()
             }
-            b"/proc/sys" => ["kernel", "fs", "vm", "net"]
+            b"/proc/sys" => ["kernel", "fs", "vm", "net", "user"]
                 .iter()
                 .map(|s| s.as_bytes().to_vec())
                 .collect(),
@@ -2777,6 +2779,7 @@ impl Vfs {
             .collect(),
             b"/proc/sys/kernel/random" => vec![b"uuid".to_vec(), b"boot_id".to_vec()],
             b"/proc/sys/fs" => vec![b"file-max".to_vec(), b"file-nr".to_vec()],
+            b"/proc/sys/user" => vec![b"max_user_namespaces".to_vec()],
             b"/proc/sys/vm" => vec![b"overcommit_memory".to_vec()],
             b"/proc/sys/net" => vec![b"ipv4".to_vec(), b"ipv6".to_vec(), b"bridge".to_vec()],
             b"/proc/sys/net/bridge" => vec![

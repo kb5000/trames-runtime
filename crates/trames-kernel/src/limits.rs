@@ -155,6 +155,19 @@ struct Target {
 #[derive(Default)]
 pub struct Directory(RwLock<BTreeMap<u32, Target>>);
 impl Directory {
+    pub fn retire(&self, pid: u32, original: &crate::task::Visibility) {
+        let removed = {
+            let mut entries = self.0.write().unwrap();
+            if !entries
+                .get(&pid)
+                .is_some_and(|t| t.presence.identity() == original.identity())
+            {
+                return;
+            }
+            entries.remove(&pid)
+        };
+        drop(removed);
+    }
     pub fn prune(&self) {
         self.0.write().unwrap().retain(|_, t| t.presence.present());
     }

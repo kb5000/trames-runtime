@@ -481,6 +481,13 @@ impl Vfs {
         {
             return Err(Errno(13));
         }
+        if mode & 2 != 0 && path.as_ref() == sysctl::MAX_USER_NAMESPACES && view.uses_pseudo(&path)
+        {
+            if mode & 1 == 0 && view.credentials.has_local_cap(capabilities::SYS_RESOURCE) {
+                return Ok(());
+            }
+            return Err(Errno(13));
+        }
         if view.allowed(&node.borrow(), mode) {
             Ok(())
         } else {

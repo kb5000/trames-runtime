@@ -23,7 +23,7 @@ pub(super) struct Birth {
     capacity: Arc<trames_kernel::task::Capacity>,
     resources: Arc<AtomicU64>,
     families: Arc<trames_kernel::family::Families>,
-    limits: Arc<trames_kernel::limits::Directory>,
+    pub(super) limits: Arc<trames_kernel::limits::Directory>,
     proc_source: Option<Arc<crate::proc_views::Source>>,
     pub(super) started: Instant,
     pub(super) memory_limits: super::super::MemoryLimits,

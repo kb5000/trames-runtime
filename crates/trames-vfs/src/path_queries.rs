@@ -427,6 +427,7 @@ impl PathQueries {
             let root = publication.borrow();
             Arc::new(SharedCell::new(pseudo::PseudoFs {
                 boot_id: root.boot_id.clone(),
+                user_namespace_limits: Default::default(), // Resolved through publication.
                 nr_open: root.nr_open.clone(),
                 video_device: root.video_device.clone(),
                 enabled: root.enabled,

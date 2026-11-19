@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 pub(super) struct Retiring<C: Cpu> {
     pid: u32,
     task: tasks::Handle<C>,
+    retain_final_registers: bool,
     original: Option<Arc<trames_kernel::signal::IoTask>>,
     status: i32,
     done: Option<Done<C>>,
@@ -220,7 +221,8 @@ mod tests {
             epoch.contains_memory(memory),
             "accepted pause still has a running CPU"
         );
-        assert!(k.processes.read(&3).signals.io.live());
+        let thread = k.processes.read(&3).signals.io.clone();
+        assert!(thread.live());
         assert!(original.try_exit(2, 27 << 8).is_some());
         let mut done = leader.finish(None, 0);
         done.thread_exit = Some(27 << 8);
@@ -229,8 +231,8 @@ mod tests {
         let root = epoch.take(0).unwrap();
         assert!(!epoch.contains_memory(memory));
         assert!(
-            !k.processes.read(&3).signals.io.live(),
-            "removed domain must wake its cold exit"
+            !thread.live() && k.processes.handle(&3).is_none(),
+            "removed domain must wake and retire its original thread"
         );
         assert_eq!(family.status(), Some(27 << 8));
         epoch.park(root, None);
@@ -284,6 +286,7 @@ impl<C: Cpu> Lifecycle<C> {
                     continue;
                 };
                 work.push(Retiring {
+                    retain_final_registers: false,
                     pid,
                     task,
                     original: Some(original),
@@ -342,6 +345,7 @@ impl<C: Cpu> Lifecycle<C> {
                 .take_source_retired()
                 .into_iter()
                 .map(|done| Retiring {
+                    retain_final_registers: false,
                     pid: done.pid,
                     task: done.task.as_ref().expect("original returned task").clone(),
                     original: None,
@@ -615,6 +619,17 @@ impl<C: Cpu> Lifecycle<C> {
                 epoch.complete();
             }
         }
+        if work.pid != 1 && !work.retain_final_registers {
+            if work.pid == p.tgid {
+                self.tasks
+                    .retire_on_wait(work.pid, &work.task, p, &self.birth.limits);
+            } else {
+                self.birth
+                    .limits
+                    .retire(work.pid, &p.signals.presence.visibility());
+                self.tasks.retire(work.pid, &work.task);
+            }
+        }
         self.tasks.restore(work.pid, work.pid, &custody);
         if let Some(done) = &mut work.done {
             self.report.lock().unwrap().workers.merge(done.take_stats());
@@ -636,6 +651,8 @@ impl<C: Cpu> Lifecycle<C> {
                 continue;
             }
             pending.push(Retiring {
+                // Session teardown preserves the CPU snapshot returned to the embedding.
+                retain_final_registers: true,
                 pid,
                 task,
                 original: Some(original),
@@ -685,6 +702,7 @@ impl<C: Cpu> Lifecycle<C> {
     }
     pub(super) fn retain_final_exit(&self, done: Done<C>) {
         self.retiring.lock().unwrap().push(Retiring {
+            retain_final_registers: false,
             pid: done.pid,
             task: done.task.as_ref().expect("original returned task").clone(),
             original: None,

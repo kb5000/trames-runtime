@@ -367,6 +367,43 @@ impl<C: Cpu> Directory<C> {
     pub fn retire(&self, id: u32, task: &Handle<C>) {
         self.remove_original(id, &task.0);
     }
+    pub fn retire_on_wait(
+        &self,
+        id: u32,
+        task: &Handle<C>,
+        process: &Process<C>,
+        limits: &Arc<trames_kernel::limits::Directory>,
+    ) {
+        let members = Arc::downgrade(&self.0);
+        let original = task.0.downgrade();
+        let family = Arc::downgrade(&process.family);
+        let limits = Arc::downgrade(limits);
+        let visibility = process.signals.presence.visibility();
+        process.wait_event.on_reap(Box::new(move || {
+            if let Some(limits) = limits.upgrade() {
+                limits.retire(id, &visibility);
+            }
+            if let Some(family) = family.upgrade() {
+                if let Some(registry) = family.registry() {
+                    registry.prune_original(&family);
+                }
+            }
+            if let Some(members) = members.upgrade() {
+                let removed = {
+                    let mut members = members.lock();
+                    if !members
+                        .tasks
+                        .get(&id)
+                        .is_some_and(|t| original.matches(&t.0))
+                    {
+                        return;
+                    }
+                    (members.remove(id), members.snapshot.take())
+                };
+                drop(removed);
+            }
+        }));
+    }
     pub fn restore(&self, from: u32, id: u32, task: &Write<C>) -> Option<Handle<C>> {
         let memory = task.memory.memory_report();
         let (replaced, snapshot) = {
