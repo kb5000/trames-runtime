@@ -1206,44 +1206,82 @@ impl Linux {
         Ok(address)
     }
     fn mremap(&mut self, a: [u64; 6], memory: &mut Memory) -> Result<u64> {
-        let old_len = Self::page_length(a[1])?;
+        let old = a[0];
+        let mut old_len = if a[1] == 0 {
+            0
+        } else {
+            Self::page_length(a[1])?
+        };
         let new_len = Self::page_length(a[2])?;
-        if a[3] & !3 != 0 || a[3] & 2 != 0 && a[3] & 1 == 0 {
+        let fixed = a[3] & 2 != 0;
+        let may_move = a[3] & 1 != 0;
+        let old_end = old.checked_add(old_len).ok_or(Errno(22))?;
+        if a[3] & !3 != 0
+            || fixed && !may_move
+            || !old.is_multiple_of(PAGE_SIZE)
+            || old_end > ADDRESS_LIMIT
+        {
             return Err(Errno(22));
         }
-        let reservation = memory.is_reserved(a[0], old_len);
-        let fixed = a[3] & 2 != 0;
+        if old >= ADDRESS_LIMIT || memory.is_free(old, PAGE_SIZE) {
+            return Err(Errno(14));
+        }
+        if fixed {
+            let dest = a[4];
+            let end = dest.checked_add(new_len).ok_or(Errno(22))?;
+            if !dest.is_multiple_of(PAGE_SIZE) || end > ADDRESS_LIMIT || dest < old_end && old < end
+            {
+                return Err(Errno(22));
+            }
+            // Linux 6.12 removes the destination before validating the surviving VMA.
+            memory.unmap(dest, new_len).map_err(Self::memory_errno)?;
+        }
+        if old_len >= new_len {
+            if old_len > new_len {
+                memory
+                    .unmap(old + new_len, old_len - new_len)
+                    .map_err(Self::memory_errno)?;
+            }
+            if !fixed {
+                return Ok(old);
+            }
+            old_len = new_len;
+        }
+        let reservation = memory.is_reserved(old, old_len);
         let address = if fixed {
             a[4]
-        } else if new_len <= old_len
-            || memory.is_free(
-                a[0].checked_add(old_len).ok_or(Errno(22))?,
-                new_len - old_len,
-            )
-        {
-            a[0]
-        } else if a[3] & 1 != 0 {
+        } else if old_len != 0 && memory.is_free(old_end, new_len - old_len) {
+            old
+        } else if may_move {
             let start = if reservation {
                 RESERVATION_BASE
             } else {
                 self.heap.cursor()
             };
             memory.find_free(start, new_len).ok_or(Errno(12))?
+        } else if old_len == 0 {
+            // Let the source distinguish private (EFAULT) from shared (ENOMEM).
+            old
         } else {
             return Err(Errno(12));
         };
         let tail_lock = if new_len > old_len {
-            let end = a[0].checked_add(old_len).ok_or(Errno(22))?;
-            memory.lock_mode_at(end - 1)
+            memory.lock_mode_at(if old_len == 0 { old } else { old_end - 1 })
         } else {
             None
         };
         if tail_lock.is_some() {
             self.admit_lock_growth(memory, new_len - old_len)?;
         }
-        memory
-            .remap(a[0], old_len, address, new_len, fixed)
-            .map_err(Self::memory_errno)?;
+        if old_len == 0 {
+            memory.alias_shared_mapping(old, address, new_len)
+        } else {
+            memory.remap(old, old_len, address, new_len, false)
+        }
+        .map_err(|error| match error {
+            MemoryError::Unmapped(_) => Errno(14),
+            other => Self::memory_errno(other),
+        })?;
         if tail_lock == Some(false) {
             let _ = memory.set_range_lock(address + old_len, new_len - old_len, tail_lock);
         }

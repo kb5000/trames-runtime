@@ -478,6 +478,48 @@ impl Memory {
         self.reclaim_unused();
         Ok(())
     }
+    /// Linux old_size == 0 duplicates the source VMA's backing and file offset.
+    /// The caller has already removed a fixed destination, even if that removed the source.
+    pub fn alias_shared_mapping(
+        &mut self,
+        old: u64,
+        new: u64,
+        len: u64,
+    ) -> Result<(), MemoryError> {
+        if let Some(mm) = &self.shared {
+            return mm.borrow_mut().alias_shared_mapping(old, new, len);
+        }
+        Self::mapping_end(old, PAGE_SIZE)?;
+        self.check_backed_mapping(new, len, false)?;
+        let page = self
+            .page_for_access_unchecked(old)
+            .ok_or(MemoryError::Unmapped(old))?;
+        let source = page
+            .backing
+            .as_ref()
+            .filter(|b| b.shared)
+            .ok_or(MemoryError::BackingIo(14))?;
+        if old == new {
+            return Err(MemoryError::Overlap(new));
+        }
+        let permissions = page.permissions;
+        let mut objects = Vec::with_capacity((len / PAGE_SIZE) as usize);
+        objects.push(source.object.clone());
+        for offset in 1..len / PAGE_SIZE {
+            objects.push(match self.attachments.extension(old + PAGE_SIZE, offset) {
+                Some(page) => page?,
+                None => source.object.next_page(offset)?,
+            });
+        }
+        let policy = self.vma_policy.moved(old, PAGE_SIZE, new, len);
+        let locks = self.locks.moved(old, PAGE_SIZE, new, len);
+        let attachments = self.attachments.moved(old, PAGE_SIZE, new, len);
+        self.map_backed(new, objects, true, permissions, false)?;
+        self.attachments.0.extend(attachments);
+        self.vma_policy.extend(policy);
+        self.locks.finish_move(new, len, new, len, locks);
+        Ok(())
+    }
     /// Transactional page-table movement; page bytes/backing identity are retained.
     pub fn remap(
         &mut self,
@@ -560,7 +602,7 @@ impl Memory {
                             || r.page.mapping != first.mapping)
                 })
             {
-                return Err(MemoryError::InvalidRange);
+                return Err(MemoryError::BackingIo(14));
             }
             if old == new && new_len > old_len && !self.is_free(old_end, new_len - old_len) {
                 return Err(MemoryError::Overlap(old_end));
@@ -622,7 +664,7 @@ impl Memory {
                 || p.permissions != permissions
                 || p.backing.is_some() != first_backed
         }) {
-            return Err(MemoryError::InvalidRange);
+            return Err(MemoryError::BackingIo(14));
         }
         let replaced = if old == new {
             old_len
@@ -695,11 +737,31 @@ impl Memory {
     }
 }
 
-struct AnonymousPage {
-    fixed_extent: bool,
-    bytes: std::sync::Arc<SharedPage>,
+struct AnonymousData {
+    bytes: Arc<SharedPage>,
     revision: AtomicU64,
     identity: u64,
+}
+impl AnonymousData {
+    fn zero() -> Self {
+        Self {
+            bytes: Arc::new(SharedPage::zero()),
+            revision: AtomicU64::new(0),
+            identity: new_backing_identity(),
+        }
+    }
+}
+
+struct AnonymousPage {
+    extent: Arc<[AnonymousData]>,
+    index: usize,
+    fixed_extent: bool,
+}
+impl std::ops::Deref for AnonymousPage {
+    type Target = AnonymousData;
+    fn deref(&self) -> &AnonymousData {
+        &self.extent[self.index]
+    }
 }
 impl AnonymousPage {
     fn new() -> Arc<Self> {
@@ -707,11 +769,57 @@ impl AnonymousPage {
     }
     fn with_extent(fixed_extent: bool) -> Arc<Self> {
         Arc::new(Self {
+            extent: Arc::new([AnonymousData::zero()]),
+            index: 0,
             fixed_extent,
-            bytes: std::sync::Arc::new(SharedPage::zero()),
-            revision: AtomicU64::new(0),
-            identity: new_backing_identity(),
         })
+    }
+}
+// A shared anonymous VMA has a fixed shmem object size. mremap may extend
+// its virtual range past EOF, and only an actual access there raises SIGBUS.
+struct BeyondAnonymousEnd {
+    object: u64,
+    index: u64,
+}
+impl PageBacking for BeyondAnonymousEnd {
+    fn parallel_key(&self) -> Option<(u64, u64)> {
+        Some((self.object, self.index))
+    }
+    fn parallel_versioned(&self) -> bool {
+        true
+    }
+    fn cpu_borrow_safe(&self) -> bool {
+        true
+    }
+    fn check(&self, address: u64) -> Result<(), MemoryError> {
+        Err(MemoryError::Bus(address))
+    }
+    fn read(&self, offset: usize, _: &mut [u8]) -> Result<(), MemoryError> {
+        Err(MemoryError::Bus(offset as u64))
+    }
+    fn write(&self, offset: usize, _: &[u8]) -> Result<(), MemoryError> {
+        Err(MemoryError::Bus(offset as u64))
+    }
+    fn sync(&self) -> Result<(), MemoryError> {
+        Ok(())
+    }
+    fn sync_required(&self) -> bool {
+        false
+    }
+    fn version(&self) -> u64 {
+        0
+    }
+    fn writable(&self) -> bool {
+        true
+    }
+    fn next_page(&self, pages: u64) -> Result<Arc<dyn PageBacking>, MemoryError> {
+        Ok(Arc::new(Self {
+            object: self.object,
+            index: self
+                .index
+                .checked_add(pages)
+                .ok_or(MemoryError::InvalidRange)?,
+        }))
     }
 }
 /// A named segment shares the ordinary anonymous page provider across independent
@@ -837,12 +945,27 @@ impl PageBacking for AnonymousPage {
     fn writable(&self) -> bool {
         true
     }
-    fn next_page(&self, _: u64) -> Result<Arc<dyn PageBacking>, MemoryError> {
+    fn next_page(&self, pages: u64) -> Result<Arc<dyn PageBacking>, MemoryError> {
         if self.fixed_extent {
-            Err(MemoryError::BackingIo(14))
-        } else {
-            Ok(Self::new())
+            return Err(MemoryError::BackingIo(14));
         }
+        let Some(index) = self
+            .index
+            .checked_add(pages as usize)
+            .filter(|&i| i < self.extent.len())
+        else {
+            return Ok(Arc::new(BeyondAnonymousEnd {
+                object: self.extent[0].identity,
+                index: (self.index as u64)
+                    .checked_add(pages)
+                    .ok_or(MemoryError::InvalidRange)?,
+            }));
+        };
+        Ok(Arc::new(Self {
+            extent: self.extent.clone(),
+            index,
+            fixed_extent: false,
+        }))
     }
 }
 impl Memory {
@@ -881,8 +1004,17 @@ impl Memory {
     ) -> Result<(), MemoryError> {
         Self::mapping_end(address, len)?;
         self.check_backed_mapping(address, len, fixed)?;
-        let objects = (0..len / PAGE_SIZE)
-            .map(|_| AnonymousPage::new() as Arc<dyn PageBacking>)
+        let extent: Arc<[AnonymousData]> = (0..len / PAGE_SIZE)
+            .map(|_| AnonymousData::zero())
+            .collect();
+        let objects = (0..extent.len())
+            .map(|index| {
+                Arc::new(AnonymousPage {
+                    extent: extent.clone(),
+                    index,
+                    fixed_extent: false,
+                }) as Arc<dyn PageBacking>
+            })
             .collect();
         self.map_backed(address, objects, true, permissions, fixed)
     }
@@ -904,6 +1036,33 @@ mod tests {
         assert_eq!(child.read_array::<8>(0x1000).unwrap(), [8; 8]);
         child.unmap(0x1000, PAGE_SIZE).unwrap();
         assert!(m.read_array::<8>(0x1000).is_ok());
+    }
+    #[test]
+    fn shared_alias_retains_original_offset_bytes_and_mapping_locks() {
+        let mut m = Memory::default();
+        let base = 0x10000;
+        let alias = 0x20000;
+        let p = PAGE_SIZE;
+        m.map_shared_anonymous(base, 3 * p, Permissions::RW, false)
+            .unwrap();
+        m.write_array(base + 2 * p, [37u8]).unwrap();
+        m.set_range_lock(base + p, p, Some(true)).unwrap();
+        m.alias_shared_mapping(base + p, alias, 3 * p).unwrap();
+        assert_eq!(m.lock_mode_at(base + p), Some(true));
+        assert_eq!(m.lock_mode_at(alias + 2 * p), Some(true));
+        m.write_array(alias, [11u8]).unwrap();
+        assert_eq!(m.read_array::<1>(base + p).unwrap(), [11]);
+        m.unmap(base, 3 * p).unwrap();
+        assert_eq!(m.read_array::<1>(alias + p).unwrap(), [37]);
+        assert_eq!(
+            m.read_array::<1>(alias + 2 * p),
+            Err(MemoryError::Bus(alias + 2 * p))
+        );
+        m.map(base, p, Permissions::RW).unwrap();
+        assert_eq!(
+            m.alias_shared_mapping(base, base + p, p),
+            Err(MemoryError::BackingIo(14))
+        );
     }
     #[test]
     fn failed_remap_is_atomic_and_success_preserves_bytes_and_zero_grows() {
