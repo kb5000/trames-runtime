@@ -68,7 +68,7 @@ impl Actions {
         changed: impl FnOnce(Action),
     ) -> Result<Option<Action>, Errno> {
         let signal = a[0] as u32;
-        if signal == 0 || signal > 64 || signal == 9 || signal == 19 || a[3] != 8 {
+        if signal == 0 || signal > 64 || a[1] != 0 && matches!(signal, 9 | 19) || a[3] != 8 {
             return Err(Errno(22));
         }
         if a[2] != 0 {
@@ -205,7 +205,18 @@ mod tests {
             Some(Ok(0))
         );
         assert_eq!(memory.read_u64(0x1100).unwrap(), 0x4000);
-        for signal in [0, 9, 19, 65] {
+        for signal in [9, 19] {
+            assert_eq!(
+                actions.query([signal, 0, 0x1100, 8, 0, 0], &mut memory),
+                Some(Ok(0))
+            );
+            assert_eq!(memory.read_array::<32>(0x1100).unwrap(), [0; 32]);
+            assert_eq!(
+                actions.call([signal, 0x1000, 0, 8, 0, 0], &mut memory),
+                Err(Errno(22))
+            );
+        }
+        for signal in [0, 65] {
             assert_eq!(
                 actions.query([signal, 0, 0, 8, 0, 0], &mut memory),
                 Some(Err(Errno(22)))

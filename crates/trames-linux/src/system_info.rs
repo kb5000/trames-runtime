@@ -26,7 +26,12 @@ pub fn sysinfo<M: CpuMemory>(
     let info = observe(memory)?;
     let mut out = [0; 112];
     for (offset, value) in [
-        (0, info.uptime.as_secs()),
+        (
+            0,
+            info.uptime
+                .as_secs()
+                .saturating_add(u64::from(info.uptime.subsec_nanos() != 0)),
+        ),
         (32, info.total as u64),
         (40, info.free as u64),
     ] {
@@ -84,7 +89,7 @@ mod tests {
         let out = memory.read_array::<112>(0x1000).unwrap();
         let mut expected = [0u8; 112];
         for (offset, value) in [
-            (0, 12u64),
+            (0, 13u64),
             (8, 81920),
             (16, 163840),
             (24, 32768),

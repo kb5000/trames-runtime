@@ -230,6 +230,8 @@ impl std::ops::Index<usize> for FdMask {
 pub const MAX_TASKS: usize = 65_536;
 pub const PIPE_CAPACITY: usize = 65536;
 pub const AT_FDCWD: i32 = -100;
+const O_CREAT: u32 = 0x40;
+const O_TRUNC: u32 = 0x200;
 pub const O_DIRECTORY: u32 = 0x4000;
 pub const O_NOFOLLOW: u32 = 0x8000;
 pub const O_DIRECT: u32 = 0x10000;
@@ -402,6 +404,7 @@ enum Content {
 type NodeRef = Arc<Inode>;
 struct Inode {
     proc_node: std::sync::OnceLock<proc_source::ProcNode>,
+    seq_file: bool,
     regular_file: bool,
     active_file_work: std::sync::atomic::AtomicUsize,
     layout: std::sync::OnceLock<Arc<trames_memory::layout::Layout>>,
@@ -430,6 +433,7 @@ impl Inode {
         }
         node.identity = trames_memory::new_backing_identity();
         Self {
+            seq_file: false,
             regular_file: !node.volatile && matches!(node.content, Content::File(_)),
             proc_node: Default::default(),
             active_file_work: std::sync::atomic::AtomicUsize::new(0),
@@ -2259,8 +2263,8 @@ impl Vfs {
     }
     pub fn mknod_at(&mut self, dirfd: i32, path: &[u8], mode: u32, device: u64) -> Result<()> {
         let type_ = mode & 0o170000;
-        if !matches!(type_, 0 | 0o100000 | 0o10000 | 0o20000 | 0o60000) {
-            return Err(Errno(if type_ == 0o140000 { 95 } else { 22 }));
+        if !matches!(type_, 0 | 0o100000 | 0o10000 | 0o20000 | 0o60000 | 0o140000) {
+            return Err(Errno(22));
         }
         let p = self.resolve_final(dirfd, path, false)?;
         match self.node(&p) {
@@ -2278,6 +2282,7 @@ impl Vfs {
                 // Linux's syscall ABI accepts an unsigned 32-bit new_encode_dev.
                 pseudo::Device::node(device as u32, type_ == 0o60000)
             }
+            0o140000 => Content::Socket(ipc::PathBinding::default()),
             0o10000 => Content::Fifo(Pipe::new(self.open_id())),
             _ => Content::File(self.empty_data_at(&p)?),
         };
@@ -2456,7 +2461,10 @@ impl Vfs {
         } else {
             flags
         };
-        if flags & !ALLOWED != 0 || flags & 3 == 3 {
+        if flags & !ALLOWED != 0
+            || flags & 3 == 3
+            || flags & (O_CREAT | O_DIRECTORY) == (O_CREAT | O_DIRECTORY)
+        {
             return Err(Errno(22));
         }
         if flags & 0x40 != 0 && path.last() == Some(&b'/') {
@@ -2553,10 +2561,8 @@ impl Vfs {
                 if flags & 0xc0 == 0xc0 {
                     return Err(Errno(17));
                 }
-                if flags & O_PATH == 0
-                    && flags & (3 | 0x240) != 0
+                if flags & (3 | O_CREAT | O_TRUNC) != 0
                     && matches!(node.borrow().content, Content::Directory)
-                    && self.proc_task_directory(&p)
                 {
                     return Err(Errno(21));
                 }
@@ -2679,7 +2685,7 @@ impl Vfs {
             if matches!(n.content, Content::Symlink(_)) && flags & O_PATH == 0 {
                 return Err(Errno(if flags & O_DIRECTORY != 0 { 20 } else { 40 }));
             }
-            if matches!(n.content, Content::Directory) && flags & 3 != 0 {
+            if matches!(n.content, Content::Directory) && flags & (3 | O_CREAT | O_TRUNC) != 0 {
                 return Err(Errno(21));
             }
             if matches!(n.content, Content::Directory)
@@ -3740,6 +3746,10 @@ impl Vfs {
         let n = node.borrow();
         if let Some(log) = &o.kernel_log {
             return log.seek(offset, whence);
+        }
+        if whence == 2 && (node.seq_file || !n.volatile && matches!(n.content, Content::Directory))
+        {
+            return Err(Errno(22));
         }
         let length = if o.oom.is_some() {
             0

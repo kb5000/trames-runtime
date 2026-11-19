@@ -1063,7 +1063,7 @@ impl PseudoFs {
             nodes.identities.insert(key, identity);
         }
         nodes.next_inode = nodes.next_inode.checked_add(1).ok_or(Errno(28))?;
-        let node = Arc::new(Inode::new(Node {
+        let mut inode = Inode::new(Node {
             identity: 0,
             record_locks: std::sync::OnceLock::new(),
             whole_locks: std::sync::OnceLock::new(),
@@ -1094,7 +1094,23 @@ impl PseudoFs {
             times: [storage::Timestamp::default(); 3],
             xattrs: BTreeMap::new(),
             seals: None,
-        }));
+        });
+        // seq_lseek accepts SET and CUR, even when the rendered text has a known length.
+        inode.seq_file = matches!(
+            path,
+            b"/proc/stat"
+                | b"/proc/meminfo"
+                | b"/proc/uptime"
+                | b"/proc/cpuinfo"
+                | b"/proc/swaps"
+                | b"/proc/partitions"
+                | b"/proc/devices"
+                | b"/proc/diskstats"
+                | b"/proc/version"
+                | b"/proc/cmdline"
+                | b"/proc/loadavg"
+        );
+        let node = Arc::new(inode);
         nodes.entries.insert((ns, path.to_vec()), node.clone());
         Ok(CachedNode {
             node,
