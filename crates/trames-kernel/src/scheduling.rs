@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Guest affinity and ready-queue policy; no execution engine or host threads.
 use std::sync::{
-    atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicU32, AtomicU64, Ordering},
     Arc,
 };
 
@@ -16,16 +16,17 @@ pub(crate) struct Authority {
 /// Single-field guest updates use relaxed atomics; there is no host priority change.
 pub struct Attributes {
     affinity: AtomicU64,
-    nice: AtomicI32,
-    policy: AtomicU32,
+    // High word: policy. Low word: signed nice. sched_setattr changes both.
+    cpu: AtomicU64,
+    io: AtomicU32,
     credentials: Arc<trames_vfs::CredentialState>,
 }
 impl Default for Attributes {
     fn default() -> Self {
         Self {
             affinity: AtomicU64::new(u64::MAX),
-            nice: AtomicI32::new(0),
-            policy: AtomicU32::new(0),
+            cpu: AtomicU64::new(0),
+            io: AtomicU32::new(NO_IO_CONTEXT),
             credentials: Arc::default(),
         }
     }
@@ -40,22 +41,56 @@ impl Attributes {
     pub fn replace_affinity(&self, mask: u64) -> bool {
         self.affinity.swap(mask, Ordering::Relaxed) != mask
     }
+    pub(crate) fn cpu(&self) -> (u32, i32) {
+        let value = self.cpu.load(Ordering::Relaxed);
+        ((value >> 32) as u32, value as i32)
+    }
+    pub(crate) fn update_cpu(&self, update: impl Fn(u32, i32) -> Option<(u32, i32)>) -> bool {
+        self.cpu
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                let (policy, nice) = update((value >> 32) as u32, value as i32)?;
+                Some((u64::from(policy) << 32) | u64::from(nice as u32))
+            })
+            .is_ok()
+    }
     pub fn nice(&self) -> i32 {
-        self.nice.load(Ordering::Relaxed)
+        self.cpu().1
     }
     pub fn set_nice(&self, nice: i32) {
-        self.nice.store(nice, Ordering::Relaxed);
+        self.update_cpu(|policy, _| Some((policy, nice)));
     }
     pub fn policy(&self) -> u32 {
-        self.policy.load(Ordering::Relaxed)
+        self.cpu().0 & !RESET_ON_FORK
     }
-    pub fn set_policy(&self, policy: u32) {
-        self.policy.store(policy, Ordering::Relaxed);
+    pub(crate) fn io_priority(&self, effective: bool) -> u32 {
+        let priority = self.io.load(Ordering::Relaxed);
+        if priority == NO_IO_CONTEXT {
+            return 0;
+        }
+        if effective && priority >> 13 == 0 {
+            let (policy, nice) = self.cpu();
+            let class = if policy & !RESET_ON_FORK == 5 { 3 } else { 2 };
+            return class << 13 | ((nice + 20) / 5) as u32;
+        }
+        priority
+    }
+    pub(crate) fn set_io_priority(&self, priority: u32) {
+        self.io.store(priority, Ordering::Relaxed);
     }
     pub fn inherit(&self, parent: &Self) {
         self.set_affinity(parent.affinity());
-        self.set_nice(parent.nice());
-        self.set_policy(parent.policy());
+        let (policy, mut nice) = parent.cpu();
+        if policy & RESET_ON_FORK != 0 {
+            nice = nice.max(0);
+        }
+        self.cpu.store(
+            (u64::from(policy & !RESET_ON_FORK) << 32) | u64::from(nice as u32),
+            Ordering::Relaxed,
+        );
+        let priority = parent.io_priority(false);
+        if priority >> 13 != 0 {
+            self.set_io_priority(priority);
+        }
     }
     pub fn credentials(&self) -> &Arc<trames_vfs::CredentialState> {
         &self.credentials
@@ -74,28 +109,11 @@ impl Attributes {
     }
 }
 
-/// Existing virtual I/O-priority query: CLASS_NONE, with original task
-/// presence supplied by the caller. The host scheduler is never consulted.
-pub fn ioprio_get(
-    which: u64,
-    who: u64,
-    present: impl FnOnce(u32) -> Result<bool, trames_vfs::Errno>,
-) -> Result<u64, trames_vfs::Errno> {
-    if !(1..=3).contains(&which) || (who as i32) < 0 {
-        return Err(trames_vfs::Errno(22));
-    }
-    if which != 1 {
-        return Err(trames_vfs::Errno(95));
-    }
-    if who as u32 == 0 || present(who as u32)? {
-        Ok(0)
-    } else {
-        Err(trames_vfs::Errno(3))
-    }
-}
+pub(crate) const RESET_ON_FORK: u32 = 0x4000_0000;
+const NO_IO_CONTEXT: u32 = u32::MAX;
 
 pub fn call(number: u32) -> bool {
-    matches!(number, 31 | 118..=123 | 125..=127 | 140 | 141 | 274 | 275)
+    matches!(number, 30 | 31 | 118..=123 | 125..=127 | 140 | 141 | 274 | 275)
 }
 
 /// Preserve round-robin queue priority while relocating an earlier flexible

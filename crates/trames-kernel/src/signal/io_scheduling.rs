@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Source/owner scheduling ABI over original task identities and attributes.
 use super::*;
+use crate::scheduling::RESET_ON_FORK;
 
 impl IoRoutes {
     fn schedule_target(&self, source: &Arc<IoTask>, pid: u32) -> Result<Arc<IoTask>, Errno> {
@@ -14,7 +15,7 @@ impl IoRoutes {
         self.directory
             .tasks(0, id)
             .into_iter()
-            .find(|t| t.live())
+            .next()
             .ok_or(Errno(3))
     }
     fn priority_targets(
@@ -25,14 +26,9 @@ impl IoRoutes {
     ) -> Result<Vec<Arc<IoTask>>, Errno> {
         let mut tasks = match which {
             0 if who == 0 => vec![source.clone()],
-            0 => {
-                let id = if who == 0 {
-                    source.pid.load(Ordering::Relaxed)
-                } else {
-                    self.namespace.global(who).ok_or(Errno(3))?
-                };
-                self.directory.tasks(0, id)
-            }
+            0 => self
+                .directory
+                .tasks(0, self.namespace.global(who).ok_or(Errno(3))?),
             1 => {
                 let id = if who == 0 {
                     source.group()
@@ -42,10 +38,13 @@ impl IoRoutes {
                 self.directory.tasks(2, id)
             }
             2 => {
-                let uid = if who == 0 {
-                    source.scheduling.authority().uid
-                } else {
-                    who
+                let uid = {
+                    let cred = source.credentials().read();
+                    if who == 0 {
+                        cred.uid
+                    } else {
+                        cred.mapped_id(false, who).map_err(|_| Errno(3))?
+                    }
                 };
                 let ids: Vec<_> = self
                     .directory
@@ -77,6 +76,42 @@ impl IoRoutes {
         } else {
             Ok(tasks)
         }
+    }
+    fn io_priority(&self, source: &Arc<IoTask>, number: u32, a: [u64; 6]) -> Result<u64, Errno> {
+        let which = a[0] as u32;
+        let priority = u32::from(a[2] as u16);
+        if number == 30 {
+            let caller = source.credentials().read();
+            match priority >> 13 {
+                0 if priority & 7 != 0 => return Err(Errno(22)),
+                1 if !caller.has_cap(trames_vfs::capabilities::SYS_ADMIN)
+                    && !caller.has_cap(trames_vfs::capabilities::SYS_NICE) =>
+                {
+                    return Err(Errno(1))
+                }
+                0..=3 => {}
+                _ => return Err(Errno(22)),
+            }
+        }
+        let targets = self.priority_targets(source, which.wrapping_sub(1), a[1] as u32)?;
+        if number == 31 {
+            return Ok(u64::from(
+                targets
+                    .iter()
+                    .map(|t| t.scheduling.io_priority(which != 1))
+                    .min()
+                    .ok_or(Errno(3))?,
+            ));
+        }
+        let caller = source.scheduling.authority();
+        for target in targets {
+            let uid = target.scheduling.authority().uid;
+            if !caller.privileged && uid != caller.uid && uid != caller.euid {
+                return Err(Errno(1));
+            }
+            target.scheduling.set_io_priority(priority);
+        }
+        Ok(0)
     }
     pub fn scheduling(
         &self,
@@ -110,12 +145,27 @@ impl IoRoutes {
         memory: &mut impl CpuMemory,
         migration: &mut Option<Arc<crate::completion::Completion>>,
     ) -> Result<u64, Errno> {
-        if number == 31 {
-            return crate::scheduling::ioprio_get(a[0], a[1], |who| {
-                let global = self.namespace.global(who).ok_or(Errno(3))?;
-                Ok(global == source.pid.load(Ordering::Relaxed)
-                    || self.directory.proc_task(global).is_some())
-            });
+        if matches!(number, 30 | 31) {
+            return self.io_priority(source, number, a);
+        }
+        if matches!(number, 274 | 275) {
+            if (a[0] as i32) < 0 || a[1] == 0 {
+                return Err(Errno(22));
+            }
+            if number == 274 {
+                if a[2] as u32 != 0 {
+                    return Err(Errno(22));
+                }
+                let attr = FairAttr::read(memory, a[1])?;
+                let target = self.schedule_target(source, a[0] as u32)?;
+                return attr.apply(source, &target);
+            }
+            let size = a[2] as u32;
+            if !(FairAttr::SIZE..=4096).contains(&size) || a[3] as u32 != 0 {
+                return Err(Errno(22));
+            }
+            let target = self.schedule_target(source, a[0] as u32)?;
+            return FairAttr::write(&target, memory, a[1]);
         }
         if matches!(number, 125 | 126) {
             return match a[0] as u32 {
@@ -126,7 +176,7 @@ impl IoRoutes {
         }
         // Retain the existing unsupported interfaces as terminal ABI results,
         // without joining the cohort just to produce ENOSYS.
-        if matches!(number, 127 | 274 | 275) {
+        if number == 127 {
             return Err(Errno(38));
         }
         if matches!(number, 140 | 141) {
@@ -159,33 +209,27 @@ impl IoRoutes {
             return error.map_or(Ok(0), Err);
         }
         let target = self.schedule_target(source, a[0] as u32)?;
-        if matches!(number, 118 | 119 | 122) {
-            let caller = source.scheduling.authority();
-            let auth = target.scheduling.authority();
-            if !caller.privileged
-                && ((caller.euid != auth.uid && caller.euid != auth.euid)
-                    || auth.permitted & !caller.permitted != 0)
-            {
-                return Err(Errno(1));
-            }
+        if matches!(number, 118..=119 | 121) && (if number == 119 { a[2] } else { a[1] }) == 0 {
+            return Err(Errno(22));
+        }
+        if number == 122 {
+            check_scheduler_owner(source, &target)?;
         }
         match number {
             118 | 119 => {
                 let pointer = if number == 118 { a[1] } else { a[2] };
                 let priority =
                     i32::from_le_bytes(memory.read_array::<4>(pointer).map_err(|_| Errno(14))?);
-                if number == 119 && !matches!(a[1] as u32, 0 | 3 | 5) {
-                    return Err(Errno(if matches!(a[1] as u32, 1 | 2) { 95 } else { 22 }));
-                }
-                if priority != 0 {
-                    return Err(Errno(22));
-                }
-                if number == 119 {
-                    target.scheduling.set_policy(a[1] as u32);
-                }
-                Ok(0)
+                let requested = (number == 119).then_some(a[1] as u32);
+                let attr = FairAttr {
+                    policy: requested.map(|p| p & !RESET_ON_FORK),
+                    reset: requested.map(|p| p & RESET_ON_FORK != 0),
+                    nice: None,
+                    priority: priority as u32,
+                };
+                attr.apply(source, &target)
             }
-            120 => Ok(target.scheduling.policy() as u64),
+            120 => Ok(target.scheduling.cpu().0 as u64),
             121 => memory
                 .write_array(a[1], 0u32.to_le_bytes())
                 .map(|()| 0)
@@ -211,7 +255,7 @@ impl IoRoutes {
                 Ok(0)
             }
             123 => {
-                if a[1] < 8 {
+                if a[1] < 8 || a[1] & 7 != 0 {
                     return Err(Errno(22));
                 }
                 memory
@@ -221,6 +265,139 @@ impl IoRoutes {
             }
             _ => Err(Errno(38)),
         }
+    }
+}
+
+fn check_scheduler_owner(source: &IoTask, target: &IoTask) -> Result<bool, Errno> {
+    let caller = source.scheduling.authority();
+    let auth = target.scheduling.authority();
+    if !caller.privileged
+        && ((caller.euid != auth.uid && caller.euid != auth.euid)
+            || auth.permitted & !caller.permitted != 0)
+    {
+        return Err(Errno(1));
+    }
+    Ok(caller.privileged)
+}
+
+// Linux sched_attr version 0. Newer zero-filled tails are accepted so callers
+// built with utilization-clamp fields can still use the supported fair policies.
+struct FairAttr {
+    policy: Option<u32>,
+    reset: Option<bool>,
+    nice: Option<i32>,
+    priority: u32,
+}
+impl FairAttr {
+    const SIZE: u32 = 48;
+
+    fn read(memory: &mut impl CpuMemory, addr: u64) -> Result<Self, Errno> {
+        let mut size = u32::from_le_bytes(memory.read_array(addr).map_err(|_| Errno(14))?);
+        if size == 0 {
+            size = Self::SIZE;
+        }
+        let mut incompatible = !(Self::SIZE..=4096).contains(&size);
+        if !incompatible && size > Self::SIZE {
+            let mut offset = Self::SIZE;
+            let mut tail = [0u8; 64];
+            while offset < size {
+                let n = ((size - offset) as usize).min(tail.len());
+                memory
+                    .read(
+                        addr.checked_add(u64::from(offset)).ok_or(Errno(14))?,
+                        &mut tail[..n],
+                    )
+                    .map_err(|_| Errno(14))?;
+                if tail[..n].iter().any(|&byte| byte != 0) {
+                    incompatible = true;
+                    break;
+                }
+                offset += n as u32;
+            }
+        }
+        if incompatible {
+            memory
+                .write_array(addr, Self::SIZE.to_le_bytes())
+                .map_err(|_| Errno(14))?;
+            return Err(Errno(7));
+        }
+        let bytes: [u8; 48] = memory.read_array(addr).map_err(|_| Errno(14))?;
+        let word = |i: usize| u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
+        let flags = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        const RESET: u64 = 1;
+        const KEEP_POLICY: u64 = 8;
+        const KEEP_PARAMS: u64 = 16;
+        if flags & !(RESET | KEEP_POLICY | KEEP_PARAMS) != 0 {
+            return Err(Errno(22));
+        }
+        let policy = (flags & KEEP_POLICY == 0).then(|| word(4));
+        if policy == Some(6) {
+            let value = |i: usize| u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
+            let (runtime, deadline, period) = (value(24), value(32), value(40));
+            return Err(Errno(
+                if runtime < 1024
+                    || runtime > deadline
+                    || (period != 0 && deadline > period)
+                    || deadline as i64 <= 0
+                    || (period as i64) < 0
+                {
+                    22
+                } else {
+                    95
+                },
+            ));
+        }
+        Ok(Self {
+            policy,
+            reset: Some(flags & RESET != 0),
+            nice: (flags & KEEP_PARAMS == 0).then(|| (word(16) as i32).clamp(-20, 19)),
+            priority: word(20),
+        })
+    }
+
+    fn apply(&self, source: &IoTask, target: &IoTask) -> Result<u64, Errno> {
+        match self.policy {
+            Some(1 | 2) if (1..=99).contains(&self.priority) => return Err(Errno(95)),
+            Some(0 | 3 | 5) | None if self.priority == 0 => {}
+            _ => return Err(Errno(22)),
+        }
+        let privileged = check_scheduler_owner(source, target)?;
+        let limit = target
+            .proc_limits
+            .get()
+            .map_or(0, |limits| limits.get(13).0);
+        let ok = target.scheduling.update_cpu(|old, old_nice| {
+            let old_policy = old & !RESET_ON_FORK;
+            let policy = self.policy.unwrap_or(old_policy);
+            let nice = self.nice.unwrap_or(old_nice);
+            let reset = self.reset.unwrap_or(old & RESET_ON_FORK != 0);
+            if !privileged
+                && ((!reset && old & RESET_ON_FORK != 0)
+                    || (nice < old_nice && (20 - nice) as u64 > limit)
+                    || (old_policy == 5 && policy != 5 && (20 - old_nice) as u64 > limit))
+            {
+                return None;
+            }
+            Some((policy | if reset { RESET_ON_FORK } else { 0 }, nice))
+        });
+        if ok {
+            Ok(0)
+        } else {
+            Err(Errno(1))
+        }
+    }
+
+    fn write(target: &IoTask, memory: &mut impl CpuMemory, addr: u64) -> Result<u64, Errno> {
+        let (policy, nice) = target.scheduling.cpu();
+        let mut bytes = [0; Self::SIZE as usize];
+        bytes[..4].copy_from_slice(&Self::SIZE.to_le_bytes());
+        bytes[4..8].copy_from_slice(&(policy & !RESET_ON_FORK).to_le_bytes());
+        bytes[8..16].copy_from_slice(&u64::from(policy & RESET_ON_FORK != 0).to_le_bytes());
+        bytes[16..20].copy_from_slice(&nice.to_le_bytes());
+        memory
+            .write(addr, &bytes)
+            .map(|()| 0)
+            .map_err(|_| Errno(14))
     }
 }
 
@@ -247,6 +424,54 @@ mod tests {
         let mut memory = Memory::default();
         memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         memory
+    }
+    #[test]
+    fn reset_on_fork_and_io_priority_follow_the_original_task() {
+        let routes = IoRoutes::default();
+        let parent = task(&routes.directory, 7, 7, 0);
+        let peer = task(&routes.directory, 8, 7, 0);
+        let mut memory = memory();
+        let call = |n, a, m: &mut Memory| routes.scheduling(&parent.io, 4, n, a, m);
+        memory.write_array(0x1000, 56u32.to_le_bytes()).unwrap();
+        memory.write_array(0x1004, 3u32.to_le_bytes()).unwrap();
+        memory.write_array(0x1008, 1u64.to_le_bytes()).unwrap();
+        memory.write_array(0x1010, (-5i32).to_le_bytes()).unwrap();
+        assert_eq!(call(274, [0, 0x1000, 0, 0, 0, 0], &mut memory), Ok(0));
+        assert_eq!(
+            call(120, [0; 6], &mut memory),
+            Ok(u64::from(RESET_ON_FORK | 3))
+        );
+        assert_eq!(call(30, [2, 0, 0x4006, 0, 0, 0], &mut memory), Ok(0));
+        assert_eq!(call(30, [1, 8, 0x4003, 0, 0, 0], &mut memory), Ok(0));
+        assert_eq!(call(31, [3, 0, 0, 0, 0, 0], &mut memory), Ok(0x4003));
+        assert_eq!(peer.io.scheduling.io_priority(false), 0x4003);
+        let child = parent.fork(false);
+        assert_eq!(parent.io.scheduling.cpu(), (RESET_ON_FORK | 3, -5));
+        assert_eq!(child.io.scheduling.cpu(), (3, 0));
+        assert_eq!(child.io.scheduling.io_priority(false), 0x4006);
+        child.io.scheduling.set_io_priority(0x6000);
+        assert_eq!(parent.io.scheduling.io_priority(false), 0x4006);
+        assert_eq!(call(275, [0, 0x1fd0, 56, 0, 0, 0], &mut memory), Ok(0));
+        assert_eq!(
+            call(275, [0, 0x1fd1, 48, 0, 0, 0], &mut memory),
+            Err(Errno(14))
+        );
+    }
+    #[test]
+    fn scheduler_attributes_preserve_nice_limit_and_size_negotiation() {
+        let routes = IoRoutes::default();
+        let caller = task(&routes.directory, 4, 4, 1000);
+        let mut memory = memory();
+        let set =
+            |m: &mut Memory| routes.scheduling(&caller.io, 4, 274, [0, 0x1000, 0, 0, 0, 0], m);
+        memory.write_array(0x1000, 64u32.to_le_bytes()).unwrap();
+        memory.write_array(0x103c, 1u32.to_le_bytes()).unwrap();
+        assert_eq!(set(&mut memory), Err(Errno(7)));
+        assert_eq!(u32::from_le_bytes(memory.read_array(0x1000).unwrap()), 48);
+        memory.write_array(0x1004, 3u32.to_le_bytes()).unwrap();
+        memory.write_array(0x1010, (-1i32).to_le_bytes()).unwrap();
+        assert_eq!(set(&mut memory), Err(Errno(1)));
+        assert_eq!(caller.io.scheduling.cpu(), (0, 0));
     }
     #[test]
     fn priority_keeps_original_zombie_authority_until_reaped_without_a_cpu() {
@@ -305,8 +530,9 @@ mod tests {
         assert_eq!(call(123, [0, 8, 0x1000, 0, 0, 0], &mut memory), Ok(8));
         assert_eq!(u64::from_le_bytes(memory.read_array(0x1000).unwrap()), 2);
         assert_eq!(target.io.scheduling.affinity(), 15);
-        for number in [127, 274, 275] {
-            assert_eq!(call(number, [0; 6], &mut memory), Err(Errno(38)));
+        assert_eq!(call(127, [0; 6], &mut memory), Err(Errno(38)));
+        for number in [274, 275] {
+            assert_eq!(call(number, [0; 6], &mut memory), Err(Errno(22)));
         }
         for (policy, max, min) in [
             (0, 0, 0),
@@ -342,7 +568,7 @@ mod tests {
             routes.scheduling(&source.io, 4, 140, [2, 0, 0, 0, 0, 0], &mut memory),
             Err(Errno(13))
         );
-        source.io.scheduling.set_policy(3);
+        assert!(source.io.scheduling.update_cpu(|_, nice| Some((3, nice))));
         source.io.scheduling.set_affinity(2);
         let child = source.fork(false);
         assert_eq!(
@@ -424,6 +650,11 @@ mod tests {
         assert_eq!(outside.io.scheduling.nice(), 0);
         let original = routes.schedule_target(&source.io, 2).unwrap();
         peer.io.exit();
+        assert_eq!(
+            routes.scheduling(&source.io, 4, 120, [2, 0, 0, 0, 0, 0], &mut memory),
+            Ok(0)
+        );
+        peer.presence.visibility().reap();
         assert_eq!(
             routes.scheduling(&source.io, 4, 120, [2, 0, 0, 0, 0, 0], &mut memory),
             Err(Errno(3))

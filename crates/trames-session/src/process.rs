@@ -2306,7 +2306,6 @@ impl<C: Cpu> Kernel<C> {
                     })
                 }).expect("legacy statistics available").map(Some)
             },
-            31 => self.ioprio_get(pid, p, a[0], a[1]).map(Some),
             132 => Self::sigaltstack(p, a[0], a[1]).map(Some),
             283 => Self::membarrier(p, a[0], a[1]).map(Some),
             163 | 164 | 261 => self.rlimit(pid, p, number, a).map(Some),

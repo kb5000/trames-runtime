@@ -42,20 +42,6 @@ impl<C: Cpu> Kernel<C> {
             }
         }
     }
-    #[cfg(all(test, trames_interpreter_conformance))]
-    pub(super) fn ioprio_get(
-        &self,
-        pid: u32,
-        p: &Process<C>,
-        which: u64,
-        who: u64,
-    ) -> Result<u64, Errno> {
-        trames_kernel::scheduling::ioprio_get(which, who, |who| {
-            let target = p.linux.vfs.global_pid(who)?;
-            Ok(target == pid || self.processes.contains_key(&target))
-        })
-    }
-
     pub(super) fn fixed_limits(&self) -> trames_kernel::limits::Fixed {
         trames_kernel::limits::Fixed {
             address_space: if self.memory_limits.is_host_managed() {
@@ -431,10 +417,6 @@ mod tests {
         assert_eq!(Kernel::membarrier(&p, 16, 0), Ok(0));
         assert_eq!(Kernel::membarrier(&p.fork(), 512, 0), Ok(16));
         assert_eq!(Kernel::membarrier(&p, 32, 0), Err(Errno(22)));
-        let k = kernel();
-        assert_eq!(k.ioprio_get(1, &p, 1, 1), Ok(0));
-        assert_eq!(k.ioprio_get(1, &p, 1, 200), Err(Errno(3)));
-        assert_eq!(k.ioprio_get(1, &p, 3, 0), Err(Errno(95)));
     }
     #[test]
     fn file_size_limit_changes_are_atomic_and_hard_limit_is_privileged() {

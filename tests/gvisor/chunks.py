@@ -61,7 +61,10 @@ def xml_rows(xml, code, expected):
 
 def run(args,output,plan,env,runner,name,store,snapshot,cache,timeout):
     rows=[];serial=0;started=time.monotonic();disk_stopped=False
-    single=set();remaining_budget=lambda: not args.time_budget or time.monotonic()-started<args.time_budget
+    # Affinity cases narrow the test process's mask without restoring it. A
+    # later case must start with the environment's full configured CPU set.
+    single={'affinity'}
+    remaining_budget=lambda: not args.time_budget or time.monotonic()-started<args.time_budget
 
     def checkpoint():save(output/'results.json',rows)
 
