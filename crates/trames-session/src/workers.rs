@@ -1532,6 +1532,7 @@ mod tests {
         crate::worker_syscalls::Snapshot {
             diagnostics: None,
             name: Default::default(),
+            memory_policy: Default::default(),
             membarrier_registered: None,
             vfork_release: None,
             native_space: None,

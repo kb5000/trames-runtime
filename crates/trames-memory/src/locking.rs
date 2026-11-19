@@ -10,17 +10,6 @@ pub(super) struct LockedRanges {
     all: Ranges,
     on_fault: Ranges,
 }
-impl Ranges {
-    fn pieces(&self, start: u64, end: u64) -> impl Iterator<Item = (u64, u64)> + '_ {
-        let first = self.0.range(..start).next_back().into_iter();
-        first
-            .chain(self.0.range(start..end))
-            .filter_map(move |(&a, &b)| {
-                let piece = (start.max(a), end.min(b));
-                (piece.0 < piece.1).then_some(piece)
-            })
-    }
-}
 impl LockedRanges {
     fn remove(&mut self, start: u64, end: u64) {
         self.all.remove(start, end);

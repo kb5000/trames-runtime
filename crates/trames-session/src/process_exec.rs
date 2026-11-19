@@ -135,6 +135,7 @@ impl<C: Cpu> Kernel<C> {
             .vfs
             .set_dumpable(dumpable)
             .expect("prepared dumpable value");
+        runtime.linux.memory_policy = p.linux.memory_policy.clone();
         runtime.linux.trace = p.linux.trace;
         runtime.linux.task_limit = p.linux.task_limit;
         runtime.linux.set_uring_clock(clock_origin);

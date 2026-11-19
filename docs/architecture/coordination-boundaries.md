@@ -3427,7 +3427,13 @@ query uses the executor's existing translation-presence contract, including
 PROT_NONE reservations. Raw target addresses retain the previous untagged ABI;
 ordinary byte destinations retain existing TBI and permission behavior. Flags,
 node-mask bounds, output preflight/order and the single-node policy are shared
-with solo/legacy execution. No new NUMA placement API is implemented.
+with solo/legacy execution. The single-node placement implementation also covers
+set_mempolicy, mbind and set_mempolicy_home_node. The source worker reads or
+sets its original thread policy. Clone copies the current value for the new
+thread, and exec preserves it. Binding ranges uses the existing mm scope and
+keeps sparse policy ranges across fork, remap and partial replacement. Worker
+views query immutable policy metadata. Ordinary CPU accesses and faults do
+not consult it because every guest allocation already uses node zero.
 
 mincore(232) and currently implemented non-discard madvise(233) use two optional
 CpuMemory observation capabilities. Original Memory and View expose the same

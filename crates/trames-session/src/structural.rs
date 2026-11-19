@@ -23,6 +23,8 @@ pub(crate) enum Memory {
     Map,
     Protect,
     Lock { number: u32 },
+    BindPolicy,
+    HomeNode,
     Residency,
     Advice { discard: bool },
     Register { operation: u32 },
@@ -40,6 +42,8 @@ impl Call {
             222 => Self::Memory(Memory::Map),
             226 => Self::Memory(Memory::Protect),
             228..=231 | 284 => Self::Memory(Memory::Lock { number }),
+            235 => Self::Memory(Memory::BindPolicy),
+            450 => Self::Memory(Memory::HomeNode),
             232 => Self::Memory(Memory::Residency),
             233 => Self::Memory(Memory::Advice {
                 discard: args[2] as u32 == 4,
@@ -98,6 +102,8 @@ impl Memory {
             Self::Map => 222,
             Self::Protect => 226,
             Self::Lock { number } => number,
+            Self::BindPolicy => 235,
+            Self::HomeNode => 450,
             Self::Residency => 232,
             Self::Advice { .. } => 233,
             Self::Register { .. } => 427,
@@ -113,7 +119,7 @@ impl Memory {
             Self::Lock { .. } => 9,
             Self::Residency => 5,
             Self::Advice { discard: true } => 6,
-            Self::Advice { discard: false } => 7,
+            Self::BindPolicy | Self::HomeNode | Self::Advice { discard: false } => 7,
             Self::Register { .. } => 8,
         }
     }

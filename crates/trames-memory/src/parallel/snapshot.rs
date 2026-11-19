@@ -641,7 +641,11 @@ impl Memory {
         if registry.metrics.incremental_updates.is_multiple_of(256) {
             registry.shared.prune();
         }
-        let view = View::new(cache.snapshot.clone(), publication);
+        let view = View::new(
+            cache.snapshot.clone(),
+            publication,
+            self.vma_policy.nodes.clone(),
+        );
         self.parallel_cache = Some(cache);
         Some(view)
     }

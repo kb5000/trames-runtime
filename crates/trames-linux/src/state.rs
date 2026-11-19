@@ -76,6 +76,7 @@ pub struct Linux {
     pub environment: Vec<Vec<u8>>,
     pub executable_path: Vec<u8>,
     pub executable_file: Option<std::sync::Arc<trames_vfs::ExecutableFile>>,
+    pub memory_policy: std::sync::Arc<crate::TaskMemoryPolicy>,
     pub command_name: trames_vfs::TaskName,
     pub argument_pointers: Vec<u64>,
     pub auxiliary: Vec<u8>,
@@ -119,6 +120,7 @@ impl Linux {
             environment: self.environment.clone(),
             executable_path: self.executable_path.clone(),
             executable_file: self.executable_file.clone(),
+            memory_policy: std::sync::Arc::new(self.memory_policy.fork()),
             command_name: self.command_name.fork(),
             argument_pointers: self.argument_pointers.clone(),
             auxiliary: self.auxiliary.clone(),
@@ -179,6 +181,7 @@ impl Linux {
             environment: Vec::new(),
             executable_path: Vec::new(),
             executable_file: None,
+            memory_policy: Default::default(),
             command_name: Default::default(),
             argument_pointers: Vec::new(),
             auxiliary: Vec::new(),
@@ -1598,6 +1601,10 @@ impl Linux {
                     .expect("original writeback capability")?
                     .run().map(|()| 0).map_err(Self::memory_errno)
             },
+            235 => crate::mempolicy::bind(memory, a, self.vfs.credentials.has_cap(trames_vfs::capabilities::SYS_NICE)),
+            236 => self.memory_policy.get(memory,a),
+            237 => self.memory_policy.set(memory,a),
+            450 => crate::mempolicy::home_node(memory,a),
             232 => crate::memory_query(memory,232,a).expect("original residency capability"),
             233 => {
                 if a[2] as u32 != 4 { return crate::memory_query(memory,233,a).expect("original mapping capability"); }

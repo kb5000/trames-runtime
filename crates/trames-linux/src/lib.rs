@@ -36,6 +36,8 @@ pub use host_files::{HostFileAdmission, HostFileLayout, HostFileTask};
 mod heap;
 mod memory_lock;
 mod memory_queries;
+mod mempolicy;
+pub use mempolicy::TaskMemoryPolicy;
 mod memory_sync;
 mod process_memory;
 pub use memory_queries::{memory_query, memory_query_entry};

@@ -1,68 +1,41 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Read-only VM observation and non-discard advice share one source/solo ABI.
-use crate::Linux;
-use trames_memory::{Access, CpuMemory, ADDRESS_LIMIT, PAGE_SIZE};
+//! VM observations, thread placement and non-discard advice share the source/solo ABI.
+use crate::{Linux, TaskMemoryPolicy};
+use trames_memory::{Access, CpuMemory, PAGE_SIZE};
 use trames_vfs::Errno;
 
 pub fn memory_query_entry(number: u32, args: [u64; 6]) -> bool {
     matches!(number, 232 | 236) || number == 233 && args[2] as u32 != 4
 }
 
+/// Stateless embedding entry, retaining the default thread policy. Sessions
+/// dispatch through the original task so that set/get observe the same state.
 pub fn memory_query(
     memory: &mut impl CpuMemory,
     number: u32,
     args: [u64; 6],
 ) -> Option<Result<u64, Errno>> {
-    match number {
-        236 => Some(mempolicy(memory, args)),
-        232 => mincore(memory, args),
-        233 if args[2] as u32 != 4 => advice(memory, args),
-        _ => None,
+    if number == 237 {
+        return None;
+    }
+    TaskMemoryPolicy::default().query(memory, number, args)
+}
+impl TaskMemoryPolicy {
+    pub fn query(
+        &self,
+        memory: &mut impl CpuMemory,
+        number: u32,
+        args: [u64; 6],
+    ) -> Option<Result<u64, Errno>> {
+        match number {
+            236 => Some(self.get(memory, args)),
+            237 => Some(self.set(memory, args)),
+            232 => mincore(memory, args),
+            233 if args[2] as u32 != 4 => advice(memory, args),
+            _ => None,
+        }
     }
 }
-
-fn mempolicy(memory: &mut impl CpuMemory, a: [u64; 6]) -> Result<u64, Errno> {
-    let flags = a[4];
-    if flags & !7 != 0
-        || flags & 4 != 0 && flags & 3 != 0
-        || flags == 1
-        || a[3] != 0 && flags & 2 == 0
-    {
-        return Err(Errno(22));
-    }
-    // This ABI's target address is untagged, unlike ordinary TBI byte accesses.
-    // Translation checks include inaccessible reservations without paging in.
-    if flags & 2 != 0 && (a[3] >= ADDRESS_LIMIT || memory.check_translation(a[3]).is_err()) {
-        return Err(Errno(14));
-    }
-    if a[0] != 0 {
-        Linux::check(memory, a[0], 4, Access::Write)?;
-    }
-    let length = if a[1] != 0 {
-        if a[2] == 0 || a[2] > 65536 {
-            return Err(Errno(22));
-        }
-        let length = a[2].div_ceil(64) as usize * 8;
-        Linux::check(memory, a[1], length, Access::Write)?;
-        length
-    } else {
-        0
-    };
-    if a[0] != 0 {
-        memory
-            .write_array(a[0], 0u32.to_le_bytes())
-            .map_err(|_| Errno(14))?;
-    }
-    if length != 0 {
-        let mut mask = vec![0; length];
-        if flags & 4 != 0 {
-            mask[0] = 1;
-        }
-        memory.write(a[1], &mask).map_err(|_| Errno(14))?;
-    }
-    Ok(0)
-}
-
 fn mincore(memory: &mut impl CpuMemory, a: [u64; 6]) -> Option<Result<u64, Errno>> {
     if !a[0].is_multiple_of(PAGE_SIZE) {
         return Some(Err(Errno(22)));

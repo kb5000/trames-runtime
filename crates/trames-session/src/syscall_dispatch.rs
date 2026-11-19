@@ -687,10 +687,11 @@ pub(crate) fn execute<C: Cpu>(
             break 'entry Some(result);
         }
         if let Some(snapshot) = work.syscalls.as_ref().filter(|_| {
-            trames_linux::memory_query_entry(
-                work.cpu.x(8) as u32,
-                std::array::from_fn(|i| work.cpu.x(i)),
-            )
+            work.cpu.x(8) as u32 == 237
+                || trames_linux::memory_query_entry(
+                    work.cpu.x(8) as u32,
+                    std::array::from_fn(|i| work.cpu.x(i)),
+                )
         }) {
             let number = work.cpu.x(8) as u32;
             let args = std::array::from_fn(|i| work.cpu.x(i));
@@ -700,7 +701,7 @@ pub(crate) fn execute<C: Cpu>(
                 break 'entry Some(result);
             }
             let began = snapshot.profile.then(Instant::now);
-            let attempt = trames_linux::memory_query(&mut *memory, number, args);
+            let attempt = snapshot.memory_policy.query(&mut *memory, number, args);
             if let Some(began) = began {
                 syscall_time += began.elapsed();
             }

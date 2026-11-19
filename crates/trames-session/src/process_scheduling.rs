@@ -21,7 +21,9 @@ impl<C: Cpu> Kernel<C> {
     }
     #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn mempolicy(p: &mut Process<C>, a: [u64; 6]) -> Result<Option<u64>, Errno> {
-        trames_linux::memory_query(&mut p.memory, 236, a)
+        p.linux
+            .memory_policy
+            .query(&mut p.memory, 236, a)
             .expect("memory policy ABI")
             .map(Some)
     }

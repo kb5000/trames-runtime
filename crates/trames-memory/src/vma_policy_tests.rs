@@ -77,3 +77,35 @@ fn shared_mm_has_one_policy_and_worker_view_defers_mutation_before_effects() {
     shared.advise_fork(BASE, PAGE_SIZE, 11).unwrap();
     assert!(!memory.try_fork().unwrap().is_free(BASE, PAGE_SIZE));
 }
+
+#[test]
+fn numa_ranges_survive_fork_and_remap_and_exclude_replacement_pages() {
+    let mut mm = Memory::default();
+    let p = PAGE_SIZE;
+    mm.map(BASE, 4 * p, Permissions::RW).unwrap();
+    let old = mm.parallel_view(&mut Default::default()).unwrap();
+    mm.bind_numa_policy(BASE, p * 4, 2).unwrap();
+    mm.bind_numa_policy(BASE + p, p * 2, 3).unwrap();
+    assert_eq!(old.numa_mode_at(BASE), 0);
+    drop(old);
+    let current = mm.parallel_view(&mut Default::default()).unwrap();
+    assert_eq!(current.numa_mode_at(BASE + p), 3);
+    drop(current);
+    let mut child = mm.try_fork().unwrap();
+    child.bind_numa_policy(BASE, p * 4, 0).unwrap();
+    assert_eq!(child.numa_mode_at(BASE), 0);
+    assert_eq!(mm.numa_mode_at(BASE), 2);
+    let dst = BASE * 3;
+    mm.remap(BASE, p * 4, dst, p * 5, false).unwrap();
+    assert_eq!(mm.numa_mode_at(BASE), 0);
+    assert_eq!(mm.numa_mode_at(dst + p), 3);
+    assert_eq!(mm.numa_mode_at(dst + 4 * p), 2);
+    mm.map_fixed(dst + 2 * p, p, Permissions::RW).unwrap();
+    assert_eq!(mm.numa_mode_at(dst + 2 * p), 0);
+    mm.unmap(dst + p, p).unwrap();
+    assert!(mm.bind_numa_policy(dst, 4 * p, 1).is_err());
+    assert_eq!(mm.numa_mode_at(dst), 2);
+    mm.bind_numa_policy(dst, 4 * p, 0).unwrap();
+    assert_eq!(mm.numa_mode_at(dst), 0);
+    assert_eq!(mm.numa_mode_at(dst + 4 * p), 2);
+}

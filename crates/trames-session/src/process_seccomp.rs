@@ -2254,6 +2254,7 @@ mod tests {
             let snapshot = crate::worker_syscalls::Snapshot {
                 diagnostics: None,
                 name: Default::default(),
+                memory_policy: Default::default(),
                 membarrier_registered: None,
                 vfork_release: None,
                 native_space: None,
@@ -2493,6 +2494,7 @@ mod tests {
             let snapshot = crate::worker_syscalls::Snapshot {
                 diagnostics: None,
                 name: Default::default(),
+                memory_policy: Default::default(),
                 membarrier_registered: None,
                 vfork_release: None,
                 native_space: None,
@@ -2602,6 +2604,7 @@ mod tests {
                 let snapshot = crate::worker_syscalls::Snapshot {
                     diagnostics: None,
                     name: Default::default(),
+                    memory_policy: Default::default(),
                     membarrier_registered: None,
                     vfork_release: None,
                     native_space: None,
@@ -2738,6 +2741,7 @@ mod tests {
                 let snapshot = crate::worker_syscalls::Snapshot {
                     diagnostics: None,
                     name: Default::default(),
+                    memory_policy: Default::default(),
                     membarrier_registered: None,
                     vfork_release: None,
                     native_space: None,
@@ -2860,6 +2864,7 @@ mod tests {
                 let snapshot = crate::worker_syscalls::Snapshot {
                     diagnostics: None,
                     name: Default::default(),
+                    memory_policy: Default::default(),
                     membarrier_registered: None,
                     vfork_release: None,
                     native_space: None,
@@ -2990,6 +2995,7 @@ mod tests {
             let snapshot = crate::worker_syscalls::Snapshot {
                 diagnostics: None,
                 name: Default::default(),
+                memory_policy: Default::default(),
                 membarrier_registered: None,
                 vfork_release: None,
                 native_space: None,
@@ -3983,6 +3989,7 @@ mod tests {
         let mut snapshot = crate::worker_syscalls::Snapshot {
             diagnostics: None,
             name: Default::default(),
+            memory_policy: Default::default(),
             membarrier_registered: None,
             vfork_release: None,
             native_space: None,
@@ -4568,6 +4575,7 @@ mod tests {
                 let snapshot = crate::worker_syscalls::Snapshot {
                     diagnostics: None,
                     name: Default::default(),
+                    memory_policy: Default::default(),
                     membarrier_registered: None,
                     vfork_release: None,
                     native_space: None,
@@ -4620,6 +4628,7 @@ mod tests {
             let snapshot = crate::worker_syscalls::Snapshot {
                 diagnostics: None,
                 name: Default::default(),
+                memory_policy: Default::default(),
                 membarrier_registered: None,
                 vfork_release: None,
                 native_space: None,
@@ -4681,6 +4690,7 @@ mod tests {
             let snapshot = crate::worker_syscalls::Snapshot {
                 diagnostics: None,
                 name: Default::default(),
+                memory_policy: Default::default(),
                 membarrier_registered: None,
                 vfork_release: None,
                 native_space: None,
@@ -4735,6 +4745,7 @@ mod tests {
             let snapshot = crate::worker_syscalls::Snapshot {
                 diagnostics: None,
                 name: Default::default(),
+                memory_policy: Default::default(),
                 membarrier_registered: None,
                 vfork_release: None,
                 native_space: None,
@@ -4799,6 +4810,7 @@ mod tests {
             let snapshot = crate::worker_syscalls::Snapshot {
                 diagnostics: None,
                 name: Default::default(),
+                memory_policy: Default::default(),
                 membarrier_registered: None,
                 vfork_release: None,
                 native_space: None,
@@ -4863,6 +4875,7 @@ mod tests {
             let snapshot = crate::worker_syscalls::Snapshot {
                 diagnostics: None,
                 name: Default::default(),
+                memory_policy: Default::default(),
                 membarrier_registered: None,
                 vfork_release: None,
                 native_space: None,
@@ -4929,6 +4942,7 @@ mod tests {
             let snapshot = crate::worker_syscalls::Snapshot {
                 diagnostics: None,
                 name: Default::default(),
+                memory_policy: Default::default(),
                 membarrier_registered: None,
                 vfork_release: None,
                 native_space: None,
@@ -4990,6 +5004,7 @@ mod tests {
                 let snapshot = crate::worker_syscalls::Snapshot {
                     diagnostics: None,
                     name: Default::default(),
+                    memory_policy: Default::default(),
                     membarrier_registered: None,
                     vfork_release: None,
                     native_space: None,

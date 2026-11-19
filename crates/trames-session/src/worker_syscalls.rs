@@ -85,6 +85,7 @@ impl ExitResources<'_> {
 pub(super) struct Snapshot {
     pub diagnostics: Option<trames_linux::SyscallDiagnostics>,
     pub name: trames_vfs::TaskName,
+    pub memory_policy: Arc<trames_linux::TaskMemoryPolicy>,
     pub membarrier_registered: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub vfork_release: Option<Arc<trames_kernel::vfork::Release>>,
     pub native_space: Option<crate::space::Native>,
@@ -1357,6 +1358,7 @@ mod tests {
         let snapshot = Snapshot {
             diagnostics: None,
             name: Default::default(),
+            memory_policy: Default::default(),
             membarrier_registered: None,
             vfork_release: None,
             native_space: None,
@@ -1503,6 +1505,7 @@ mod tests {
         let snapshot = Snapshot {
             diagnostics: None,
             name: Default::default(),
+            memory_policy: Default::default(),
             membarrier_registered: None,
             vfork_release: None,
             native_space: None,
@@ -1570,6 +1573,7 @@ mod tests {
         let mut snapshot = Snapshot {
             diagnostics: None,
             name: Default::default(),
+            memory_policy: Default::default(),
             membarrier_registered: None,
             vfork_release: None,
             native_space: None,
@@ -1680,6 +1684,7 @@ mod tests {
         let snapshot = Snapshot {
             diagnostics: None,
             name: Default::default(),
+            memory_policy: Default::default(),
             membarrier_registered: None,
             vfork_release: None,
             native_space: None,
@@ -1755,6 +1760,7 @@ mod tests {
         let snapshot = Snapshot {
             diagnostics: None,
             name: Default::default(),
+            memory_policy: Default::default(),
             membarrier_registered: None,
             vfork_release: None,
             native_space: None,

@@ -26,6 +26,11 @@ impl<M> std::ops::DerefMut for CpuSlice<'_, M> {
 }
 
 pub trait CpuMemory {
+    /// Optional address-specific policy metadata. Small CPU embeddings with
+    /// no placement controls expose the guest default on their mapped pages.
+    fn numa_mode_at(&self, _address: u64) -> u32 {
+        0
+    }
     /// Structural syscalls can edit the original mm only after existing CPU
     /// views have returned. A worker View declines before any side effects.
     fn mapping_owner(&mut self) -> Option<&mut Memory> {
@@ -189,6 +194,12 @@ pub trait CpuMemory {
 }
 
 impl CpuMemory for Memory {
+    fn numa_mode_at(&self, address: u64) -> u32 {
+        if let Some(shared) = &self.shared {
+            return shared.borrow().numa_mode_at(address);
+        }
+        self.vma_policy.nodes.at(address)
+    }
     fn mapping_owner(&mut self) -> Option<&mut Memory> {
         Some(self)
     }

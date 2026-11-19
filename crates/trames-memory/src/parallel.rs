@@ -662,6 +662,7 @@ pub(super) struct Users {
 }
 /// Send, with worker-local translations; never Sync and never retains Arc data.
 pub struct View {
+    nodes: vma_policy::NodePolicies,
     snapshot: Arc<Snapshot>,
     publication: Option<Arc<layout::Publication>>,
     translations: [Cell<Translation>; TRANSLATION_SLOTS],
@@ -674,7 +675,11 @@ pub struct View {
 /// translation cells. This is a shared-VM view, not a process fork.
 impl Clone for View {
     fn clone(&self) -> Self {
-        let mut view = Self::new(self.snapshot.clone(), self.publication.clone());
+        let mut view = Self::new(
+            self.snapshot.clone(),
+            self.publication.clone(),
+            self.nodes.clone(),
+        );
         view.hardware_mode = self.hardware_mode;
         view
     }
@@ -695,10 +700,15 @@ impl View {
     pub fn commit_domains(&self) -> BTreeSet<(u8, u64)> {
         self.snapshot.backings.commit_domains()
     }
-    fn new(snapshot: Arc<Snapshot>, publication: Option<Arc<layout::Publication>>) -> Self {
+    fn new(
+        snapshot: Arc<Snapshot>,
+        publication: Option<Arc<layout::Publication>>,
+        nodes: vma_policy::NodePolicies,
+    ) -> Self {
         snapshot.users.count.fetch_add(1, Ordering::Relaxed);
         Self {
             snapshot,
+            nodes,
             publication,
             mmu_cache: mmu::Cache::default(),
             hardware_chunks: std::array::from_fn(|_| Cell::new((u64::MAX, 0))),
@@ -1055,6 +1065,9 @@ impl View {
     }
 }
 impl CpuMemory for View {
+    fn numa_mode_at(&self, address: u64) -> u32 {
+        self.nodes.at(address)
+    }
     fn range_locked(&self, address: u64, length: u64) -> bool {
         self.snapshot
             .locks
@@ -1357,6 +1370,7 @@ impl Memory {
         Some(View::new(
             cache.snapshot.clone(),
             self.layout_publication.clone(),
+            self.vma_policy.nodes.clone(),
         ))
     }
     /// Subscribe before checking quiescence. This covers external retained
@@ -1485,7 +1499,11 @@ impl Memory {
                 && !self.parallel_anonymous_dirty
             {
                 registry.metrics.cache_hits += 1;
-                return Some(View::new(c.snapshot.clone(), publication));
+                return Some(View::new(
+                    c.snapshot.clone(),
+                    publication,
+                    self.vma_policy.nodes.clone(),
+                ));
             }
         }
         // Data-only coordinator writes reuse the immutable mapping table and
@@ -1527,7 +1545,11 @@ impl Memory {
                 frame.refresh_content_metadata(page);
             }
             cache.source_revision = self.revision;
-            let view = View::new(cache.snapshot.clone(), publication);
+            let view = View::new(
+                cache.snapshot.clone(),
+                publication,
+                self.vma_policy.nodes.clone(),
+            );
             self.parallel_cache = Some(cache);
             return Some(view);
         }
@@ -1680,7 +1702,11 @@ impl Memory {
                 page.parallel_dirty = false;
             }
         }
-        Some(View::new(snapshot, publication))
+        Some(View::new(
+            snapshot,
+            publication,
+            self.vma_policy.nodes.clone(),
+        ))
     }
     /// This mm's joined CPUs publish dirty metadata and persistence/code hooks.
     /// Isolated providers may retain live other-mm users of canonical storage.
