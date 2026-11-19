@@ -211,6 +211,9 @@ impl TerminalTask for TerminalRoute {
         }
         let global = self.namespace.global(local).ok_or(Errno(3))?;
         let tasks = self.directory.tasks(2, global);
+        if tasks.is_empty() {
+            return Err(Errno(3));
+        }
         if !tasks.iter().any(|t| t.session() == session) {
             return Err(Errno(1));
         }

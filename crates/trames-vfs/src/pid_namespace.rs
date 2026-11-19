@@ -382,6 +382,9 @@ impl Vfs {
             p.parent = ns.local(p.parent);
             p.group = ns.local(p.group);
             p.session = ns.local(p.session);
+            if let Some((_, foreground)) = &mut p.terminal_stat {
+                *foreground = ns.local(*foreground);
+            }
         }
         std::borrow::Cow::Owned(r)
     }

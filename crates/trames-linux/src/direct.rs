@@ -902,7 +902,7 @@ impl DirectSyscalls {
         if number == 62 {
             fd.is_kmsg() || fd.positioned_bytes()
         } else if matches!(number, 67..=70) {
-            fd.positioned_bytes() || fd.is_inotify()
+            fd.positioned_bytes() || fd.is_inotify() || fd.is_pty()
         } else if matches!(number, 22 | 441) {
             fd.is_epoll()
         } else if matches!(number, 86 | 87) {
@@ -1066,7 +1066,7 @@ impl DirectSyscalls {
                     .get(args[0] as u32)
                     .is_some_and(|fd| fd.is_pty())
                     && (self.terminal_task.is_some() && !matches!(args[1] as u32, 0x5421 | 0x5452)
-                        || matches!(args[1] as u32, 0x5401 | 0x5413)
+                        || matches!(args[1] as u32, 0x5401 | 0x5413 | 0x802c542a)
                         || crate::pty_control_request(args[1] as u32)
                         || args[1] as u32 == 0x5441 && self.resources.is_some()))
     }
@@ -1226,6 +1226,11 @@ impl DirectSyscalls {
         self.terminal_stop.set(false);
         if !Self::supports_fd_call(number, args, fd) {
             return None;
+        }
+        if matches!(number, 67..=70) && fd.is_pty() {
+            return Some(Err(
+                fd.positioned_terminal_error(number == 68 || number == 70, args[3])
+            ));
         }
         if number == 86 {
             if let Some(timer) = fd.timer() {

@@ -11,7 +11,7 @@ import subprocess
 import time
 import xml.etree.ElementTree as ET
 
-from run import classify, execute, save
+from run import classify, execute, guest_terminal, save
 
 
 class Progress:
@@ -109,7 +109,8 @@ def run(args,output,plan,env,runner,name,store,snapshot,cache,timeout):
             # Match native Linux's existing tmpfs fixture, without changing the
             # original binary or treating an unexercised ACL as a passing case.
             wrapper='mkdir -p /dev/shm; mount -t tmpfs -o mode=1777 tmpfs /dev/shm; '+wrapper
-        argv=[runner,'debug','env-run',name,'--no-windows','--no-pty','--','/bin/sh','-ec',wrapper,'trames-gvisor',work,'/opt/gvisor/'+suite+'_test','--gtest_color=no','--gtest_filter='+':'.join(selected),'--gtest_output=xml:'+guest_xml]
+        terminal, wrapper = guest_terminal(suite, wrapper)
+        argv=[runner,'debug','env-run',name,'--no-windows',terminal,'--','/bin/sh','-ec',wrapper,'trames-gvisor',work,'/opt/gvisor/'+suite+'_test','--gtest_color=no','--gtest_filter='+':'.join(selected),'--gtest_output=xml:'+guest_xml]
         stdout=output/'logs'/(stem+'.stdout');stderr=output/'logs'/(stem+'.stderr')
         budget=lambda case:timeout(suite,case) if case else 30
         progress=Progress(stdout,selected,budget)

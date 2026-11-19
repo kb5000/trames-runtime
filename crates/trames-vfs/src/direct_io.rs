@@ -1485,6 +1485,15 @@ impl DirectFd {
             .open
             .simple_write::<true>(kind, bytes)
     }
+    pub fn positioned_terminal_error(&self, write: bool, offset: u64) -> Errno {
+        if offset > i64::MAX as u64 {
+            Errno(22)
+        } else if self.flags & O_PATH != 0 || self.flags & 3 == u32::from(!write) {
+            Errno(9)
+        } else {
+            Errno(29)
+        }
+    }
     pub fn positioned_bytes(&self) -> bool {
         matches!(
             self.resource,

@@ -127,6 +127,9 @@ impl trames_vfs::ProcTask for IoTask {
         info.tgid = self.tgid();
         info.group = self.group();
         info.session = self.session();
+        if demand.terminal_stat() {
+            info.terminal_stat = self.lifecycle().controlling().and_then(|c| c.stat());
+        }
         if let Some(family) = self.family() {
             info.parent = family.parent();
         }

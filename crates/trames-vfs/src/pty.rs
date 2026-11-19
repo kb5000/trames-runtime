@@ -231,6 +231,7 @@ impl Vfs {
             .find(|id| registry.get(id).is_none_or(|p| p.strong_count() == 0))
             .ok_or(Errno(28))?;
         let mut tty = Terminal::default();
+        tty.window = [0; 8];
         tty.session = 0;
         tty.foreground = 0;
         let (number, slave) = if let Some(pts) = mount.as_ref().and_then(|m| m.devpts.as_ref()) {

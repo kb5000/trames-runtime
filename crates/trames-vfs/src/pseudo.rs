@@ -185,9 +185,7 @@ mod tests {
                     command: b"ash".to_vec(),
                     arguments: vec![b"ash".to_vec()],
                     cwd: b"/".to_vec(),
-                    terminal: v
-                        .fd_kind(0)
-                        .is_ok_and(|kind| matches!(kind, FdKind::Terminal)),
+                    terminal_stat: v.controlling_state().stat(),
                     fds: v.fd_snapshot(),
                     ..ProcessInfo::default()
                 }],
@@ -802,8 +800,8 @@ pub struct ProcessInfo {
     pub user_ticks: u64,
     pub start_ticks: u64,
     pub start_stack: u64,
-    pub terminal: bool,
-    pub terminal_number: u32,
+    /// Mount-local PTY number and guest-wide foreground process group.
+    pub terminal_stat: Option<(u32, u32)>,
     pub fds: Vec<FdInfo>,
     pub auxiliary: Vec<u8>,
     pub mutable_limits: Option<MutableLimits>,
@@ -2123,12 +2121,12 @@ impl Vfs {
                             fields[1] = p.parent.to_string();
                             fields[2] = p.group.to_string();
                             fields[3] = p.session.to_string();
-                            fields[4] = if p.terminal {
-                                (34816 + p.terminal_number).to_string()
+                            if let Some((number, foreground)) = p.terminal_stat {
+                                fields[4] = (34816 + number).to_string();
+                                fields[5] = foreground.to_string();
                             } else {
-                                "0".into()
-                            };
-                            fields[5] = p.group.to_string();
+                                fields[5] = "-1".into();
+                            }
                             fields[11] = p.user_ticks.to_string();
                             fields[15] = (20 + p.nice).to_string();
                             fields[16] = p.nice.to_string();
@@ -3083,11 +3081,11 @@ mod proc_probe_tests {
             v.proc_observation(AT_FDCWD, b"/descriptors"),
             Some(ProcRefresh::Descriptors)
         );
-        for path in [
-            b"/proc/self/status".as_slice(),
-            b"/proc/self/stat",
-            b"/proc/self/statm",
-        ] {
+        assert_eq!(
+            v.proc_observation(AT_FDCWD, b"/proc/self/stat"),
+            Some(ProcRefresh::TerminalStat)
+        );
+        for path in [b"/proc/self/status".as_slice(), b"/proc/self/statm"] {
             assert_eq!(
                 v.proc_observation(AT_FDCWD, path),
                 Some(ProcRefresh::Residency)

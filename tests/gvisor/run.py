@@ -7,6 +7,7 @@ Trames runtime process/private registry. No running product environment is used.
 """
 import argparse
 import collections
+from contextlib import ExitStack
 import hashlib
 import fnmatch
 import json
@@ -31,10 +32,17 @@ def save(path, value):
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
-def execute(argv, stdout, stderr, timeout, env=None, cwd=None, min_free=0, progress=None):
+def execute(argv, stdout, stderr, timeout, env=None, cwd=None, min_free=0, progress=None, host_pty=False):
     start = time.monotonic()
-    with stdout.open('wb') as out, stderr.open('wb') as err:
-        child = subprocess.Popen(argv, stdout=out, stderr=err, env=env, cwd=cwd, start_new_session=True)
+    with ExitStack() as stack, stdout.open('wb') as out, stderr.open('wb') as err:
+        inherited = ()
+        if host_pty:
+            master, slave = os.openpty()
+            stack.callback(os.close, master)
+            stack.callback(os.close, slave)
+            env = dict(os.environ if env is None else env, TEST_HOST_PTY_FD=str(slave))
+            inherited = (slave,)
+        child = subprocess.Popen(argv, stdout=out, stderr=err, env=env, cwd=cwd, start_new_session=True, pass_fds=inherited)
         timed_out = False
         try:
             while child.poll() is None:
@@ -64,6 +72,13 @@ def execute(argv, stdout, stderr, timeout, env=None, cwd=None, min_free=0, progr
             child.wait(timeout=5)
             raise
     return child.returncode, timed_out, time.monotonic() - start
+
+def guest_terminal(suite, wrapper):
+    if suite == 'host_pty':
+        # Keep an inherited copy even when the shell backgrounds the test and
+        # redirects its standard input. The Mac runner supplies this actual PTY.
+        return '--pty', 'exec 3<&0; test -t 3; export TEST_HOST_PTY_FD=3; ' + wrapper
+    return '--no-pty', wrapper
 
 def list_cases(binary):
     result = subprocess.run([str(binary), '--gtest_list_tests'], capture_output=True, text=True, timeout=20, check=True)
@@ -115,7 +130,7 @@ def reuse_rows(args, plan):
     old = {s['name']:s['sha256'] for s in previous['suites']}
     if old != {s['name']:s['sha256'] for s in plan['suites']}:
         raise RuntimeError('Cannot reuse results from different binaries')
-    for key in ['kernel','uid','runtime_sha256','nofile','network','cpus','rootfs_sha256','runfiles_sha256','process_context','native_init_sha256','fresh_store']:
+    for key in ['kernel','uid','runtime_sha256','nofile','network','cpus','rootfs_sha256','runfiles_sha256','process_context','native_init_sha256','fresh_store','host_pty_fixture']:
         if key in plan and previous.get(key) != plan[key]:
             raise RuntimeError('Cannot reuse results with a different '+key)
     return {(r['suite'],r['case']):dict(r,reused_from=str(args.reuse.resolve()/'logs'/(r.get('log_stem') or str(i))))
@@ -156,7 +171,9 @@ def native(args, output):
     if not any(s['cases'] for s in plan['suites']):raise RuntimeError('No cases selected')
     plan['case_execution'] = dict(timeout_base=args.timeout, suite_timeouts=args.suite_timeouts, upstream_wait_timeouts=SIGNAL_WAIT_TIMEOUTS)
     if args.native_init:plan['native_init_sha256']=digest(args.native_init)
-    save(output / 'plan.json', plan)
+    if any(s['name'] == 'host_pty' for s in plan['suites']):
+        plan['host_pty_fixture'] = True
+    save(output/'plan.json', plan)
     cache=reuse_rows(args,plan)
     rows = []
     started=time.monotonic()
@@ -180,7 +197,7 @@ def native(args, output):
                 argv = ['unshare', '--mount', '--uts', '--ipc', '--net', '--pid', '--fork', '--kill-child=KILL', '--mount-proc',
                         '--', *([str(args.native_init)] if args.native_init else []), '/usr/bin/env', '-u', 'TEST_ON_GVISOR', '-u', 'GVISOR_SAVE_TEST', 'TEST_TMPDIR=' + str(work), 'TEST_SRCDIR='+str(binaries/'runfiles'), 'RUNFILES_DIR='+str(binaries/'runfiles'),
                         str(binary), '--gtest_color=no', '--gtest_filter=' + case, '--gtest_output=xml:' + str(xml)]
-                code, timed, seconds = execute(argv, output/'logs'/(str(index)+'.stdout'), output/'logs'/(str(index)+'.stderr'), watchdog(args, suite['name'], case), cwd=work, min_free=int(args.min_free_gib*1024**3))
+                code, timed, seconds = execute(argv, output/'logs'/(str(index)+'.stdout'), output/'logs'/(str(index)+'.stderr'), watchdog(args, suite['name'], case), cwd=work, min_free=int(args.min_free_gib*1024**3), host_pty=suite['name']=='host_pty')
                 status, messages = classify(xml, code, timed, case)
                 rows.append(dict(suite=suite['name'], case=case, status=status, code=code, seconds=seconds, messages=messages))
                 save(output/'results.json', rows)
@@ -206,7 +223,9 @@ def trames(args, output):
     plan['runfiles_sha256']={str(p.relative_to(binaries)):digest(p) for p in (binaries/'runfiles').rglob('*') if p.is_file()}
 
     plan.pop('kernel',None);plan.pop('uid',None);plan.pop('nofile',None);plan.pop('native_init_sha256',None)
-    save(output/'plan.json',plan)
+    if any(s['name'] == 'host_pty' for s in plan['suites']):
+        plan['host_pty_fixture'] = True
+    save(output/'plan.json', plan)
     cache=reuse_rows(args,plan)
     registry = output/'registry'
     env = dict(os.environ, TRAMES_HOME=str(registry))
@@ -275,7 +294,8 @@ def trames(args, output):
                 wrapper='mkdir -p /dev/shm; mount -t tmpfs -o mode=1777 tmpfs /dev/shm; '+wrapper
             if args.network=='internal':
                 wrapper=wrapper.replace('exec "$@"', '"$@" & child=$!; wait "$child"')
-            argv = [runner,'debug','env-run',name,'--no-windows','--no-pty','--','/bin/sh','-ec',wrapper,'trames-gvisor',work,
+            terminal, wrapper = guest_terminal(suite['name'], wrapper)
+            argv = [runner,'debug','env-run',name,'--no-windows',terminal,'--','/bin/sh','-ec',wrapper,'trames-gvisor',work,
                     '/opt/gvisor/'+suite['name']+'_test','--gtest_color=no','--gtest_filter='+case,'--gtest_output=xml:'+guest_xml]
             code, timed, seconds = execute(argv,output/'logs'/(str(index)+'.stdout'),output/'logs'/(str(index)+'.stderr'),case_timeout(suite['name'],case),env=env,min_free=int(args.min_free_gib*1024**3))
             if not timed:

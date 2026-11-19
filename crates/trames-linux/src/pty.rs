@@ -10,10 +10,13 @@ pub fn pty_control_request(request: u32) -> bool {
     )
 }
 pub(crate) fn terminal_job_request(request: u32) -> bool {
-    matches!(request, 0x5402..=0x5404 | 0x540b | 0x5410)
+    matches!(request, 0x5402..=0x5404 | 0x5409 | 0x540b | 0x5410 | 0x402c542b..=0x402c542d)
 }
 pub fn terminal_query_request(request: u32) -> bool {
-    matches!(request, 0x5401 | 0x540f | 0x5413 | 0x541b | 0x5429)
+    matches!(
+        request,
+        0x5401 | 0x802c542a | 0x540f | 0x5413 | 0x541b | 0x5429
+    )
 }
 
 pub fn pty_control(
@@ -72,6 +75,9 @@ pub fn terminal_query(
     match request {
         0x5401 => memory
             .write(address, &tty.attributes)
+            .map_err(|_| Errno(14))?,
+        0x802c542a => memory
+            .write(address, &tty.termios2())
             .map_err(|_| Errno(14))?,
         0x540f => memory
             .write_array(address, task.visible(tty.foreground).to_le_bytes())
@@ -153,14 +159,21 @@ pub fn terminal_control(
         match request {
             0x5402..=0x5404 => {
                 let attr = memory.read_array::<36>(address).map_err(|_| Errno(14))?;
-                if attr[22] != 0 {
-                    return Err(Errno(95));
-                }
-                tty.attributes = attr;
-                if request == 0x5404 {
-                    tty.flush_input();
-                }
+                tty.set_attributes(attr, None, request == 0x5404)?;
             }
+            0x402c542b..=0x402c542d => {
+                let raw = memory.read_array::<44>(address).map_err(|_| Errno(14))?;
+                let speeds = [
+                    u32::from_le_bytes(raw[36..40].try_into().unwrap()),
+                    u32::from_le_bytes(raw[40..].try_into().unwrap()),
+                ];
+                tty.set_attributes(
+                    raw[..36].try_into().unwrap(),
+                    Some(speeds),
+                    request == 0x402c542d,
+                )?;
+            }
+            0x5409 => {} // A pseudoterminal has no physical break or transmitter to drain.
             0x5410 => {
                 let local = u32::from_le_bytes(memory.read_array(address).map_err(|_| Errno(14))?);
                 tty.foreground = task.foreground(tty.session, local)?;
@@ -181,12 +194,20 @@ pub fn terminal_control(
                 if address > 2 {
                     return Err(Errno(22));
                 }
-                if address == 0 || address == 2 {
+                if address == u64::from(end.master) || address == 2 {
                     tty.flush_input();
                 }
-                if address == 1 || address == 2 {
+                if address == u64::from(!end.master) || address == 2 {
+                    tty.echo.clear();
                     tty.output_queue.clear();
                     tty.output_space_epoch = tty.output_space_epoch.wrapping_add(1);
+                }
+                if !end.master && pair.packet.load(std::sync::atomic::Ordering::Relaxed) {
+                    pair.packet_status.fetch_or(
+                        [1, 2, 3][address as usize],
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    tty.output_epoch = tty.output_epoch.wrapping_add(1);
                 }
             }
             _ => return Err(Errno(25)),

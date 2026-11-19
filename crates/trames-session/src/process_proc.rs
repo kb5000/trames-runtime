@@ -259,8 +259,11 @@ impl<C: Cpu> Process<C> {
             scheduler: self.signals.io.scheduling.policy(),
             user_ticks: (self.cpu_time.as_millis() / 10) as u64,
             start_ticks: (self.started.saturating_duration_since(origin).as_millis() / 10) as u64,
-            terminal: self.linux.vfs.controlling_terminal().is_some(),
-            terminal_number: self.linux.vfs.controlling_terminal().unwrap_or(0),
+            terminal_stat: if demand.terminal_stat() {
+                self.linux.vfs.controlling_state().stat()
+            } else {
+                None
+            },
             fds: if demand.descriptors() {
                 self.linux.vfs.fd_snapshot()
             } else {

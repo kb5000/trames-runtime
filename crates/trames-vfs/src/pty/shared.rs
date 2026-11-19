@@ -172,12 +172,12 @@ impl PtyIo {
             let status = self.packet.load(Ordering::Relaxed)
                 && self.packet_status.load(Ordering::Relaxed) != 0;
             (if !tty.flow_stopped && !tty.output_queue.is_empty() || status {
-                events & 1
+                events & (1 | 0x40)
             } else {
                 0
             }) | (if status { events & 2 } else { 0 })
                 | (if tty.input_capacity() != 0 {
-                    events & 4
+                    events & (4 | 0x100)
                 } else {
                     0
                 })
@@ -191,11 +191,11 @@ impl PtyIo {
         } else {
             let alive = self.master_alive.load(Ordering::Relaxed);
             (if tty.readable() || !alive {
-                events & 1
+                events & (1 | 0x40)
             } else {
                 0
             }) | (if tty.output_queue.len() < PIPE_CAPACITY && alive {
-                events & 4
+                events & (4 | 0x100)
             } else {
                 0
             }) | (if !alive { 16 | 8 } else { 0 })
@@ -428,6 +428,7 @@ impl PtyIo {
         let tty = self.terminal.borrow();
         match request {
             0x5401 => Some(tty.attributes.to_vec()),
+            0x802c542a => Some(tty.termios2().to_vec()),
             0x5413 => Some(tty.window.to_vec()),
             _ => None,
         }

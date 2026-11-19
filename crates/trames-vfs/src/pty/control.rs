@@ -79,6 +79,11 @@ impl Drop for ControllingGuard<'_> {
     }
 }
 impl ControllingTerminal {
+    pub fn stat(&self) -> Option<(u32, u32)> {
+        let pair = self.pair()?;
+        let foreground = pair.terminal.borrow().foreground;
+        Some((pair.number, foreground))
+    }
     pub fn pair(&self) -> Option<Arc<Pty>> {
         self.state.lock().unwrap().as_ref()?.1.clone()
     }

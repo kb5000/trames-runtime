@@ -324,6 +324,12 @@ impl SharedOpenDescription {
         self.node
             .clone()
             .or_else(|| self.pipe.as_ref()?.metadata.clone())
+            .or_else(|| {
+                self.pty
+                    .as_ref()
+                    .filter(|end| !end.master)
+                    .map(|end| end.pair.slave.clone())
+            })
     }
     fn proc_control(&self) -> bool {
         self.oom.is_some()
@@ -658,7 +664,8 @@ impl ProcRefresh {
     pub const Namespaces: Self = Self(1 | 1 << 8);
     pub const Directories: Self = Self(1 | 1 << 10);
     const Content: Self = Self(1 << 9);
-    pub const Full: Self = Self((1 << 12) - 1);
+    pub const TerminalStat: Self = Self(1 | 1 << 6 | 1 << 12);
+    pub const Full: Self = Self((1 << 13) - 1);
 
     fn includes(self, fields: Self) -> bool {
         self.0 & fields.0 == fields.0
@@ -725,9 +732,11 @@ impl ProcRefresh {
         if path == b"/proc/meminfo" {
             return Self::HostMemory;
         }
+        if path.ends_with(b"/stat") {
+            return Self::TerminalStat;
+        }
         if [
-            b"/stat".as_slice(),
-            b"/statm",
+            b"/statm".as_slice(),
             b"/status",
             b"/smaps",
             b"/smaps_rollup",
@@ -764,6 +773,9 @@ impl ProcRefresh {
     }
     pub fn residency(self) -> bool {
         self.includes(Self::Residency)
+    }
+    pub fn terminal_stat(self) -> bool {
+        self.includes(Self::TerminalStat)
     }
     pub fn host_memory(self) -> bool {
         self.includes(Self::HostMemory)

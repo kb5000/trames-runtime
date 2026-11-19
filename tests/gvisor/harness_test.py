@@ -3,12 +3,13 @@
 import argparse
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 
 from batch import partition
 from chunks import Progress, xml_rows
-from run import classify, reuse_rows, watchdog
+from run import classify, execute, guest_terminal, reuse_rows, watchdog
 
 
 class EvidenceTests(unittest.TestCase):
@@ -42,6 +43,15 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(xml_rows(path, 0, ['WaitTest.TraceeWALL'], stderr)[0]['status'], 'fixture_failed')
         stderr.write_text('')
         self.assertEqual(xml_rows(path, 0, ['WaitTest.TraceeWALL'], stderr)[0]['status'], 'passed')
+
+    def test_host_pty_is_inherited_and_other_suites_keep_piped_stdio(self):
+        out, err = self.root/'stdout', self.root/'stderr'
+        probe = 'import os; assert os.isatty(int(os.environ["TEST_HOST_PTY_FD"]))'
+        code, timed, _ = execute([sys.executable, '-c', probe], out, err, 5, host_pty=True)
+        self.assertFalse(timed)
+        self.assertEqual(code, 0, err.read_text())
+        self.assertEqual(guest_terminal('pty', 'command'), ('--no-pty', 'command'))
+        self.assertEqual(guest_terminal('host_pty', 'command')[0], '--pty')
 
     def test_global_fixture_failure_never_becomes_a_passing_skip(self):
         path=self.xml('<testcase classname="T" name="A"><skipped/></testcase><testcase classname="" name=""><failure message="missing prerequisite"/></testcase>')
