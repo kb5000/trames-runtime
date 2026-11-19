@@ -841,7 +841,8 @@ impl Snapshot {
         if !matches!(
             cpu.x(8) as u32,
             25 | 92 | 98..=101 | 113..=115 | 124 | 139 | 154..=157 | 163 | 164 | 261 | 166 | 168 | 169 | 172..=179 | 270 | 271 | 278
-        ) && !(cpu.x(8) as u32 == 29 && matches!(cpu.x(1) as u32, 0x5421 | 0x5452))
+        ) && !(cpu.x(8) as u32 == 29
+            && trames_vfs::DescriptorControl::status_ioctl_request(cpu.x(1) as u32))
             && !(matches!(cpu.x(8) as u32, 160..=162) && self.uts.is_some())
             && !(cpu.x(8) as u32 == 32 && (cpu.x(1) as u32 & 4 != 0 || cpu.x(1) as u32 == 8))
             && !(cpu.x(8) as u32 == 214 && cpu.x(0) == 0)
@@ -955,15 +956,11 @@ impl Snapshot {
                     &self.io_routes,
                 )
             }
-            29 if cpu.x(1) as u32 == 0x5452 => {
+            29 if trames_vfs::DescriptorControl::status_ioctl_request(cpu.x(1) as u32) => {
                 self.direct.record_fd_control();
-                let value = memory.read_array::<4>(cpu.x(2)).map_err(|_| Errno(14));
-                value.and_then(|v| {
-                    self.fd_flags.set_async(
-                        &self.direct.descriptors(),
-                        cpu.x(0) as u32,
-                        u32::from_le_bytes(v) != 0,
-                    )
+                let fd = cpu.x(0) as u32;
+                self.fd_flags.descriptor_control(fd).and_then(|control| {
+                    control.status_ioctl(fd, cpu.x(1) as u32, cpu.x(2), memory, &self.io_routes)
                 })
             }
             number @ (19 | 20 | 26 | 59 | 74 | 85 | 198 | 199 | 280 | 425) => self
@@ -972,19 +969,6 @@ impl Snapshot {
             number if self.direct.supports_path_query(number) => {
                 self.direct
                     .invoke_path(number, std::array::from_fn(|i| cpu.x(i)), memory)?
-            }
-            29 if cpu.x(1) as u32 == 0x5421 => {
-                let result = (|| {
-                    let flags = self.fd_flags.get(cpu.x(0) as u32)?;
-                    if flags & trames_vfs::O_PATH != 0 {
-                        return Err(Errno(9));
-                    }
-                    let bytes = memory.read_array::<4>(cpu.x(2)).map_err(|_| Errno(14))?;
-                    self.fd_flags
-                        .set_nonblocking(cpu.x(0) as u32, u32::from_le_bytes(bytes) != 0)
-                })();
-                self.direct.record_fd_control();
-                result
             }
             number @ (29 | 62..=66 | 73 | 86 | 87 | 116 | 206 | 207 | 210..=212) => self
                 .direct

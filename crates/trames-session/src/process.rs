@@ -2002,13 +2002,12 @@ impl<C: Cpu> Kernel<C> {
             @dynamic number if trames_linux::credential_entry(number, a) => self.credential_call(pid, p, number, a).map(Some),
             25 | 29
                 if number == 25 && matches!(a[1], 4 | 8..=11 | 15 | 16)
-                    || number == 29 && a[1] as u32 == 0x5452 =>
+                    || number == 29 && trames_vfs::DescriptorControl::status_ioctl_request(a[1] as u32) =>
             {
-                if number == 25 && matches!(a[1], 8 | 15) {
+                if number == 25 && matches!(a[1], 8 | 15) || number == 29 && matches!(a[1] as u32, 0x8901 | 0x8902) {
                     self.publish_io_tasks(Some((pid, p)));
                 }
                 let flags = p.linux.vfs.fd_flags_snapshot();
-                let fds = p.linux.vfs.direct_descriptors();
                 let routes = trames_kernel::signal::IoRoutes {
                     directory: p.signals.io_directory.clone(),
                     namespace: p.linux.vfs.pid_namespace().clone(),
@@ -2016,8 +2015,7 @@ impl<C: Cpu> Kernel<C> {
                     euid: p.linux.vfs.credentials.euid,
                 };
                 let value = if number == 29 {
-                    let b = p.memory.read_array::<4>(a[2]).map_err(|_| Errno(14))?;
-                    flags.set_async(&fds, a[0] as u32, u32::from_le_bytes(b) != 0)
+                    p.linux.vfs.descriptor_control(a[0] as u32)?.status_ioctl(a[0] as u32, a[1] as u32, a[2], &mut p.memory, &routes)
                 } else if a[1] == 4 {
                     p.linux.vfs.descriptor_control(a[0] as u32)?.short(a[0] as u32,4,a[2],&p.linux.vfs.credentials)
                 } else {

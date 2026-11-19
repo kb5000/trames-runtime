@@ -59,6 +59,85 @@ const CHANGEABLE: u32 = 0x400 | O_NONBLOCK | O_NOATIME | 0x2000 | O_DIRECT;
 /// This has no Files root and never resolves a numeric FD after acceptance.
 pub struct DescriptorControl(Descriptor);
 impl DescriptorControl {
+    pub fn status_ioctl_request(request: u32) -> bool {
+        matches!(request, 0x5421 | 0x5450..=0x5452 | 0x8901..=0x8904)
+    }
+
+    /// Per-slot CLOEXEC and OFD controls accept the descriptor once. A concurrent
+    /// close/dup2 cannot redirect a guest pointer access to a replacement file.
+    pub fn status_ioctl(
+        &self,
+        fd: u32,
+        request: u32,
+        argument: u64,
+        memory: &mut impl trames_memory::CpuMemory,
+        owners: &impl AsyncOwners,
+    ) -> Result<u64> {
+        let open = self.0.open.borrow().shared.clone();
+        if open.flags.get() & O_PATH != 0 {
+            return Err(Errno(9));
+        }
+        match request {
+            0x5450 | 0x5451 => self.0.cloexec.set(request == 0x5451),
+            0x5421 | 0x5452 => {
+                let enabled = memory.read_array::<4>(argument).map_err(|_| Errno(14))? != [0; 4];
+                if request == 0x5421 {
+                    open.flags.nonblocking(enabled)?;
+                } else {
+                    let _update = open.flags.lock_update();
+                    if (open.flags.get() & 0x2000 != 0) != enabled {
+                        if !Self::change_async(&open, fd, enabled)? {
+                            return Err(Errno(25));
+                        }
+                        open.flags.set_async(enabled);
+                    }
+                }
+            }
+            0x8901..=0x8904 if open.kind == FdKind::Socket => {
+                if request <= 0x8902 {
+                    let pid =
+                        u32::from_le_bytes(memory.read_array(argument).map_err(|_| Errno(14))?);
+                    open.flags
+                        .owner_control(8, u64::from(pid), memory, owners)?;
+                } else {
+                    let pid = open.flags.owner_control(9, 0, memory, owners)? as u32;
+                    memory
+                        .write_array(argument, pid.to_le_bytes())
+                        .map_err(|_| Errno(14))?;
+                }
+            }
+            _ => return Err(Errno(25)),
+        }
+        Ok(0)
+    }
+
+    fn change_async(open: &Arc<SharedOpenDescription>, fd: u32, enabled: bool) -> Result<bool> {
+        // Linux F_SETFL ignores FASYNC for files lacking an fasync operation.
+        // Resolve readiness only when a supported endpoint changes registration.
+        if open.pty.is_none() && open.pipe.is_none() && open.local.is_none() {
+            // Known files without a Linux fasync callback. Other device types
+            // retain their unsupported result until a notification source exists.
+            if open.node.as_ref().is_some_and(|node| node.regular_file)
+                || open.native_image.is_some()
+                || matches!(
+                    &open.control,
+                    Some(
+                        events::SharedControl::Signal(_)
+                            | events::SharedControl::Timer(_)
+                            | events::SharedControl::Event(_)
+                            | events::SharedControl::Epoll(_)
+                    )
+                )
+            {
+                return Ok(false);
+            }
+            return Err(Errno(95));
+        }
+        let target = SharedFd::new(open.clone()).direct_poll().ok_or(Errno(95))?;
+        open.flags.async_state().enable(&target, fd, enabled)?;
+        Ok(true)
+    }
+
     pub fn flags(&self) -> u32 {
         self.0.open.borrow().flags.get() | if self.0.cloexec.get() { O_CLOEXEC } else { 0 }
     }
@@ -114,16 +193,13 @@ impl DescriptorControl {
             4 => {
                 let _update = flags.lock_update();
                 check_status(&open, credentials, argument as u32)?;
-                let current = flags.get();
-                let shared = open.shared.clone();
-                drop(open);
-                if (current | argument as u32) & 0x2000 != 0 {
-                    let target = SharedFd::new(shared).direct_byte().ok_or(Errno(95))?;
-                    flags
-                        .async_state()
-                        .enable(&target, fd, argument as u32 & 0x2000 != 0)?;
+                let mut requested = argument as u32;
+                if (flags.get() ^ requested) & 0x2000 != 0
+                    && !Self::change_async(&open.shared, fd, requested & 0x2000 != 0)?
+                {
+                    requested &= !0x2000;
                 }
-                flags.store_locked(argument as u32)?;
+                flags.store_locked(requested)?;
                 Ok(0)
             }
             _ => Err(Errno(22)),
@@ -225,6 +301,13 @@ pub(super) struct DescriptorFlags {
     pub(super) cloexec: CloseOnExec,
 }
 impl FdFlags {
+    pub fn descriptor_control(&self, fd: u32) -> Result<DescriptorControl> {
+        self.1
+            .as_ref()
+            .ok_or(Errno(9))?
+            .observation_descriptor(fd)
+            .map(DescriptorControl)
+    }
     pub(super) fn with_flags<T>(
         &self,
         fd: u32,

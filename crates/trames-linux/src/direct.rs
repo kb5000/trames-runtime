@@ -497,7 +497,9 @@ impl DirectSyscalls {
         Some(result)
     }
     pub fn supports_ioctl(&self, number: u32, args: [u64; 6]) -> bool {
-        number == 29 && self.paths.is_some() && !matches!(args[1] as u32, 0x5421 | 0x5452)
+        number == 29
+            && self.paths.is_some()
+            && !trames_vfs::DescriptorControl::status_ioctl_request(args[1] as u32)
     }
     pub fn supports_binder(&self, number: u32, args: [u64; 6]) -> bool {
         number == 29
@@ -520,7 +522,7 @@ impl DirectSyscalls {
         }
         // Task-sensitive PTY controls and shared flag/async changes keep their
         // existing accepted endpoint and signal-routing implementations.
-        if matches!(args[1] as u32, 0x5421 | 0x5452)
+        if trames_vfs::DescriptorControl::status_ioctl_request(args[1] as u32)
             || self
                 .descriptors
                 .get(args[0] as u32)
@@ -923,9 +925,11 @@ impl DirectSyscalls {
         }
         Self::supports_fd(number, fd)
             && (number != 29
-                || fd.is_entropy_device() && !matches!(args[1] as u32, 0x5421 | 0x5452)
+                || fd.is_entropy_device()
+                    && !trames_vfs::DescriptorControl::status_ioctl_request(args[1] as u32)
                 || (args[1] as u32 == 0x541b || args[1] as u32 == 0x5411 && fd.is_unix())
-                || fd.is_pty() && !matches!(args[1] as u32, 0x5421 | 0x5452)
+                || fd.is_pty()
+                    && !trames_vfs::DescriptorControl::status_ioctl_request(args[1] as u32)
                 || fd.pty_endpoint().is_some()
                     && (crate::pty_control_request(args[1] as u32) || args[1] as u32 == 0x5441))
     }
@@ -1053,7 +1057,8 @@ impl DirectSyscalls {
         self.supports(number, args[0] as u32)
             && (number != 29
                 || self.descriptors.get(args[0] as u32).is_some_and(|fd| {
-                    fd.is_entropy_device() && !matches!(args[1] as u32, 0x5421 | 0x5452)
+                    fd.is_entropy_device()
+                        && !trames_vfs::DescriptorControl::status_ioctl_request(args[1] as u32)
                 })
                 || args[1] as u32 == 0x541b
                 || args[1] as u32 == 0x5411
@@ -1065,7 +1070,8 @@ impl DirectSyscalls {
                     .descriptors
                     .get(args[0] as u32)
                     .is_some_and(|fd| fd.is_pty())
-                    && (self.terminal_task.is_some() && !matches!(args[1] as u32, 0x5421 | 0x5452)
+                    && (self.terminal_task.is_some()
+                        && !trames_vfs::DescriptorControl::status_ioctl_request(args[1] as u32)
                         || matches!(args[1] as u32, 0x5401 | 0x5413 | 0x802c542a)
                         || crate::pty_control_request(args[1] as u32)
                         || args[1] as u32 == 0x5441 && self.resources.is_some()))

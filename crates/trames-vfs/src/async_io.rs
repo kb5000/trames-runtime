@@ -97,10 +97,10 @@ impl AsyncState {
         if !fd.supports_async() {
             return Err(Errno(95));
         }
-        self.settings.lock().unwrap().fd = number;
         if observer.is_some() {
             return Ok(());
         }
+        self.settings.lock().unwrap().fd = number;
         let wake: Arc<dyn IoWake> = Arc::new(Wake {
             state: Arc::downgrade(self),
             target: direct_io::WatchResource::notification(fd),
@@ -126,10 +126,21 @@ impl FdFlags {
         owners: &impl AsyncOwners,
     ) -> Result<u64> {
         let status = self.with_flags(fd, |status, _| Ok(status.clone()))?;
-        if status.get() & O_PATH != 0 {
+        status.owner_control(command, argument, memory, owners)
+    }
+}
+impl fd_status::StatusFlags {
+    pub(super) fn owner_control(
+        &self,
+        command: u32,
+        argument: u64,
+        memory: &mut impl trames_memory::CpuMemory,
+        owners: &impl AsyncOwners,
+    ) -> Result<u64> {
+        if self.get() & O_PATH != 0 {
             return Err(Errno(9));
         }
-        let state = status.async_state();
+        let state = self.async_state();
         match command {
             8 | 15 => {
                 let (kind, pid) = if command == 8 {
@@ -142,8 +153,11 @@ impl FdFlags {
                     let b = memory.read_array::<8>(argument).map_err(|_| Errno(14))?;
                     let kind = u32::from_le_bytes(b[..4].try_into().unwrap());
                     let pid = i32::from_le_bytes(b[4..].try_into().unwrap());
-                    if kind > 2 || pid < 0 {
+                    if kind > 2 {
                         return Err(Errno(22));
+                    }
+                    if pid < 0 {
+                        return Err(Errno(3));
                     }
                     (kind, pid as u32)
                 };
@@ -183,6 +197,8 @@ impl FdFlags {
             _ => Err(Errno(22)),
         }
     }
+}
+impl FdFlags {
     pub fn set_async(&self, fds: &DirectFds, fd: u32, enabled: bool) -> Result<u64> {
         let target = fds
             .get(fd)
@@ -262,6 +278,45 @@ mod tests {
         v.close(alias).unwrap();
         drop(original);
         assert_eq!(v.write(writer, b"z"), Err(Errno(32)));
+    }
+    #[test]
+    fn status_ioctl_keeps_the_accepted_slot_and_checks_type_before_user_pointers() {
+        let mut vfs = Vfs::default();
+        vfs.import_file(b"/plain", Vec::new()).unwrap();
+        let fd = vfs.open_at(AT_FDCWD, b"/plain", 2, 0).unwrap();
+        let alias = vfs.dup(fd, 0, false).unwrap();
+        let accepted = vfs.descriptor_control(fd).unwrap();
+        vfs.close(fd).unwrap();
+        assert_eq!(vfs.eventfd(0, 0).unwrap(), fd);
+        let routes = Routes(Arc::new(Owner(Mutex::default())));
+        let mut memory = trames_memory::Memory::default();
+        memory
+            .map(0x1000, 4096, trames_memory::Permissions::RW)
+            .unwrap();
+        trames_memory::CpuMemory::write_array(&mut memory, 0x1000, 1u32.to_le_bytes()).unwrap();
+        assert_eq!(
+            accepted.status_ioctl(fd, 0x5451, u64::MAX, &mut memory, &routes),
+            Ok(0)
+        );
+        assert_ne!(accepted.flags() & O_CLOEXEC, 0);
+        assert_eq!(vfs.flags(fd).unwrap() & O_CLOEXEC, 0);
+        assert_eq!(vfs.flags(alias).unwrap() & O_CLOEXEC, 0);
+        assert_eq!(
+            accepted.status_ioctl(fd, 0x5421, 0x1000, &mut memory, &routes),
+            Ok(0)
+        );
+        assert_ne!(vfs.flags(alias).unwrap() & O_NONBLOCK, 0);
+        assert_eq!(vfs.flags(fd).unwrap() & O_NONBLOCK, 0);
+        assert_eq!(
+            accepted.status_ioctl(fd, 0x8901, 0, &mut memory, &routes),
+            Err(Errno(25))
+        );
+        assert_eq!(
+            accepted.status_ioctl(fd, 0x5452, 0x1000, &mut memory, &routes),
+            Err(Errno(25))
+        );
+        assert_eq!(accepted.short(fd, 4, 0x2000, &vfs.credentials), Ok(0));
+        assert_eq!(vfs.flags(alias).unwrap() & 0x2000, 0);
     }
     #[test]
     fn async_pipe_observes_repeated_events_shares_ofd_state_and_stops_on_disable() {
