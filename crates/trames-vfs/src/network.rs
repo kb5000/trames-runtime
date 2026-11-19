@@ -3,7 +3,22 @@ use super::*;
 use std::net::SocketAddr;
 /// One syscall's accepted original network OFD, independent of numeric reuse.
 #[derive(Clone)]
-pub struct SocketOperation(Arc<SharedOpenDescription>);
+pub struct SocketOperation(pub(super) Arc<SharedOpenDescription>);
+pub struct TunOperation {
+    pub(super) file: Arc<trames_net::tun::Connection>,
+    pub(super) namespace: UserNamespace,
+}
+impl TunOperation {
+    pub fn user_namespace(&self) -> &UserNamespace {
+        &self.namespace
+    }
+}
+impl std::ops::Deref for TunOperation {
+    type Target = trames_net::tun::Connection;
+    fn deref(&self) -> &Self::Target {
+        &self.file
+    }
+}
 pub enum SocketControlOperation {
     Network(SocketOperation),
     Unix(LocalOperation),
@@ -22,6 +37,15 @@ impl SharedFd {
     }
 }
 impl SocketOperation {
+    pub fn user_namespace(&self) -> &UserNamespace {
+        &self
+            .0
+            .socket_control
+            .as_ref()
+            .expect("original socket control")
+            .1
+    }
+
     pub fn shares_resources(&self, fds: &DirectFds) -> bool {
         fds.1.as_ref().is_some_and(|files| {
             files
@@ -111,6 +135,10 @@ pub(super) struct Control {
     kind: Sysctl,
 }
 impl Control {
+    pub fn authorized(&self, credentials: &Credentials) -> bool {
+        self.namespace.user_namespace.to_global(false, 0) == Some(credentials.fsuid)
+            || credentials.has_ns_cap(&self.namespace.user_namespace, capabilities::NET_ADMIN)
+    }
     pub fn read(&self, offset: u64, count: usize) -> Result<Vec<u8>> {
         let n = self.namespace.network.borrow();
         let data = match self.kind {
@@ -261,7 +289,10 @@ impl Vfs {
         self.network.device_carrier(d)
     }
     pub fn set_network_device_up(&self, index: u32, up: bool) -> Result<()> {
-        if !self.credentials.has_cap(capabilities::NET_ADMIN) {
+        if !self
+            .credentials
+            .has_ns_cap(&self.root_network.user_namespace, capabilities::NET_ADMIN)
+        {
             return Err(Errno(1));
         }
         self.network
@@ -274,7 +305,10 @@ impl Vfs {
         address: Option<std::net::Ipv4Addr>,
         prefix: Option<u8>,
     ) -> Result<()> {
-        if !self.credentials.has_cap(capabilities::NET_ADMIN) {
+        if !self
+            .credentials
+            .has_ns_cap(&self.root_network.user_namespace, capabilities::NET_ADMIN)
+        {
             return Err(Errno(1));
         }
         self.network
@@ -283,7 +317,7 @@ impl Vfs {
     }
     pub fn socket_send_bytes(
         &self,
-        socket: &NetSocket,
+        socket: &SocketOperation,
         bytes: &[u8],
         flags: u32,
         destination: Option<&[u8]>,
@@ -321,7 +355,10 @@ impl Vfs {
         self.network.loopback_up()
     }
     pub fn set_loopback_up(&self, up: bool) -> Result<()> {
-        if !self.credentials.has_cap(capabilities::NET_ADMIN) {
+        if !self
+            .credentials
+            .has_ns_cap(&self.root_network.user_namespace, capabilities::NET_ADMIN)
+        {
             return Err(Errno(1));
         }
         self.network.set_loopback_up(up).map_err(|e| Errno(e.0))
@@ -343,6 +380,7 @@ impl Vfs {
         owner: (u32, u32),
         socket: Arc<NetSocket>,
         flags: u32,
+        namespace: UserNamespace,
     ) -> Descriptor {
         socket.initialize_inode_owner(owner.0, owner.1);
         Descriptor {
@@ -364,7 +402,7 @@ impl Vfs {
                     namespace_resource: None,
                     file_authority: Default::default(),
                     tcp_publication: Default::default(),
-                    socket_control: Some(network_io::SocketControl::new(&socket)),
+                    socket_control: Some(network_io::SocketControl::new(&socket, namespace)),
                     control: None,
                     read_node: None,
                     id,
@@ -423,7 +461,7 @@ impl Vfs {
     /// Caller already retained its original socket; never look up its number again.
     pub fn accept_socket_output(
         &mut self,
-        socket: &NetSocket,
+        socket: &SocketOperation,
         flags: u32,
         output: impl FnOnce(SocketAddr) -> Result<()>,
     ) -> Result<(u32, SocketAddr)> {
@@ -661,12 +699,17 @@ mod tests {
             receiver.bind("127.0.0.1:0".parse().unwrap()).unwrap();
             let address = trames_net::encode_address(receiver.local_addr().unwrap());
             let sender = v.socket(2, 2 | O_NONBLOCK, 0).unwrap();
-            let peer = v.socket_fd(sender).unwrap();
             let ep = v.epoll_create(0).unwrap();
             v.epoll_ctl(ep, 1, fd, 0x80000001, 7).unwrap();
             assert!(v.epoll_wait(ep, 1, |_, _| Ok(None)).unwrap().is_empty());
             for text in [b"one", b"two"] {
-                v.socket_send_bytes(&peer, text, 0, Some(&address)).unwrap();
+                v.socket_send_bytes(
+                    &v.socket_operation(sender).unwrap(),
+                    text,
+                    0,
+                    Some(&address),
+                )
+                .unwrap();
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
                 loop {
                     let ready = v.epoll_wait(ep, 1, |_, _| Ok(None)).unwrap();

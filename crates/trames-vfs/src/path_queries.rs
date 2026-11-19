@@ -584,8 +584,12 @@ impl PathQueries {
                 .files
                 .observation_descriptor(fd)?;
             let open = descriptor.open.borrow();
-            view.stat_open(&open)
-                .map(|stat| (stat, Vfs::open_mount_id(&open)))
+            view.stat_open(&open).map(|stat| {
+                (
+                    view.credentials.user_namespace.stat(stat),
+                    Vfs::open_mount_id(&open),
+                )
+            })
         })())
     }
     pub fn stat_at(&self, dirfd: i32, path: &[u8], nofollow: bool) -> Option<Result<[u8; 128]>> {

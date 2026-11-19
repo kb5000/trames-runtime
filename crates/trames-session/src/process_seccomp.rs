@@ -561,7 +561,7 @@ impl Seccomp {
                     return Err(Errno(22));
                 }
                 let no_new_privs = credentials.caps.no_new_privs.get();
-                if !no_new_privs && !credentials.has_cap(capabilities::SYS_ADMIN) {
+                if !no_new_privs && !credentials.has_local_cap(capabilities::SYS_ADMIN) {
                     return Err(Errno(13));
                 }
                 Change::Filter {

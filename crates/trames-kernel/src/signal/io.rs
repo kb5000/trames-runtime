@@ -1027,19 +1027,13 @@ impl IoRoutes {
             .next()
             .ok_or(Errno(3))?;
         if caller.tgid() != target.tgid() {
-            let (euid, privileged) = {
-                let credentials = caller.credentials().read();
-                (
-                    credentials.euid,
-                    credentials.has_cap(trames_vfs::capabilities::SYS_PTRACE),
-                )
+            let (uid, euid, suid, namespace) = {
+                let c = target.credentials().read();
+                (c.uid, c.euid, c.suid, c.user_namespace.clone())
             };
-            let credentials = target.credentials().read();
-            if euid != 0
-                && !privileged
-                && !(euid == credentials.uid
-                    && euid == credentials.euid
-                    && euid == credentials.suid)
+            let caller = caller.credentials().read();
+            if !caller.has_ns_cap(&namespace, trames_vfs::capabilities::SYS_PTRACE)
+                && !(caller.euid == uid && caller.euid == euid && caller.euid == suid)
             {
                 return Err(Errno(1));
             }

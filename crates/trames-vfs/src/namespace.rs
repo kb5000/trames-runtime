@@ -153,7 +153,11 @@ impl Vfs {
         let _metadata = node.metadata.lock().unwrap();
         self.pseudo_metadata_mutable(&node)?;
         let mut n = node.borrow_mut();
-        if !self.credentials.has_cap(capabilities::FOWNER) && self.credentials.fsuid != n.uid {
+        if !self
+            .credentials
+            .inode_cap(capabilities::FOWNER, n.uid, n.gid)
+            && self.credentials.fsuid != n.uid
+        {
             return Err(Errno(1));
         }
         let old_mode = n.mode;
@@ -168,7 +172,11 @@ impl Vfs {
             n = node.borrow_mut();
         }
         n.mode = (n.mode & !0o7777) | (mode & 0o7777);
-        if !self.credentials.has_cap(capabilities::FSETID) && !self.credentials.in_group(n.gid) {
+        if !self
+            .credentials
+            .inode_cap(capabilities::FSETID, n.uid, n.gid)
+            && !self.credentials.in_group(n.gid)
+        {
             n.mode &= !0o2000;
         }
         let acl_mode = n.mode;

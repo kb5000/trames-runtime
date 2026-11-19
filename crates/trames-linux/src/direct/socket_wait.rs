@@ -186,7 +186,7 @@ impl RetainedSocket {
                 let result = if let Some(address) = &self.accepted_address {
                     socket.with_tcp_publication(|| {
                         let result = if self.number == 200 {
-                            socket.bind_authorized(address, self.factory.can_bind_service())
+                            socket.bind_authorized(address, self.factory.can_bind_service(socket))
                         } else if self.connecting {
                             socket.resume_connect().and_then(|ready| {
                                 if ready {

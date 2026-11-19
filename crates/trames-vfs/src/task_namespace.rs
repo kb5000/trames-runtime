@@ -90,7 +90,8 @@ impl Publication {
 
 const FILES: u64 = 0x400;
 const FS: u64 = 0x200;
-const ALLOWED: u64 = CLONE_NEWUTS
+const ALLOWED: u64 = CLONE_NEWUSER
+    | CLONE_NEWUTS
     | CLONE_NEWNS
     | CLONE_NEWPID
     | CLONE_NEWNET
@@ -164,7 +165,12 @@ impl Vfs {
 
     /// A non-mount namespace replaces only a task-local handle after validation.
     /// There is no multi-resource rollback state to copy on a serial executor.
-    pub fn setns_task(&mut self, fd: u32, kind: u64) -> TaskNamespaceOwnerAttempt {
+    pub fn setns_task(
+        &mut self,
+        fd: u32,
+        kind: u64,
+        single_threaded: bool,
+    ) -> TaskNamespaceOwnerAttempt {
         let namespace = (|| {
             self.descriptor(fd)?
                 .open
@@ -174,6 +180,9 @@ impl Vfs {
                 .ok_or(Errno(22))
         })();
         match namespace {
+            Ok(NamespaceHandle::User(_)) if !single_threaded => {
+                TaskNamespaceOwnerAttempt::Complete(Err(Errno(22)))
+            }
             Ok(namespace @ NamespaceHandle::Mount(_)) => self
                 .task_namespaces()
                 .setns_target(Ok(namespace), kind)
@@ -287,16 +296,18 @@ impl TaskNamespaces {
     pub fn unshare(self, flags: u64, pid_allowed: bool) -> TaskNamespaceWork {
         let mut admin = None;
         let change = (|| {
-            if flags & !ALLOWED != 0 || flags & CLONE_NEWPID != 0 && !pid_allowed {
+            if flags & !ALLOWED != 0 || flags & (CLONE_NEWPID | CLONE_NEWUSER) != 0 && !pid_allowed
+            {
                 return Err(Errno(22));
             }
-            if flags & !(FILES | FS) != 0
+            if flags & !(FILES | FS | CLONE_NEWUSER) != 0
+                && flags & CLONE_NEWUSER == 0
                 && !self
                     .view
                     .view
                     .borrow()
                     .credentials
-                    .has_cap(capabilities::SYS_ADMIN)
+                    .has_local_cap(capabilities::SYS_ADMIN)
             {
                 return Err(Errno(1));
             }
@@ -322,6 +333,16 @@ impl TaskNamespaces {
             change,
             admin: None,
         }
+    }
+    pub fn setns_checked(self, fd: u32, kind: u64, single_threaded: bool) -> TaskNamespaceWork {
+        if single_threaded {
+            return self.setns(fd, kind);
+        }
+        let mut work = self.setns(fd, kind);
+        if matches!(work.change, Ok(Change::Setns(NamespaceHandle::User(_), _))) {
+            work.change = Err(Errno(22));
+        }
+        work
     }
     pub fn setns(self, fd: u32, kind: u64) -> TaskNamespaceWork {
         let namespace = (|| {
@@ -397,7 +418,8 @@ impl Change {
         let (files, context) = match self {
             Change::Unshare(flags) => (
                 flags & FILES != 0 && original.shared_files().task_shared(),
-                flags & CLONE_NEWNS != 0 || flags & FS != 0 && original.context_shared(),
+                flags & (CLONE_NEWNS | CLONE_NEWUSER) != 0
+                    || flags & FS != 0 && original.context_shared(),
             ),
             Change::CloseRange(_, _, flags) => (
                 flags & 2 != 0 && original.shared_files().task_shared(),
@@ -433,6 +455,9 @@ impl Change {
         }
         match self {
             Change::Unshare(flags) => {
+                if flags & CLONE_NEWUSER != 0 {
+                    view.unshare_user()?;
+                }
                 if flags & CLONE_NEWPID != 0 {
                     view.unshare_pid()?;
                 }
@@ -440,7 +465,7 @@ impl Change {
                     view.unshare_uts()?;
                 }
                 if flags & CLONE_NEWNS != 0 {
-                    if !view.credentials.has_cap(capabilities::SYS_ADMIN) {
+                    if !view.credentials.has_local_cap(capabilities::SYS_ADMIN) {
                         return Err(Errno(1));
                     }
                     view.unshare_mounts_locked()?;

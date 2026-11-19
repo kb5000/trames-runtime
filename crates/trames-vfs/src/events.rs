@@ -40,7 +40,7 @@ impl SignalMask {
     }
 }
 pub(super) enum SharedControl {
-    Tun(Arc<trames_net::tun::Connection>),
+    Tun(Arc<trames_net::tun::Connection>, UserNamespace),
     Sync(Arc<sync_file::File>),
     Binder(Arc<binder::Connection>),
     Cgroup(Arc<cgroup::CgroupFile>),
@@ -73,7 +73,7 @@ impl SharedControl {
                 }
                 Anonymous::Sync(file.clone())
             }
-            Self::Tun(_) | Self::Cgroup(_) | Self::Binder(_) => return None,
+            Self::Tun(..) | Self::Cgroup(_) | Self::Binder(_) => return None,
             Self::Uring(ring) => Anonymous::Uring(ring.clone()),
             Self::Signal(mask) => Anonymous::Signal(mask.clone()),
             Self::Bpf(program) => Anonymous::Bpf(program.clone()),
@@ -321,7 +321,7 @@ impl Vfs {
         Self::poll_epoch_with(o, None)
     }
     fn poll_epoch_with(o: &OpenDescription, reader: Option<&Arc<dyn SignalReader>>) -> [u64; 2] {
-        if let Some(SharedControl::Tun(file)) = &o.control {
+        if let Some(SharedControl::Tun(file, _)) = &o.control {
             return file.poll(0).1;
         }
         if let Some(SharedControl::Sync(file)) = &o.control {

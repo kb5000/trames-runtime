@@ -10,6 +10,7 @@ pub const CLONE_NEWPID: u64 = 0x2000_0000;
 static NEXT: AtomicU64 = AtomicU64::new(0xd000_0000);
 
 pub(super) struct PidSpace {
+    pub(super) user_namespace: UserNamespace,
     inode: u64,
     parent: Option<PidNamespace>,
     depth: usize,
@@ -63,6 +64,13 @@ impl Default for PidNamespace {
 }
 impl PidNamespace {
     fn new(parent: Option<Self>, registry: Arc<Mutex<Vec<Weak<PidSpace>>>>) -> Result<Self> {
+        Self::with_owner(parent, registry, UserNamespace::default())
+    }
+    fn with_owner(
+        parent: Option<Self>,
+        registry: Arc<Mutex<Vec<Weak<PidSpace>>>>,
+        user_namespace: UserNamespace,
+    ) -> Result<Self> {
         let depth = parent.as_ref().map_or(0, |p| p.0.depth + 1);
         let mut all = registry.lock().unwrap();
         all.retain(|p| p.strong_count() != 0);
@@ -73,6 +81,7 @@ impl PidNamespace {
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| Errno(28))?;
         let n = Self(Arc::new(PidSpace {
+            user_namespace,
             inode,
             parent,
             depth,
@@ -86,6 +95,9 @@ impl PidNamespace {
         }));
         all.push(Arc::downgrade(&n.0));
         Ok(n)
+    }
+    pub fn user_namespace(&self) -> &UserNamespace {
+        &self.0.user_namespace
     }
     pub(super) fn local_in(&self, namespace: u64, global: u32) -> u32 {
         if namespace == 0 {
@@ -310,14 +322,17 @@ impl Vfs {
         &self.pid_children
     }
     pub fn unshare_pid(&mut self) -> Result<()> {
-        if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
+        if !self.credentials.has_local_cap(capabilities::SYS_ADMIN) {
             return Err(Errno(1));
         }
         if self.pid_children.id() != self.pid_ns.id() {
             return Err(Errno(22));
         }
-        self.pid_children =
-            PidNamespace::new(Some(self.pid_ns.clone()), self.pid_ns.0.registry.clone())?;
+        self.pid_children = PidNamespace::with_owner(
+            Some(self.pid_ns.clone()),
+            self.pid_ns.0.registry.clone(),
+            self.credentials.user_namespace.clone(),
+        )?;
         Ok(())
     }
     pub fn activate_child_pid(&mut self, global: u32) -> Result<()> {

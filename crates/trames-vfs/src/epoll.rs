@@ -298,7 +298,7 @@ pub(super) fn control(
     let resource_control = matches!(
         t.control,
         Some(
-            events::SharedControl::Tun(_)
+            events::SharedControl::Tun(..)
                 | events::SharedControl::Cgroup(_)
                 | events::SharedControl::Binder(_)
                 | events::SharedControl::Sync(_)

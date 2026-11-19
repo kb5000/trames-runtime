@@ -1260,7 +1260,11 @@ impl DirectSyscalls {
                 Command::Seek { offset, whence } => {
                     file.seek(*offset, *whence).map(|r| r.map(Value::Count))
                 }
-                Command::Stat => Some(file.stat().map(Value::Stat)),
+                Command::Stat => Some(file.stat().map(|stat| {
+                    Value::Stat(self.resources.as_ref().map_or(stat, |factory| {
+                        factory.local_credentials().user_namespace.stat(stat)
+                    }))
+                })),
                 _ => None,
             }
         });

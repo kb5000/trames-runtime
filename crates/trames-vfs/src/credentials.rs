@@ -74,16 +74,18 @@ impl ExecCredentials {
         let old_permitted = self.original.caps.permitted;
         let mut c = self.original.clone();
         if !self.nosuid && !no_new_privs {
-            if self.mode & 0o4000 != 0 {
+            if self.mode & 0o4000 != 0 && c.user_namespace.from_global(false, self.uid).is_some() {
                 c.euid = self.uid;
             }
-            if self.mode & 0o2010 == 0o2010 {
+            if self.mode & 0o2010 == 0o2010
+                && c.user_namespace.from_global(true, self.gid).is_some()
+            {
                 c.egid = self.gid;
             }
         }
         c.caps.exec_with_nnp(
-            c.uid,
-            c.euid,
+            c.local_id(false, c.uid),
+            c.local_id(false, c.euid),
             c.uid != c.euid || c.gid != c.egid,
             no_new_privs,
         );
@@ -109,6 +111,7 @@ impl ExecCredentials {
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Credentials {
+    pub user_namespace: UserNamespace,
     pub uid: u32,
     pub euid: u32,
     pub suid: u32,
@@ -144,16 +147,17 @@ impl Credentials {
             (mode >> shift) & bits == bits
         };
         permitted
-            || c.has_cap(capabilities::DAC_OVERRIDE)
+            || c.inode_cap(capabilities::DAC_OVERRIDE, node.uid, node.gid)
                 && (bits & 1 == 0
                     || matches!(node.content, Content::Directory)
                     || mode & 0o111 != 0)
-            || c.has_cap(capabilities::DAC_READ_SEARCH)
+            || c.inode_cap(capabilities::DAC_READ_SEARCH, node.uid, node.gid)
                 && bits & 2 == 0
                 && (bits & 1 == 0 || matches!(node.content, Content::Directory))
     }
     pub fn user(uid: u32, gid: u32) -> Self {
         Self {
+            user_namespace: UserNamespace::default(),
             uid,
             euid: uid,
             suid: uid,
@@ -167,7 +171,32 @@ impl Credentials {
         }
     }
     pub fn has_cap(&self, cap: u32) -> bool {
+        self.user_namespace.is_initial() && self.caps.has(cap)
+    }
+    pub fn has_local_cap(&self, cap: u32) -> bool {
         self.caps.has(cap)
+    }
+    pub fn has_ns_cap(&self, namespace: &UserNamespace, cap: u32) -> bool {
+        namespace.capable(self, cap)
+    }
+    pub fn local_id(&self, group: bool, id: u32) -> u32 {
+        self.user_namespace.visible(group, id)
+    }
+    pub fn mapped_id(&self, group: bool, id: u32) -> Result<u32> {
+        self.user_namespace.to_global(group, id).ok_or(Errno(22))
+    }
+    pub fn enter_user_namespace(&mut self, namespace: UserNamespace) {
+        let nnp = self.caps.no_new_privs.clone();
+        self.user_namespace = namespace;
+        self.caps = capabilities::Capabilities::default();
+        self.caps.no_new_privs = nnp;
+    }
+    pub fn inode_cap(&self, cap: u32, uid: u32, gid: u32) -> bool {
+        self.has_local_cap(cap)
+            && (self.user_namespace.is_initial()
+                || self.user_namespace.from_global(false, uid).is_some()
+                    && (cap == capabilities::FOWNER
+                        || self.user_namespace.from_global(true, gid).is_some()))
     }
     pub fn in_group(&self, gid: u32) -> bool {
         self.fsgid == gid || self.groups.contains(&gid)
@@ -187,7 +216,7 @@ impl Credentials {
         {
             return Ok(());
         }
-        if !self.has_cap(if group {
+        if !self.has_local_cap(if group {
             capabilities::SETGID
         } else {
             capabilities::SETUID
@@ -207,7 +236,10 @@ impl Credentials {
             [self.gid, self.egid, self.sgid] = next;
             self.fsgid = self.egid;
         } else {
-            self.caps.uids_changed(current, next);
+            self.caps.uids_changed(
+                current.map(|id| self.local_id(false, id)),
+                next.map(|id| self.local_id(false, id)),
+            );
             [self.uid, self.euid, self.suid] = next;
             self.fsuid = self.euid;
         }
@@ -217,7 +249,7 @@ impl Credentials {
         if value == u32::MAX {
             return Err(Errno(22));
         }
-        if self.has_cap(if group {
+        if self.has_local_cap(if group {
             capabilities::SETGID
         } else {
             capabilities::SETUID
@@ -241,7 +273,7 @@ impl Credentials {
         } else {
             [self.uid, self.euid, self.suid]
         };
-        if !self.has_cap(if group {
+        if !self.has_local_cap(if group {
             capabilities::SETGID
         } else {
             capabilities::SETUID
@@ -278,7 +310,7 @@ impl Credentials {
         };
         if value != u32::MAX
             && (ids.contains(&value)
-                || self.has_cap(if group {
+                || self.has_local_cap(if group {
                     capabilities::SETGID
                 } else {
                     capabilities::SETUID
@@ -287,7 +319,8 @@ impl Credentials {
             if group {
                 self.fsgid = value;
             } else {
-                self.caps.fsuid_changed(old, value);
+                self.caps
+                    .fsuid_changed(self.local_id(false, old), self.local_id(false, value));
                 self.fsuid = value;
             }
         }
@@ -373,7 +406,9 @@ impl Vfs {
             .processes
             .iter()
             .any(|p| p.pid == own && p.tgid == target.tgid)
-            || self.credentials.has_cap(capabilities::SYS_PTRACE)
+            || self
+                .credentials
+                .has_ns_cap(&target.credentials.user_namespace, capabilities::SYS_PTRACE)
         {
             return true;
         }
@@ -382,7 +417,8 @@ impl Vfs {
         !target.nondumpable
             && [t.uid, t.euid, t.suid].iter().all(|id| *id == c.fsuid)
             && [t.gid, t.egid, t.sgid].iter().all(|id| *id == c.fsgid)
-            && t.caps.permitted & !c.caps.effective == 0
+            && (c.user_namespace == t.user_namespace && t.caps.permitted & !c.caps.effective == 0
+                || c.has_ns_cap(&t.user_namespace, capabilities::SYS_PTRACE))
     }
 
     pub fn apply_exec_credentials(&mut self, path: &[u8]) -> Result<()> {
@@ -423,11 +459,12 @@ impl Vfs {
             view.credentials.fsuid = self.credentials.uid;
             view.credentials.fsgid = self.credentials.gid;
             if self.credentials.caps.securebits & capabilities::NO_SETUID_FIXUP == 0 {
-                view.credentials.caps.effective = if self.credentials.uid == 0 {
-                    self.credentials.caps.permitted
-                } else {
-                    0
-                };
+                view.credentials.caps.effective =
+                    if self.credentials.local_id(false, self.credentials.uid) == 0 {
+                        self.credentials.caps.permitted
+                    } else {
+                        0
+                    };
             }
         }
         let path = view.resolve_final(dirfd, path, !nofollow)?;
@@ -465,7 +502,7 @@ impl Vfs {
         self.pseudo_metadata_mutable(&node)?;
         let mut n = node.borrow_mut();
         let c = &self.credentials;
-        if !c.has_cap(capabilities::CHOWN)
+        if !c.inode_cap(capabilities::CHOWN, n.uid, n.gid)
             && (c.fsuid != n.uid
                 || (uid != u32::MAX && uid != n.uid)
                 || (gid != u32::MAX && gid != n.gid && !c.in_group(gid)))
@@ -512,6 +549,16 @@ impl Vfs {
         gid: u32,
         nofollow: bool,
     ) -> Result<()> {
+        let uid = if uid == u32::MAX {
+            uid
+        } else {
+            self.credentials.mapped_id(false, uid)?
+        };
+        let gid = if gid == u32::MAX {
+            gid
+        } else {
+            self.credentials.mapped_id(true, gid)?
+        };
         let MetadataTarget { path, node, _magic } = self.metadata_target(dirfd, path, !nofollow)?;
         path.writable()?;
         self.chown_node(node, uid, gid, true)
@@ -524,6 +571,16 @@ impl Vfs {
     }
     /// AT_EMPTY_PATH operates on an inode reference, including O_PATH.
     pub fn chown_fd_at(&mut self, fd: u32, uid: u32, gid: u32) -> Result<()> {
+        let uid = if uid == u32::MAX {
+            uid
+        } else {
+            self.credentials.mapped_id(false, uid)?
+        };
+        let gid = if gid == u32::MAX {
+            gid
+        } else {
+            self.credentials.mapped_id(true, gid)?
+        };
         self.fd_writable(fd)?;
         let open_descriptor = self.descriptor(fd)?;
         let open = open_descriptor.open.borrow();
@@ -531,7 +588,7 @@ impl Vfs {
             let c = &self.credentials;
             return socket
                 .chown(uid, gid, |[current_uid, current_gid]| {
-                    if !c.has_cap(capabilities::CHOWN)
+                    if !c.inode_cap(capabilities::CHOWN, current_uid, current_gid)
                         && (c.fsuid != current_uid
                             || uid != u32::MAX && uid != current_uid
                             || gid != u32::MAX && gid != current_gid && !c.in_group(gid))

@@ -223,10 +223,20 @@ impl IoRoutes {
                 if !can_kill
                     && !(sig == 18 && source.session() == target.session())
                     && !{
-                        let c = target.credentials().read();
-                        [self.uid, self.euid]
-                            .iter()
-                            .any(|id| *id == c.uid || *id == c.suid)
+                        let (matched, namespace) = {
+                            let c = target.credentials().read();
+                            (
+                                [self.uid, self.euid]
+                                    .iter()
+                                    .any(|id| *id == c.uid || *id == c.suid),
+                                c.user_namespace.clone(),
+                            )
+                        };
+                        matched
+                            || source
+                                .credentials()
+                                .read()
+                                .has_ns_cap(&namespace, trames_vfs::capabilities::KILL)
                     }
                 {
                     continue;

@@ -7,7 +7,7 @@ pub fn prepare(
     namespace: &PidNamespace,
     args: [u64; 6],
 ) -> Result<(), Errno> {
-    if !credentials.has_cap(capabilities::SYS_BOOT) {
+    if !credentials.has_ns_cap(namespace.user_namespace(), capabilities::SYS_BOOT) {
         return Err(Errno(1));
     }
     if args[0] as u32 != 0xfee1_dead

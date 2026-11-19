@@ -400,6 +400,7 @@ impl MountData {
     }
 }
 pub(super) struct Table {
+    pub(super) user_namespace: UserNamespace,
     pub id: u64,
     pub root: Arc<Mount>,
     pub mounts: Vec<Arc<Mount>>,
@@ -412,6 +413,7 @@ pub(super) struct Table {
 impl Table {
     fn new(id: u64, root: Arc<Mount>, mounts: Vec<Arc<Mount>>) -> Self {
         Self {
+            user_namespace: UserNamespace::default(),
             id,
             root,
             mounts,
@@ -426,6 +428,7 @@ impl Table {
         let mut project =
             |mount: &Arc<Mount>| Mount::query_projection(mount.shared.clone(), &mut cache);
         Self {
+            user_namespace: table.user_namespace.clone(),
             id: table.id,
             root: project(&table.root),
             mounts: table.mounts.iter().map(&mut project).collect(),
@@ -858,7 +861,7 @@ impl Vfs {
         Err(Errno(40))
     }
     pub fn unshare_mounts(&mut self) -> Result<()> {
-        if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
+        if !self.credentials.has_local_cap(capabilities::SYS_ADMIN) {
             return Err(Errno(1));
         }
         let admin = self.mount_admin()?;
@@ -924,6 +927,7 @@ impl Vfs {
             remap(&mut paths.root_mount);
         }
         let mut table = Table::new(NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed), root, mounts);
+        table.user_namespace = self.credentials.user_namespace.clone();
         if let Some(admin) = shared_admin {
             table.admin = admin;
         }
@@ -1043,7 +1047,15 @@ impl Vfs {
         const SLAVE: u64 = 1 << 19;
         const SHARED: u64 = 1 << 20;
         const ATTRS: u64 = MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_RELATIME;
-        if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
+        if !self.credentials.has_ns_cap(
+            &self
+                .mounts
+                .as_ref()
+                .map_or_else(UserNamespace::default, |n| {
+                    n.0.borrow().user_namespace.clone()
+                }),
+            capabilities::SYS_ADMIN,
+        ) {
             return Err(Errno(1));
         }
         let flags = if flags & 0xffff0000 == 0xc0ed0000 {
@@ -1454,7 +1466,15 @@ impl Vfs {
         self.umount_locked(target, flags)
     }
     pub(super) fn umount_locked(&mut self, target: &[u8], flags: u64) -> Result<()> {
-        if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
+        if !self.credentials.has_ns_cap(
+            &self
+                .mounts
+                .as_ref()
+                .map_or_else(UserNamespace::default, |n| {
+                    n.0.borrow().user_namespace.clone()
+                }),
+            capabilities::SYS_ADMIN,
+        ) {
             return Err(Errno(1));
         }
         if flags & !(2 | 8) != 0 {
@@ -1476,7 +1496,15 @@ impl Vfs {
         self.pivot_root_locked(new_root, put_old)
     }
     pub(super) fn pivot_root_locked(&mut self, new_root: &[u8], put_old: &[u8]) -> Result<()> {
-        if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
+        if !self.credentials.has_ns_cap(
+            &self
+                .mounts
+                .as_ref()
+                .map_or_else(UserNamespace::default, |n| {
+                    n.0.borrow().user_namespace.clone()
+                }),
+            capabilities::SYS_ADMIN,
+        ) {
             return Err(Errno(1));
         }
         let new = self.resolve(AT_FDCWD, new_root)?;

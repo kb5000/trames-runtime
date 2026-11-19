@@ -22,7 +22,7 @@ pub(super) fn control_publishes(number: u32, a: [u64; 6]) -> bool {
 /// Identical socket control ABI for owner and executing-worker dispatch.
 pub(super) fn control(
     factory: &trames_vfs::DescriptorFactory,
-    socket: &trames_net::Socket,
+    socket: &trames_vfs::SocketOperation,
     number: u32,
     a: [u64; 6],
     memory: &mut impl CpuMemory,
@@ -35,7 +35,7 @@ pub(super) fn control(
             let peer = address(memory, a[1], a[2])?;
             if number == 200 {
                 socket
-                    .bind_authorized(&peer, factory.can_bind_service())
+                    .bind_authorized(&peer, factory.can_bind_service(socket))
                     .map_err(net)?;
             } else {
                 socket.connect_bytes(&peer).map_err(net)?;
@@ -94,19 +94,23 @@ pub(super) fn control(
             write_option(memory, a, |value| {
                 if a[1] as u32 == 1 && a[2] as u32 == 36 {
                     let credentials = factory.local_credentials();
-                    if !credentials.has_cap(trames_vfs::capabilities::NET_ADMIN)
-                        && !credentials.has_cap(trames_vfs::capabilities::NET_RAW)
+                    if !credentials
+                        .has_ns_cap(socket.user_namespace(), trames_vfs::capabilities::NET_ADMIN)
+                        && !credentials
+                            .has_ns_cap(socket.user_namespace(), trames_vfs::capabilities::NET_RAW)
                     {
                         return Err(Errno(1));
                     }
                 }
-                if socket.is_netlink() && a[1] as u32 == 1 && matches!(a[2] as u32, 32 | 33) {
-                    if !factory
+                if a[1] as u32 == 1
+                    && matches!(a[2] as u32, 32 | 33)
+                    && !factory
                         .local_credentials()
                         .has_cap(trames_vfs::capabilities::NET_ADMIN)
-                    {
-                        return Err(Errno(1));
-                    }
+                {
+                    return Err(Errno(1));
+                }
+                if socket.is_netlink() && a[1] as u32 == 1 && matches!(a[2] as u32, 32 | 33) {
                     // These affect the guest queue only. Never grant a native
                     // host socket a force-buffer option using guest authority.
                     return socket
@@ -730,7 +734,7 @@ impl Linux {
     }
     fn network_socket(
         vfs: &mut trames_vfs::Vfs,
-        socket: &trames_net::Socket,
+        socket: &trames_vfs::SocketOperation,
         number: u64,
         a: [u64; 6],
         memory: &mut impl CpuMemory,
@@ -1092,7 +1096,7 @@ mod packet_filter_tests {
             .configure_network(trames_vfs::NetworkMode::Full)
             .unwrap();
         let fd = linux.vfs.socket(17, 3, 0x0300).unwrap();
-        let socket = linux.vfs.socket_fd(fd).unwrap();
+        let socket = linux.vfs.socket_operation(fd).unwrap();
         let factory = linux.vfs.descriptor_factory();
         let mut memory = Memory::default();
         memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();

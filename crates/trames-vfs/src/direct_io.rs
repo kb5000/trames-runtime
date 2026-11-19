@@ -553,7 +553,7 @@ impl DirectFd {
             }
         } else {
             match &open.control {
-                Some(events::SharedControl::Tun(file)) => ByteResource::Tun(file.clone()),
+                Some(events::SharedControl::Tun(file, _)) => ByteResource::Tun(file.clone()),
                 Some(events::SharedControl::Sync(file)) => {
                     ByteResource::PollOnly(file.poll_handle())
                 }

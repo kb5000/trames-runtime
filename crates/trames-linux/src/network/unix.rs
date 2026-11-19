@@ -190,6 +190,14 @@ pub(crate) fn control(
             if a[2] == 17 {
                 let mut credentials = socket.peer_credentials();
                 credentials[0] = factory.local_pid(credentials[0]);
+                // An unconnected socket has no peer credential. Preserve its
+                // -1 sentinel rather than treating it as an unmapped identity.
+                for (group, at) in [(false, 1), (true, 2)] {
+                    if credentials[at] != u32::MAX {
+                        credentials[at] =
+                            factory.local_credentials().local_id(group, credentials[at]);
+                    }
+                }
                 let value: Vec<_> = credentials.into_iter().flat_map(u32::to_le_bytes).collect();
                 let size = u32_at(memory, a[4])? as usize;
                 if size > i32::MAX as usize {
@@ -237,6 +245,7 @@ pub(crate) trait MessageIo {
     type Rights: Clone;
     fn kind(&self) -> u32;
     fn connected(&self) -> bool;
+    fn pid_user_namespace(&self) -> &trames_vfs::UserNamespace;
     fn send_buffer(&self) -> usize;
     fn nonblocking(&self) -> u32;
     fn recv(
@@ -354,6 +363,9 @@ impl MessageIo for OwnerMessage<'_> {
             true,
         ))
     }
+    fn pid_user_namespace(&self) -> &trames_vfs::UserNamespace {
+        self.vfs.pid_namespace().user_namespace()
+    }
     fn sender_credentials(&self) -> [u32; 3] {
         self.vfs.local_sender_credentials()
     }
@@ -452,14 +464,16 @@ pub(crate) fn prepare_message<I: MessageIo>(
                 if uid == u32::MAX || gid == u32::MAX {
                     return Err(Errno(22));
                 }
+                let uid = c.mapped_id(false, uid)?;
+                let gid = c.mapped_id(true, gid)?;
                 // Permission precedes PID lookup, as for Linux SCM_CREDENTIALS.
                 // Ordinary self credentials need no process-directory lookup.
                 if (pid != io.local_pid(identity[0])
-                    && !c.has_cap(trames_vfs::capabilities::SYS_ADMIN))
+                    && !c.has_ns_cap(io.pid_user_namespace(), trames_vfs::capabilities::SYS_ADMIN))
                     || (![c.uid, c.euid, c.suid].contains(&uid)
-                        && !c.has_cap(trames_vfs::capabilities::SETUID))
+                        && !c.has_local_cap(trames_vfs::capabilities::SETUID))
                     || (![c.gid, c.egid, c.sgid].contains(&gid)
-                        && !c.has_cap(trames_vfs::capabilities::SETGID))
+                        && !c.has_local_cap(trames_vfs::capabilities::SETGID))
                 {
                     return Err(Errno(1));
                 }
@@ -557,6 +571,8 @@ impl<R: Clone> PreparedMessage<R> {
                 let mut control_truncated = false;
                 if let Some(mut credentials) = received.credentials {
                     credentials[0] = io.local_pid(credentials[0]);
+                    credentials[1] = io.credentials().local_id(false, credentials[1]);
+                    credentials[2] = io.credentials().local_id(true, credentials[2]);
                     let value: Vec<_> =
                         credentials.into_iter().flat_map(u32::to_le_bytes).collect();
                     push_control(&mut ancillary, 1, 2, &value);

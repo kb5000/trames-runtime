@@ -26,6 +26,7 @@ fn reserve_namespace(live: &std::sync::atomic::AtomicUsize) -> Result<u64> {
 /// A network identity owns both its IP stack and abstract Unix address space.
 /// Existing socket FDs retain their creating stack after unshare/setns.
 pub(super) struct RootNetwork {
+    pub(super) user_namespace: UserNamespace,
     inode: u64,
     pub network: SharedCell<trames_net::Network>,
     pub local: Arc<SharedCell<ipc::LocalNamespace>>,
@@ -34,6 +35,7 @@ pub(super) struct RootNetwork {
 impl Default for RootNetwork {
     fn default() -> Self {
         Self {
+            user_namespace: UserNamespace::default(),
             inode: NEXT_INODE.fetch_add(1, Ordering::Relaxed),
             network: SharedCell::default(),
             local: Arc::default(),
@@ -47,6 +49,7 @@ impl Drop for RootNetwork {
     }
 }
 pub(super) struct IpcNamespace {
+    pub(super) user_namespace: UserNamespace,
     inode: u64,
     pub mqueue: std::sync::OnceLock<FsHandle>,
     live: Arc<std::sync::atomic::AtomicUsize>,
@@ -54,6 +57,7 @@ pub(super) struct IpcNamespace {
 impl Default for IpcNamespace {
     fn default() -> Self {
         Self {
+            user_namespace: UserNamespace::default(),
             inode: NEXT_INODE.fetch_add(1, Ordering::Relaxed),
             mqueue: Default::default(),
             live: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
@@ -66,6 +70,7 @@ impl Drop for IpcNamespace {
     }
 }
 pub(super) struct CgroupNamespace {
+    pub(super) user_namespace: UserNamespace,
     inode: u64,
     pub root: Option<NodeRef>,
     pub path: Vec<u8>,
@@ -74,6 +79,7 @@ pub(super) struct CgroupNamespace {
 impl Default for CgroupNamespace {
     fn default() -> Self {
         Self {
+            user_namespace: UserNamespace::default(),
             inode: NEXT_INODE.fetch_add(1, Ordering::Relaxed),
             root: None,
             path: b"/".to_vec(),
@@ -88,6 +94,7 @@ impl Drop for CgroupNamespace {
 }
 
 struct Uts {
+    pub(super) user_namespace: UserNamespace,
     inode: u64,
     names: std::sync::Mutex<[Vec<u8>; 2]>,
     live: Arc<std::sync::atomic::AtomicUsize>,
@@ -107,6 +114,13 @@ impl Default for UtsNamespace {
 }
 impl UtsNamespace {
     fn new(names: [Vec<u8>; 2], live: Arc<std::sync::atomic::AtomicUsize>) -> Result<Self> {
+        Self::with_owner(names, live, UserNamespace::default())
+    }
+    fn with_owner(
+        names: [Vec<u8>; 2],
+        live: Arc<std::sync::atomic::AtomicUsize>,
+        user_namespace: UserNamespace,
+    ) -> Result<Self> {
         live.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
             (n < MAX_NAMESPACES).then_some(n + 1)
         })
@@ -118,6 +132,7 @@ impl UtsNamespace {
                 Errno(28)
             })?;
         Ok(Self(Arc::new(Uts {
+            user_namespace,
             inode,
             names: std::sync::Mutex::new(names),
             live,
@@ -129,8 +144,12 @@ impl UtsNamespace {
     pub fn name(&self, domain: bool) -> Vec<u8> {
         self.0.names.lock().unwrap()[usize::from(domain)].clone()
     }
-    fn copy(&self) -> Result<Self> {
-        Self::new(self.0.names.lock().unwrap().clone(), self.0.live.clone())
+    fn copy(&self, owner: UserNamespace) -> Result<Self> {
+        Self::with_owner(
+            self.0.names.lock().unwrap().clone(),
+            self.0.live.clone(),
+            owner,
+        )
     }
     pub(super) fn label(&self) -> Vec<u8> {
         format!("uts:[{}]", self.id()).into_bytes()
@@ -161,6 +180,7 @@ impl UtsAccess {
 
 #[derive(Clone)]
 pub(super) enum NamespaceHandle {
+    User(UserNamespace),
     Uts(UtsNamespace),
     Mount(MountNamespace),
     Pid(PidNamespace),
@@ -171,6 +191,7 @@ pub(super) enum NamespaceHandle {
 // Complete namespace resources, including the original synchronized mount table.
 #[derive(Clone)]
 pub(super) enum SharedNamespace {
+    User(UserNamespace),
     Mount(MountNamespace),
     Uts(UtsNamespace),
     Pid(PidNamespace),
@@ -181,6 +202,7 @@ pub(super) enum SharedNamespace {
 impl SharedNamespace {
     fn capture(namespace: &NamespaceHandle) -> Option<Self> {
         Some(match namespace {
+            NamespaceHandle::User(n) => Self::User(n.clone()),
             NamespaceHandle::Uts(n) => Self::Uts(n.clone()),
             NamespaceHandle::Pid(n) => Self::Pid(n.clone()),
             NamespaceHandle::Net(n) => Self::Net(n.clone()),
@@ -195,6 +217,7 @@ impl SharedNamespace {
     pub(super) fn id(&self) -> u64 {
         match self {
             Self::Mount(n) => n.id(),
+            Self::User(n) => n.id(),
             Self::Uts(n) => n.id(),
             Self::Pid(n) => n.id(),
             Self::Net(n) => n.inode,
@@ -205,6 +228,7 @@ impl SharedNamespace {
     pub(super) fn owner_projection(&self) -> Option<NamespaceHandle> {
         Some(match self {
             Self::Mount(n) => NamespaceHandle::Mount(n.clone()),
+            Self::User(n) => NamespaceHandle::User(n.clone()),
             Self::Uts(n) => NamespaceHandle::Uts(n.clone()),
             Self::Pid(n) => NamespaceHandle::Pid(n.clone()),
             Self::Net(n) => NamespaceHandle::Net(n.clone()),
@@ -217,6 +241,7 @@ impl SharedNamespace {
 impl NamespaceHandle {
     pub fn id(&self) -> u64 {
         match self {
+            Self::User(n) => n.id(),
             Self::Uts(n) => n.id(),
             Self::Mount(n) => n.id(),
             Self::Pid(n) => n.id(),
@@ -225,8 +250,20 @@ impl NamespaceHandle {
             Self::Cgroup(n) => n.inode,
         }
     }
+    pub(super) fn owner(&self) -> UserNamespace {
+        match self {
+            Self::User(n) => n.parent().unwrap_or_default(),
+            Self::Uts(n) => n.0.user_namespace.clone(),
+            Self::Mount(n) => n.0.borrow().user_namespace.clone(),
+            Self::Pid(n) => n.0.user_namespace.clone(),
+            Self::Net(n) => n.user_namespace.clone(),
+            Self::Ipc(n) => n.user_namespace.clone(),
+            Self::Cgroup(n) => n.user_namespace.clone(),
+        }
+    }
     pub fn kind(&self) -> u64 {
         match self {
+            Self::User(_) => CLONE_NEWUSER,
             Self::Uts(_) => CLONE_NEWUTS,
             Self::Mount(_) => CLONE_NEWNS,
             Self::Pid(_) => CLONE_NEWPID,
@@ -237,6 +274,7 @@ impl NamespaceHandle {
     }
     pub fn label(&self) -> Vec<u8> {
         match self {
+            Self::User(n) => format!("user:[{}]", n.id()).into_bytes(),
             Self::Uts(n) => n.label(),
             Self::Mount(n) => format!("mnt:[{}]", n.id()).into_bytes(),
             Self::Pid(n) => n.label(),
@@ -249,6 +287,7 @@ impl NamespaceHandle {
 
 #[derive(Clone, Default)]
 pub struct NamespaceSnapshot {
+    user: Option<std::sync::Weak<user_namespace::UserSpace>>,
     uts: std::sync::Weak<Uts>,
     pub(super) net: std::sync::Weak<RootNetwork>,
     ipc: std::sync::Weak<IpcNamespace>,
@@ -263,6 +302,7 @@ pub struct NamespaceSnapshot {
 /// does not retain a task or namespace; an accepted nsfs open acquires authority.
 #[derive(Clone, Default)]
 pub struct SharedNamespaceSnapshot {
+    user: Option<std::sync::Weak<user_namespace::UserSpace>>,
     uts: std::sync::Weak<Uts>,
     net: std::sync::Weak<RootNetwork>,
     ipc: std::sync::Weak<IpcNamespace>,
@@ -282,6 +322,7 @@ pub struct NamespaceProjection {
 impl NamespaceSnapshot {
     pub fn shared(&self) -> SharedNamespaceSnapshot {
         SharedNamespaceSnapshot {
+            user: self.user.clone(),
             uts: self.uts.clone(),
             net: self.net.clone(),
             ipc: self.ipc.clone(),
@@ -303,6 +344,7 @@ impl NamespaceSnapshot {
 impl SharedNamespaceSnapshot {
     pub fn metadata(&self) -> NamespaceSnapshot {
         NamespaceSnapshot {
+            user: self.user.clone(),
             uts: self.uts.clone(),
             net: self.net.clone(),
             ipc: self.ipc.clone(),
@@ -331,6 +373,7 @@ impl SharedNamespaceSnapshot {
             ))
         });
         let snapshot = NamespaceSnapshot {
+            user: self.user.clone(),
             uts: self.uts.clone(),
             net: self.net.clone(),
             ipc: self.ipc.clone(),
@@ -356,6 +399,7 @@ impl Vfs {
     pub fn namespace_snapshot(&self) -> NamespaceSnapshot {
         let paths = self.context.paths.borrow();
         NamespaceSnapshot {
+            user: self.credentials.user_namespace.weak(),
             uts: Arc::downgrade(&self.uts.0),
             net: Arc::downgrade(&self.root_network),
             ipc: Arc::downgrade(&self.ipc_namespace),
@@ -375,7 +419,7 @@ impl Vfs {
         }
     }
     pub fn unshare_net(&mut self) -> Result<()> {
-        if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
+        if !self.credentials.has_local_cap(capabilities::SYS_ADMIN) {
             return Err(Errno(1));
         }
         let live = self.root_network.live.clone();
@@ -388,6 +432,7 @@ impl Vfs {
             }
         };
         self.root_network = Arc::new(RootNetwork {
+            user_namespace: self.credentials.user_namespace.clone(),
             inode,
             network: SharedCell::new(network.clone()),
             local: Arc::default(),
@@ -397,12 +442,13 @@ impl Vfs {
         Ok(())
     }
     pub fn unshare_ipc(&mut self) -> Result<()> {
-        if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
+        if !self.credentials.has_local_cap(capabilities::SYS_ADMIN) {
             return Err(Errno(1));
         }
         let live = self.ipc_namespace.live.clone();
         let inode = reserve_namespace(&live)?;
         self.ipc_namespace = Arc::new(IpcNamespace {
+            user_namespace: self.credentials.user_namespace.clone(),
             inode,
             mqueue: Default::default(),
             live,
@@ -410,7 +456,7 @@ impl Vfs {
         Ok(())
     }
     pub fn unshare_cgroup(&mut self) -> Result<()> {
-        if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
+        if !self.credentials.has_local_cap(capabilities::SYS_ADMIN) {
             return Err(Errno(1));
         }
         let live = self.cgroup_namespace.live.clone();
@@ -429,6 +475,7 @@ impl Vfs {
             .ok_or(Errno(2))?;
         let inode = reserve_namespace(&live)?;
         self.cgroup_namespace = Arc::new(CgroupNamespace {
+            user_namespace: self.credentials.user_namespace.clone(),
             inode,
             root: Some(root),
             path,
@@ -453,10 +500,10 @@ impl Vfs {
         out
     }
     pub fn unshare_uts(&mut self) -> Result<()> {
-        if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
+        if !self.credentials.has_local_cap(capabilities::SYS_ADMIN) {
             return Err(Errno(1));
         }
-        self.uts = self.uts.copy()?;
+        self.uts = self.uts.copy(self.credentials.user_namespace.clone())?;
         Ok(())
     }
     pub fn set_uts_name(&mut self, domain: bool, name: &[u8]) -> Result<()> {
@@ -465,7 +512,9 @@ impl Vfs {
     pub fn uts_capability(&self) -> UtsAccess {
         UtsAccess {
             namespace: self.uts.clone(),
-            authorized: self.credentials.has_cap(capabilities::SYS_ADMIN),
+            authorized: self
+                .credentials
+                .has_ns_cap(&self.uts.0.user_namespace, capabilities::SYS_ADMIN),
         }
     }
     pub fn uts_name(&self, domain: bool) -> Vec<u8> {
@@ -485,7 +534,19 @@ impl Vfs {
         if kind != 0 && kind != ns.kind() {
             return Err(Errno(22));
         }
-        if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
+        if let NamespaceHandle::User(target) = ns {
+            if target == &self.credentials.user_namespace || self.context_shared() {
+                return Err(Errno(22));
+            }
+            if !self.credentials.has_ns_cap(target, capabilities::SYS_ADMIN) {
+                return Err(Errno(1));
+            }
+            return Ok(());
+        }
+        if !self
+            .credentials
+            .has_ns_cap(&ns.owner(), capabilities::SYS_ADMIN)
+        {
             return Err(Errno(1));
         }
         if let NamespaceHandle::Pid(ns) = ns {
@@ -494,7 +555,7 @@ impl Vfs {
             }
         }
         if matches!(ns, NamespaceHandle::Mount(_)) {
-            if !self.credentials.has_cap(capabilities::SYS_CHROOT) {
+            if !self.credentials.has_local_cap(capabilities::SYS_CHROOT) {
                 return Err(Errno(1));
             }
             if self.context_shared() {
@@ -506,6 +567,7 @@ impl Vfs {
     pub(super) fn set_namespace(&mut self, ns: NamespaceHandle, kind: u64) -> Result<()> {
         self.check_namespace(&ns, kind)?;
         match ns {
+            NamespaceHandle::User(ns) => self.credentials.enter_user_namespace(ns),
             NamespaceHandle::Net(ns) => {
                 self.network = ns.network.borrow().clone();
                 self.root_network = ns;
@@ -554,9 +616,9 @@ impl Vfs {
         };
         let parts: Vec<_> = rest.split(|b| *b == b'/').collect();
         let (group, pid, kind) = match parts.as_slice() {
-            [pid, b"ns", kind @ (b"uts" | b"mnt" | b"pid" | b"pid_for_children" | b"net" | b"ipc"
+            [pid, b"ns", kind @ (b"user" | b"uts" | b"mnt" | b"pid" | b"pid_for_children" | b"net" | b"ipc"
             | b"cgroup")] => (None, *pid, *kind),
-            [group, b"task", pid, b"ns", kind @ (b"uts" | b"mnt" | b"pid" | b"pid_for_children" | b"net" | b"ipc"
+            [group, b"task", pid, b"ns", kind @ (b"user" | b"uts" | b"mnt" | b"pid" | b"pid_for_children" | b"net" | b"ipc"
             | b"cgroup")] => (Some(*group), *pid, *kind),
             _ => return Ok(None),
         };
@@ -579,6 +641,7 @@ impl Vfs {
             return Err(Errno(13));
         }
         Ok(Some(match kind {
+            b"user" => NamespaceHandle::User(UserNamespace::upgrade(&process.namespaces.user)?),
             b"net" => NamespaceHandle::Net(process.namespaces.net.upgrade().ok_or(Errno(2))?),
             b"ipc" => NamespaceHandle::Ipc(process.namespaces.ipc.upgrade().ok_or(Errno(2))?),
             b"cgroup" => {
@@ -651,7 +714,7 @@ impl Vfs {
     }
     /// Linux chroot changes only fs.root. Existing cwd/dirfds remain capabilities.
     pub fn chroot(&mut self, path: &[u8]) -> Result<()> {
-        if !self.credentials.has_cap(capabilities::SYS_CHROOT) {
+        if !self.credentials.has_local_cap(capabilities::SYS_CHROOT) {
             return Err(Errno(1));
         }
         let path = self.resolve(AT_FDCWD, path)?;
@@ -671,6 +734,9 @@ impl Vfs {
 
 pub(super) fn snapshot_label(snapshot: &NamespaceSnapshot, kind: &[u8]) -> Option<Vec<u8>> {
     match kind {
+        b"user" => UserNamespace::upgrade(&snapshot.user)
+            .ok()
+            .map(|n| format!("user:[{}]", n.id()).into_bytes()),
         b"net" => snapshot
             .net
             .upgrade()
@@ -957,7 +1023,7 @@ mod tests {
         let ns = UtsNamespace::default();
         let mut retained = Vec::new();
         for _ in 1..MAX_NAMESPACES - 1 {
-            retained.push(ns.copy().unwrap());
+            retained.push(ns.copy(ns.0.user_namespace.clone()).unwrap());
         }
         let gate = Arc::new(std::sync::Barrier::new(8));
         let results = std::thread::scope(|scope| {
@@ -967,7 +1033,7 @@ mod tests {
                 let gate = gate.clone();
                 threads.push(scope.spawn(move || {
                     gate.wait();
-                    ns.copy()
+                    ns.copy(ns.0.user_namespace.clone())
                 }));
             }
             threads
@@ -982,7 +1048,7 @@ mod tests {
             .all(|e| *e == Errno(28)));
         assert_eq!(ns.0.live.load(Ordering::Relaxed), MAX_NAMESPACES);
         std::thread::spawn(move || drop(results)).join().unwrap();
-        assert!(ns.copy().is_ok());
+        assert!(ns.copy(ns.0.user_namespace.clone()).is_ok());
     }
     #[test]
     fn namespace_fd_pins_identity_across_unshare_and_setns() {

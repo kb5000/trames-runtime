@@ -117,6 +117,9 @@ impl crate::network::unix::MessageIo for Message<'_> {
         self.fd
             .send_local_message_explicit(bytes, flags, &rights, identity)
     }
+    fn pid_user_namespace(&self) -> &trames_vfs::UserNamespace {
+        self.factory.pid_user_namespace()
+    }
     fn sender_credentials(&self) -> [u32; 3] {
         self.identity
     }

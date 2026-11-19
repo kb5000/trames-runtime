@@ -134,10 +134,11 @@ pub(super) fn check_status(
     flags: u32,
 ) -> Result<()> {
     if flags & O_NOATIME != 0 && open.flags.get() & O_NOATIME == 0 {
-        let uid = open
-            .metadata_node()
-            .map_or(open.owner.0, |node| node.borrow().uid);
-        if credentials.fsuid != uid && !credentials.has_cap(capabilities::FOWNER) {
+        let (uid, gid) = open.metadata_node().map_or(open.owner, |node| {
+            let n = node.borrow();
+            (n.uid, n.gid)
+        });
+        if credentials.fsuid != uid && !credentials.inode_cap(capabilities::FOWNER, uid, gid) {
             return Err(Errno(1));
         }
     }

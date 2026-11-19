@@ -81,6 +81,13 @@ fn write(memory: &mut impl CpuMemory, address: u64, value: u32) -> Result<()> {
         .write_array(address, value.to_le_bytes())
         .map_err(|_| Errno(14))
 }
+fn map_optional(c: &Credentials, group: bool, id: u32) -> Result<u32> {
+    if id == u32::MAX {
+        Ok(id)
+    } else {
+        c.mapped_id(group, id)
+    }
+}
 fn invoke(
     c: &mut Credentials,
     local: u32,
@@ -90,13 +97,32 @@ fn invoke(
     remote: impl FnOnce(u32) -> Result<capabilities::Capabilities>,
 ) -> Result<u64> {
     match number {
-        174..=177 => Ok([c.uid, c.euid, c.gid, c.egid][(number - 174) as usize] as u64),
-        144 | 146 => c.set_id(number == 144, a[0] as u32).map(|()| 0),
+        174..=177 => {
+            let group = number >= 176;
+            Ok(c.local_id(
+                group,
+                [c.uid, c.euid, c.gid, c.egid][(number - 174) as usize],
+            ) as u64)
+        }
+        144 | 146 => c
+            .set_id(number == 144, c.mapped_id(number == 144, a[0] as u32)?)
+            .map(|()| 0),
         143 | 145 => c
-            .set_re_ids(number == 143, a[0] as u32, a[1] as u32)
+            .set_re_ids(
+                number == 143,
+                map_optional(c, number == 143, a[0] as u32)?,
+                map_optional(c, number == 143, a[1] as u32)?,
+            )
             .map(|()| 0),
         147 | 149 => c
-            .set_res_ids(number == 149, [a[0] as u32, a[1] as u32, a[2] as u32])
+            .set_res_ids(
+                number == 149,
+                [
+                    map_optional(c, number == 149, a[0] as u32)?,
+                    map_optional(c, number == 149, a[1] as u32)?,
+                    map_optional(c, number == 149, a[2] as u32)?,
+                ],
+            )
             .map(|()| 0),
         148 | 150 => {
             let values = if number == 148 {
@@ -105,11 +131,16 @@ fn invoke(
                 [c.gid, c.egid, c.sgid]
             };
             for (pointer, value) in a[..3].iter().zip(values) {
-                write(memory, *pointer, value)?;
+                write(memory, *pointer, c.local_id(number == 150, value))?;
             }
             Ok(0)
         }
-        151 | 152 => Ok(c.set_fs_id(number == 152, a[0] as u32) as u64),
+        151 | 152 => {
+            let group = number == 152;
+            let value = c.mapped_id(group, a[0] as u32).unwrap_or(u32::MAX);
+            let old = c.set_fs_id(group, value);
+            Ok(c.local_id(group, old) as u64)
+        }
         158 | 159 => {
             let count = a[0] as u32 as usize;
             if number == 158 {
@@ -126,12 +157,12 @@ fn invoke(
                     write(
                         memory,
                         a[1].checked_add((i * 4) as u64).ok_or(Errno(14))?,
-                        *value,
+                        c.local_id(true, *value),
                     )?;
                 }
                 Ok(c.groups.len() as u64)
             } else {
-                if !c.has_cap(capabilities::SETGID) {
+                if !c.has_local_cap(capabilities::SETGID) || !c.user_namespace.may_setgroups() {
                     return Err(Errno(1));
                 }
                 if count > 65536 {
@@ -143,7 +174,7 @@ fn invoke(
                     if value == u32::MAX {
                         return Err(Errno(22));
                     }
-                    groups.push(value);
+                    groups.push(c.mapped_id(true, value)?);
                 }
                 groups.sort_unstable();
                 c.groups = groups;

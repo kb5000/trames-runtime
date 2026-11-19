@@ -1,0 +1,1397 @@
+{
+  "date": "2026-11-19",
+  "runtime_base": "4e14d2296ab42b552c6270db64cd4b1d90322177",
+  "gvisor_revision": "89cacadae21eca4270a8f7c79281d0426d33ac5f",
+  "comparison": {
+    "schema_version": 1,
+    "cases": 6194,
+    "native_counts": {
+      "passed": 5903,
+      "skipped": 270,
+      "failed": 2,
+      "no_result": 19
+    },
+    "trames_counts": {
+      "passed": 5920,
+      "skipped": 271,
+      "failed": 3
+    },
+    "native_passed_cases": 5903,
+    "outcomes_on_native_passed": {
+      "passed": 5901,
+      "failed": 1,
+      "skipped": 1
+    },
+    "strict_pass_fraction": 0.9996611892258174,
+    "groups": [
+      {
+        "name": "socket_abstract",
+        "cases": 1464,
+        "native": {
+          "passed": 1387,
+          "skipped": 58,
+          "no_result": 19
+        },
+        "trames": {
+          "passed": 1406,
+          "skipped": 58
+        }
+      },
+      {
+        "name": "socket_abstract_non_blocking",
+        "cases": 18,
+        "native": {
+          "passed": 18
+        },
+        "trames": {
+          "passed": 18
+        }
+      },
+      {
+        "name": "socket_unix_dgram_local",
+        "cases": 648,
+        "native": {
+          "passed": 648
+        },
+        "trames": {
+          "passed": 648
+        }
+      },
+      {
+        "name": "socket_unix_dgram_non_blocking",
+        "cases": 6,
+        "native": {
+          "passed": 6
+        },
+        "trames": {
+          "passed": 6
+        }
+      },
+      {
+        "name": "socket_unix_seqpacket_local",
+        "cases": 336,
+        "native": {
+          "passed": 336
+        },
+        "trames": {
+          "passed": 336
+        }
+      },
+      {
+        "name": "socket_unix_stream",
+        "cases": 216,
+        "native": {
+          "passed": 216
+        },
+        "trames": {
+          "passed": 216
+        }
+      },
+      {
+        "name": "socket_unix_stream_listener_close",
+        "cases": 2,
+        "native": {
+          "passed": 2
+        },
+        "trames": {
+          "passed": 2
+        }
+      },
+      {
+        "name": "socket_domain",
+        "cases": 636,
+        "native": {
+          "passed": 612,
+          "skipped": 24
+        },
+        "trames": {
+          "passed": 612,
+          "skipped": 24
+        }
+      },
+      {
+        "name": "socket_domain_non_blocking",
+        "cases": 18,
+        "native": {
+          "passed": 18
+        },
+        "trames": {
+          "passed": 18
+        }
+      },
+      {
+        "name": "socket_filesystem",
+        "cases": 1464,
+        "native": {
+          "passed": 1406,
+          "skipped": 58
+        },
+        "trames": {
+          "passed": 1406,
+          "skipped": 58
+        }
+      },
+      {
+        "name": "socket_filesystem_non_blocking",
+        "cases": 18,
+        "native": {
+          "passed": 18
+        },
+        "trames": {
+          "passed": 18
+        }
+      },
+      {
+        "name": "socket_unix_unbound_dgram",
+        "cases": 52,
+        "native": {
+          "passed": 52
+        },
+        "trames": {
+          "passed": 52
+        }
+      },
+      {
+        "name": "socket_unix_unbound_abstract",
+        "cases": 60,
+        "native": {
+          "passed": 58,
+          "skipped": 2
+        },
+        "trames": {
+          "passed": 58,
+          "skipped": 2
+        }
+      },
+      {
+        "name": "socket_unix_unbound_filesystem",
+        "cases": 18,
+        "native": {
+          "passed": 18
+        },
+        "trames": {
+          "passed": 18
+        }
+      },
+      {
+        "name": "socket_unix_pair",
+        "cases": 913,
+        "native": {
+          "passed": 819,
+          "skipped": 94
+        },
+        "trames": {
+          "passed": 819,
+          "skipped": 94
+        }
+      },
+      {
+        "name": "socket_unix_unbound_seqpacket",
+        "cases": 16,
+        "native": {
+          "passed": 16
+        },
+        "trames": {
+          "passed": 16
+        }
+      },
+      {
+        "name": "socket_unix_unbound_stream",
+        "cases": 208,
+        "native": {
+          "passed": 196,
+          "skipped": 12
+        },
+        "trames": {
+          "passed": 196,
+          "skipped": 12
+        }
+      },
+      {
+        "name": "socket_capability",
+        "cases": 2,
+        "native": {
+          "passed": 2
+        },
+        "trames": {
+          "passed": 2
+        }
+      },
+      {
+        "name": "capabilities",
+        "cases": 14,
+        "native": {
+          "passed": 14
+        },
+        "trames": {
+          "passed": 14
+        }
+      },
+      {
+        "name": "prctl_setuid",
+        "cases": 6,
+        "native": {
+          "passed": 6
+        },
+        "trames": {
+          "passed": 6
+        }
+      },
+      {
+        "name": "proc_pid_uid_gid_map",
+        "cases": 22,
+        "native": {
+          "passed": 22
+        },
+        "trames": {
+          "passed": 22
+        }
+      },
+      {
+        "name": "setgid",
+        "cases": 21,
+        "native": {
+          "skipped": 21
+        },
+        "trames": {
+          "skipped": 21
+        }
+      },
+      {
+        "name": "uidgid",
+        "cases": 26,
+        "native": {
+          "passed": 26
+        },
+        "trames": {
+          "passed": 25,
+          "skipped": 1
+        }
+      },
+      {
+        "name": "network_namespace",
+        "cases": 10,
+        "native": {
+          "passed": 7,
+          "skipped": 1,
+          "failed": 2
+        },
+        "trames": {
+          "passed": 6,
+          "skipped": 1,
+          "failed": 3
+        }
+      }
+    ]
+  },
+  "new_native_confirmed_passes": 72,
+  "newly_passing": [
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/10",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/11",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/7",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/8",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/9",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/10",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/11",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/7",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/8",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_abstract",
+      "case": "AbstractUnixSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/9",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/10",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/11",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/7",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/8",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/9",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/10",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/11",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/7",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/8",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_domain",
+      "case": "AllUnixDomainSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/9",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/10",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/11",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/7",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/8",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetSocketRecvBufForceAboveMax/9",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/0",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/1",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/10",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/11",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/2",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/3",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/4",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/5",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/6",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/7",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/8",
+      "before": "failed"
+    },
+    {
+      "suite": "socket_filesystem",
+      "case": "FilesystemUnixSockets/AllSocketPairTest.SetSocketRecvBufForceWithoutCapability/9",
+      "before": "failed"
+    }
+  ],
+  "regressions": [],
+  "remaining": [
+    {
+      "suite": "network_namespace",
+      "case": "NetworkNamespaceTest.IPv6FlushedOnDown",
+      "native": "failed",
+      "trames": "failed",
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/network_namespace.cc:233\nValue of: LinkAddLocalAddr(nlsk, lo.index, 10, 128, &global, sizeof(global))\nExpected: is OK\n  Actual: PosixError(errno=95 Operation not supported) (of type gvisor::testing::PosixError)\n"
+      ]
+    },
+    {
+      "suite": "network_namespace",
+      "case": "NetworkNamespaceTest.LinkChangeFlagsLikeLinux",
+      "native": "passed",
+      "trames": "failed",
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/network_namespace.cc:312\nExpected: (lo.flags & IFF_UP) != (0u), actual: 0 vs 0\n",
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/network_namespace.cc:317\nExpected: (lo.flags & IFF_UP) != (0u), actual: 0 vs 0\n",
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/network_namespace.cc:321\nValue of: LinkChangeFlags(lo.index, lo.flags & ~IFF_UP, ~0u)\nExpected: is OK\n  Actual: PosixError(errno=95 Operation not supported) (of type gvisor::testing::PosixError)\n"
+      ]
+    },
+    {
+      "suite": "network_namespace",
+      "case": "NetworkNamespaceTest.LoopbackAddressesAddedOnUp",
+      "native": "failed",
+      "trames": "failed",
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/network_namespace.cc:179\nValue of: bind(s4.get(), AsSockAddr(&addr4), sizeof(addr4))\nExpected: not -1 (success)\n  Actual: -1 (of type int), with errno PosixError(errno=99 Cannot assign requested address)\n"
+      ]
+    },
+    {
+      "suite": "uidgid",
+      "case": "UidGidRootTest.SetresuidNoopKeepsFilesystemIDs",
+      "native": "passed",
+      "trames": "skipped",
+      "messages": [
+        "/home/main.guest/trames-ci/gvisor-expanded-20261117/source/test/syscalls/linux/uidgid.cc:550\nversion.major < 6 || (version.major == 6 && version.minor < 3)\n"
+      ]
+    }
+  ],
+  "performance": {
+    "source_sha256": "14113835d78b2a77389376ef2bbd9a175ad1792c6edbcdaeb68f3355b25e9fb2",
+    "rounds": 15,
+    "iterations": 300000,
+    "method": "Two warmups, 15 alternating process pairs, same source/profile/dependencies; ns per send/read roundtrip or one poll. No conformance workers, CI or builds running.",
+    "samples": {
+      "before": [
+        {
+          "stream-64": 52.029,
+          "stream-4096": 115.751,
+          "dgram-64": 47.69,
+          "dgram-4096": 108.642,
+          "seqpacket-64": 46.8,
+          "recvmsg-stream-64": 61.591,
+          "addressed-dgram-64": 118.594,
+          "addressed-dgram-4096": 176.468,
+          "poll-empty": 5.554
+        },
+        {
+          "stream-64": 50.845,
+          "stream-4096": 115.373,
+          "dgram-64": 48.523,
+          "dgram-4096": 109.239,
+          "seqpacket-64": 47.017,
+          "recvmsg-stream-64": 62.832,
+          "addressed-dgram-64": 113.371,
+          "addressed-dgram-4096": 178.804,
+          "poll-empty": 5.355
+        },
+        {
+          "stream-64": 52.515,
+          "stream-4096": 112.449,
+          "dgram-64": 48.371,
+          "dgram-4096": 109.972,
+          "seqpacket-64": 47.213,
+          "recvmsg-stream-64": 62.42,
+          "addressed-dgram-64": 113.823,
+          "addressed-dgram-4096": 174.675,
+          "poll-empty": 5.467
+        },
+        {
+          "stream-64": 52.827,
+          "stream-4096": 115.392,
+          "dgram-64": 47.768,
+          "dgram-4096": 110.142,
+          "seqpacket-64": 47.734,
+          "recvmsg-stream-64": 63.707,
+          "addressed-dgram-64": 116.875,
+          "addressed-dgram-4096": 180.884,
+          "poll-empty": 5.665
+        },
+        {
+          "stream-64": 51.521,
+          "stream-4096": 113.621,
+          "dgram-64": 48.311,
+          "dgram-4096": 108.948,
+          "seqpacket-64": 48.863,
+          "recvmsg-stream-64": 61.841,
+          "addressed-dgram-64": 119.11,
+          "addressed-dgram-4096": 174.766,
+          "poll-empty": 5.479
+        },
+        {
+          "stream-64": 52.008,
+          "stream-4096": 118.626,
+          "dgram-64": 47.27,
+          "dgram-4096": 108.826,
+          "seqpacket-64": 47.823,
+          "recvmsg-stream-64": 61.776,
+          "addressed-dgram-64": 117.669,
+          "addressed-dgram-4096": 178.724,
+          "poll-empty": 5.493
+        },
+        {
+          "stream-64": 50.306,
+          "stream-4096": 110.6,
+          "dgram-64": 48.767,
+          "dgram-4096": 106.976,
+          "seqpacket-64": 47.189,
+          "recvmsg-stream-64": 63.292,
+          "addressed-dgram-64": 118.742,
+          "addressed-dgram-4096": 176.091,
+          "poll-empty": 5.36
+        },
+        {
+          "stream-64": 51.981,
+          "stream-4096": 113.461,
+          "dgram-64": 48.641,
+          "dgram-4096": 122.488,
+          "seqpacket-64": 47.916,
+          "recvmsg-stream-64": 62.108,
+          "addressed-dgram-64": 116.094,
+          "addressed-dgram-4096": 176.226,
+          "poll-empty": 5.378
+        },
+        {
+          "stream-64": 51.987,
+          "stream-4096": 110.867,
+          "dgram-64": 48.51,
+          "dgram-4096": 109.578,
+          "seqpacket-64": 47.686,
+          "recvmsg-stream-64": 61.443,
+          "addressed-dgram-64": 117.479,
+          "addressed-dgram-4096": 174.968,
+          "poll-empty": 5.41
+        },
+        {
+          "stream-64": 51.985,
+          "stream-4096": 111.383,
+          "dgram-64": 48.148,
+          "dgram-4096": 111.341,
+          "seqpacket-64": 46.422,
+          "recvmsg-stream-64": 61.212,
+          "addressed-dgram-64": 115.493,
+          "addressed-dgram-4096": 174.738,
+          "poll-empty": 5.485
+        },
+        {
+          "stream-64": 51.102,
+          "stream-4096": 114.404,
+          "dgram-64": 46.941,
+          "dgram-4096": 112.762,
+          "seqpacket-64": 47.913,
+          "recvmsg-stream-64": 60.69,
+          "addressed-dgram-64": 116.406,
+          "addressed-dgram-4096": 181.78,
+          "poll-empty": 5.428
+        },
+        {
+          "stream-64": 51.526,
+          "stream-4096": 114.027,
+          "dgram-64": 50.039,
+          "dgram-4096": 109.922,
+          "seqpacket-64": 47.71,
+          "recvmsg-stream-64": 64.572,
+          "addressed-dgram-64": 118.161,
+          "addressed-dgram-4096": 180.094,
+          "poll-empty": 5.6
+        },
+        {
+          "stream-64": 51.158,
+          "stream-4096": 116.845,
+          "dgram-64": 49.336,
+          "dgram-4096": 111.697,
+          "seqpacket-64": 47.788,
+          "recvmsg-stream-64": 63.701,
+          "addressed-dgram-64": 120.877,
+          "addressed-dgram-4096": 182.716,
+          "poll-empty": 5.583
+        },
+        {
+          "stream-64": 52.165,
+          "stream-4096": 113.878,
+          "dgram-64": 48.514,
+          "dgram-4096": 109.547,
+          "seqpacket-64": 46.946,
+          "recvmsg-stream-64": 62.031,
+          "addressed-dgram-64": 115.968,
+          "addressed-dgram-4096": 175.764,
+          "poll-empty": 5.354
+        },
+        {
+          "stream-64": 50.174,
+          "stream-4096": 112.529,
+          "dgram-64": 48.44,
+          "dgram-4096": 107.795,
+          "seqpacket-64": 47.399,
+          "recvmsg-stream-64": 64.504,
+          "addressed-dgram-64": 115.83,
+          "addressed-dgram-4096": 176.335,
+          "poll-empty": 5.423
+        }
+      ],
+      "after": [
+        {
+          "stream-64": 51.924,
+          "stream-4096": 117.83,
+          "dgram-64": 47.027,
+          "dgram-4096": 107.711,
+          "seqpacket-64": 51.292,
+          "recvmsg-stream-64": 68.552,
+          "addressed-dgram-64": 123.801,
+          "addressed-dgram-4096": 202.258,
+          "poll-empty": 5.733
+        },
+        {
+          "stream-64": 57.393,
+          "stream-4096": 120.482,
+          "dgram-64": 50.4,
+          "dgram-4096": 115.856,
+          "seqpacket-64": 47.717,
+          "recvmsg-stream-64": 62.823,
+          "addressed-dgram-64": 114.28,
+          "addressed-dgram-4096": 177.72,
+          "poll-empty": 5.467
+        },
+        {
+          "stream-64": 51.991,
+          "stream-4096": 111.041,
+          "dgram-64": 46.749,
+          "dgram-4096": 117.748,
+          "seqpacket-64": 51.995,
+          "recvmsg-stream-64": 74.185,
+          "addressed-dgram-64": 146.147,
+          "addressed-dgram-4096": 182.671,
+          "poll-empty": 5.34
+        },
+        {
+          "stream-64": 53.624,
+          "stream-4096": 114.375,
+          "dgram-64": 47.266,
+          "dgram-4096": 107.246,
+          "seqpacket-64": 47.181,
+          "recvmsg-stream-64": 62.969,
+          "addressed-dgram-64": 117.148,
+          "addressed-dgram-4096": 178.414,
+          "poll-empty": 5.509
+        },
+        {
+          "stream-64": 52.091,
+          "stream-4096": 114.606,
+          "dgram-64": 48.112,
+          "dgram-4096": 112.794,
+          "seqpacket-64": 46.67,
+          "recvmsg-stream-64": 61.772,
+          "addressed-dgram-64": 114.592,
+          "addressed-dgram-4096": 177.963,
+          "poll-empty": 5.673
+        },
+        {
+          "stream-64": 53.958,
+          "stream-4096": 117.054,
+          "dgram-64": 47.849,
+          "dgram-4096": 110.787,
+          "seqpacket-64": 47.328,
+          "recvmsg-stream-64": 60.097,
+          "addressed-dgram-64": 115.492,
+          "addressed-dgram-4096": 182.213,
+          "poll-empty": 5.442
+        },
+        {
+          "stream-64": 51.476,
+          "stream-4096": 116.547,
+          "dgram-64": 47.182,
+          "dgram-4096": 106.546,
+          "seqpacket-64": 47.063,
+          "recvmsg-stream-64": 62.307,
+          "addressed-dgram-64": 114.351,
+          "addressed-dgram-4096": 174.128,
+          "poll-empty": 5.345
+        },
+        {
+          "stream-64": 52.459,
+          "stream-4096": 112.018,
+          "dgram-64": 47.386,
+          "dgram-4096": 106.11,
+          "seqpacket-64": 47.18,
+          "recvmsg-stream-64": 63.373,
+          "addressed-dgram-64": 115.41,
+          "addressed-dgram-4096": 175.987,
+          "poll-empty": 5.435
+        },
+        {
+          "stream-64": 51.147,
+          "stream-4096": 114.614,
+          "dgram-64": 47.417,
+          "dgram-4096": 108.488,
+          "seqpacket-64": 47.108,
+          "recvmsg-stream-64": 63.045,
+          "addressed-dgram-64": 113.417,
+          "addressed-dgram-4096": 177.611,
+          "poll-empty": 5.506
+        },
+        {
+          "stream-64": 53.053,
+          "stream-4096": 113.599,
+          "dgram-64": 46.775,
+          "dgram-4096": 109.392,
+          "seqpacket-64": 50.754,
+          "recvmsg-stream-64": 62.781,
+          "addressed-dgram-64": 114.412,
+          "addressed-dgram-4096": 178.158,
+          "poll-empty": 5.416
+        },
+        {
+          "stream-64": 51.979,
+          "stream-4096": 114.876,
+          "dgram-64": 46.385,
+          "dgram-4096": 107.484,
+          "seqpacket-64": 47.597,
+          "recvmsg-stream-64": 62.14,
+          "addressed-dgram-64": 114.516,
+          "addressed-dgram-4096": 184.55,
+          "poll-empty": 5.396
+        },
+        {
+          "stream-64": 52.201,
+          "stream-4096": 115.427,
+          "dgram-64": 46.233,
+          "dgram-4096": 110.008,
+          "seqpacket-64": 46.543,
+          "recvmsg-stream-64": 60.886,
+          "addressed-dgram-64": 112.629,
+          "addressed-dgram-4096": 184.06,
+          "poll-empty": 5.671
+        },
+        {
+          "stream-64": 51.522,
+          "stream-4096": 115.911,
+          "dgram-64": 46.794,
+          "dgram-4096": 110.072,
+          "seqpacket-64": 47.134,
+          "recvmsg-stream-64": 63.623,
+          "addressed-dgram-64": 114.74,
+          "addressed-dgram-4096": 179.58,
+          "poll-empty": 5.471
+        },
+        {
+          "stream-64": 53.208,
+          "stream-4096": 121.177,
+          "dgram-64": 54.71,
+          "dgram-4096": 112.587,
+          "seqpacket-64": 46.689,
+          "recvmsg-stream-64": 62.694,
+          "addressed-dgram-64": 114.52,
+          "addressed-dgram-4096": 184.728,
+          "poll-empty": 5.519
+        },
+        {
+          "stream-64": 51.621,
+          "stream-4096": 117.496,
+          "dgram-64": 46.438,
+          "dgram-4096": 110.028,
+          "seqpacket-64": 51.369,
+          "recvmsg-stream-64": 66.724,
+          "addressed-dgram-64": 120.421,
+          "addressed-dgram-4096": 186.127,
+          "poll-empty": 5.912
+        }
+      ]
+    },
+    "summary": {
+      "stream-64": {
+        "before_ns": 51.981,
+        "after_ns": 52.091,
+        "median_delta_percent": 0.2116157826898224,
+        "paired_median_percent": 1.508698203570158,
+        "paired_p10_percent": -0.9978101494811042,
+        "paired_p90_percent": 3.749423165666821,
+        "before_range": [
+          50.174,
+          52.827
+        ],
+        "after_range": [
+          51.147,
+          57.393
+        ]
+      },
+      "stream-4096": {
+        "before_ns": 113.878,
+        "after_ns": 115.427,
+        "median_delta_percent": 1.3602276120058265,
+        "paired_median_percent": 1.2277793855841157,
+        "paired_p10_percent": -1.2718026458430676,
+        "paired_p90_percent": 5.377034358047017,
+        "before_range": [
+          110.6,
+          118.626
+        ],
+        "after_range": [
+          111.041,
+          121.177
+        ]
+      },
+      "dgram-64": {
+        "before_ns": 48.44,
+        "after_ns": 47.182,
+        "median_delta_percent": -2.5970272502064295,
+        "paired_median_percent": -2.2531436817151085,
+        "paired_p10_percent": -5.152424193286853,
+        "paired_p90_percent": 3.8682686561012147,
+        "before_range": [
+          46.941,
+          50.039
+        ],
+        "after_range": [
+          46.233,
+          54.71
+        ]
+      },
+      "dgram-4096": {
+        "before_ns": 109.578,
+        "after_ns": 110.008,
+        "median_delta_percent": 0.3924145357644626,
+        "paired_median_percent": -0.40195931797786244,
+        "paired_p10_percent": -4.680654830528019,
+        "paired_p90_percent": 6.05736046650005,
+        "before_range": [
+          106.976,
+          122.488
+        ],
+        "after_range": [
+          106.11,
+          117.748
+        ]
+      },
+      "seqpacket-64": {
+        "before_ns": 47.686,
+        "after_ns": 47.181,
+        "median_delta_percent": -1.0590110304911304,
+        "paired_median_percent": -0.6595287291549123,
+        "paired_p10_percent": -2.4460280863550676,
+        "paired_p90_percent": 9.598290598290603,
+        "before_range": [
+          46.422,
+          48.863
+        ],
+        "after_range": [
+          46.543,
+          51.995
+        ]
+      },
+      "recvmsg-stream-64": {
+        "before_ns": 62.108,
+        "after_ns": 62.823,
+        "median_delta_percent": 1.1512204546918259,
+        "paired_median_percent": 1.0688204284954317,
+        "paired_p10_percent": -2.7178839678839717,
+        "paired_p90_percent": 11.301975938042897,
+        "before_range": [
+          60.69,
+          64.572
+        ],
+        "after_range": [
+          60.097,
+          74.185
+        ]
+      },
+      "addressed-dgram-64": {
+        "before_ns": 116.875,
+        "after_ns": 114.592,
+        "median_delta_percent": -1.9533689839572155,
+        "paired_median_percent": -1.2486203090507741,
+        "paired_p10_percent": -4.681747784802093,
+        "paired_p90_percent": 4.390609980268834,
+        "before_range": [
+          113.371,
+          120.877
+        ],
+        "after_range": [
+          112.629,
+          146.147
+        ]
+      },
+      "addressed-dgram-4096": {
+        "before_ns": 176.335,
+        "after_ns": 179.58,
+        "median_delta_percent": 1.8402472566421801,
+        "paired_median_percent": 1.8293031825412198,
+        "paired_p10_percent": -1.3655160213175255,
+        "paired_p90_percent": 5.553066606175738,
+        "before_range": [
+          174.675,
+          182.716
+        ],
+        "after_range": [
+          174.128,
+          202.258
+        ]
+      },
+      "poll-empty": {
+        "before_ns": 5.467,
+        "after_ns": 5.471,
+        "median_delta_percent": 0.0731662703493674,
+        "paired_median_percent": 1.0598735589438357,
+        "paired_p10_percent": -2.323029083592465,
+        "paired_p90_percent": 3.5407921153495225,
+        "before_range": [
+          5.354,
+          5.665
+        ],
+        "after_range": [
+          5.34,
+          5.912
+        ]
+      }
+    },
+    "baseline_runtime": "4e14d2296ab42b552c6270db64cd4b1d90322177",
+    "binary_sha256": {
+      "before": "b44b20e497a4e654b4c50698331b33a220e04d4fa02b1995ca667e54bcdad91c",
+      "after": "a799d974274bce36c0f31a2ee547844784dbbd097cd3074c43910a5e74760900"
+    },
+    "lock_sha256": "fd6ff2d895dfbf5d3a3081c44fc648ab4b82aa7e4ec735f53486880bf81322c6",
+    "compiler": "rustc 1.101.0-nightly (4ebd25825 2026-10-15)\nbinary: rustc\ncommit-hash: 4ebd258257737d5b7635c116fa7d281627a7e937\ncommit-date: 2026-10-15\nhost: aarch64-apple-darwin\nrelease: 1.101.0-nightly\nLLVM version: 23.1.4\n",
+    "background": "Installed Dev/Stable environments remain running; no test, CI, build or disposable Linux VM runs during measurement."
+  },
+  "checks": {
+    "runtime_macos": "8/8 complete local workflow steps passed",
+    "runtime_linux_arm64": "8/8 complete local workflow steps passed; established RUST_MIN_STACK=8388608 test harness only",
+    "ipad_compile": "aarch64-apple-ios check passed",
+    "ipad_ffi": "24/24 passed",
+    "ipad_interpreter": "489 passed, 3 upstream local benchmark ignores, 2 explicitly excluded existing bounded-handoff stalls; no assertions changed",
+    "new_user_namespace_tests": "10 VFS isolation/map/ownership cases and 1 interpreter clone/publication case passed",
+    "physical_ipad": "not contacted",
+    "installed_environments": "not replaced or restarted"
+  },
+  "evidence_root": "/Users/main/dev/trames/target/gvisor-userns-20261119",
+  "runner_sha256": "c6e01a6b4d3921dd26827a381226640a770cd7752dcf9a9c05608e2dc112a45d",
+  "source_sha256": {
+    "crates/trames-kernel/src/power.rs": "9fe17afc3c8defd4fbff1da4cce77b0b3448f94377f715195cbbbc32bb5a4e53",
+    "crates/trames-kernel/src/signal/io.rs": "e47a036b2ecdbd8b8be68a3bed2383b8211dd9fe7df39dfb237231c4ff792152",
+    "crates/trames-kernel/src/signal/io_guest.rs": "fe72e24493a6f822c24595a92dc0ca6f107c4703c118331e2367e7b6e8148f84",
+    "crates/trames-linux/src/credentials.rs": "05c8ad74f99951025abf45b27bec0a3778fb75ac5cb552e5c335d52013f28871",
+    "crates/trames-linux/src/direct.rs": "3e752bf95a28b5b8fb4f7c4226a5361cada3cc216439d3f2022ed40eede746ee",
+    "crates/trames-linux/src/direct/file.rs": "453e21fcbc1ecdfd3bf03ee20b18115d2ec1b7a9174f0d1d2df1298a00de404b",
+    "crates/trames-linux/src/direct/local_message.rs": "3257aecc420e8b987502f589d1addde03f78d2d6b0fbc30c86930c26cb43bbde",
+    "crates/trames-linux/src/direct/socket_wait.rs": "6efef24f67b84b8b7c49ac164c67283523b62c2b7ee0b71387f7efe55a810a6b",
+    "crates/trames-linux/src/ioctl.rs": "c162ed13b6c16232903ab1ee17b154c545862c7c9815cd6f3f4faf47e94c9e9c",
+    "crates/trames-linux/src/network.rs": "10d9ecd7c9eb25b2476752dbb08005c9906a770e18f8087efd02cd6598c1b00a",
+    "crates/trames-linux/src/network/unix.rs": "f63ee60d063b1a9f721c0e1241f3c305b22d7722b4a4de7506c7bcfacfbf7eeb",
+    "crates/trames-session/src/process.rs": "b5ca62335ec273344ded47e7244546967f5cda7f2eac4764e89688e74dfe9ffc",
+    "crates/trames-session/src/process_birth.rs": "3f3ef5b61a35a19cf3d48e908619868f92310464e7d57ded42707db9bbe5c265",
+    "crates/trames-session/src/process_dispatch.rs": "440ddef0030150687a262dfc9c05d7b2ff0d51fbfa61d56b637d4406d8774960",
+    "crates/trames-session/src/process_seccomp.rs": "bc027b0ac56e547003c4a60b48f6402e0b36a542c39b2e654324f2c9779fc7a0",
+    "crates/trames-session/src/worker_syscalls.rs": "ee4cfad693d530368b3381cc7524c554d74b064997e788558f2cde696617517d",
+    "crates/trames-vfs/src/credentials.rs": "3af0b73b967fe3472be4790d64b36894a00296781d3dd92be8992965909c172d",
+    "crates/trames-vfs/src/descriptor_factory.rs": "4050e4c69fdc0a184a46c68c980a3ab727c6830c429bc1c53e3202fddd4ab3cb",
+    "crates/trames-vfs/src/direct_io.rs": "d4eab1f934f055c8cdb41e9c7b966c9c1c04176ed3cf21e6fab72a1b17db4e7a",
+    "crates/trames-vfs/src/epoll.rs": "427e2421aa5e30e03f408226094900d0924ce805449b56056a13a8d5ac1b0088",
+    "crates/trames-vfs/src/events.rs": "3537e9abb37ca420f87e6c1ab46069f5f32b2c5cd274a28b2c93a6f31d4d09af",
+    "crates/trames-vfs/src/fd_status.rs": "4448615d334e30cb72a380d59b25f2e3f8d03851530f80c14c5e23a7b8eff4b2",
+    "crates/trames-vfs/src/lib.rs": "1bfc115e3e9f97eba7e309d53a95643dd2cfa97f19a2ab383558f1a6420cf6aa",
+    "crates/trames-vfs/src/linux_namespace.rs": "b656968d66d8dc818f6780f3765739427fa56a9dcc9d3a82249cc39b09048c78",
+    "crates/trames-vfs/src/mounts.rs": "683ee0d94a6bf0415aae6114e8daf5a6ad09309d2ac68b62a1b3334af2381ac5",
+    "crates/trames-vfs/src/namespace.rs": "5bd556ebc0c84a65310c68dbefbc2ae0c9f22bd925b55a70d74bc93ab534ffe0",
+    "crates/trames-vfs/src/network.rs": "8dd8c4c9ce024a51d4ca5a51243a72a81073738e3c02d55cac09ab0733c394ee",
+    "crates/trames-vfs/src/network_io.rs": "a7771d433db4759fe825aa7a5730dcd3c20ea5c3b2aea361e3d298983ca79f82",
+    "crates/trames-vfs/src/path_queries.rs": "2958eab128218c5a8debdf4a6d2c0d88b30a15e853a51c7041ce80dcddc261a9",
+    "crates/trames-vfs/src/pid_namespace.rs": "e3889966a63c857d7bfbbe5f7775fdd640dcde223688eb986f4ebdd860a221d1",
+    "crates/trames-vfs/src/pseudo.rs": "2d84c73cfe0d6724d2fcefb47c05ed34f4fc50dce64b4965bf399d1e7a1901e4",
+    "crates/trames-vfs/src/sysctl.rs": "78a750926601a582bc9c157d934c2408d4095b522c86df9e512310849d5ae184",
+    "crates/trames-vfs/src/task_namespace.rs": "07f845810428fdd69a581a88f94c8aabc04c05609ad5847de12046a91f7d860d",
+    "crates/trames-vfs/src/user_namespace.rs": "33534b0df425540c822d3eaa5b7ae3120428f162d4dcd9db46ebdfe47671ba51"
+  },
+  "interpreter_fixture_audit": {
+    "baseline_runtime": "4e14d2296ab42b552c6270db64cd4b1d90322177",
+    "raw_repetitions": [
+      {
+        "label": "baseline",
+        "sample": 0,
+        "status": "timeout",
+        "code": -9,
+        "seconds": 5.0058505
+      },
+      {
+        "label": "candidate-diagnostic",
+        "sample": 0,
+        "status": "passed",
+        "code": 0,
+        "seconds": 0.3676585000000001
+      },
+      {
+        "label": "baseline",
+        "sample": 1,
+        "status": "passed",
+        "code": 0,
+        "seconds": 0.3714283749999998
+      },
+      {
+        "label": "candidate-diagnostic",
+        "sample": 1,
+        "status": "passed",
+        "code": 0,
+        "seconds": 0.37103087499999976
+      },
+      {
+        "label": "baseline",
+        "sample": 2,
+        "status": "passed",
+        "code": 0,
+        "seconds": 0.3717435
+      },
+      {
+        "label": "candidate-diagnostic",
+        "sample": 2,
+        "status": "passed",
+        "code": 0,
+        "seconds": 0.3818435409999994
+      },
+      {
+        "label": "baseline",
+        "sample": 3,
+        "status": "passed",
+        "code": 0,
+        "seconds": 0.3757641249999999
+      },
+      {
+        "label": "candidate-diagnostic",
+        "sample": 3,
+        "status": "passed",
+        "code": 0,
+        "seconds": 0.366564833
+      },
+      {
+        "label": "baseline",
+        "sample": 4,
+        "status": "timeout",
+        "code": -9,
+        "seconds": 5.011022916000001
+      },
+      {
+        "label": "candidate-diagnostic",
+        "sample": 4,
+        "status": "passed",
+        "code": 0,
+        "seconds": 0.3750730840000003
+      },
+      {
+        "label": "baseline",
+        "sample": 5,
+        "status": "passed",
+        "code": 0,
+        "seconds": 0.3817734159999997
+      },
+      {
+        "label": "candidate-diagnostic",
+        "sample": 5,
+        "status": "passed",
+        "code": 0,
+        "seconds": 0.37553250000000027
+      },
+      {
+        "label": "baseline",
+        "sample": 6,
+        "status": "passed",
+        "code": 0,
+        "seconds": 0.3828503750000003
+      },
+      {
+        "label": "candidate-diagnostic",
+        "sample": 6,
+        "status": "passed",
+        "code": 0,
+        "seconds": 0.36393545800000027
+      },
+      {
+        "label": "baseline",
+        "sample": 7,
+        "status": "passed",
+        "code": 0,
+        "seconds": 0.4165993749999988
+      },
+      {
+        "label": "candidate-diagnostic",
+        "sample": 7,
+        "status": "passed",
+        "code": 0,
+        "seconds": 0.37423545800000113
+      }
+    ],
+    "baseline_full": [
+      {
+        "sample": 0,
+        "status": "passed",
+        "code": 0,
+        "seconds": 8.604240625000001
+      },
+      {
+        "sample": 1,
+        "status": "timeout",
+        "code": -9,
+        "seconds": 20.014570208000002
+      }
+    ],
+    "candidate_uninstrumented_full": [
+      {
+        "sample": 0,
+        "status": "timeout",
+        "code": -9,
+        "seconds": 20.015150166
+      },
+      {
+        "sample": 1,
+        "status": "timeout",
+        "code": -9,
+        "seconds": 20.016956583000002
+      },
+      {
+        "sample": 2,
+        "status": "timeout",
+        "code": -9,
+        "seconds": 20.01350275
+      }
+    ],
+    "excluded": [
+      "process::socket_wait_tests::raw_ip_scalar_vector_pairs_run_without_owner_on_native_and_packet_stack_transports",
+      "process::seccomp::tests::complete_socket_controls_use_workers_and_one_filter_decision"
+    ],
+    "note": "The uninstrumented final full run timed out three times. The unchanged baseline also times out (2/8 isolated raw-IP runs; 1/2 full runs). Temporary per-case diagnostics were removed. Other 489 tests passed serially. No full interpreter green claim is made."
+  },
+  "limits": [
+    "All selected Unix native-passing cases pass; this is not full Linux conformance.",
+    "Remaining netlink link-flag and IPv6 lifecycle gaps are explicit, as is one version-gated native-passing UID test skipped by Trames.",
+    "No full interpreter green claim: two unchanged bounded-handoff fixture races remain, reproduced on the pre-task baseline.",
+    "Microbenchmarks describe original VFS I/O operations, not Firefox or whole-guest latency."
+  ]
+}

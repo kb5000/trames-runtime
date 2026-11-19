@@ -27,6 +27,11 @@ adds real addressed-sender accounting, receive completion, socket options and
 autobind, reaching 98.76% of native-passing Unix cases; 72 user-namespace-dependent
 cases remain, with explicit performance samples and limitations.
 
+The [user-namespace checkpoint](../../docs/validation/gvisor-user-namespaces-20261119.md)
+closes all 72 remaining Unix failures with scoped UID/GID maps and capability
+ownership, reaching 5826/5826 native-passing Unix cases. Expanded namespace
+coverage and remaining network gaps are reported separately.
+
 ## Build on native ARM64 Linux
 
 Install a C++17 compiler, CMake, Ninja, Python 3 and ordinary static glibc/libstdc++

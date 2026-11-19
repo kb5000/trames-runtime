@@ -22,6 +22,8 @@ use fs_context::FsContext;
 pub use fs_context::{FsOwner, Umask};
 use fs_data::{FsBorrow, FsHandle};
 mod async_io;
+mod user_namespace;
+pub use user_namespace::{UserNamespace, CLONE_NEWUSER};
 mod credentials;
 mod fd_status;
 pub use async_io::{AsyncOwner, AsyncOwners, TaskSignal};
@@ -187,7 +189,7 @@ pub fn query_fd_flags(flags: u32, command: u64) -> Result<u64> {
         _ => Err(Errno(22)),
     }
 }
-pub use network::{SocketControlOperation, SocketOperation};
+pub use network::{SocketControlOperation, SocketOperation, TunOperation};
 pub use storage::{DiskOptions, StorageCapacity, StorageLimits, VolumeSpace, DEFAULT_DISK_BYTES};
 pub use trames_net::{NetworkMode, Socket as NetSocket};
 pub fn kernel_log_capacity() -> usize {
@@ -1271,7 +1273,7 @@ impl Vfs {
         pending: u64,
         reader: Option<&Arc<dyn SignalReader>>,
     ) -> u16 {
-        if let Some(events::SharedControl::Tun(file)) = &o.control {
+        if let Some(events::SharedControl::Tun(file, _)) = &o.control {
             return if o.flags.get() & O_PATH != 0 {
                 32
             } else {
@@ -2424,7 +2426,8 @@ impl Vfs {
             .and_then(|o| o.oom.clone())
             .or_else(|| self.oom_for_path(&p));
         let network_control = original
-            .and_then(|o| o.sysctl_control.clone())
+            .and_then(|o| o.sysctl_control.as_ref())
+            .map(|control| control.reopen(&self.credentials))
             .or_else(|| self.sysctl_control(&p));
         let mount_file = (flags & O_PATH == 0)
             .then(|| self.proc_mount_file(&p))
@@ -2556,7 +2559,9 @@ impl Vfs {
             self.check_device_open(&n, flags)?;
             if flags & O_NOATIME != 0
                 && self.credentials.fsuid != n.uid
-                && !self.credentials.has_cap(capabilities::FOWNER)
+                && !self
+                    .credentials
+                    .inode_cap(capabilities::FOWNER, n.uid, n.gid)
             {
                 return Err(Errno(1));
             }
@@ -2574,9 +2579,9 @@ impl Vfs {
             }
             if existed
                 && flags & O_PATH == 0
-                && !(network_control.is_some()
-                    && (self.credentials.euid == 0
-                        || self.credentials.has_cap(capabilities::NET_ADMIN)))
+                && !network_control
+                    .as_ref()
+                    .is_some_and(|control| control.authorized(&self.credentials))
                 && ((flags & 3 != 1 && !self.allowed(&n, 4))
                     || ((flags & 3 != 0 || flags & 0x200 != 0) && !self.allowed(&n, 2)))
             {
@@ -2714,9 +2719,10 @@ impl Vfs {
         };
         let binder_control = if flags & O_PATH == 0 {
             match node.borrow().content {
-                Content::Device(pseudo::Device::Tun) => {
-                    Some(events::SharedControl::Tun(self.network.open_tun()))
-                }
+                Content::Device(pseudo::Device::Tun) => Some(events::SharedControl::Tun(
+                    self.network.open_tun(),
+                    self.root_network.user_namespace.clone(),
+                )),
                 Content::Device(pseudo::Device::Binder(device)) => {
                     Some(events::SharedControl::Binder(self.binder.open(
                         device as usize,
@@ -3079,14 +3085,17 @@ impl Vfs {
         };
         write.commit(&bytes)
     }
-    pub fn tun_file(&self, fd: u32) -> Result<Option<Arc<trames_net::tun::Connection>>> {
+    pub fn tun_file(&self, fd: u32) -> Result<Option<TunOperation>> {
         let d = self.descriptor(fd)?;
         let o = d.open.borrow();
         if o.flags.get() & O_PATH != 0 {
             return Err(Errno(9));
         }
         Ok(match &o.control {
-            Some(events::SharedControl::Tun(file)) => Some(file.clone()),
+            Some(events::SharedControl::Tun(file, namespace)) => Some(TunOperation {
+                file: file.clone(),
+                namespace: namespace.clone(),
+            }),
             _ => None,
         })
     }
@@ -3103,7 +3112,7 @@ impl Vfs {
         if o.flags.get() & O_PATH != 0 || o.flags.get() & 3 == 1 {
             return Err(Errno(9));
         }
-        if let Some(events::SharedControl::Tun(file)) = &o.control {
+        if let Some(events::SharedControl::Tun(file, _)) = &o.control {
             let file = file.clone();
             drop(o);
             return file.read(count).map_err(|e| Errno(e.0));
@@ -3207,7 +3216,7 @@ impl Vfs {
         if o.flags.get() & 3 == 0 {
             return Err(Errno(9));
         }
-        if let Some(events::SharedControl::Tun(file)) = &o.control {
+        if let Some(events::SharedControl::Tun(file, _)) = &o.control {
             let file = file.clone();
             drop(o);
             return file.write(bytes).map_err(|e| Errno(e.0));
@@ -3233,8 +3242,8 @@ impl Vfs {
         if let Some(bridge) = &o.bridge {
             return bridge.write(bytes).map_err(Errno);
         }
-        if let Some(socket) = &o.socket {
-            let socket = socket.clone();
+        if o.socket.is_some() {
+            let socket = SocketOperation(o.shared.clone());
             drop(o);
             return self.socket_send_bytes(&socket, bytes, 0, None);
         }
@@ -3299,11 +3308,8 @@ impl Vfs {
         }
         if let Some(control) = &o.sysctl_control {
             let mut position = o.file_position.lock().unwrap();
-            let count = control.write(
-                bytes,
-                offset.unwrap_or(position.value),
-                control.authorized(&self.credentials),
-            )?;
+            let count =
+                control.write(bytes, offset.unwrap_or(position.value), &self.credentials)?;
             if offset.is_none() {
                 position.value += count as u64;
             }
@@ -3734,6 +3740,10 @@ impl Vfs {
         path: &[u8],
         nofollow: bool,
     ) -> Result<([u8; 128], u64)> {
+        self.stat_at_raw(dirfd, path, nofollow)
+            .map(|(stat, mount)| (self.credentials.user_namespace.stat(stat), mount))
+    }
+    fn stat_at_raw(&self, dirfd: i32, path: &[u8], nofollow: bool) -> Result<([u8; 128], u64)> {
         let (p, magic) =
             self.resolve_entry_policy(dirfd, path, !nofollow, !nofollow, 0, !nofollow)?;
         match magic {
@@ -3771,8 +3781,12 @@ impl Vfs {
     pub fn stat_fd_with_mount(&self, fd: u32) -> Result<([u8; 128], u64)> {
         let descriptor = self.descriptor(fd)?;
         let open = descriptor.open.borrow();
-        self.stat_open(&open)
-            .map(|stat| (stat, Self::open_mount_id(&open)))
+        self.stat_open(&open).map(|stat| {
+            (
+                self.credentials.user_namespace.stat(stat),
+                Self::open_mount_id(&open),
+            )
+        })
     }
     fn namespace_stat(id: u64) -> [u8; 128] {
         let mut stat = [0; 128];

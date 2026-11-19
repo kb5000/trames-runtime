@@ -268,6 +268,7 @@ impl Birth {
             | 0x10000
             | 0xfc0000
             | 0x1000000
+            | trames_vfs::CLONE_NEWUSER
             | trames_vfs::CLONE_NEWUTS
             | trames_vfs::CLONE_NEWNS
             | trames_vfs::CLONE_NEWPID
@@ -277,6 +278,7 @@ impl Birth {
         let threaded = a[0] & 0x10000 != 0;
         let shared_vm = a[0] & 0x100 != 0;
         if a[0] & !ALLOWED != 0
+            || a[0] & trames_vfs::CLONE_NEWUSER != 0 && a[0] & (0x200 | 0x10000) != 0
             || (a[0] & trames_vfs::CLONE_NEWPID != 0 && a[0] & (0x10000 | 0x8000) != 0)
             || (threaded
                 && p.linux.vfs.pid_namespace().id() != p.linux.vfs.pid_children_namespace().id())
@@ -303,6 +305,9 @@ impl Birth {
             a[0] & 0x800 != 0,
             Arc::new(slot.into_presence()),
         );
+        if a[0] & trames_vfs::CLONE_NEWUSER != 0 {
+            child.linux.vfs.unshare_user()?;
+        }
         if a[0] & trames_vfs::CLONE_NEWPID != 0 {
             child.linux.vfs.unshare_pid()?;
         }

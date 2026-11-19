@@ -17,10 +17,10 @@ impl DirectTcpFd {
 /// Weak full-socket control admission. The socket owns the sole control gate;
 /// no separate VFS publication lock or Files lock covers a native operation.
 #[derive(Clone)]
-pub(super) struct SocketControl(std::sync::Weak<NetSocket>);
+pub(super) struct SocketControl(std::sync::Weak<NetSocket>, pub(super) UserNamespace);
 impl SocketControl {
-    pub(super) fn new(socket: &Arc<NetSocket>) -> Self {
-        Self(Arc::downgrade(socket))
+    pub(super) fn new(socket: &Arc<NetSocket>, owner: UserNamespace) -> Self {
+        Self(Arc::downgrade(socket), owner)
     }
     fn with_native<T>(&self, operation: impl FnOnce(&trames_net::DirectControl) -> T) -> Option<T> {
         self.0.upgrade()?.with_direct_control(operation)

@@ -158,23 +158,11 @@ impl<C: Cpu> crate::workers::Work<C> {
         });
         if let Ok(result) = &result {
             if result.changed {
-                let credentials = state.publish_credentials();
+                state.publish_credentials();
                 if result.sensitive {
                     if let Some(parentage) = snapshot.io_signals.parentage() {
                         parentage.set_death_signal(0);
                     }
-                }
-                snapshot.io_signals.credentials().publish(&credentials);
-                snapshot.io_routes.uid = credentials.uid;
-                snapshot.io_routes.euid = credentials.euid;
-                snapshot.identities[2..6].copy_from_slice(&[
-                    credentials.uid as u64,
-                    credentials.euid as u64,
-                    credentials.gid as u64,
-                    credentials.egid as u64,
-                ]);
-                if let Some(limits) = &mut snapshot.limits {
-                    limits.credentials = credentials;
                 }
             }
         }
@@ -183,6 +171,13 @@ impl<C: Cpu> crate::workers::Work<C> {
     pub fn namespace_work(&mut self, number: u32, args: [u64; 6]) -> trames_vfs::TaskNamespaceWork {
         let snapshot = self.syscalls.as_mut().expect("namespace task");
         let state = snapshot.namespaces.take().expect("current namespace state");
+        let task = &snapshot.io_signals;
+        let single_threaded = self.pid == task.tgid()
+            && task
+                .lifecycle()
+                .members()
+                .iter()
+                .all(|(pid, _)| *pid == self.pid);
         if number == 97 {
             let task = &snapshot.io_signals;
             let allowed = self.pid == task.tgid()
@@ -195,7 +190,7 @@ impl<C: Cpu> crate::workers::Work<C> {
         } else if number == 436 {
             state.close_range(args[0] as u32, args[1] as u32, args[2] as u32)
         } else {
-            state.setns(args[0] as u32, args[1])
+            state.setns_checked(args[0] as u32, args[1], single_threaded)
         }
     }
     pub fn finish_namespaces(
@@ -206,6 +201,20 @@ impl<C: Cpu> crate::workers::Work<C> {
         let snapshot = self.syscalls.as_mut().expect("namespace task");
         if result.is_ok() && state.changed() {
             let resources = state.resources();
+            let credentials = &resources.credentials;
+            snapshot.io_signals.credentials().publish(credentials);
+            snapshot.io_routes.uid = credentials.uid;
+            snapshot.io_routes.euid = credentials.euid;
+            snapshot.identities[2..6].copy_from_slice(&[
+                credentials.local_id(false, credentials.uid) as u64,
+                credentials.local_id(false, credentials.euid) as u64,
+                credentials.local_id(true, credentials.gid) as u64,
+                credentials.local_id(true, credentials.egid) as u64,
+            ]);
+            if let Some(limits) = &mut snapshot.limits {
+                limits.credentials = credentials.clone();
+            }
+
             snapshot.fd_flags = resources.flags.clone();
             snapshot.umask = resources.umask.clone();
             snapshot.uts = Some(resources.uts.clone());
@@ -1086,6 +1095,10 @@ impl Snapshot {
                 .map_or(self.identities[1], |family| {
                     self.io_routes.namespace.local(family.parent()) as u64
                 })),
+            number @ 174..=177 => Ok(self
+                .direct
+                .user_identity(number)
+                .unwrap_or(self.identities[(number - 172) as usize])),
             number @ 172..=178 => Ok(self.identities[(number - 172) as usize]),
             169 => trames_linux::gettimeofday(memory, cpu.x(0), cpu.x(1)),
             99 | 100 => self.io_routes.robust_list(

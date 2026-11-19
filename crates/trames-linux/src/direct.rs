@@ -559,6 +559,14 @@ impl DirectSyscalls {
         self.record_fd_control();
         Some(result.map(|()| 0))
     }
+    pub fn user_identity(&self, number: u32) -> Option<u64> {
+        let c = self.resources.as_ref()?.local_credentials();
+        if c.user_namespace.is_initial() {
+            return None;
+        }
+        let id = [c.uid, c.euid, c.gid, c.egid][(number - 174) as usize];
+        Some(c.local_id(number >= 176, id) as u64)
+    }
     pub fn supports_socket_control(&self, number: u32) -> bool {
         (crate::network::control_number(number) || ip_message::number(number))
             && self.resources.is_some()

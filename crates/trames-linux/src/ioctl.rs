@@ -59,6 +59,14 @@ pub(crate) fn call(vfs: &mut Vfs, a: [u64; 6], memory: &mut impl CpuMemory) -> R
     } else if let Some(kind) = vfs.namespace_type(a[0] as u32)? {
         match a[1] as u32 {
             0xb703 => Ok(kind),
+            0xb701 | 0xb702 => vfs.namespace_ioctl(a[0] as u32, a[1] as u32).map(u64::from),
+            0xb704 => {
+                let uid = vfs.namespace_owner_uid(a[0] as u32)?;
+                memory
+                    .write_array(a[2], uid.to_le_bytes())
+                    .map_err(|_| Errno(14))?;
+                Ok(0)
+            }
             _ => Err(Errno(25)),
         }
     } else if vfs.is_render_device(a[0] as u32)? {
@@ -72,7 +80,7 @@ pub(crate) fn call(vfs: &mut Vfs, a: [u64; 6], memory: &mut impl CpuMemory) -> R
 
 fn tun_ioctl(
     vfs: &Vfs,
-    file: &trames_net::tun::Connection,
+    file: &trames_vfs::TunOperation,
     request: u32,
     argument: u64,
     memory: &mut impl CpuMemory,
@@ -96,9 +104,8 @@ fn tun_ioctl(
                 .attach(
                     name,
                     flags,
-                    vfs.descriptor_factory()
-                        .local_credentials()
-                        .has_cap(trames_vfs::capabilities::NET_ADMIN),
+                    vfs.credentials
+                        .has_ns_cap(file.user_namespace(), trames_vfs::capabilities::NET_ADMIN),
                 )
                 .map_err(net)?;
             ifreq[..16].fill(0);

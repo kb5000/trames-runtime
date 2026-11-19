@@ -1519,7 +1519,7 @@ impl<C: Cpu> Kernel<C> {
     fn may_signal(source: &Process<C>, target: &Process<C>, sig: u32) -> bool {
         let a = &source.linux.vfs.credentials;
         let b = &target.linux.vfs.credentials;
-        a.has_cap(capabilities::KILL)
+        a.has_ns_cap(&b.user_namespace, capabilities::KILL)
             || [a.uid, a.euid]
                 .iter()
                 .any(|id| *id == b.uid || *id == b.suid)
@@ -2096,6 +2096,7 @@ impl<C: Cpu> Kernel<C> {
                 Ok(None)
             },
             97 | 268 | 436 => {
+                let single_threaded = pid == p.tgid && p.signals.io.lifecycle().members().iter().all(|(other, _)| *other == pid);
                 let attempt = if number == 97 {
                     let allowed = pid == p.tgid
                         && p.signals
@@ -2114,10 +2115,13 @@ impl<C: Cpu> Kernel<C> {
                         .vfs
                         .close_range_task(a[0] as u32, a[1] as u32, a[2] as u32)
                 } else {
-                    p.linux.vfs.setns_task(a[0] as u32, a[1])
+                    p.linux.vfs.setns_task(a[0] as u32, a[1], single_threaded)
                 };
                 match attempt {
-                    trames_vfs::TaskNamespaceOwnerAttempt::Complete(result) => result.map(Some),
+                    trames_vfs::TaskNamespaceOwnerAttempt::Complete(result) => {
+                        if result.is_ok() && matches!(number, 97 | 268) { p.signals.io.credentials().publish(&p.linux.vfs.credentials); }
+                        result.map(Some)
+                    },
                     trames_vfs::TaskNamespaceOwnerAttempt::Waiting(work) => {
                         p.state = State::Namespace(crate::run_queue::NamespaceWait::new(*work));
                         Ok(None)
@@ -9293,6 +9297,38 @@ mod boundary_tests {
             Err(Errno(11))
         );
         assert_eq!(p.memory.mapped_bytes(), before);
+    }
+    #[test]
+    fn clone_user_namespace_publishes_scoped_credentials_and_rejects_shared_fs() {
+        let mut p = process();
+        let mut k = kernel();
+        let mut output = CapturedOutput::default();
+        for flags in [
+            trames_vfs::CLONE_NEWUSER | 0x200 | 17,
+            trames_vfs::CLONE_NEWUSER | 0x10900,
+        ] {
+            assert_eq!(
+                k.syscall(1, &mut p, 220, [flags, 0, 0, 0, 0, 0], &mut output),
+                Err(Errno(22))
+            );
+        }
+        let flags = trames_vfs::CLONE_NEWUSER | trames_vfs::CLONE_NEWNET | 17;
+        let id = k
+            .syscall(1, &mut p, 220, [flags, 0, 0, 0, 0, 0], &mut output)
+            .unwrap()
+            .unwrap() as u32;
+        let child = k.processes.read(&id);
+        let c = &child.linux.vfs.credentials;
+        assert!(!c.user_namespace.is_initial());
+        assert_eq!(c.local_id(false, c.uid), 65534);
+        assert!(c.has_local_cap(capabilities::SYS_ADMIN));
+        assert!(!c.has_cap(capabilities::SYS_ADMIN));
+        assert_eq!(
+            child.signals.io.credentials().read().user_namespace,
+            c.user_namespace
+        );
+        assert!(child.linux.vfs.descriptor_factory().can_admin_network());
+        assert!(p.linux.vfs.credentials.user_namespace.is_initial());
     }
     #[test]
     fn private_fork_quota_failure_returns_eagain_without_task_birth() {

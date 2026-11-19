@@ -5,17 +5,28 @@ use super::*;
 pub(super) enum Control {
     Network(network::Control),
     NrOpen(DescriptorCeiling),
+    UserMap(Arc<user_namespace::MapFile>),
 }
 impl Control {
+    pub fn reopen(&self, credentials: &Credentials) -> Self {
+        match self {
+            Self::UserMap(control) => Self::UserMap(Arc::new(control.reopen(credentials))),
+            _ => self.clone(),
+        }
+    }
     pub fn authorized(&self, credentials: &Credentials) -> bool {
-        credentials.euid == 0
-            || credentials.has_cap(match self {
-                Self::Network(_) => capabilities::NET_ADMIN,
-                Self::NrOpen(_) => capabilities::SYS_RESOURCE,
-            })
+        match self {
+            Self::UserMap(control) => control.authorized(credentials),
+            Self::Network(control) => control.authorized(credentials),
+            Self::NrOpen(_) => {
+                credentials.has_cap(capabilities::SYS_RESOURCE)
+                    || credentials.euid == 0 && credentials.user_namespace.is_initial()
+            }
+        }
     }
     pub fn read(&self, offset: u64, count: usize) -> Result<Vec<u8>> {
         match self {
+            Self::UserMap(control) => control.read(offset, count),
             Self::Network(control) => control.read(offset, count),
             Self::NrOpen(limit) => {
                 let bytes = format!("{}\n", limit.get()).into_bytes();
@@ -26,8 +37,10 @@ impl Control {
             }
         }
     }
-    pub fn write(&self, bytes: &[u8], offset: u64, authorized: bool) -> Result<usize> {
+    pub fn write(&self, bytes: &[u8], offset: u64, credentials: &Credentials) -> Result<usize> {
+        let authorized = self.authorized(credentials);
         match self {
+            Self::UserMap(control) => control.write(bytes, offset, credentials),
             Self::Network(control) => control.write(bytes, offset, authorized),
             Self::NrOpen(limit) => {
                 if !authorized {
@@ -55,7 +68,9 @@ impl Control {
 }
 impl Vfs {
     pub(super) fn sysctl_control(&self, path: &ResolvedPath) -> Option<Control> {
-        if self.uses_pseudo(path) && path.as_ref() == b"/proc/sys/fs/nr_open" {
+        if let Some(control) = self.user_map_control(path) {
+            Some(Control::UserMap(Arc::new(control)))
+        } else if self.uses_pseudo(path) && path.as_ref() == b"/proc/sys/fs/nr_open" {
             Some(Control::NrOpen(self.descriptor_ceiling()))
         } else {
             self.network_control(path).map(Control::Network)

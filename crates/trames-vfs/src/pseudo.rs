@@ -393,10 +393,13 @@ mod tests {
         assert_eq!(read(&mut v, b"/proc/1/task/1/setgroups"), b"allow\n");
         for path in [b"/proc/self/uid_map".as_slice(), b"/proc/1/task/1/gid_map"] {
             assert_eq!(read(&mut v, path), b"         0          0 4294967295\n");
-            assert!(v.open_at(AT_FDCWD, path, 1, 0).is_err());
+            let fd = v.open_at(AT_FDCWD, path, 1, 0).unwrap();
+            assert_eq!(v.write(fd, b"0 0 1"), Err(Errno(1)));
+            v.close(fd).unwrap();
         }
-        // User namespaces and changing their setgroups policy are unsupported.
-        assert!(v.open_at(AT_FDCWD, b"/proc/self/setgroups", 1, 0).is_err());
+        // Initial maps are immutable, although their proc files allow write-open.
+        let fd = v.open_at(AT_FDCWD, b"/proc/self/setgroups", 1, 0).unwrap();
+        assert_eq!(v.write(fd, b"deny"), Err(Errno(1)));
     }
     #[test]
     fn proc_root_inode_matches_linux_across_paths_fds_and_bind_mounts() {
@@ -1981,6 +1984,7 @@ impl Vfs {
                             | b"net"
                             | b"ipc"
                             | b"cgroup"
+                            | b"user"
                     )
                 {
                     return Ok(
@@ -2011,10 +2015,19 @@ impl Vfs {
                         b"exe" if p.state != 'Z' => return Ok(link(p.executable.clone())),
                         b"exe" => return Ok(None),
                         b"oom_score_adj" => return Ok(Some((file(Vec::new()), 0o100644))),
-                        // All tasks currently belong to the initial user
-                        // namespace; supplementary groups are not disabled.
-                        b"setgroups" => b"allow\n".to_vec(),
-                        b"uid_map" | b"gid_map" => b"         0          0 4294967295\n".to_vec(),
+                        b"setgroups" | b"uid_map" | b"gid_map" => {
+                            let kind = match key {
+                                b"uid_map" => user_namespace::MapKind::Uid,
+                                b"gid_map" => user_namespace::MapKind::Gid,
+                                _ => user_namespace::MapKind::Groups,
+                            };
+                            let control = user_namespace::MapFile::new(
+                                p.credentials.user_namespace.clone(),
+                                self.credentials.clone(),
+                                kind,
+                            );
+                            return Ok(Some((file(control.read(0, 4096)?), 0o100644)));
+                        }
                         b"comm" => comm(p),
                         b"cgroup" => {
                             [b"0::".as_slice(), &self.cgroup_view_path(&p.cgroup), b"\n"].concat()
@@ -2126,7 +2139,7 @@ impl Vfs {
                                 .max(64)
                                 .next_power_of_two();
                             format!("Name:\t{name}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t{fd_size}\nGroups:\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{threads}\nSigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\n", p.state, p.tgid, p.pid, p.parent,
-                                c.uid,c.euid,c.suid,c.fsuid,c.gid,c.egid,c.sgid,c.fsgid,c.groups.iter().map(u32::to_string).collect::<Vec<_>>().join(" "),p.virtual_bytes/1024,p.mapped_bytes/1024,p.pending,p.shared_pending,p.blocked,p.ignored,p.caught).into_bytes()
+                                self.credentials.local_id(false,c.uid),self.credentials.local_id(false,c.euid),self.credentials.local_id(false,c.suid),self.credentials.local_id(false,c.fsuid),self.credentials.local_id(true,c.gid),self.credentials.local_id(true,c.egid),self.credentials.local_id(true,c.sgid),self.credentials.local_id(true,c.fsgid),c.groups.iter().map(|id|self.credentials.local_id(true,*id).to_string()).collect::<Vec<_>>().join(" "),p.virtual_bytes/1024,p.mapped_bytes/1024,p.pending,p.shared_pending,p.blocked,p.ignored,p.caught).into_bytes()
                         }
                         b"limits" => {
                             let (soft, hard) = p.file_size_limits.unwrap_or((u64::MAX, u64::MAX));
@@ -2233,7 +2246,7 @@ impl Vfs {
                                         if seen.insert(fd.inode, ()).is_some() {
                                             continue;
                                         }
-                                        data.push_str(&format!("{:4}: {} {} {:02X} {:08X}:{:08X} 00:00000000 00000000 {:5} 0 {} 1 0000000000000000\n",seen.len()-1,hex(s.local,(kind==3).then_some(protocol as u16)),hex(s.peer,None),s.state,s.tx_queue.unwrap_or(0),s.rx_queue.unwrap_or(0),process.credentials.euid,fd.inode));
+                                        data.push_str(&format!("{:4}: {} {} {:02X} {:08X}:{:08X} 00:00000000 00000000 {:5} 0 {} 1 0000000000000000\n",seen.len()-1,hex(s.local,(kind==3).then_some(protocol as u16)),hex(s.peer,None),s.state,s.tx_queue.unwrap_or(0),s.rx_queue.unwrap_or(0),self.credentials.local_id(false,process.credentials.euid),fd.inode));
                                     }
                                 }
                             }
@@ -2888,6 +2901,7 @@ impl Vfs {
                     if parts[depth] == b"ns"
                         && linux_namespace::snapshot_label(&p.namespaces, b"uts").is_some()
                     {
+                        names.push(b"user".to_vec());
                         names.push(b"uts".to_vec());
                         names.push(b"pid".to_vec());
                         names.push(b"pid_for_children".to_vec());

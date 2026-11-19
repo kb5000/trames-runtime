@@ -177,6 +177,9 @@ impl DescriptorFactory {
     pub fn local_sender_credentials(&self) -> [u32; 3] {
         self.local_identity
     }
+    pub fn pid_user_namespace(&self) -> &UserNamespace {
+        self.pid_namespace.user_namespace()
+    }
     pub fn local_credentials(&self) -> &Credentials {
         &self.credentials
     }
@@ -209,7 +212,9 @@ impl DescriptorFactory {
             }
         }
         if (family == 17 || matches!(family, 2 | 10) && kind & 0xf == 3)
-            && !self.credentials.has_cap(capabilities::NET_RAW)
+            && !self
+                .credentials
+                .has_ns_cap(&self.local_network.user_namespace, capabilities::NET_RAW)
         {
             return Err(Errno(1));
         }
@@ -222,7 +227,13 @@ impl DescriptorFactory {
             .socket(family, kind & 0xf, protocol)
             .map_err(|e| Errno(e.0))?;
         socket.set_owner_uid(self.credentials.fsuid);
-        let descriptor = Vfs::socket_descriptor(self.open_id(), self.owner, socket, kind);
+        let descriptor = Vfs::socket_descriptor(
+            self.open_id(),
+            self.owner,
+            socket,
+            kind,
+            self.local_network.user_namespace.clone(),
+        );
         reserved.publish(descriptor, None)
     }
     /// None leaves an excluded owner object untouched; missing/invalid shared
@@ -247,7 +258,7 @@ impl DescriptorFactory {
     }
     pub fn send_socket_bytes(
         &self,
-        socket: &NetSocket,
+        socket: &SocketOperation,
         bytes: &[u8],
         flags: u32,
         destination: Option<&[u8]>,
@@ -258,7 +269,8 @@ impl DescriptorFactory {
                 bytes,
                 flags,
                 destination,
-                self.credentials.has_cap(capabilities::NET_ADMIN),
+                self.credentials
+                    .has_ns_cap(socket.user_namespace(), capabilities::NET_ADMIN),
                 &|fd| {
                     let file = self
                         .files
@@ -270,6 +282,12 @@ impl DescriptorFactory {
                         .map_err(|e| trames_net::NetError(e.0))?;
                     let network = match &file.open.namespace_resource {
                         Some(linux_namespace::SharedNamespace::Net(ns)) => {
+                            if !self
+                                .credentials
+                                .has_ns_cap(&ns.user_namespace, capabilities::NET_ADMIN)
+                            {
+                                return Err(trames_net::NetError(1));
+                            }
                             Ok(ns.network.borrow().clone())
                         }
                         _ => Err(trames_net::NetError(22)),
@@ -282,12 +300,17 @@ impl DescriptorFactory {
             )
             .map_err(|e| Errno(e.0))
     }
-    pub fn can_bind_service(&self) -> bool {
-        self.credentials.has_cap(capabilities::NET_BIND_SERVICE)
+    pub fn can_bind_service(&self, socket: &SocketOperation) -> bool {
+        self.credentials
+            .has_ns_cap(socket.user_namespace(), capabilities::NET_BIND_SERVICE)
+    }
+    pub fn can_admin_network(&self) -> bool {
+        self.credentials
+            .has_ns_cap(&self.local_network.user_namespace, capabilities::NET_ADMIN)
     }
     pub fn accept_socket_output(
         &self,
-        socket: &NetSocket,
+        socket: &SocketOperation,
         flags: u32,
         output: impl FnOnce(std::net::SocketAddr) -> Result<()>,
     ) -> Result<(u32, std::net::SocketAddr)> {
@@ -295,9 +318,11 @@ impl DescriptorFactory {
             return Err(Errno(22));
         }
         let reserved = self.files.reserve()?;
+        let namespace = socket.user_namespace().clone();
         let (socket, address) = socket.accept().map_err(|e| Errno(e.0))?;
         output(address)?;
-        let descriptor = Vfs::socket_descriptor(self.open_id(), self.owner, socket, flags);
+        let descriptor =
+            Vfs::socket_descriptor(self.open_id(), self.owner, socket, flags, namespace);
         {
             // Prepare the accepted original OFD before its number is visible.
             // A concurrent close/reuse must not redirect this publication.
