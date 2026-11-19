@@ -907,7 +907,7 @@ impl View {
             return Err(MemoryError::InvalidRange);
         }
         let frame = self.frame(address, access)?;
-        self.load_frame(frame)?;
+        self.load_frame(frame, address)?;
         if frame.backed {
             frame.charge.ensure()?;
         }
@@ -951,13 +951,13 @@ impl View {
             }
         }
     }
-    fn load_frame(&self, frame: &Frame) -> Result<(), MemoryError> {
+    fn load_frame(&self, frame: &Frame, address: u64) -> Result<(), MemoryError> {
         if frame.backed && frame.bytes.source.is_some() && frame.bytes.loaded.get().is_none() {
             frame.charge.check_available()?;
         }
-        frame.bytes.load()
+        frame.bytes.load().map_err(|e| e.at_access(address))
     }
-    fn ensure_resident(&self, frame: &Frame) -> Result<(), MemoryError> {
+    fn ensure_resident(&self, frame: &Frame, address: u64) -> Result<(), MemoryError> {
         // Residency is monotonic for the lifetime of this immutable frame.
         // CPU software stores and native chunks reuse the same paid TLB bit as
         // hardware stores; no quota acquire is needed on each fragment.
@@ -966,7 +966,7 @@ impl View {
         if entry.matches(frame.base, Translation::RESIDENT) {
             return Ok(());
         }
-        self.load_frame(frame)?;
+        self.load_frame(frame, address)?;
         frame.charge.ensure()?;
         if entry.matches(frame.base, Translation::VALID) {
             entry.tag |= Translation::RESIDENT;
@@ -979,7 +979,7 @@ impl View {
         let mut done = 0;
         while done < out.len() {
             let frame = self.frame(address, Access::Read)?;
-            self.load_frame(frame)?;
+            self.load_frame(frame, address)?;
             if frame.backed {
                 frame.charge.ensure()?;
             }
@@ -1037,7 +1037,7 @@ impl View {
         offset: usize,
         input: &[u8],
     ) -> Result<(), MemoryError> {
-        self.ensure_resident(frame)?;
+        self.ensure_resident(frame, frame.base + offset as u64)?;
         if self.hardware_mode {
             let mut raw = frame
                 .bytes
@@ -1085,7 +1085,7 @@ impl CpuMemory for View {
             if frame.proc_anonymous.load(Ordering::Relaxed)
                 || frame.bytes.private_source && frame.bytes.dirty.load(Ordering::Relaxed) != 0
             {
-                self.ensure_resident(frame)?;
+                self.ensure_resident(frame, address)?;
                 self.read_fragment(frame, (address % PAGE_SIZE) as usize, out);
                 Ok(())
             } else {
@@ -1135,7 +1135,7 @@ impl CpuMemory for View {
             return Ok((operation(&mut []), true));
         }
         let (frame, offset) = self.reached(address & 0x00ffffffffffffff, len, Access::Write)?;
-        self.ensure_resident(frame)?;
+        self.ensure_resident(frame, address)?;
         let mut guard = self.frame_guard(frame, offset, len);
         // Match native/CPU writes: invalidate reservations and code even when
         // the external callback unwinds. No borrow escapes this call.
@@ -1151,7 +1151,7 @@ impl CpuMemory for View {
         for at in (address & !(PAGE_SIZE - 1)..address + len as u64).step_by(PAGE_SIZE as usize) {
             let frame = self.frame(at.max(address), access)?;
             if access == Access::Write {
-                self.ensure_resident(frame)?;
+                self.ensure_resident(frame, at.max(address))?;
             }
         }
         Ok(())
@@ -1296,7 +1296,7 @@ impl CpuMemory for View {
             });
         }
         let mut guard = self.frame_guard(frame, offset, len);
-        self.ensure_resident(frame)?;
+        self.ensure_resident(frame, address)?;
         let (value, write) = update(guard.write(offset, len));
         if write {
             self.changed(frame, &mut guard, offset, len)
@@ -1331,7 +1331,7 @@ impl CpuMemory for View {
         {
             return Ok(false);
         }
-        self.ensure_resident(frame)?;
+        self.ensure_resident(frame, address)?;
         guard.write(offset, bytes.len()).copy_from_slice(bytes);
         self.changed(frame, &mut guard, offset, bytes.len());
         Ok(true)
@@ -2243,7 +2243,7 @@ impl View {
     ) -> Result<(Arc<dyn crate::HardwareStorage>, HardwarePageInfo), MemoryError> {
         assert!(self.hardware_mode);
         let frame = self.frame(address, access)?;
-        self.load_frame(frame)?;
+        self.load_frame(frame, address)?;
         if frame.backed {
             frame.charge.ensure()?;
         }
@@ -2252,7 +2252,7 @@ impl View {
         }
         // A hardware export binds a real physical slot even for a zero read.
         // Ordinary software zero reads remain allocation-free and uncharged.
-        self.ensure_resident(frame)?;
+        self.ensure_resident(frame, address)?;
         let page = if let Some(page) = frame.bytes.mutable() {
             page
         } else {

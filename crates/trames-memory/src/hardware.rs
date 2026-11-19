@@ -135,7 +135,8 @@ impl Memory {
             && !(initially_zero && page.backing.is_none() && page.bytes.is_zero())
         {
             let mut bytes = [0; PAGE_SIZE as usize];
-            page.read_bytes(0, &mut bytes)?;
+            page.read_bytes(0, &mut bytes)
+                .map_err(|e| e.at_access(base))?;
             storage.with_write(0, bytes.len(), |out| out.copy_from_slice(&bytes));
         }
         if write {

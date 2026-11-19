@@ -21,6 +21,7 @@ pub use path_queries::PathQueries;
 mod fs_data;
 #[cfg(all(feature = "hostfs", unix))]
 mod hostfs;
+mod tmpfs;
 use fs_context::FsContext;
 pub use fs_context::{FsOwner, Umask};
 use fs_data::{FsBorrow, FsHandle};
@@ -403,6 +404,7 @@ struct Inode {
     state: SharedCell<Node>,
     length: std::sync::OnceLock<trames_shared::LogicalSize>,
     quota: std::sync::OnceLock<Arc<file_accounting::FileQuota>>,
+    symlink_page: std::sync::OnceLock<Arc<file_accounting::FileCharge>>,
 }
 impl Inode {
     fn new(mut node: Node) -> Self {
@@ -430,6 +432,7 @@ impl Inode {
             state: SharedCell::new(node),
             length: std::sync::OnceLock::new(),
             quota: std::sync::OnceLock::new(),
+            symlink_page: Default::default(),
         }
     }
     fn bind_quota(&self, quota: &Arc<file_accounting::FileQuota>) -> Result<()> {

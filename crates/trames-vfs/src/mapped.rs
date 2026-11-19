@@ -126,9 +126,13 @@ impl FilePage {
         else {
             return Ok(());
         };
-        let data = source
-            .read_at(*offset, PAGE_SIZE as usize, None)
-            .map_err(|error| MemoryError::BackingIo(error.0))?;
+        let data = source.fault_read(*offset).map_err(|error| {
+            if error == Errno(28) {
+                MemoryError::Bus(*offset)
+            } else {
+                MemoryError::BackingIo(error.0)
+            }
+        })?;
         let state = state.upgrade();
         let range = *offset..offset.saturating_add(PAGE_SIZE);
         *storage = if data.is_empty() {
@@ -369,6 +373,9 @@ impl MappedData {
     pub(super) fn orphan(&self, value: bool) {
         self.data.borrow_mut().orphan(value);
     }
+    pub(super) fn tmpfs_file(&self) -> Option<Arc<file_data::PlainFile>> {
+        self.data.borrow().tmpfs_file()
+    }
     pub(super) fn shared_file(&self) -> Option<trames_shared::SharedFile> {
         self.data.borrow().shared_file()
     }
@@ -505,7 +512,7 @@ impl MappedData {
             if let Some(p) = p.upgrade() {
                 let start = base.max(offset);
                 let to = (base + PAGE_SIZE).min(end);
-                if !p.bytes.read().unwrap().is_shared() {
+                if !p.deferred() && !p.bytes.read().unwrap().is_shared() {
                     p.bytes.write().unwrap().copy_write(
                         (start - base) as usize,
                         &bytes[(start - offset) as usize..(to - offset) as usize],
@@ -582,9 +589,17 @@ impl MappedData {
         // that fact before fallible I/O; no VM/provider re-entry occurs here.
         self.changed();
         self.refresh_shared_pages();
+        let sparse = self.tmpfs_file();
         for (&base, page) in self.pages.borrow().iter() {
             if let Some(page) = page.upgrade() {
-                if !page.deferred() && !page.bytes.read().unwrap().is_shared() {
+                if let Some(source) = sparse.as_ref().filter(|_| base >= length) {
+                    page.replace(PageStorage::Deferred {
+                        source: source.clone(),
+                        offset: base,
+                        state: Arc::downgrade(&self.state),
+                    });
+                    page.dirty.store(false, Ordering::Relaxed);
+                } else if !page.deferred() && !page.bytes.read().unwrap().is_shared() {
                     let bytes = self.data.borrow().read_at(base, PAGE_SIZE as usize)?;
                     let mut content = page.bytes.write().unwrap();
                     if bytes.is_empty() {

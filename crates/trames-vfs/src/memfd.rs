@@ -118,7 +118,7 @@ impl Vfs {
         let length = match request {
             FileResize::Truncate(length) => length,
             FileResize::Allocate { mode, end, .. } => {
-                if let Some(_file) = data.shared_file() {
+                if data.shared_file().is_some() || data.tmpfs_file().is_some() {
                     if seals.is_some_and(|s| s & 8 != 0 || mode == 0 && s & 4 != 0 && end > old) {
                         return Err(Errno(1));
                     }
@@ -152,8 +152,16 @@ impl Vfs {
         }
         // This is the original inode's resize ownership. No mapped publisher
         // can appear between layout admission, reserve_range and final EOF.
-        if let FileResize::Allocate { offset, length, .. } = request {
-            if let Some(file) = data.shared_file() {
+        if let FileResize::Allocate {
+            offset,
+            length,
+            end,
+            ..
+        } = request
+        {
+            if let Some(file) = data.tmpfs_file() {
+                file.reserve_tmpfs(offset, end)?;
+            } else if let Some(file) = data.shared_file() {
                 file.reserve_range(
                     usize::try_from(offset).map_err(|_| Errno(27))?,
                     usize::try_from(length).map_err(|_| Errno(27))?,

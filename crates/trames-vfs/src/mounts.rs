@@ -1322,20 +1322,23 @@ impl Vfs {
                         xattrs: BTreeMap::new(),
                         seals: None,
                     }));
-                    let fs = FsHandle::new(Filesystem {
-                        shared_budget: trames_shared::SharedBudget::new(
-                            memfd::MEMFD_BYTES as usize,
-                        ),
-                        paths: BTreeMap::from([(b"/".to_vec(), root.clone())]),
-                        inodes: vec![Arc::downgrade(&root)],
-                        next_inode: inode + 1,
-                        limits: StorageLimits {
-                            file_bytes: limit,
-                            nodes,
+                    let fs = FsHandle::with_page_accounting(
+                        Filesystem {
+                            shared_budget: trames_shared::SharedBudget::new(
+                                memfd::MEMFD_BYTES as usize,
+                            ),
+                            paths: BTreeMap::from([(b"/".to_vec(), root.clone())]),
+                            inodes: vec![Arc::downgrade(&root)],
+                            next_inode: inode + 1,
+                            limits: StorageLimits {
+                                file_bytes: limit,
+                                nodes,
+                            },
+                            disk: None,
+                            volume: None,
                         },
-                        disk: None,
-                        volume: None,
-                    });
+                        !mqueue,
+                    );
                     let (fs, root) = if mqueue {
                         let shared = self.ipc_namespace.mqueue.get_or_init(|| fs).clone();
                         let root = shared.borrow().paths[b"/".as_slice()].clone();
@@ -1710,6 +1713,17 @@ fn tmpfs_options(data: &[u8], memory: u64) -> Result<TmpfsOptions> {
                 if size > i64::MAX as u64 {
                     return Err(Errno(22));
                 }
+            }
+            b"nr_blocks" => {
+                let blocks = tmpfs_quantity(value)?;
+                size = if blocks == 0 {
+                    i64::MAX as u64
+                } else {
+                    blocks
+                        .checked_mul(trames_memory::PAGE_SIZE)
+                        .filter(|&v| v <= i64::MAX as u64)
+                        .ok_or(Errno(22))?
+                };
             }
             b"nr_inodes" => {
                 let quantity = tmpfs_quantity(value)?;
@@ -2528,7 +2542,10 @@ mod boundary_tests {
         assert_eq!(capacity.node_limit, 800 * 1024);
         assert_eq!(capacity.used_bytes, 0);
         v.write(fd, b"x").unwrap();
-        assert_eq!(Vfs::filesystem_capacity(&mount.fs.borrow()).used_bytes, 1);
+        assert_eq!(
+            Vfs::filesystem_capacity(&mount.fs.borrow()).used_bytes,
+            4096
+        );
         assert_eq!(tmpfs_options(b"size=invalid%", 1 << 30), Err(Errno(22)));
         assert_eq!(tmpfs_options(b"size=200%", 1 << 30).unwrap().0, 2 << 30);
         assert_eq!(
@@ -2558,7 +2575,7 @@ mod boundary_tests {
         let mount = open.borrow().mount.clone().unwrap();
         let capacity = Vfs::filesystem_capacity(&mount.fs.borrow());
         assert_eq!(capacity.budget_bytes, 64 * 1024 * 1024);
-        assert_eq!(capacity.used_bytes, 1);
+        assert_eq!(capacity.used_bytes, 4096);
         let node = open.borrow().node.clone().unwrap();
         let future = storage::Timestamp {
             seconds: storage::Timestamp::now().seconds + 100000,

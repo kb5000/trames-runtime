@@ -8,11 +8,18 @@ use std::sync::OnceLock;
 pub(super) struct FileQuota {
     pub used: Arc<AtomicU64>,
     ceiling: AtomicU64,
+    pub tmpfs: bool,
 }
 impl FileQuota {
-    pub fn new(used: Arc<AtomicU64>, limit: u64, volume: Option<(VolumeSpace, u64)>) -> Arc<Self> {
+    pub fn new(
+        used: Arc<AtomicU64>,
+        limit: u64,
+        volume: Option<(VolumeSpace, u64)>,
+        tmpfs: bool,
+    ) -> Arc<Self> {
         let quota = Arc::new(Self {
             used,
+            tmpfs,
             ceiling: AtomicU64::new(0),
         });
         quota.configure(limit, volume);

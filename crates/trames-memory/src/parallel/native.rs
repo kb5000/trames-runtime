@@ -31,7 +31,7 @@ impl View {
             // the exact first fault address, in one mapping traversal.
             let frame = self.frame(base.max(address), access)?;
             if access == Access::Write {
-                self.ensure_resident(frame)?;
+                self.ensure_resident(frame, base.max(address))?;
             }
             defer |= frame.native_live_private.load(Ordering::Relaxed);
             match gate {
@@ -225,7 +225,7 @@ impl View {
                 (d, s, count)
             };
             let (df, di) = self.reached(d, count, Access::Write)?;
-            self.ensure_resident(df)?;
+            self.ensure_resident(df, d)?;
             let (sf, si) = self.reached(s, count, Access::Read)?;
             let dst = &df.bytes;
             let src = &sf.bytes;
@@ -263,7 +263,7 @@ impl View {
         operation: impl FnOnce(&mut [u8]) -> T,
     ) -> Result<T, MemoryError> {
         let (frame, offset) = self.reached(address, len, Access::Write)?;
-        self.ensure_resident(frame)?;
+        self.ensure_resident(frame, address)?;
         let mut guard = self.frame_guard(frame, offset, len);
         // Invalidate reservations/code before exposing a mutable slice, including
         // an internal panic. Dirty-fragment commit uses the existing CPU hooks.

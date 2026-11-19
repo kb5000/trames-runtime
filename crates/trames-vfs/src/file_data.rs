@@ -11,12 +11,14 @@ use storage::{DiskObject, Timestamp};
 
 pub(super) enum Bytes {
     Memory(Vec<u8>),
+    Tmpfs(Box<tmpfs::SparseFile>),
     Disk(DiskObject),
 }
 pub(super) struct PlainFile {
     #[cfg(all(feature = "hostfs", unix))]
     host: Option<Arc<hostfs::HostFile>>,
     bytes: RwLock<Bytes>,
+    pub tmpfs: bool,
     length: AtomicU64,
     charge: std::sync::OnceLock<Arc<file_accounting::FileCharge>>,
     logical_size: std::sync::OnceLock<trames_shared::LogicalSize>,
@@ -138,6 +140,9 @@ impl PlainFile {
         if self.host.is_some() {
             return Ok(());
         }
+        if self.tmpfs {
+            return Ok(());
+        }
         if let Some(charge) = self.charge.get() {
             charge.bind(quota);
             return Ok(());
@@ -187,6 +192,7 @@ impl PlainFile {
     pub fn new(bytes: Bytes) -> Arc<Self> {
         let length = match &bytes {
             Bytes::Memory(data) => data.len() as u64,
+            Bytes::Tmpfs(data) => data.length,
             Bytes::Disk(data) => data.length,
         };
         let backing = match &bytes {
@@ -196,6 +202,7 @@ impl PlainFile {
         Arc::new(Self {
             #[cfg(all(feature = "hostfs", unix))]
             host: backing.as_ref().and_then(|b| b.host.clone()),
+            tmpfs: matches!(bytes, Bytes::Tmpfs(_)),
             bytes: RwLock::new(bytes),
             length: AtomicU64::new(length),
             charge: std::sync::OnceLock::new(),
@@ -323,6 +330,11 @@ impl PlainFile {
                 None => std::fs::symlink_metadata(&backing.path),
             };
             return Ok(metadata.map_err(storage::host_errno)?.blocks());
+        }
+        if self.tmpfs {
+            if let Bytes::Tmpfs(file) = &*self.bytes.read().unwrap() {
+                return Ok(file.charge.size() / 512);
+            }
         }
         Ok(self.len().div_ceil(512))
     }
@@ -467,6 +479,41 @@ impl PlainFile {
         self.pending.fetch_add(1, Ordering::Acquire);
         ReadLease { data: self.clone() }
     }
+    pub fn copy_up_tmpfs(
+        &self,
+        quota: &Arc<file_accounting::FileQuota>,
+    ) -> Result<storage::FileData> {
+        let bytes = self.bytes.read().unwrap();
+        let Bytes::Tmpfs(file) = &*bytes else {
+            unreachable!()
+        };
+        Ok(storage::FileData::Plain(Self::new(Bytes::Tmpfs(Box::new(
+            file.copy_up(quota)?,
+        )))))
+    }
+    pub fn reserve_tmpfs(&self, offset: u64, end: u64) -> Result<()> {
+        let mut bytes = self.bytes.write().unwrap();
+        let Bytes::Tmpfs(file) = &mut *bytes else {
+            return Err(Errno(95));
+        };
+        file.reserve(offset, end)
+    }
+    pub fn fault_read(&self, offset: u64) -> Result<Vec<u8>> {
+        let page = trames_memory::PAGE_SIZE;
+        if !self.tmpfs {
+            return self.read_at(offset, page as usize, None);
+        }
+        let mut bytes = self.bytes.write().unwrap();
+        let Bytes::Tmpfs(file) = &mut *bytes else {
+            unreachable!()
+        };
+        if offset >= file.length {
+            return Ok(Vec::new());
+        }
+        let end = (offset + page).min(file.length);
+        file.reserve(offset, end)?;
+        Ok(file.read(offset, (end - offset) as usize))
+    }
     pub fn truncate(&self, length: u64) -> Result<()> {
         let mut data = self.bytes.write().unwrap();
         let growth = self
@@ -476,6 +523,7 @@ impl PlainFile {
             .transpose()?
             .flatten();
         match &mut *data {
+            Bytes::Tmpfs(file) => file.resize(length),
             Bytes::Memory(b) => {
                 let n = usize::try_from(length).map_err(|_| Errno(27))?;
                 if n > b.len() {
@@ -520,6 +568,7 @@ impl Bytes {
     fn len(&self) -> u64 {
         match self {
             Self::Memory(b) => b.len() as u64,
+            Self::Tmpfs(file) => file.length,
             Self::Disk(d) => {
                 #[cfg(all(feature = "hostfs", unix))]
                 if let Some(host) = &d.backing.host {
@@ -542,6 +591,7 @@ impl Bytes {
             return Ok(Vec::new());
         }
         match self {
+            Self::Tmpfs(file) => Ok(file.read(offset, count)),
             Self::Memory(b) => Ok(b[offset as usize..offset as usize + count].to_vec()),
             Self::Disk(d) => {
                 let mut bytes = vec![0; count];
@@ -573,6 +623,7 @@ impl Bytes {
         cache: Option<&mut DiskReadCache>,
     ) -> Result<usize> {
         match self {
+            Self::Tmpfs(file) => file.write(offset, bytes),
             Self::Memory(b) => {
                 let end = usize::try_from(offset)
                     .ok()

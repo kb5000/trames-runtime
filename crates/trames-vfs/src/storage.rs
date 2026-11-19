@@ -360,8 +360,15 @@ impl FileData {
             _ => None,
         }
     }
+    pub(super) fn tmpfs_file(&self) -> Option<Arc<file_data::PlainFile>> {
+        match self {
+            Self::Plain(file) if file.tmpfs => Some(file.clone()),
+            Self::Mapped(data) => data.tmpfs_file(),
+            _ => None,
+        }
+    }
     pub(super) fn growth_charge(&self, length: u64) -> u64 {
-        if self.shared_file().is_some() {
+        if self.shared_file().is_some() || self.tmpfs_file().is_some() {
             0
         } else {
             length.saturating_sub(self.len())
@@ -1415,6 +1422,15 @@ impl Vfs {
     pub(super) fn empty_data(&self) -> Result<FileData> {
         Self::filesystem_empty_data(&mut self.fs.borrow_mut())
     }
+    pub(super) fn ram_file(quota: &Arc<file_accounting::FileQuota>) -> Result<FileData> {
+        if quota.tmpfs {
+            Ok(FileData::Plain(file_data::PlainFile::new(
+                file_data::Bytes::Tmpfs(Box::new(tmpfs::SparseFile::new(quota)?)),
+            )))
+        } else {
+            Ok(FileData::memory(Vec::new()))
+        }
+    }
     pub(super) fn filesystem_empty_data(
         fs: &mut FsBorrow<'_, impl std::ops::DerefMut<Target = Filesystem>>,
     ) -> Result<FileData> {
@@ -1427,7 +1443,7 @@ impl Vfs {
             fs.next_inode = next;
             data
         } else {
-            FileData::memory(Vec::new())
+            Self::ram_file(fs.quota)?
         };
         data.bind_quota(fs.quota)?;
         Ok(data)

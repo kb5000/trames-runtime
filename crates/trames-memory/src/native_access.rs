@@ -325,13 +325,15 @@ impl Memory {
             .object
             .with_read(offset, len, &mut |bytes| {
                 result = Some(operation.take().expect("one callback")(bytes));
-            })?
+            })
+            .map_err(|e| e.at_access(address))?
         {
             return Ok((result.expect("resident callback"), true));
         }
         let operation = operation.expect("unavailable borrow has no effects");
         let mut snapshot = [0; PAGE_SIZE as usize];
-        page.read_bytes(offset, &mut snapshot[..len])?;
+        page.read_bytes(offset, &mut snapshot[..len])
+            .map_err(|e| e.at_access(address))?;
         Ok((operation(&snapshot[..len]), false))
     }
 
@@ -377,7 +379,9 @@ impl Memory {
         if let Some(b) = &mut page.backing {
             if !b.shared && !b.private_copy {
                 let mut bytes = [0; PAGE_SIZE as usize];
-                b.object.read(0, &mut bytes)?;
+                b.object
+                    .read(0, &mut bytes)
+                    .map_err(|e| e.at_access(address))?;
                 page.bytes = Arc::new(PageBytes::new(bytes));
                 b.private_copy = true;
             }
@@ -394,15 +398,18 @@ impl Memory {
                 .object
                 .with_write(offset, len, &mut |bytes| {
                     result = Some(operation.take().expect("one callback")(bytes));
-                })?
+                })
+                .map_err(|e| e.at_access(address))?
             {
                 return Ok((result.expect("resident callback"), true));
             }
             let operation = operation.expect("unavailable borrow has no effects");
             let mut bytes = [0; PAGE_SIZE as usize];
-            page.read_bytes(offset, &mut bytes[..len])?;
+            page.read_bytes(offset, &mut bytes[..len])
+                .map_err(|e| e.at_access(address))?;
             let result = operation(&mut bytes[..len]);
-            page.write_bytes(offset, &bytes[..len])?;
+            page.write_bytes(offset, &bytes[..len])
+                .map_err(|e| e.at_access(address))?;
             return Ok((result, false));
         }
         Ok((

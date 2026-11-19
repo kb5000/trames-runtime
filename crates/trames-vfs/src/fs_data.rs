@@ -20,11 +20,15 @@ pub(super) struct FsBorrow<'a, G> {
 }
 impl FsHandle {
     pub fn new(data: Filesystem) -> Self {
+        Self::with_page_accounting(data, false)
+    }
+    pub fn with_page_accounting(data: Filesystem, tmpfs: bool) -> Self {
         let used = data
             .disk
             .as_ref()
             .map_or_else(|| Arc::new(AtomicU64::new(0)), |d| d.used.clone());
-        let quota = file_accounting::FileQuota::new(used, data.limits.file_bytes, data.volume);
+        let quota =
+            file_accounting::FileQuota::new(used, data.limits.file_bytes, data.volume, tmpfs);
         for node in data.inodes.iter().filter_map(std::sync::Weak::upgrade) {
             node.bind_quota(&quota)
                 .expect("validated initial filesystem");
@@ -99,6 +103,16 @@ impl<G: DerefMut<Target = Filesystem>> DerefMut for FsBorrow<'_, G> {
 }
 impl<G: DerefMut<Target = Filesystem>> FsBorrow<'_, G> {
     pub fn track_inode(&mut self, node: &NodeRef) -> Result<()> {
+        if self.quota.tmpfs
+            && self.overlay.is_none()
+            && matches!(&node.borrow().content, Content::Symlink(target) if target.len() >= 128)
+            && node.symlink_page.get().is_none()
+        {
+            // Stored with the inode, including hard links and open-unlinked O_PATH handles.
+            // Namespace admission serializes publication on this backing filesystem.
+            let charge = file_accounting::FileCharge::admit(self.quota, trames_memory::PAGE_SIZE)?;
+            let _ = node.symlink_page.set(charge);
+        }
         node.bind_quota(self.quota)?;
         self.inodes.push(Arc::downgrade(node));
         Ok(())

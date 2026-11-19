@@ -126,6 +126,16 @@ pub enum MemoryError {
     Permission { address: u64, access: Access },
 }
 
+impl MemoryError {
+    // A page provider knows its file offset. The address space knows which
+    // virtual alias and byte actually faulted.
+    fn at_access(self, address: u64) -> Self {
+        match self {
+            Self::Bus(_) => Self::Bus(address),
+            error => error,
+        }
+    }
+}
 impl fmt::Display for MemoryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "guest memory: {self:?}")
@@ -1180,7 +1190,7 @@ impl Memory {
                     .as_ref()
                     .and_then(|backing| backing.object.page_source())
                 {
-                    source.load()?;
+                    source.load().map_err(|e| e.at_access(fault_address))?;
                 }
             }
             allowed &= eligible(page);
@@ -1194,7 +1204,8 @@ impl Memory {
             let offset = (address - base) as usize;
             let len = out.len().min(PAGE_SIZE as usize - offset);
             self.page_for_access(address, len, Access::Read)?
-                .read_bytes(offset, &mut out[..len])?;
+                .read_bytes(offset, &mut out[..len])
+                .map_err(|e| e.at_access(address))?;
             address += len as u64;
             out = &mut out[len..];
         }
@@ -1228,7 +1239,8 @@ impl Memory {
         let offset = (address & (PAGE_SIZE - 1)) as usize;
         if out.len() <= PAGE_SIZE as usize - offset {
             let page = self.page_for_access(address, out.len(), Access::Read)?;
-            page.read_bytes(offset, out)?;
+            page.read_bytes(offset, out)
+                .map_err(|e| e.at_access(address))?;
             return Ok(());
         }
         self.check(address, out.len(), Access::Read)?;
@@ -1257,7 +1269,8 @@ impl Memory {
             if entry.tag & Translation::BACKED != 0 {
                 page.check_backing(address)?;
             }
-            page.write_bytes(offset, input)?;
+            page.write_bytes(offset, input)
+                .map_err(|e| e.at_access(address))?;
             let executable = entry.tag & Translation::access_bit(Access::Execute) != 0;
             if executable {
                 page.instruction_revision = next_code_revision;
@@ -1285,7 +1298,8 @@ impl Memory {
             if page.permissions.execute {
                 page.instruction_revision = self.code_revision.wrapping_add(1);
             }
-            page.write_bytes(offset, &input[..len])?;
+            page.write_bytes(offset, &input[..len])
+                .map_err(|e| e.at_access(address))?;
             self.note_parallel_write(frame);
             address += len as u64;
             input = &input[len..];
@@ -1307,7 +1321,8 @@ impl Memory {
         let page = self.page_for_access(address, 4, Access::Execute)?;
         let offset = (address & (PAGE_SIZE - 1)) as usize;
         let mut bytes = [0; 4];
-        page.read_bytes(offset, &mut bytes)?;
+        page.read_bytes(offset, &mut bytes)
+            .map_err(|e| e.at_access(address))?;
         Ok(u32::from_le_bytes(bytes))
     }
 
@@ -1341,7 +1356,8 @@ impl Memory {
             }
             let page = self.page_for_access(address, N, Access::Read)?;
             let mut bytes = [0; N];
-            page.read_bytes(offset, &mut bytes)?;
+            page.read_bytes(offset, &mut bytes)
+                .map_err(|e| e.at_access(address))?;
             return Ok(bytes);
         }
         let mut bytes = [0; N];
@@ -1403,7 +1419,8 @@ impl Memory {
         if entry.tag & Translation::BACKED != 0 {
             page.check_backing(address)?;
         }
-        page.write_bytes(offset, &bytes)?;
+        page.write_bytes(offset, &bytes)
+            .map_err(|e| e.at_access(address))?;
         let executable = entry.tag & Translation::access_bit(Access::Execute) != 0;
         if executable {
             page.instruction_revision = next_code_revision;

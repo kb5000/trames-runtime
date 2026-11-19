@@ -247,31 +247,42 @@ impl Overlay {
                 return Err(Errno(5));
             };
             let length = if truncate { 0 } else { data.len() };
-            if length > available {
+            let sparse = fs.quota.tmpfs.then(|| data.tmpfs_file()).flatten();
+            if sparse.is_none() && length > available {
                 return Err(Errno(28));
             }
-            let mut copy = if let Some(disk) = &fs.disk {
-                disk.create(n.inode)?
+            let copy = if let Some(file) = sparse.filter(|_| !truncate) {
+                let quota = fs.quota.clone();
+                drop(fs);
+                // Include bytes held by live shared mappings before taking the
+                // source byte lock for an independent copy of its sparse pages.
+                data.sync(false)?;
+                file.copy_up_tmpfs(&quota)?
             } else {
-                storage::FileData::memory(Vec::new())
-            };
-            drop(fs);
-            let mut offset = 0;
-            while offset < length {
-                let bytes = data.read_at(offset, (length - offset).min(65536) as usize)?;
-                if bytes.is_empty() {
-                    return Err(Errno(5));
-                }
-                let mut written = 0;
-                while written < bytes.len() {
-                    let count = copy.write_at(offset + written as u64, &bytes[written..])?;
-                    if count == 0 {
+                let mut copy = if let Some(disk) = &fs.disk {
+                    disk.create(n.inode)?
+                } else {
+                    Vfs::ram_file(fs.quota)?
+                };
+                drop(fs);
+                let mut offset = 0;
+                while offset < length {
+                    let bytes = data.read_at(offset, (length - offset).min(65536) as usize)?;
+                    if bytes.is_empty() {
                         return Err(Errno(5));
                     }
-                    written += count;
+                    let mut written = 0;
+                    while written < bytes.len() {
+                        let count = copy.write_at(offset + written as u64, &bytes[written..])?;
+                        if count == 0 {
+                            return Err(Errno(5));
+                        }
+                        written += count;
+                    }
+                    offset += bytes.len() as u64;
                 }
-                offset += bytes.len() as u64;
-            }
+                copy
+            };
             copy.sync(false)?;
             drop(source);
             n.content = Content::File(copy);
@@ -1180,6 +1191,37 @@ mod tests {
         }
         result
     }
+    #[test]
+    fn tmpfs_copy_up_keeps_a_large_lower_hole_with_a_two_page_upper() {
+        let mut v = Vfs::default();
+        dirs(&mut v);
+        v.mount(None, b"/lower", Some(b"tmpfs"), 0, Some(b"nr_blocks=1"))
+            .unwrap();
+        v.mount(None, b"/upper", Some(b"tmpfs"), 0, Some(b"nr_blocks=2"))
+            .unwrap();
+        v.mkdir_at(AT_FDCWD, b"/upper/data", 0o700).unwrap();
+        v.mkdir_at(AT_FDCWD, b"/upper/work", 0o700).unwrap();
+        let file = v.open_at(AT_FDCWD, b"/lower/file", 0x42, 0o644).unwrap();
+        let far = 1 << 40;
+        v.pwrite(file, b"end", far).unwrap();
+        v.close(file).unwrap();
+        v.mount(
+            None,
+            b"/merged",
+            Some(b"overlay"),
+            0,
+            Some(b"lowerdir=/lower,upperdir=/upper/data,workdir=/upper/work"),
+        )
+        .unwrap();
+        let merged = v.open_at(AT_FDCWD, b"/merged/file", 2, 0).unwrap();
+        assert_eq!(v.pread(merged, 3, far).unwrap(), b"end");
+        assert_eq!(v.pwrite(merged, b"start", 0), Ok(5));
+        assert_eq!(v.pread(merged, 5, 4096).unwrap(), [0; 5]);
+        assert_eq!(v.pwrite(merged, b"x", 4096), Err(Errno(28)));
+        let lower = v.open_at(AT_FDCWD, b"/lower/file", 0, 0).unwrap();
+        assert_eq!(v.pread(lower, 5, 0).unwrap(), [0; 5]);
+    }
+
     #[test]
     fn merged_layers_copy_up_and_old_descriptions_keep_lower() {
         let mut v = Vfs::default();
