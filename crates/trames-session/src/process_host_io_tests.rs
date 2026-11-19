@@ -158,10 +158,20 @@ fn native_backend_failure_drains_source_read_poll_and_uring_without_owner_replay
                 k.workers.ensure(slot).unwrap();
                 k.workers.launch(slot, epoch.clone()).unwrap();
             }
-            let mut stopped = 0;
-            while stopped < slots {
+            // A fast failure may close admission before later planned slots
+            // start. Every actually registered executor must return once;
+            // executors rejected after closure owe no completion event.
+            let active = epoch.active_slots();
+            assert_ne!(active, 0);
+            let mut stopped = 0u64;
+            while stopped != active {
                 match k.workers.event_timeout(Duration::from_secs(5)).unwrap() {
-                    Some(crate::workers::Event::EpochStopped(_)) => stopped += 1,
+                    Some(crate::workers::Event::EpochStopped(slot)) => {
+                        let bit = 1 << slot;
+                        assert_ne!(active & bit, 0, "unregistered CPU returned");
+                        assert_eq!(stopped & bit, 0, "CPU returned twice");
+                        stopped |= bit;
+                    }
                     _ => panic!("host error must stop actors without owner work: mode={mode}"),
                 }
             }

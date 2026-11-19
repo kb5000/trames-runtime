@@ -103,6 +103,11 @@ logs are under `target/gvisor-userns-20261119`, with Linux workflow evidence in
 
 ## Interpreter fixture limitation
 
+Follow-up: the [completion stability checkpoint](executor-completion-stability-20261119.md)
+repairs the publication/completion failures and restores six complete interpreter
+runs with no filtered tests. The observations below remain the historical
+user-namespace checkpoint evidence.
+
 The final uninstrumented complete interpreter suite timed out in three bounded
 runs. The unchanged 4e14d22 baseline independently reproduces this problem:
 2/8 isolated raw-IP runs time out, and 1/2 full runs times out. Captured stacks

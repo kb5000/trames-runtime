@@ -1046,6 +1046,15 @@ impl<C: Cpu> Epoch<C> {
         self.activation_failed.load(Ordering::Relaxed)
     }
     pub fn activate(&self, slot: usize) -> std::io::Result<()> {
+        let mut q = self.queues.lock().unwrap();
+        self.activate_locked(&mut q, slot)
+    }
+    fn activate_locked(&self, q: &mut Queues<C>, slot: usize) -> std::io::Result<()> {
+        // Registration and completion share the queue boundary. Once joining
+        // observes completion, no late starter may extend the active-slot set.
+        if self.control.stopped() {
+            return Ok(());
+        }
         let bit = 1u64 << slot;
         if self.active_slots.fetch_or(bit, Ordering::Relaxed) & bit != 0 {
             return Ok(());
@@ -1056,11 +1065,12 @@ impl<C: Cpu> Epoch<C> {
             self.active_slots.fetch_and(!bit, Ordering::Relaxed);
             self.activation_failed.store(true, Ordering::Relaxed);
             self.control.close(crate::execution_control::End::Failed);
+            self.notify(q);
             return Err(error);
         }
         Ok(())
     }
-    fn activate_for(&self, mask: u64) {
+    fn activate_for(&self, q: &mut Queues<C>, mask: u64) {
         if self.control.stopped() || self.host_pause.load(Ordering::Relaxed) {
             return;
         }
@@ -1069,7 +1079,7 @@ impl<C: Cpu> Epoch<C> {
         };
         let mask = mask & ((1u64 << starter.capacity()) - 1);
         if mask != 0 && mask & self.active_slots() == 0 {
-            let _ = self.activate(mask.trailing_zeros() as usize);
+            let _ = self.activate_locked(q, mask.trailing_zeros() as usize);
         }
     }
     pub fn bind_timers(self: &Arc<Self>, timers: Arc<trames_kernel::timers::Timers>) {
@@ -1183,7 +1193,7 @@ impl<C: Cpu> Epoch<C> {
             q.initial_slots.insert(job.work.pid, slot);
             self.slot_changed[slot].notify_one();
         }
-        self.activate_for(job.affinity());
+        self.activate_for(q, job.affinity());
         q.ready.push_back(job);
         self.refresh_ready(q);
     }
@@ -1268,8 +1278,7 @@ impl<C: Cpu> Epoch<C> {
             }
             snapshot.io_wake = Some(signal);
             if let Err(error) = snapshot.direct.bind_host_protocol(&self.io_target) {
-                let _ = self.host_error.set(Arc::new(error));
-                self.control.close(crate::execution_control::End::Failed);
+                self.fail_host_io(error);
             }
             job.uring = snapshot.direct.uring_background(pid, &self.io_target);
         }
@@ -1308,10 +1317,14 @@ impl<C: Cpu> Epoch<C> {
             } else if job.uring.is_none() && !job.ring_ready() {
                 self.publish_deadline(waiting.deadline());
                 q.parked.insert(pid, job);
+                // A new original waiter may introduce the first deadline or
+                // native producer while every existing executor is asleep.
+                self.notify(&mut q);
                 return;
             }
         }
         self.ready(&mut q, job);
+        self.notify(&mut q);
     }
     pub(crate) fn reserve_host(&self, id: u32) -> HostAdmission<C> {
         assert!(self.queues.lock().unwrap().host_admissions.insert(id));
@@ -1799,6 +1812,11 @@ impl<C: Cpu> Epoch<C> {
                 drop(q);
                 timers.tick();
                 q = self.queues.lock().unwrap();
+                // Completion may have acquired/notified this queue while the
+                // callback ran. Do not dispatch or register a new sleep after it.
+                if self.control.stopped() {
+                    return None;
+                }
             }
             if self.protocols.due() {
                 drop(q);
@@ -1806,11 +1824,15 @@ impl<C: Cpu> Epoch<C> {
                     trames_vfs::IoWake::host_events(self)?
                         .ok_or_else(|| std::io::Error::other("missing host events"))
                 });
+                q = self.queues.lock().unwrap();
                 if let Err(error) = result {
                     let _ = self.host_error.set(Arc::new(error));
                     self.control.close(crate::execution_control::End::Failed);
+                    self.notify(&mut q);
                 }
-                q = self.queues.lock().unwrap();
+                if self.control.stopped() {
+                    return None;
+                }
             }
             let now = Instant::now();
             let expired = q.parked.expired(now);
@@ -2494,7 +2516,7 @@ impl<C: Cpu> trames_vfs::IoWake for Epoch<C> {
                 .find(|j| j.work.pid == signal.pid)
                 .unwrap()
                 .affinity();
-            self.activate_for(mask);
+            self.activate_for(&mut q, mask);
             q.initial_slots.remove(&signal.pid);
             self.refresh_ready(&q);
             self.notify(&mut q);
@@ -2773,7 +2795,7 @@ mod tests {
         assert!(Instant::now() >= deadline && began.elapsed() < Duration::from_secs(2));
         assert!(!resumed.gpu_pending.as_ref().unwrap().waiting());
     }
-    fn job(pid: u32, epoch: &Arc<Epoch>) -> Box<Job> {
+    pub(super) fn job(pid: u32, epoch: &Arc<Epoch>) -> Box<Job> {
         let mut memory = Memory::default();
         memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         Job::new(
@@ -3018,7 +3040,7 @@ mod tests {
         wait.fire();
         assert!(epoch.queues.lock().unwrap().parked.is_empty());
     }
-    fn tcp() -> (trames_vfs::Vfs, u32, std::net::TcpStream) {
+    pub(super) fn tcp() -> (trames_vfs::Vfs, u32, std::net::TcpStream) {
         use std::net::{Ipv4Addr, TcpListener};
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let mut v = trames_vfs::Vfs::default();
@@ -3083,7 +3105,12 @@ mod tests {
         assert_eq!(done[0].serviced_syscalls, 0);
         drop(native);
     }
-    fn tcp_wait(epoch: &Arc<Epoch>, direct: &trames_linux::DirectSyscalls, fd: u32, pid: u32) {
+    pub(super) fn tcp_wait(
+        epoch: &Arc<Epoch>,
+        direct: &trames_linux::DirectSyscalls,
+        fd: u32,
+        pid: u32,
+    ) {
         epoch.add(job(pid, epoch));
         let mut running = epoch.take(0).unwrap();
         let Some(trames_linux::IoAttempt::Blocked(pending)) = direct.start(
@@ -3099,7 +3126,7 @@ mod tests {
         assert!(pending.external_wait());
         epoch.park_io(running, pending);
     }
-    fn await_host_wait(epoch: &Arc<Epoch>) {
+    pub(super) fn await_host_wait(epoch: &Arc<Epoch>) {
         let until = Instant::now() + Duration::from_secs(2);
         let mut q = epoch.queues.lock().unwrap();
         while !q.host_waiting {
@@ -3495,3 +3522,7 @@ mod tests {
         assert_eq!(epoch.drain().len(), 1);
     }
 }
+
+#[cfg(all(test, trames_interpreter_conformance))]
+#[path = "run_queue_completion_tests.rs"]
+mod completion_tests;

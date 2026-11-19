@@ -32,6 +32,10 @@ closes all 72 remaining Unix failures with scoped UID/GID maps and capability
 ownership, reaching 5826/5826 native-passing Unix cases. Expanded namespace
 coverage and remaining network gaps are reported separately.
 
+The [execution stability checkpoint](../../docs/validation/executor-completion-stability-20261119.md)
+repairs completion and wait-publication races, restores repeated full interpreter
+runs without filtered tests, and preserves the complete 6194-case result.
+
 ## Build on native ARM64 Linux
 
 Install a C++17 compiler, CMake, Ninja, Python 3 and ordinary static glibc/libstdc++

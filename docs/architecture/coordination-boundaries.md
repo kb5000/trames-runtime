@@ -6,6 +6,25 @@ runtime baseline is `74f5c7f3f9961c879b51142bec84a065ab810dad`. Mac HVF and the 
 interpreter share this userspace Linux kernel. Historical stage paragraphs retain
 their prior counts; the authoritative current category inventory is below.
 
+## Execution wait/completion publication — 2026-11-19
+
+The [completion stability checkpoint](../validation/executor-completion-stability-20261119.md)
+repairs seven fixed publication interleavings without adding an owner dispatch
+category. Keep these boundaries when extending the existing executors:
+
+- Publish new runnable work, deadlines and failure with an actual wake of the
+  original CPU/native interests. An empty ready queue does not remove producers.
+- If an executor releases the queue mutex for protocol or timer work, recheck
+  admission when it reacquires the mutex before selecting work or sleeping.
+  The completion notification may already have happened while it was outside.
+- Register cold CPU slots under the same queue boundary as completion. Joining
+  waits for the actual registered actors; closed admission cannot extend that set.
+- A backend failure closes admission and wakes peers. Do not turn it into a guest
+  success, host-side retry, polling loop or new resource-service thread.
+
+These are original resource/queue synchronization rules, not permission to
+restore production handoff. Production coordinator categories remain zero.
+
 ## Current status at a glance — 2026-11-11
 
 Stage 107 removes the remaining host scheduling/compatibility entry class.
