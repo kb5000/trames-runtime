@@ -227,7 +227,7 @@ pub(crate) fn retained(
         6 => {
             if s.length() & !9 != 0
                 || s.length() & 8 != 0 && !s.multishot()
-                || s.op_flags() & !0x201f != 0
+                || s.op_flags() & !trames_vfs::poll_mask::SUPPORTED != 0
             {
                 return Err(Errno(22));
             }
@@ -242,9 +242,12 @@ pub(crate) fn retained(
             };
             let fresh = !s.multishot()
                 || s.length() & 8 != 0
-                || events & !request.poll_ready != 0
-                || events & 3 != 0 && epoch[0] != request.poll_epoch[0]
-                || events & 4 != 0 && epoch[1] != request.poll_epoch[1];
+                || trames_vfs::poll_mask::new_edges(
+                    events,
+                    request.poll_ready,
+                    epoch,
+                    request.poll_epoch,
+                ) != 0;
             if events == 0 || !fresh {
                 if events == 0 {
                     request.poll_ready = 0;

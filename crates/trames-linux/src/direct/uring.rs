@@ -128,16 +128,19 @@ impl RequestOps for Request {
                 Object::Byte(f) => Some(
                     if s.length() & !9 != 0
                         || s.length() & 8 != 0 && !s.multishot()
-                        || s.op_flags() & !0x201f != 0
+                        || s.op_flags() & !trames_vfs::poll_mask::SUPPORTED != 0
                     {
                         Err(Errno(22))
                     } else {
                         let (events, epoch) = f.poll_state(s.op_flags() as u16)?;
                         let fresh = !s.multishot()
                             || s.length() & 8 != 0
-                            || events & !self.poll_ready != 0
-                            || events & 3 != 0 && epoch[0] != self.poll_epoch[0]
-                            || events & 4 != 0 && epoch[1] != self.poll_epoch[1];
+                            || trames_vfs::poll_mask::new_edges(
+                                events,
+                                self.poll_ready,
+                                epoch,
+                                self.poll_epoch,
+                            ) != 0;
                         if events == 0 || !fresh {
                             if events == 0 {
                                 self.poll_ready = 0;

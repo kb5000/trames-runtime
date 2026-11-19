@@ -129,34 +129,36 @@ fn multishot_recv_keeps_link_until_terminal_and_cancels_without_stale_flags() {
 
 #[test]
 fn multishot_poll_preserves_epochs_and_update_remove_rules() {
-    let (mut l, mut m, fd, r) = setup(8);
-    let [reader, writer] = l.vfs.pipe(0).unwrap();
-    let mut epoch = UringEpoch::default();
-    let s = epoch.capture(&l.vfs, m.instruction_identity().0, 7);
-    let mut poll = data(6, reader, 0, 1, 1, 0);
-    poll[28..32].copy_from_slice(&1u32.to_le_bytes());
-    add(&mut m, &r, poll);
-    complete(start(&s, fd, 1, 0, &mut m), 1);
-    for byte in *b"xy" {
-        l.vfs.write(writer, &[byte]).unwrap();
-        complete(start(&s, fd, 0, 1, &mut m), 0);
-        assert_eq!(flags(&mut m, &r), (1, 1, 2));
-        complete(start(&s, fd, 0, 0, &mut m), 0);
-        assert_eq!(s.rings[&fd].load_queue(64), s.rings[&fd].load_queue(68));
+    for (initial, updated) in [(1u32, 0x40u32), (0x40, 1)] {
+        let (mut l, mut m, fd, r) = setup(8);
+        let [reader, writer] = l.vfs.pipe(0).unwrap();
+        let mut epoch = UringEpoch::default();
+        let s = epoch.capture(&l.vfs, m.instruction_identity().0, 7);
+        let mut poll = data(6, reader, 0, 1, 1, 0);
+        poll[28..32].copy_from_slice(&initial.to_le_bytes());
+        add(&mut m, &r, poll);
+        complete(start(&s, fd, 1, 0, &mut m), 1);
+        for byte in *b"xy" {
+            l.vfs.write(writer, &[byte]).unwrap();
+            complete(start(&s, fd, 0, 1, &mut m), 0);
+            assert_eq!(flags(&mut m, &r), (1, initial as i32, 2));
+            complete(start(&s, fd, 0, 0, &mut m), 0);
+            assert_eq!(s.rings[&fd].load_queue(64), s.rings[&fd].load_queue(68));
+        }
+        let mut update = data(7, u32::MAX, 1, 6, 3, 0);
+        update[8..16].copy_from_slice(&2u64.to_le_bytes());
+        update[28..32].copy_from_slice(&updated.to_le_bytes());
+        add(&mut m, &r, update);
+        complete(start(&s, fd, 1, 2, &mut m), 1);
+        assert_eq!(flags(&mut m, &r), (3, 0, 0));
+        assert_eq!(flags(&mut m, &r), (2, updated as i32, 2));
+        add(&mut m, &r, data(7, u32::MAX, 2, 0, 4, 0));
+        complete(start(&s, fd, 1, 2, &mut m), 1);
+        assert_eq!(flags(&mut m, &r), (2, -125, 0));
+        assert_eq!(flags(&mut m, &r), (4, 0, 0));
+        drop(s);
+        assert!(epoch.finish().is_empty());
     }
-    let mut update = data(7, u32::MAX, 1, 6, 3, 0);
-    update[8..16].copy_from_slice(&2u64.to_le_bytes());
-    update[28..32].copy_from_slice(&1u32.to_le_bytes());
-    add(&mut m, &r, update);
-    complete(start(&s, fd, 1, 2, &mut m), 1);
-    assert_eq!(flags(&mut m, &r), (3, 0, 0));
-    assert_eq!(flags(&mut m, &r), (2, 1, 2));
-    add(&mut m, &r, data(7, u32::MAX, 2, 0, 4, 0));
-    complete(start(&s, fd, 1, 2, &mut m), 1);
-    assert_eq!(flags(&mut m, &r), (2, -125, 0));
-    assert_eq!(flags(&mut m, &r), (4, 0, 0));
-    drop(s);
-    assert!(epoch.finish().is_empty());
 }
 
 #[test]

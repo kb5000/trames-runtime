@@ -135,6 +135,32 @@ impl PipeData {
     pub(super) fn readable(&self) -> bool {
         !self.read_reserved && !self.bytes.is_empty()
     }
+    pub(super) fn poll(
+        &self,
+        read: bool,
+        write: bool,
+        initial_write_epoch: u64,
+        events: u16,
+    ) -> u16 {
+        let mut ready = 0;
+        if read {
+            if self.readable() {
+                ready |= events & poll_mask::READ_NORMAL;
+            }
+            if self.writers == 0 && self.write_epoch != initial_write_epoch {
+                ready |= 16;
+            }
+        }
+        if write {
+            if self.write_room() >= 4096 {
+                ready |= events & poll_mask::WRITE_NORMAL;
+            }
+            if self.readers == 0 {
+                ready |= 8;
+            }
+        }
+        ready
+    }
     // The original pipe algorithms, shared by VFS and worker-local calls.
     pub(super) fn read(&mut self, count: usize) -> Result<Vec<u8>> {
         if count == 0 {
@@ -850,10 +876,9 @@ impl DirectFd {
                                 let state = state.lock().unwrap();
                                 let (ready, epoch) = fd.peek_poll(state.events as u16);
                                 let mut previous = baseline.lock().unwrap();
-                                let changed = ready & !previous.0 != 0
-                                    || ready & 3 != 0 && epoch[0] != previous.1[0]
-                                    || ready & 4 != 0 && epoch[1] != previous.1[1]
-                                    || ready & (8 | 16) != 0;
+                                let changed =
+                                    poll_mask::new_edges(ready, previous.0, epoch, previous.1) != 0
+                                        || ready & (8 | 16) != 0;
                                 *previous = (ready, epoch);
                                 state.armed && ready != 0 && changed && state.ready(ready, epoch)
                             });
@@ -1291,9 +1316,10 @@ impl DirectFd {
             ByteResource::Tun(file) => file.poll(events),
             ByteResource::Mounts(watch) => watch.peek(events),
             ByteResource::Bpf => (0, [0; 2]),
-            ByteResource::Regular | ByteResource::SimpleDevice(_) | ByteResource::Device(_) => {
-                (events & 5, [0; 2])
-            }
+            ByteResource::Regular | ByteResource::SimpleDevice(_) | ByteResource::Device(_) => (
+                events & (poll_mask::READ_NORMAL | poll_mask::WRITE_NORMAL),
+                [0; 2],
+            ),
             ByteResource::Cgroup(file, _) => {
                 if self.flags & O_PATH != 0 {
                     (32, [0; 2])
@@ -1323,25 +1349,14 @@ impl DirectFd {
             ByteResource::Pipe {
                 data,
                 read,
+                write,
                 initial_write_epoch,
-                ..
             } => {
                 let data = data.lock().unwrap();
-                let ready = if *read {
-                    (if data.readable() { events & 1 } else { 0 })
-                        | (if data.writers == 0 && data.write_epoch != *initial_write_epoch {
-                            16
-                        } else {
-                            0
-                        })
-                } else if data.readers == 0 {
-                    8
-                } else if data.write_room() >= 4096 {
-                    events & 4
-                } else {
-                    0
-                };
-                (ready, data.io_epoch)
+                (
+                    data.poll(*read, *write, *initial_write_epoch, events),
+                    data.io_epoch,
+                )
             }
             ByteResource::Epoll(epoll) => {
                 let Some(_traversal) = epoll::Traversal::enter(&epoll.live) else {
@@ -1734,6 +1749,21 @@ pub struct DirectFds(
     pub(super) Option<cgroup::CgroupAccess>,
 );
 impl DirectFds {
+    pub fn descriptor_limit(&self) -> u32 {
+        self.1
+            .as_ref()
+            .map_or(DEFAULT_MAX_FDS, SharedFiles::descriptor_limit)
+    }
+    pub fn select_count(&self, requested: u32) -> u32 {
+        if requested <= 64 {
+            return requested;
+        }
+        let capacity = self.1.as_ref().map_or_else(
+            || self.0.len().max(64).next_power_of_two() as u32,
+            SharedFiles::select_capacity,
+        );
+        requested.min(capacity)
+    }
     /// Bind an accepted original OFD, including fixed io_uring files. Never
     /// look it up again by a descriptor number which may have been reused.
     pub fn byte_file(&self, file: SharedFd) -> Option<DirectFd> {

@@ -484,7 +484,10 @@ mod tests {
         assert_eq!(v.write(writer, b"still open"), Ok(10));
         std::thread::spawn(move || drop(lease)).join().unwrap();
         assert_eq!(v.write(writer, b"closed"), Err(Errno(32)));
-        assert_eq!(bytes.get(writer).unwrap().poll_ready(4), Some(8));
+        // The last reader is gone, but the pipe still has room. Linux reports
+        // the error unconditionally and writability when requested.
+        assert_eq!(bytes.get(writer).unwrap().poll_ready(0), Some(8));
+        assert_eq!(bytes.get(writer).unwrap().poll_ready(4), Some(8 | 4));
         v.close(writer).unwrap();
         let p = data.lock().unwrap();
         assert_eq!((p.readers, p.writers), (0, 0));

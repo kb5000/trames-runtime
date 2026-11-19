@@ -14,6 +14,7 @@ mod cgroup;
 pub use cgroup::{CgroupBirth, CgroupTask};
 mod fs_context;
 mod path_queries;
+pub mod poll_mask;
 pub mod posix_mq;
 mod sysv_ipc;
 pub mod sysv_message;
@@ -1359,27 +1360,15 @@ impl Vfs {
         if let Some(socket) = &o.socket {
             return socket.poll(events).unwrap_or(8);
         }
-        let mut ready = events & 5;
         if let Some(end) = &o.pipe {
-            let p = end.data.lock().unwrap();
-            ready = 0;
-            if end.read {
-                if p.readable() {
-                    ready |= events & 1;
-                }
-                if p.writers == 0 && p.write_epoch != end.initial_write_epoch {
-                    ready |= 16;
-                }
-            }
-            if end.write {
-                if p.readers == 0 {
-                    ready |= 8;
-                } else if p.write_room() >= 4096 {
-                    ready |= events & 4;
-                }
-            }
+            return end.data.lock().unwrap().poll(
+                end.read,
+                end.write,
+                end.initial_write_epoch,
+                events,
+            );
         }
-        ready
+        events & (poll_mask::READ_NORMAL | poll_mask::WRITE_NORMAL)
     }
     pub fn enable_terminal(&mut self) -> Result<()> {
         let pair = if let Some(pair) = self.embedding_terminal.get() {

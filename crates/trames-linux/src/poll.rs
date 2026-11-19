@@ -90,14 +90,26 @@ impl Poll {
         memory: &impl CpuMemory,
         a: [u64; 6],
     ) -> Option<Result<Self, Errno>> {
-        if a[1] > 256 {
+        let count = a[1] as u32;
+        if count > fds.descriptor_limit() {
             return Some(Err(Errno(22)));
         }
-        if let Err(e) = Linux::check(memory, a[0], a[1] as usize * 8, Access::Write) {
+        if count == 0 {
+            return Some(Ok(Self {
+                entries: Vec::new(),
+            }));
+        }
+        if let Err(e) = Linux::check(memory, a[0], count as usize * 8, Access::Write) {
             return Some(Err(e));
         }
-        let mut entries = Vec::with_capacity(a[1] as usize);
-        for i in 0..a[1] {
+        let mut entries = Vec::new();
+        if entries
+            .try_reserve_exact((count as usize).min(4096))
+            .is_err()
+        {
+            return Some(Err(Errno(12)));
+        }
+        for i in 0..u64::from(count) {
             let address = a[0] + i * 8;
             let bytes = match memory.read_array::<8>(address) {
                 Ok(b) => b,
@@ -114,6 +126,9 @@ impl Poll {
                     None => Source::owner(owner?, fd as u32),
                 }
             };
+            if entries.len() == entries.capacity() && entries.try_reserve(1).is_err() {
+                return Some(Err(Errno(12)));
+            }
             entries.push(Entry {
                 address: address + 6,
                 fd: fd as u32,
@@ -358,13 +373,19 @@ impl RetainedSelect {
         memory: &impl CpuMemory,
         args: [u64; 6],
     ) -> Option<Result<Self, Errno>> {
-        if args[0] > 256 {
+        let count = args[0] as i32;
+        if count < 0 {
             return Some(Err(Errno(22)));
         }
-        let size = args[0].div_ceil(64) as usize * 8;
+        let count = fds.select_count(count as u32);
+        let size = count.div_ceil(64) as usize * 8;
         let mut sets = Vec::new();
-        for (index, events) in [(1, 1), (2, 4), (3, 2)] {
-            if args[index] == 0 {
+        for (index, events) in [
+            (1, trames_vfs::poll_mask::READ_NORMAL | 0x80 | 8 | 16),
+            (2, trames_vfs::poll_mask::WRITE_NORMAL | 0x200 | 8),
+            (3, 2),
+        ] {
+            if args[index] == 0 || count == 0 {
                 continue;
             }
             if let Err(e) = Linux::check(memory, args[index], size, Access::Write) {
@@ -375,9 +396,7 @@ impl RetainedSelect {
                 return Some(Err(Errno(14)));
             }
             let mut entries = Vec::new();
-            for fd in
-                (0..args[0] as u32).filter(|fd| bits[*fd as usize / 8] & (1 << (*fd % 8)) != 0)
-            {
+            for fd in (0..count).filter(|fd| bits[*fd as usize / 8] & (1 << (*fd % 8)) != 0) {
                 let source = match fds.polling(fd) {
                     Some(Ok(resource)) => Source::Direct(resource),
                     Some(Err(_)) => Source::Invalid,
@@ -516,7 +535,7 @@ impl RetainedSelect {
                 if ready & 32 != 0 {
                     return Err(Errno(9));
                 }
-                if ready & (set.events | 8 | 16) != 0 && set.events != 2 {
+                if ready & set.events != 0 {
                     result[entry.fd as usize / 8] |= 1 << (entry.fd % 8);
                     count += 1;
                 }

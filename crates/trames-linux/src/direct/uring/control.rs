@@ -124,7 +124,7 @@ impl ControlStateOps for State {
         if s.opcode() == 7 && s.length() != 0 {
             if s.length() & !6 != 0
                 || s.length() & 2 == 0 && flags != 0
-                || s.length() & 2 != 0 && flags & !0x201f != 0
+                || s.length() & 2 != 0 && flags & !trames_vfs::poll_mask::SUPPORTED != 0
             {
                 return Err(Errno(22));
             }

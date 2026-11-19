@@ -110,6 +110,7 @@ impl Default for Membership {
 }
 #[derive(Default)]
 pub(super) struct MembershipEntries {
+    select_capacity: u32,
     slots: BTreeMap<u32, Slot>,
     free: crate::fd_allocator::FreeFds,
     reserved: std::collections::BTreeSet<u32>,
@@ -125,6 +126,9 @@ impl MembershipEntries {
         self.free.next(min)
     }
     pub(super) fn insert(&mut self, fd: u32, slot: Slot) -> Option<Slot> {
+        if fd >= self.select_capacity && fd < MAX_FDS {
+            self.select_capacity = (fd + 1).next_power_of_two();
+        }
         let old = self.slots.insert(fd, slot);
         if old.is_none() {
             self.free.reserve(fd);
@@ -557,6 +561,9 @@ impl SharedFiles {
             fd,
             pending: true,
         })
+    }
+    pub(super) fn select_capacity(&self) -> u32 {
+        self.0.entries.lock().unwrap().select_capacity.max(64)
     }
     pub fn limit_handle(&self) -> super::DescriptorLimit {
         super::DescriptorLimit(self.1.clone())
@@ -1308,6 +1315,10 @@ impl SharedFiles {
                 (fd, copy)
             })
             .collect();
+        let select_capacity = source
+            .range(..MAX_FDS)
+            .next_back()
+            .map_or(0, |(&fd, _)| (fd + 1).next_power_of_two());
         let revision = self.0.revision.load(Ordering::Relaxed);
         drop(source);
         let files = Self(
@@ -1315,6 +1326,7 @@ impl SharedFiles {
                 local_ownership: self.0.local_ownership.clone(),
                 entries: Mutex::new(MembershipEntries {
                     slots,
+                    select_capacity,
                     free,
                     reserved: Default::default(),
                 }),

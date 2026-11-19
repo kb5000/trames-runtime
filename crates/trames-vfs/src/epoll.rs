@@ -20,7 +20,7 @@ pub(super) fn validate(op: u32, events: u32, old: Option<u32>, nested: bool) -> 
     {
         return Err(Errno(22));
     }
-    if events & !0xf000201f != 0 {
+    if events & !(0xf0000000 | poll_mask::SUPPORTED) != 0 {
         return Err(Errno(95));
     }
     Ok(())

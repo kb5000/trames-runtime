@@ -8,7 +8,7 @@ import unittest
 
 from batch import partition
 from chunks import Progress, xml_rows
-from run import classify, reuse_rows
+from run import classify, reuse_rows, watchdog
 
 
 class EvidenceTests(unittest.TestCase):
@@ -17,6 +17,12 @@ class EvidenceTests(unittest.TestCase):
     def tearDown(self):self.temp.cleanup()
     def xml(self, body):
         path=self.root/'result.xml';path.write_text('<testsuites><testsuite>'+body+'</testsuite></testsuites>');return path
+    def test_watchdog_allows_intentional_wait_and_preserves_suite_override(self):
+        args = argparse.Namespace(timeout=20, suite_timeouts={})
+        self.assertEqual(watchdog(args, 'ppoll', 'PpollTest.SignalMaskBlocksSignal'), 45)
+        self.assertEqual(watchdog(args, 'ppoll', 'PpollTest.SignalMaskAllowsSignal'), 20)
+        args.suite_timeouts['ppoll'] = 15
+        self.assertEqual(watchdog(args, 'ppoll', 'PpollTest.SignalMaskBlocksSignal'), 15)
     def test_mixed_results_need_matching_xml_and_exit(self):
         path=self.xml('<testcase classname="T" name="Pass" time="0.01"/><testcase classname="T" name="Fail"><failure message="original assertion"/></testcase><testcase classname="T" name="Skip"><skipped message="upstream gate"/></testcase>')
         rows=xml_rows(path,1,['T.Pass','T.Fail','T.Skip'])

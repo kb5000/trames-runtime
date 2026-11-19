@@ -107,9 +107,7 @@ impl WatchState {
     }
     pub fn ready(&self, ready: u16, epoch: [u64; 2]) -> bool {
         self.events & 0x80000000 == 0
-            || ready & !self.last_ready != 0
-            || ready & 3 != 0 && epoch[0] != self.last_epoch[0]
-            || ready & 4 != 0 && epoch[1] != self.last_epoch[1]
+            || poll_mask::new_edges(ready, self.last_ready, epoch, self.last_epoch) != 0
     }
     pub fn observe(&mut self, ready: u16, epoch: [u64; 2]) -> Option<(u32, u64)> {
         if !self.armed {

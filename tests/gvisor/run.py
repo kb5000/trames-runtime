@@ -122,6 +122,19 @@ def reuse_rows(args, plan):
             for i,r in enumerate(json.loads((args.reuse/'results.json').read_text())) if r['status'] in (['passed','skipped','failed','no_result','crashed','invalid_result','mismatched_result'] if args.reuse_completed else ['passed','skipped'])}
 
 
+# These upstream cases block SIGALRM and expect the full 30-second wait to
+# expire. The default worker watchdog must also allow startup and XML export.
+SIGNAL_WAIT_TIMEOUTS = {
+    'ppoll': {'PpollTest.SignalMaskBlocksSignal': 45},
+    'pselect': {'PselectTest.SignalMaskBlocksSignal': 45},
+}
+
+def watchdog(args, suite, case):
+    if suite in args.suite_timeouts:
+        return args.suite_timeouts[suite]
+    return max(args.timeout, SIGNAL_WAIT_TIMEOUTS.get(suite, {}).get(case, 0))
+
+
 def native(args, output):
     if os.geteuid() != 0:
         raise RuntimeError('Run native references as root inside the disposable Linux CI instance')
@@ -141,6 +154,7 @@ def native(args, output):
         if args.case_filter: selected=[case for case in selected if fnmatch.fnmatchcase(case,args.case_filter)]
         plan['suites'].append({'name': name, 'sha256': digest(path), 'available': len(cases), 'cases': selected})
     if not any(s['cases'] for s in plan['suites']):raise RuntimeError('No cases selected')
+    plan['case_execution'] = dict(timeout_base=args.timeout, suite_timeouts=args.suite_timeouts, upstream_wait_timeouts=SIGNAL_WAIT_TIMEOUTS)
     if args.native_init:plan['native_init_sha256']=digest(args.native_init)
     save(output / 'plan.json', plan)
     cache=reuse_rows(args,plan)
@@ -166,7 +180,7 @@ def native(args, output):
                 argv = ['unshare', '--mount', '--uts', '--ipc', '--net', '--pid', '--fork', '--kill-child=KILL', '--mount-proc',
                         '--', *([str(args.native_init)] if args.native_init else []), '/usr/bin/env', '-u', 'TEST_ON_GVISOR', '-u', 'GVISOR_SAVE_TEST', 'TEST_TMPDIR=' + str(work), 'TEST_SRCDIR='+str(binaries/'runfiles'), 'RUNFILES_DIR='+str(binaries/'runfiles'),
                         str(binary), '--gtest_color=no', '--gtest_filter=' + case, '--gtest_output=xml:' + str(xml)]
-                code, timed, seconds = execute(argv, output/'logs'/(str(index)+'.stdout'), output/'logs'/(str(index)+'.stderr'), args.suite_timeouts.get(suite['name'],args.timeout), cwd=work, min_free=int(args.min_free_gib*1024**3))
+                code, timed, seconds = execute(argv, output/'logs'/(str(index)+'.stdout'), output/'logs'/(str(index)+'.stderr'), watchdog(args, suite['name'], case), cwd=work, min_free=int(args.min_free_gib*1024**3))
                 status, messages = classify(xml, code, timed, case)
                 rows.append(dict(suite=suite['name'], case=case, status=status, code=code, seconds=seconds, messages=messages))
                 save(output/'results.json', rows)
@@ -184,7 +198,7 @@ def trames(args, output):
     if not any(s['cases'] for s in plan['suites']):raise RuntimeError('No cases selected')
     plan['runtime_sha256']=digest(args.runner.resolve())
     plan['process_context']='pid2' if args.network=='internal' else 'pid1'
-    plan['case_execution']={'chunk_size':args.chunk_size,'fresh_store':args.fresh_store,'timeout_base':args.timeout,'suite_timeouts':args.suite_timeouts,'reference_timing_extension':'max(base,min(90,native_seconds*3+2))'}
+    plan['case_execution']={'chunk_size':args.chunk_size,'fresh_store':args.fresh_store,'timeout_base':args.timeout,'suite_timeouts':args.suite_timeouts,'upstream_wait_timeouts':SIGNAL_WAIT_TIMEOUTS,'reference_timing_extension':'max(base,min(90,native_seconds*3+2))'}
     plan['fresh_store']=args.fresh_store
     plan['network']=args.network
     plan['cpus']=args.cpus
@@ -232,7 +246,7 @@ def trames(args, output):
                 for row in json.loads(path.read_text()):
                     if row['status']=='passed':reference_times[(row['suite'],row['case'])]=row['seconds']
             checked_at=time.monotonic()
-        return max(args.suite_timeouts.get(suite,args.timeout), min(90,reference_times.get((suite,case),0)*3+2))
+        return max(watchdog(args, suite, case), min(90,reference_times.get((suite,case),0)*3+2))
     if args.chunk_size>1:
         from chunks import run
         rows=run(args,output,plan,env,runner,name,store,snapshot,cache,case_timeout)
