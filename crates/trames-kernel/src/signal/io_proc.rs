@@ -69,6 +69,32 @@ impl IoTask {
         }
         *self.proc_pid.write().unwrap() = binding;
     }
+    pub fn finish_accounting(
+        &self,
+        began: std::time::Instant,
+        elapsed: std::time::Duration,
+        cpu: usize,
+    ) {
+        self.proc_view.finish_accounting(began, elapsed, cpu);
+        self.check_cpu_limit();
+    }
+    pub fn check_cpu_limit(&self) {
+        if let Some(signal) = self
+            .proc_limits
+            .get()
+            .and_then(|limits| limits.cpu_signal(|| self.lifecycle().cpu_time()))
+        {
+            let _ = self.job_signal(
+                signal,
+                true,
+                Info {
+                    code: 128,
+                    ..Info::default()
+                },
+                true,
+            );
+        }
+    }
     pub fn bind_proc_limits(&self, limits: &Arc<crate::limits::Limits>) {
         let original = self.proc_limits.get_or_init(|| limits.clone());
         debug_assert!(Arc::ptr_eq(original, limits));

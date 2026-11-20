@@ -63,11 +63,7 @@ impl Inbox {
                 *overrun = overrun.saturating_add(extra).saturating_add(1);
                 *overrun
             } else {
-                let fresh = sig >= 32 || !pending.contains_key(&sig);
-                queued = pending
-                    .enqueue_retained(sig, info, self.retain_sender(info))
-                    .is_ok()
-                    && fresh;
+                queued = pending.enqueue_timer(sig, info).is_ok();
                 extra
             }
         } else {
@@ -1210,6 +1206,30 @@ mod tests {
         assert!(signals.io.inbox.is_empty());
     }
 
+    #[test]
+    fn standard_signal_preserves_sender_and_each_distinct_timer() {
+        let inbox = Inbox::default();
+        let timer = |id| Info {
+            timer: Some((id, 0, 9)),
+            ..Info::default()
+        };
+        inbox
+            .enqueue(
+                10,
+                Info {
+                    sender: 42,
+                    ..Info::default()
+                },
+            )
+            .unwrap();
+        inbox.timer(10, timer(7));
+        inbox.timer(10, timer(8));
+        assert_eq!(inbox.timer(10, timer(7)), 1);
+        assert_eq!(inbox.take(10).unwrap().sender, 42);
+        assert_eq!(inbox.take(10).unwrap().timer, Some((7, 1, 9)));
+        assert_eq!(inbox.take(10).unwrap().timer, Some((8, 0, 9)));
+        assert!(inbox.take(10).is_none());
+    }
     #[test]
     fn pending_timer_overrun_does_not_create_another_signalfd_readiness_edge() {
         let inbox = Inbox::default();

@@ -44,6 +44,18 @@ impl Pending {
         });
         Ok(())
     }
+    /// POSIX timers own one queued record per timer, including for standard
+    /// signals. A preceding kill or a different timer retains its FIFO position.
+    pub(super) fn enqueue_timer(&mut self, sig: u32, info: Info) -> Result<(), Errno> {
+        if self.0.values().map(VecDeque::len).sum::<usize>() >= 4096 {
+            return Err(Errno(11));
+        }
+        self.0.entry(sig).or_default().push_back(RetainedInfo {
+            info,
+            _sender: None,
+        });
+        Ok(())
+    }
     pub fn remove(&mut self, sig: &u32) -> Option<RetainedInfo> {
         let q = self.0.get_mut(sig)?;
         let info = q.pop_front();

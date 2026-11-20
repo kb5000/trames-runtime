@@ -98,7 +98,7 @@ impl DescriptorLimit {
 
 /// Current mutable pairs from one original process-limit transaction.
 #[derive(Clone, Copy, Debug)]
-pub struct MutableLimits(pub [(u64, u64); 8]);
+pub struct MutableLimits(pub [(u64, u64); 9]);
 impl MutableLimits {
     pub fn index(resource: u64) -> Option<usize> {
         match resource {
@@ -110,6 +110,7 @@ impl MutableLimits {
             9 => Some(5),
             8 => Some(6),
             12 => Some(7),
+            0 => Some(8),
             _ => None,
         }
     }

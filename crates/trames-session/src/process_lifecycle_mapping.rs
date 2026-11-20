@@ -213,10 +213,7 @@ impl<C: Cpu> Lifecycle<C> {
                     .cpu
                     .run_quiesced(engine, &mut p.memory, registry, remaining);
                 let elapsed = outcome.as_ref().map_or(Duration::ZERO, |_| began.elapsed());
-                p.signals
-                    .io
-                    .proc_view
-                    .finish_accounting(began, elapsed, slot);
+                p.signals.io.finish_accounting(began, elapsed, slot);
                 let Some(outcome) = outcome else {
                     break;
                 };

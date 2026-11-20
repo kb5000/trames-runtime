@@ -119,10 +119,7 @@ impl<C: Cpu> Lifecycle<C> {
                 cgroup.acknowledge();
             }
             let elapsed = began.elapsed();
-            p.signals
-                .io
-                .proc_view
-                .finish_accounting(began, elapsed, slot);
+            p.signals.io.finish_accounting(began, elapsed, slot);
             job.stats.cpu_times[slot] += elapsed;
             job.stats.elapsed += elapsed;
             report.time[3] += elapsed;

@@ -2428,7 +2428,12 @@ impl DirectSyscalls {
                             },
                             |file| file.fd.nonblocking(),
                         ))
-                        || pending.deadline.is_some_and(|d| Instant::now() >= d))
+                        // A poll timeout completes with a final readiness sample and
+                        // copyout. If time advanced since check(), its expired wait
+                        // rearms immediately. EAGAIN is only final for data I/O.
+                        || pending.retained_poll.is_none()
+                            && !matches!(pending.number, 22 | 441)
+                            && pending.deadline.is_some_and(|d| Instant::now() >= d))
                 {
                     return self.complete_pending(&pending, Err(Errno(11)), memory);
                 }

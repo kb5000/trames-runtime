@@ -2,7 +2,10 @@
 //! Original process limits, callable by any executor. No CPU/VFS owner crosses.
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex, RwLock, Weak},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, RwLock, Weak,
+    },
 };
 use trames_memory::{Access, CpuMemory};
 use trames_vfs::{
@@ -10,7 +13,8 @@ use trames_vfs::{
 };
 type Pair = (u64, u64);
 pub struct Limits {
-    values: Mutex<[Pair; 8]>, // FSIZE, CORE, NOFILE, NICE, DATA, AS, MEMLOCK, MSGQUEUE.
+    values: Mutex<[Pair; 9]>, // FSIZE, CORE, NOFILE, NICE, DATA, AS, MEMLOCK, MSGQUEUE, CPU.
+    next_cpu_second: AtomicU64,
     file_size: FileSizeLimit,
     nofile: DescriptorLimit,
     nr_open: trames_vfs::DescriptorCeiling,
@@ -37,7 +41,9 @@ impl Limits {
                     vfs.memory_resource_limits().message_queue(),
                     trames_vfs::posix_mq::DEFAULT_BYTES,
                 ),
+                (u64::MAX, u64::MAX),
             ]),
+            next_cpu_second: AtomicU64::new(u64::MAX),
             file_size: vfs.file_size_limit_handle(),
             nofile: vfs.descriptor_limit_handle(),
             nr_open: vfs.descriptor_ceiling(),
@@ -47,7 +53,7 @@ impl Limits {
     pub fn fork(&self, vfs: &Vfs) -> Arc<Self> {
         let values = *self.values.lock().unwrap();
         let child = Self::new(vfs);
-        for (resource, value) in [1, 4, 7, 13, 2, 9, 8, 12].into_iter().zip(values) {
+        for (resource, value) in [1, 4, 7, 13, 2, 9, 8, 12, 0].into_iter().zip(values) {
             child.set(resource, value);
         }
         child
@@ -70,11 +76,33 @@ impl Limits {
     }
     fn enforce(&self, resource: u64, soft: u64) {
         match resource {
+            0 => self.next_cpu_second.store(soft, Ordering::Relaxed),
             1 => self.file_size.set(soft),
             7 => self.nofile.set(soft as u32),
             2 | 8 | 9 | 12 => self.vm.set(resource, soft),
             _ => {}
         }
+    }
+    pub(crate) fn cpu_signal(&self, elapsed: impl FnOnce() -> std::time::Duration) -> Option<u32> {
+        let threshold = self.next_cpu_second.load(Ordering::Relaxed);
+        if threshold == u64::MAX {
+            return None;
+        }
+        let now = elapsed().as_secs();
+        if now < threshold {
+            return None;
+        }
+        let mut values = self.values.lock().unwrap();
+        let (soft, hard) = &mut values[trames_vfs::MutableLimits::index(0).unwrap()];
+        if now >= *hard {
+            return Some(9);
+        }
+        if now < *soft {
+            return None;
+        }
+        *soft = soft.saturating_add(1);
+        self.next_cpu_second.store(*soft, Ordering::Relaxed);
+        Some(24)
     }
     /// Decode an already authorized target. Callers keep guest identity checks outside.
     pub fn call(
@@ -269,6 +297,34 @@ mod tests {
         b[..8].copy_from_slice(&v.0.to_le_bytes());
         b[8..].copy_from_slice(&v.1.to_le_bytes());
         m.write_array(0x1000, b).unwrap();
+    }
+    #[test]
+    fn cpu_limit_uses_process_seconds_and_claims_each_soft_threshold_once() {
+        let v = Vfs::default();
+        let limits = Limits::new(&v);
+        assert_eq!(
+            limits.cpu_signal(|| panic!("unlimited CPU time sampled")),
+            None
+        );
+        limits.set(0, (0, 3));
+        let child = limits.fork(&v);
+        let at = |seconds| move || std::time::Duration::from_secs(seconds);
+        assert_eq!(limits.cpu_signal(at(0)), Some(24));
+        assert_eq!(limits.cpu_signal(at(0)), None);
+        assert_eq!(child.get(0), (0, 3));
+        std::thread::scope(|scope| {
+            let a = scope.spawn(|| limits.cpu_signal(at(1)));
+            let b = scope.spawn(|| limits.cpu_signal(at(1)));
+            let signals = [a.join().unwrap(), b.join().unwrap()];
+            assert_eq!(signals.into_iter().flatten().collect::<Vec<_>>(), [24]);
+        });
+        assert_eq!(limits.get(0), (2, 3));
+        assert_eq!(limits.cpu_signal(at(3)), Some(9));
+        limits.set(0, (u64::MAX, u64::MAX));
+        assert_eq!(
+            limits.cpu_signal(|| panic!("disabled CPU limit sampled")),
+            None
+        );
     }
     #[test]
     fn concurrent_alias_transactions_keep_pairs_and_original_fd_enforcement_together() {

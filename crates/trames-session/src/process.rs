@@ -3339,10 +3339,7 @@ impl<C: Cpu> Kernel<C> {
                 p.cpu_time += elapsed;
                 self.cpu_total += elapsed;
                 self.per_cpu[p.last_cpu] += elapsed;
-                p.signals
-                    .io
-                    .proc_view
-                    .finish_accounting(began, elapsed, p.last_cpu);
+                p.signals.io.finish_accounting(began, elapsed, p.last_cpu);
             }
             SliceOutcome::Syscall { instructions } => {
                 p.cpu.clear_exclusive();

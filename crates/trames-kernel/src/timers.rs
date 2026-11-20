@@ -320,7 +320,7 @@ impl Timers {
             return Ok(0);
         }
         if number == 107 {
-            if !matches!(a[0], 0 | 1) {
+            if !matches!(a[0] as u32, 0 | 1) {
                 return Err(Errno(22));
             }
             memory
@@ -331,7 +331,7 @@ impl Timers {
             let (signal, value, thread) = if a[1] == 0 {
                 (14, id as u64, None)
             } else {
-                let b = memory.read_array::<16>(a[1]).map_err(|_| Errno(14))?;
+                let b = memory.read_array::<64>(a[1]).map_err(|_| Errno(14))?;
                 let value = u64::from_le_bytes(b[..8].try_into().unwrap());
                 let signal = u32::from_le_bytes(b[8..12].try_into().unwrap());
                 let notify = u32::from_le_bytes(b[12..16].try_into().unwrap());
@@ -339,13 +339,11 @@ impl Timers {
                     return Err(Errno(22));
                 }
                 let thread = match notify {
-                    0 | 1 => None,
+                    // SIGEV_THREAD at the raw Linux ABI targets the process.
+                    // libc implements callbacks with its own helper thread.
+                    0..=2 => None,
                     4 => {
-                        let tid = u32::from_le_bytes(
-                            memory
-                                .read_array::<4>(a[1].checked_add(16).ok_or(Errno(14))?)
-                                .map_err(|_| Errno(14))?,
-                        );
+                        let tid = u32::from_le_bytes(b[16..20].try_into().unwrap());
                         Some(namespace.global(tid).ok_or(Errno(22))?)
                     }
                     _ => return Err(Errno(22)),
@@ -369,7 +367,7 @@ impl Timers {
                 id,
                 Arc::new(Timer {
                     tgid,
-                    clock: a[0],
+                    clock: a[0] as u32 as u64,
                     signal,
                     value,
                     target,
