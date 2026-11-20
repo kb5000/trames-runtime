@@ -113,6 +113,41 @@ impl IoRoutes {
             .map(u64::from)
     }
 
+    pub fn pidfd_getfd(
+        &self,
+        caller: &IoTask,
+        flags: &trames_vfs::FdFlags,
+        into: &trames_vfs::DescriptorFactory,
+        a: [u64; 6],
+    ) -> Result<u64, Errno> {
+        if a[2] as u32 != 0 {
+            return Err(Errno(22));
+        }
+        let (pidfd, _) = flags.pidfd(a[0] as u32)?;
+        let target = self
+            .directory
+            .proc_task(pidfd.pid())
+            .filter(|t| t.live())
+            .ok_or(Errno(3))?;
+        if !target
+            .lifecycle()
+            .pidfd()
+            .is_some_and(|current| Arc::ptr_eq(&current, &pidfd))
+        {
+            return Err(Errno(3));
+        }
+        let credentials = caller.credentials().read().clone();
+        target
+            .credentials()
+            .receive_pidfd_file(
+                &credentials,
+                target.tgid() == caller.tgid(),
+                a[1] as u32,
+                into.files(),
+            )
+            .map(u64::from)
+    }
+
     pub fn pidfd_send(
         &self,
         source: &IoTask,

@@ -5,25 +5,78 @@ use super::*;
 /// One original task's objective credentials. Observers take one coherent
 /// record; ordinary caller-side file/network checks use their retained value.
 #[derive(Default)]
-pub struct CredentialState(std::sync::RwLock<Credentials>);
+pub struct CredentialState {
+    current: std::sync::RwLock<Credentials>,
+    files: std::sync::Mutex<Option<PidfdFiles>>,
+}
+struct PidfdFiles {
+    table: std::sync::Weak<fd_table::Membership>,
+    dumpable: Dumpable,
+}
 impl CredentialState {
     pub fn new(credentials: Credentials) -> Self {
-        Self(std::sync::RwLock::new(credentials))
+        Self {
+            current: std::sync::RwLock::new(credentials),
+            files: Default::default(),
+        }
     }
     pub fn read(&self) -> std::sync::RwLockReadGuard<'_, Credentials> {
-        self.0.read().unwrap()
+        self.current.read().unwrap()
     }
     pub fn publish(&self, credentials: &Credentials) {
-        self.0.write().unwrap().clone_from(credentials);
+        self.current.write().unwrap().clone_from(credentials);
+    }
+    /// Publish the files_struct and mm at the same credential boundary as
+    /// exec/unshare. A pidfd does not own the target table or keep it alive.
+    pub fn publish_files(
+        &self,
+        credentials: &Credentials,
+        files: &SharedFiles,
+        dumpable: Dumpable,
+    ) {
+        let mut target = self.current.write().unwrap();
+        target.clone_from(credentials);
+        *self.files.lock().unwrap() = Some(PidfdFiles {
+            table: Arc::downgrade(&files.0),
+            dumpable,
+        });
+    }
+    pub fn receive_pidfd_file(
+        &self,
+        caller: &Credentials,
+        same_group: bool,
+        fd: u32,
+        into: &SharedFiles,
+    ) -> Result<u32> {
+        let target = self.current.read().unwrap();
+        let binding = self.files.lock().unwrap();
+        let files = binding.as_ref().ok_or(Errno(3))?;
+        // PTRACE_MODE_ATTACH_REALCREDS uses real IDs and permitted capabilities.
+        if !same_group
+            && !caller.has_ns_cap(&target.user_namespace, capabilities::SYS_PTRACE)
+            && (!files.dumpable.get()
+                || caller.user_namespace != target.user_namespace
+                || [target.uid, target.euid, target.suid]
+                    .iter()
+                    .any(|id| *id != caller.uid)
+                || [target.gid, target.egid, target.sgid]
+                    .iter()
+                    .any(|id| *id != caller.gid)
+                || target.caps.permitted & !caller.caps.permitted != 0)
+        {
+            return Err(Errno(1));
+        }
+        let files = files.table.upgrade().ok_or(Errno(3))?;
+        into.receive_pidfd_slot(&files, fd)
     }
     /// Directory/bootstrap compatibility; both signal target IDs change together.
     pub fn publish_signal_ids(&self, uid: u32, suid: u32) {
-        let mut credentials = self.0.write().unwrap();
+        let mut credentials = self.current.write().unwrap();
         credentials.uid = uid;
         credentials.suid = suid;
     }
     pub fn publish_kill_permission(&self, allowed: bool) {
-        let mut credentials = self.0.write().unwrap();
+        let mut credentials = self.current.write().unwrap();
         let bit = 1 << capabilities::KILL;
         if allowed {
             credentials.caps.effective |= bit;

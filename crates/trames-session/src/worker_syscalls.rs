@@ -203,7 +203,11 @@ impl<C: Cpu> crate::workers::Work<C> {
         if result.is_ok() && state.changed() {
             let resources = state.resources();
             let credentials = &resources.credentials;
-            snapshot.io_signals.credentials().publish(credentials);
+            snapshot.io_signals.credentials().publish_files(
+                credentials,
+                &resources.files,
+                resources.dumpable.clone(),
+            );
             snapshot.io_routes.uid = credentials.uid;
             snapshot.io_routes.euid = credentials.euid;
             snapshot.identities[2..6].copy_from_slice(&[
@@ -755,7 +759,7 @@ impl Snapshot {
         match cpu.x(8) as u32 {
             number if trames_kernel::scheduling::call(number) => true,
             93 | 94 => self.exit_files.is_some(),
-            142 | 153 | 165 | 434 => true,
+            142 | 153 | 165 | 434 | 438 => true,
             96 => self.io_signals.thread_addresses().is_some(),
             167 => match cpu.x(0) {
                 1 | 2 => self.io_signals.parentage().is_some(),
@@ -937,6 +941,12 @@ impl Snapshot {
                 self.io_signals.thread_addresses()?.set_clear_tid(cpu.x(0));
                 Ok(self.identities[6])
             }
+            438 => self.io_routes.pidfd_getfd(
+                &self.io_signals,
+                &self.fd_flags,
+                self.direct.descriptor_factory()?,
+                std::array::from_fn(|i| cpu.x(i)),
+            ),
             434 => self.io_routes.pidfd_open(
                 self.direct.descriptor_factory()?,
                 cpu.x(0) as i32,

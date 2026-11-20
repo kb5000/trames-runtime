@@ -103,6 +103,7 @@ const ALLOWED: u64 = CLONE_NEWUSER
 
 /// Owned new-call capabilities. No reference to a private VFS cache escapes.
 pub struct TaskNamespaceResources {
+    pub dumpable: Dumpable,
     pub credentials: Credentials,
     pub kernel_log: KernelLogAccess,
     pub files: SharedFiles,
@@ -267,6 +268,7 @@ impl TaskNamespaces {
         let view = self.view.view.borrow();
         let mut epoch = FileEpoch::default();
         TaskNamespaceResources {
+            dumpable: view.dumpable_state(),
             credentials: view.credentials.clone(),
             kernel_log: view.kernel_log_capability(),
             files: view.shared_files(),

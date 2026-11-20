@@ -170,6 +170,11 @@ impl<C: Cpu> Kernel<C> {
             if wait.ready() {
                 if let Some((state, result)) = wait.run() {
                     p.linux.vfs.adopt_task_namespaces(state);
+                    p.signals.io.credentials().publish_files(
+                        &p.linux.vfs.credentials,
+                        &p.linux.vfs.shared_files(),
+                        p.linux.vfs.dumpable_state(),
+                    );
                     p.signals
                         .io
                         .proc_view

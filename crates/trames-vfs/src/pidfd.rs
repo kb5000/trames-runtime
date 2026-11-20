@@ -77,3 +77,50 @@ impl FdFlags {
         descriptor.pidfd()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn getfd_shares_the_open_description_and_uses_real_credentials() {
+        let mut sender = Vfs::default();
+        let fd = sender.open_at(AT_FDCWD, b"/file", 0x42, 0o600).unwrap();
+        sender.write(fd, b"abcdef").unwrap();
+        sender.seek(fd, 1, 0).unwrap();
+        let mut receiver = Vfs::default();
+        let target = CredentialState::default();
+        let mut owner = Credentials::user(12, 34);
+        owner.caps.permitted = 1;
+        let dumpable = sender.dumpable_state();
+        target.publish_files(&owner, &sender.shared_files(), dumpable.clone());
+
+        let mut caller = owner.clone();
+        caller.fsuid = 99;
+        caller.fsgid = 99;
+        caller.caps.effective = 0;
+        let copy = |caller: &Credentials| {
+            target.receive_pidfd_file(caller, false, fd, &receiver.shared_files())
+        };
+        caller.caps.permitted = 0;
+        assert_eq!(copy(&caller), Err(Errno(1)));
+        caller.caps.permitted = 1;
+        dumpable.set(false);
+        assert_eq!(copy(&caller), Err(Errno(1)));
+        dumpable.set(true);
+        caller.uid = 99;
+        assert_eq!(copy(&caller), Err(Errno(1)));
+        caller.uid = owner.uid;
+        let dup = copy(&caller).unwrap();
+        assert!(receiver.descriptor(dup).unwrap().cloexec.get());
+        assert!(!sender.descriptor(fd).unwrap().cloexec.get());
+        assert_eq!(receiver.read(dup, 2).unwrap(), b"bc");
+        assert_eq!(sender.seek(fd, 0, 1), Ok(3));
+        sender.close(fd).unwrap();
+        assert_eq!(receiver.read(dup, 3).unwrap(), b"def");
+        assert_eq!(
+            target.receive_pidfd_file(&caller, false, fd, &receiver.shared_files()),
+            Err(Errno(9))
+        );
+    }
+}

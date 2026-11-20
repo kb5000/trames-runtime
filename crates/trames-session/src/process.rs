@@ -2108,7 +2108,10 @@ impl<C: Cpu> Kernel<C> {
                 };
                 match attempt {
                     trames_vfs::TaskNamespaceOwnerAttempt::Complete(result) => {
-                        if result.is_ok() && matches!(number, 97 | 268) { p.signals.io.credentials().publish(&p.linux.vfs.credentials); }
+                        if result.is_ok() && (number != 436 || a[2] & 2 != 0) {
+                            p.signals.io.credentials().publish_files(&p.linux.vfs.credentials,
+                                &p.linux.vfs.shared_files(), p.linux.vfs.dumpable_state());
+                        }
                         result.map(Some)
                     },
                     trames_vfs::TaskNamespaceOwnerAttempt::Waiting(work) => {
@@ -2424,7 +2427,7 @@ impl<C: Cpu> Kernel<C> {
             // The legacy conformance oracle predates queued signals. Exercise
             // their canonical resource implementation here too; production
             // calls stay on their original worker through WorkerSnapshot.
-            if matches!(number, 138 | 240 | 424 | 434) {
+            if matches!(number, 138 | 240 | 424 | 434 | 438) {
                 kernel.publish_io_tasks(Some((pid, p)));
                 let routes = trames_kernel::signal::IoRoutes {
                     directory: p.signals.io_directory.clone(),
@@ -2432,6 +2435,16 @@ impl<C: Cpu> Kernel<C> {
                     uid: p.linux.vfs.credentials.uid,
                     euid: p.linux.vfs.credentials.euid,
                 };
+                if number == 438 {
+                    return routes
+                        .pidfd_getfd(
+                            &p.signals.io,
+                            &p.linux.vfs.fd_flags_snapshot(),
+                            &p.linux.vfs.descriptor_factory(),
+                            a,
+                        )
+                        .map(Some);
+                }
                 if number == 434 {
                     return routes
                         .pidfd_open(&p.linux.vfs.descriptor_factory(), a[0] as i32, a[1] as u32)

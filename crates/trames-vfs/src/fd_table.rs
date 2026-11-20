@@ -355,6 +355,33 @@ pub(super) enum PollOpen {
     Epoll(Arc<SharedOpenDescription>),
 }
 impl SharedFiles {
+    pub(super) fn receive_pidfd_slot(&self, source: &Membership, fd: u32) -> Result<u32> {
+        let mut slot = {
+            let entries = source.entries.lock().unwrap();
+            if source.owners.load(Ordering::Relaxed) == 0 {
+                return Err(Errno(3));
+            }
+            let slot = entries.get(&fd).ok_or(Errno(9))?;
+            if let Some(open) = slot.shared_open() {
+                open?;
+            }
+            slot.clone()
+        };
+        // Keep the complete original OFD, including cold control bindings.
+        // Source and destination may be the same table or be used reciprocally.
+        slot.cloexec = true.into();
+        let mut entries = self.0.entries.lock().unwrap();
+        if self.closed() {
+            return Err(Errno(9));
+        }
+        let new = entries
+            .available(0)
+            .filter(|&n| n < self.descriptor_limit())
+            .ok_or(Errno(24))?;
+        entries.insert(new, slot);
+        self.changed(&mut entries);
+        Ok(new)
+    }
     /// Buffer-owned Android FDA cleanup must not consume a reused descriptor.
     pub(crate) fn close_if_slot(&self, fd: u32, identity: &CloseOnExec, owner: u32) {
         let retired = {

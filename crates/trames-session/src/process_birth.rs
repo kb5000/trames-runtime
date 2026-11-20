@@ -112,10 +112,11 @@ impl Birth {
     ) {
         p.seccomp.bind(&p.signals.io, id);
         self.publish_proc(id, p);
-        p.signals
-            .io
-            .scheduling
-            .publish_credentials(&p.linux.vfs.credentials);
+        p.signals.io.credentials().publish_files(
+            &p.linux.vfs.credentials,
+            &p.linux.vfs.shared_files(),
+            p.linux.vfs.dumpable_state(),
+        );
         self.limits.publish(
             id,
             &p.signals.presence,
