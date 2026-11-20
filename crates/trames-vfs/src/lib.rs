@@ -1267,6 +1267,9 @@ impl Vfs {
             .map(|_| ())
     }
     fn check_parent_write(&self, path: &ResolvedPath) -> Result<NodeRef> {
+        if self.proc_directory_tree(path) {
+            self.node(path)?;
+        }
         path.writable()?;
         if Self::cgroup_mount(path)
             || path
@@ -1281,7 +1284,7 @@ impl Vfs {
             if self.proc_task_directory(&parent) && self.node(path).is_ok() {
                 return Err(Errno(1));
             }
-            if self.proc_task_directory(path) && !self.allowed(&self.node(&parent)?.borrow(), 3) {
+            if self.proc_directory_tree(path) && !self.allowed(&self.node(&parent)?.borrow(), 3) {
                 return Err(Errno(13));
             }
             return Err(Errno(30));
@@ -1888,7 +1891,11 @@ impl Vfs {
                 continue;
             }
             if part.len() > 255 {
-                return Err(Errno(36));
+                return Err(Errno(if self.proc_directory_tree(&current) {
+                    2
+                } else {
+                    36
+                }));
             }
             let parent = current.clone();
             if current != b"/" {
@@ -2564,7 +2571,9 @@ impl Vfs {
                 && network_control.is_none()
                 && self.uses_pseudo(&p)
                 && self.pseudo_readonly(&p)
-                && (flags & 3 != 0 || flags & 0x240 != 0)
+                && (flags & 3 != 0
+                    || flags & O_TRUNC != 0
+                    || flags & O_CREAT != 0 && !self.proc_directory_tree(&p))
             {
                 return Err(Errno(30));
             }
@@ -2644,6 +2653,9 @@ impl Vfs {
             Err(e) => return Err(e),
         };
         if !existed {
+            if self.proc_directory_tree(&p) {
+                return Err(Errno(2));
+            }
             check_write(None)?;
         }
         #[cfg(all(feature = "hostfs", unix))]

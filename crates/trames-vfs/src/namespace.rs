@@ -18,6 +18,11 @@ impl Vfs {
     ) -> Result<()> {
         let source = self.resolve_final(oldfd, old, follow)?;
         let dest = self.resolve_final(newfd, new, false)?;
+        if self.proc_directory_tree(&dest) {
+            self.node(&source)?;
+            self.node(&dest)?;
+            return Err(Errno(17));
+        }
         self.check_parent_write(&dest)?;
         self.link_resolved(&source, &dest, false)
     }
@@ -60,7 +65,7 @@ impl Vfs {
         let src = self.node(&source)?;
         let target = match self.node(&dest) {
             Ok(node) => Some(node),
-            Err(Errno(2)) if !exchange => None,
+            Err(Errno(2)) if !exchange && !self.proc_directory_tree(&dest) => None,
             Err(error) => return Err(error),
         };
         if flags == RENAME_NOREPLACE && target.is_some() {

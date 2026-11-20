@@ -256,7 +256,7 @@ mod tests {
         assert_eq!(v.open_at(AT_FDCWD, b"/proc/stat", 1, 0), Err(Errno(30)));
         assert_eq!(
             v.open_at(AT_FDCWD, b"/proc/1/new", 0x41, 0o644),
-            Err(Errno(30))
+            Err(Errno(2))
         );
         drop(task);
         assert_eq!(v.pread(fd, 32, 0), Err(Errno(3)));

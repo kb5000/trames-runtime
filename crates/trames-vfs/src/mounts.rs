@@ -2194,6 +2194,21 @@ mod tests {
         v
     }
     #[test]
+    fn proc_lookup_follows_the_mount_across_bind_and_overmount() {
+        let mut v = setup();
+        v.mount(Some(b"/proc/fs"), b"/dst", None, 4096, None)
+            .unwrap();
+        v.mount(None, b"/proc/fs", Some(b"tmpfs"), 0, None).unwrap();
+
+        let dir = v.open_at(AT_FDCWD, b"/dst", 0, 0).unwrap() as i32;
+        assert_eq!(v.mkdir_at(dir, b"child", 0o755), Err(Errno(2)));
+        assert_eq!(v.open_at(dir, &[b'x'; 256], 0, 0), Err(Errno(2)));
+        v.mkdir_at(AT_FDCWD, b"/proc/fs/child", 0o755).unwrap();
+        let covered = v.open_at(AT_FDCWD, b"/proc/fs", 0, 0).unwrap() as i32;
+        assert_eq!(v.open_at(covered, &[b'x'; 256], 0, 0), Err(Errno(36)));
+        assert_eq!(v.open_at(dir, b"child", 0, 0), Err(Errno(2)));
+    }
+    #[test]
     fn shared_mount_data_observes_remount_detach_and_releases_filesystem_on_worker() {
         fn send_sync<T: Send + Sync>() {}
         send_sync::<MountData>();

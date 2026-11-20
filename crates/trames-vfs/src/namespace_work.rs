@@ -742,7 +742,7 @@ mod tests {
         assert_eq!(owner.stat_at(AT_FDCWD, b"/new/child"), Err(Errno(2)));
     }
     #[test]
-    fn published_global_readonly_namespace_rejection_completes_on_source() {
+    fn missing_proc_dentry_completes_on_source() {
         let mut owner = Vfs::default();
         owner.set_runtime_info(1, RuntimeInfo::default());
         let work = owner.path_queries().namespace_work(NamespaceCall::Mkdir {
@@ -750,7 +750,7 @@ mod tests {
             path: b"/proc/new".to_vec(),
             mode: 0o755,
         });
-        assert_eq!(count(work), Err(Errno(30)));
+        assert_eq!(count(work), Err(Errno(2)));
         assert_eq!(owner.stat_at(AT_FDCWD, b"/proc/new"), Err(Errno(2)));
     }
     #[test]
@@ -780,7 +780,7 @@ mod tests {
                 FileValue::Count(n) => n,
                 _ => panic!(),
             }),
-            Err(Errno(30))
+            Err(Errno(2))
         );
         assert_eq!(owner.stat_at(AT_FDCWD, b"/proc/new"), Err(Errno(2)));
     }

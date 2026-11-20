@@ -675,7 +675,7 @@ mod tests {
         );
         assert_eq!(
             v.mkdir_at(AT_FDCWD, b"/proc/injected", 0o777),
-            Err(Errno(30))
+            Err(Errno(2))
         );
         let stat = v.stat_at(AT_FDCWD, b"/proc/self/status").unwrap();
         assert_eq!(&stat[..8], &2u64.to_le_bytes());
@@ -1377,6 +1377,17 @@ impl Vfs {
         };
         task && self.uses_pseudo(path)
     }
+    /// procfs supplies directory entries itself. A missing entry cannot be
+    /// turned into a negative dentry for a subsequent create or rename.
+    pub(super) fn proc_directory_tree(&self, path: &ResolvedPath) -> bool {
+        match path.mount.as_ref() {
+            Some(mount) => mount.kind == mounts::Kind::Proc,
+            None => {
+                (path.as_ref() == b"/proc" || path.starts_with(b"/proc/"))
+                    && self.pseudo.borrow().enabled
+            }
+        }
+    }
     pub(super) fn pseudo_readonly(&self, path: &[u8]) -> bool {
         self.pseudo.borrow().enabled
             && (path == b"/proc"
@@ -1964,7 +1975,7 @@ impl Vfs {
             b"/sys/devices/system" | b"/sys/devices/system/cpu" | b"/sys/devices/virtual" | b"/sys/devices/virtual/net" | b"/sys/block" |
             b"/sys/class/block" | b"/sys/devices/virtual/block" | b"/sys/devices/virtual/block/vda" |
             b"/sys/devices/virtual/block/vda/vda1" | b"/sys/devices/virtual/block/vda/queue" |
-            b"/sys/dev" | b"/sys/dev/block" | b"/dev/block" | b"/proc/sys" |
+            b"/sys/dev" | b"/sys/dev/block" | b"/dev/block" | b"/proc/fs" | b"/proc/sys" |
             b"/proc/sys/kernel" | b"/proc/sys/kernel/random" | b"/proc/sys/fs" | b"/proc/sys/vm" | b"/proc/sys/user" | b"/proc/sys/net" |
             b"/proc/sys/net/ipv4" | b"/dev/pts" => return Ok(directory()),
             b"/dev/tty" => return Ok(Some((Content::Terminal, 0o20666))),
@@ -2688,6 +2699,7 @@ impl Vfs {
                 "cpuinfo",
                 "version",
                 "filesystems",
+                "fs",
                 "cgroups",
                 "stat",
                 "loadavg",
