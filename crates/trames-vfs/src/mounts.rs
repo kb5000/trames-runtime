@@ -2,6 +2,7 @@
 //! Mount identity and metadata are separate from owner namespace controls.
 use super::*;
 pub(super) mod admin;
+pub(crate) mod fd;
 mod propagation;
 mod registry;
 pub(super) use registry::Registry;
@@ -22,6 +23,17 @@ pub(super) const MS_NODIRATIME: u64 = 1 << 11;
 const MS_STRICTATIME: u64 = 1 << 24;
 const ATIME_FLAGS: u64 = MS_NOATIME | MS_NODIRATIME | MS_RELATIME;
 pub(super) const MS_RELATIME: u64 = 1 << 21;
+const LOCK_ATTACHMENT: u64 = 1 << 63;
+fn hides_locked_child(mounts: &[Arc<Mount>], parent: &Arc<Mount>, key: &[u8]) -> bool {
+    mounts.iter().any(|child| {
+        child.inherited.load(Ordering::Relaxed) & LOCK_ATTACHMENT != 0
+            && child
+                .parent
+                .borrow()
+                .as_ref()
+                .is_some_and(|a| Arc::ptr_eq(&a.parent, parent) && below(&a.key(), key))
+    })
+}
 const MAX_MOUNTS: usize = 128;
 static NEXT_MOUNT: AtomicU64 = AtomicU64::new(16);
 static NEXT_NAMESPACE: AtomicU64 = AtomicU64::new(0xe000_0000);
@@ -86,6 +98,8 @@ pub(super) struct MountInit {
 // Resource identity is independent of parent topology. Overlay layers must
 // retain this identity rather than the old root's parent chain after pivot.
 pub(super) struct MountIdentity {
+    inherited: AtomicU64,
+    anonymous_tree: std::sync::OnceLock<fd::TreeOrigin>,
     users: std::sync::atomic::AtomicUsize,
     #[cfg(all(feature = "hostfs", unix))]
     has_children: std::sync::atomic::AtomicBool,
@@ -167,9 +181,12 @@ struct SharedAttachment {
     _node: NodeRef,
     _fallback: Vec<u8>,
 }
-pub(super) struct MountFlags(AtomicU64);
+pub(super) struct MountFlags(AtomicU64, Option<Arc<std::sync::atomic::AtomicBool>>);
 impl MountFlags {
     pub fn get(&self) -> u64 {
+        self.local() | u64::from(self.1.as_ref().is_some_and(|ro| ro.load(Ordering::Relaxed)))
+    }
+    fn local(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
     }
     pub fn set(&self, flags: u64) {
@@ -265,6 +282,8 @@ impl Mount {
         ));
         let namespace = init.namespace.clone();
         let identity = Arc::new(MountIdentity {
+            inherited: AtomicU64::new(0),
+            anonymous_tree: Default::default(),
             users: Default::default(),
             #[cfg(all(feature = "hostfs", unix))]
             has_children: std::sync::atomic::AtomicBool::new(false),
@@ -273,6 +292,10 @@ impl Mount {
                 .fs
                 .overlay_device()
                 .unwrap_or_else(|| init.root.borrow().device),
+            flags: Arc::new(MountFlags(
+                AtomicU64::new(init.flags.get()),
+                init.fs.super_readonly.clone(),
+            )),
             fs: init.fs,
             root: init.root,
             root_key: init.root_key,
@@ -280,7 +303,6 @@ impl Mount {
             display: init.display,
             pid_namespace: init.pid_namespace,
             devpts: init.devpts,
-            flags: Arc::new(MountFlags(AtomicU64::new(init.flags.get()))),
             propagation: Default::default(),
             writers: init.writers,
         });
@@ -638,7 +660,7 @@ impl Vfs {
                 namespace: None,
                 pid_namespace: (kind == Kind::Proc).then(|| self.pid_ns.clone()),
                 devpts: None,
-                flags: Cell::new(flags),
+                flags: Cell::new(flags | MS_RELATIME),
                 writers: Arc::default(),
                 parent: RefCell::new(Some(Attachment {
                     parent: root.clone(),
@@ -926,7 +948,15 @@ impl Vfs {
             .collect();
         let mut copies = BTreeMap::new();
         for m in &mounts {
-            copies.insert(m.id, copy_mount(m)?);
+            let copy = copy_mount(m)?;
+            if old.user_namespace != self.credentials.user_namespace {
+                copy.set_propagation(m.propagation().inherited_slave());
+                copy.inherited.fetch_or(
+                    LOCK_ATTACHMENT | ATIME_FLAGS | (m.flags.get() & 15),
+                    Ordering::Relaxed,
+                );
+            }
+            copies.insert(m.id, copy);
         }
         let shared_admin = mounts
             .iter()
@@ -1036,12 +1066,19 @@ impl Vfs {
     // A proc FD magic link is a retained mount/inode capability. Its display
     // label may have been renamed or replaced and must not select the target.
     pub(super) fn mount_location(&self, path: &[u8], follow: bool) -> Result<ResolvedPath> {
-        let (path, magic) = self.resolve_entry(AT_FDCWD, path, follow, true)?;
+        self.mount_location_at(AT_FDCWD, path, follow)
+    }
+    fn mount_location_at(&self, fd: i32, path: &[u8], follow: bool) -> Result<ResolvedPath> {
+        let (path, magic) = self.resolve_entry_policy(fd, path, follow, true, 0, true)?;
         match magic {
             Some(ResolvedTarget::Inode(file)) => self.location(&file.node, &file.mount),
             Some(ResolvedTarget::Descriptor(open)) => {
                 if open.borrow().namespace_resource.is_some() {
                     return Ok(path);
+                }
+                if open.borrow().node.is_none() {
+                    // Anonymous inodes have no mountpoint in the caller's tree.
+                    return Err(Errno(2));
                 }
                 let file = self.proc_open_node(&open, &path)?;
                 self.location(&file.node, &file.mount)
@@ -1159,6 +1196,10 @@ impl Vfs {
             if preserve_atime {
                 attrs |= parent.flags.get() & ATIME_FLAGS;
             }
+            let locked = parent.inherited.load(Ordering::Relaxed);
+            if (attrs ^ parent.flags.get()) & locked != 0 {
+                return Err(Errno(1));
+            }
             parent.flags.set(attrs);
             let events = self.mounts.as_ref().unwrap().0.borrow().events.clone();
             events.changed();
@@ -1169,54 +1210,7 @@ impl Vfs {
                 return Err(Errno(95));
             }
             let source = self.mount_location(source.ok_or(Errno(22))?, true)?;
-            let moved = source.mount.as_ref().ok_or(Errno(22))?;
-            if moved
-                .parent
-                .borrow()
-                .as_ref()
-                .is_some_and(|a| a.parent.propagation().shared != 0)
-            {
-                return Err(Errno(22));
-            }
-            if parent.propagation() != propagation::State::default()
-                || moved.propagation() != propagation::State::default()
-                || moved
-                    .parent
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|a| a.parent.propagation() != propagation::State::default())
-            {
-                return Err(Errno(95));
-            }
-
-            let table = self.mounts.as_ref().ok_or(Errno(22))?.0.borrow_mut();
-            if !self.is_mount_root(&source)
-                || Arc::ptr_eq(moved, &table.root)
-                || !table.mounts.iter().any(|mount| Arc::ptr_eq(mount, moved))
-            {
-                return Err(Errno(22));
-            }
-            if matches!(moved.root.borrow().content, Content::Directory)
-                != matches!(target_node.borrow().content, Content::Directory)
-            {
-                return Err(Errno(20));
-            }
-            let mut ancestor = Some(parent.clone());
-            while let Some(mount) = ancestor {
-                if Arc::ptr_eq(&mount, moved) {
-                    return Err(Errno(40));
-                }
-                ancestor = mount.parent.borrow().as_ref().map(|a| a.parent.clone());
-            }
-            *moved.parent.borrow_mut() = Some(Attachment {
-                parent,
-                node: target_node,
-                fallback: target.key,
-            });
-            let events = table.events.clone();
-            drop(table);
-            events.changed();
-            return Ok(());
+            return self.move_attached(&source, &target, parent, target_node);
         }
         if flags & !(ATTRS | BIND | REC) != 0 {
             return Err(Errno(95));
@@ -1300,6 +1294,9 @@ impl Vfs {
             {
                 return Err(Errno(22));
             }
+            if flags & REC == 0 && hides_locked_child(&ns.0.borrow().mounts, m, &source.key) {
+                return Err(Errno(22));
+            }
             devpts = m.devpts.clone();
             bind_origin = Some(m.clone());
             if flags & REC != 0 {
@@ -1323,7 +1320,7 @@ impl Vfs {
                     }
                 }
             }
-            (m.fs.clone(), node, source.key, m.kind, m.flags.get())
+            (m.fs.clone(), node, source.key, m.kind, m.flags.local())
         } else {
             if !matches!(target_node.borrow().content, Content::Directory) {
                 return Err(Errno(20));
@@ -1434,6 +1431,11 @@ impl Vfs {
         } else {
             (mount_kind == Kind::Proc).then(|| self.pid_ns.clone())
         };
+        let locked_visible = if bind_origin.is_none() {
+            self.visible_pseudo_flags(mount_kind, attrs)?
+        } else {
+            0
+        };
         let root = Arc::new(Mount::new(MountInit {
             id: new_mount_id()?,
             fs,
@@ -1463,8 +1465,13 @@ impl Vfs {
                 fallback: target.key,
             })),
         }));
+        root.inherited.store(locked_visible, Ordering::Relaxed);
         if let Some(source_mount) = &bind_origin {
             root.set_propagation(source_mount.propagation());
+            root.inherited.store(
+                source_mount.inherited.load(Ordering::Relaxed) & !LOCK_ATTACHMENT,
+                Ordering::Relaxed,
+            );
         }
         let mut copies = BTreeMap::new();
         if !additions.is_empty() {
@@ -1485,6 +1492,100 @@ impl Vfs {
         let mut added = vec![root];
         added.extend(additions.iter().map(|m| copies[&m.id].clone()));
         self.publish_mounts(&ns, added)
+    }
+    fn visible_pseudo_flags(&self, kind: Kind, attrs: u64) -> Result<u64> {
+        if !matches!(kind, Kind::Proc | Kind::Sysfs) {
+            return Ok(0);
+        }
+        let table = self.mounts.as_ref().ok_or(Errno(22))?.0.borrow();
+        if table.user_namespace.is_initial() {
+            return Ok(0);
+        }
+        let root = if kind == Kind::Proc {
+            b"/proc".as_slice()
+        } else {
+            b"/sys"
+        };
+        for m in &table.mounts {
+            if m.kind != kind || m.root_key != root {
+                continue;
+            }
+            let locked = m.inherited.load(Ordering::Relaxed) & (MS_RDONLY | ATIME_FLAGS);
+            if (m.flags.get() ^ attrs) & locked != 0 {
+                continue;
+            }
+            if table.mounts.iter().any(|child| {
+                child.inherited.load(Ordering::Relaxed) & LOCK_ATTACHMENT != 0
+                    && child.parent.borrow().as_ref().is_some_and(|a| {
+                        // sysfs deliberately exposes an empty mountpoint for cgroupfs.
+                        Arc::ptr_eq(&a.parent, m)
+                            && !(kind == Kind::Sysfs && a.key() == b"/sys/fs/cgroup")
+                    })
+            }) {
+                continue;
+            }
+            return Ok(locked);
+        }
+        Err(Errno(1))
+    }
+    fn move_attached(
+        &self,
+        source: &ResolvedPath,
+        target: &ResolvedPath,
+        parent: Arc<Mount>,
+        target_node: NodeRef,
+    ) -> Result<()> {
+        let moved = source.mount.as_ref().ok_or(Errno(22))?;
+        if moved.inherited.load(Ordering::Relaxed) & LOCK_ATTACHMENT != 0 {
+            return Err(Errno(22));
+        }
+        if moved
+            .parent
+            .borrow()
+            .as_ref()
+            .is_some_and(|a| a.parent.propagation().shared != 0)
+        {
+            return Err(Errno(22));
+        }
+        if parent.propagation() != propagation::State::default()
+            || moved.propagation() != propagation::State::default()
+            || moved
+                .parent
+                .borrow()
+                .as_ref()
+                .is_some_and(|a| a.parent.propagation() != propagation::State::default())
+        {
+            return Err(Errno(95));
+        }
+
+        let table = self.mounts.as_ref().ok_or(Errno(22))?.0.borrow_mut();
+        if !self.is_mount_root(source)
+            || Arc::ptr_eq(moved, &table.root)
+            || !table.mounts.iter().any(|mount| Arc::ptr_eq(mount, moved))
+        {
+            return Err(Errno(22));
+        }
+        if matches!(moved.root.borrow().content, Content::Directory)
+            != matches!(target_node.borrow().content, Content::Directory)
+        {
+            return Err(Errno(20));
+        }
+        let mut ancestor = Some(parent.clone());
+        while let Some(mount) = ancestor {
+            if Arc::ptr_eq(&mount, moved) {
+                return Err(Errno(40));
+            }
+            ancestor = mount.parent.borrow().as_ref().map(|a| a.parent.clone());
+        }
+        *moved.parent.borrow_mut() = Some(Attachment {
+            parent,
+            node: target_node,
+            fallback: target.key.clone(),
+        });
+        let events = table.events.clone();
+        drop(table);
+        events.changed();
+        Ok(())
     }
     pub fn umount(&mut self, target: &[u8], flags: u64) -> Result<()> {
         let admin = self.mount_admin()?;
@@ -1700,20 +1801,25 @@ pub(super) fn new_mount_id() -> Result<u64> {
         .map_err(|_| Errno(28))
 }
 fn copy_mount(m: &Mount) -> Result<Arc<Mount>> {
+    copy_mount_root(m, m.root.clone(), m.root_key.clone())
+}
+fn copy_mount_root(m: &Mount, root: NodeRef, key: Vec<u8>) -> Result<Arc<Mount>> {
     let copy = Arc::new(Mount::new(MountInit {
         id: new_mount_id()?,
         fs: m.fs.clone(),
-        root: m.root.clone(),
-        root_key: m.root_key.clone(),
+        root,
+        root_key: key,
         kind: m.kind,
         display: m.display.clone(),
         namespace: m.namespace.clone(),
         pid_namespace: m.pid_namespace.clone(),
         devpts: m.devpts.clone(),
-        flags: Cell::new(m.flags.get()),
+        flags: Cell::new(m.flags.local()),
         writers: Arc::default(),
         parent: RefCell::new(None),
     }));
+    copy.inherited
+        .store(m.inherited.load(Ordering::Relaxed), Ordering::Relaxed);
     copy.set_propagation(m.propagation());
     Ok(copy)
 }

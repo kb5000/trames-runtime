@@ -598,6 +598,8 @@ impl Vfs {
         }
         let layer = |path: &[u8], lower_layer: bool| -> Result<Layer> {
             let at = self.mount_location(path, true)?;
+            let mount = at.mount.as_ref().ok_or(Errno(22))?;
+            mounts::fd::check_overlay_layer(mount, &self.credentials)?;
             let fs = at.filesystem(self);
             match at.mount.as_ref().map(|m| m.kind) {
                 Some(mounts::Kind::Root | mounts::Kind::Tmpfs) => {}
@@ -615,7 +617,7 @@ impl Vfs {
             if !self.allowed(&n.borrow(), 5) {
                 return Err(Errno(13));
             }
-            let identity = at.mount.as_ref().ok_or(Errno(22))?.identity.clone();
+            let identity = mount.identity.clone();
             Ok(Layer {
                 at: LayerPath {
                     key: at.key,

@@ -3,6 +3,7 @@
 use super::*;
 
 pub enum NamespaceCall {
+    MountFd(MountFdCall),
     MqOpen {
         name: Vec<u8>,
         flags: u32,
@@ -108,6 +109,7 @@ pub enum NamespaceCall {
 impl NamespaceCall {
     fn paths(&self) -> Vec<(i32, Option<&[u8]>, bool)> {
         match self {
+            Self::MountFd(call) => call.operands(),
             Self::Memfd(_) | Self::MqOpen { .. } | Self::MqUnlink(_) => Vec::new(),
             Self::Mount {
                 source,
@@ -180,13 +182,15 @@ impl NamespaceCall {
         }
     }
     fn topology(&self) -> bool {
-        matches!(
-            self,
-            Self::Mount { .. } | Self::Umount { .. } | Self::PivotRoot { .. }
-        )
+        matches!(self, Self::MountFd(call) if call.topology())
+            || matches!(
+                self,
+                Self::Mount { .. } | Self::Umount { .. } | Self::PivotRoot { .. }
+            )
     }
     fn execute_locked(&self, v: &mut Vfs) -> Result<FileValue> {
         match self {
+            Self::MountFd(call) => return call.run(v).map(FileValue::Count),
             Self::Mount {
                 source,
                 target,
@@ -221,6 +225,14 @@ impl NamespaceCall {
             Self::MqUnlink(name) => v.mq_unlink(name)?,
             Self::Memfd(parameters) => {
                 return parameters.create(v).map(|fd| FileValue::Count(fd as u64))
+            }
+            Self::MountFd(call) => {
+                if call.topology() {
+                    let admin = v.mount_admin()?;
+                    let _guard = admin.enter();
+                    return call.run(v).map(FileValue::Count);
+                }
+                return call.run(v).map(FileValue::Count);
             }
             Self::Mount {
                 source,
@@ -389,6 +401,15 @@ fn prepare_namespace(view: &mut Vfs, call: &NamespaceCall) -> bool {
     // pathname/mount lookup or namespace administration transaction.
     if matches!(call, NamespaceCall::Memfd(_)) {
         return true;
+    }
+    if matches!(
+        call,
+        NamespaceCall::MountFd(
+            MountFdCall::Open { .. } | MountFdCall::Config { .. } | MountFdCall::Mount { .. }
+        )
+    ) {
+        // These contexts only construct in-memory filesystems or pseudo roots.
+        return false;
     }
     // Socket ownership is original sockfs metadata plus sk_uid. It performs
     // no filesystem I/O merely because the calling task's root is disk-backed.

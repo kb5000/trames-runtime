@@ -1949,7 +1949,7 @@ impl Vfs {
             b"/sys/devices/platform/trames/drm/renderD128/dev" if self.pseudo.borrow().video_device.load(Ordering::Relaxed) => return Ok(regular(b"226:128\n".to_vec())),
             b"/sys/devices/platform/trames/drm/renderD128/uevent" if self.pseudo.borrow().video_device.load(Ordering::Relaxed) => return Ok(regular(b"MAJOR=226\nMINOR=128\nDEVNAME=dri/renderD128\nDEVTYPE=drm_minor\n".to_vec())),
             b"/sys/devices/platform/trames/uevent" if self.pseudo.borrow().video_device.load(Ordering::Relaxed) => return Ok(regular(b"DRIVER=trames\nMODALIAS=platform:trames\n".to_vec())),
-            b"/proc" | b"/sys" | b"/sys/fs" | b"/sys/fs/cgroup" | b"/sys/class" | b"/sys/class/net" | b"/sys/devices" |
+            b"/proc" | b"/sys" | b"/sys/kernel" | b"/sys/kernel/debug" | b"/sys/kernel/debug/sync" | b"/sys/fs" | b"/sys/fs/cgroup" | b"/sys/class" | b"/sys/class/net" | b"/sys/devices" |
             b"/sys/devices/system" | b"/sys/devices/system/cpu" | b"/sys/devices/virtual" | b"/sys/devices/virtual/net" | b"/sys/block" |
             b"/sys/class/block" | b"/sys/devices/virtual/block" | b"/sys/devices/virtual/block/vda" |
             b"/sys/devices/virtual/block/vda/vda1" | b"/sys/devices/virtual/block/vda/queue" |
@@ -2730,7 +2730,11 @@ impl Vfs {
             ],
             b"/sys/bus" => vec![b"platform".to_vec()],
             b"/sys/fs" => vec![b"cgroup".to_vec()],
+            b"/sys/kernel" => vec![b"debug".to_vec()],
+            b"/sys/kernel/debug" => vec![b"sync".to_vec()],
+            b"/sys/kernel/debug/sync" => vec![b"sw_sync".to_vec()],
             b"/sys" => vec![
+                b"kernel".to_vec(),
                 b"fs".to_vec(),
                 b"class".to_vec(),
                 b"devices".to_vec(),

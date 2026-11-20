@@ -4,6 +4,7 @@ use super::*;
 use std::time::{Duration, Instant};
 
 pub(super) enum Anonymous {
+    FsContext(Arc<mounts::fd::FsContext>),
     Sync(Arc<sync_file::File>),
     Uring(Arc<Uring>),
     Bpf(Arc<bpf::Program>),
@@ -40,6 +41,8 @@ impl SignalMask {
     }
 }
 pub(super) enum SharedControl {
+    FsContext(Arc<mounts::fd::FsContext>),
+    MountTree(Arc<mounts::fd::DetachedTree>),
     MessageQueue(Arc<posix_mq::Queue>),
     Tun(Arc<trames_net::tun::Connection>, UserNamespace),
     Sync(Arc<sync_file::File>),
@@ -56,6 +59,7 @@ pub(super) enum SharedControl {
 impl SharedControl {
     fn capture(control: &Anonymous) -> Option<Self> {
         Some(match control {
+            Anonymous::FsContext(ctx) => Self::FsContext(ctx.clone()),
             Anonymous::Sync(file) => Self::Sync(file.clone()),
             Anonymous::Uring(ring) => Self::Uring(ring.clone()),
             Anonymous::Signal(mask) => Self::Signal(mask.clone()),
@@ -68,6 +72,8 @@ impl SharedControl {
     }
     pub(super) fn owner_projection(&self) -> Option<Anonymous> {
         Some(match self {
+            Self::MountTree(_) => return None,
+            Self::FsContext(ctx) => Anonymous::FsContext(ctx.clone()),
             Self::Sync(file) => {
                 if !file.is_fence() {
                     return None;
@@ -130,6 +136,7 @@ impl WatchState {
 impl Anonymous {
     pub(super) fn name(&self) -> &'static [u8] {
         match self {
+            Self::FsContext(_) => b"anon_inode:[fscontext]",
             Self::Sync(_) => b"anon_inode:[sync_file]",
             Self::Uring(_) => b"anon_inode:[io_uring]",
             Self::Bpf(_) => b"anon_inode:bpf-prog",
@@ -155,7 +162,7 @@ impl Anonymous {
                     0
                 }
             }
-            Self::Bpf(_) => 0,
+            Self::FsContext(_) | Self::Bpf(_) => 0,
             Self::Inotify(i) => {
                 if i.queue.available() != 0 {
                     events & 1
@@ -200,13 +207,17 @@ impl Anonymous {
         if let Self::Inotify(i) = self {
             return i.queue.read(count);
         }
+        if matches!(self, Self::FsContext(_)) {
+            return Err(Errno(61));
+        }
         if count < 8 {
             return Err(Errno(22));
         }
         match self {
             Self::Event(counter) => counter.read(count),
             Self::Timer(timer) => timer.read(count),
-            Self::Sync(_)
+            Self::FsContext(_)
+            | Self::Sync(_)
             | Self::Bpf(_)
             | Self::Signal(_)
             | Self::Epoll(_)
@@ -639,7 +650,7 @@ mod timer_index_tests {
 }
 
 pub(super) fn anonymous_descriptor(id: u64, flags: u32, anonymous: Anonymous) -> Descriptor {
-    let access = if matches!(anonymous, Anonymous::Inotify(_)) {
+    let access = if matches!(anonymous, Anonymous::Inotify(_) | Anonymous::FsContext(_)) {
         0
     } else {
         2
@@ -661,6 +672,17 @@ pub(super) fn resource_descriptor(
     node: Option<NodeRef>,
     control: Option<SharedControl>,
     anonymous: Option<Anonymous>,
+) -> Descriptor {
+    mounted_resource_descriptor(id, flags, kind, node, control, anonymous, None)
+}
+pub(super) fn mounted_resource_descriptor(
+    id: u64,
+    flags: u32,
+    kind: FdKind,
+    node: Option<NodeRef>,
+    control: Option<SharedControl>,
+    anonymous: Option<Anonymous>,
+    mount: Option<OpenMount>,
 ) -> Descriptor {
     let descriptor = Descriptor {
         open: OpenHandle::new(OpenDescription {
@@ -702,7 +724,7 @@ pub(super) fn resource_descriptor(
             anonymous,
 
             namespace: None,
-            mount: None,
+            mount,
         }),
         cloexec: (flags & O_CLOEXEC != 0).into(),
     };

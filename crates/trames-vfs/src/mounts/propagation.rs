@@ -19,6 +19,16 @@ pub(super) struct State {
     lineage: Vec<u64>,
 }
 impl State {
+    pub(super) fn inherited_slave(mut self) -> Self {
+        if self.shared != 0 {
+            if self.master != 0 {
+                self.lineage.insert(0, self.master);
+            }
+            self.master = self.shared;
+            self.shared = 0;
+        }
+        self
+    }
     pub(super) fn resolved(mut self, alive: &BTreeSet<u64>) -> Self {
         while self.master != 0 && !alive.contains(&self.master) {
             self.master = if self.lineage.is_empty() {
@@ -190,6 +200,15 @@ impl Vfs {
     ) -> Result<()> {
         let root = added.first().ok_or(Errno(22))?;
         let attachment = root.parent.borrow().clone().ok_or(Errno(22))?;
+        self.publish_mounts_at(namespace, added, attachment)
+    }
+    pub(super) fn publish_mounts_at(
+        &self,
+        namespace: &MountNamespace,
+        added: Vec<Arc<Mount>>,
+        attachment: Attachment,
+    ) -> Result<()> {
+        let root = added.first().ok_or(Errno(22))?;
         let parents = self.propagation_parents(&attachment.parent)?;
         let parent_group = attachment.parent.propagation().shared;
         let mut state = root.propagation();
@@ -219,8 +238,22 @@ impl Vfs {
                 continue;
             };
             let mut copies = BTreeMap::new();
+            let less_privileged =
+                namespace.0.borrow().user_namespace != ns.0.borrow().user_namespace;
             for mount in &added {
-                copies.insert(mount.id, copy_mount(mount)?);
+                let copy = copy_mount(mount)?;
+                if less_privileged {
+                    let attachment_lock = if Arc::ptr_eq(mount, root) {
+                        0
+                    } else {
+                        LOCK_ATTACHMENT
+                    };
+                    copy.inherited.fetch_or(
+                        attachment_lock | ATIME_FLAGS | (mount.flags.get() & 15),
+                        Ordering::Relaxed,
+                    );
+                }
+                copies.insert(mount.id, copy);
             }
             let copy = copies[&root.id].clone();
             *copy.parent.borrow_mut() = Some(Attachment {
@@ -271,6 +304,7 @@ impl Vfs {
                 return Err(Errno(28));
             }
         }
+        *root.parent.borrow_mut() = Some(attachment);
         for (_, mounts) in &plans {
             self.register_mounts(mounts)?;
         }
@@ -287,6 +321,9 @@ impl Vfs {
     pub(super) fn unmount_propagated(&self, mount: &Arc<Mount>, flags: u64) -> Result<()> {
         let ns = self.mounts.as_ref().ok_or(Errno(22))?;
         if !ns.0.borrow().mounts.iter().any(|m| Arc::ptr_eq(m, mount)) {
+            return Err(Errno(22));
+        }
+        if mount.inherited.load(Ordering::Relaxed) & LOCK_ATTACHMENT != 0 {
             return Err(Errno(22));
         }
         if Arc::ptr_eq(mount, &ns.0.borrow().root) {

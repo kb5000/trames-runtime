@@ -4,7 +4,7 @@ use super::*;
 use trames_vfs::NamespaceCall as Call;
 
 pub(crate) fn supported(number: u32) -> bool {
-    matches!(number, 5..=17 | 33..=41 | 43 | 44 | 49..=55 | 88 | 180 | 181 | 276 | 279 | 452)
+    matches!(number, 5..=17 | 33..=41 | 43 | 44 | 49..=55 | 88 | 180 | 181 | 276 | 279 | 428..=432 | 452)
 }
 pub(super) fn import(
     number: u32,
@@ -13,6 +13,55 @@ pub(super) fn import(
 ) -> Result<(Call, FileOutput), Errno> {
     let output = FileOutput::None;
     let call = match number {
+        428..=432 => {
+            use trames_vfs::MountFdCall as M;
+            let opt = |address| {
+                if address == 0 {
+                    Ok(None)
+                } else {
+                    Linux::path(memory, address).map(Some)
+                }
+            };
+            let operation = match number {
+                428 => M::Tree {
+                    fd: a[0] as i32,
+                    path: Linux::path(memory, a[1])?,
+                    flags: a[2] as u32,
+                },
+                429 => M::Move {
+                    from: a[0] as i32,
+                    source: Linux::path(memory, a[1])?,
+                    to: a[2] as i32,
+                    target: Linux::path(memory, a[3])?,
+                    flags: a[4] as u32,
+                },
+                430 => M::Open {
+                    kind: Linux::path(memory, a[0])?,
+                    flags: a[1] as u32,
+                },
+                431 => {
+                    let cmd = a[1] as u32;
+                    match cmd {
+                        0 if a[2] != 0 && a[3] == 0 && a[4] as i32 == 0 => (),
+                        1 if a[2] != 0 && a[3] != 0 && a[4] as i32 == 0 => (),
+                        6..=8 if a[2] == 0 && a[3] == 0 && a[4] as i32 == 0 => (),
+                        _ => return Err(Errno(22)),
+                    }
+                    M::Config {
+                        fd: a[0] as u32,
+                        cmd,
+                        key: opt(a[2])?,
+                        value: opt(a[3])?,
+                    }
+                }
+                _ => M::Mount {
+                    fd: a[0] as u32,
+                    flags: a[1] as u32,
+                    attrs: a[2] as u32,
+                },
+            };
+            Call::MountFd(operation)
+        }
         180 => {
             let name = Linux::path(memory, a[0])?;
             let attr = if a[1] & 0x40 != 0 && a[3] != 0 {

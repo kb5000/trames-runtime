@@ -595,6 +595,8 @@ impl DirectFd {
                 Some(
                     events::SharedControl::Uring(_)
                     | events::SharedControl::Signal(_)
+                    | events::SharedControl::MountTree(_)
+                    | events::SharedControl::FsContext(_)
                     | events::SharedControl::Bpf(_),
                 ) => return None,
                 Some(events::SharedControl::Cgroup(file)) => {
