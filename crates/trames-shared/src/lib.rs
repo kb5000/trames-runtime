@@ -2,7 +2,7 @@
 //! Host-owned shared storage. Mappings retain physical storage while logical
 //! truncate/EOF remains a guest file property. No host pathname reaches guests.
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, VecDeque},
     fs::{File, OpenOptions},
     io,
     os::{
@@ -17,6 +17,8 @@ use std::{
 };
 
 mod custody;
+mod sparse;
+use sparse::{Charges, Windows, WINDOW};
 mod logical_size;
 mod syscall_dispatch;
 pub use custody::{Admission, Custody, CustodyRead, CustodyWrite, OwnedRead, OwnedWrite};
@@ -31,7 +33,7 @@ mod pipe;
 pub use pipe::NativePipe;
 pub const MAX_SHARED_BYTES: usize = 128 * 1024 * 1024;
 /// Sparse logical address space is distinct from the retained working-set quota.
-pub const MAX_SHARED_LENGTH: usize = 2 * 1024 * 1024 * 1024;
+pub const MAX_SHARED_LENGTH: usize = isize::MAX as usize;
 const MAP_BLOCK: usize = 65536;
 static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
 type Key = (u64, u64);
@@ -133,7 +135,8 @@ struct Inner {
     logical: AtomicUsize,
     logical_observer: OnceLock<LogicalSize>,
     capacity: AtomicUsize,
-    charged: Mutex<BTreeSet<usize>>,
+    charged: Mutex<Charges>,
+    windows: Windows,
     allocated: AtomicUsize,
     owned: bool,
     budget: SharedBudget,
@@ -157,34 +160,38 @@ impl std::fmt::Debug for SharedFile {
             .finish()
     }
 }
+fn anonymous_file() -> io::Result<File> {
+    for _ in 0..32 {
+        let serial = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("trames-shared-{}-{serial}", std::process::id()));
+        let file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        // The descriptor alone owns the inode; no cleanup pathname is kept.
+        std::fs::remove_file(&path)?;
+        return Ok(file);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "shared inode name collision",
+    ))
+}
+
 impl SharedFile {
     pub fn anonymous() -> io::Result<Self> {
         Self::anonymous_in(SharedBudget::default())
     }
     pub fn anonymous_in(budget: SharedBudget) -> io::Result<Self> {
-        for _ in 0..32 {
-            let serial = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
-            let path =
-                std::env::temp_dir().join(format!("trames-shared-{}-{serial}", std::process::id()));
-            let file = match OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)
-            {
-                Ok(f) => f,
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e),
-            };
-            // The descriptor alone owns the inode; no cleanup pathname is kept.
-            std::fs::remove_file(&path)?;
-            return Self::register(file, true, budget);
-        }
-        Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "shared inode name collision",
-        ))
+        Self::register(anonymous_file()?, true, budget)
     }
     fn register(file: File, owned: bool, budget: SharedBudget) -> io::Result<Self> {
         let stat = file.metadata()?;
@@ -223,6 +230,7 @@ impl SharedFile {
             logical_observer: OnceLock::new(),
             capacity: AtomicUsize::new(capacity),
             charged: Mutex::default(),
+            windows: Windows::default(),
             allocated: AtomicUsize::new(0),
             owned,
             budget,
@@ -244,11 +252,16 @@ impl SharedFile {
     pub fn import(fd: OwnedFd) -> io::Result<Self> {
         Self::register(File::from(fd), false, SharedBudget::default())
     }
+    /// A raw consumer cannot resolve segmented data through our inode registry.
     pub fn duplicate_fd(&self) -> io::Result<OwnedFd> {
+        if self.0.owned && self.len() > WINDOW {
+            return Err(io::Error::from_raw_os_error(libc::EOVERFLOW));
+        }
         self.0.file.as_fd().try_clone_to_owned()
     }
     pub fn export(&self) -> io::Result<(OwnedFd, ExportLease)> {
-        let fd = self.duplicate_fd()?;
+        // The receiver imports this identity with its lease and recovers all windows.
+        let fd = self.0.file.as_fd().try_clone_to_owned()?;
         let lease = Arc::new(Transfer {
             _file: self.clone(),
             claimed: AtomicBool::new(false),
@@ -305,38 +318,77 @@ impl SharedFile {
     /// Charge only ranges that are mapped, written or explicitly allocated.
     /// Merely extending a sparse memfd does not instantiate its holes.
     pub fn reserve_range(&self, offset: usize, length: usize) -> io::Result<()> {
+        self.with_charge(offset, length, || Ok(()))
+    }
+    fn with_charge<T>(
+        &self,
+        offset: usize,
+        length: usize,
+        operation: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
         let end = offset
             .checked_add(length)
-            .filter(|n| *n <= MAX_SHARED_LENGTH)
+            .filter(|n| *n <= MAX_SHARED_LENGTH + 1)
             .ok_or_else(invalid)?;
         if length == 0 {
-            return Ok(());
+            return operation();
         }
         let page = host_page();
-        let range = offset / page..round(end, page)? / page;
-        let mut charged = self.0.charged.lock().map_err(lock_error)?;
-        let extra = range.clone().filter(|p| !charged.contains(p)).count() * page;
+        let range = (offset & !(page - 1))..round(end, page)?;
+        let mut charges = self.0.charged.lock().map_err(lock_error)?;
+        let Some((extent, extra)) = charges.extension(range) else {
+            drop(charges);
+            return operation();
+        };
         self.0.budget.reserve(extra)?;
-        charged.extend(range);
-        self.0.allocated.fetch_add(extra, Ordering::Release);
-        Ok(())
+        match operation() {
+            Ok(value) => {
+                charges.insert(extent);
+                self.0.allocated.fetch_add(extra, Ordering::Release);
+                Ok(value)
+            }
+            Err(error) => {
+                self.0.budget.release(extra);
+                Err(error)
+            }
+        }
     }
     pub fn set_len(&self, length: usize) -> io::Result<()> {
         if !self.0.owned || length > MAX_SHARED_LENGTH {
             return Err(invalid());
         }
         let _resize = self.0.resize.lock().map_err(lock_error)?;
+        self.resize_locked(length)
+    }
+    fn resize_locked(&self, length: usize) -> io::Result<()> {
         let old = self.len();
-        let needed = round(length, host_page())?;
-        if needed > self.capacity() {
-            self.0.file.set_len(needed as u64)?;
-            self.0.capacity.store(needed, Ordering::Release);
-        }
+        self.ensure_capacity(length)?;
         if length < old {
             // Never remove physical pages from under native/GPU leases. Zero
             // truncated bytes now, so a later grow cannot resurrect old data.
-            self.clear_range(length, old - length)?;
+            if length < WINDOW {
+                Self::clear_file_range(&self.0.file, length, old.min(WINDOW) - length)?;
+            }
+            if old > WINDOW {
+                self.0.windows.clear(length.max(WINDOW), old)?;
+            }
         }
+        self.publish_len(length);
+        Ok(())
+    }
+    // Caller holds the resize lock. A failed extending write may leave spare
+    // native capacity, but cannot publish unwritten bytes past logical EOF.
+    fn ensure_capacity(&self, length: usize) -> io::Result<()> {
+        let needed = round(length, host_page())?;
+        if needed > self.capacity() {
+            if self.capacity() < WINDOW {
+                self.0.file.set_len(needed.min(WINDOW) as u64)?;
+            }
+            self.0.capacity.store(needed, Ordering::Release);
+        }
+        Ok(())
+    }
+    fn publish_len(&self, length: usize) {
         self.0.logical.store(length, Ordering::Release);
         if let Some(size) = self
             .0
@@ -346,28 +398,34 @@ impl SharedFile {
         {
             size.store(length as u64, Ordering::Relaxed);
         }
-        Ok(())
     }
-    fn clear_range(&self, offset: usize, length: usize) -> io::Result<()> {
+    fn clear_file_range(file: &File, offset: usize, length: usize) -> io::Result<()> {
         fn zeros(file: &File, mut start: usize, end: usize) -> io::Result<()> {
             let zeros = [0; 16384];
+            let mut current = [0; 16384];
             while start < end {
                 let count = (end - start).min(zeros.len());
-                file.write_all_at(&zeros[..count], start as u64)?;
+                file.read_exact_at(&mut current[..count], start as u64)?;
+                if current[..count].iter().any(|byte| *byte != 0) {
+                    file.write_all_at(&zeros[..count], start as u64)?;
+                }
                 start += count;
             }
             Ok(())
         }
+        if length == 0 {
+            return Ok(());
+        }
         let end = offset.checked_add(length).ok_or_else(invalid)?;
         let first = round(offset, host_page())?.min(end);
         let last = (end & !(host_page() - 1)).max(first);
-        zeros(&self.0.file, offset, first)?;
+        zeros(file, offset, first)?;
         if last > first {
             #[cfg(target_os = "linux")]
             // SAFETY: retained regular inode and validated nonnegative range.
             let punched = unsafe {
                 libc::fallocate(
-                    self.0.file.as_raw_fd(),
+                    file.as_raw_fd(),
                     3,
                     first as libc::off_t,
                     (last - first) as libc::off_t,
@@ -390,15 +448,17 @@ impl SharedFile {
                 };
                 // SAFETY: Darwin F_PUNCHHOLE (99), a live regular FD, public
                 // fpunchhole layout, and host-page-aligned retained extent.
-                (unsafe { libc::fcntl(self.0.file.as_raw_fd(), 99, &mut punch) }) == 0
+                (unsafe { libc::fcntl(file.as_raw_fd(), 99, &mut punch) }) == 0
             };
             #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
             let punched = false;
             if !punched {
-                zeros(&self.0.file, first, last)?;
+                // A filesystem without hole punching must not materialize a
+                // sparse window by writing zeroes into every hole.
+                zeros(file, first, last)?;
             }
         }
-        zeros(&self.0.file, last, end)
+        zeros(file, last, end)
     }
     pub fn read_at(&self, offset: u64, count: usize) -> io::Result<Vec<u8>> {
         let size = self
@@ -406,20 +466,78 @@ impl SharedFile {
             .saturating_sub(usize::try_from(offset).unwrap_or(usize::MAX))
             .min(count);
         let mut bytes = vec![0; size];
-        self.0.file.read_exact_at(&mut bytes, offset)?;
+        if size != 0 {
+            if self.0.owned && offset + size as u64 > WINDOW as u64 {
+                self.read_windows(offset as usize, &mut bytes)?;
+            } else {
+                self.0.file.read_exact_at(&mut bytes, offset)?;
+            }
+        }
         Ok(bytes)
     }
     pub fn write_at(&self, offset: u64, bytes: &[u8]) -> io::Result<usize> {
         let offset = usize::try_from(offset).map_err(|_| invalid())?;
         let end = offset.checked_add(bytes.len()).ok_or_else(invalid)?;
-        if !bytes.is_empty() {
-            self.reserve_range(offset, bytes.len())?;
-            if end > self.len() {
-                self.set_len(end)?;
-            }
-            self.0.file.write_all_at(bytes, offset as u64)?;
+        if bytes.is_empty() {
+            return Ok(0);
         }
-        Ok(bytes.len())
+        if end > MAX_SHARED_LENGTH {
+            return Err(invalid());
+        }
+        if !self.0.owned || end <= WINDOW {
+            return self.write_part(offset, bytes.len(), || {
+                self.0.file.write_at(bytes, offset as u64)
+            });
+        }
+        // Each completed window is a valid partial write if a later backing
+        // allocation or write fails.
+        let mut done = 0;
+        while done < bytes.len() {
+            let at = offset + done;
+            let local = at % WINDOW;
+            let n = (bytes.len() - done).min(WINDOW - local);
+            let part = &bytes[done..done + n];
+            let result = self.write_part(at, n, || {
+                if at < WINDOW {
+                    self.0.file.write_at(part, local as u64)
+                } else {
+                    let file = self.0.windows.get(at - local, true)?.unwrap();
+                    file.write_at(part, local as u64)
+                }
+            });
+            match result {
+                Ok(written) if written == n => done += written,
+                Ok(written) => return Ok(done + written),
+                Err(_) if done != 0 => return Ok(done),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(done)
+    }
+    fn write_part(
+        &self,
+        offset: usize,
+        length: usize,
+        write: impl FnOnce() -> io::Result<usize>,
+    ) -> io::Result<usize> {
+        self.with_charge(offset, length, || {
+            let end = offset + length;
+            if end > self.len() {
+                let _resize = self.0.resize.lock().map_err(lock_error)?;
+                if end > self.len() {
+                    if !self.0.owned {
+                        return Err(invalid());
+                    }
+                    self.ensure_capacity(end)?;
+                    let written = write()?;
+                    if written != 0 && offset + written > self.len() {
+                        self.publish_len(offset + written);
+                    }
+                    return Ok(written);
+                }
+            }
+            write()
+        })
     }
     /// Map retained physical bytes. Callers separately enforce logical EOF; this
     /// permits page-contained guest mappings and safe retained views at truncate.
@@ -428,34 +546,19 @@ impl SharedFile {
         if length == 0 || end > self.capacity() {
             return Err(invalid());
         }
-        self.reserve_range(offset, length)?;
         let start = offset & !(MAP_BLOCK - 1);
         let mapped_len = round(end - start, MAP_BLOCK)?.min(self.capacity() - start);
         let mut mappings = self.0.mappings.lock().map_err(lock_error)?;
         let key = (start, mapped_len);
         let region = match mappings.get(&key).and_then(Weak::upgrade) {
-            Some(region) => region,
+            Some(region) => {
+                self.reserve_range(offset, length)?;
+                region
+            }
             None => {
-                // SAFETY: offset and length are host-page aligned inside this
-                // retained inode. Owned storage never physically shrinks.
-                let pointer = unsafe {
-                    libc::mmap(
-                        std::ptr::null_mut(),
-                        mapped_len,
-                        libc::PROT_READ | libc::PROT_WRITE,
-                        libc::MAP_SHARED,
-                        self.0.file.as_raw_fd(),
-                        start as libc::off_t,
-                    )
-                };
-                if pointer == libc::MAP_FAILED {
-                    return Err(io::Error::last_os_error());
-                }
-                let region = Arc::new(Region {
-                    pointer: NonNull::new(pointer.cast()).expect("non-null mmap"),
-                    length: mapped_len,
-                    _owner: self.0.clone(),
-                });
+                let region = Arc::new(
+                    self.with_charge(offset, length, || self.map_region(start, mapped_len))?,
+                );
                 mappings.retain(|_, p| p.strong_count() != 0);
                 mappings.insert(key, Arc::downgrade(&region));
                 region
@@ -641,6 +744,76 @@ mod tests {
         unsafe {
             lease.with_read(0, 3, |b| assert_eq!(b, &[9; 3]));
         }
+    }
+    #[test]
+    fn max_sparse_eof_aliases_high_pages_and_restarts_with_zeroes() {
+        let page = host_page();
+        let file = SharedFile::anonymous_in(SharedBudget::new(4 * page)).unwrap();
+        file.set_len(MAX_SHARED_LENGTH).unwrap();
+        assert_eq!(file.allocated(), 0);
+        assert_eq!(
+            file.read_at((MAX_SHARED_LENGTH - 3) as u64, 32).unwrap(),
+            [0; 3]
+        );
+        assert!(file.reserve_range(0, MAX_SHARED_LENGTH).is_err());
+        assert_eq!(file.allocated(), 0);
+        file.write_at((MAX_SHARED_LENGTH - 3) as u64, b"end")
+            .unwrap();
+        let (token, lease) = file.export().unwrap();
+        let peer = SharedFile::import(token).unwrap();
+        assert!(lease.claimed());
+        assert_eq!(peer.len(), MAX_SHARED_LENGTH);
+        assert_eq!(
+            peer.read_at((MAX_SHARED_LENGTH - 3) as u64, 5).unwrap(),
+            b"end"
+        );
+        let at = WINDOW - page;
+        file.write_at((WINDOW - 1) as u64, b"ab").unwrap();
+        let crossing = peer.map(at, 2 * page).unwrap();
+        // SAFETY: the test accesses sequentially and retains the mapped views.
+        unsafe {
+            crossing.with_read(page - 1, 2, |b| assert_eq!(b, b"ab"));
+            crossing.with_write(page, 2, |b| b.copy_from_slice(b"xy"));
+        }
+        assert_eq!(file.read_at((WINDOW - 1) as u64, 3).unwrap(), b"axy");
+        assert_eq!(file.allocated(), 3 * page);
+        assert!(file.duplicate_fd().is_err());
+        peer.set_len(WINDOW).unwrap();
+        unsafe {
+            crossing.with_read(page - 1, 3, |b| assert_eq!(b, &[b'a', 0, 0]));
+        }
+        file.set_len(MAX_SHARED_LENGTH).unwrap();
+        assert_eq!(
+            peer.read_at((MAX_SHARED_LENGTH - 3) as u64, 3).unwrap(),
+            [0; 3]
+        );
+    }
+    #[test]
+    fn sparse_charges_coalesce_overlaps_and_failed_operations_refund_quota() {
+        let page = host_page();
+        let budget = SharedBudget::new(7 * page);
+        let file = SharedFile::anonymous_in(budget.clone()).unwrap();
+        for (start, len) in [(1, 2), (5, 2), (2, 4), (1, 6)] {
+            file.reserve_range(start * page, len * page).unwrap();
+        }
+        assert_eq!(file.allocated(), 6 * page);
+        assert!(file.reserve_range(0, 8 * page).is_err());
+        assert!(file
+            .with_charge(0, page, || Err::<(), _>(invalid()))
+            .is_err());
+        assert_eq!(budget.available(), page);
+        file.reserve_range(0, page).unwrap();
+        assert_eq!(file.allocated(), 7 * page);
+    }
+    #[test]
+    fn write_crossing_quota_boundary_publishes_only_completed_prefix() {
+        let file = SharedFile::anonymous_in(SharedBudget::new(host_page())).unwrap();
+        assert_eq!(file.write_at((WINDOW - 2) as u64, b"abcd").unwrap(), 2);
+        assert_eq!(file.len(), WINDOW);
+        assert_eq!(file.read_at((WINDOW - 2) as u64, 4).unwrap(), b"ab");
+        assert_eq!(file.allocated(), host_page());
+        assert!(file.write_at(WINDOW as u64, b"cd").is_err());
+        assert_eq!(file.len(), WINDOW);
     }
     #[test]
     fn ranges_and_physical_budget_are_bounded() {
