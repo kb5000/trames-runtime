@@ -274,6 +274,26 @@ impl DirectSyscalls {
     pub fn file_entry(number: u32, args: [u64; 6]) -> bool {
         Self::file_call(number) || number == 25 && matches!(args[1], 1033 | 1034)
     }
+    fn read_zero_file(
+        &self,
+        file: &trames_vfs::FileTarget,
+        number: u32,
+        args: [u64; 6],
+        memory: &mut impl CpuMemory,
+    ) -> Option<Result<u64, Errno>> {
+        let read = match number {
+            63 | 65 | 67 | 69 => number,
+            286 if args[3] == u64::MAX => 65,
+            286 => 69,
+            _ => return None,
+        };
+        let result = file.read_zero_device(|| {
+            Linux::copy_device_zeroes(read, args, memory, self.signal_reader.as_deref())
+        })?;
+        self.completed.set(self.completed.get() + 1);
+        self.file_completed.set(self.file_completed.get() + 1);
+        Some(result)
+    }
     pub fn start_file_call(
         &self,
         number: u32,
@@ -786,6 +806,9 @@ impl DirectSyscalls {
             } else {
                 original.filesystem_target()
             };
+            if let Some(result) = self.read_zero_file(&file, number, args, memory) {
+                return Some(IoAttempt::Complete(result));
+            }
             let (command, output) = match import(
                 number,
                 args,
@@ -1272,7 +1295,12 @@ impl DirectSyscalls {
                 let target = file.target();
                 (Some(file), target)
             }
-            trames_vfs::FileAccess::Full(target) => (None, Some(target)),
+            trames_vfs::FileAccess::Full(target) => {
+                if let Some(result) = self.read_zero_file(&target, number, a, memory) {
+                    return Some(result);
+                }
+                (None, Some(target))
+            }
             trames_vfs::FileAccess::Descriptor(target) => {
                 let (command, output) =
                     match import(number, a, memory, &mut self.scratch.borrow_mut(), false) {

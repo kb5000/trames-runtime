@@ -13,6 +13,9 @@ impl trames_vfs::SignalReader for TaskReader {
     fn task_signal(&self) -> Option<Arc<dyn trames_vfs::TaskSignal>> {
         Some(self.task.clone())
     }
+    fn interrupted(&self) -> bool {
+        self.task.ready()
+    }
     fn poll(&self, mask: u64) -> (u16, [u64; 2]) {
         (
             u16::from(self.task.pending_bits() & mask != 0),

@@ -39,12 +39,12 @@ pub(super) struct WriteLease {
     pub(super) count: usize,
 }
 impl WriteLease {
-    pub(super) fn take(pipe: Arc<PipeResource>, count: usize) -> Result<Self> {
+    pub(super) fn take(pipe: Arc<PipeResource>, count: usize, file_pages: bool) -> Result<Self> {
         let mut data = pipe.lock().unwrap();
         if data.readers == 0 {
             return Err(Errno(32));
         }
-        let count = count.min(data.write_room());
+        let count = count.min(data.transfer_room(file_pages));
         if count == 0 {
             return Err(Errno(11));
         }
@@ -254,7 +254,7 @@ impl StreamTransfer {
         if let Some(pipe) = &file.open.pipe {
             let data = pipe.data.lock().unwrap();
             if write {
-                data.readers == 0 || data.write_room() != 0
+                data.readers == 0 || data.transfer_room(self.input.open.is_regular_file()) != 0
             } else {
                 !data.read_reserved && (!data.bytes.is_empty() || data.writers == 0)
             }
@@ -388,7 +388,7 @@ impl StreamTransfer {
             }
         }
         let mut destination = if let Some(pipe) = dest_pipe {
-            match WriteLease::take(pipe, count) {
+            match WriteLease::take(pipe, count, from_seekable) {
                 Ok(lease) => Some(lease),
                 Err(Errno(11)) => {
                     self.blocked(true);
@@ -556,7 +556,7 @@ mod tests {
         assert_eq!(v.write(w, b"tail"), Ok(4));
         drop(read);
         assert_eq!(v.read(r, 10).unwrap(), b"prefixtail");
-        let mut write = WriteLease::take(pipe.clone(), PIPE_CAPACITY - 2).unwrap();
+        let mut write = WriteLease::take(pipe.clone(), PIPE_CAPACITY - 2, false).unwrap();
         assert_eq!(v.write(w, b"abc"), Err(Errno(11)));
         assert_eq!(v.write(w, b"ab"), Ok(2));
         assert_eq!(
@@ -566,7 +566,7 @@ mod tests {
         drop(write);
         assert_eq!(pipe.lock().unwrap().bytes.len(), PIPE_CAPACITY);
         assert_eq!(v.read(r, 2).unwrap(), b"ab");
-        let write = WriteLease::take(pipe.clone(), 2).unwrap();
+        let write = WriteLease::take(pipe.clone(), 2, false).unwrap();
         drop(write);
         assert_eq!(v.write(w, b"cd"), Ok(2));
     }

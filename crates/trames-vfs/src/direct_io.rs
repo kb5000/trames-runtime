@@ -132,6 +132,16 @@ impl PipeData {
     pub(super) fn write_room(&self) -> usize {
         self.capacity - self.bytes.len() - self.write_reserved
     }
+    // File splice inserts a page buffer. Free bytes at the tail of an
+    // occupied page can serve byte writes but cannot accept a file page.
+    pub(super) fn transfer_room(&self, file_pages: bool) -> usize {
+        let room = self.write_room();
+        if file_pages {
+            room & !(trames_memory::PAGE_SIZE as usize - 1)
+        } else {
+            room
+        }
+    }
     pub(super) fn readable(&self) -> bool {
         !self.read_reserved && !self.bytes.is_empty()
     }
@@ -1408,6 +1418,15 @@ impl DirectFd {
 
     pub fn is_eventfd(&self) -> bool {
         matches!(self.resource, ByteResource::Event(_))
+    }
+    pub fn read_zero_device(&self, copy: impl FnOnce() -> Result<u64>) -> Option<Result<u64>> {
+        if !matches!(
+            self.resource,
+            ByteResource::SimpleDevice(simple_device::Kind::Zero | simple_device::Kind::Full)
+        ) {
+            return None;
+        }
+        self._file.as_ref()?.open.read_zero_device(copy)
     }
     pub fn is_simple_device(&self) -> bool {
         matches!(self.resource, ByteResource::SimpleDevice(_))

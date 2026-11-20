@@ -1236,6 +1236,13 @@ impl DirectSyscalls {
         if !Self::supports_fd_call(number, args, fd) {
             return None;
         }
+        if matches!(number, 63 | 65 | 67 | 69) {
+            if let Some(result) = fd.read_zero_device(|| {
+                Linux::copy_device_zeroes(number, args, memory, self.signal_reader.as_deref())
+            }) {
+                return Some(result);
+            }
+        }
         if matches!(number, 67..=70) && fd.is_pty() {
             return Some(Err(
                 fd.positioned_terminal_error(number == 68 || number == 70, args[3])
@@ -4759,6 +4766,42 @@ mod tests {
             Some(Err(Errno(22)))
         );
         assert_eq!(vfs.read(fd, 8), Err(Errno(11)));
+    }
+    #[test]
+    fn zero_device_reads_snapshot_iovecs_and_report_only_written_bytes() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, trames_vfs::RuntimeInfo::default());
+        for path in [b"/dev/zero", b"/dev/full"] {
+            let fd = v.open_at(-100, path, 0, 0).unwrap() as u64;
+            let d = DirectSyscalls::new(v.direct_descriptors());
+            let mut m = memory();
+            for number in [63, 67] {
+                m.write(0x1ffe, &[5; 2]).unwrap();
+                assert_eq!(
+                    d.invoke(number, [fd, 0x1ffe, 4, 12, 0, 0], &mut m),
+                    Some(Ok(2))
+                );
+                assert_eq!(m.read_array::<2>(0x1ffe).unwrap(), [0; 2]);
+            }
+            for number in [65, 69] {
+                // First segment overwrites the second descriptor. Its snapshotted
+                // destination straddles an unmapped page.
+                for (at, val) in [
+                    (0x1000, 0x1010u64),
+                    (0x1008, 16),
+                    (0x1010, 0x1ffe),
+                    (0x1018, 4),
+                ] {
+                    m.write_array(at, val.to_le_bytes()).unwrap();
+                }
+                m.write(0x1ffe, &[5; 2]).unwrap();
+                assert_eq!(
+                    d.invoke(number, [fd, 0x1000, 2, 12, 0, 0], &mut m),
+                    Some(Ok(18))
+                );
+                assert_eq!(m.read_array::<2>(0x1ffe).unwrap(), [0; 2]);
+            }
+        }
     }
     #[test]
     fn device_scalar_vector_and_positioned_abi_preserves_faults_access_and_original_ofd() {

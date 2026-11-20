@@ -318,12 +318,95 @@ impl Linux {
             memory.write(a[1], &bytes).map_err(|_| Errno(14))?;
             return Ok(bytes.len() as u64);
         }
+        if let Some(result) = self.vfs.read_zero_device(fd, |signals| {
+            Self::copy_device_zeroes(63, a, memory, signals)
+        }) {
+            return result;
+        }
         if self.vfs.fd_kind(fd)? == FdKind::Socket {
             if let Some(socket) = self.vfs.local_socket(fd)?.filter(|s| s.kind() != 1) {
                 return Self::local_network_vfs(&mut self.vfs, &socket, 63, a, memory);
             }
         }
         Self::read_transport(a, memory, |count| self.read_bytes(fd, count, io))
+    }
+    /// Zero-producing character devices have no payload to stage in a host Vec.
+    /// Import all vector descriptors before any write (the table may alias output).
+    /// Guest page writes preserve COW, backing-file effects and partial faults.
+    pub(crate) fn copy_device_zeroes(
+        number: u32,
+        a: [u64; 6],
+        memory: &mut impl CpuMemory,
+        signals: Option<&dyn trames_vfs::SignalReader>,
+    ) -> Result<u64> {
+        if matches!(number, 67 | 69) && a[3] > i64::MAX as u64 {
+            if number == 67 {
+                Self::read_parameters(a, memory)?;
+            }
+            return Err(Errno(22));
+        }
+        let scalar;
+        let mut vectors;
+        let parts = if matches!(number, 63 | 67) {
+            let n = a[2].min(Vfs::MAX_RW_COUNT);
+            if a[1] > ADDRESS_LIMIT || n > ADDRESS_LIMIT - a[1] {
+                return Err(Errno(14));
+            }
+            scalar = [(a[1], n)];
+            &scalar[..]
+        } else {
+            if a[2] > 1024 {
+                return Err(Errno(22));
+            }
+            Self::check(memory, a[1], a[2] as usize * 16, Access::Read)?;
+            vectors = Vec::with_capacity(a[2] as usize);
+            let mut remaining = Vfs::MAX_RW_COUNT;
+            for i in 0..a[2] {
+                let (base, len) = Self::iovec_at(memory, a[1] + 16 * i)?;
+                if len > i64::MAX as u64 {
+                    return Err(Errno(22));
+                }
+                if base > ADDRESS_LIMIT || len > ADDRESS_LIMIT - base {
+                    return Err(Errno(14));
+                }
+                let take = remaining.min(len);
+                remaining -= take;
+                vectors.push((base, take));
+            }
+            &vectors[..]
+        };
+        const ZERO: [u8; PAGE_SIZE as usize] = [0; PAGE_SIZE as usize];
+        let mut total = 0;
+        let mut next_signal_check = 65536;
+        for &(mut address, mut remaining) in parts {
+            while remaining != 0 {
+                let take = remaining.min(PAGE_SIZE - address % PAGE_SIZE);
+                if memory.write(address, &ZERO[..take as usize]).is_err() {
+                    return if total == 0 {
+                        Err(Errno(14))
+                    } else {
+                        Ok(total)
+                    };
+                }
+                total += take;
+                address += take;
+                remaining -= take;
+                if total >= next_signal_check {
+                    if signals.is_some_and(|s| s.interrupted()) {
+                        return Ok(total);
+                    }
+                    next_signal_check = total + 65536;
+                }
+            }
+        }
+        Ok(total)
+    }
+    fn iovec_at(memory: &impl CpuMemory, at: u64) -> Result<(u64, u64)> {
+        let v = memory.read_array::<16>(at).map_err(|_| Errno(14))?;
+        Ok((
+            u64::from_le_bytes(v[..8].try_into().unwrap()),
+            u64::from_le_bytes(v[8..].try_into().unwrap()),
+        ))
     }
     pub(crate) fn read_transport(
         a: [u64; 6],
@@ -430,6 +513,11 @@ impl Linux {
         {
             return Self::local_network_vfs(&mut self.vfs, &socket, 65, a, memory);
         }
+        if let Some(result) = self.vfs.read_zero_device(a[0] as u32, |signals| {
+            Self::copy_device_zeroes(65, a, memory, signals)
+        }) {
+            return result;
+        }
         let records = self.vfs.readv_records(a[0] as u32)?;
         Self::readv_transport_mode(a, memory, records, |count| {
             self.read_bytes(a[0] as u32, count, io)
@@ -534,6 +622,13 @@ impl Linux {
         bytes: &mut Vec<u8>,
     ) -> Result<u64> {
         let regular = self.vfs.regular_file_fd(a[0] as u32)?;
+        if !write && !regular {
+            if let Some(result) = self.vfs.read_zero_device(a[0] as u32, |signals| {
+                Self::copy_device_zeroes(67, a, memory, signals)
+            }) {
+                return result;
+            }
+        }
         let access = if write { Access::Read } else { Access::Write };
         let count = Self::file_scalar_count(memory, a, access, regular)?;
         if write {
@@ -739,11 +834,7 @@ impl Linux {
         let mut faulted = false;
         let access = if write { Access::Read } else { Access::Write };
         for i in 0..a[2] {
-            let vector = memory
-                .read_array::<16>(a[1] + i * 16)
-                .map_err(|_| Errno(14))?;
-            let pointer = u64::from_le_bytes(vector[..8].try_into().unwrap());
-            let length = u64::from_le_bytes(vector[8..].try_into().unwrap());
+            let (pointer, length) = Self::iovec_at(memory, a[1] + i * 16)?;
             requested = requested
                 .checked_add(length)
                 .filter(|n| *n <= i64::MAX as u64)
@@ -808,6 +899,13 @@ impl Linux {
         let offset = a[3];
         if offset > i64::MAX as u64 {
             return Err(Errno(22));
+        }
+        if !write && !regular {
+            if let Some(result) = self.vfs.read_zero_device(a[0] as u32, |signals| {
+                Self::copy_device_zeroes(69, a, memory, signals)
+            }) {
+                return result;
+            }
         }
         let (parts, total) = if regular {
             let vectors = Self::file_vector_import::<true>(memory, a, write)?;

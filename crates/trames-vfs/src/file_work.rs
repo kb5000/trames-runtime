@@ -6,6 +6,10 @@ use super::*;
 #[derive(Clone)]
 pub struct FileTarget(pub(super) SharedFd);
 impl FileTarget {
+    pub fn read_zero_device(&self, copy: impl FnOnce() -> Result<u64>) -> Option<Result<u64>> {
+        self.0.open.read_zero_device(copy)
+    }
+
     pub fn regular_file(&self) -> bool {
         self.0.open.is_regular_file()
     }

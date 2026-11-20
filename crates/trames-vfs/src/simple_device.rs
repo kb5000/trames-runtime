@@ -54,7 +54,47 @@ pub(super) fn builtin(path: &[u8]) -> Option<(Content, u32)> {
         0o20666,
     ))
 }
+impl Vfs {
+    pub fn read_zero_device(
+        &self,
+        fd: u32,
+        copy: impl FnOnce(Option<&dyn SignalReader>) -> Result<u64>,
+    ) -> Option<Result<u64>> {
+        let desc = self.descriptor(fd).ok()?;
+        let open = desc.open.borrow().shared.clone();
+        open.read_zero_device(|| copy(self.signal_reader.borrow().as_deref()))
+    }
+}
 impl SharedOpenDescription {
+    pub(super) fn read_zero_device(
+        &self,
+        copy: impl FnOnce() -> Result<u64>,
+    ) -> Option<Result<u64>> {
+        let node = self.node.as_ref()?;
+        if !matches!(node.simple_device, Some(Kind::Zero | Kind::Full)) {
+            return None;
+        }
+        let flags = self.flags.get();
+        if flags & O_PATH != 0 || flags & 3 == 1 {
+            return Some(Err(Errno(9)));
+        }
+        let count = copy();
+        if count.as_ref().is_ok_and(|n| *n != 0) {
+            self.record_device_read(node, flags, true);
+        }
+        Some(count)
+    }
+    fn record_device_read(&self, node: &NodeRef, flags: u32, transferred: bool) {
+        if flags & O_NOATIME == 0 {
+            mounts::accessed(
+                &mut node.borrow_mut(),
+                self.mount_resource.get().map(AsRef::as_ref),
+            );
+        }
+        if transferred {
+            self.notify_file_io(node, inotify::ACCESS);
+        }
+    }
     pub(super) fn simple_read(&self, kind: Kind, count: usize) -> Result<Vec<u8>> {
         let flags = self.flags.get();
         if flags & O_PATH != 0 || flags & 3 == 1 {
@@ -62,14 +102,10 @@ impl SharedOpenDescription {
         }
         let result = kind.read(count);
         let node = self.node.as_ref().expect("memory-device inode");
-        if count != 0 && result.is_ok() && flags & O_NOATIME == 0 {
-            mounts::accessed(
-                &mut node.borrow_mut(),
-                self.mount_resource.get().map(AsRef::as_ref),
-            );
-        }
-        if result.as_ref().is_ok_and(|bytes| !bytes.is_empty()) {
-            self.notify_file_io(node, inotify::ACCESS);
+        if let Ok(bytes) = &result {
+            if count != 0 {
+                self.record_device_read(node, flags, !bytes.is_empty());
+            }
         }
         result
     }

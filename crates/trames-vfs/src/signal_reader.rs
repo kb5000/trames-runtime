@@ -12,6 +12,10 @@ pub trait SignalReader: Send + Sync {
     fn task_signal(&self) -> Option<Arc<dyn crate::TaskSignal>> {
         None
     }
+    /// A long-running transfer may return a short count to deliver a guest signal.
+    fn interrupted(&self) -> bool {
+        false
+    }
     fn poll(&self, mask: u64) -> (u16, [u64; 2]);
     fn take(&self, mask: u64) -> Option<[u8; 128]>;
     fn subscribe(&self, signal: &Arc<IoSignal>) -> Vec<IoSubscription>;

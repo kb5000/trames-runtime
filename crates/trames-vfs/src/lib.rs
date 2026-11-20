@@ -3296,7 +3296,7 @@ impl Vfs {
             }
             let n = if let Some((target, _)) = &dest_pipe {
                 let mut write =
-                    stream_transfer::WriteLease::take(target.data.clone(), bytes.len())?;
+                    stream_transfer::WriteLease::take(target.data.clone(), bytes.len(), false)?;
                 let n = write.count;
                 write.commit(&bytes[..n])?
             } else if let Some(offset) = to {
@@ -3308,7 +3308,11 @@ impl Vfs {
             return Ok(n);
         }
         let (pipe, _) = dest_pipe.unwrap();
-        let mut write = stream_transfer::WriteLease::take(pipe.data.clone(), count)?;
+        let mut write = stream_transfer::WriteLease::take(
+            pipe.data.clone(),
+            count,
+            source.borrow().is_regular_file(),
+        )?;
         let bytes = if let Some(offset) = from {
             self.pread(input, write.count, offset)?
         } else {
