@@ -2169,6 +2169,21 @@ impl Vfs {
                         }
                         b"exe" if p.state != 'Z' => return Ok(link(p.executable.clone())),
                         b"exe" => return Ok(None),
+                        b"oom_score" => {
+                            let points = if p.state == 'Z'
+                                || self.proc_namespace(at).global(p.tgid) == Some(1)
+                            {
+                                0
+                            } else {
+                                p.oom
+                                    .upgrade()
+                                    .map_or(0, |oom| oom.points(p.mapped_bytes, r.memory_limit))
+                            };
+                            format!("{points}\n").into_bytes()
+                        }
+                        b"coredump_filter" if i == 1 && p.tgid == p.pid => {
+                            return Ok(Some((file(Vec::new()), 0o100644)));
+                        }
                         b"oom_score_adj" => return Ok(Some((file(Vec::new()), 0o100644))),
                         b"setgroups" | b"uid_map" | b"gid_map" => {
                             let kind = match key {
@@ -3026,6 +3041,7 @@ impl Vfs {
                             "stat",
                             "status",
                             "statm",
+                            "oom_score",
                             "oom_score_adj",
                             "setgroups",
                             "uid_map",
@@ -3051,6 +3067,9 @@ impl Vfs {
                         .map(|s| s.as_bytes().to_vec()),
                     );
                     if depth == 1 {
+                        if p.pid == p.tgid {
+                            names.push(b"coredump_filter".to_vec());
+                        }
                         names.push(b"task".to_vec());
                     } else {
                         names.push(b"children".to_vec());

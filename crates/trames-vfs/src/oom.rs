@@ -29,6 +29,16 @@ impl OomTask {
             score: self.score.clone(),
         }
     }
+    pub(super) fn points(&self, resident: usize, capacity: usize) -> u32 {
+        let pages = (capacity / 4096) as i128;
+        let adjustment = i128::from(unpack(self.score.load(Ordering::Relaxed)).0);
+        if pages == 0 || adjustment == -1000 {
+            return 0;
+        }
+        // Guest swap and Linux page-table pages have no backing charge here.
+        let badness = (resident / 4096) as i128 + adjustment * (pages / 1000);
+        ((1000 + badness * 1000 / pages) * 2 / 3) as u32
+    }
     fn read(&self, offset: u64, count: usize) -> Vec<u8> {
         let value = format!("{}\n", unpack(self.score.load(Ordering::Relaxed)).0).into_bytes();
         let start = usize::try_from(offset)
@@ -134,6 +144,18 @@ impl Vfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn points_use_resident_pages_and_group_adjustment() {
+        let task = OomTask::default();
+        let total = 8000 * 4096;
+        assert_eq!(task.points(0, total), 666);
+        assert_eq!(task.points(total / 2, total), 1000);
+        task.thread().write(b"-500", true).unwrap();
+        assert_eq!(task.points(total / 2, total), 666);
+        task.write(b"-1000", true).unwrap();
+        assert_eq!(task.points(total, total), 0);
+    }
+
     #[test]
     fn concurrent_score_and_privilege_floor_updates_remain_one_atomic_state() {
         fn send_sync<T: Send + Sync>() {}

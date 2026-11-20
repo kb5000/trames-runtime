@@ -35,6 +35,9 @@ impl trames_vfs::ProcTask for ProcPid {
         info.identity = self.identity;
         Some(info)
     }
+    fn dump_policy(&self) -> Result<Option<trames_vfs::Dumpable>, trames_vfs::Errno> {
+        trames_vfs::ProcTask::dump_policy(&*self.task().ok_or(trames_vfs::Errno(3))?)
+    }
     fn memory_report(&self) -> Option<trames_memory::MemoryReport> {
         trames_vfs::ProcTask::memory_report(&*self.task()?)
     }
@@ -174,6 +177,12 @@ impl trames_vfs::ProcTask for IoTask {
                 })
                 .collect()
         })
+    }
+    fn dump_policy(&self) -> Result<Option<trames_vfs::Dumpable>, trames_vfs::Errno> {
+        if !self.present() {
+            return Err(trames_vfs::Errno(3));
+        }
+        Ok(self.live().then(|| self.proc_view.dump_policy()).flatten())
     }
     fn memory_report(&self) -> Option<trames_memory::MemoryReport> {
         self.live()

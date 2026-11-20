@@ -786,7 +786,7 @@ impl ProcRefresh {
         {
             return Self::Metadata;
         }
-        if path == b"/proc/meminfo" {
+        if path == b"/proc/meminfo" || path.ends_with(b"/oom_score") {
             return Self::HostMemory;
         }
         if path.ends_with(b"/stat") {
@@ -4368,6 +4368,9 @@ impl Vfs {
             .and_then(|scope| scope.at(&p, self.proc_namespace(&p).id()))
             .is_some_and(|scope| !scope.target.present())
         {
+            if self.proc_thread_directory(&p).is_some() {
+                return Err(Errno(2));
+            }
             return Ok(Vec::new());
         }
         let filesystem = p.filesystem(self);

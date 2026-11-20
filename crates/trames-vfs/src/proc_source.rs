@@ -110,6 +110,10 @@ pub trait ProcTask: Send + Sync {
     fn pid(&self) -> u32;
     fn observe(&self, demand: ProcRefresh, residency: Option<usize>) -> Option<ProcessInfo>;
     fn memory_report(&self) -> Option<trames_memory::MemoryReport>;
+    /// Per-mm dump policy of the original task. A zombie has released its mm.
+    fn dump_policy(&self) -> Result<Option<Dumpable>> {
+        Err(Errno(3))
+    }
     fn present(&self) -> bool {
         self.observe(ProcRefresh::Metadata, None).is_some()
     }
@@ -763,6 +767,17 @@ impl ProcessView {
     pub fn waiting(&self, waiting: bool) {
         self.state
             .store(if waiting { b'S' } else { b'R' } as u32, Ordering::Relaxed);
+    }
+    pub fn dump_policy(&self) -> Option<Dumpable> {
+        Some(
+            self.image
+                .read()
+                .unwrap()
+                .as_ref()?
+                .resources
+                .dumpable
+                .clone(),
+        )
     }
     pub fn task_name(&self) -> Option<TaskName> {
         self.image.read().unwrap().as_ref()?.resources.name.clone()

@@ -111,22 +111,36 @@ impl CredentialState {
 
 /// Original mm dumpability, shared by CLONE_VM tasks and retained proc views.
 #[derive(Clone)]
-pub struct Dumpable(Arc<std::sync::atomic::AtomicBool>);
+pub struct Dumpable(Arc<DumpPolicy>);
+struct DumpPolicy {
+    enabled: std::sync::atomic::AtomicBool,
+    filter: std::sync::atomic::AtomicU32,
+}
 impl Default for Dumpable {
     fn default() -> Self {
-        Self(Arc::new(std::sync::atomic::AtomicBool::new(true)))
+        Self(Arc::new(DumpPolicy {
+            enabled: true.into(),
+            filter: 0x33.into(),
+        }))
     }
 }
 impl Dumpable {
     pub fn get(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
+        self.0.enabled.load(Ordering::Relaxed)
     }
     pub fn set(&self, value: bool) {
-        self.0.store(value, Ordering::Relaxed);
+        self.0.enabled.store(value, Ordering::Relaxed);
+    }
+    pub(super) fn filter(&self) -> u32 {
+        self.0.filter.load(Ordering::Relaxed)
+    }
+    pub(super) fn set_filter(&self, value: u32) {
+        self.0.filter.store(value & 0x1ff, Ordering::Relaxed);
     }
     pub fn fork(&self) -> Self {
         let copy = Self::default();
         copy.set(self.get());
+        copy.set_filter(self.filter());
         copy
     }
 }
@@ -173,7 +187,7 @@ impl ExecCredentials {
             c.euid = c.uid;
             c.egid = c.gid;
         }
-        view.dumpable = Dumpable::default();
+        view.unshare_dumpable();
         view.dumpable.set(
             self.readable
                 && c.uid == c.euid

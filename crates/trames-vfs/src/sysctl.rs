@@ -46,6 +46,7 @@ pub(super) enum Control {
     UtsName(bool, Arc<readiness::ProcWatch>),
     Namei(Protection, Arc<NameiPolicy>),
     MountMax(Arc<mounts::MountPolicy>),
+    CoreFilter(Arc<dyn ProcTask>),
     Comm {
         task: Arc<dyn ProcTask>,
         thread_entry: bool,
@@ -66,6 +67,7 @@ impl Control {
             Self::Comm { task, thread_entry } => {
                 *thread_entry && task.comm().is_some_and(|(group, _)| group == tgid)
             }
+            Self::CoreFilter(_) => false, // ordinary inode owner/mode checks
             Self::UtsName(..) => credentials.euid == 0,
             Self::UserMap(control) => control.authorized(credentials),
             Self::Network(control) => control.authorized(credentials),
@@ -83,6 +85,16 @@ impl Control {
     }
     pub fn read(&self, offset: u64, count: usize, uts: &UtsNamespace) -> Result<Vec<u8>> {
         let value = match self {
+            Self::CoreFilter(task) => {
+                let Some(policy) = task.dump_policy()? else {
+                    return Ok(Vec::new());
+                };
+                return Ok(slice(
+                    format!("{:08x}\n", policy.filter()).as_bytes(),
+                    offset,
+                    count,
+                ));
+            }
             Self::Comm { task, .. } => {
                 let (_, name) = task.comm().ok_or(Errno(3))?;
                 let mut bytes = name.get();
@@ -111,6 +123,11 @@ impl Control {
         let credentials = &caller.credentials;
         let tgid = caller.lock_owner;
         let n = match self {
+            Self::CoreFilter(task) => {
+                let value = parse_dump_filter(bytes)?;
+                task.dump_policy()?.ok_or(Errno(3))?.set_filter(value);
+                return Ok(bytes.len());
+            }
             Self::UtsName(domain, _) => {
                 if !self.authorized(credentials, tgid) {
                     return Err(Errno(13));
@@ -167,6 +184,29 @@ impl Control {
         Ok(n)
     }
 }
+fn parse_dump_filter(bytes: &[u8]) -> Result<u32> {
+    // kstrtouint_from_user, base 0. The input buffer fits a binary u32,
+    // one leading sign and a final newline.
+    let bytes = &bytes[..bytes.len().min(34)];
+    let bytes = bytes.split(|&b| b == 0).next().unwrap_or_default();
+    let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let bytes = bytes.strip_prefix(b"+").unwrap_or(bytes);
+    let (radix, digits) = if let Some(digits) = bytes
+        .strip_prefix(b"0x")
+        .or_else(|| bytes.strip_prefix(b"0X"))
+    {
+        (16, digits)
+    } else if bytes.starts_with(b"0") {
+        (8, bytes)
+    } else {
+        (10, bytes)
+    };
+    let digits = std::str::from_utf8(digits).map_err(|_| Errno(22))?;
+    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+        return Err(Errno(22));
+    }
+    u32::from_str_radix(digits, radix).map_err(|_| Errno(34))
+}
 fn slice(bytes: &[u8], offset: u64, count: usize) -> Vec<u8> {
     let start = usize::try_from(offset)
         .unwrap_or(usize::MAX)
@@ -193,12 +233,14 @@ impl Vfs {
         if let Some(domain) = domain.filter(|_| self.uses_pseudo(path)) {
             return Some(Control::UtsName(domain, self.uts.watch_name(domain)));
         }
-        if path.ends_with(b"/comm") && self.uses_pseudo(path) {
+        if (path.ends_with(b"/comm") || path.ends_with(b"/coredump_filter"))
+            && self.uses_pseudo(path)
+        {
             let rest = path.strip_prefix(b"/proc/")?;
             let mut parts = rest.split(|b| *b == b'/');
             let pid = proc_task_id(parts.next()?)?;
             let (id, thread_entry) = match parts.next()? {
-                b"comm" => (pid, false),
+                b"comm" | b"coredump_filter" => (pid, false),
                 b"task" => {
                     let tid = proc_task_id(parts.next()?)?;
                     if parts.next()? != b"comm" {
@@ -220,6 +262,9 @@ impl Vfs {
                 .filter(|p| p.target.pid() == id)
                 .map(|p| p.target.clone())
                 .or_else(|| self.pseudo.borrow().source.as_ref()?.task(id))?;
+            if path.ends_with(b"/coredump_filter") {
+                return Some(Control::CoreFilter(task));
+            }
             task.comm()?;
             return Some(Control::Comm { task, thread_entry });
         }
@@ -245,6 +290,23 @@ impl Vfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dump_filter_inheritance_and_linux_integer_syntax() {
+        let policy = Dumpable::default();
+        let sibling = policy.clone();
+        let child = policy.fork();
+        assert_eq!(child.filter(), 0x33);
+        for (input, value) in [(b"+0x123\n".as_slice(), 0x123), (b"077", 63), (b"512", 0)] {
+            sibling.set_filter(parse_dump_filter(input).unwrap());
+            assert_eq!(policy.filter(), value);
+            assert_eq!(child.filter(), 0x33);
+        }
+        for invalid in [b"".as_slice(), b"-1", b"08", b"0x", b"++1", b"1 ", b"1\n\n"] {
+            assert_eq!(parse_dump_filter(invalid), Err(Errno(22)));
+        }
+        assert_eq!(parse_dump_filter(b"4294967296"), Err(Errno(34)));
+    }
 
     const HOST: &[u8] = b"/proc/sys/kernel/hostname";
     const DOMAIN: &[u8] = b"/proc/sys/kernel/domainname";
