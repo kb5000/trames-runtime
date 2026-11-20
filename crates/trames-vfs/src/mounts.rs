@@ -2942,12 +2942,38 @@ mod boundary_tests {
     }
 }
 
+fn atime_enabled(node: &Node, flags: u64) -> bool {
+    !node.volatile
+        && flags & (MS_RDONLY | MS_NOATIME) == 0
+        && (flags & MS_NODIRATIME == 0 || !matches!(node.content, Content::Directory))
+}
+
+fn relatime_due(node: &Node, now: storage::Timestamp) -> bool {
+    let atime = node.times[0];
+    node.times[1..]
+        .iter()
+        .any(|t| (t.seconds, t.nanos) >= (atime.seconds, atime.nanos))
+        || now.seconds.saturating_sub(atime.seconds) >= 86400
+}
+
+pub(super) fn link_accessed(
+    node: &NodeRef,
+    state: std::sync::RwLockReadGuard<'_, Node>,
+    mount: Option<&MountData>,
+) {
+    let flags = mount.map_or(0, |m| m.flags.get());
+    if !atime_enabled(&state, flags)
+        || flags & MS_RELATIME != 0 && !relatime_due(&state, storage::Timestamp::now())
+    {
+        return;
+    }
+    drop(state);
+    accessed(&mut node.borrow_mut(), mount);
+}
+
 pub(super) fn accessed(node: &mut Node, mount: Option<&MountData>) {
     let flags = mount.map_or(0, |m| m.flags.get());
-    if node.volatile
-        || flags & (MS_RDONLY | MS_NOATIME) != 0
-        || flags & MS_NODIRATIME != 0 && matches!(node.content, Content::Directory)
-    {
+    if !atime_enabled(node, flags) {
         return;
     }
     if let Content::File(storage::FileData::Plain(data)) = &node.content {
@@ -2956,13 +2982,7 @@ pub(super) fn accessed(node: &mut Node, mount: Option<&MountData>) {
         }
     }
     let now = storage::Timestamp::now();
-    let atime = node.times[0];
-    if flags & MS_RELATIME != 0
-        && node.times[1..]
-            .iter()
-            .all(|t| (t.seconds, t.nanos) < (atime.seconds, atime.nanos))
-        && now.seconds.saturating_sub(atime.seconds) < 86400
-    {
+    if flags & MS_RELATIME != 0 && !relatime_due(node, now) {
         return;
     }
     node.times[0] = now;

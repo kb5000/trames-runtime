@@ -847,6 +847,7 @@ pub struct Vfs {
     mount_resources: Arc<SharedCell<Vec<std::sync::Weak<mounts::MountIdentity>>>>,
     detached_mounts: Arc<SharedCell<Vec<Vec<Arc<Mount>>>>>,
     pub credentials: Credentials,
+    namei_policy: Arc<sysctl::NameiPolicy>,
     pseudo: Arc<SharedCell<pseudo::PseudoFs>>,
     kernel_log: Arc<kernel_log::KernelLog>,
     binder: Arc<binder::Contexts>,
@@ -944,6 +945,7 @@ impl Vfs {
             mount_resources: self.mount_resources.clone(),
             detached_mounts: self.detached_mounts.clone(),
             credentials: self.credentials.clone(),
+            namei_policy: self.namei_policy.clone(),
             pseudo: self.pseudo.clone(),
             kernel_log: self.kernel_log.clone(),
             binder: self.binder.clone(),
@@ -1001,6 +1003,7 @@ impl Vfs {
             mount_resources: Arc::default(),
             detached_mounts: Arc::default(),
             credentials: Credentials::default(),
+            namei_policy: Arc::default(),
             pseudo: Arc::new(SharedCell::new(pseudo::PseudoFs::default())),
             kernel_log: Arc::default(),
             binder: Arc::default(),
@@ -1876,6 +1879,8 @@ impl Vfs {
             if !self.allowed(&n, 1) {
                 return Err(Errno(13));
             }
+            let parent_owner = n.uid;
+            let parent_mode = n.mode;
             drop(n);
             if part == b"." {
                 continue;
@@ -2003,7 +2008,16 @@ impl Vfs {
                     Err(e) => return Err(e),
                 };
                 if let Some(node) = node {
-                    if let Content::Symlink(target) = &node.borrow().content {
+                    let n = node.borrow();
+                    if let Content::Symlink(target) = &n.content {
+                        if parts.is_empty()
+                            && parent_mode & 0o1002 == 0o1002
+                            && n.uid != self.credentials.fsuid
+                            && n.uid != parent_owner
+                            && self.namei_policy.get(sysctl::Protection::Symlinks) != 0
+                        {
+                            return Err(Errno(13));
+                        }
                         let caller_target = self.proc_caller_link(&current)?;
                         let target = caller_target.as_deref().unwrap_or(target);
                         if policy & 4 != 0 {
@@ -2020,11 +2034,7 @@ impl Vfs {
                         if links > 40 {
                             return Err(Errno(40));
                         }
-                        current = if target.starts_with(b"/") {
-                            root.clone()
-                        } else {
-                            parent
-                        };
+                        let absolute = target.starts_with(b"/");
                         let mut expanded: VecDeque<_> = target
                             .split(|&b| b == b'/')
                             .filter(|p| !p.is_empty())
@@ -2033,6 +2043,9 @@ impl Vfs {
                         if target.ends_with(b"/") {
                             expanded.push_back(b".".to_vec());
                         }
+                        let mount = current.mount.as_deref().map(|m| &**m);
+                        mounts::link_accessed(&node, n, mount);
+                        current = if absolute { root.clone() } else { parent };
                         expanded.append(&mut parts);
                         if expanded.iter().map(|p| p.len() + 1).sum::<usize>() >= MAX_PATH {
                             return Err(Errno(36));
@@ -2086,11 +2099,8 @@ impl Vfs {
             }
             self.refresh_pseudo_fd(dirfd as u32)?;
             let open = description.borrow();
-            let node = open.node.as_ref().ok_or(Errno(2))?.borrow();
-            return match &node.content {
-                Content::Symlink(target) => Ok(target.clone()),
-                _ => Err(Errno(2)),
-            };
+            let node = open.node.as_ref().ok_or(Errno(2))?;
+            return Self::symlink_text(node, open.mount.as_deref(), Errno(2));
         }
         let dest = self.resolve_final(dirfd, path, false)?;
         self.check_proc_inspection(&dest, true)?;
@@ -2101,11 +2111,20 @@ impl Vfs {
             return Ok(target);
         }
         let node = self.node(&dest)?;
+        Self::symlink_text(&node, dest.mount.as_deref().map(|m| &**m), Errno(22))
+    }
+    fn symlink_text(
+        node: &NodeRef,
+        mount: Option<&mounts::MountData>,
+        invalid: Errno,
+    ) -> Result<Vec<u8>> {
         let n = node.borrow();
-        match &n.content {
-            Content::Symlink(target) => Ok(target.clone()),
-            _ => Err(Errno(22)),
-        }
+        let Content::Symlink(target) = &n.content else {
+            return Err(invalid);
+        };
+        let text = target.clone();
+        mounts::link_accessed(node, n, mount);
+        Ok(text)
     }
     pub fn import_file(&mut self, path: &[u8], bytes: Vec<u8>) -> Result<()> {
         self.import_reader(path, &mut bytes.as_slice(), false)
@@ -2176,13 +2195,13 @@ impl Vfs {
     pub fn import_alias(&mut self, existing: &[u8], alias: &[u8], executable: bool) -> Result<()> {
         let source = self.resolve_final(AT_FDCWD, existing, false)?;
         let dest = self.resolve_final(AT_FDCWD, alias, false)?;
-        self.link_resolved(&source, &dest, executable)
+        self.link_resolved(&source, &dest, Some(executable))
     }
     fn link_resolved(
         &mut self,
         source: &ResolvedPath,
         dest: &ResolvedPath,
-        executable: bool,
+        import_executable: Option<bool>,
     ) -> Result<()> {
         if source.mount.as_ref().map(|m| m.id) != dest.mount.as_ref().map(|m| m.id) {
             return Err(Errno(18));
@@ -2195,6 +2214,12 @@ impl Vfs {
         if self.node(dest).is_ok() {
             return Err(Errno(17));
         }
+        if import_executable.is_none() {
+            dest.writable()?;
+            self.check_link_source(&source.borrow())?;
+            self.check_parent_write(dest)?;
+        }
+        let executable = import_executable == Some(true);
         // Synthesized endpoints have a separate inode allocation/lifetime and
         // cannot be inserted into the persistent filesystem's inode table.
         if source.borrow().volatile
@@ -2564,7 +2589,9 @@ impl Vfs {
                     mount.writable_data(node)?;
                 }
                 if let Some(
-                    control @ (sysctl::Control::UserNamespaces(..) | sysctl::Control::UtsName(..)),
+                    control @ (sysctl::Control::UserNamespaces(..)
+                    | sysctl::Control::UtsName(..)
+                    | sysctl::Control::Namei(..)),
                 ) = &network_control
                 {
                     if !control.authorized(&self.credentials, self.lock_owner) {
@@ -2702,6 +2729,9 @@ impl Vfs {
             }
         }
         let node = forced_node.map_or_else(|| self.node(&p), Ok)?;
+        if existed && flags & O_CREAT != 0 {
+            self.check_sticky_create(&p, &node)?;
+        }
         {
             let n = node.borrow();
             self.check_device_open(&n, flags)?;

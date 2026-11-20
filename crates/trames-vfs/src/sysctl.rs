@@ -3,11 +3,47 @@
 use super::*;
 pub(super) const MAX_USER_NAMESPACES: &[u8] = b"/proc/sys/user/max_user_namespaces";
 
+#[derive(Clone, Copy)]
+pub(super) enum Protection {
+    Hardlinks,
+    Symlinks,
+    Fifos,
+    Regular,
+}
+impl Protection {
+    pub(super) fn at(path: &[u8]) -> Option<Self> {
+        match path {
+            b"/proc/sys/fs/protected_hardlinks" => Some(Self::Hardlinks),
+            b"/proc/sys/fs/protected_symlinks" => Some(Self::Symlinks),
+            b"/proc/sys/fs/protected_fifos" => Some(Self::Fifos),
+            b"/proc/sys/fs/protected_regular" => Some(Self::Regular),
+            _ => None,
+        }
+    }
+    fn max(self) -> u32 {
+        match self {
+            Self::Hardlinks | Self::Symlinks => 1,
+            Self::Fifos | Self::Regular => 2,
+        }
+    }
+}
+pub(super) struct NameiPolicy([std::sync::atomic::AtomicU32; 4]);
+impl Default for NameiPolicy {
+    fn default() -> Self {
+        Self([1, 1, 0, 0].map(std::sync::atomic::AtomicU32::new))
+    }
+}
+impl NameiPolicy {
+    pub(super) fn get(&self, kind: Protection) -> u32 {
+        self.0[kind as usize].load(Ordering::Relaxed)
+    }
+}
 #[derive(Clone)]
 pub(super) enum Control {
     Network(network::Control),
     NrOpen(DescriptorCeiling),
     UtsName(bool, Arc<readiness::ProcWatch>),
+    Namei(Protection, Arc<NameiPolicy>),
     MountMax(Arc<mounts::MountPolicy>),
     Comm {
         task: Arc<dyn ProcTask>,
@@ -35,7 +71,9 @@ impl Control {
             Self::UserNamespaces(owner, _) => {
                 owner.capable(credentials, capabilities::SYS_RESOURCE)
             }
-            Self::MountMax(_) => credentials.euid == 0 && credentials.user_namespace.is_initial(),
+            Self::MountMax(_) | Self::Namei(..) => {
+                credentials.euid == 0 && credentials.user_namespace.is_initial()
+            }
             Self::NrOpen(_) => {
                 credentials.has_cap(capabilities::SYS_RESOURCE)
                     || credentials.euid == 0 && credentials.user_namespace.is_initial()
@@ -58,6 +96,7 @@ impl Control {
             }
             Self::UserMap(control) => return control.read(offset, count),
             Self::Network(control) => return control.read(offset, count),
+            Self::Namei(kind, policy) => policy.get(*kind),
             Self::MountMax(policy) => policy.get(),
             Self::NrOpen(limit) => limit.get(),
             Self::UserNamespaces(_, limit) => limit.max(),
@@ -88,7 +127,7 @@ impl Control {
             }
             Self::UserMap(control) => control.write(bytes, offset, credentials),
             Self::Network(control) => control.write(bytes, offset, control.authorized(credentials)),
-            Self::MountMax(_) | Self::NrOpen(_) | Self::UserNamespaces(_, _) => {
+            Self::Namei(..) | Self::MountMax(_) | Self::NrOpen(_) | Self::UserNamespaces(_, _) => {
                 if !self.authorized(credentials, tgid) {
                     return Err(Errno(13));
                 }
@@ -104,6 +143,9 @@ impl Control {
                     .parse::<u32>()
                     .map_err(|_| Errno(22))?;
                 match self {
+                    Self::Namei(kind, policy) if value <= kind.max() => {
+                        policy.0[*kind as usize].store(value, Ordering::Relaxed)
+                    }
                     Self::MountMax(policy) if value > 0 => policy.set(value),
                     Self::NrOpen(limit) if (1..=MAX_FDS).contains(&value) => limit.set(value),
                     Self::UserNamespaces(_, limit) if value <= i32::MAX as u32 => limit.set(value),
@@ -169,6 +211,8 @@ impl Vfs {
                 self.credentials.user_namespace.clone(),
                 self.user_namespace_limits(),
             ))
+        } else if let Some(kind) = Protection::at(path).filter(|_| self.uses_pseudo(path)) {
+            Some(Control::Namei(kind, self.namei_policy.clone()))
         } else if path.as_ref() == b"/proc/sys/fs/mount-max" && self.uses_pseudo(path) {
             Some(Control::MountMax(self.pseudo.borrow().mount_policy.clone()))
         } else if self.uses_pseudo(path) && path.as_ref() == b"/proc/sys/fs/nr_open" {

@@ -172,6 +172,7 @@ impl Vfs {
         view.detached_mounts = self.detached_mounts.clone();
         view.context.paths.registry = view.mount_registry.clone();
         view.credentials = self.credentials.clone();
+        view.namei_policy = self.namei_policy.clone();
         view.dumpable = self.dumpable.clone();
         view.kernel_log = self.kernel_log.clone();
         view.binder = self.binder.clone();

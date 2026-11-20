@@ -23,8 +23,51 @@ impl Vfs {
             self.node(&dest)?;
             return Err(Errno(17));
         }
-        self.check_parent_write(&dest)?;
-        self.link_resolved(&source, &dest, false)
+        self.link_resolved(&source, &dest, None)
+    }
+    pub(super) fn check_link_source(&self, source: &Node) -> Result<()> {
+        if self.credentials.fsuid == source.uid
+            || self.namei_policy.get(sysctl::Protection::Hardlinks) == 0
+            || self
+                .credentials
+                .inode_cap(capabilities::FOWNER, source.uid, source.gid)
+        {
+            return Ok(());
+        }
+        let safe = matches!(source.content, Content::File(_))
+            && source.mode & 0o4000 == 0
+            && source.mode & 0o2010 != 0o2010
+            && self.allowed(source, 6);
+        if safe {
+            Ok(())
+        } else {
+            Err(Errno(1))
+        }
+    }
+    pub(super) fn check_sticky_create(&self, path: &ResolvedPath, node: &NodeRef) -> Result<()> {
+        let n = node.borrow();
+        if n.uid == self.credentials.fsuid {
+            return Ok(());
+        }
+        let level = match n.content {
+            Content::File(_) => self.namei_policy.get(sysctl::Protection::Regular),
+            Content::Fifo(_) => self.namei_policy.get(sysctl::Protection::Fifos),
+            _ => 0,
+        };
+        if level == 0 {
+            return Ok(());
+        }
+        let owner = n.uid;
+        drop(n);
+        let parent = self.node(&path.parent())?;
+        let dir = parent.borrow();
+        if owner != dir.uid
+            && dir.mode & 0o1000 != 0
+            && (dir.mode & 2 != 0 || level == 2 && dir.mode & 0o020 != 0)
+        {
+            return Err(Errno(13));
+        }
+        Ok(())
     }
     /// Move or exchange complete subtrees under one namespace transaction.
     pub fn rename_at(
@@ -462,5 +505,115 @@ impl Vfs {
         };
         inotify::notify(&node, mask, link.as_ref());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod namei_tests {
+    use super::*;
+
+    fn setting(v: &mut Vfs, name: &str, value: &[u8]) -> Result<usize> {
+        let path = format!("/proc/sys/fs/protected_{name}");
+        let fd = v.open_at(AT_FDCWD, path.as_bytes(), 1, 0)?;
+        let result = v.write(fd, value);
+        v.close(fd)?;
+        result
+    }
+
+    #[test]
+    fn shared_link_policy_uses_filesystem_credentials_and_original_inode() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, RuntimeInfo::default());
+        v.mkdir_at(AT_FDCWD, b"/public", 0o777).unwrap();
+        v.chmod_at(AT_FDCWD, b"/public", 0o1777).unwrap();
+        v.import_file(b"/target", Vec::new()).unwrap();
+        v.symlink_at(b"/target", AT_FDCWD, b"/public/link").unwrap();
+        v.chown_at(AT_FDCWD, b"/public/link", 1000, 1000, true)
+            .unwrap();
+        let mut user = v.clone();
+        user.credentials = Credentials::user(1001, 1001);
+        let link = |v: &mut Vfs| v.link_at(AT_FDCWD, b"/target", AT_FDCWD, b"/public/alias");
+        assert_eq!(link(&mut user), Err(Errno(1)));
+        assert_eq!(user.stat_at(AT_FDCWD, b"/public/link"), Err(Errno(13)));
+        assert_eq!(
+            user.readlink_at(AT_FDCWD, b"/public/link").unwrap(),
+            b"/target"
+        );
+        assert_eq!(setting(&mut user, "hardlinks", b"0"), Err(Errno(13)));
+        assert_eq!(setting(&mut v, "hardlinks", b"2"), Err(Errno(22)));
+        setting(&mut v, "hardlinks", b"0").unwrap();
+        link(&mut user).unwrap();
+        setting(&mut v, "symlinks", b"0").unwrap();
+        assert!(user.stat_at(AT_FDCWD, b"/public/link").is_ok());
+        setting(&mut v, "hardlinks", b"1").unwrap();
+        v.chmod_at(AT_FDCWD, b"/target", 0o666).unwrap();
+        user.link_at(AT_FDCWD, b"/target", AT_FDCWD, b"/public/rw")
+            .unwrap();
+        v.chmod_at(AT_FDCWD, b"/target", 0o2776).unwrap();
+        assert_eq!(
+            user.link_at(AT_FDCWD, b"/target", AT_FDCWD, b"/public/sgid"),
+            Err(Errno(1))
+        );
+        v.chmod_at(AT_FDCWD, b"/target", 0o2666).unwrap();
+        user.link_at(AT_FDCWD, b"/target", AT_FDCWD, b"/public/sgid-data")
+            .unwrap();
+    }
+
+    #[test]
+    fn protected_create_checks_existing_files_and_fifos_in_sticky_directories() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, RuntimeInfo::default());
+        v.mkdir_at(AT_FDCWD, b"/group", 0o770).unwrap();
+        v.chmod_at(AT_FDCWD, b"/group", 0o1770).unwrap();
+        v.import_file(b"/group/file", Vec::new()).unwrap();
+        v.mknod_at(AT_FDCWD, b"/group/fifo", 0o10644, 0).unwrap();
+        for (name, path) in [("regular", b"/group/file"), ("fifos", b"/group/fifo")] {
+            v.chown_at(AT_FDCWD, path, 1001, 1001, false).unwrap();
+            let flags = O_CREAT | 0x800; // O_NONBLOCK, including for the FIFO.
+            assert_eq!(setting(&mut v, name, b"3"), Err(Errno(22)));
+            setting(&mut v, name, b"1").unwrap();
+            let fd = v.open_at(AT_FDCWD, path, flags, 0).unwrap();
+            v.close(fd).unwrap();
+            setting(&mut v, name, b"2").unwrap();
+            assert_eq!(v.open_at(AT_FDCWD, path, flags, 0), Err(Errno(13)));
+            assert_eq!(v.open_at(AT_FDCWD, path, flags | 0x80, 0), Err(Errno(17)));
+            let fd = v.open_at(AT_FDCWD, path, 0x800, 0).unwrap();
+            v.close(fd).unwrap();
+            v.chmod_at(AT_FDCWD, b"/group", 0o1777).unwrap();
+            setting(&mut v, name, b"1").unwrap();
+            assert_eq!(v.open_at(AT_FDCWD, path, flags, 0), Err(Errno(13)));
+            v.chown_at(AT_FDCWD, path, 0, 0, false).unwrap();
+            let fd = v.open_at(AT_FDCWD, path, flags, 0).unwrap();
+            v.close(fd).unwrap();
+            v.chmod_at(AT_FDCWD, b"/group", 0o1770).unwrap();
+        }
+    }
+
+    #[test]
+    fn link_timestamps_follow_access_mount_and_empty_path_descriptor() {
+        let mut v = Vfs::default();
+        v.mkdir_at(AT_FDCWD, b"/src", 0o755).unwrap();
+        v.mkdir_at(AT_FDCWD, b"/view", 0o755).unwrap();
+        v.import_file(b"/target", Vec::new()).unwrap();
+        v.symlink_at(b"/target", AT_FDCWD, b"/src/link").unwrap();
+        v.mount(Some(b"/src"), b"/view", None, 4096, None).unwrap();
+        let atime = |v: &Vfs| {
+            let bytes = v.stat_at_flags(AT_FDCWD, b"/src/link", true).unwrap();
+            i64::from_le_bytes(bytes[72..80].try_into().unwrap())
+        };
+        for flags in [mounts::MS_NOATIME, mounts::MS_RDONLY, mounts::MS_RELATIME] {
+            v.mount(None, b"/view", None, 4096 | 32 | flags, None)
+                .unwrap();
+            v.set_times_flags(AT_FDCWD, Some(b"/src/link"), Some([[1, 0], [2, 0]]), 0x100)
+                .unwrap();
+            assert_eq!(atime(&v), 1);
+            let fd = v
+                .open_at(AT_FDCWD, b"/view/link", O_PATH | O_NOFOLLOW, 0)
+                .unwrap();
+            assert_eq!(v.readlink_at(fd as i32, b"").unwrap(), b"/target");
+            v.close(fd).unwrap();
+            v.stat_at(AT_FDCWD, b"/view/link").unwrap();
+            assert_eq!(atime(&v) > 1, flags == mounts::MS_RELATIME);
+        }
     }
 }
