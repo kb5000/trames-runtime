@@ -465,6 +465,9 @@ impl DirectSyscalls {
         self.protocol_bound.set(false);
         self
     }
+    pub fn descriptor_factory(&self) -> Option<&trames_vfs::DescriptorFactory> {
+        self.resources.as_ref()
+    }
     pub fn supports_creation(&self, number: u32) -> bool {
         if number == 425 {
             self.paths.is_some()

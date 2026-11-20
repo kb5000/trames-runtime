@@ -4,6 +4,8 @@
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+const CLONE_PIDFD: u64 = 0x1000;
+
 pub(super) struct Child<C: Cpu> {
     pub id: u32,
     pub process: Box<Process<C>>,
@@ -328,10 +330,14 @@ impl Birth {
             .checked_add(size)
             .filter(|top| *top < trames_memory::ADDRESS_LIMIT)
             .ok_or(Errno(22))?;
-        self.clone_task(
+        if flags & CLONE_PIDFD != 0 && flags & 0x100000 != 0 && word(8) == word(24) {
+            return Err(Errno(22));
+        }
+        self.birth_with_pidfd(
             pid,
             p,
             [flags | signal, top, word(24), word(56), word(16), 0],
+            word(8),
         )
     }
     pub(super) fn clone_task<C: Cpu>(
@@ -340,7 +346,20 @@ impl Birth {
         p: &mut Process<C>,
         a: [u64; 6],
     ) -> Result<Child<C>, Errno> {
+        if a[0] & CLONE_PIDFD != 0 && a[0] & (0x100000 | 0x400000) != 0 {
+            return Err(Errno(22));
+        }
+        self.birth_with_pidfd(pid, p, a, a[2])
+    }
+    fn birth_with_pidfd<C: Cpu>(
+        &self,
+        pid: u32,
+        p: &mut Process<C>,
+        a: [u64; 6],
+        pidfd_address: u64,
+    ) -> Result<Child<C>, Errno> {
         const ALLOWED: u64 = 0xff
+            | CLONE_PIDFD
             | 0xf00
             | 0x4000
             | 0x8000
@@ -357,7 +376,8 @@ impl Birth {
             | trames_vfs::CLONE_NEWCGROUP;
         let threaded = a[0] & 0x10000 != 0;
         let shared_vm = a[0] & 0x100 != 0;
-        if a[0] & !ALLOWED != 0
+        if threaded && a[0] & CLONE_PIDFD != 0
+            || a[0] & !ALLOWED != 0
             || a[0] & trames_vfs::CLONE_NEWUSER != 0 && a[0] & (0x200 | 0x10000) != 0
             || (a[0] & trames_vfs::CLONE_NEWPID != 0 && a[0] & (0x10000 | 0x8000) != 0)
             || (threaded
@@ -466,6 +486,20 @@ impl Birth {
         }
         // Source callers already admitted this resource without blocking their
         // executor. Joined/bootstrap callers use the same short transaction.
+        // Fork Files first: only CLONE_FILES children share the returned descriptor.
+        let pidfd = if a[0] & CLONE_PIDFD != 0 {
+            let slot = p
+                .linux
+                .vfs
+                .descriptor_factory()
+                .reserve_pidfd(child.wait_event.pidfd(id), 0)?;
+            p.memory
+                .write(pidfd_address, &slot.number().to_le_bytes())
+                .map_err(|_| Errno(14))?;
+            Some(slot)
+        } else {
+            None
+        };
         let policy_group = p.seccomp.birth_group();
         let _policy = policy_group.write_owned().into_admission();
         // Publish credentials only: a new PID namespace is activated inside
@@ -494,6 +528,9 @@ impl Birth {
             None,
             inherit_parent.then_some(&*p),
         )?;
+        if let Some(slot) = pidfd {
+            slot.publish()?;
+        }
         // Linux stores these user TIDs after task birth and ignores
         // copyout faults. CHILD_CLEARTID only records its address.
         let parent_tid = p.linux.vfs.visible_pid(id);

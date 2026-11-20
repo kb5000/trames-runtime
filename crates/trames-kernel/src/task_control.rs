@@ -297,6 +297,12 @@ impl Group {
         }
         status
     }
+    pub fn pidfd(&self) -> Option<Arc<trames_vfs::PidFd>> {
+        let state = self.state.lock().unwrap();
+        let (child, id) = (state.child.upgrade()?, state.tgid);
+        drop(state);
+        Some(child.pidfd(id))
+    }
     pub fn exit_status(&self) -> Option<i32> {
         let state = self.state.lock().unwrap();
         state.completed.then_some(state.exit_status).flatten()

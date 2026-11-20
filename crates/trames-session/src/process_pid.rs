@@ -60,13 +60,26 @@ impl<C: Cpu> Kernel<C> {
         p: &mut Process<C>,
         a: [u64; 6],
     ) -> Result<Option<u64>, Errno> {
-        let request = trames_kernel::children::Wait::prepare(pid, 95, a)?;
+        let request = if a[0] as u32 == 3 {
+            trames_kernel::children::Wait::prepare_with_files(
+                pid,
+                95,
+                a,
+                &p.linux.vfs.fd_flags_snapshot(),
+                p.linux.vfs.pid_namespace(),
+            )
+        } else {
+            trames_kernel::children::Wait::prepare(pid, 95, a)
+        }?;
         let result = p.children.wait(
             request,
             p.linux.vfs.pid_namespace(),
             p.group(),
             &mut p.memory,
         );
+        if a[0] as u32 == 3 && matches!(result, Ok(None)) {
+            p.state = State::PidfdWait(request);
+        }
         if p.children.take_reaped() {
             self.reap_waited();
         }

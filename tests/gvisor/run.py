@@ -99,6 +99,18 @@ def list_cases(binary):
         raise RuntimeError('No gtest cases listed: ' + str(binary))
     return cases
 
+TRACEE_WAIT = 'WaitTest.TraceeWALL'
+
+
+def tracee_fixture_error(case, stderr):
+    # The parent accepts ECHILD on native Linux, even when its child aborted.
+    if case != TRACEE_WAIT or stderr is None or not stderr.is_file():
+        return None
+    failure = 'Check failed: ptrace(PTRACE_TRACEME, 0, nullptr, nullptr) == 0'
+    with stderr.open(errors='replace') as stream:
+        return next((line.rstrip() for line in stream if line.startswith(failure)), None)
+
+
 def classify(xml, code, timed_out, expected):
     if timed_out:
         return str(timed_out), []
@@ -121,6 +133,8 @@ def classify(xml, code, timed_out, expected):
         return 'failed', failures
     if case.find('skipped') is not None:
         return 'skipped', [case.find('skipped').get('message', '')]
+    if code == 0 and (error := tracee_fixture_error(expected, xml.with_suffix('.stderr'))):
+        return 'fixture_failed', [error]
     return ('passed' if code == 0 else 'crashed'), []
 
 def reuse_rows(args, plan):
@@ -141,6 +155,7 @@ def reuse_rows(args, plan):
 # expire. The default worker watchdog must also allow startup and XML export.
 SIGNAL_WAIT_TIMEOUTS = {
     'ppoll': {'PpollTest.SignalMaskBlocksSignal': 45},
+    'vfork': {'VforkTest.ParentStopsUntilChildExecves': 40},
     'pselect': {'PselectTest.SignalMaskBlocksSignal': 45},
 }
 

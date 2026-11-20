@@ -90,6 +90,71 @@ impl IoRoutes {
         a: [u64; 6],
         memory: &impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
+        self.queued(source, number, a, memory, false)
+    }
+    pub fn pidfd_open(
+        &self,
+        factory: &trames_vfs::DescriptorFactory,
+        pid: i32,
+        flags: u32,
+    ) -> Result<u64, Errno> {
+        if pid <= 0 || flags & !trames_vfs::O_NONBLOCK != 0 {
+            return Err(Errno(22));
+        }
+        let global = self.namespace.global(pid as u32).ok_or(Errno(3))?;
+        let task = self.directory.proc_task(global).ok_or(Errno(3))?;
+        if task.tgid() != global {
+            return Err(Errno(2));
+        }
+        let target = task.lifecycle().pidfd().ok_or(Errno(3))?;
+        factory
+            .reserve_pidfd(target, flags)?
+            .publish()
+            .map(u64::from)
+    }
+
+    pub fn pidfd_send(
+        &self,
+        source: &IoTask,
+        files: &trames_vfs::FdFlags,
+        a: [u64; 6],
+        memory: &impl CpuMemory,
+    ) -> Result<u64, Errno> {
+        if a[3] as u32 != 0 {
+            return Err(Errno(22));
+        }
+        let (target, _) = files.pidfd(a[0] as u32)?;
+        let global = target.pid();
+        let observed = self
+            .directory
+            .proc_task(global)
+            .and_then(|t| t.lifecycle().pidfd())
+            .ok_or(Errno(3))?;
+        if !Arc::ptr_eq(&observed, &target) {
+            return Err(Errno(3));
+        }
+        let local = self.namespace.local(global);
+        if local == 0 {
+            return Err(Errno(22));
+        }
+        let args = [u64::from(local), a[1], a[2], 0, 0, 0];
+        // Global IDs are never recycled in a session. Signal delivery can now
+        // use the ordinary permission, disposition and group-queue checks.
+        if a[2] != 0 {
+            self.queued(source, 138, args, memory, true)
+        } else {
+            self.send(source, 129, args)
+        }
+        .expect("process-directed route")
+    }
+    fn queued(
+        &self,
+        source: &IoTask,
+        number: u32,
+        a: [u64; 6],
+        memory: &impl CpuMemory,
+        check_signo: bool,
+    ) -> Option<Result<u64, Errno>> {
         let (route, args, address) = if number == 138 {
             (129, a, a[2])
         } else {
@@ -104,6 +169,9 @@ impl IoRoutes {
         }
         let code = i32::from_le_bytes(user[8..12].try_into().unwrap());
         let sig = a[if number == 240 { 2 } else { 1 }] as u32;
+        if check_signo && u32::from_le_bytes(user[..4].try_into().unwrap()) != sig {
+            return Some(Err(Errno(22)));
+        }
         let limit = match sig {
             4 => 11,
             5 => 6,

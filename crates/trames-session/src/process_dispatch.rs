@@ -136,6 +136,10 @@ impl Dispatch {
                     mask: p.signals.mask,
                 }),
             ))
+        } else if let State::PidfdWait(request) = p.state {
+            Some(crate::run_queue::WaitState::Child(
+                crate::run_queue::ChildWait::new(request),
+            ))
         } else if let State::Blocked(number @ (95 | 260), args) = p.state {
             Some(crate::run_queue::WaitState::Child(
                 crate::run_queue::ChildWait::new(

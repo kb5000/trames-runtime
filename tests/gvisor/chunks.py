@@ -11,7 +11,7 @@ import subprocess
 import time
 import xml.etree.ElementTree as ET
 
-from run import classify, execute, guest_terminal, save
+from run import TRACEE_WAIT, classify, execute, guest_terminal, save, tracee_fixture_error
 
 
 class Progress:
@@ -37,9 +37,6 @@ class Progress:
         return self.timeout(self.active)- (time.monotonic()-self.since) if self.active else 30-(time.monotonic()-self.since)
 
 
-TRACEE_WAIT = 'WaitTest.TraceeWALL'
-
-
 def xml_rows(xml, code, expected, stderr=None):
     if not xml.is_file() or code not in (0,1):return None
     try:cases=ET.parse(xml).findall('.//testcase')
@@ -59,15 +56,9 @@ def xml_rows(xml, code, expected, stderr=None):
         status='failed' if failed else 'skipped' if skipped is not None else 'passed'
         messages=[c.get('message','') for c in failed] if failed else [skipped.get('message','')] if skipped is not None else []
         rows.append(dict(case=name,status=status,messages=messages,seconds=float(case.get('time','0'))))
-    # The native-Linux branch also accepts ECHILD. A tracee that aborted in
-    # setup can therefore yield passing parent XML without exercising ptrace.
-    if expected == [TRACEE_WAIT] and rows[0]['status'] == 'passed' and stderr is not None:
-        failure = 'Check failed: ptrace(PTRACE_TRACEME, 0, nullptr, nullptr) == 0'
-        with stderr.open(errors='replace') as stream:
-            for line in stream:
-                if line.startswith(failure):
-                    rows[0].update(status='fixture_failed', messages=[line.rstrip()])
-                    break
+    if len(rows) == 1 and rows[0]['status'] == 'passed':
+        if error := tracee_fixture_error(rows[0]['case'], stderr):
+            rows[0].update(status='fixture_failed', messages=[error])
     return rows
 
 

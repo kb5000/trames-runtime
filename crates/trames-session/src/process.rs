@@ -104,6 +104,7 @@ enum State {
         began: Instant,
     },
     Blocked(u32, [u64; 6]),
+    PidfdWait(trames_kernel::children::Wait),
     Sleep(Instant, u64),
     Suspend(u64),
     Completion(Arc<trames_kernel::completion::Completion>),
@@ -216,6 +217,7 @@ impl<C: Cpu> Process<C> {
                 | State::Policy(_)
                 | State::Barrier(_)
                 | State::Blocked(95 | 260, _)
+                | State::PidfdWait(_)
         ) || self.worker_io_candidate(id)
             || self.worker_gpu_candidate()
     }
@@ -1797,7 +1799,11 @@ impl<C: Cpu> Kernel<C> {
             self.exit(pid, p, 11);
             return Ok(true);
         }
-        match p.state.clone() {
+        let interrupted = match p.state.clone() {
+            State::PidfdWait(wait) => State::Blocked(wait.number, wait.args),
+            other => other,
+        };
+        match interrupted {
             State::Blocked(number, a) => {
                 if let Some(fd) = p.pending_open.take() {
                     p.linux.vfs.cancel_fifo_open(fd);
@@ -2417,7 +2423,7 @@ impl<C: Cpu> Kernel<C> {
             // The legacy conformance oracle predates queued signals. Exercise
             // their canonical resource implementation here too; production
             // calls stay on their original worker through WorkerSnapshot.
-            if matches!(number, 138 | 240) {
+            if matches!(number, 138 | 240 | 424 | 434) {
                 kernel.publish_io_tasks(Some((pid, p)));
                 let routes = trames_kernel::signal::IoRoutes {
                     directory: p.signals.io_directory.clone(),
@@ -2425,6 +2431,21 @@ impl<C: Cpu> Kernel<C> {
                     uid: p.linux.vfs.credentials.uid,
                     euid: p.linux.vfs.credentials.euid,
                 };
+                if number == 434 {
+                    return routes
+                        .pidfd_open(&p.linux.vfs.descriptor_factory(), a[0] as i32, a[1] as u32)
+                        .map(Some);
+                }
+                if number == 424 {
+                    return routes
+                        .pidfd_send(
+                            &p.signals.io,
+                            &p.linux.vfs.fd_flags_snapshot(),
+                            a,
+                            &p.memory,
+                        )
+                        .map(Some);
+                }
                 return routes
                     .send_queued(&p.signals.io, number, a, &p.memory)
                     .expect("queued signal route")
@@ -3491,7 +3512,7 @@ impl<C: Cpu> Kernel<C> {
                 && (p.stopped()
                     || matches!(&p.state, State::Completion(release)
                         if first.vfork.as_ref().is_some_and(|producer| Arc::ptr_eq(producer, release)))
-                    || matches!(p.state, State::Blocked(95 | 260, _))
+                    || matches!(p.state, State::Blocked(95 | 260, _) | State::PidfdWait(_))
                         && first.family.parent() == p.tgid
                     || matches!(p.state, State::Futex { .. }) && p.vm_id == first.vm_id
                     || matches!(p.state, State::Sigwait { .. } | State::Suspend(_))
@@ -3643,7 +3664,10 @@ impl<C: Cpu> Kernel<C> {
                         State::Blocked(..) if p.stopped() && !p.stop_held() => {}
                         State::Blocked(..)
                             if p.worker_io_candidate(id)
-                                || matches!(p.state, State::Blocked(95 | 260, _)) =>
+                                || matches!(
+                                    p.state,
+                                    State::Blocked(95 | 260, _) | State::PidfdWait(_)
+                                ) =>
                         {
                             // The worker owns the retry; do not perform byte I/O in
                             // the coordinator before preparing its execution View.
@@ -3702,6 +3726,7 @@ impl<C: Cpu> Kernel<C> {
                         State::Sigwait { .. }
                             | State::Suspend(_)
                             | State::Blocked(95 | 260, _)
+                            | State::PidfdWait(_)
                             | State::Completion(_)
                             | State::Namespace(_)
                             | State::Policy(_)

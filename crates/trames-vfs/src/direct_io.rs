@@ -584,6 +584,7 @@ impl DirectFd {
                     ByteResource::MessageQueue(q.clone())
                 }
                 Some(events::SharedControl::Tun(file, _)) => ByteResource::Tun(file.clone()),
+                Some(events::SharedControl::Pid(pid)) => ByteResource::PollOnly(pid.clone()),
                 Some(events::SharedControl::Sync(file)) => {
                     ByteResource::PollOnly(file.poll_handle())
                 }

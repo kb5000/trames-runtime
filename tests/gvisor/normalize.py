@@ -13,6 +13,8 @@ from pathlib import Path
 import shutil
 import xml.etree.ElementTree as ET
 
+from run import tracee_fixture_error
+
 
 def normalize(source,output):
     output.mkdir(parents=True,exist_ok=False)
@@ -33,7 +35,11 @@ def normalize(source,output):
             assert len(matching)==1 and not matching[0].findall('failure') and matching[0].find('skipped') is None, ('Missing original passing XML',row['suite'],row['case'])
             assert row['code'] in (0,1),row
             if row['code']==1:assert any(c.findall('failure') for c in cases),row
-            passes+=1
+            if error := tracee_fixture_error(row['case'], stem.with_suffix('.stderr')):
+                row.update(classification_refined_from='passed',status='fixture_failed',messages=[error])
+                refined+=1
+            else:
+                passes+=1
         elif row['status']=='skipped' and len(matching)==1 and matching[0].findall('failure'):
             row['classification_refined_from']='skipped';row['status']='failed'
             row['messages']=[f.get('message','') for f in matching[0].findall('failure')];refined+=1

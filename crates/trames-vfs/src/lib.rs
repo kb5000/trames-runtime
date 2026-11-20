@@ -43,6 +43,8 @@ pub use pipe::PipeEndpoint;
 use pipe::{Pipe, PipeEnd};
 pub use stream_transfer::{StreamTransfer, TransferWait};
 mod descriptor_factory;
+mod pidfd;
+pub use pidfd::{PendingPidFd, PidFd};
 mod fd_allocator;
 mod fd_table;
 mod resource_limits;
@@ -1356,6 +1358,9 @@ impl Vfs {
                     )
                     .0
             };
+        }
+        if let Some(events::SharedControl::Pid(pid)) = &o.control {
+            return pid.poll(events).0;
         }
         if let Some(events::SharedControl::Sync(file)) = &o.control {
             return file.poll(events).0;

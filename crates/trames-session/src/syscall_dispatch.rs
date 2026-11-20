@@ -804,10 +804,12 @@ pub(crate) fn execute<C: Cpu>(
                 let began = snapshot.profile.then(Instant::now);
                 let number = work.cpu.x(8) as u32;
                 if matches!(number, 95 | 260) {
-                    let request = match trames_kernel::children::Wait::prepare(
+                    let request = match trames_kernel::children::Wait::prepare_with_files(
                         work.pid,
                         number,
                         std::array::from_fn(|i| work.cpu.x(i)),
+                        &snapshot.fd_flags,
+                        &snapshot.io_routes.namespace,
                     ) {
                         Ok(request) => request,
                         Err(e) => {

@@ -755,7 +755,7 @@ impl Snapshot {
         match cpu.x(8) as u32 {
             number if trames_kernel::scheduling::call(number) => true,
             93 | 94 => self.exit_files.is_some(),
-            142 | 153 | 165 => true,
+            142 | 153 | 165 | 434 => true,
             96 => self.io_signals.thread_addresses().is_some(),
             167 => match cpu.x(0) {
                 1 | 2 => self.io_signals.parentage().is_some(),
@@ -807,7 +807,7 @@ impl Snapshot {
         )
     }
     pub fn signal_send<C: Cpu>(&self, cpu: &C) -> bool {
-        matches!(cpu.x(8) as u32, 129..=131 | 138 | 240)
+        matches!(cpu.x(8) as u32, 129..=131 | 138 | 240 | 424)
     }
     pub fn admit<C: Cpu>(&self, cpu: &C) -> bool {
         if self.seccomp.mode() == 0 {
@@ -937,6 +937,17 @@ impl Snapshot {
                 self.io_signals.thread_addresses()?.set_clear_tid(cpu.x(0));
                 Ok(self.identities[6])
             }
+            434 => self.io_routes.pidfd_open(
+                self.direct.descriptor_factory()?,
+                cpu.x(0) as i32,
+                cpu.x(1) as u32,
+            ),
+            424 => self.io_routes.pidfd_send(
+                &self.io_signals,
+                &self.fd_flags,
+                std::array::from_fn(|i| cpu.x(i)),
+                memory,
+            ),
             number @ (138 | 240) => self.io_routes.send_queued(
                 &self.io_signals,
                 number,

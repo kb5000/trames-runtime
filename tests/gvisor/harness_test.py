@@ -22,6 +22,7 @@ class EvidenceTests(unittest.TestCase):
         args = argparse.Namespace(timeout=20, suite_timeouts={})
         self.assertEqual(watchdog(args, 'ppoll', 'PpollTest.SignalMaskBlocksSignal'), 45)
         self.assertEqual(watchdog(args, 'ppoll', 'PpollTest.SignalMaskAllowsSignal'), 20)
+        self.assertEqual(watchdog(args, 'vfork', 'VforkTest.ParentStopsUntilChildExecves'), 40)
         args.suite_timeouts['ppoll'] = 15
         self.assertEqual(watchdog(args, 'ppoll', 'PpollTest.SignalMaskBlocksSignal'), 15)
     def test_mixed_results_need_matching_xml_and_exit(self):
@@ -38,9 +39,10 @@ class EvidenceTests(unittest.TestCase):
         self.assertIsNone(xml_rows(path,0,['T.Pass','T.Pass']))
     def test_tracee_child_setup_failure_overrides_parent_xml(self):
         path = self.xml('<testcase classname="WaitTest" name="TraceeWALL"/>')
-        stderr = self.root / 'stderr'
+        stderr = path.with_suffix('.stderr')
         stderr.write_text('Check failed: ptrace(PTRACE_TRACEME, 0, nullptr, nullptr) == 0 (errno 38)\n')
         self.assertEqual(xml_rows(path, 0, ['WaitTest.TraceeWALL'], stderr)[0]['status'], 'fixture_failed')
+        self.assertEqual(classify(path, 0, False, 'WaitTest.TraceeWALL')[0], 'fixture_failed')
         stderr.write_text('')
         self.assertEqual(xml_rows(path, 0, ['WaitTest.TraceeWALL'], stderr)[0]['status'], 'passed')
 

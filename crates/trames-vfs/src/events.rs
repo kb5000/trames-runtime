@@ -4,6 +4,7 @@ use super::*;
 use std::time::{Duration, Instant};
 
 pub(super) enum Anonymous {
+    Pid(Arc<PidFd>),
     FsContext(Arc<mounts::fd::FsContext>),
     Sync(Arc<sync_file::File>),
     Uring(Arc<Uring>),
@@ -41,6 +42,7 @@ impl SignalMask {
     }
 }
 pub(super) enum SharedControl {
+    Pid(Arc<PidFd>),
     FsContext(Arc<mounts::fd::FsContext>),
     MountTree(Arc<mounts::fd::DetachedTree>),
     MessageQueue(Arc<posix_mq::Queue>),
@@ -59,6 +61,7 @@ pub(super) enum SharedControl {
 impl SharedControl {
     fn capture(control: &Anonymous) -> Option<Self> {
         Some(match control {
+            Anonymous::Pid(pid) => Self::Pid(pid.clone()),
             Anonymous::FsContext(ctx) => Self::FsContext(ctx.clone()),
             Anonymous::Sync(file) => Self::Sync(file.clone()),
             Anonymous::Uring(ring) => Self::Uring(ring.clone()),
@@ -72,6 +75,7 @@ impl SharedControl {
     }
     pub(super) fn owner_projection(&self) -> Option<Anonymous> {
         Some(match self {
+            Self::Pid(pid) => Anonymous::Pid(pid.clone()),
             Self::MountTree(_) => return None,
             Self::FsContext(ctx) => Anonymous::FsContext(ctx.clone()),
             Self::Sync(file) => {
@@ -136,6 +140,7 @@ impl WatchState {
 impl Anonymous {
     pub(super) fn name(&self) -> &'static [u8] {
         match self {
+            Self::Pid(_) => b"anon_inode:[pidfd]",
             Self::FsContext(_) => b"anon_inode:[fscontext]",
             Self::Sync(_) => b"anon_inode:[sync_file]",
             Self::Uring(_) => b"anon_inode:[io_uring]",
@@ -154,6 +159,7 @@ impl Anonymous {
         reader: Option<&Arc<dyn SignalReader>>,
     ) -> u16 {
         match self {
+            Self::Pid(pid) => pid.poll(events).0,
             Self::Sync(file) => file.poll(events).0,
             Self::Uring(ring) => {
                 if ring.cq_ready() != 0 {
@@ -216,7 +222,8 @@ impl Anonymous {
         match self {
             Self::Event(counter) => counter.read(count),
             Self::Timer(timer) => timer.read(count),
-            Self::FsContext(_)
+            Self::Pid(_)
+            | Self::FsContext(_)
             | Self::Sync(_)
             | Self::Bpf(_)
             | Self::Signal(_)
@@ -338,6 +345,9 @@ impl Vfs {
         }
         if let Some(SharedControl::Tun(file, _)) = &o.control {
             return file.poll(0).1;
+        }
+        if let Some(SharedControl::Pid(pid)) = &o.control {
+            return pid.poll(0).1;
         }
         if let Some(SharedControl::Sync(file)) = &o.control {
             return file.poll(0).1;

@@ -91,12 +91,23 @@ struct State {
     exited: bool,
     reaped: bool,
     on_reap: Option<OnReap>,
+    pidfd: Option<Arc<trames_vfs::PidFd>>,
     presence: crate::task::Visibility,
     group_usage: Weak<crate::task_control::Group>,
     children_usage: Weak<Children>,
     exit_usage: crate::usage::Usage,
 }
 impl Child {
+    /// Allocated only when an application requests a process descriptor.
+    pub fn pidfd(&self, id: u32) -> Arc<trames_vfs::PidFd> {
+        let mut state = self.0.lock().unwrap();
+        let (exited, reaped) = (state.exited, state.reaped);
+        state
+            .pidfd
+            .get_or_insert_with(|| Arc::new(trames_vfs::PidFd::new(id, exited, reaped)))
+            .clone()
+    }
+
     /// Registration can race wait or automatic reaping. Destroy original resources
     /// outside family/child locks, exactly once in either ordering.
     pub fn on_reap(&self, retire: Box<dyn FnOnce() + Send>) {
@@ -251,9 +262,17 @@ impl Child {
             state.stopped = stopped;
             state.event = status;
             state.exited = exited;
-            (state.parent.upgrade(), state.parent_group.clone())
+            (
+                state.parent.upgrade(),
+                state.parent_group.clone(),
+                exited.then(|| state.pidfd.clone()).flatten(),
+            )
         };
-        Notice(parent.0, parent.1, Vec::new())
+        let mut callbacks: Vec<OnReap> = Vec::new();
+        if let Some(pid) = parent.2 {
+            callbacks.push(Box::new(move || pid.publish(false)));
+        }
+        Notice(parent.0, parent.1, callbacks)
     }
     fn publish(&self, status: Option<i32>, exited: bool) {
         self.publish_quiet(status, exited).notify();
@@ -305,11 +324,14 @@ impl Child {
                 parent.reaped.store(true, Ordering::Relaxed);
             }
         }
-        let cleanup = if auto_reap {
+        let mut cleanup: Vec<OnReap> = if auto_reap {
             state.on_reap.take().into_iter().collect()
         } else {
             Vec::new()
         };
+        if let Some(pid) = state.pidfd.clone() {
+            cleanup.push(Box::new(move || pid.publish(auto_reap)));
+        }
         Some((
             Notice(parent, state.parent_group.clone(), cleanup),
             signo,
@@ -335,11 +357,16 @@ const WCLONE: u64 = 0x8000_0000;
 #[derive(Clone, Copy, Debug)]
 pub struct Wait {
     caller: u32,
+    pidfd_target: u32,
+    nonblocking_pidfd: bool,
     pub number: u32,
     pub args: [u64; 6],
 }
 impl Wait {
     pub fn prepare(caller: u32, number: u32, args: [u64; 6]) -> Result<Self, Errno> {
+        Self::parse(caller, number, args, false)
+    }
+    fn parse(caller: u32, number: u32, args: [u64; 6], allow_pidfd: bool) -> Result<Self, Errno> {
         match number {
             260 => {
                 if args[2] as u32 & !(11 | (WNOTHREAD | WALL | WCLONE) as u32) != 0 {
@@ -352,7 +379,8 @@ impl Wait {
                 let options = args[3] as u32;
                 if options & !(15 | 0x01000000 | (WNOTHREAD | WALL | WCLONE) as u32) != 0
                     || options & 14 == 0
-                    || which > 2
+                    || which > 3
+                    || (which == 3 && !allow_pidfd)
                     || which != 0 && id < 0
                     || which == 1 && id == 0
                 {
@@ -363,9 +391,31 @@ impl Wait {
         };
         Ok(Self {
             caller,
+            pidfd_target: 0,
+            nonblocking_pidfd: false,
             number,
             args,
         })
+    }
+    pub fn prepare_with_files(
+        caller: u32,
+        number: u32,
+        args: [u64; 6],
+        files: &trames_vfs::FdFlags,
+        namespace: &PidNamespace,
+    ) -> Result<Self, Errno> {
+        if number != 95 || args[0] as u32 != 3 {
+            return Self::prepare(caller, number, args);
+        }
+        let mut request = Self::parse(caller, number, args, true)?;
+        let (target, nonblocking) = files.pidfd(args[1] as u32)?;
+        if namespace.local(target.pid()) == 0 {
+            return Err(Errno(10));
+        }
+        // Retain the session-global, never-reused child ID across a parked wait.
+        request.pidfd_target = target.pid();
+        request.nonblocking_pidfd = nonblocking;
+        Ok(request)
     }
     fn options(&self) -> u64 {
         if self.number == 260 {
@@ -410,6 +460,7 @@ impl Wait {
             match self.args[0] as u32 {
                 0 => true,
                 1 => namespace.local(child.id) == self.args[1] as u32,
+                3 => child.id == self.pidfd_target,
                 _ if self.args[1] == 0 => child.group == group,
                 _ => namespace.local(child.group) == self.args[1] as u32,
             }
@@ -501,6 +552,9 @@ impl Children {
                 self.collected.lock().unwrap().include(state.exit_usage);
                 state.presence.reap();
                 cleanup.extend(state.on_reap.take());
+                if let Some(pid) = state.pidfd.clone() {
+                    cleanup.push(Box::new(move || pid.publish(true)));
+                }
                 changed = true;
             }
         }
@@ -560,8 +614,12 @@ impl Children {
             }
             // A second waiting thread must see the consumed event/ECHILD.
             // Callbacks can enter these objects, so release both locks first.
+            let pidfd = state.reaped.then(|| state.pidfd.clone()).flatten();
             drop(state);
             drop(entries);
+            if let Some(pid) = pidfd {
+                pid.publish(true);
+            }
             if let Some(retire) = cleanup {
                 retire();
             }
@@ -622,6 +680,9 @@ impl Children {
         if !found {
             return Err(Errno(10));
         }
+        if request.nonblocking_pidfd && options & 1 == 0 {
+            return Err(Errno(11));
+        }
         if options & 1 != 0 {
             if request.number == 95 && request.args[2] != 0 {
                 memory
@@ -652,6 +713,8 @@ mod tests {
     fn wait4(options: u64) -> Wait {
         Wait {
             caller: 1,
+            pidfd_target: 0,
+            nonblocking_pidfd: false,
             number: 260,
             args: [u32::MAX as u64, 0x1000, options, 0x1100, 0, 0],
         }
@@ -659,6 +722,8 @@ mod tests {
     fn waitid(options: u64) -> Wait {
         Wait {
             caller: 1,
+            pidfd_target: 0,
+            nonblocking_pidfd: false,
             number: 95,
             args: [0, 0, 0x1000, options, 0x1100, 0],
         }
@@ -687,6 +752,47 @@ mod tests {
         assert_eq!(family.wait(waitid(5), &ns, 1, &mut memory), Ok(Some(0)));
         assert_eq!(memory.read_array::<128>(0x1000).unwrap(), [0; 128]);
         assert_eq!(family.wait(wait4(0), &ns, 1, &mut memory), Ok(None));
+    }
+    #[test]
+    fn parked_pidfd_wait_keeps_original_child_after_close_and_slot_reuse() {
+        use trames_vfs::{DirectPoll, Vfs};
+        let mut vfs = Vfs::default();
+        let family = Arc::new(Children::default());
+        let first = child(&family, 42, 1);
+        let second = child(&family, 43, 1);
+        let handle = first.pidfd(42);
+        let files = vfs.descriptor_factory();
+        let fd = files
+            .reserve_pidfd(handle.clone(), 0)
+            .unwrap()
+            .publish()
+            .unwrap();
+        let args = [3, u64::from(fd), 0x1000, 4, 0, 0];
+        let ns = PidNamespace::default();
+        let wait = Wait::prepare_with_files(1, 95, args, &vfs.fd_flags_snapshot(), &ns).unwrap();
+        assert_eq!(wait.args, args); // Original registers are required for SA_RESTART.
+        let mut mem = memory();
+        assert_eq!(family.wait(wait, &ns, 1, &mut mem), Ok(None));
+        vfs.close(fd).unwrap();
+        assert_eq!(
+            files
+                .reserve_pidfd(second.pidfd(43), 0)
+                .unwrap()
+                .publish()
+                .unwrap(),
+            fd
+        );
+        second.exited(0);
+        assert_eq!(family.wait(wait, &ns, 1, &mut mem), Ok(None));
+        first.exited(7 << 8);
+        assert_eq!(handle.poll(1).0, 1);
+        assert_eq!(family.wait(wait, &ns, 1, &mut mem), Ok(Some(0)));
+        assert_eq!(handle.poll(1).0, 0x11);
+        assert_eq!(
+            &mem.read_array::<128>(0x1000).unwrap()[16..20],
+            &42u32.to_le_bytes()
+        );
+        assert!(!second.reaped());
     }
     #[test]
     fn stop_continue_events_are_consumed_once_per_group_transition() {
@@ -802,6 +908,8 @@ mod tests {
             memory.write_array(0x1000, [0x55; 128]).unwrap();
             let request = Wait {
                 caller: 1,
+                pidfd_target: 0,
+                nonblocking_pidfd: false,
                 number,
                 args: if number == 260 {
                     [42, 0x1000, 0, 1, 0, 0]
@@ -829,6 +937,8 @@ mod tests {
         let mut memory = memory();
         let bad = Wait {
             caller: 1,
+            pidfd_target: 0,
+            nonblocking_pidfd: false,
             number: 95,
             args: [0, 0, 1, 4 | 0x01000000, 0, 0],
         };

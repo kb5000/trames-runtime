@@ -85,6 +85,11 @@ pub(super) fn publish<C: Cpu>(
                     State::Suspend(p.signals.wait_mask.take().expect("suspend restore mask"))
                 }
             },
+            crate::run_queue::WaitState::Child(wait)
+                if wait.request.number == 95 && wait.request.args[0] as u32 == 3 =>
+            {
+                State::PidfdWait(wait.request)
+            }
             crate::run_queue::WaitState::Child(wait) => {
                 State::Blocked(wait.request.number, wait.request.args)
             }
