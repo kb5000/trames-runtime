@@ -4,6 +4,13 @@ use crate::{Linux, TaskMemoryPolicy};
 use trames_memory::{Access, CpuMemory, PAGE_SIZE};
 use trames_vfs::Errno;
 
+/// AArch64 accepts a top-byte tag when a syscall operates on an existing
+/// user mapping. Keep placement addresses (brk, mmap, MREMAP_FIXED target)
+/// intact so a tagged request cannot select an existing lower mapping.
+pub(crate) const fn untag_mapping(address: u64) -> u64 {
+    address & 0x00ff_ffff_ffff_ffff
+}
+
 pub fn memory_query_entry(number: u32, args: [u64; 6]) -> bool {
     matches!(number, 232 | 236) || number == 233 && args[2] as u32 != 4
 }
@@ -37,10 +44,11 @@ impl TaskMemoryPolicy {
     }
 }
 fn mincore(memory: &mut impl CpuMemory, a: [u64; 6]) -> Option<Result<u64, Errno>> {
-    if !a[0].is_multiple_of(PAGE_SIZE) {
+    let start = untag_mapping(a[0]);
+    if !start.is_multiple_of(PAGE_SIZE) {
         return Some(Err(Errno(22)));
     }
-    if a[0]
+    if start
         .checked_add(a[1])
         .is_none_or(|end| end > trames_memory::ADDRESS_LIMIT)
     {
@@ -51,7 +59,7 @@ fn mincore(memory: &mut impl CpuMemory, a: [u64; 6]) -> Option<Result<u64, Errno
     while done < pages {
         // Linux uses a single temporary page for the output bitmap.
         let count = (pages - done).min(PAGE_SIZE);
-        let resident = match memory.resident(a[0] + done * PAGE_SIZE, count * PAGE_SIZE)? {
+        let resident = match memory.resident(start + done * PAGE_SIZE, count * PAGE_SIZE)? {
             Ok(v) => v,
             Err(error) => return Some(Err(Linux::memory_errno(error))),
         };
@@ -69,7 +77,8 @@ fn mincore(memory: &mut impl CpuMemory, a: [u64; 6]) -> Option<Result<u64, Errno
 }
 
 fn advice(memory: &mut impl CpuMemory, a: [u64; 6]) -> Option<Result<u64, Errno>> {
-    if !a[0].is_multiple_of(PAGE_SIZE) || !matches!(a[2] as u32,0..=3|10..=11|14..=19) {
+    let start = untag_mapping(a[0]);
+    if !start.is_multiple_of(PAGE_SIZE) || !matches!(a[2] as u32,0..=3|10..=11|14..=19) {
         return Some(Err(Errno(22)));
     }
     if a[1] == 0 {
@@ -82,14 +91,14 @@ fn advice(memory: &mut impl CpuMemory, a: [u64; 6]) -> Option<Result<u64, Errno>
     if matches!(a[2] as u32, 10 | 11 | 18 | 19) {
         return Some(
             memory
-                .advise_fork(a[0], len, a[2] as u32)?
+                .advise_fork(start, len, a[2] as u32)?
                 .map(|()| 0)
                 .map_err(Linux::memory_errno),
         );
     }
     Some(
         memory
-            .validate_mapped(a[0], len)?
+            .validate_mapped(start, len)?
             .map(|()| 0)
             .map_err(Linux::memory_errno),
     )
@@ -126,6 +135,12 @@ mod tests {
             (236, [0x1000, 0x1ff8, 65, 0, 0, 0], 14),
             (236, [0x1fff, 0x1010, 0, 0, 0, 0], 14),
             (232, [0x4000, 3 * PAGE_SIZE, 0x1000, 0, 0, 0], 0),
+            (
+                232,
+                [0xab00_0000_0000_4000, 3 * PAGE_SIZE, 0x1000, 0, 0, 0],
+                0,
+            ),
+            (233, [0xff00_0000_0000_4000, PAGE_SIZE, 0, 0, 0, 0], 0),
             (232, [0x8000, 2 * PAGE_SIZE, 0x1000, 0, 0, 0], 0),
             (232, [0x4000, 0, 0, 0, 0, 0], 0),
             (232, [0x4001, 0, 0, 0, 0, 0], 22),

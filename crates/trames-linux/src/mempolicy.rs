@@ -126,7 +126,7 @@ fn normalize(mode: u32, node: bool) -> Result<u32, Errno> {
 }
 
 fn range(start: u64, len: u64) -> Result<(u64, u64), Errno> {
-    let start = start & 0x00ff_ffff_ffff_ffff;
+    let start = crate::memory_queries::untag_mapping(start);
     if !start.is_multiple_of(PAGE_SIZE) {
         return Err(Errno(22));
     }

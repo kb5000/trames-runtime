@@ -74,7 +74,7 @@ impl Linux {
                 if n != 229 && limit == 0 {
                     return Err(Errno(1));
                 }
-                let addr = a[0] & 0x00ff_ffff_ffff_ffff;
+                let addr = crate::memory_queries::untag_mapping(a[0]);
                 let start = addr & !(PAGE_SIZE - 1);
                 let end = addr
                     .checked_add(a[1])

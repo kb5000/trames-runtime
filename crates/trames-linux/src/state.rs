@@ -1440,7 +1440,7 @@ impl Linux {
         Ok(0)
     }
     fn mremap(&mut self, a: [u64; 6], memory: &mut Memory) -> Result<u64> {
-        let old = a[0];
+        let old = crate::memory_queries::untag_mapping(a[0]);
         let mut old_len = if a[1] == 0 {
             0
         } else {
@@ -1519,7 +1519,7 @@ impl Linux {
         if tail_lock == Some(false) {
             let _ = memory.set_range_lock(address + old_len, new_len - old_len, tail_lock);
         }
-        if address != a[0] && !fixed && !reservation {
+        if address != old && !fixed && !reservation {
             self.heap.set_cursor(address + new_len);
         }
         Ok(address)
@@ -1881,7 +1881,8 @@ impl Linux {
             232 => crate::memory_query(memory,232,a).expect("original residency capability"),
             233 => {
                 if a[2] as u32 != 4 { return crate::memory_query(memory,233,a).expect("original mapping capability"); }
-                if !a[0].is_multiple_of(PAGE_SIZE) {
+                let start = crate::memory_queries::untag_mapping(a[0]);
+                if !start.is_multiple_of(PAGE_SIZE) {
                     return Err(Errno(22));
                 }
                 if !matches!(a[2] as u32,0..=4|14..=17) {
@@ -1891,23 +1892,24 @@ impl Linux {
                     return Ok(0);
                 }
                 let len = Self::page_length(a[1])?;
-                memory.discard(a[0], len).map_err(Self::memory_errno)?;
+                memory.discard(start, len).map_err(Self::memory_errno)?;
                 Ok(0)
             },
             214 => Ok(self.brk(a[0], memory)),
             222 => self.mmap(a, memory),
             215 => {
                 let len = Self::page_length(a[1])?;
-                memory.unmap(a[0], len).map_err(Self::memory_errno)?;
+                memory.unmap(crate::memory_queries::untag_mapping(a[0]), len).map_err(Self::memory_errno)?;
                 Ok(0)
             },
             228..=231 | 284 => self.memory_lock(number, a, memory),
             226 => {
+                let start = crate::memory_queries::untag_mapping(a[0]);
                 if a[2] & !7 != 0 {
                     return Err(Errno(22));
                 }
                 if a[1] == 0 {
-                    return if a[0].is_multiple_of(PAGE_SIZE) {
+                    return if start.is_multiple_of(PAGE_SIZE) {
                         Ok(0)
                     } else {
                         Err(Errno(22))
@@ -1916,7 +1918,7 @@ impl Linux {
                 let len = Self::page_length(a[1]).map_err(|_| Errno(12))?;
                 memory
                     .protect(
-                        a[0],
+                        start,
                         len,
                         Permissions {
                             read: a[2] & 3 != 0,
@@ -1925,7 +1927,7 @@ impl Linux {
                         },
                     )
                     .map_err(Self::memory_errno)?;
-                memory.report_write_only(a[0],len,a[2] & 3 == 2);
+                memory.report_write_only(start,len,a[2] & 3 == 2);
                 Ok(0)
             },
             @fallback => Err(Errno(38)),
@@ -2090,6 +2092,47 @@ mod tests {
             linux.mmap([0, len, 3, 0x21, u64::MAX, 0], &mut memory),
             Err(Errno(12))
         );
+    }
+
+    #[test]
+    fn tagged_existing_mappings_and_untagged_placement_have_distinct_roles() {
+        let mut linux = Linux::new(0);
+        let mut memory = Memory::default();
+        let mut output = CapturedOutput::default();
+        let base = 0x8000;
+        let tagged = base | 0xab00_0000_0000_0000;
+        let target = base + 4 * PAGE_SIZE;
+        memory.map(base, 2 * PAGE_SIZE, Permissions::RW).unwrap();
+        memory.map(target, PAGE_SIZE, Permissions::RW).unwrap();
+        memory.write(base, &[42]).unwrap();
+        memory.write(target, &[99]).unwrap();
+        let mut call = |number, args| linux.syscall(number, args, &mut memory, &mut output);
+        assert_eq!(call(226, [tagged, PAGE_SIZE, 2, 0, 0, 0]), Ok(0));
+        assert_eq!(call(227, [tagged, PAGE_SIZE, 4, 0, 0, 0]), Ok(0));
+        assert_eq!(
+            call(
+                216,
+                [tagged, PAGE_SIZE, PAGE_SIZE, 3, tagged + 4 * PAGE_SIZE, 0]
+            ),
+            Err(Errno(22))
+        );
+        assert!(call(222, [tagged, PAGE_SIZE, 3, 0x32, u64::MAX, 0]).is_err());
+        assert_eq!(
+            call(233, [tagged + PAGE_SIZE, PAGE_SIZE, 4, 0, 0, 0]),
+            Ok(0)
+        );
+        assert_eq!(
+            call(215, [tagged + PAGE_SIZE, PAGE_SIZE, 0, 0, 0, 0]),
+            Ok(0)
+        );
+        assert_eq!(memory.read_array::<1>(target).unwrap(), [99]);
+        assert!(memory.is_free(base + PAGE_SIZE, PAGE_SIZE));
+        assert_eq!(
+            linux.mremap([tagged, PAGE_SIZE, PAGE_SIZE, 3, target, 0], &mut memory),
+            Ok(target)
+        );
+        assert!(memory.is_free(base, PAGE_SIZE));
+        assert_eq!(memory.read_array::<1>(target).unwrap(), [42]);
     }
 
     #[test]
