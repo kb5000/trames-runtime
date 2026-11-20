@@ -1257,9 +1257,6 @@ impl Vfs {
             if !self.is_mount_root(&target) {
                 return Err(Errno(22));
             }
-            if parent.kind == Kind::Sysfs && flags & MS_RDONLY == 0 {
-                return Err(Errno(30));
-            }
             if flags & MS_RDONLY == 0
                 && parent
                     .fs
@@ -1485,13 +1482,7 @@ impl Vfs {
                         _ => unreachable!(),
                     };
                     let node = self.pseudo_node(key)?.ok_or(Errno(19))?;
-                    (
-                        self.fs.clone(),
-                        node,
-                        key.to_vec(),
-                        k,
-                        (flags & ATTRS) | if k == Kind::Sysfs { MS_RDONLY } else { 0 },
-                    )
+                    (self.fs.clone(), node, key.to_vec(), k, flags & ATTRS)
                 }
                 _ => return Err(Errno(19)),
             }

@@ -92,6 +92,13 @@ python3 tests/gvisor/compare.py --native /tmp/gvisor-native \
   --trames /tmp/gvisor-trames --output /tmp/gvisor-comparison
 ```
 
+For tests with additional interpreter dependencies, pass `--custom-rootfs`
+alongside `--rootfs PATH` to import a prepared ARM64 Linux archive. For
+example, `ExecTest.InterpreterScript` uses the original runfile with
+`#!/bin/bash` and requires Bash plus its dynamic loader and libraries. The
+runner records the archive digest. The mount and rename suites remount the isolated guest sysfs
+with the same writable mount flags as the native reference.
+
 Each output directory must be new. Case stdout/stderr and original GoogleTest
 XML remain available. Timed-out processes are terminated as their own process
 group; abnormal exits/missing XML remain failures, never successful skips.

@@ -115,7 +115,7 @@ impl<C: Cpu> Kernel<C> {
         // slot. Serialize the final credentials/auxv image with TSYNC publication.
         let policy = p.seccomp.birth_group();
         let _permit = policy.write_owned().into_admission();
-        runtime.refresh_credentials();
+        runtime.refresh_credentials(runtime.externally_shared_fs);
         let task = p.linux.vfs.process_context();
         {
             let body = &mut *p;
@@ -179,6 +179,17 @@ impl<C: Cpu> Kernel<C> {
                 p.signals.io.inherit_proc_pid(&leader.signals.io);
             }
         }
+        let mut image = image;
+        image.check_shared_fs(&p.linux.vfs, || {
+            self.processes
+                .iter()
+                .filter(|(id, peer)| {
+                    *id != pid
+                        && peer.tgid == p.tgid
+                        && peer.linux.vfs.owns_context_of(&p.linux.vfs)
+                })
+                .count()
+        });
         let old_memory = Self::install_exec(p, image, self.started);
         let ids: Vec<_> = self
             .processes
@@ -1267,14 +1278,36 @@ pub(crate) struct Image<C: Cpu> {
     pub(super) memory: Memory,
     pub(super) linux: Linux,
     credentials: trames_vfs::ExecCredentials,
+    externally_shared_fs: bool,
     no_new_privs: bool,
 }
 impl<C: Cpu> Image<C> {
-    fn refresh_credentials(&mut self) {
-        if self.credentials.no_new_privs() == self.no_new_privs {
+    // Group admission already owns these siblings. Consult membership only
+    // for images whose credentials might be elevated by exec.
+    pub(super) fn check_shared_fs(
+        &mut self,
+        vfs: &trames_vfs::Vfs,
+        siblings: impl FnOnce() -> usize,
+    ) {
+        let c = &self.linux.vfs.credentials;
+        if (c.euid != vfs.credentials.euid
+            || !vfs.credentials.in_group(c.egid)
+            || c.caps.permitted & !vfs.credentials.caps.permitted != 0)
+            && {
+                let users = vfs.live_context_users();
+                users > 1 && users > 1 + siblings()
+            }
+        {
+            self.externally_shared_fs = true;
+        }
+    }
+    fn refresh_credentials(&mut self, externally_shared_fs: bool) {
+        if !externally_shared_fs && self.credentials.no_new_privs() == self.no_new_privs {
             return;
         }
-        self.no_new_privs = self.credentials.apply(&mut self.linux.vfs);
+        self.no_new_privs = self
+            .credentials
+            .apply_for_exec(&mut self.linux.vfs, externally_shared_fs);
         let c = &self.linux.vfs.credentials;
         let base = self.cpu.sp()
             + 8 * (3 + self.linux.arguments.len() + self.linux.environment.len()) as u64;
@@ -1473,6 +1506,7 @@ impl Request {
             argv.push(Vec::new());
         }
         for depth in 0..=5 {
+            let executable_access = file.begin_execution()?;
             let bytes = file.bytes()?;
             if let Some((interpreter, optional)) = trames_vfs::script_interpreter(&bytes)? {
                 if depth == 0 && inaccessible {
@@ -1523,7 +1557,7 @@ impl Request {
                 &execute_vfs,
                 options,
                 Some(&filename),
-                Some(file.clone()),
+                Some(executable_access),
             )
             .map_err(exec_error)?;
             crate::clock::initialize::<C>(
@@ -1535,8 +1569,6 @@ impl Request {
             if runtime.memory.resident_bytes() > budget {
                 return Err(Errno(12));
             }
-            runtime.linux.executable_path = execute_vfs.executable_display(&file);
-            runtime.linux.executable_file = Some(file);
             runtime.linux.command_name.set(
                 &(filename
                     .rsplit(|b| *b == b'/')
@@ -1556,6 +1588,7 @@ impl Request {
                 linux: runtime.linux,
                 credentials,
                 no_new_privs,
+                externally_shared_fs: false,
             });
         }
         Err(Errno(40))

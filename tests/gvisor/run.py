@@ -82,7 +82,12 @@ def guest_test_work(suite):
     if suite == 'memfd':
         # Keep the original XML on persistent storage for the later export.
         return 'mkdir -p "$1/tmpfs"; mount -t tmpfs -o mode=1777 tmpfs "$1/tmpfs"; cd "$1/tmpfs"; export TEST_TMPDIR="$PWD"; '
-    return 'mkdir -p "$1"; cd "$1"; export TEST_TMPDIR="$1"; '
+    work = 'mkdir -p "$1"; cd "$1"; export TEST_TMPDIR="$1"; '
+    if suite in ('rename','mount'):
+        # The native reference has writable sysfs. Linux rejects even a
+        # same-inode rename on an explicitly read-only mount.
+        return work + 'mount -t sysfs -o remount,rw,nodev,nosuid,noexec sysfs /sys; '
+    return work
 
 
 def guest_terminal(suite, wrapper):
@@ -167,7 +172,7 @@ def reuse_rows(args, plan):
     old = {s['name']:s['sha256'] for s in previous['suites']}
     if old != {s['name']:s['sha256'] for s in plan['suites']}:
         raise RuntimeError('Cannot reuse results from different binaries')
-    for key in ['kernel','uid','runtime_sha256','nofile','network','cpus','rootfs_sha256','runfiles_sha256','process_context','native_init_sha256','fresh_store','host_pty_fixture','setgid_fixture','memfd_tmpfs_fixture']:
+    for key in ['kernel','uid','runtime_sha256','nofile','network','cpus','rootfs_sha256','runfiles_sha256','process_context','native_init_sha256','fresh_store','host_pty_fixture','setgid_fixture','memfd_tmpfs_fixture','writable_sysfs_fixture','custom_rootfs']:
         if key in plan and previous.get(key) != plan[key]:
             raise RuntimeError('Cannot reuse results with a different '+key)
     return {(r['suite'],r['case']):dict(r,reused_from=str(args.reuse.resolve()/'logs'/(r.get('log_stem') or str(i))))
@@ -267,6 +272,8 @@ def trames(args, output):
     plan['network']=args.network
     plan['cpus']=args.cpus
     plan['rootfs_sha256']=digest(args.rootfs.resolve())
+    if args.custom_rootfs:plan['custom_rootfs'] = True
+    if any(s['name'] in ('rename','mount') for s in plan['suites']):plan['writable_sysfs_fixture'] = True
     plan['runfiles_sha256']={str(p.relative_to(binaries)):digest(p) for p in (binaries/'runfiles').rglob('*') if p.is_file()}
 
     plan.pop('kernel',None);plan.pop('uid',None);plan.pop('nofile',None);plan.pop('native_init_sha256',None)
@@ -284,7 +291,7 @@ def trames(args, output):
     name = 'gvisor'
     def control(*argv):
         return subprocess.run([runner,*argv], env=env, capture_output=True, text=True, timeout=90, check=True)
-    control('env','create',name,'--archive',str(args.rootfs.resolve()),'--cpus',str(args.cpus),'--memory','8GiB','--vulkan','false','--network','none')
+    control('env','create',name,'--rootfs' if args.custom_rootfs else '--archive',str(args.rootfs.resolve()),'--cpus',str(args.cpus),'--memory','8GiB','--vulkan','false','--network','none')
     if args.network == 'internal':
         control('network','create','gvisor','--internal')
         control('-e',name,'config','set','network.mode','bridge','network.bridge','gvisor')
@@ -386,6 +393,7 @@ def main():
     p.add_argument('--reuse',type=Path,help='Reuse passed/skipped cases only after matching binary and runtime fingerprints')
     p.add_argument('--runner',type=Path)
     p.add_argument('--rootfs',type=Path)
+    p.add_argument('--custom-rootfs',action='store_true',help='Import --rootfs as a custom fixture instead of the pinned Alpine distribution')
     a = p.parse_args()
     a.suite_timeouts={name:float(seconds) for name,seconds in (v.split('=',1) for v in a.suite_timeout)}
     if any(v<=0 for v in a.suite_timeouts.values()):p.error('suite timeouts must be positive')

@@ -103,8 +103,8 @@ pub use uring::{
     URING_OPS, URING_SQ_ARRAY,
 };
 mod executable;
-pub use executable::ExecutableFile;
 pub use executable::{script_interpreter, ScriptInterpreter};
+pub use executable::{ExecutableFile, ExecutingFile};
 mod inotify;
 pub use inotify::{FileClose, InotifyInstance};
 mod ipc;
@@ -286,6 +286,7 @@ struct OpenDescription {
 // The actual file, pipe and lock/notification lifetimes share one allocation.
 // Legacy ancillary, task and mount control projections retain owner ownership.
 struct SharedOpenDescription {
+    _write_access: Option<executable::WriteAccess>,
     console: std::sync::OnceLock<console::ConsoleEndpoint>,
     oom: Option<std::sync::Weak<OomTask>>,
     sysctl_control: Option<sysctl::Control>,
@@ -431,6 +432,7 @@ enum Content {
 }
 type NodeRef = Arc<Inode>;
 struct Inode {
+    text_users: std::sync::atomic::AtomicIsize,
     proc_node: std::sync::OnceLock<proc_source::ProcNode>,
     seq_file: bool,
     regular_file: bool,
@@ -461,6 +463,7 @@ impl Inode {
         }
         node.identity = trames_memory::new_backing_identity();
         Self {
+            text_users: Default::default(),
             seq_file: false,
             regular_file: !node.volatile && matches!(node.content, Content::File(_)),
             proc_node: Default::default(),
@@ -1089,6 +1092,7 @@ impl Default for Vfs {
                 Descriptor {
                     open: OpenHandle::new(OpenDescription {
                         shared: Arc::new(SharedOpenDescription {
+                            _write_access: None,
                             console: Default::default(),
                             oom: None,
                             sysctl_control: None,
@@ -1478,6 +1482,7 @@ impl Vfs {
                 Descriptor {
                     open: OpenHandle::new(OpenDescription {
                         shared: Arc::new(SharedOpenDescription {
+                            _write_access: None,
                             console: Default::default(),
                             oom: None,
                             sysctl_control: None,
@@ -2824,6 +2829,12 @@ impl Vfs {
                 return Err(Errno(13));
             }
         }
+        let mut write_access = if node.regular_file && (fd_can_write(flags) || flags & O_TRUNC != 0)
+        {
+            Some(executable::WriteAccess::acquire(&node)?)
+        } else {
+            None
+        };
         if fd_can_write(flags) || flags & O_TRUNC != 0 {
             self.overlay_prepare(&p, &node, flags & 0x200 != 0)?;
         }
@@ -2993,6 +3004,11 @@ impl Vfs {
         let descriptor = Descriptor {
             open: OpenHandle::new(OpenDescription {
                 shared: Arc::new(SharedOpenDescription {
+                    _write_access: if fd_can_write(flags) {
+                        write_access.take()
+                    } else {
+                        None
+                    },
                     console: Default::default(),
                     oom,
                     sysctl_control: network_control,
@@ -3056,6 +3072,7 @@ impl Vfs {
                 };
                 if let Some(target) = target {
                     *query.open_work.borrow_mut() = Some(file_work::PreparedOpen {
+                        _truncate_access: write_access,
                         reservation,
                         target,
                         cloexec: descriptor.cloexec,

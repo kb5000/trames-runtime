@@ -676,6 +676,7 @@ impl Vfs {
         Descriptor {
             open: OpenHandle::new(OpenDescription {
                 shared: Arc::new(SharedOpenDescription {
+                    _write_access: None,
                     owner,
                     console: Default::default(),
                     oom: None,

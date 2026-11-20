@@ -437,9 +437,24 @@ impl<C: Cpu> Runtime<C> {
         vfs: &trames_vfs::Vfs,
         options: RuntimeOptions,
         exec_filename: Option<&[u8]>,
-        accepted: Option<std::sync::Arc<trames_vfs::ExecutableFile>>,
+        accepted: Option<std::sync::Arc<trames_vfs::ExecutingFile>>,
     ) -> Result<Self, RuntimeError> {
-        let elf = Self::load_elf(bytes, vfs, options, accepted.as_deref(), None)?;
+        let elf = Self::load_elf(
+            bytes,
+            vfs,
+            options,
+            accepted.as_ref().map(|f| f.file().as_ref()),
+            None,
+        )?;
+        let accepted = match (accepted, argv.first()) {
+            (None, Some(path)) => vfs
+                .executable_file_at(trames_vfs::AT_FDCWD, path, 0)
+                .ok()
+                .map(|f| f.begin_execution())
+                .transpose()
+                .map_err(|e| ElfError::Interpreter(e.0))?,
+            (accepted, _) => accepted,
+        };
         Self::start_image(elf, argv, envp, vfs, options, exec_filename, accepted)
     }
     fn load_elf(
@@ -466,6 +481,9 @@ impl<C: Cpu> Runtime<C> {
                 if let Some(creds) = credentials.as_mut() {
                     creds.include_interpreter(vfs, &file);
                 }
+                let _access = file
+                    .begin_execution()
+                    .map_err(|e| ElfError::Interpreter(e.0))?;
                 let bytes = file.bytes().map_err(|e| ElfError::Interpreter(e.0))?;
                 Ok((bytes, Some(vfs.executable_mapping(&file))))
             },
@@ -478,7 +496,7 @@ impl<C: Cpu> Runtime<C> {
         vfs: &trames_vfs::Vfs,
         options: RuntimeOptions,
         exec_filename: Option<&[u8]>,
-        executable: Option<std::sync::Arc<trames_vfs::ExecutableFile>>,
+        executable: Option<std::sync::Arc<trames_vfs::ExecutingFile>>,
     ) -> Result<Self, RuntimeError> {
         let mut linux = Linux::new(elf.brk_base);
         linux.arguments = argv.to_vec();
@@ -495,16 +513,12 @@ impl<C: Cpu> Runtime<C> {
                 .take(15)
                 .collect::<Vec<_>>()),
         );
-        if exec_filename.is_none() {
-            if let Some(file) = executable.or_else(|| {
-                vfs.executable_file_at(trames_vfs::AT_FDCWD, &linux.executable_path, 0)
-                    .ok()
-            }) {
-                linux.executable_path = vfs.executable_display(&file);
-                linux.executable_file = Some(file);
-            } else if let Ok(path) = vfs.resolve(trames_vfs::AT_FDCWD, &linux.executable_path) {
-                linux.executable_path = path.into_bytes();
-            }
+        if let Some(access) = executable {
+            linux.executable_path = vfs.executable_display(access.file());
+            linux.executable_file = Some(access.file().clone());
+            linux.executing_file = Some(access);
+        } else if let Ok(path) = vfs.resolve(trames_vfs::AT_FDCWD, &linux.executable_path) {
+            linux.executable_path = path.into_bytes();
         }
         let sp = initial_stack_bytes::<C>(
             &mut elf,
@@ -600,11 +614,14 @@ impl<C: Cpu> Runtime<C> {
             next.push(script);
             next.extend(argv.into_iter().skip(1));
             argv = next;
+            let access = file
+                .begin_execution()
+                .map_err(|e| ElfError::Interpreter(e.0))?;
             bytes = std::borrow::Cow::Owned(
                 file.bytes()
                     .map_err(|e| RuntimeError::Elf(ElfError::Interpreter(e.0)))?,
             );
-            accepted = Some(file);
+            accepted = Some(access);
         }
         let mut runtime = if let Some(filename) = filename {
             Self::load_guest_execfn(

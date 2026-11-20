@@ -143,7 +143,7 @@ impl<C: Cpu> Lifecycle<C> {
                 self.birth.started,
             );
             job.stats.syscalls += 1;
-            let image = match image {
+            let mut image = match image {
                 Ok(Some(image)) => image,
                 Ok(None) => unreachable!("image admission waits before effects"),
                 Err(error) => {
@@ -179,6 +179,14 @@ impl<C: Cpu> Lifecycle<C> {
                 [c.euid, c.egid, c.fsuid, c.fsgid]
             };
             let old_ids = identity(p);
+            image.check_shared_fs(&p.linux.vfs, || {
+                members
+                    .iter()
+                    .filter(|(id, peer)| {
+                        *id != pid && peer.read().linux.vfs.owns_context_of(&p.linux.vfs)
+                    })
+                    .count()
+            });
             let old_memory = Kernel::install_exec(p, image, self.birth.started);
             job.work.trace.replaced();
             p.trace = std::mem::take(&mut job.work.trace);

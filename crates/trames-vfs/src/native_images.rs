@@ -52,6 +52,7 @@ impl ImageFds for Images {
         // Construct the complete OFD before publishing one slot. The table
         // mutex covers membership only; no native operation runs under it.
         let open = Arc::new(SharedOpenDescription {
+            _write_access: None,
             console: Default::default(),
             oom: None,
             sysctl_control: None,

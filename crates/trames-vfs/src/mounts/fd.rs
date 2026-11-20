@@ -329,7 +329,7 @@ impl Vfs {
         };
         let attrs = (attrs & 15) as u64 | atime | if attrs & 0x80 != 0 { MS_NODIRATIME } else { 0 };
         let local = attrs
-            | if root.kind == Kind::Sysfs || root.kind != Kind::Tmpfs && state.readonly {
+            | if root.kind != Kind::Tmpfs && state.readonly {
                 MS_RDONLY
             } else {
                 0
@@ -619,6 +619,41 @@ mod tests {
         v.close(fd).unwrap();
         v.unshare_user().unwrap();
         assert_eq!(check_layer_owner(&mount, &v.credentials), Err(Errno(1)));
+    }
+    #[test]
+    fn sysfs_write_mount_state_is_separate_from_attribute_permissions() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, Default::default());
+        let file = b"/sys/devices/system/cpu/online";
+        assert_eq!(
+            v.rename_at(AT_FDCWD, file, AT_FDCWD, file, 0),
+            Err(Errno(30))
+        );
+        v.mount(
+            None,
+            b"/sys",
+            None,
+            32 | MS_NODEV | MS_NOSUID | MS_NOEXEC,
+            None,
+        )
+        .unwrap();
+        v.rename_at(AT_FDCWD, file, AT_FDCWD, file, 0).unwrap();
+        assert!(v.mkdir_at(AT_FDCWD, b"/sys/devices/new", 0o755).is_err());
+        for readonly in [false, true] {
+            let ctx = v.fsopen(b"sysfs", 0).unwrap();
+            if readonly {
+                v.fsconfigure(ctx, 0, Some(b"ro"), None).unwrap();
+            }
+            v.fsconfigure(ctx, 6, None, None).unwrap();
+            let mount = v.fsmount(ctx, 0, 0).unwrap();
+            let stat = v.statfs_fd(mount).unwrap();
+            assert_eq!(
+                u64::from_le_bytes(stat[80..88].try_into().unwrap()) & MS_RDONLY != 0,
+                readonly
+            );
+            v.close(mount).unwrap();
+            v.close(ctx).unwrap();
+        }
     }
     #[test]
     fn descriptor_exhaustion_preserves_context_and_reconfiguration_reaches_bind_aliases() {

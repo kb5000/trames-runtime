@@ -339,6 +339,7 @@ impl Drop for FileActive {
     }
 }
 pub(super) struct PreparedOpen {
+    pub(super) _truncate_access: Option<executable::WriteAccess>,
     pub(super) reservation: fd_table::ReservedFd,
     pub(super) target: FileTarget,
     pub(super) cloexec: CloseOnExec,

@@ -1269,6 +1269,7 @@ impl<C: Cpu> Kernel<C> {
     #[cfg(all(test, trames_interpreter_conformance))]
     fn close_exit_files(&self, p: &mut Process<C>) {
         p.linux.vfs.sync_task_namespaces();
+        p.linux.executing_file = None;
         p.linux.executable_file = None;
         p.space.retire();
         {
@@ -1338,6 +1339,7 @@ impl<C: Cpu> Kernel<C> {
         p.retained_byte = None;
         p.tcp_liveness = None;
         p.retained_poll = None;
+        p.linux.executing_file = None;
         p.linux.executable_file = None;
     }
     #[cfg(all(test, trames_interpreter_conformance))]

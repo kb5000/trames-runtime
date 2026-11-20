@@ -282,6 +282,7 @@ pub(super) fn peer_descriptor(end: &PtyEnd, flags: u32, id: u64, owner: (u32, u3
     Descriptor {
         open: OpenHandle::new(OpenDescription {
             shared: Arc::new(SharedOpenDescription {
+                _write_access: None,
                 console: Default::default(),
                 oom: None,
                 sysctl_control: None,

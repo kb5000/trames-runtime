@@ -2,6 +2,55 @@
 //! Exec resolves an inode capability, never a proc magic-link display string.
 use super::*;
 
+/// A file being loaded or retained by a guest executable image. Cloning the
+/// image across fork shares the lease. Procfs observers retain only file identity.
+pub struct ExecutingFile(Arc<ExecutableFile>);
+impl ExecutingFile {
+    pub fn file(&self) -> &Arc<ExecutableFile> {
+        &self.0
+    }
+}
+pub(super) struct WriteAccess(NodeRef);
+
+impl Inode {
+    fn claim_text_access(&self, writer: bool) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        self.text_users
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |users| {
+                if writer && users >= 0 {
+                    users.checked_add(1)
+                } else if !writer && users <= 0 {
+                    users.checked_sub(1)
+                } else {
+                    None
+                }
+            })
+            .map(|_| ())
+            .map_err(|_| Errno(26))
+    }
+}
+impl WriteAccess {
+    pub(super) fn acquire(node: &NodeRef) -> Result<Self> {
+        node.claim_text_access(true)?;
+        Ok(Self(node.clone()))
+    }
+}
+impl Drop for WriteAccess {
+    fn drop(&mut self) {
+        self.0
+            .text_users
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+impl Drop for ExecutingFile {
+    fn drop(&mut self) {
+        self.0
+            .node
+            .text_users
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub struct ExecutableFile {
     notification: Arc<FileClose>,
     _mount_use: Option<mounts::MountUse>,
@@ -206,6 +255,10 @@ pub fn script_interpreter(bytes: &[u8]) -> Result<Option<ScriptInterpreter>> {
 }
 
 impl ExecutableFile {
+    pub fn begin_execution(self: &Arc<Self>) -> Result<Arc<ExecutingFile>> {
+        self.node.claim_text_access(false)?;
+        Ok(Arc::new(ExecutingFile(self.clone())))
+    }
     pub fn bytes(&self) -> Result<Vec<u8>> {
         let bytes = match &self.node.borrow().content {
             Content::File(data) => Vfs::executable_data(data)?,
@@ -221,6 +274,32 @@ impl ExecutableFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn text_busy_follows_inode_and_last_open_description() {
+        let mut v = Vfs::default();
+        v.import_executable(b"/image", b"binary".to_vec()).unwrap();
+        v.link_at(AT_FDCWD, b"/image", AT_FDCWD, b"/alias").unwrap();
+        let file = v.executable_file_at(AT_FDCWD, b"/image", 0).unwrap();
+        let writer = v.open_at(AT_FDCWD, b"/alias", 2, 0).unwrap();
+        let duplicate = v.dup(writer, 0, false).unwrap();
+        v.close(writer).unwrap();
+        assert!(matches!(file.begin_execution(), Err(Errno(26))));
+        v.close(duplicate).unwrap();
+
+        let image = file.begin_execution().unwrap();
+        let forked = image.clone();
+        drop(image);
+        v.unlink_at(AT_FDCWD, b"/image", false).unwrap();
+        for flags in [1, 2, O_TRUNC] {
+            assert_eq!(v.open_at(AT_FDCWD, b"/alias", flags, 0), Err(Errno(26)));
+        }
+        assert_eq!(v.truncate_at(b"/alias", 0), Err(Errno(26)));
+        let reader = v.open_at(AT_FDCWD, b"/alias", 0, 0).unwrap();
+        assert_eq!(v.read(reader, 6).unwrap(), b"binary");
+        drop(forked);
+        v.truncate_at(b"/alias", 0).unwrap();
+        assert!(file.bytes().unwrap().is_empty());
+    }
     #[test]
     fn resident_exec_lookup_accepts_private_inodes_and_reports_missing_files() {
         let path = std::env::temp_dir().join(format!(

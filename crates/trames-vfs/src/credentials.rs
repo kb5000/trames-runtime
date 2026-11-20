@@ -163,6 +163,9 @@ impl ExecCredentials {
         self.original.caps.no_new_privs.get()
     }
     pub fn apply(&self, view: &mut Vfs) -> bool {
+        self.apply_for_exec(view, false)
+    }
+    pub fn apply_for_exec(&self, view: &mut Vfs, externally_shared_fs: bool) -> bool {
         let no_new_privs = self.no_new_privs();
         let old_permitted = self.original.caps.permitted;
         let mut c = self.original.clone();
@@ -180,10 +183,13 @@ impl ExecCredentials {
             c.privilege_uid(c.uid),
             c.privilege_uid(c.euid),
             c.uid != c.euid || c.gid != c.egid,
-            no_new_privs,
+            no_new_privs || externally_shared_fs,
         );
         // Preserve the established pre-existing effective-ID downgrade rule.
-        if no_new_privs && (c.uid != c.euid || c.gid != c.egid) {
+        if (no_new_privs
+            || externally_shared_fs && !self.original.has_local_cap(capabilities::SETUID))
+            && (c.uid != c.euid || c.gid != c.egid)
+        {
             c.euid = c.uid;
             c.egid = c.gid;
         }

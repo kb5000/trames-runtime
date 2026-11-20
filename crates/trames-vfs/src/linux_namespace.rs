@@ -804,6 +804,7 @@ impl Vfs {
     ) -> OpenHandle {
         OpenHandle::new(OpenDescription {
             shared: Arc::new(SharedOpenDescription {
+                _write_access: None,
                 console: Default::default(),
                 oom: None,
                 sysctl_control: None,

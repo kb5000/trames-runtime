@@ -501,8 +501,19 @@ impl Vfs {
         self.context.paths.projections.borrow_mut().clear();
         self.mounts = None;
     }
+    pub fn live_context_users(&self) -> usize {
+        self.context.paths.users.load(Ordering::Relaxed)
+    }
+    pub fn owns_context_of(&self, other: &Self) -> bool {
+        self.shares_context_with(other)
+            && self
+                .context
+                .owner
+                .as_ref()
+                .is_some_and(|o| o.0.active.load(Ordering::Relaxed))
+    }
     pub fn context_shared(&self) -> bool {
-        self.context.paths.users.load(Ordering::Relaxed) > 1
+        self.live_context_users() > 1
     }
     pub fn unshare_context(&mut self) {
         self.context = self.context.clone();

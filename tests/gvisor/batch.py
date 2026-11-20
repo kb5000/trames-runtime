@@ -42,6 +42,7 @@ def main():
     p.add_argument('--reference',type=Path)
     p.add_argument('--runner',type=Path)
     p.add_argument('--rootfs',type=Path)
+    p.add_argument('--custom-rootfs',action='store_true',help='Import --rootfs as a custom fixture instead of the pinned Alpine distribution')
     p.add_argument('--fresh-store',action='store_true')
     p.add_argument('--reference-timings',type=Path)
     p.add_argument('--chunk-size',type=int,default=1)
@@ -96,6 +97,7 @@ def main():
             cmd+=['--case-plan',str(part)]
             if a.native_init:cmd+=['--native-init',str(a.native_init.resolve())]
         else:cmd+=['--reference',str(part),'--runner',str(a.runner.resolve()),'--rootfs',str(a.rootfs.resolve())]
+        if a.platform=='trames' and a.custom_rootfs:cmd.append('--custom-rootfs')
         with (out/('worker-%02d.log'%index)).open('w') as log:
             result=subprocess.run(cmd,stdout=log,stderr=subprocess.STDOUT)
         return dict(worker=index,exit_code=result.returncode,output=str(destination))
