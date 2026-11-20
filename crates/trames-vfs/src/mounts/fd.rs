@@ -525,7 +525,7 @@ impl Vfs {
             if Arc::ptr_eq(t, &tree) {
                 return Err(Errno(40));
             }
-            if t.members.borrow().len() + tree.members.borrow().len() > MAX_MOUNTS {
+            if t.members.borrow().len() + tree.members.borrow().len() > self.mount_limit() {
                 return Err(Errno(28));
             }
         } else if !attached(&parent) {

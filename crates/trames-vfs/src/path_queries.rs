@@ -209,6 +209,7 @@ impl Vfs {
                     .unwrap_or_else(|| self.pseudo.clone())
             });
             pseudo.boot_id = source.boot_id.clone();
+            pseudo.mount_policy = source.mount_policy.clone();
             pseudo.nr_open = source.nr_open.clone();
             pseudo.video_device = source.video_device.clone();
         }
@@ -428,6 +429,7 @@ impl PathQueries {
             Arc::new(SharedCell::new(pseudo::PseudoFs {
                 boot_id: root.boot_id.clone(),
                 user_namespace_limits: Default::default(), // Resolved through publication.
+                mount_policy: root.mount_policy.clone(),
                 nr_open: root.nr_open.clone(),
                 video_device: root.video_device.clone(),
                 enabled: root.enabled,

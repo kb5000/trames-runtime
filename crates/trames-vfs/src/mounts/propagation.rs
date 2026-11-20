@@ -6,35 +6,71 @@ use super::*;
 use std::collections::BTreeSet;
 use std::sync::Mutex;
 
-static NEXT_GROUP: AtomicU64 = AtomicU64::new(1);
-fn group() -> Result<u64> {
-    NEXT_GROUP
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-        .map_err(|_| Errno(28))
+// A detached tree and a slave's ancestry keep their IDs alive. Each guest
+// recycles its own numbers after the last reference to a group disappears.
+#[derive(Debug)]
+pub(super) struct Group {
+    pub(super) id: u64,
+    pool: std::sync::Weak<Mutex<GroupIds>>,
+}
+impl PartialEq for Group {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.pool.ptr_eq(&other.pool)
+    }
+}
+impl Eq for Group {}
+impl Drop for Group {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool.upgrade() {
+            pool.lock().unwrap().unused.insert(self.id);
+        }
+    }
+}
+type Link = Option<Arc<Group>>;
+#[derive(Default, Debug)]
+struct GroupIds {
+    last: u64,
+    unused: BTreeSet<u64>,
+}
+#[derive(Default)]
+pub(super) struct Groups(Arc<Mutex<GroupIds>>);
+impl Groups {
+    fn allocate(&self) -> Result<Arc<Group>> {
+        let mut pool = self.0.lock().unwrap();
+        let id = match pool.unused.pop_first() {
+            Some(id) => id,
+            None => {
+                pool.last = pool.last.checked_add(1).ok_or(Errno(28))?;
+                pool.last
+            }
+        };
+        Ok(Arc::new(Group {
+            id,
+            pool: Arc::downgrade(&self.0),
+        }))
+    }
 }
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub(super) struct State {
-    pub shared: u64,
-    pub master: u64,
-    lineage: Vec<u64>,
+    pub shared: Link,
+    pub master: Link,
+    lineage: Vec<Arc<Group>>,
 }
 impl State {
     pub(super) fn inherited_slave(mut self) -> Self {
-        if self.shared != 0 {
-            if self.master != 0 {
-                self.lineage.insert(0, self.master);
+        if let Some(shared) = self.shared.take() {
+            if let Some(master) = self.master.replace(shared) {
+                self.lineage.insert(0, master);
             }
-            self.master = self.shared;
-            self.shared = 0;
         }
         self
     }
     pub(super) fn resolved(mut self, alive: &BTreeSet<u64>) -> Self {
-        while self.master != 0 && !alive.contains(&self.master) {
+        while self.master.as_ref().is_some_and(|g| !alive.contains(&g.id)) {
             self.master = if self.lineage.is_empty() {
-                0
+                None
             } else {
-                self.lineage.remove(0)
+                Some(self.lineage.remove(0))
             };
         }
         self
@@ -49,15 +85,13 @@ fn members(namespaces: &[MountNamespace]) -> Vec<Arc<Mount>> {
 pub(super) fn live_groups(namespaces: &[MountNamespace]) -> BTreeSet<u64> {
     members(namespaces)
         .iter()
-        .map(|m| m.propagation().shared)
-        .filter(|g| *g != 0)
+        .filter_map(|m| Some(m.propagation().shared?.id))
         .collect()
 }
 fn normalize(mounts: &[Arc<Mount>]) {
     let alive = mounts
         .iter()
-        .map(|m| m.propagation().shared)
-        .filter(|g| *g != 0)
+        .filter_map(|m| Some(m.propagation().shared?.id))
         .collect();
     for mount in mounts {
         let old = mount.propagation();
@@ -83,6 +117,21 @@ impl MountNamespace {
         table.borrow().admin.register(&table);
         Self(table)
     }
+}
+
+fn child_at(ns: &MountNamespace, parent: &Mount, node: &NodeRef) -> Option<Arc<Mount>> {
+    ns.0.borrow()
+        .mounts
+        .iter()
+        .rev()
+        .find(|mount| {
+            mount
+                .parent
+                .borrow()
+                .as_ref()
+                .is_some_and(|a| a.parent.id == parent.id && Arc::ptr_eq(&a.node, node))
+        })
+        .cloned()
 }
 
 impl Vfs {
@@ -124,22 +173,22 @@ impl Vfs {
             match operation {
                 PRIVATE => state = State::default(),
                 SHARED => {
-                    if state.shared == 0 {
-                        state.shared = group()?;
+                    if state.shared.is_none() {
+                        state.shared = Some(self.pseudo.borrow().mount_policy.groups.allocate()?);
                     }
                 }
                 SLAVE => {
-                    if state.shared != 0
+                    if state.shared.is_some()
                         && mounts
                             .iter()
                             .any(|m| m.id != mount.id && m.propagation().shared == state.shared)
                     {
-                        if state.master != 0 {
-                            state.lineage.insert(0, state.master);
+                        if let Some(master) = state.master.take() {
+                            state.lineage.insert(0, master);
                         }
-                        state.master = state.shared;
+                        state.master = state.shared.take();
                     }
-                    state.shared = 0;
+                    state.shared = None;
                 }
                 _ => unreachable!(),
             }
@@ -161,12 +210,12 @@ impl Vfs {
         let namespace = self.mounts.as_ref().ok_or(Errno(22))?;
         let shared = parent.propagation().shared;
         let mut result = vec![(namespace.clone(), parent.clone(), 0)];
-        if shared == 0 {
+        let Some(shared) = shared else {
             return Ok(result);
-        }
+        };
         let namespaces = namespace.0.borrow().admin.namespaces();
         normalize(&members(&namespaces));
-        let mut pending = vec![(shared, 0)];
+        let mut pending = vec![(shared.id, 0)];
         let mut groups = BTreeSet::new();
         let mut seen = BTreeSet::from([parent.id]);
         while let Some((peer, upstream)) = pending.pop() {
@@ -176,13 +225,13 @@ impl Vfs {
             for ns in &namespaces {
                 for mount in &ns.0.borrow().mounts {
                     let state = mount.propagation();
-                    if state.shared == peer {
+                    if state.shared.as_ref().is_some_and(|g| g.id == peer) {
                         if seen.insert(mount.id) {
                             result.push((ns.clone(), mount.clone(), upstream));
                         }
-                    } else if state.master == peer {
-                        if state.shared != 0 {
-                            pending.push((state.shared, peer));
+                    } else if state.master.as_ref().is_some_and(|g| g.id == peer) {
+                        if let Some(shared) = state.shared {
+                            pending.push((shared.id, peer));
                         } else if seen.insert(mount.id) {
                             result.push((ns.clone(), mount.clone(), peer));
                         }
@@ -210,33 +259,57 @@ impl Vfs {
     ) -> Result<()> {
         let root = added.first().ok_or(Errno(22))?;
         let parents = self.propagation_parents(&attachment.parent)?;
-        let parent_group = attachment.parent.propagation().shared;
+        let parent_group = attachment.parent.propagation().shared.map_or(0, |g| g.id);
         let mut state = root.propagation();
-        if parent_group != 0 && state.shared == 0 {
-            state.shared = group()?;
-            root.set_propagation(state.clone());
+        if parent_group != 0 && state.shared.is_none() {
+            state.shared = Some(self.pseudo.borrow().mount_policy.groups.allocate()?);
         }
-        let mut child_groups = BTreeMap::from([(parent_group, state.shared)]);
+        let mut child_groups = BTreeMap::from([(parent_group, state.shared.clone())]);
         // Allocate groups before constructing recipients: their order in the
         // namespace registry is unrelated to their master/slave ordering.
         for (_, parent, _) in &parents {
-            let peer = parent.propagation().shared;
+            let peer = parent.propagation().shared.map_or(0, |g| g.id);
             if peer != 0 && !child_groups.contains_key(&peer) {
-                child_groups.insert(peer, group()?);
+                child_groups.insert(
+                    peer,
+                    Some(self.pseudo.borrow().mount_policy.groups.allocate()?),
+                );
             }
         }
         let parent_states: BTreeMap<_, _> = parents
             .iter()
             .map(|(_, m, _)| {
                 let p = m.propagation();
-                (p.shared, p)
+                (p.shared.as_ref().map_or(0, |g| g.id), p)
             })
             .collect();
+        // Charge every recipient table before cloning any trees. A shared
+        // self-bind can double the topology in a single syscall.
+        let recipients: Vec<_> = parents
+            .into_iter()
+            .skip(1)
+            .filter_map(|(ns, parent, upstream)| {
+                let key = parent.key_of(&attachment.node)?;
+                Some((ns, parent, upstream, key))
+            })
+            .collect();
+        let mut charges = BTreeMap::new();
+        let limit = self.mount_limit();
+        for ns in std::iter::once(namespace).chain(recipients.iter().map(|(ns, ..)| ns)) {
+            let total = charges
+                .entry(ns.id())
+                .or_insert_with(|| ns.0.borrow().mounts.len());
+            *total = total.checked_add(added.len()).ok_or(Errno(28))?;
+            if *total > limit {
+                return Err(Errno(28));
+            }
+            if added.iter().any(|m| matches!(&m.namespace, Some(linux_namespace::NamespaceHandle::Mount(target)) if ns.id() >= target.id())) {
+                return Err(Errno(22));
+            }
+        }
         let mut plans = vec![(namespace.clone(), added.clone())];
-        for (ns, parent, upstream) in parents.into_iter().skip(1) {
-            let Some(key) = parent.key_of(&attachment.node) else {
-                continue;
-            };
+        let mut covered = Vec::new();
+        for (ns, parent, upstream, key) in recipients {
             let mut copies = BTreeMap::new();
             let less_privileged =
                 namespace.0.borrow().user_namespace != ns.0.borrow().user_namespace;
@@ -256,31 +329,34 @@ impl Vfs {
                 copies.insert(mount.id, copy);
             }
             let copy = copies[&root.id].clone();
+            if let Some(existing) = child_at(&ns, &parent, &attachment.node) {
+                covered.push((existing, copy.clone()));
+            }
             *copy.parent.borrow_mut() = Some(Attachment {
                 parent: parent.clone(),
                 node: attachment.node.clone(),
                 fallback: key,
             });
-            let peer = parent.propagation().shared;
+            let peer = parent.propagation().shared.map_or(0, |g| g.id);
             copy.set_propagation(if upstream == 0 {
                 state.clone()
             } else {
-                let mut chain = vec![child_groups[&upstream]];
+                let mut chain = vec![child_groups[&upstream].clone().unwrap()];
                 let mut at = upstream;
                 while at != parent_group {
-                    at = parent_states[&at].master;
+                    at = parent_states[&at].master.as_ref().map_or(0, |g| g.id);
                     if at == 0 {
                         break;
                     }
-                    chain.push(child_groups[&at]);
+                    chain.push(child_groups[&at].clone().unwrap());
                 }
-                if state.master != 0 {
-                    chain.push(state.master);
+                if let Some(master) = &state.master {
+                    chain.push(master.clone());
                     chain.extend_from_slice(&state.lineage);
                 }
                 State {
-                    shared: if peer == 0 { 0 } else { child_groups[&peer] },
-                    master: chain[0],
+                    shared: child_groups.get(&peer).cloned().flatten(),
+                    master: Some(chain[0].clone()),
                     lineage: chain[1..].to_vec(),
                 }
             });
@@ -294,19 +370,20 @@ impl Vfs {
             }
             plans.push((ns, added.iter().map(|m| copies[&m.id].clone()).collect()));
         }
-        let mut counts = BTreeMap::new();
-        for (ns, mounts) in &plans {
-            *counts.entry(ns.id()).or_insert(0) += mounts.len();
-        }
-        for (ns, mounts) in &plans {
-            if mounts.iter().any(|mount| matches!(&mount.namespace, Some(linux_namespace::NamespaceHandle::Mount(target)) if ns.id() >= target.id())) { return Err(Errno(22)); }
-            if ns.0.borrow().mounts.len() + counts[&ns.id()] > MAX_MOUNTS {
-                return Err(Errno(28));
-            }
-        }
+        root.set_propagation(state);
         *root.parent.borrow_mut() = Some(attachment);
         for (_, mounts) in &plans {
             self.register_mounts(mounts)?;
+        }
+        // A propagated mount goes beneath the mount already visible at
+        // that dentry. Keeping a single parent edge per mountpoint also lets
+        // unmount uncover the original tree without losing its descendants.
+        for (previous, below) in covered {
+            *previous.parent.borrow_mut() = Some(Attachment {
+                node: below.root.clone(),
+                fallback: below.root_path(),
+                parent: below,
+            });
         }
         for (ns, mounts) in plans {
             let mut table = ns.0.borrow_mut();
@@ -329,70 +406,120 @@ impl Vfs {
         if Arc::ptr_eq(mount, &ns.0.borrow().root) {
             return Err(Errno(16));
         }
-        let attachment = mount.parent.borrow().clone().ok_or(Errno(22))?;
-        let mut targets = vec![(ns.clone(), mount.clone())];
-        for (ns, parent, _) in self
-            .propagation_parents(&attachment.parent)?
-            .into_iter()
-            .skip(1)
-        {
-            let peer =
-                ns.0.borrow()
-                    .mounts
-                    .iter()
-                    .rev()
-                    .find(|m| {
-                        m.parent.borrow().as_ref().is_some_and(|a| {
-                            a.parent.id == parent.id && Arc::ptr_eq(&a.node, &attachment.node)
-                        })
-                    })
-                    .cloned();
-            if let Some(peer) = peer {
-                targets.push((ns, peer));
+        let lazy = flags & 2 != 0;
+        let mut removed = BTreeMap::from([(mount.id, (ns.clone(), mount.clone()))]);
+        let mut subtree = vec![mount.clone()];
+        let mut children: BTreeMap<u64, Vec<Arc<Mount>>> = BTreeMap::new();
+        for child in &ns.0.borrow().mounts {
+            if let Some(parent) = child.parent.borrow().as_ref() {
+                children
+                    .entry(parent.parent.id)
+                    .or_default()
+                    .push(child.clone());
             }
         }
-        let mut plans = vec![];
-        for (ns, mount) in targets {
-            let table = ns.0.borrow();
-            let mut ids = BTreeSet::from([mount.id]);
-            loop {
-                let before = ids.len();
-                for m in &table.mounts {
-                    if m.parent
-                        .borrow()
-                        .as_ref()
-                        .is_some_and(|a| ids.contains(&a.parent.id))
-                    {
-                        ids.insert(m.id);
+        if !lazy && (children.contains_key(&mount.id) || mount.in_use() || mount.writers.active()) {
+            return Err(Errno(16));
+        }
+        let mut i = 0;
+        while i < subtree.len() {
+            if let Some(nested) = children.get(&subtree[i].id) {
+                for child in nested {
+                    removed.insert(child.id, (ns.clone(), child.clone()));
+                    subtree.push(child.clone());
+                }
+            }
+            i += 1;
+        }
+
+        // Every attachment removed from the source subtree can propagate
+        // independently, including events crossing a nested shared mount.
+        let mut candidates = BTreeMap::new();
+        for source in &subtree {
+            let a = source.parent.borrow().clone().ok_or(Errno(22))?;
+            for (peer_ns, parent, _) in self.propagation_parents(&a.parent)?.into_iter().skip(1) {
+                if let Some(peer) = child_at(&peer_ns, &parent, &a.node) {
+                    if !removed.contains_key(&peer.id) {
+                        candidates.insert(peer.id, (peer_ns, peer));
                     }
                 }
-                if ids.len() == before {
-                    break;
-                }
             }
-            // Native Linux rejects the whole ordinary unmount when a peer
-            // recipient is busy; no namespace is changed before this preflight.
-            if flags & 2 == 0 && (ids.len() > 1 || mount.in_use() || mount.writers.active()) {
-                return Err(Errno(16));
-            }
-            let detached: Vec<_> = table
-                .mounts
-                .iter()
-                .filter(|m| ids.contains(&m.id))
-                .cloned()
-                .collect();
-            drop(table);
-            plans.push((ns, mount, ids, detached));
         }
-        for (ns, mount, ids, detached) in plans {
+
+        // Postorder is determined by dependencies, independent of namespace
+        // registry order. A peer with its own surviving submount stays put.
+        loop {
+            let before = candidates.len();
+            for id in candidates.keys().copied().collect::<Vec<_>>() {
+                let (ns, peer) = &candidates[&id];
+                let retains_submount =
+                    ns.0.borrow().mounts.iter().any(|child| {
+                        !removed.contains_key(&child.id)
+                            && child.parent.borrow().as_ref().is_some_and(|a| {
+                                a.parent.id == id && !Arc::ptr_eq(&a.node, &peer.root)
+                            })
+                    });
+                if retains_submount {
+                    continue;
+                }
+                if !lazy && (peer.in_use() || peer.writers.active()) {
+                    return Err(Errno(16));
+                }
+                removed.insert(id, candidates.remove(&id).unwrap());
+            }
+            if before == candidates.len() {
+                break;
+            }
+        }
+        let mut affected = BTreeMap::new();
+        for (ns, m) in removed.values() {
+            affected
+                .entry(ns.id())
+                .or_insert_with(|| (ns.clone(), Vec::new()))
+                .1
+                .push(m.clone());
+        }
+        for (ns, detached) in affected.into_values() {
             let mut table = ns.0.borrow_mut();
-            table.mounts.retain(|m| !ids.contains(&m.id));
+            for child in &table.mounts {
+                if removed.contains_key(&child.id) {
+                    continue;
+                }
+                let mut link = child.parent.borrow().clone();
+                if !link
+                    .as_ref()
+                    .is_some_and(|a| removed.contains_key(&a.parent.id))
+                {
+                    continue;
+                }
+                // Restore the bottom of the surviving stack to the original
+                // mountpoint before clearing the removed layers' parent edges.
+                while let Some(a) = &link {
+                    if !removed.contains_key(&a.parent.id) {
+                        break;
+                    }
+                    let next = a.parent.parent.borrow().clone();
+                    link = next;
+                }
+                *child.parent.borrow_mut() = link;
+            }
+            table.mounts.retain(|m| !removed.contains_key(&m.id));
             let events = table.events.clone();
             drop(table);
-            if flags & 2 != 0 {
+            for m in &detached {
+                let boundary = m
+                    .parent
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|a| !removed.contains_key(&a.parent.id));
+                if boundary {
+                    *m.parent.borrow_mut() = None;
+                }
+                m.set_propagation(State::default());
+            }
+            if lazy {
                 self.detached_mounts.borrow_mut().push(detached);
             }
-            *mount.parent.borrow_mut() = None;
             events.changed();
         }
         normalize(&members(&ns.0.borrow().admin.namespaces()));

@@ -904,6 +904,7 @@ pub struct RuntimeInfo {
 #[derive(Default)]
 pub(super) struct PseudoFs {
     pub(super) user_namespace_limits: std::sync::OnceLock<Arc<user_namespace::UserNamespaceLimits>>,
+    pub(super) mount_policy: Arc<mounts::MountPolicy>,
     pub(super) nr_open: DescriptorCeiling,
     pub(super) boot_id: Arc<std::sync::OnceLock<Result<Vec<u8>>>>,
     pub(super) video_device: Arc<std::sync::atomic::AtomicBool>,
@@ -2030,6 +2031,7 @@ impl Vfs {
             b"/proc/sys/kernel/pid_max" => return Ok(regular(b"2147483647\n".to_vec())),
             b"/proc/sys/kernel/threads-max" => return Ok(regular(format!("{task_limit}\n").into_bytes())),
             sysctl::MAX_USER_NAMESPACES => return Ok(Some((file(format!("{}\n", self.user_namespace_limits().max()).into_bytes()), 0o100644))),
+            b"/proc/sys/fs/mount-max" => return Ok(Some((file(format!("{}\n", self.mount_limit()).into_bytes()), 0o100644))),
             b"/proc/sys/fs/nr_open" => return Ok(Some((file(format!("{}\n", self.descriptor_ceiling().get()).into_bytes()), 0o100644))),
             b"/proc/sys/fs/suid_dumpable" => return Ok(regular(b"0\n".to_vec())),
             b"/proc/sys/fs/file-max" => return Ok(regular(format!("{}\n", task_limit * MAX_FDS as usize).into_bytes())),
@@ -2822,6 +2824,8 @@ impl Vfs {
             .collect(),
             b"/proc/sys/kernel/random" => vec![b"uuid".to_vec(), b"boot_id".to_vec()],
             b"/proc/sys/fs" => vec![
+                b"mount-max".to_vec(),
+                b"nr_open".to_vec(),
                 b"file-max".to_vec(),
                 b"file-nr".to_vec(),
                 b"suid_dumpable".to_vec(),

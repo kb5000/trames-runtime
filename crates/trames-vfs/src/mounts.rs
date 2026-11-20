@@ -34,7 +34,37 @@ fn hides_locked_child(mounts: &[Arc<Mount>], parent: &Arc<Mount>, key: &[u8]) ->
                 .is_some_and(|a| Arc::ptr_eq(&a.parent, parent) && below(&a.key(), key))
     })
 }
-const MAX_MOUNTS: usize = 128;
+// This is an environment-wide setting applied separately to each mount table.
+pub(super) struct MountPolicy {
+    limit: std::sync::atomic::AtomicU32,
+    groups: propagation::Groups,
+}
+impl Default for MountPolicy {
+    fn default() -> Self {
+        Self {
+            limit: std::sync::atomic::AtomicU32::new(128),
+            groups: Default::default(),
+        }
+    }
+}
+impl MountPolicy {
+    pub(super) fn get(&self) -> u32 {
+        self.limit.load(Ordering::Relaxed)
+    }
+    pub(super) fn set(&self, value: u32) {
+        self.limit.store(value, Ordering::Relaxed);
+    }
+}
+impl Vfs {
+    // Most paths stay in one mount. Only a deep traversal needs the size
+    // of the live registry, which also contains detached descriptor trees.
+    fn mount_walk(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..8).chain(std::iter::once_with(|| 8..=self.mount_registry.borrow().len()).flatten())
+    }
+    pub(super) fn mount_limit(&self) -> usize {
+        self.pseudo.borrow().mount_policy.get() as usize
+    }
+}
 static NEXT_MOUNT: AtomicU64 = AtomicU64::new(16);
 static NEXT_NAMESPACE: AtomicU64 = AtomicU64::new(0xe000_0000);
 
@@ -787,7 +817,7 @@ impl Vfs {
         }
     }
     pub(super) fn follow_mounts(&self, mut path: ResolvedPath) -> Result<ResolvedPath> {
-        for _ in 0..MAX_MOUNTS {
+        for _ in self.mount_walk() {
             let Some(current) = &path.mount else {
                 return Ok(path);
             };
@@ -843,7 +873,7 @@ impl Vfs {
             return Ok(path.clone());
         }
         let mut at = path.clone();
-        for _ in 0..MAX_MOUNTS {
+        for _ in self.mount_walk() {
             let Some(m) = &at.mount else {
                 return Ok(at.parent());
             };
@@ -869,7 +899,7 @@ impl Vfs {
         let root = self.root_location()?;
         let mut at = path.clone();
         let mut suffix = Vec::new();
-        for _ in 0..=MAX_MOUNTS {
+        for _ in self.mount_walk() {
             // An OFD opened before CLONE_NEWNS retains its original mount tree.
             // Both namespace roots can still name the same filesystem root;
             // finish that original ancestry rather than exposing its backing
@@ -1305,7 +1335,7 @@ impl Vfs {
                         continue;
                     }
                     let mut at = child.clone();
-                    for _ in 0..MAX_MOUNTS {
+                    for _ in 0..ns.0.borrow().mounts.len() {
                         let Some(a) = at.parent.borrow().clone() else {
                             break;
                         };
@@ -1415,7 +1445,7 @@ impl Vfs {
                 _ => return Err(Errno(19)),
             }
         };
-        if ns.0.borrow().mounts.len() + additions.len() + 1 > MAX_MOUNTS {
+        if ns.0.borrow().mounts.len() + additions.len() + 1 > self.mount_limit() {
             return Err(Errno(28));
         }
         if additions.iter().any(|mount| {
@@ -1543,7 +1573,7 @@ impl Vfs {
             .parent
             .borrow()
             .as_ref()
-            .is_some_and(|a| a.parent.propagation().shared != 0)
+            .is_some_and(|a| a.parent.propagation().shared.is_some())
         {
             return Err(Errno(22));
         }
@@ -1968,14 +1998,19 @@ pub(super) fn table_text(snapshot: &NamespaceSnapshot, info: bool) -> Vec<u8> {
         return Vec::new();
     };
     let table = table.borrow();
-    let alive = if table.mounts.iter().any(|m| m.propagation().master != 0) {
+    let alive = if table
+        .mounts
+        .iter()
+        .any(|m| m.propagation().master.is_some())
+    {
         propagation::live_groups(&table.admin.namespaces())
     } else {
         Default::default()
     };
     let mut text = String::new();
     for m in &table.mounts {
-        let Some(mut target) = mount_absolute(m, &m.root_path(), &table.root) else {
+        let Some(mut target) = mount_absolute(m, &m.root_path(), &table.root, table.mounts.len())
+        else {
             continue;
         };
         let view_root = snapshot
@@ -1987,7 +2022,9 @@ pub(super) fn table_text(snapshot: &NamespaceSnapshot, info: bool) -> Vec<u8> {
             let Some(root_key) = root_mount.key_of(&root_node) else {
                 continue;
             };
-            let Some(root_path) = mount_absolute(&root_mount, &root_key, &table.root) else {
+            let Some(root_path) =
+                mount_absolute(&root_mount, &root_key, &table.root, table.mounts.len())
+            else {
                 continue;
             };
             if Arc::ptr_eq(m, &root_mount) {
@@ -2044,11 +2081,11 @@ pub(super) fn table_text(snapshot: &NamespaceSnapshot, info: bool) -> Vec<u8> {
                 {
                     let p = m.propagation().resolved(&alive);
                     let mut tags = String::new();
-                    if p.shared != 0 {
-                        tags.push_str(&format!(" shared:{}", p.shared));
+                    if let Some(group) = p.shared {
+                        tags.push_str(&format!(" shared:{}", group.id));
                     }
-                    if p.master != 0 {
-                        tags.push_str(&format!(" master:{}", p.master));
+                    if let Some(group) = p.master {
+                        tags.push_str(&format!(" master:{}", group.id));
                     }
                     tags
                 },
@@ -2468,11 +2505,16 @@ impl Vfs {
     }
 }
 
-pub(super) fn mount_absolute(mount: &Arc<Mount>, key: &[u8], root: &Arc<Mount>) -> Option<Vec<u8>> {
+pub(super) fn mount_absolute(
+    mount: &Arc<Mount>,
+    key: &[u8],
+    root: &Arc<Mount>,
+    max_steps: usize,
+) -> Option<Vec<u8>> {
     let mut at = mount.clone();
     let mut key = key.to_vec();
     let mut suffix = Vec::new();
-    for _ in 0..MAX_MOUNTS {
+    for _ in 0..=max_steps {
         let base = at.root_path();
         if !below(&key, &base) {
             return None;
@@ -2589,13 +2631,13 @@ mod boundary_tests {
             .filter(|w| w.strong_count() != 0)
             .count();
         let mut siblings = Vec::new();
-        for _ in 0..MAX_MOUNTS + 16 {
+        for _ in 0..parent.mount_limit() + 16 {
             let mut child = parent.clone();
             child.unshare_mounts().unwrap();
             child.mount(None, b"/b", Some(b"tmpfs"), 0, None).unwrap();
             siblings.push(child);
         }
-        assert!(parent.mount_resources.borrow().len() > MAX_MOUNTS);
+        assert!(parent.mount_resources.borrow().len() > parent.mount_limit());
         for child in &siblings {
             assert_eq!(
                 child.mounts.as_ref().unwrap().0.borrow().mounts.len(),
@@ -2607,9 +2649,32 @@ mod boundary_tests {
         assert_eq!(parent.mount_resources.borrow().len(), initial);
     }
     #[test]
+    fn mount_max_tracks_live_sysctl_across_namespaces_and_existing_trees() {
+        let mut parent = vfs();
+        let path = b"/proc/sys/fs/mount-max";
+        let mut sibling = parent.clone();
+        sibling.unshare_mounts().unwrap();
+        let fd = parent.open_at(AT_FDCWD, path, 1, 0).unwrap();
+        parent.write(fd, b"1\n").unwrap();
+        parent.close(fd).unwrap();
+        assert_eq!(
+            sibling.mount(None, b"/b", Some(b"tmpfs"), 0, None),
+            Err(Errno(28))
+        );
+        let fd = sibling.open_at(AT_FDCWD, path, 0, 0).unwrap();
+        assert_eq!(sibling.read(fd, 16).unwrap(), b"1\n");
+        sibling.close(fd).unwrap();
+        let fd = sibling.open_at(AT_FDCWD, path, 1, 0).unwrap();
+        assert_eq!(sibling.write(fd, b"0"), Err(Errno(22)));
+        sibling.write(fd, b"512").unwrap();
+        sibling.close(fd).unwrap();
+        parent.mount(None, b"/b", Some(b"tmpfs"), 0, None).unwrap();
+        sibling.mount(None, b"/b", Some(b"tmpfs"), 0, None).unwrap();
+    }
+    #[test]
     fn per_namespace_mount_limit_failure_is_atomic_and_recoverable() {
         let mut v = vfs();
-        while v.mounts.as_ref().unwrap().0.borrow().mounts.len() < MAX_MOUNTS {
+        while v.mounts.as_ref().unwrap().0.borrow().mounts.len() < v.mount_limit() {
             v.mount(None, b"/a", Some(b"tmpfs"), 0, None).unwrap();
         }
         let id = v.mounts.as_ref().unwrap().id();
@@ -2624,7 +2689,7 @@ mod boundary_tests {
         child.unshare_mounts().unwrap();
         assert_eq!(
             child.mounts.as_ref().unwrap().0.borrow().mounts.len(),
-            MAX_MOUNTS
+            v.mount_limit()
         );
         v.umount(b"/a", 0).unwrap();
         v.mount(None, b"/a", Some(b"tmpfs"), 0, None).unwrap();

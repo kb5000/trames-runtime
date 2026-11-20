@@ -7,6 +7,7 @@ pub(super) const MAX_USER_NAMESPACES: &[u8] = b"/proc/sys/user/max_user_namespac
 pub(super) enum Control {
     Network(network::Control),
     NrOpen(DescriptorCeiling),
+    MountMax(Arc<mounts::MountPolicy>),
     Comm {
         task: Arc<dyn ProcTask>,
         thread_entry: bool,
@@ -31,6 +32,7 @@ impl Control {
             Self::UserNamespaces(owner, _) => {
                 owner.capable(credentials, capabilities::SYS_RESOURCE)
             }
+            Self::MountMax(_) => credentials.euid == 0 && credentials.user_namespace.is_initial(),
             Self::NrOpen(_) => {
                 credentials.has_cap(capabilities::SYS_RESOURCE)
                     || credentials.euid == 0 && credentials.user_namespace.is_initial()
@@ -47,6 +49,7 @@ impl Control {
             }
             Self::UserMap(control) => return control.read(offset, count),
             Self::Network(control) => return control.read(offset, count),
+            Self::MountMax(policy) => policy.get(),
             Self::NrOpen(limit) => limit.get(),
             Self::UserNamespaces(_, limit) => limit.max(),
         };
@@ -72,7 +75,7 @@ impl Control {
             }
             Self::UserMap(control) => control.write(bytes, offset, credentials),
             Self::Network(control) => control.write(bytes, offset, control.authorized(credentials)),
-            Self::NrOpen(_) | Self::UserNamespaces(_, _) => {
+            Self::MountMax(_) | Self::NrOpen(_) | Self::UserNamespaces(_, _) => {
                 if !self.authorized(credentials, tgid) {
                     return Err(Errno(13));
                 }
@@ -88,6 +91,7 @@ impl Control {
                     .parse::<u32>()
                     .map_err(|_| Errno(22))?;
                 match self {
+                    Self::MountMax(policy) if value > 0 => policy.set(value),
                     Self::NrOpen(limit) if (1..=MAX_FDS).contains(&value) => limit.set(value),
                     Self::UserNamespaces(_, limit) if value <= i32::MAX as u32 => limit.set(value),
                     _ => return Err(Errno(22)),
@@ -142,6 +146,8 @@ impl Vfs {
                 self.credentials.user_namespace.clone(),
                 self.user_namespace_limits(),
             ))
+        } else if path.as_ref() == b"/proc/sys/fs/mount-max" && self.uses_pseudo(path) {
+            Some(Control::MountMax(self.pseudo.borrow().mount_policy.clone()))
         } else if self.uses_pseudo(path) && path.as_ref() == b"/proc/sys/fs/nr_open" {
             Some(Control::NrOpen(self.descriptor_ceiling()))
         } else {

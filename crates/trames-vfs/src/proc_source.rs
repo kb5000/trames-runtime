@@ -224,7 +224,8 @@ impl Vfs {
                 };
                 root = next;
             }
-            mounts::mount_absolute(&mount, &path.key, &root).ok_or(Errno(2))
+            mounts::mount_absolute(&mount, &path.key, &root, self.mount_registry.borrow().len())
+                .ok_or(Errno(2))
         })
     }
     pub(super) fn bind_proc_path(&self, path: &mut ResolvedPath) -> Result<()> {
