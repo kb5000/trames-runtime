@@ -516,7 +516,7 @@ impl HostFs {
             (48, native.f_ffree as u64),
             (64, native.f_namemax as u64),
             (72, native.f_frsize as u64),
-            (80, flags & 15),
+            (80, flags),
         ] {
             out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
         }
@@ -1029,6 +1029,7 @@ impl Vfs {
             root,
             root_key: b"/".to_vec(),
             kind: Kind::Host,
+            display: Default::default(),
             namespace: None,
             pid_namespace: None,
             devpts: None,

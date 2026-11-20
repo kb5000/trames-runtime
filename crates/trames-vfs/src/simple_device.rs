@@ -73,32 +73,15 @@ impl SharedOpenDescription {
         }
         result
     }
-    pub(super) fn simple_write<const POSITIONED: bool>(
-        &self,
-        kind: Kind,
-        bytes: &[u8],
-    ) -> Result<usize> {
-        let access = || {
-            let flags = self.flags.get();
-            if flags & O_PATH != 0 || flags & 3 == 0 {
-                Err(Errno(9))
-            } else {
-                Ok(())
-            }
-        };
-        if !POSITIONED {
-            access()?;
-        }
-        if let Some(mount) = self.mount_resource.get() {
-            mount.writable()?;
-        }
-        if POSITIONED {
-            access()?;
+    pub(super) fn simple_write(&self, kind: Kind, bytes: &[u8]) -> Result<usize> {
+        let flags = self.flags.get();
+        if flags & O_PATH != 0 || flags & 3 == 0 {
+            return Err(Errno(9));
         }
         let result = kind.write(bytes);
         if result.is_ok_and(|n| n != 0) {
             let node = self.node.as_ref().expect("memory-device inode");
-            {
+            if !self.mount_resource.get().is_some_and(|m| m.readonly()) {
                 let mut n = node.borrow_mut();
                 n.times[1] = storage::Timestamp::now();
                 n.times[2] = n.times[1];
@@ -240,11 +223,11 @@ mod tests {
         let readonly = v.direct_descriptors().get(ro).unwrap();
         v.mount(None, b"/devices", None, 32 | mounts::MS_RDONLY, None)
             .unwrap();
-        assert_eq!(cap.write(b"x"), Err(Errno(30)));
+        assert_eq!(cap.write(b"x"), Ok(1));
         assert_eq!(readonly.write(b"x"), Err(Errno(9)));
-        assert_eq!(readonly.device_pwrite(b"x", 0), Err(Errno(30)));
-        assert_eq!(v.pwrite(ro, b"x", 0), Err(Errno(30)));
-        assert_eq!(open(&q, b"/devices/other", 2), Err(Errno(30)));
+        assert_eq!(readonly.device_pwrite(b"x", 0), Err(Errno(9)));
+        assert_eq!(v.pwrite(ro, b"x", 0), Err(Errno(9)));
+        assert!(open(&q, b"/devices/other", 2).is_ok());
         v.mount(None, b"/devices", None, 32 | mounts::MS_NODEV, None)
             .unwrap();
         assert_eq!(open(&q, b"/devices/other", 0), Err(Errno(13)));

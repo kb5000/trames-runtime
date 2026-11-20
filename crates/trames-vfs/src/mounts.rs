@@ -17,6 +17,10 @@ pub(super) const MS_RDONLY: u64 = 1;
 pub(super) const MS_NOSUID: u64 = 2;
 pub(super) const MS_NODEV: u64 = 4;
 pub(super) const MS_NOEXEC: u64 = 8;
+pub(super) const MS_NOATIME: u64 = 1 << 10;
+pub(super) const MS_NODIRATIME: u64 = 1 << 11;
+const MS_STRICTATIME: u64 = 1 << 24;
+const ATIME_FLAGS: u64 = MS_NOATIME | MS_NODIRATIME | MS_RELATIME;
 pub(super) const MS_RELATIME: u64 = 1 << 21;
 const MAX_MOUNTS: usize = 128;
 static NEXT_MOUNT: AtomicU64 = AtomicU64::new(16);
@@ -60,12 +64,18 @@ impl Attachment {
             .unwrap_or_else(|| self.fallback.clone())
     }
 }
+#[derive(Clone, Default)]
+pub(super) struct MountDisplay {
+    source: Option<Arc<[u8]>>,
+    tmpfs_mode: Option<u32>,
+}
 pub(super) struct MountInit {
     pub id: u64,
     pub fs: FsHandle,
     pub root: NodeRef,
     pub root_key: Vec<u8>,
     pub kind: Kind,
+    pub display: MountDisplay,
     pub namespace: Option<linux_namespace::NamespaceHandle>,
     pub pid_namespace: Option<PidNamespace>,
     pub devpts: Option<Arc<pty::Devpts>>,
@@ -87,9 +97,10 @@ pub(super) struct MountIdentity {
     pub root: NodeRef,
     pub root_key: Vec<u8>,
     pub kind: Kind,
+    pub display: MountDisplay,
     pub pid_namespace: Option<PidNamespace>,
     pub devpts: Option<Arc<pty::Devpts>>,
-    pub flags: MountFlags,
+    pub flags: Arc<MountFlags>,
     propagation: propagation::Metadata,
     pub writers: Arc<mapped::Writers>,
 }
@@ -266,9 +277,10 @@ impl Mount {
             root: init.root,
             root_key: init.root_key,
             kind: init.kind,
+            display: init.display,
             pid_namespace: init.pid_namespace,
             devpts: init.devpts,
-            flags: MountFlags(AtomicU64::new(init.flags.get())),
+            flags: Arc::new(MountFlags(AtomicU64::new(init.flags.get()))),
             propagation: Default::default(),
             writers: init.writers,
         });
@@ -352,6 +364,18 @@ impl Mount {
         })
     }
 }
+pub(super) fn special_file(node: Option<&NodeRef>) -> bool {
+    node.is_some_and(|node| {
+        matches!(
+            node.borrow().content,
+            Content::Fifo(_)
+                | Content::Socket(_)
+                | Content::Null
+                | Content::Terminal
+                | Content::Device(_)
+        )
+    })
+}
 impl MountData {
     pub(super) fn device(&self) -> u64 {
         self.identity.device
@@ -365,6 +389,13 @@ impl MountData {
         } else {
             Ok(())
         }
+    }
+    /// A FIFO or device write transfers data to its endpoint without writing the filesystem.
+    pub(super) fn writable_data(&self, node: Option<&NodeRef>) -> Result<()> {
+        if self.readonly() && !special_file(node) {
+            return Err(Errno(30));
+        }
+        Ok(())
     }
     pub fn key_of(&self, node: &NodeRef) -> Option<Vec<u8>> {
         if Arc::ptr_eq(node, &self.root) {
@@ -580,6 +611,7 @@ impl Vfs {
             root,
             root_key: b"/".to_vec(),
             kind: Kind::Root,
+            display: Default::default(),
             namespace: None,
             pid_namespace: None,
             devpts: None,
@@ -602,6 +634,7 @@ impl Vfs {
                 root: node.clone(),
                 root_key: path.to_vec(),
                 kind,
+                display: Default::default(),
                 namespace: None,
                 pid_namespace: (kind == Kind::Proc).then(|| self.pid_ns.clone()),
                 devpts: None,
@@ -623,6 +656,7 @@ impl Vfs {
             root: cgroup_root,
             root_key: b"/".to_vec(),
             kind: Kind::Cgroup,
+            display: Default::default(),
             namespace: None,
             pid_namespace: None,
             devpts: None,
@@ -1046,7 +1080,7 @@ impl Vfs {
         const PRIVATE: u64 = 1 << 18;
         const SLAVE: u64 = 1 << 19;
         const SHARED: u64 = 1 << 20;
-        const ATTRS: u64 = MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_RELATIME;
+        const ATTRS: u64 = MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC | ATIME_FLAGS;
         if !self.credentials.has_ns_cap(
             &self
                 .mounts
@@ -1067,8 +1101,10 @@ impl Vfs {
         let flags = flags & !0x8000;
         // Strict atime is the absence of relatime in the selected VFS model.
         // Linux gives MS_STRICTATIME precedence when both are supplied.
-        let flags = if flags & (1 << 24) != 0 {
-            flags & !((1 << 24) | MS_RELATIME)
+        let preserve_atime = flags & (ATIME_FLAGS | MS_STRICTATIME) == 0;
+        let strict_atime = flags & MS_STRICTATIME != 0;
+        let flags = if strict_atime {
+            flags & !(MS_STRICTATIME | MS_NOATIME | MS_RELATIME)
         } else {
             flags
         };
@@ -1119,7 +1155,11 @@ impl Vfs {
             if flags & MS_RDONLY != 0 && parent.writers.active() {
                 return Err(Errno(16));
             }
-            parent.flags.set(flags & ATTRS);
+            let mut attrs = flags & ATTRS;
+            if preserve_atime {
+                attrs |= parent.flags.get() & ATIME_FLAGS;
+            }
+            parent.flags.set(attrs);
             let events = self.mounts.as_ref().unwrap().0.borrow().events.clone();
             events.changed();
             return Ok(());
@@ -1130,6 +1170,14 @@ impl Vfs {
             }
             let source = self.mount_location(source.ok_or(Errno(22))?, true)?;
             let moved = source.mount.as_ref().ok_or(Errno(22))?;
+            if moved
+                .parent
+                .borrow()
+                .as_ref()
+                .is_some_and(|a| a.parent.propagation().shared != 0)
+            {
+                return Err(Errno(22));
+            }
             if parent.propagation() != propagation::State::default()
                 || moved.propagation() != propagation::State::default()
                 || moved
@@ -1180,6 +1228,8 @@ impl Vfs {
         let mut additions = Vec::new();
         let mut devpts = None;
         let mut namespace = None;
+        let mut bind_origin = None;
+        let mut tmpfs_mode = None;
         if flags & BIND != 0 {
             let (_, target) =
                 self.resolve_entry_policy(AT_FDCWD, source.ok_or(Errno(22))?, true, true, 0, true)?;
@@ -1241,7 +1291,17 @@ impl Vfs {
                 return Err(Errno(20));
             }
             let m = source.mount.as_ref().ok_or(Errno(22))?;
+            if !ns
+                .0
+                .borrow()
+                .mounts
+                .iter()
+                .any(|attached| Arc::ptr_eq(attached, m))
+            {
+                return Err(Errno(22));
+            }
             devpts = m.devpts.clone();
+            bind_origin = Some(m.clone());
             if flags & REC != 0 {
                 for child in &ns.0.borrow().mounts {
                     if Arc::ptr_eq(child, m) {
@@ -1268,6 +1328,11 @@ impl Vfs {
             if !matches!(target_node.borrow().content, Content::Directory) {
                 return Err(Errno(20));
             }
+            let flags = if !strict_atime && flags & MS_NOATIME == 0 {
+                flags | MS_RELATIME
+            } else {
+                flags
+            };
             match kind.ok_or(Errno(22))? {
                 b"overlay" => {
                     let (fs, readonly) =
@@ -1294,6 +1359,7 @@ impl Vfs {
                         data.unwrap_or_default(),
                         self.pseudo.borrow().runtime.memory_limit as u64,
                     )?;
+                    tmpfs_mode = (mode != 0o1777).then_some(mode);
                     let fs = ram_filesystem(
                         limit,
                         nodes,
@@ -1363,10 +1429,8 @@ impl Vfs {
         }
         let proc_ns = if namespace.is_some() {
             None
-        } else if flags & 4096 != 0 {
-            self.mount_location(source.ok_or(Errno(22))?, true)?
-                .mount
-                .and_then(|m| m.pid_namespace.clone())
+        } else if let Some(m) = &bind_origin {
+            m.pid_namespace.clone()
         } else {
             (mount_kind == Kind::Proc).then(|| self.pid_ns.clone())
         };
@@ -1376,6 +1440,18 @@ impl Vfs {
             root,
             root_key,
             kind: mount_kind,
+            display: if let Some(m) = &bind_origin {
+                m.display.clone()
+            } else if namespace.is_some() {
+                MountDisplay::default()
+            } else {
+                MountDisplay {
+                    source: Some(Arc::from(
+                        source.filter(|s| !s.is_empty()).unwrap_or(b"none"),
+                    )),
+                    tmpfs_mode,
+                }
+            },
             namespace,
             pid_namespace: proc_ns,
             devpts,
@@ -1387,11 +1463,7 @@ impl Vfs {
                 fallback: target.key,
             })),
         }));
-        if flags & BIND != 0 && root.namespace.is_none() {
-            let source_mount = self
-                .mount_location(source.ok_or(Errno(22))?, true)?
-                .mount
-                .ok_or(Errno(22))?;
+        if let Some(source_mount) = &bind_origin {
             root.set_propagation(source_mount.propagation());
         }
         let mut copies = BTreeMap::new();
@@ -1634,6 +1706,7 @@ fn copy_mount(m: &Mount) -> Result<Arc<Mount>> {
         root: m.root.clone(),
         root_key: m.root_key.clone(),
         kind: m.kind,
+        display: m.display.clone(),
         namespace: m.namespace.clone(),
         pid_namespace: m.pid_namespace.clone(),
         devpts: m.devpts.clone(),
@@ -1767,18 +1840,19 @@ impl Mount {
         }
     }
     fn options(&self) -> String {
-        let mut out = if self.readonly() { "ro" } else { "rw" }.to_owned();
+        let flags = self.flags.get();
+        let mut out = if flags & MS_RDONLY != 0 { "ro" } else { "rw" }.to_owned();
         for (bit, label) in [
             (MS_NOSUID, ",nosuid"),
             (MS_NODEV, ",nodev"),
             (MS_NOEXEC, ",noexec"),
+            (MS_NOATIME, ",noatime"),
+            (MS_NODIRATIME, ",nodiratime"),
+            (MS_RELATIME, ",relatime"),
         ] {
-            if self.flags.get() & bit != 0 {
+            if flags & bit != 0 {
                 out.push_str(label);
             }
-        }
-        if self.flags.get() & MS_RELATIME != 0 {
-            out.push_str(",relatime");
         }
         out
     }
@@ -1825,18 +1899,21 @@ pub(super) fn table_text(snapshot: &NamespaceSnapshot, info: bool) -> Vec<u8> {
         if target.is_empty() {
             target.push(b'/');
         }
-        let source = if m.kind == Kind::Root {
-            "/dev/vda1"
-        } else {
-            m.fs_name()
+        let source = match m.display.source.as_deref() {
+            Some(source) => escape_mount_field(source),
+            None if m.kind == Kind::Root => "/dev/vda1".to_owned(),
+            None => m.fs_name().to_owned(),
         };
         let flags = m.options();
-        let super_options =
+        let super_options = if let Some(mode) = m.display.tmpfs_mode {
+            format!(",mode={mode:o}")
+        } else {
             m.fs.borrow()
                 .overlay
                 .as_ref()
                 .map(|o| format!(",{}", escape_mount_field(o.options())))
-                .unwrap_or_default();
+                .unwrap_or_default()
+        };
         if info {
             let root = match m.kind {
                 Kind::Proc | Kind::Sysfs | Kind::Devpts => m
@@ -1892,9 +1969,13 @@ impl Vfs {
         let Some(m) = mount else {
             return Ok(self.storage_stat());
         };
+        let flags = m.flags.get();
+        let stat_flags = (flags
+            & (MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_NOATIME | MS_NODIRATIME))
+            | if flags & MS_RELATIME != 0 { 4096 } else { 0 };
         #[cfg(all(feature = "hostfs", unix))]
         if let Some(host) = &m.fs.host {
-            return host.statfs(m.flags.get());
+            return host.statfs(stat_flags);
         }
         let mut out = [0; 120];
         let magic = match m.kind {
@@ -1931,15 +2012,7 @@ impl Vfs {
             (56, m.device()),
             (64, 255),
             (72, 4096),
-            (
-                80,
-                (m.flags.get() & 15)
-                    | if m.flags.get() & MS_RELATIME != 0 {
-                        4096
-                    } else {
-                        0
-                    },
-            ),
+            (80, stat_flags),
         ] {
             out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
         }
@@ -2590,6 +2663,37 @@ mod boundary_tests {
         assert!(node.borrow().file_metadata().times[0].seconds < future.seconds);
     }
     #[test]
+    fn directory_atime_survives_remount_and_bind_keeps_its_own_policy() {
+        let mut v = vfs();
+        v.mount(
+            Some(b"ram disk"),
+            b"/a",
+            Some(b"tmpfs"),
+            MS_NODIRATIME,
+            Some(b"mode=755"),
+        )
+        .unwrap();
+        v.mount(Some(b"/a"), b"/b", None, 4096, None).unwrap();
+        v.mount(None, b"/a", None, 32 | MS_RDONLY, None).unwrap();
+        let dir = v.open_at(AT_FDCWD, b"/b", O_DIRECTORY, 0).unwrap();
+        let open = v.descriptor(dir).unwrap().open.clone();
+        let node = open.borrow().node.clone().unwrap();
+        let old = storage::Timestamp {
+            seconds: 5,
+            nanos: 0,
+        };
+        node.borrow_mut().times[0] = old;
+        v.getdents(dir, 4096).unwrap();
+        assert_eq!(node.borrow().times[0], old);
+        v.mount(None, b"/b", None, 4096 | 32 | MS_STRICTATIME, None)
+            .unwrap();
+        v.getdents(dir, 4096).unwrap();
+        assert!(node.borrow().times[0].seconds > old.seconds);
+        let text = String::from_utf8(table_text(&v.namespace_snapshot(), false)).unwrap();
+        assert!(text.contains("ram\\040disk /a tmpfs ro,nodiratime,relatime,mode=755 "));
+        assert!(text.contains("ram\\040disk /b tmpfs rw,mode=755 "));
+    }
+    #[test]
     fn empty_mqueue_mounts_share_identity_without_creatable_regular_files() {
         let mut v = vfs();
         v.mount(None, b"/a", Some(b"mqueue"), 14, None).unwrap();
@@ -2619,23 +2723,21 @@ mod boundary_tests {
 }
 
 pub(super) fn accessed(node: &mut Node, mount: Option<&MountData>) {
-    if node.volatile || mount.is_some_and(|m| m.readonly()) {
+    let flags = mount.map_or(0, |m| m.flags.get());
+    if node.volatile
+        || flags & (MS_RDONLY | MS_NOATIME) != 0
+        || flags & MS_NODIRATIME != 0 && matches!(node.content, Content::Directory)
+    {
         return;
     }
     if let Content::File(storage::FileData::Plain(data)) = &node.content {
-        if data
-            .accessed(
-                false,
-                mount.is_some_and(|m| m.flags.get() & MS_RELATIME != 0),
-            )
-            .is_some()
-        {
+        if data.accessed(flags & MS_RELATIME != 0).is_some() {
             return; // The original shared file metadata is canonical already.
         }
     }
     let now = storage::Timestamp::now();
     let atime = node.times[0];
-    if mount.is_some_and(|m| m.flags.get() & MS_RELATIME != 0)
+    if flags & MS_RELATIME != 0
         && node.times[1..]
             .iter()
             .all(|t| (t.seconds, t.nanos) < (atime.seconds, atime.nanos))

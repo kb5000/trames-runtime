@@ -237,17 +237,16 @@ impl PlainFile {
             }
         }
     }
-    pub fn accessed(&self, readonly: bool, relatime: bool) -> Option<FileMeta> {
+    pub fn accessed(&self, relatime: bool) -> Option<FileMeta> {
         let mut meta = self.meta.lock().unwrap();
         if let Some(meta) = meta.as_mut() {
             let now = Timestamp::now();
             let atime = meta.times[0];
-            if !readonly
-                && !(relatime
-                    && meta.times[1..]
-                        .iter()
-                        .all(|t| (t.seconds, t.nanos) < (atime.seconds, atime.nanos))
-                    && now.seconds.saturating_sub(atime.seconds) < 86400)
+            if !(relatime
+                && meta.times[1..]
+                    .iter()
+                    .all(|t| (t.seconds, t.nanos) < (atime.seconds, atime.nanos))
+                && now.seconds.saturating_sub(atime.seconds) < 86400)
             {
                 meta.times[0] = now;
             }

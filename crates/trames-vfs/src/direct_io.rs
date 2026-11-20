@@ -1483,7 +1483,7 @@ impl DirectFd {
             .as_ref()
             .ok_or(Errno(9))?
             .open
-            .simple_write::<true>(kind, bytes)
+            .simple_write(kind, bytes)
     }
     pub fn positioned_terminal_error(&self, write: bool, offset: u64) -> Errno {
         if offset > i64::MAX as u64 {
@@ -1697,7 +1697,7 @@ impl DirectFd {
                 .as_ref()
                 .ok_or(Errno(9))?
                 .open
-                .simple_write::<false>(kind, bytes);
+                .simple_write(kind, bytes);
         }
         if self.flags & O_PATH != 0 || self.flags & 3 == 0 {
             return Err(Errno(9));

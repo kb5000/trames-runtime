@@ -479,10 +479,12 @@ impl Vfs {
             }
         }
         let path = view.resolve_final(dirfd, path, !nofollow)?;
-        if mode & 2 != 0 {
-            path.writable()?;
-        }
         let node = view.node(&path)?;
+        if mode & 2 != 0 {
+            if let Some(mount) = &path.mount {
+                mount.writable_data(Some(&node))?;
+            }
+        }
         if mode & 2 != 0 && view.proc_task_directory(&path) {
             return Err(Errno(1));
         }

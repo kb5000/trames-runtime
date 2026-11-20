@@ -2543,9 +2543,11 @@ impl Vfs {
         let mount_file = (flags & O_PATH == 0)
             .then(|| self.proc_mount_file(&p))
             .flatten();
-        let check_write = || -> Result<()> {
+        let check_write = |node: Option<&NodeRef>| -> Result<()> {
             if flags & O_PATH == 0 && (flags & 3 != 0 || flags & 0x200 != 0) {
-                p.writable()?;
+                if let Some(mount) = &p.mount {
+                    mount.writable_data(node)?;
+                }
                 if let Some(control @ sysctl::Control::UserNamespaces(..)) = &network_control {
                     if !control.authorized(&self.credentials, self.lock_owner) {
                         return Err(Errno(13));
@@ -2573,7 +2575,7 @@ impl Vfs {
                 {
                     return Err(Errno(21));
                 }
-                check_write()?;
+                check_write(Some(&node))?;
                 let proc_regular = {
                     let n = node.borrow();
                     n.volatile && matches!(n.content, Content::File(_))
@@ -2636,7 +2638,7 @@ impl Vfs {
             Err(e) => return Err(e),
         };
         if !existed {
-            check_write()?;
+            check_write(None)?;
         }
         #[cfg(all(feature = "hostfs", unix))]
         let mut created_host_file = None;
@@ -3376,7 +3378,7 @@ impl Vfs {
     fn write_description(&mut self, descriptor: &Descriptor, bytes: &[u8]) -> Result<usize> {
         let mut o = descriptor.open.borrow_mut();
         if let Some(kind) = o.node.as_ref().and_then(|n| n.simple_device) {
-            return o.simple_write::<false>(kind, bytes);
+            return o.simple_write(kind, bytes);
         }
         if o.flags.get() & 3 == 0 {
             return Err(Errno(9));
@@ -3466,8 +3468,9 @@ impl Vfs {
         if offset.is_some() && o.pipe.is_some() {
             return Err(Errno(29));
         }
-        if let Some(mount) = &o.mount {
-            mount.writable()?;
+        let readonly = o.mount.as_ref().is_some_and(|mount| mount.readonly());
+        if readonly && !mounts::special_file(o.node.as_ref()) {
+            return Err(Errno(30));
         }
         let available = self.description_available_bytes(&o);
         let memfd_available = self.memfd_available();
@@ -3617,7 +3620,7 @@ impl Vfs {
                 Ok(written)
             }
         };
-        if result.is_ok_and(|n| n != 0) {
+        if !readonly && result.is_ok_and(|n| n != 0) {
             let clear_setid = !self.credentials.has_cap(capabilities::FSETID);
             let shared = if let Content::File(storage::FileData::Plain(data)) = &n.content {
                 data.modified(clear_setid)
@@ -3728,7 +3731,7 @@ impl Vfs {
         let descriptor = self.descriptor(fd)?;
         let o = descriptor.open.borrow();
         if let Some(kind) = o.node.as_ref().and_then(|n| n.simple_device) {
-            return o.simple_write::<true>(kind, bytes);
+            return o.simple_write(kind, bytes);
         }
         drop(o);
         self.file_write(fd, bytes, Some(offset))

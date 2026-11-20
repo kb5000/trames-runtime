@@ -1134,7 +1134,11 @@ mod tests {
         owner
             .mount(Some(b"tmpfs"), b"/mount", Some(b"tmpfs"), 0, None)
             .unwrap();
-        owner.import_file(b"/mount/f", b"inside".to_vec()).unwrap();
+        let file = owner
+            .open_at(AT_FDCWD, b"/mount/f", O_CREAT | 2, 0o600)
+            .unwrap();
+        owner.write(file, b"inside").unwrap();
+        owner.close(file).unwrap();
         owner.mkdir_at(AT_FDCWD, b"/bind", 0o755).unwrap();
         owner
             .mount(Some(b"/mount"), b"/bind", None, 4096, None)
@@ -1157,6 +1161,10 @@ mod tests {
         assert_eq!(
             query.access_at(AT_FDCWD, b"/bind/f", 2, true, false),
             Some(Err(Errno(30)))
+        );
+        assert_eq!(
+            query.access_at(AT_FDCWD, b"/bind/missing", 2, true, false),
+            Some(Err(Errno(2)))
         );
         owner.chroot(b"/mount").unwrap();
         owner.chdir(b"/").unwrap();

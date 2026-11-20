@@ -31,8 +31,7 @@ struct FileAuthority {
     write_error: Option<Errno>,
     unlimited: bool,
     clear_setid: bool,
-    readonly: bool,
-    relatime: bool,
+    mount_flags: Option<Arc<mounts::MountFlags>>,
 }
 impl PreparedFile {
     fn accept(&self, file: Option<SharedFd>) -> Option<DirectFile> {
@@ -317,12 +316,7 @@ impl FileEpoch {
             .map(Arc::downgrade)
             .unwrap_or_default();
         let stat = vfs.stat_node_fields(&n, o.mount.as_ref()).ok()?;
-        let write_error = o
-            .mount
-            .as_ref()
-            .map_or(Ok(()), |m| m.writable())
-            .and_then(|()| Vfs::pseudo_immutable_node(&n))
-            .err();
+        let write_error = Vfs::pseudo_immutable_node(&n).err();
         let prepared = PreparedFile(
             Arc::new(FileAuthority {
                 data: Arc::downgrade(&data),
@@ -337,11 +331,7 @@ impl FileEpoch {
                 write_error,
                 unlimited,
                 clear_setid,
-                readonly: o.mount.as_ref().is_some_and(|m| m.readonly()),
-                relatime: o
-                    .mount
-                    .as_ref()
-                    .is_some_and(|m| m.flags.get() & mounts::MS_RELATIME != 0),
+                mount_flags: o.mount.as_ref().map(|m| m.flags.clone()),
             }),
             vfs.file_size_limit.clone(),
         );
@@ -475,8 +465,10 @@ impl DirectFile {
             result
         };
         if result.is_ok() && count != 0 && self.prepared.0.status.get() & O_NOATIME == 0 {
-            self.data
-                .accessed(self.prepared.0.readonly, self.prepared.0.relatime);
+            let flags = self.prepared.0.mount_flags.as_ref().map_or(0, |m| m.get());
+            if flags & (mounts::MS_RDONLY | mounts::MS_NOATIME) == 0 {
+                self.data.accessed(flags & mounts::MS_RELATIME != 0);
+            }
         }
         if result.as_ref().is_ok_and(|bytes| !bytes.is_empty()) {
             self.notify_io(inotify::ACCESS);
@@ -492,16 +484,24 @@ impl DirectFile {
         if offset.is_some_and(|n| n > i64::MAX as u64) {
             return Some(Err(Errno(22)));
         }
-        if offset.is_some() {
-            if let Some(error) = self.prepared.0.write_error {
-                return Some(Err(error));
-            }
-        }
-        if self.prepared.0.flags & O_PATH != 0 || self.prepared.0.flags & 3 == 0 {
+        let denied = self.prepared.0.flags & O_PATH != 0 || self.prepared.0.flags & 3 == 0;
+        if denied && offset.is_none() {
             return Some(Err(Errno(9)));
+        }
+        if self
+            .prepared
+            .0
+            .mount_flags
+            .as_ref()
+            .is_some_and(|f| f.get() & mounts::MS_RDONLY != 0)
+        {
+            return Some(Err(Errno(30)));
         }
         if let Some(error) = self.prepared.0.write_error {
             return Some(Err(error));
+        }
+        if denied {
+            return Some(Err(Errno(9)));
         }
         if bytes.is_empty() {
             return Some(Ok(0));
@@ -772,8 +772,21 @@ mod tests {
             i64::from_le_bytes(file.stat().unwrap()[72..80].try_into().unwrap()),
             1
         );
-        epoch.finish();
         assert_eq!(node.borrow().times[0].seconds, 1);
+        // Keep using the same prepared descriptor through both remounts.
+        vfs.mount(None, b"/dst", None, 4096 | 32 | mounts::MS_NOATIME, None)
+            .unwrap();
+        assert_eq!(file.write(b"X", Some(0), &mut cache), Some(Ok(1)));
+        assert_eq!(file.read(1, Some(0), &mut cache).unwrap().unwrap(), b"X");
+        assert_eq!(
+            i64::from_le_bytes(file.stat().unwrap()[72..80].try_into().unwrap()),
+            1
+        );
+        vfs.mount(None, b"/dst", None, 4096 | 32 | (1 << 24), None)
+            .unwrap();
+        file.read(1, Some(0), &mut cache).unwrap().unwrap();
+        assert!(i64::from_le_bytes(file.stat().unwrap()[72..80].try_into().unwrap()) > 1);
+        epoch.finish();
     }
     #[test]
     fn mapping_change_rechecks_file_capability_without_an_fd_table_change() {
