@@ -691,7 +691,7 @@ impl<C: Cpu> Starter<C> {
                                                     work.trace.restart();
                                                     for (i, value) in pending.args.iter().enumerate() { work.cpu.set_x(i, *value); }
                                                     work.cpu.set_pc(work.cpu.pc().wrapping_sub(4));
-                                                } else { work.trace.finish(&mut work.cpu, interrupted.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64))); }
+                                                } else { snapshot.io_signals.io.complete(pending.number, pending.args[3], interrupted); work.trace.finish(&mut work.cpu, interrupted.unwrap_or_else(|e|0u64.wrapping_sub(e.0 as u64))); }
                                             }
                                             if snapshot.enter_io_signal(&mut work.cpu, work.memory.as_deref_mut().expect("signal View"), sig, *info, action).is_err() {
                                                 snapshot.io_signals.lifecycle().request_exit(11);
@@ -832,6 +832,7 @@ impl<C: Cpu> Starter<C> {
                                 match result {
                                     trames_linux::IoAttempt::HostError(error) => { epoch.as_ref().expect("native I/O execution epoch").fail_host_io(error); maintenance=true; break SliceOutcome::Yield {instructions:0}; },
                                     trames_linux::IoAttempt::Complete(result) => {
+                                        if let Some(call) = &saved_call { snapshot.io_signals.io.complete(call.number, call.args[3], result); }
                                         if saved_call.as_ref().is_some_and(|c|trames_linux::event_wait(c.number)) { snapshot.finish_wait_mask(); }
                                         work.trace.finish(&mut work.cpu, result.unwrap_or_else(|e| 0u64.wrapping_sub(e.0 as u64)));
                                         syscalls += 1;

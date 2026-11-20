@@ -2169,6 +2169,7 @@ impl Vfs {
                         }
                         b"exe" if p.state != 'Z' => return Ok(link(p.executable.clone())),
                         b"exe" => return Ok(None),
+                        b"io" => return Ok(Some((file(Vec::new()), 0o100400))),
                         b"oom_score" => {
                             let points = if p.state == 'Z'
                                 || self.proc_namespace(at).global(p.tgid) == Some(1)
@@ -3041,6 +3042,7 @@ impl Vfs {
                             "stat",
                             "status",
                             "statm",
+                            "io",
                             "oom_score",
                             "oom_score_adj",
                             "setgroups",

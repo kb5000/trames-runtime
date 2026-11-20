@@ -248,6 +248,16 @@ impl Credentials {
                 && bits & 2 == 0
                 && (bits & 1 == 0 || matches!(node.content, Content::Directory))
     }
+    pub fn can_read_proc_task(&self, same_group: bool, target: &ProcessInfo) -> bool {
+        let t = &target.credentials;
+        same_group
+            || self.has_ns_cap(&t.user_namespace, capabilities::SYS_PTRACE)
+            || !target.nondumpable
+                && [t.uid, t.euid, t.suid].iter().all(|id| *id == self.fsuid)
+                && [t.gid, t.egid, t.sgid].iter().all(|id| *id == self.fsgid)
+                && self.user_namespace == t.user_namespace
+                && t.caps.permitted & !self.caps.effective == 0
+    }
     pub fn user(uid: u32, gid: u32) -> Self {
         Self {
             user_namespace: UserNamespace::default(),
@@ -510,23 +520,13 @@ impl Vfs {
         target: &ProcessInfo,
     ) -> bool {
         let own = self.proc_namespace(at).local(self.pid);
-        if runtime
-            .processes
-            .iter()
-            .any(|p| p.pid == own && p.tgid == target.tgid)
-            || self
-                .credentials
-                .has_ns_cap(&target.credentials.user_namespace, capabilities::SYS_PTRACE)
-        {
-            return true;
-        }
-        let c = &self.credentials;
-        let t = &target.credentials;
-        !target.nondumpable
-            && [t.uid, t.euid, t.suid].iter().all(|id| *id == c.fsuid)
-            && [t.gid, t.egid, t.sgid].iter().all(|id| *id == c.fsgid)
-            && (c.user_namespace == t.user_namespace && t.caps.permitted & !c.caps.effective == 0
-                || c.has_ns_cap(&t.user_namespace, capabilities::SYS_PTRACE))
+        self.credentials.can_read_proc_task(
+            runtime
+                .processes
+                .iter()
+                .any(|p| p.pid == own && p.tgid == target.tgid),
+            target,
+        )
     }
 
     pub fn apply_exec_credentials(&mut self, path: &[u8]) -> Result<()> {

@@ -39,6 +39,7 @@ pub(crate) fn execute<C: Cpu>(
     let mut vm_checkpoint = false;
     let mut syscalls = 0;
     let mut syscall_time = Duration::ZERO;
+    let mut io_entry = None;
     let outcome = 'entry: {
         work.trace.begin_cpu(work.pid, &work.cpu);
         work.cpu.clear_exclusive();
@@ -98,6 +99,9 @@ pub(crate) fn execute<C: Cpu>(
                 }
                 snapshot.io_signals.lifecycle().request_exit(31);
                 break 'entry None;
+            }
+            if matches!(number, 63..=71 | 285..=287) {
+                io_entry = Some((number, args[3]));
             }
         }
         if let Some(wait) = restart_wait {
@@ -1298,6 +1302,18 @@ pub(crate) fn execute<C: Cpu>(
         }
         Some(result)
     };
+    // Only a terminal, admitted syscall returns here with a result. A retained
+    // call owns its accounting until completion, including across CPU custody.
+    if outcome.is_none() && syscalls != 0 {
+        if let Some((number, position)) = io_entry {
+            work.syscalls
+                .as_ref()
+                .unwrap()
+                .io_signals
+                .io
+                .complete_return(number, position, work.cpu.x(0));
+        }
+    }
     Step {
         outcome,
         thread_exit,

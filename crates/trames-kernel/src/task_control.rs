@@ -31,6 +31,7 @@ pub struct Group {
 #[derive(Default)]
 struct State {
     members: BTreeMap<u32, Member>,
+    retired_io: crate::usage::IoUsage,
     retired_cpu: std::time::Duration,
     live: usize,
     child: Weak<Child>,
@@ -72,6 +73,11 @@ impl Publication {
     }
 }
 impl State {
+    fn retire_usage(&mut self, task: &IoTask) {
+        self.retired_cpu = self.retired_cpu.saturating_add(task.proc_view.elapsed());
+        self.retired_io.include(task.io.snapshot());
+    }
+
     fn tasks(&self) -> Vec<Arc<IoTask>> {
         self.members
             .values()
@@ -283,7 +289,7 @@ impl Group {
             {
                 return None;
             }
-            state.retired_cpu = state.retired_cpu.saturating_add(task.proc_view.elapsed());
+            state.retire_usage(task);
             let migrations = state.members.remove(&pid).unwrap().migrations;
             let status = if state.members.is_empty() && !state.completed {
                 state.completed = true;
@@ -408,7 +414,7 @@ impl Group {
         // A non-leader exec replaces the old leader's PID with this original task.
         let replaced = state.members.insert(pid, member);
         if let Some(task) = replaced.as_ref().and_then(|m| m.task.upgrade()) {
-            state.retired_cpu = state.retired_cpu.saturating_add(task.proc_view.elapsed());
+            state.retire_usage(&task);
         }
         if replaced.as_ref().is_some_and(|m| !m.retiring) {
             state.live -= 1;
@@ -458,7 +464,7 @@ impl Group {
             mark();
             let removed = s.members.remove(&pid);
             if let Some(task) = removed.as_ref().and_then(|m| m.task.upgrade()) {
-                s.retired_cpu = s.retired_cpu.saturating_add(task.proc_view.elapsed());
+                s.retire_usage(&task);
             }
             if removed.as_ref().is_some_and(|m| !m.retiring) {
                 s.live -= 1;
@@ -602,6 +608,18 @@ impl Group {
                 total.saturating_add(task.proc_view.elapsed())
             })
     }
+    pub(crate) fn io_usage(&self) -> crate::usage::IoUsage {
+        let state = self.state.lock().unwrap();
+        let mut total = state.retired_io;
+        for task in state
+            .members
+            .values()
+            .filter_map(|member| member.task.upgrade())
+        {
+            total.include(task.io.snapshot());
+        }
+        total
+    }
     pub fn retain_image_peak(&self, bytes: usize) {
         if bytes > self.image_peak() {
             self.image_peak.fetch_max(bytes, Ordering::Relaxed);
@@ -613,6 +631,7 @@ impl Group {
     pub(crate) fn usage(&self) -> crate::usage::Usage {
         crate::usage::Usage {
             cpu: self.cpu_time(),
+            io: self.io_usage(),
             peak_bytes: self.image_peak(),
         }
     }

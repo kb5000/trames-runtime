@@ -114,6 +114,14 @@ pub trait ProcTask: Send + Sync {
     fn dump_policy(&self) -> Result<Option<Dumpable>> {
         Err(Errno(3))
     }
+    fn io_text(
+        &self,
+        _whole: bool,
+        _reader_group: u32,
+        _credentials: &Credentials,
+    ) -> Result<Vec<u8>> {
+        Err(Errno(3))
+    }
     fn present(&self) -> bool {
         self.observe(ProcRefresh::Metadata, None).is_some()
     }

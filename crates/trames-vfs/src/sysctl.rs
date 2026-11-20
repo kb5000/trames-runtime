@@ -46,6 +46,10 @@ pub(super) enum Control {
     UtsName(bool, Arc<readiness::ProcWatch>),
     Namei(Protection, Arc<NameiPolicy>),
     MountMax(Arc<mounts::MountPolicy>),
+    TaskIo {
+        task: Arc<dyn ProcTask>,
+        whole: bool,
+    },
     CoreFilter(Arc<dyn ProcTask>),
     Comm {
         task: Arc<dyn ProcTask>,
@@ -67,7 +71,7 @@ impl Control {
             Self::Comm { task, thread_entry } => {
                 *thread_entry && task.comm().is_some_and(|(group, _)| group == tgid)
             }
-            Self::CoreFilter(_) => false, // ordinary inode owner/mode checks
+            Self::CoreFilter(_) | Self::TaskIo { .. } => false, // ordinary inode owner/mode checks
             Self::UtsName(..) => credentials.euid == 0,
             Self::UserMap(control) => control.authorized(credentials),
             Self::Network(control) => control.authorized(credentials),
@@ -83,8 +87,12 @@ impl Control {
             }
         }
     }
-    pub fn read(&self, offset: u64, count: usize, uts: &UtsNamespace) -> Result<Vec<u8>> {
+    pub fn read(&self, offset: u64, count: usize, caller: &Vfs) -> Result<Vec<u8>> {
         let value = match self {
+            Self::TaskIo { task, whole } => {
+                let text = task.io_text(*whole, caller.lock_owner, &caller.credentials)?;
+                return Ok(slice(&text, offset, count));
+            }
             Self::CoreFilter(task) => {
                 let Some(policy) = task.dump_policy()? else {
                     return Ok(Vec::new());
@@ -102,7 +110,7 @@ impl Control {
                 return Ok(slice(&bytes, offset, count));
             }
             Self::UtsName(domain, _) => {
-                let mut name = uts.name(*domain);
+                let mut name = caller.uts.name(*domain);
                 name.truncate(name.iter().position(|&b| b == 0).unwrap_or(name.len()));
                 name.push(b'\n');
                 return Ok(slice(&name, offset, count));
@@ -123,6 +131,7 @@ impl Control {
         let credentials = &caller.credentials;
         let tgid = caller.lock_owner;
         let n = match self {
+            Self::TaskIo { .. } => return Err(Errno(5)),
             Self::CoreFilter(task) => {
                 let value = parse_dump_filter(bytes)?;
                 task.dump_policy()?.ok_or(Errno(3))?.set_filter(value);
@@ -233,17 +242,19 @@ impl Vfs {
         if let Some(domain) = domain.filter(|_| self.uses_pseudo(path)) {
             return Some(Control::UtsName(domain, self.uts.watch_name(domain)));
         }
-        if (path.ends_with(b"/comm") || path.ends_with(b"/coredump_filter"))
+        if (path.ends_with(b"/comm")
+            || path.ends_with(b"/coredump_filter")
+            || path.ends_with(b"/io"))
             && self.uses_pseudo(path)
         {
             let rest = path.strip_prefix(b"/proc/")?;
             let mut parts = rest.split(|b| *b == b'/');
             let pid = proc_task_id(parts.next()?)?;
             let (id, thread_entry) = match parts.next()? {
-                b"comm" | b"coredump_filter" => (pid, false),
+                b"comm" | b"coredump_filter" | b"io" => (pid, false),
                 b"task" => {
                     let tid = proc_task_id(parts.next()?)?;
-                    if parts.next()? != b"comm" {
+                    if !matches!(parts.next()?, b"comm" | b"io") {
                         return None;
                     }
                     (tid, true)
@@ -262,6 +273,12 @@ impl Vfs {
                 .filter(|p| p.target.pid() == id)
                 .map(|p| p.target.clone())
                 .or_else(|| self.pseudo.borrow().source.as_ref()?.task(id))?;
+            if path.ends_with(b"/io") {
+                return Some(Control::TaskIo {
+                    task,
+                    whole: !thread_entry,
+                });
+            }
             if path.ends_with(b"/coredump_filter") {
                 return Some(Control::CoreFilter(task));
             }

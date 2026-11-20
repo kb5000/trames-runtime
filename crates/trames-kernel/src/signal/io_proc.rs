@@ -35,6 +35,19 @@ impl trames_vfs::ProcTask for ProcPid {
         info.identity = self.identity;
         Some(info)
     }
+    fn io_text(
+        &self,
+        whole: bool,
+        reader: u32,
+        credentials: &trames_vfs::Credentials,
+    ) -> Result<Vec<u8>, trames_vfs::Errno> {
+        trames_vfs::ProcTask::io_text(
+            &*self.task().ok_or(trames_vfs::Errno(3))?,
+            whole,
+            reader,
+            credentials,
+        )
+    }
     fn dump_policy(&self) -> Result<Option<trames_vfs::Dumpable>, trames_vfs::Errno> {
         trames_vfs::ProcTask::dump_policy(&*self.task().ok_or(trames_vfs::Errno(3))?)
     }
@@ -177,6 +190,30 @@ impl trames_vfs::ProcTask for IoTask {
                 })
                 .collect()
         })
+    }
+    fn io_text(
+        &self,
+        whole: bool,
+        reader: u32,
+        credentials: &trames_vfs::Credentials,
+    ) -> Result<Vec<u8>, trames_vfs::Errno> {
+        let task = self
+            .observe(trames_vfs::ProcRefresh::Metadata, None)
+            .ok_or(trames_vfs::Errno(3))?;
+        if !credentials.can_read_proc_task(reader == task.tgid, &task) {
+            return Err(trames_vfs::Errno(13));
+        }
+        let io = if whole && task.pid == task.tgid {
+            let group = self.lifecycle();
+            let mut io = group.io_usage();
+            if let Some(children) = group.wait_children() {
+                io.include(children.usage().io);
+            }
+            io
+        } else {
+            self.io.snapshot()
+        };
+        Ok(io.text())
     }
     fn dump_policy(&self) -> Result<Option<trames_vfs::Dumpable>, trames_vfs::Errno> {
         if !self.present() {

@@ -3382,7 +3382,7 @@ impl Vfs {
         }
         if let Some(control) = &o.sysctl_control {
             let mut position = o.file_position.lock().unwrap();
-            let data = control.read(position.value, count, &self.uts)?;
+            let data = control.read(position.value, count, self)?;
             position.value += data.len() as u64;
             drop(position);
             o.notify_read(&data);
@@ -3808,7 +3808,7 @@ impl Vfs {
         }
         if let Some(control) = &o.sysctl_control {
             return control
-                .read(offset, count, &self.uts)
+                .read(offset, count, self)
                 .inspect(|data| o.notify_read(data));
         }
         if let Some(data) = Self::oom_read(&o, offset, count)? {

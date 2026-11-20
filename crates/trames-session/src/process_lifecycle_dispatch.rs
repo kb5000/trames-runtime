@@ -396,6 +396,7 @@ impl<C: Cpu> Lifecycle<C> {
                 }
             }
         };
+        snapshot.io_signals.io.complete(number, args[3], value);
         let raw = value.unwrap_or_else(super::super::error);
         if (raw == super::super::error(Errno(32))
             && matches!(number, 64 | 66 | 71 | 76..=77 | 206 | 211 | 269)

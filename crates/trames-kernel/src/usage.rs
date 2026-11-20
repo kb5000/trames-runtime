@@ -1,17 +1,110 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! ARM64 Linux resource usage from the guest execution clock and resident mm.
 use crate::{children::Children, signal::IoTask};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Duration;
 use trames_memory::CpuMemory;
 use trames_vfs::Errno;
 
+#[derive(Default, Copy, Clone)]
+pub(crate) struct IoUsage {
+    rchar: u64,
+    wchar: u64,
+    syscr: u64,
+    syscw: u64,
+}
+impl IoUsage {
+    pub(crate) fn include(&mut self, other: Self) {
+        self.rchar = self.rchar.wrapping_add(other.rchar);
+        self.wchar = self.wchar.wrapping_add(other.wchar);
+        self.syscr = self.syscr.wrapping_add(other.syscr);
+        self.syscw = self.syscw.wrapping_add(other.syscw);
+    }
+    pub(crate) fn text(self) -> Vec<u8> {
+        // Only logical VFS counters are tracked. Host writeback is not
+        // attributable to the thread completing a guest write syscall.
+        format!(
+            "rchar: {}\nwchar: {}\nsyscr: {}\nsyscw: {}\n",
+            self.rchar, self.wchar, self.syscr, self.syscw
+        )
+        .into_bytes()
+    }
+}
+#[derive(Default)]
+pub struct TaskIo {
+    rchar: AtomicU64,
+    wchar: AtomicU64,
+    syscr: AtomicU64,
+    syscw: AtomicU64,
+}
+impl TaskIo {
+    /// Charge a completed guest operation on its original task. Checkpoint,
+    /// retry and seccomp-denied entries never call this hook.
+    #[inline]
+    pub fn complete(&self, number: u32, position: u64, result: Result<u64, Errno>) {
+        let (read, write) = match number {
+            // Scalar operations reject invalid descriptors and positioned
+            // arguments before entering vfs_read/vfs_write.
+            63 | 64 | 67 | 68 => {
+                if result.is_err_and(|e| matches!(e.0, 9 | 29))
+                    || matches!(number, 67 | 68) && (position as i64) < 0
+                {
+                    return;
+                }
+                (number == 63 || number == 67, number == 64 || number == 68)
+            }
+            65 | 66 => (number == 65, number == 66),
+            69 | 70 | 286 | 287 => {
+                if (position as i64) < 0 && !(number >= 286 && position == u64::MAX) {
+                    return;
+                }
+                (number == 69 || number == 286, number == 70 || number == 287)
+            }
+            71 | 285 if result.is_ok() => (true, true),
+            _ => return,
+        };
+        let bytes = result.unwrap_or(0);
+        if read {
+            self.syscr.fetch_add(1, Relaxed);
+            if bytes != 0 {
+                self.rchar.fetch_add(bytes, Relaxed);
+            }
+        }
+        if write {
+            self.syscw.fetch_add(1, Relaxed);
+            if bytes != 0 {
+                self.wchar.fetch_add(bytes, Relaxed);
+            }
+        }
+    }
+    #[inline]
+    pub fn complete_return(&self, number: u32, position: u64, raw: u64) {
+        let result = if raw >= (-4095i64) as u64 {
+            Err(Errno(raw.wrapping_neg() as u32))
+        } else {
+            Ok(raw)
+        };
+        self.complete(number, position, result);
+    }
+    pub(crate) fn snapshot(&self) -> IoUsage {
+        IoUsage {
+            rchar: self.rchar.load(Relaxed),
+            wchar: self.wchar.load(Relaxed),
+            syscr: self.syscr.load(Relaxed),
+            syscw: self.syscw.load(Relaxed),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Usage {
+    pub io: IoUsage,
     pub cpu: Duration,
     pub peak_bytes: usize,
 }
 impl Usage {
     pub fn include(&mut self, other: Self) {
+        self.io.include(other.io);
         self.cpu = self.cpu.saturating_add(other.cpu);
         self.peak_bytes = self.peak_bytes.max(other.peak_bytes);
     }
@@ -42,6 +135,7 @@ pub fn getrusage(
                 group.cpu_time()
             };
             Usage {
+                io: Default::default(),
                 cpu,
                 peak_bytes: group.image_peak().max(
                     task.proc_view
@@ -73,4 +167,22 @@ pub fn times(
         memory.write_array(address, bytes).map_err(|_| Errno(14))?;
     }
     Ok(ticks(elapsed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn io_counts_operations_and_only_transferred_bytes() {
+        let io = TaskIo::default();
+        io.complete(63, 0, Ok(0));
+        io.complete(63, 0, Err(Errno(9)));
+        io.complete(65, 0, Err(Errno(9)));
+        io.complete(68, 0, Ok(7));
+        io.complete(71, 0, Ok(5));
+        io.complete(69, u64::MAX, Err(Errno(22)));
+        io.complete(286, u64::MAX, Ok(11));
+        let got = io.snapshot();
+        assert_eq!((got.syscr, got.rchar, got.syscw, got.wchar), (4, 16, 2, 12));
+    }
 }

@@ -816,6 +816,7 @@ impl PathQueries {
         if matches!(open.sysctl_control, Some(sysctl::Control::UtsName(..))) {
             view.uts = original.uts.clone();
         }
+        view.lock_owner = original.lock_owner;
         view.credentials = original.credentials.clone();
         view.file_size_limit = original.file_size_limit.clone();
         view.query = Some(original.query.as_ref().map_or_else(

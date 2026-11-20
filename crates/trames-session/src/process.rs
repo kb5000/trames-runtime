@@ -3034,6 +3034,7 @@ impl<C: Cpu> Kernel<C> {
             }
         }
         if let Some(value) = raw {
+            p.signals.io.io.complete_return(number, a[3], value);
             p.trace.record(value);
             p.trace.flush();
         } else if matches!(p.state, State::Ready | State::Zombie(_)) {
