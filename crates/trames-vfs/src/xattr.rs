@@ -3,11 +3,9 @@
 use super::*;
 type AttributeNode = (NodeRef, FsHandle);
 pub(super) const XATTR_BUDGET: usize = 1024 * 1024;
-pub(super) fn overlay_attribute(name: &[u8]) -> bool {
-    matches!(
-        name,
-        b"trusted.overlay.opaque" | b"trusted.overlay.whiteout"
-    )
+pub(super) fn trusted_attribute(name: &[u8]) -> bool {
+    name.strip_prefix(b"trusted.")
+        .is_some_and(|suffix| !suffix.is_empty())
 }
 pub(super) fn xattr_size(attrs: &BTreeMap<Vec<u8>, Vec<u8>>) -> usize {
     attrs.iter().map(|(k, v)| k.len() + 1 + v.len()).sum()
@@ -89,12 +87,10 @@ impl Vfs {
             if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
                 return Err(Errno(if write { 1 } else { 61 }));
             }
-            if overlay_attribute(name)
-                && matches!(node.content, Content::File(_) | Content::Directory)
-            {
-                return Ok(());
+            if !trusted_attribute(name) {
+                return Err(Errno(22));
             }
-            return Err(Errno(if write { 95 } else { 61 }));
+            return Ok(());
         }
         if name.starts_with(b"user.") && name.len() > 5 {
             if !matches!(node.content, Content::File(_) | Content::Directory) {
@@ -156,7 +152,7 @@ impl Vfs {
         value: Option<&[u8]>,
         flags: u32,
     ) -> Result<()> {
-        if flags & !3 != 0 || flags == 3 {
+        if flags & !3 != 0 {
             return Err(Errno(22));
         }
         if value.is_some_and(|v| v.len() > 65536) {

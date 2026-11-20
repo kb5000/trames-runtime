@@ -293,6 +293,9 @@ pub(super) fn import(
                 trames_vfs::AT_FDCWD
             };
             let follow = variant != 1;
+            if number <= 7 && a[4] as u32 & !3 != 0 {
+                return Err(Errno(22));
+            }
             let list = (11..=13).contains(&number);
             let name = if list {
                 Vec::new()

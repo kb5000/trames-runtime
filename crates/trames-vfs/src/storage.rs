@@ -1051,7 +1051,9 @@ fn decode(disk: &Arc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
                 }
                 let name = d.take(len)?.to_vec();
                 let value = d.take(size)?.to_vec();
-                if !matches!(n.content, Content::File(_) | Content::Directory)
+                let trusted = super::xattr::trusted_attribute(&name);
+                if !trusted
+                    && !matches!(n.content, Content::File(_) | Content::Directory)
                     && (!super::acl::name(&name) || matches!(n.content, Content::Symlink(_)))
                 {
                     return Err(Errno(22));
@@ -1064,9 +1066,7 @@ fn decode(disk: &Arc<DiskStore>, data: &[u8]) -> Result<Filesystem> {
                         return Err(Errno(22));
                     }
                 }
-                if !(name.starts_with(b"user.")
-                    || super::xattr::overlay_attribute(&name)
-                    || super::acl::name(&name))
+                if !(name.starts_with(b"user.") || trusted || super::acl::name(&name))
                     || name.len() <= 5
                     || name.contains(&0)
                     || n.xattrs.insert(name, value).is_some()
@@ -1612,6 +1612,41 @@ impl Vfs {
             fs.sync_file_metadata(data_only && regular, regular.then_some(&node))?;
         }
         Ok(())
+    }
+    /// Startup imports into /dev/shm belong to the session tmpfs. Keep raw
+    /// archive imports on private storage, including directories hidden at boot.
+    pub fn import_session_reader(
+        &mut self,
+        path: &[u8],
+        reader: &mut impl Read,
+        executable: bool,
+    ) -> Result<u64> {
+        if path.len() >= MAX_PATH || !path.starts_with(b"/") {
+            return Err(Errno(22));
+        }
+        let mut parts = path.split(|&b| b == b'/').filter(|part| !part.is_empty());
+        if parts.next() == Some(b"dev".as_slice())
+            && parts.next() == Some(b"shm".as_slice())
+            && parts.clone().next().is_some()
+        {
+            let shm = self.resolve_final(AT_FDCWD, b"/dev/shm", false)?;
+            if let Some(mount) = &shm.mount {
+                if mount.kind == mounts::Kind::Tmpfs && shm.key == b"/" {
+                    shm.writable()?;
+                    if path.ends_with(b"/") {
+                        return Err(Errno(22));
+                    }
+                    let mut relative = Vec::new();
+                    for part in parts {
+                        relative.push(b'/');
+                        relative.extend_from_slice(part);
+                    }
+                    return Vfs::empty(mount.fs.clone())
+                        .import_reader(&relative, reader, executable);
+                }
+            }
+        }
+        self.import_reader(path, reader, executable)
     }
     /// Copy a platform-authorized stream into private storage using bounded buffers.
     pub fn import_reader(

@@ -2012,3 +2012,59 @@ fn host_capability_nodes_cannot_be_forged_and_open_fds_observe_revocation() {
         Err(Errno(6))
     );
 }
+
+#[test]
+fn trusted_attributes_survive_reopen_on_a_fifo() {
+    let dir = Temp::new();
+    let mut v = dir.open();
+    v.mknod_at(AT_FDCWD, b"/fifo", 0o10600, 0).unwrap();
+    let path = Some(b"/fifo".as_slice());
+    v.set_xattr(AT_FDCWD, path, false, b"trusted.backup", Some(b"id"), 1)
+        .unwrap();
+    drop(v);
+    let mut v = dir.open();
+    assert_eq!(
+        v.list_xattrs(AT_FDCWD, path, false).unwrap(),
+        b"trusted.backup\0"
+    );
+    assert_eq!(
+        v.get_xattr(AT_FDCWD, path, false, b"trusted.backup")
+            .unwrap(),
+        b"id"
+    );
+    v.set_xattr(AT_FDCWD, path, false, b"trusted.backup", None, 0)
+        .unwrap();
+    drop(v);
+    assert!(dir
+        .open()
+        .list_xattrs(AT_FDCWD, path, false)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn session_import_into_shm_obeys_tmpfs_quota_and_lifetime() {
+    let mut v = Vfs::default();
+    v.mkdir_at(AT_FDCWD, b"/dev/shm", 0o1777).unwrap();
+    v.mount(
+        Some(b"tmpfs"),
+        b"/dev/shm",
+        Some(b"tmpfs"),
+        0,
+        Some(b"size=4k"),
+    )
+    .unwrap();
+    v.import_session_reader(b"//dev/shm//dir/script", &mut &b"hello"[..], true)
+        .unwrap();
+    assert_eq!(v.executable(b"/dev/shm/dir/script").unwrap(), b"hello");
+    assert_eq!(
+        v.import_session_reader(b"/dev/shm/large", &mut &[0; 4097][..], false),
+        Err(Errno(28))
+    );
+    assert_eq!(v.open_at(AT_FDCWD, b"/dev/shm/large", 0, 0), Err(Errno(2)));
+    v.umount(b"/dev/shm", 0).unwrap();
+    assert_eq!(
+        v.open_at(AT_FDCWD, b"/dev/shm/dir/script", 0, 0),
+        Err(Errno(2))
+    );
+}
