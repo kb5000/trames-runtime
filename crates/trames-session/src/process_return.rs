@@ -67,6 +67,7 @@ pub(super) fn publish<C: Cpu>(
             crate::run_queue::WaitState::Futex { wait, deadline } => {
                 State::Futex { wait, deadline }
             }
+            crate::run_queue::WaitState::ClockSleep(wait) => State::ClockSleep(wait),
             crate::run_queue::WaitState::Sleep {
                 deadline,
                 remaining,

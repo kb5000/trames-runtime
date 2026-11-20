@@ -442,6 +442,7 @@ impl<C: Cpu> Kernel<C> {
                             .unwrap_or(true)
                 }
                 State::Ready | State::Gpu { .. } | State::Blocked(..) => true,
+                State::ClockSleep(ref w) => w.ready(),
                 State::Sleep(d, _) => d <= now,
                 State::Futex { deadline, .. } | State::Sigwait { deadline, .. } => {
                     deadline.is_some_and(|d| d <= now)

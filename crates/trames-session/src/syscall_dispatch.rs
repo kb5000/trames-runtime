@@ -645,24 +645,24 @@ pub(crate) fn execute<C: Cpu>(
                         job.seccomp_entry = Some(entry);
                         break 'entry Some(result);
                     }
-                    let waiting = crate::worker_syscalls::sleep_parameters(
+                    let waiting = crate::worker_syscalls::sleep_wait(
                         &*memory,
                         number,
                         args,
                         snapshot.started,
+                        snapshot.direct.boot_clock(),
+                        &snapshot.io_signals,
+                        snapshot.io_wake.as_ref(),
                     );
                     if let Some(began) = began {
                         syscall_time += began.elapsed();
                     }
                     syscalls += 1;
                     match waiting {
-                        Ok((deadline, remaining)) => {
+                        Ok(wait) => {
                             job.sleep_stop_generation =
                                 snapshot.io_signals.lifecycle().stop_generation();
-                            parked = Some(crate::run_queue::WaitState::Sleep {
-                                deadline,
-                                remaining,
-                            });
+                            parked = Some(wait);
                             break 'entry Some(SliceOutcome::Yield { instructions: 0 });
                         }
                         Err(error) => {

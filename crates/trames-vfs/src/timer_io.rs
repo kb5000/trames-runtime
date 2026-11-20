@@ -4,7 +4,7 @@ mod boottime;
 mod clock_watch;
 use crate::readiness::Readiness;
 use crate::{Errno, Result};
-use boottime::BootTimer;
+pub use boottime::BootTimer;
 use clock_watch::ClockWatch;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

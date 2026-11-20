@@ -8,6 +8,7 @@ use trames_engine::{Cpu, CpuFault};
 use trames_linux::{GuestOutput, Linux};
 mod barrier;
 mod clock;
+mod clock_sleep;
 mod devices;
 mod execution_control;
 mod exit_groups;

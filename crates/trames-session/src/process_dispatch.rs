@@ -110,6 +110,8 @@ impl Dispatch {
                 wait: wait.clone(),
                 deadline: *deadline,
             })
+        } else if let State::ClockSleep(ref wait) = p.state {
+            Some(crate::run_queue::WaitState::ClockSleep(wait.clone()))
         } else if let State::Sleep(deadline, remaining) = p.state {
             Some(crate::run_queue::WaitState::Sleep {
                 deadline,

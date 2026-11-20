@@ -85,6 +85,7 @@ mod readiness;
 mod timer_io;
 pub use direct_io::{DirectFd, DirectFds, DirectPoll};
 pub use readiness::{IoSignal, IoSubscription, IoWake};
+pub use timer_io::BootTimer;
 mod signal_reader;
 #[cfg(test)]
 mod uring_context_tests;

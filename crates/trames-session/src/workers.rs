@@ -14,6 +14,7 @@ use std::{
 };
 use trames_engine::{Cpu, DecodeStats, SliceOutcome};
 use trames_memory::parallel::View;
+#[cfg(all(test, trames_interpreter_conformance))]
 use trames_memory::CpuMemory;
 
 /// Local interpreter polls, not scheduler quanta. Completing one of these does
@@ -607,6 +608,11 @@ impl<C: Cpu> Starter<C> {
                                     break SliceOutcome::Yield { instructions: 0 };
                                 }
                                 if let Some(wake) = snapshot.io_wake.as_ref().filter(|s| s.ready()) { wake.reset(); }
+                                if !snapshot.quiesced() && matches!(&job.waiting,Some(crate::run_queue::WaitState::ClockSleep(w)) if w.ready()) {
+                                    job.waiting=None;
+                                    work.trace.finish(&mut work.cpu,0);
+                                    continue;
+                                }
                                 if matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if wait.release.finished()) {
                                     job.waiting=None;continue;
                                 }
@@ -666,14 +672,12 @@ impl<C: Cpu> Starter<C> {
                                                     wait.cancel();
                                                 }
                                                 if let crate::run_queue::WaitState::Sleep { deadline, remaining } = &waiting {
-                                                    if *remaining != 0 {
-                                                        let ns = deadline.saturating_duration_since(Instant::now()).as_nanos();
-                                                        let memory = work.memory.as_deref_mut().expect("signal View");
-                                                        let _ = memory.write_array(*remaining, ((ns / 1_000_000_000) as u64).to_le_bytes());
-                                                        let _ = memory.write_array(*remaining + 8, ((ns % 1_000_000_000) as u64).to_le_bytes());
-                                                    }
-                                                }
-                                                if let crate::run_queue::WaitState::Child(wait) = &waiting {
+                                                    let result=crate::clock_sleep::interrupted(work.memory.as_deref_mut().expect("signal View"),*remaining,deadline.saturating_duration_since(Instant::now()));
+                                                    work.trace.finish(&mut work.cpu,result);
+                                                } else if let crate::run_queue::WaitState::ClockSleep(wait) = &waiting {
+                                                    let result=wait.interrupt(work.memory.as_deref_mut().expect("signal View"));
+                                                    work.trace.finish(&mut work.cpu,result);
+                                                } else if let crate::run_queue::WaitState::Child(wait) = &waiting {
                                                     if action.flags & 0x10000000 != 0 {
                                                         work.trace.restart();
                                                         for (i, value) in wait.request.args.iter().enumerate() { work.cpu.set_x(i, *value); }

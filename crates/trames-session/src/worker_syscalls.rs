@@ -275,28 +275,12 @@ pub(super) fn sleep_parameters(
     a: [u64; 6],
     started: Instant,
 ) -> Result<(Instant, u64), Errno> {
-    if number == 115 && (!matches!(a[0], 0 | 1) || a[1] & !1 != 0) {
+    if number == 115 && !matches!(a[0] as u32, 0 | 1) {
         return Err(Errno(22));
     }
-    let (request, remaining) = if number == 101 {
-        (a[0], a[1])
-    } else {
-        (a[2], if a[1] & 1 == 0 { a[3] } else { 0 })
-    };
-    let value = memory.read_array::<16>(request).map_err(|_| Errno(14))?;
-    let sec = u64::from_le_bytes(value[..8].try_into().unwrap());
-    let ns = u64::from_le_bytes(value[8..].try_into().unwrap());
-    if ns >= 1_000_000_000 || sec > i64::MAX as u64 {
-        return Err(Errno(22));
-    }
-    if remaining != 0 {
-        memory
-            .check(remaining, 16, Access::Write)
-            .map_err(|_| Errno(14))?;
-    }
-    let mut duration = Duration::new(sec, ns as u32);
+    let (mut duration, remaining) = sleep_request(memory, number, a)?;
     if number == 115 && a[1] & 1 != 0 {
-        let now = if a[0] == 0 {
+        let now = if a[0] as u32 == 0 {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|_| Errno(5))?
@@ -309,6 +293,58 @@ pub(super) fn sleep_parameters(
         Instant::now().checked_add(duration).ok_or(Errno(22))?,
         remaining,
     ))
+}
+
+fn sleep_request(
+    memory: &impl CpuMemory,
+    number: u32,
+    a: [u64; 6],
+) -> Result<(Duration, u64), Errno> {
+    let (request, remaining) = if number == 101 {
+        (a[0], a[1])
+    } else {
+        (a[2], if a[1] & 1 == 0 { a[3] } else { 0 })
+    };
+    let value = memory.read_array::<16>(request).map_err(|_| Errno(14))?;
+    let sec = u64::from_le_bytes(value[..8].try_into().unwrap());
+    let ns = u64::from_le_bytes(value[8..].try_into().unwrap());
+    if ns >= 1_000_000_000 || sec > i64::MAX as u64 {
+        return Err(Errno(22));
+    }
+    Ok((Duration::new(sec, ns as u32), remaining))
+}
+
+pub(super) fn sleep_wait(
+    memory: &impl CpuMemory,
+    number: u32,
+    a: [u64; 6],
+    started: Instant,
+    boot: Option<trames_linux::Boottime>,
+    task: &trames_kernel::signal::IoTask,
+    signal: Option<&Arc<trames_vfs::IoSignal>>,
+) -> Result<crate::run_queue::WaitState, Errno> {
+    use crate::run_queue::WaitState;
+    let clock = a[0] as u32;
+    if number == 115 && matches!(clock, 2 | 7) {
+        let (value, rem) = sleep_request(memory, number, a)?;
+        let wait = crate::clock_sleep::ClockSleep::new(
+            clock,
+            value,
+            a[1] & 1 != 0,
+            rem,
+            boot.unwrap_or_else(|| trames_linux::Boottime::from_start(started)),
+            task,
+        )?;
+        if let Some(signal) = signal {
+            wait.bind(signal).map_err(|_| Errno(5))?;
+        }
+        return Ok(WaitState::ClockSleep(wait));
+    }
+    let (deadline, remaining) = sleep_parameters(memory, number, a, started)?;
+    Ok(WaitState::Sleep {
+        deadline,
+        remaining,
+    })
 }
 
 fn pi_deadline(memory: &impl CpuMemory, address: u64) -> Result<Option<Instant>, Errno> {
@@ -667,18 +703,15 @@ impl Snapshot {
         epoch: &crate::run_queue::Epoch<C>,
     ) -> Option<Result<crate::run_queue::WaitState, Errno>> {
         if matches!(cpu.x(8) as u32, 101 | 115) {
-            return Some(
-                sleep_parameters(
-                    memory,
-                    cpu.x(8) as u32,
-                    std::array::from_fn(|i| cpu.x(i)),
-                    self.started,
-                )
-                .map(|(deadline, remaining)| crate::run_queue::WaitState::Sleep {
-                    deadline,
-                    remaining,
-                }),
-            );
+            return Some(sleep_wait(
+                memory,
+                cpu.x(8) as u32,
+                std::array::from_fn(|i| cpu.x(i)),
+                self.started,
+                self.direct.boot_clock(),
+                &self.io_signals,
+                self.io_wake.as_ref(),
+            ));
         }
         if !self.futex_wait(cpu) {
             return None;
@@ -1492,8 +1525,10 @@ mod tests {
         );
         memory.write_array(0x1008, 0u64.to_le_bytes()).unwrap();
         assert_eq!(
-            sleep_parameters(&memory, 101, [0x1000, 0x9000, 0, 0, 0, 0], started),
-            Err(Errno(14))
+            sleep_parameters(&memory, 101, [0x1000, 0x9000, 0, 0, 0, 0], started)
+                .unwrap()
+                .1,
+            0x9000
         );
         for clock in [0, 1] {
             let (deadline, remaining) =
@@ -1506,10 +1541,7 @@ mod tests {
             sleep_parameters(&memory, 115, [2, 0, 0x1000, 0, 0, 0], started),
             Err(Errno(22))
         );
-        assert_eq!(
-            sleep_parameters(&memory, 115, [1, 2, 0x1000, 0, 0, 0], started),
-            Err(Errno(22))
-        );
+        assert!(sleep_parameters(&memory, 115, [1, 2, 0x1000, 0, 0, 0], started).is_ok());
     }
 
     #[test]

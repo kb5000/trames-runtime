@@ -35,6 +35,7 @@ pub(super) enum WaitState {
         wait: Arc<Wait>,
         deadline: Option<Instant>,
     },
+    ClockSleep(Arc<crate::clock_sleep::ClockSleep>),
     Sleep {
         deadline: Instant,
         remaining: u64,
@@ -183,6 +184,7 @@ impl WaitState {
         match self {
             Self::Futex { deadline, .. } => *deadline,
             Self::Sleep { deadline, .. } => Some(*deadline),
+            Self::ClockSleep(wait) => wait.deadline(),
             Self::OwnerEvent
             | Self::Child(_)
             | Self::Completion(_)
@@ -524,7 +526,10 @@ impl<C: Cpu> Job<C> {
         })
     }
     pub fn restart_sleep_after_stop(&mut self) -> bool {
-        if !matches!(self.waiting, Some(WaitState::Sleep { .. })) {
+        if !matches!(
+            self.waiting,
+            Some(WaitState::Sleep { .. } | WaitState::ClockSleep(_))
+        ) {
             return false;
         }
         let Some(snapshot) = &self.work.syscalls else {
@@ -609,7 +614,13 @@ impl<C: Cpu> Job<C> {
             self.waiting
                 .as_ref()
                 .filter(|w| {
-                    !stopped || !matches!(w, WaitState::Signal(_) | WaitState::Sleep { .. })
+                    !stopped
+                        || !matches!(
+                            w,
+                            WaitState::Signal(_)
+                                | WaitState::Sleep { .. }
+                                | WaitState::ClockSleep(_)
+                        )
                 })
                 .and_then(WaitState::deadline),
             self.io
@@ -668,6 +679,9 @@ impl<C: Cpu> Job<C> {
             || matches!(&self.waiting, Some(WaitState::Policy(wait)) if wait.ready())
             || matches!(&self.waiting, Some(WaitState::Barrier(wait)) if wait.ready()))
         {
+            return true;
+        }
+        if matches!(&self.waiting,Some(WaitState::ClockSleep(w)) if w.ready()) {
             return true;
         }
         if let Some(WaitState::Completion(wait)) = &self.waiting {
@@ -1264,6 +1278,11 @@ impl<C: Cpu> Epoch<C> {
         if let Some(snapshot) = &mut job.work.syscalls {
             let signal = trames_vfs::IoSignal::new(pid, self.io_target.clone());
             snapshot.io_signals.set_wake(&signal);
+            if let Some(WaitState::ClockSleep(wait)) = &job.waiting {
+                if let Err(error) = wait.bind(&signal) {
+                    self.fail_host_io(error);
+                }
+            }
             if let Some(WaitState::Signal(wait)) = &job.waiting {
                 wait.bind(&snapshot.io_signals, &signal);
             }

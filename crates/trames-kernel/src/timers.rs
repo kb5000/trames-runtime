@@ -5,6 +5,7 @@ mod cpu;
 use crate::signal::{Info, IoDirectory, IoTask, TimerTarget};
 use cpu::CpuClock;
 pub(crate) use cpu::CpuSchedule;
+pub use cpu::CpuSleep;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{

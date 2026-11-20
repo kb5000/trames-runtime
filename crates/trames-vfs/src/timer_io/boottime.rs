@@ -5,7 +5,7 @@ use std::{
     os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
     time::{Duration, Instant},
 };
-pub(super) struct BootTimer {
+pub struct BootTimer {
     pub deadline: Duration,
     pub armed: Duration,
     fd: OwnedFd,

@@ -25,6 +25,8 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(watchdog(args, 'vfork', 'VforkTest.ParentStopsUntilChildExecves'), 40)
         self.assertEqual(watchdog(args, 'flock', 'FlockTest.BlockingLockNoBlockingForSharedLocks'), 45)
         self.assertEqual(watchdog(args, 'flock', 'FlockTest.Basic'), 20)
+        self.assertEqual(watchdog(args, 'sigstop', 'SigstopTest.Correctness'), 45)
+        self.assertEqual(watchdog(args, 'itimer', 'ItimerTest.DeliversSIGPROFToThreadsRoughlyFairlyIdle'), 220)
         args.suite_timeouts['ppoll'] = 15
         self.assertEqual(watchdog(args, 'ppoll', 'PpollTest.SignalMaskBlocksSignal'), 15)
     def test_mixed_results_need_matching_xml_and_exit(self):

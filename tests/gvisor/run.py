@@ -185,6 +185,14 @@ UPSTREAM_WAIT_TIMEOUTS = {
     'flock': {'FlockTest.BlockingLockNoBlockingForSharedLocks': 45},
     'ppoll': {'PpollTest.SignalMaskBlocksSignal': 45},
     'vfork': {'VforkTest.ParentStopsUntilChildExecves': 40},
+    'sigstop': {'SigstopTest.Correctness': 45},
+    # The workers take turns to accrue 20 CPU seconds each. The idle
+    # variant also sleeps between turns, extending the wall time further.
+    'itimer': {
+        'ItimerTest.DeliversSIGALRMToMainThread': 45,
+        'ItimerTest.DeliversSIGPROFToThreadsRoughlyFairlyActive': 100,
+        'ItimerTest.DeliversSIGPROFToThreadsRoughlyFairlyIdle': 220,
+    },
     'pselect': {'PselectTest.SignalMaskBlocksSignal': 45},
 }
 

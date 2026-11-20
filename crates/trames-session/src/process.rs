@@ -106,6 +106,7 @@ enum State {
     Blocked(u32, [u64; 6]),
     PidfdWait(trames_kernel::children::Wait),
     Sleep(Instant, u64),
+    ClockSleep(Arc<crate::clock_sleep::ClockSleep>),
     Suspend(u64),
     Completion(Arc<trames_kernel::completion::Completion>),
     Namespace(Arc<crate::run_queue::NamespaceWait>),
@@ -210,6 +211,7 @@ impl<C: Cpu> Process<C> {
             State::Ready
                 | State::Futex { .. }
                 | State::Sleep(..)
+                | State::ClockSleep(_)
                 | State::Sigwait { .. }
                 | State::Suspend(_)
                 | State::Completion(_)
@@ -1865,15 +1867,18 @@ impl<C: Cpu> Kernel<C> {
                 }
             }
             State::Sleep(deadline, remaining) => {
-                if remaining != 0 {
-                    let ns = deadline
-                        .saturating_duration_since(Instant::now())
-                        .as_nanos();
-                    let _ = write_u64(&mut p.memory, remaining, (ns / 1_000_000_000) as u64);
-                    let _ = write_u64(&mut p.memory, remaining + 8, (ns % 1_000_000_000) as u64);
-                }
-                p.cpu.set_x(0, error(Errno(4)));
-                p.trace.record(p.cpu.x(0));
+                let result = crate::clock_sleep::interrupted(
+                    &mut p.memory,
+                    remaining,
+                    deadline.saturating_duration_since(Instant::now()),
+                );
+                p.cpu.set_x(0, result);
+                p.trace.record(result);
+            }
+            State::ClockSleep(ref wait) => {
+                let result = wait.interrupt(&mut p.memory);
+                p.cpu.set_x(0, result);
+                p.trace.record(result);
             }
             State::Suspend(old) => {
                 p.signals.wait_mask = Some(old);
@@ -2250,9 +2255,11 @@ impl<C: Cpu> Kernel<C> {
                 routes.job_call(&p.signals.io, number, a).expect("original job authority").map(Some)
             },
             101 | 115 => {
-                let (deadline, remaining) =
-                    crate::worker_syscalls::sleep_parameters(&p.memory, number, a, self.started)?;
-                p.state = State::Sleep(deadline, remaining);
+                p.state = match crate::worker_syscalls::sleep_wait(&p.memory,number,a,self.started,Some(p.linux.boot_clock()),&p.signals.io,None)? {
+                    crate::run_queue::WaitState::Sleep{deadline,remaining}=>State::Sleep(deadline,remaining),
+                    crate::run_queue::WaitState::ClockSleep(wait)=>State::ClockSleep(wait),
+                    _=>unreachable!(),
+                };
                 Ok(None)
             },
             99 | 100 => trames_kernel::signal::IoRoutes { directory: p.signals.io_directory.clone(), namespace: p.linux.vfs.pid_namespace().clone(), uid: p.linux.vfs.credentials.uid, euid: p.linux.vfs.credentials.euid }.robust_list(&p.signals.io, number, a, &mut p.memory).map(Some),
@@ -3694,6 +3701,11 @@ impl<C: Cpu> Kernel<C> {
                             // the coordinator before preparing its execution View.
                         }
                         State::Blocked(number, a) => self.call(id, &mut p, number, a, io),
+                        State::ClockSleep(ref wait) if wait.ready() => {
+                            p.state = State::Ready;
+                            p.cpu.set_x(0, 0);
+                            p.trace.record(0);
+                        }
                         State::Sleep(deadline, _) if Instant::now() >= deadline => {
                             p.state = State::Ready;
                             p.cpu.set_x(0, 0);
@@ -3740,7 +3752,7 @@ impl<C: Cpu> Kernel<C> {
                         && !p.worker_gpu_candidate())
                     || (matches!(p.state, State::Futex { .. })
                         && (terminal || vms.contains(&p.vm_id)))
-                    || (matches!(p.state, State::Sleep(..))
+                    || (matches!(p.state, State::Sleep(..) | State::ClockSleep(_))
                         && (terminal || vms.contains(&p.vm_id)))
                     || (matches!(
                         p.state,
@@ -3819,8 +3831,12 @@ impl<C: Cpu> Kernel<C> {
             .processes
             .iter()
             .filter_map(|(id, p)| {
-                (!warm.contains(&id) && matches!(p.state, State::Futex { .. } | State::Sleep(..)))
-                    .then_some(id)
+                (!warm.contains(&id)
+                    && matches!(
+                        p.state,
+                        State::Futex { .. } | State::Sleep(..) | State::ClockSleep(_)
+                    ))
+                .then_some(id)
             })
             .collect();
         let prepare: Vec<_> = members
@@ -3835,6 +3851,7 @@ impl<C: Cpu> Kernel<C> {
                     p.state,
                     State::Futex { .. }
                         | State::Sleep(..)
+                        | State::ClockSleep(_)
                         | State::Sigwait { .. }
                         | State::Suspend(_)
                         | State::Completion(_)
@@ -4478,7 +4495,10 @@ impl<C: Cpu> Kernel<C> {
             if owned_waiters.is_some_and(|owned| owned.contains(&id))
                 && matches!(
                     p.state,
-                    State::Futex { .. } | State::Sleep(..) | State::Sigwait { .. }
+                    State::Futex { .. }
+                        | State::Sleep(..)
+                        | State::ClockSleep(_)
+                        | State::Sigwait { .. }
                 )
             {
                 continue;
@@ -4532,6 +4552,11 @@ impl<C: Cpu> Kernel<C> {
             } = p.state
             {
                 timeout = timeout.min(d.saturating_duration_since(now));
+            }
+            if let State::ClockSleep(ref wait) = p.state {
+                if let Some(d) = wait.deadline() {
+                    timeout = timeout.min(d.saturating_duration_since(now));
+                }
             }
             if let State::Sleep(d, _) = p.state {
                 let retained = worker_vms.contains(&p.vm_id);

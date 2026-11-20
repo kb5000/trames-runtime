@@ -108,7 +108,77 @@ impl CpuClock {
     }
 }
 
-type Entries = BTreeMap<(Duration, i32), Weak<Timer>>;
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CpuEventId {
+    Timer(i32),
+    Sleep(usize),
+}
+enum CpuEvent {
+    Timer(Weak<Timer>),
+    Sleep(Weak<CpuSleep>),
+}
+type Entries = BTreeMap<(Duration, CpuEventId), CpuEvent>;
+
+/// One sleeper on its own process clock. The clock's existing accounting
+/// schedule owns a weak entry, so cancellation needs no timer ID or signal.
+pub struct CpuSleep {
+    group: Weak<Group>,
+    schedule: Arc<CpuSchedule>,
+    deadline: Duration,
+    expired: AtomicBool,
+    wake: Mutex<Weak<trames_shared::IoSignal>>,
+}
+impl CpuSleep {
+    pub fn new(task: &IoTask, value: Duration, absolute: bool) -> Result<Arc<Self>, Errno> {
+        let group = task.lifecycle();
+        let now = group.cpu_time();
+        let deadline = if absolute {
+            value
+        } else {
+            now.checked_add(value).ok_or(Errno(22))?
+        };
+        let schedule = group.posix_timers.get_or_init(Default::default).clone();
+        let wait = Arc::new(Self {
+            group: Arc::downgrade(group),
+            schedule,
+            deadline,
+            expired: AtomicBool::new(deadline <= now),
+            wake: Mutex::default(),
+        });
+        if deadline > now {
+            let mut entries = wait.schedule.entries.lock().unwrap();
+            entries.insert(wait.key(), CpuEvent::Sleep(Arc::downgrade(&wait)));
+            wait.schedule.publish(&entries);
+            drop(entries);
+            wait.schedule.charge(|| group.cpu_time());
+        }
+        Ok(wait)
+    }
+    fn key(&self) -> (Duration, CpuEventId) {
+        (
+            self.deadline,
+            CpuEventId::Sleep(self as *const Self as usize),
+        )
+    }
+    pub fn ready(&self) -> bool {
+        self.expired.load(Ordering::Relaxed)
+    }
+    pub fn remaining(&self) -> Duration {
+        self.group.upgrade().map_or(Duration::ZERO, |g| {
+            self.deadline.saturating_sub(g.cpu_time())
+        })
+    }
+    pub fn bind(&self, signal: &Arc<trames_shared::IoSignal>) {
+        *self.wake.lock().unwrap() = Arc::downgrade(signal);
+    }
+}
+impl Drop for CpuSleep {
+    fn drop(&mut self) {
+        let mut entries = self.schedule.entries.lock().unwrap();
+        entries.remove(&self.key());
+        self.schedule.publish(&entries);
+    }
+}
 
 /// Indexed by the clock being charged, irrespective of the signal recipient.
 /// Queue entries never keep the original timer, process or thread alive.
@@ -137,10 +207,10 @@ impl CpuSchedule {
     fn update(&self, id: i32, old: Option<Duration>, new: Option<(Duration, Weak<Timer>)>) {
         let mut entries = self.entries.lock().unwrap();
         if let Some(d) = old {
-            entries.remove(&(d, id));
+            entries.remove(&(d, CpuEventId::Timer(id)));
         }
         if let Some((d, timer)) = new {
-            entries.insert((d, id), timer);
+            entries.insert((d, CpuEventId::Timer(id)), CpuEvent::Timer(timer));
         }
         self.publish(&entries);
     }
@@ -167,7 +237,21 @@ impl CpuSchedule {
             self.publish(&entries);
             due
         };
-        for ((deadline, id), timer) in due {
+        for ((deadline, key), event) in due {
+            let (id, timer) = match (key, event) {
+                (CpuEventId::Timer(id), CpuEvent::Timer(timer)) => (id, timer),
+                (CpuEventId::Sleep(_), CpuEvent::Sleep(wait)) => {
+                    if let Some(wait) = wait.upgrade() {
+                        wait.expired.store(true, Ordering::Relaxed);
+                        let wake = wait.wake.lock().unwrap().upgrade();
+                        if let Some(wake) = wake {
+                            wake.notify();
+                        }
+                    }
+                    continue;
+                }
+                _ => unreachable!("clock event key and resource disagree"),
+            };
             let Some(timer) = timer.upgrade() else {
                 continue;
             };
@@ -204,6 +288,36 @@ mod tests {
     use super::super::tests::{call, setup};
     use super::*;
 
+    #[test]
+    fn process_sleep_uses_group_execution_and_cancels_its_exact_entry() {
+        let (_, directory, leader, _) = setup();
+        let peer = Arc::new(IoTask::default());
+        peer.share_process(&leader);
+        directory.publish(&peer, 43, 42, 42, 0, 0);
+        let group = leader.lifecycle();
+        group.register(&leader, 42);
+        group.register(&peer, 43);
+        let ns = Duration::from_nanos;
+        peer.proc_view.account(ns(7), 1);
+        let relative = CpuSleep::new(&leader, ns(5), false).unwrap();
+        let absolute = CpuSleep::new(&peer, ns(12), true).unwrap();
+        let cancelled = CpuSleep::new(&leader, ns(12), true).unwrap();
+        let schedule = &relative.schedule;
+        assert_eq!(schedule.entries.lock().unwrap().len(), 3);
+        drop(cancelled);
+        assert_eq!(schedule.entries.lock().unwrap().len(), 2);
+        for _ in 0..3 {
+            leader.check_cpu_timers();
+        }
+        assert_eq!(relative.remaining(), ns(5));
+        assert!(!relative.ready());
+        peer.proc_view.account(ns(5), 1);
+        peer.check_cpu_timers();
+        assert!(relative.ready() && absolute.ready());
+        assert!(schedule.entries.lock().unwrap().is_empty());
+        assert_eq!(schedule.next_ns.load(Ordering::Relaxed), u64::MAX);
+        assert!(CpuSleep::new(&peer, ns(1), true).unwrap().ready());
+    }
     #[test]
     fn process_and_thread_alarms_follow_their_original_clocks() {
         let (timers, directory, leader, mut memory) = setup();
