@@ -1,14 +1,46 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Guest user namespaces. Kernel-facing identities stay global; only ABI edges
-//! translate them. The initial namespace is None and requires no map lookup.
+//! translate them. The initial namespace requires no map lookup.
 use super::*;
 use std::sync::{Mutex, OnceLock};
 pub const CLONE_NEWUSER: u64 = 0x1000_0000;
 const INITIAL: u64 = 0xefff_fffd;
 static NEXT: AtomicU64 = AtomicU64::new(0xb000_0000);
+#[derive(Clone)]
+pub struct UserNamespace(Namespace);
+#[derive(Clone)]
+enum Namespace {
+    Initial(Arc<OverflowIds>),
+    Child(Arc<UserSpace>),
+}
+pub(super) struct OverflowIds([std::sync::atomic::AtomicU32; 2]);
+impl Default for OverflowIds {
+    fn default() -> Self {
+        Self([65534, 65534].map(std::sync::atomic::AtomicU32::new))
+    }
+}
+impl OverflowIds {
+    pub(super) fn get(&self, group: bool) -> u32 {
+        self.0[group as usize].load(Ordering::Relaxed)
+    }
+    pub(super) fn set(&self, group: bool, value: u32) {
+        self.0[group as usize].store(value, Ordering::Relaxed);
+    }
+}
 #[derive(Clone, Default)]
-pub struct UserNamespace(pub(super) Option<Arc<UserSpace>>);
+pub(super) enum WeakUserNamespace {
+    #[default]
+    Unspecified,
+    Initial(std::sync::Weak<OverflowIds>),
+    Child(std::sync::Weak<UserSpace>),
+}
+impl Default for UserNamespace {
+    fn default() -> Self {
+        Self(Namespace::Initial(Arc::default()))
+    }
+}
 pub(super) struct UserSpace {
+    overflow: Arc<OverflowIds>,
     id: u64,
     parent: UserNamespace,
     owner: u32,
@@ -83,7 +115,7 @@ impl std::fmt::Debug for UserNamespace {
 }
 impl PartialEq for UserNamespace {
     fn eq(&self, other: &Self) -> bool {
-        match (&self.0, &other.0) {
+        match (self.child(), other.child()) {
             (None, None) => true,
             (Some(a), Some(b)) => Arc::ptr_eq(a, b),
             _ => false,
@@ -92,17 +124,29 @@ impl PartialEq for UserNamespace {
 }
 impl Eq for UserNamespace {}
 impl UserNamespace {
+    fn child(&self) -> Option<&Arc<UserSpace>> {
+        match &self.0 {
+            Namespace::Child(n) => Some(n),
+            Namespace::Initial(_) => None,
+        }
+    }
+    pub(super) fn overflow(&self) -> &Arc<OverflowIds> {
+        match &self.0 {
+            Namespace::Initial(ids) => ids,
+            Namespace::Child(n) => &n.overflow,
+        }
+    }
     pub fn is_initial(&self) -> bool {
-        self.0.is_none()
+        matches!(self.0, Namespace::Initial(_))
     }
     pub fn id(&self) -> u64 {
-        self.0.as_ref().map_or(INITIAL, |n| n.id)
+        self.child().map_or(INITIAL, |n| n.id)
     }
     pub fn parent(&self) -> Option<Self> {
-        self.0.as_ref().map(|n| n.parent.clone())
+        self.child().map(|n| n.parent.clone())
     }
     pub fn owner(&self) -> Option<u32> {
-        self.0.as_ref().map(|n| n.owner)
+        self.child().map(|n| n.owner)
     }
     pub fn contains(&self, target: &Self) -> bool {
         let mut at = target.clone();
@@ -118,7 +162,7 @@ impl UserNamespace {
     }
     fn create(credentials: &Credentials, limits: &Arc<UserNamespaceLimits>) -> Result<Self> {
         let parent = credentials.user_namespace.clone();
-        let depth = parent.0.as_ref().map_or(1, |n| n.depth + 1);
+        let depth = parent.child().map_or(1, |n| n.depth + 1);
         if depth > 32 {
             return Err(Errno(28));
         }
@@ -129,7 +173,7 @@ impl UserNamespace {
         }
         let mut charges = Vec::with_capacity(depth as usize);
         charges.push(limits.charge(credentials.euid)?);
-        if let Some(parent) = &parent.0 {
+        if let Some(parent) = parent.child() {
             for ancestor in &parent.charges {
                 charges.push(ancestor.limits.charge(ancestor.uid)?);
             }
@@ -138,7 +182,8 @@ impl UserNamespace {
         let id = NEXT
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| Errno(28))?;
-        Ok(Self(Some(Arc::new(UserSpace {
+        Ok(Self(Namespace::Child(Arc::new(UserSpace {
+            overflow: parent.overflow().clone(),
             id,
             parent,
             owner: credentials.euid,
@@ -154,7 +199,7 @@ impl UserNamespace {
         if id == u32::MAX {
             return None;
         }
-        let Some(ns) = &self.0 else {
+        let Some(ns) = self.child() else {
             return Some(id);
         };
         let map = ns.maps[usize::from(group)].get()?;
@@ -168,7 +213,7 @@ impl UserNamespace {
         if end == u32::MAX {
             return None;
         }
-        let Some(ns) = &self.0 else {
+        let Some(ns) = self.child() else {
             return Some(first);
         };
         let e = ns.maps[usize::from(group)]
@@ -182,7 +227,7 @@ impl UserNamespace {
         if id == u32::MAX {
             return None;
         }
-        let Some(ns) = &self.0 else {
+        let Some(ns) = self.child() else {
             return Some(id);
         };
         let lower = ns.parent.from_global(group, id)?;
@@ -193,7 +238,8 @@ impl UserNamespace {
         Some(e.first + (lower - e.lower))
     }
     pub fn visible(&self, group: bool, id: u32) -> u32 {
-        self.from_global(group, id).unwrap_or(65534)
+        self.from_global(group, id)
+            .unwrap_or_else(|| self.overflow().get(group))
     }
     pub fn stat(&self, mut bytes: [u8; 128]) -> [u8; 128] {
         if !self.is_initial() {
@@ -205,11 +251,10 @@ impl UserNamespace {
         bytes
     }
     pub fn groups_policy(&self) -> bool {
-        self.0.as_ref().is_none_or(|n| *n.policy.lock().unwrap())
+        self.child().is_none_or(|n| *n.policy.lock().unwrap())
     }
     pub fn may_setgroups(&self) -> bool {
-        self.0
-            .as_ref()
+        self.child()
             .is_none_or(|n| n.maps[1].get().is_some() && *n.policy.lock().unwrap())
     }
     pub fn capable(&self, caller: &Credentials, cap: u32) -> bool {
@@ -217,7 +262,7 @@ impl UserNamespace {
             return caller.has_local_cap(cap);
         }
         let mut at = self.clone();
-        while let Some(ns) = &at.0 {
+        while let Some(ns) = at.child() {
             if ns.parent == caller.user_namespace && ns.owner == caller.euid {
                 return true;
             }
@@ -228,19 +273,33 @@ impl UserNamespace {
         }
         false
     }
-    pub(super) fn weak(&self) -> Option<std::sync::Weak<UserSpace>> {
-        self.0.as_ref().map(Arc::downgrade)
+    pub(super) fn weak(&self) -> WeakUserNamespace {
+        match &self.0 {
+            Namespace::Initial(ids) => WeakUserNamespace::Initial(Arc::downgrade(ids)),
+            Namespace::Child(ns) => WeakUserNamespace::Child(Arc::downgrade(ns)),
+        }
     }
-    pub(super) fn upgrade(weak: &Option<std::sync::Weak<UserSpace>>) -> Result<Self> {
-        Ok(Self(
-            weak.as_ref()
-                .map(|n| n.upgrade().ok_or(Errno(2)))
-                .transpose()?,
-        ))
+    pub(super) fn upgrade(weak: &WeakUserNamespace) -> Result<Self> {
+        match weak {
+            WeakUserNamespace::Initial(ids) => ids
+                .upgrade()
+                .map(|ids| Self(Namespace::Initial(ids)))
+                .ok_or(Errno(2)),
+            WeakUserNamespace::Child(ns) => ns
+                .upgrade()
+                .map(|ns| Self(Namespace::Child(ns)))
+                .ok_or(Errno(2)),
+            WeakUserNamespace::Unspecified => Ok(Self::default()),
+        }
     }
     fn map_text(&self, group: bool, observer: &Self) -> Vec<u8> {
-        let Some(ns) = &self.0 else {
-            return format!("{:10} {:10} 4294967295\n", 0, observer.visible(group, 0)).into_bytes();
+        let Some(ns) = self.child() else {
+            return format!(
+                "{:10} {:10} 4294967295\n",
+                0,
+                observer.from_global(group, 0).unwrap_or(u32::MAX)
+            )
+            .into_bytes();
         };
         let mut bytes = String::new();
         if let Some(map) = ns.maps[usize::from(group)].get() {
@@ -250,7 +309,8 @@ impl UserNamespace {
                 } else {
                     ns.parent
                         .to_global(group, e.lower)
-                        .map_or(65534, |id| observer.visible(group, id))
+                        .and_then(|id| observer.from_global(group, id))
+                        .unwrap_or(u32::MAX)
                 };
                 bytes.push_str(&format!("{:10} {:10} {:10}\n", e.first, lower, e.count));
             }
@@ -304,7 +364,7 @@ impl MapFile {
         Ok(bytes[offset..offset + count.min(bytes.len() - offset)].to_vec())
     }
     pub fn write(&self, bytes: &[u8], offset: u64, writer: &Credentials) -> Result<usize> {
-        let ns = self.namespace.0.as_ref().ok_or(Errno(1))?;
+        let ns = self.namespace.child().ok_or(Errno(1))?;
         if offset != 0 || bytes.len() >= 4096 {
             return Err(Errno(22));
         }
@@ -415,7 +475,7 @@ impl MapFile {
 
 impl Vfs {
     pub(super) fn user_namespace_limits(&self) -> Arc<UserNamespaceLimits> {
-        if let Some(ns) = &self.credentials.user_namespace.0 {
+        if let Some(ns) = self.credentials.user_namespace.child() {
             return ns.limits.clone();
         }
         let pseudo = self.pseudo.borrow();
@@ -536,7 +596,7 @@ mod tests {
         c.enter_user_namespace(
             UserNamespace::create(
                 parent,
-                &parent.user_namespace.0.as_ref().map_or_else(
+                &parent.user_namespace.child().map_or_else(
                     || Arc::new(UserNamespaceLimits::new(1024)),
                     |ns| ns.limits.clone(),
                 ),
@@ -702,6 +762,55 @@ mod tests {
             .credentials
             .has_ns_cap(original.user_namespace(), capabilities::NET_ADMIN));
     }
+    #[test]
+    fn overflow_sysctls_belong_to_each_environment_and_follow_live_mappings() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, RuntimeInfo::default());
+        let fd = v
+            .open_at(AT_FDCWD, b"/proc/sys/kernel/overflowuid", 2, 0)
+            .unwrap();
+        let gid = v
+            .open_at(AT_FDCWD, b"/proc/sys/kernel/overflowgid", 2, 0)
+            .unwrap();
+        let file = v.open_at(AT_FDCWD, b"/owner", 0x42, 0o600).unwrap();
+        let mut child = v.clone();
+        child.unshare_user().unwrap();
+        assert_eq!(v.pread(fd, 32, 0).unwrap(), b"65534\n");
+        assert_eq!(v.pwrite(fd, b"65536", 0), Err(Errno(22)));
+        assert_eq!(v.pwrite(fd, b"0", 0), Ok(1));
+        assert_eq!(v.pwrite(gid, b"65535", 0), Ok(5));
+        assert_eq!(child.pread(gid, 32, 0).unwrap(), b"65535\n");
+        assert_eq!(child.pwrite(fd, b"123", 0), Err(Errno(13)));
+        let c = &child.credentials;
+        assert_eq!(c.local_id(false, c.uid), 0);
+        assert_eq!(c.user_namespace.to_global(false, 0), None);
+        assert_eq!(c.user_namespace.from_global(false, c.uid), None);
+        assert_eq!(
+            &child.stat_fd(file).unwrap()[24..32],
+            &[0, 0, 0, 0, 255, 255, 0, 0]
+        );
+        let map = MapFile::new(
+            v.credentials.user_namespace.clone(),
+            c.clone(),
+            MapKind::Uid,
+        );
+        assert_eq!(
+            map.read(0, 100).unwrap(),
+            b"         0 4294967295 4294967295\n"
+        );
+        for (kind, text) in [(MapKind::Uid, b"71 0 1"), (MapKind::Gid, b"72 0 1")] {
+            MapFile::new(c.user_namespace.clone(), v.credentials.clone(), kind)
+                .write(text, 0, &v.credentials)
+                .unwrap();
+        }
+        assert_eq!(
+            &child.stat_fd(file).unwrap()[24..32],
+            &[71, 0, 0, 0, 72, 0, 0, 0]
+        );
+        assert_eq!(c.local_id(false, u32::MAX), 0);
+        assert_eq!(Vfs::default().credentials.local_id(false, u32::MAX), 65534);
+    }
+
     #[test]
     fn metadata_translation_observes_late_maps_without_changing_inode_ids() {
         let mut v = Vfs::default();

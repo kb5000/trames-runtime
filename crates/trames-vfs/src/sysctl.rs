@@ -42,6 +42,7 @@ impl NameiPolicy {
 pub(super) enum Control {
     Network(network::Control),
     NrOpen(DescriptorCeiling),
+    OverflowId(bool, Arc<user_namespace::OverflowIds>),
     UtsName(bool, Arc<readiness::ProcWatch>),
     Namei(Protection, Arc<NameiPolicy>),
     MountMax(Arc<mounts::MountPolicy>),
@@ -71,7 +72,7 @@ impl Control {
             Self::UserNamespaces(owner, _) => {
                 owner.capable(credentials, capabilities::SYS_RESOURCE)
             }
-            Self::MountMax(_) | Self::Namei(..) => {
+            Self::OverflowId(..) | Self::MountMax(_) | Self::Namei(..) => {
                 credentials.euid == 0 && credentials.user_namespace.is_initial()
             }
             Self::NrOpen(_) => {
@@ -98,6 +99,7 @@ impl Control {
             Self::Network(control) => return control.read(offset, count),
             Self::Namei(kind, policy) => policy.get(*kind),
             Self::MountMax(policy) => policy.get(),
+            Self::OverflowId(group, ids) => ids.get(*group),
             Self::NrOpen(limit) => limit.get(),
             Self::UserNamespaces(_, limit) => limit.max(),
         };
@@ -127,7 +129,11 @@ impl Control {
             }
             Self::UserMap(control) => control.write(bytes, offset, credentials),
             Self::Network(control) => control.write(bytes, offset, control.authorized(credentials)),
-            Self::Namei(..) | Self::MountMax(_) | Self::NrOpen(_) | Self::UserNamespaces(_, _) => {
+            Self::OverflowId(..)
+            | Self::Namei(..)
+            | Self::MountMax(_)
+            | Self::NrOpen(_)
+            | Self::UserNamespaces(_, _) => {
                 if !self.authorized(credentials, tgid) {
                     return Err(Errno(13));
                 }
@@ -143,6 +149,9 @@ impl Control {
                     .parse::<u32>()
                     .map_err(|_| Errno(22))?;
                 match self {
+                    Self::OverflowId(group, ids) if value <= u16::MAX as u32 => {
+                        ids.set(*group, value)
+                    }
                     Self::Namei(kind, policy) if value <= kind.max() => {
                         policy.0[*kind as usize].store(value, Ordering::Relaxed)
                     }
@@ -166,6 +175,16 @@ fn slice(bytes: &[u8], offset: u64, count: usize) -> Vec<u8> {
 }
 impl Vfs {
     pub(super) fn sysctl_control(&self, path: &ResolvedPath) -> Option<Control> {
+        if matches!(
+            path.as_ref(),
+            b"/proc/sys/kernel/overflowuid" | b"/proc/sys/kernel/overflowgid"
+        ) && self.uses_pseudo(path)
+        {
+            return Some(Control::OverflowId(
+                path.ends_with(b"gid"),
+                self.credentials.user_namespace.overflow().clone(),
+            ));
+        }
         let domain = match path.as_ref() {
             b"/proc/sys/kernel/hostname" => Some(false),
             b"/proc/sys/kernel/domainname" => Some(true),

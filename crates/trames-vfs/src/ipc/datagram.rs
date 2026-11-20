@@ -467,7 +467,7 @@ mod tests {
             assert_eq!(
                 receiver.recv(1, 0).unwrap().credentials,
                 Some(if mode == 0 {
-                    [0, 65534, 65534]
+                    [0, u32::MAX, u32::MAX]
                 } else {
                     [42, 1000, 1001]
                 })

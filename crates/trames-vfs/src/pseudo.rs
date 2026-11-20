@@ -2076,6 +2076,7 @@ impl Vfs {
             b"/proc/sys/kernel/version" => return Ok(regular(b"Trames userspace runtime\n".to_vec())),
             b"/proc/sys/kernel/hostname" => { let mut n = self.uts_name(false); n.push(b'\n'); return Ok(Some((file(n), 0o100644))); },
             b"/proc/sys/kernel/domainname" => { let mut n = self.uts_name(true); n.push(b'\n'); return Ok(Some((file(n), 0o100644))); },
+            b"/proc/sys/kernel/overflowuid" | b"/proc/sys/kernel/overflowgid" => return Ok(Some((file(format!("{}\n", self.credentials.user_namespace.overflow().get(path.ends_with(b"gid"))).into_bytes()), 0o100644))),
             b"/proc/sys/kernel/cap_last_cap" => return Ok(regular(format!("{}\n", capabilities::LAST).into_bytes())),
             b"/proc/sys/kernel/pid_max" => return Ok(regular(b"2147483647\n".to_vec())),
             b"/proc/sys/kernel/threads-max" => return Ok(regular(format!("{task_limit}\n").into_bytes())),
@@ -2869,6 +2870,8 @@ impl Vfs {
                 "domainname",
                 "pid_max",
                 "cap_last_cap",
+                "overflowuid",
+                "overflowgid",
                 "threads-max",
                 "random",
             ]

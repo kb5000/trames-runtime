@@ -116,8 +116,10 @@ def main():
     for suite,case in sorted(expected-observed):merged.append(dict(suite=suite,case=case,status='not_run_worker_error',code=None,seconds=0,messages=[]))
     merged.sort(key=lambda r:(r['suite'],r['case']))
     final=dict(plans[0] if plans else plan,suites=plan['suites'],discovery_errors=discovery_errors,workers=outcomes)
-    if any(worker_plan.get('host_pty_fixture') for worker_plan in plans):
-        final['host_pty_fixture'] = True
+    for worker_plan in plans:
+        for fixture in ('host_pty_fixture', 'setgid_fixture'):
+            if fixture in worker_plan:
+                final[fixture] = worker_plan[fixture]
     save(out/'plan.json',final);save(out/'results.json',merged)
     counts=dict(collections.Counter(r['status'] for r in merged))
     summary=dict(platform=a.platform,groups=len(plan['suites']),cases=len(merged),counts=counts,discovery_errors=discovery_errors,worker_errors=[r for r in outcomes if r['exit_code']])

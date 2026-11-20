@@ -87,8 +87,8 @@ impl ExecCredentials {
             }
         }
         c.caps.exec_with_nnp(
-            c.local_id(false, c.uid),
-            c.local_id(false, c.euid),
+            c.privilege_uid(c.uid),
+            c.privilege_uid(c.euid),
             c.uid != c.euid || c.gid != c.egid,
             no_new_privs,
         );
@@ -182,6 +182,13 @@ impl Credentials {
     pub fn has_ns_cap(&self, namespace: &UserNamespace, cap: u32) -> bool {
         namespace.capable(self, cap)
     }
+    // Capability rules compare mapped IDs. The configurable display value for
+    // an unmapped UID can itself be zero.
+    fn privilege_uid(&self, id: u32) -> u32 {
+        self.user_namespace
+            .from_global(false, id)
+            .unwrap_or(u32::MAX)
+    }
     pub fn local_id(&self, group: bool, id: u32) -> u32 {
         self.user_namespace.visible(group, id)
     }
@@ -240,8 +247,8 @@ impl Credentials {
             self.fsgid = self.egid;
         } else {
             self.caps.uids_changed(
-                current.map(|id| self.local_id(false, id)),
-                next.map(|id| self.local_id(false, id)),
+                current.map(|id| self.privilege_uid(id)),
+                next.map(|id| self.privilege_uid(id)),
             );
             [self.uid, self.euid, self.suid] = next;
             self.fsuid = self.euid;
@@ -323,7 +330,7 @@ impl Credentials {
                 self.fsgid = value;
             } else {
                 self.caps
-                    .fsuid_changed(self.local_id(false, old), self.local_id(false, value));
+                    .fsuid_changed(self.privilege_uid(old), self.privilege_uid(value));
                 self.fsuid = value;
             }
         }
@@ -471,7 +478,7 @@ impl Vfs {
             view.credentials.fsgid = self.credentials.gid;
             if self.credentials.caps.securebits & capabilities::NO_SETUID_FIXUP == 0 {
                 view.credentials.caps.effective =
-                    if self.credentials.local_id(false, self.credentials.uid) == 0 {
+                    if self.credentials.privilege_uid(self.credentials.uid) == 0 {
                         self.credentials.caps.permitted
                     } else {
                         0
@@ -558,7 +565,10 @@ impl Vfs {
             n.gid = gid;
         }
         if matches!(n.content, Content::File(_)) && (uid != u32::MAX || gid != u32::MAX) {
-            n.mode &= !0o6000;
+            n.mode &= !0o4000;
+            if n.mode & 0o0010 != 0 {
+                n.mode &= !0o2000;
+            }
         }
         n.times[2] = storage::Timestamp::now();
         drop(n);

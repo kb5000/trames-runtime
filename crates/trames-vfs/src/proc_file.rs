@@ -346,6 +346,9 @@ impl Vfs {
         // opener's live Files. In particular OFD -> renderer -> Files -> OFD
         // must never form a last-close cycle.
         let mut view = Vfs::empty(self.fs.clone());
+        // seq_file renders IDs in the namespace of the opener. Retain it
+        // across descriptor transfer and subsequent changes to the ID maps.
+        view.credentials.user_namespace = self.credentials.user_namespace.clone();
         view.uts = self.uts.clone();
         view.network = self.network.clone();
         view.root_network = self.root_network.clone();

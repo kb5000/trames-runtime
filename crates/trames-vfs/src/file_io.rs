@@ -11,6 +11,7 @@ pub struct DirectFile {
     locks: Arc<locks::Records>,
     prepared: PreparedFile,
     file: Option<SharedFd>,
+    local_inode: Option<NodeRef>,
     clear_setid: bool,
     unlimited: bool,
 }
@@ -24,7 +25,8 @@ struct FileAuthority {
     locks: std::sync::Weak<locks::Records>,
     origin: OfdIdentity,
     flock: std::sync::Weak<flock::Owner>,
-    stat: [u8; 128],
+    inode: std::sync::Weak<Inode>,
+    device: u64,
     flags: u32,
     status: StatusFlags,
     notification: std::sync::Weak<FileClose>,
@@ -35,12 +37,23 @@ struct FileAuthority {
 }
 impl PreparedFile {
     fn accept(&self, file: Option<SharedFd>) -> Option<DirectFile> {
+        let local_inode = if file.is_none() {
+            Some(self.0.inode.upgrade()?)
+        } else {
+            None
+        };
+        let mut accepted = self.promote(local_inode)?;
+        accepted.file = file;
+        Some(accepted)
+    }
+    fn promote(&self, local_inode: Option<NodeRef>) -> Option<DirectFile> {
         Some(DirectFile {
             data: self.0.data.upgrade()?,
             position: self.0.position.upgrade()?,
             locks: self.0.locks.upgrade()?,
             prepared: self.clone(),
-            file,
+            local_inode,
+            file: None,
             clear_setid: self.0.clear_setid,
             unlimited: self.0.unlimited,
         })
@@ -157,15 +170,15 @@ impl DirectFiles {
             }
             (&published.prepared, Some(publication))
         };
-        let Some(mut accepted) = prepared.accept(None) else {
+        let Some(mut accepted) = prepared.promote(None) else {
             return Err(file);
         };
+        accepted.file = Some(file);
         if let Some(publication) = publication {
             accepted.clear_setid = publication.clear_setid;
             accepted.unlimited = publication.unlimited;
             accepted.prepared.1 = publication.limit.clone();
         }
-        accepted.file = Some(file);
         Ok(accepted)
     }
     /// Cold preparation of fixed or already-accepted io_uring descriptions.
@@ -315,7 +328,7 @@ impl FileEpoch {
             .as_ref()
             .map(Arc::downgrade)
             .unwrap_or_default();
-        let stat = vfs.stat_node_fields(&n, o.mount.as_ref()).ok()?;
+        let device = n.stat_device(o.mount.as_ref());
         let write_error = Vfs::pseudo_immutable_node(&n).err();
         let prepared = PreparedFile(
             Arc::new(FileAuthority {
@@ -324,7 +337,8 @@ impl FileEpoch {
                 locks: Arc::downgrade(&vfs.inode_record_locks(&n)),
                 origin: OfdIdentity::new(&o.shared),
                 flock,
-                stat,
+                inode: Arc::downgrade(&node),
+                device,
                 flags: o.flags.get(),
                 status: o.flags.clone(),
                 notification,
@@ -570,16 +584,14 @@ impl DirectFile {
         if let Some(result) = self.data.host_stat() {
             return result;
         }
-        let mut out = self.prepared.0.stat;
-        out[48..56].copy_from_slice(&self.data.len().to_le_bytes());
+        let inode = self
+            .file
+            .as_ref()
+            .and_then(|fd| fd.open.node.as_ref())
+            .or(self.local_inode.as_ref())
+            .expect("accepted ordinary file owns its inode");
+        let mut out = Vfs::stat_node_fields(&inode.borrow(), self.prepared.0.device);
         out[64..72].copy_from_slice(&self.data.blocks()?.to_le_bytes());
-        if let Some(meta) = self.data.metadata() {
-            out[16..20].copy_from_slice(&meta.mode.to_le_bytes());
-            for (offset, t) in [72, 88, 104].into_iter().zip(meta.times) {
-                out[offset..offset + 8].copy_from_slice(&t.seconds.to_le_bytes());
-                out[offset + 8..offset + 16].copy_from_slice(&(t.nanos as u64).to_le_bytes());
-            }
-        }
         Ok(out)
     }
 }
@@ -672,6 +684,32 @@ mod tests {
         assert_eq!(replacement, fd);
         assert!(files.get(fd).is_none()); // no stale ordinary-file authority
         epoch.finish();
+    }
+    #[test]
+    fn accepted_stat_tracks_the_original_unlinked_inode_across_fd_reuse() {
+        let (mut v, fd) = memory_file(Vec::new());
+        let mut epoch = FileEpoch::default();
+        let accepted = epoch.capture(&v, true).get(fd).unwrap();
+        v.link_at(AT_FDCWD, b"/data", AT_FDCWD, b"/alias").unwrap();
+        v.chmod_fd(fd, 0o6766).unwrap();
+        v.chown_at(AT_FDCWD, b"/alias", 123, 456, false).unwrap();
+        let stat = accepted.stat().unwrap();
+        assert_eq!(stat, v.stat_fd(fd).unwrap());
+        assert_eq!(
+            u32::from_le_bytes(stat[16..20].try_into().unwrap()) & 0o7777,
+            0o2766
+        );
+        assert_eq!(u32::from_le_bytes(stat[20..24].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(stat[24..28].try_into().unwrap()), 123);
+        assert_eq!(u32::from_le_bytes(stat[28..32].try_into().unwrap()), 456);
+        v.unlink_at(AT_FDCWD, b"/data", false).unwrap();
+        v.unlink_at(AT_FDCWD, b"/alias", false).unwrap();
+        v.close(fd).unwrap();
+        assert_eq!(v.open_at(AT_FDCWD, b"/data", 0x42, 0o600).unwrap(), fd);
+        let unlinked = accepted.stat().unwrap();
+        assert_eq!(u32::from_le_bytes(unlinked[20..24].try_into().unwrap()), 0);
+        assert_eq!(&unlinked[8..16], &stat[8..16]);
+        assert_ne!(&unlinked[8..16], &v.stat_fd(fd).unwrap()[8..16]);
     }
     fn weak_file(v: &Vfs, fd: u32) -> (std::sync::Weak<Inode>, std::sync::Weak<PlainFile>) {
         let descriptor = v.descriptor(fd).unwrap();

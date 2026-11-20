@@ -332,7 +332,7 @@ impl NamespaceHandle {
 
 #[derive(Clone, Default)]
 pub struct NamespaceSnapshot {
-    user: Option<std::sync::Weak<user_namespace::UserSpace>>,
+    user: user_namespace::WeakUserNamespace,
     uts: std::sync::Weak<Uts>,
     pub(super) net: std::sync::Weak<RootNetwork>,
     ipc: std::sync::Weak<IpcNamespace>,
@@ -347,7 +347,7 @@ pub struct NamespaceSnapshot {
 /// does not retain a task or namespace; an accepted nsfs open acquires authority.
 #[derive(Clone, Default)]
 pub struct SharedNamespaceSnapshot {
-    user: Option<std::sync::Weak<user_namespace::UserSpace>>,
+    user: user_namespace::WeakUserNamespace,
     uts: std::sync::Weak<Uts>,
     net: std::sync::Weak<RootNetwork>,
     ipc: std::sync::Weak<IpcNamespace>,

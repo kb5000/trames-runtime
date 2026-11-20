@@ -591,6 +591,11 @@ struct Node {
 #[cfg(test)]
 thread_local! {static PATH_SEARCHES: Cell<usize> = const { Cell::new(0) };}
 impl Node {
+    fn stat_device(&self, mount: Option<&OpenMount>) -> u64 {
+        mount
+            .filter(|m| m.kind == mounts::Kind::Overlay)
+            .map_or(self.device, |m| m.device())
+    }
     fn file_metadata(&self) -> file_data::FileMeta {
         if let Content::File(data) = &self.content {
             if let Some(meta) = data.metadata() {
@@ -2591,7 +2596,8 @@ impl Vfs {
                 if let Some(
                     control @ (sysctl::Control::UserNamespaces(..)
                     | sysctl::Control::UtsName(..)
-                    | sysctl::Control::Namei(..)),
+                    | sysctl::Control::Namei(..)
+                    | sysctl::Control::OverflowId(..)),
                 ) = &network_control
                 {
                     if !control.authorized(&self.credentials, self.lock_owner) {
@@ -3869,7 +3875,7 @@ impl Vfs {
         Ok(new as u64)
     }
     fn stat_node(&self, node: &Node, mount: Option<&OpenMount>) -> Result<[u8; 128]> {
-        let mut out = self.stat_node_fields(node, mount)?;
+        let mut out = Self::stat_node_fields(node, node.stat_device(mount));
         let blocks = match &node.content {
             Content::File(data) if !node.volatile => data.blocks()?,
             _ => 0,
@@ -3877,14 +3883,8 @@ impl Vfs {
         out[64..72].copy_from_slice(&blocks.to_le_bytes());
         Ok(out)
     }
-    // Freeze only virtual fields when publishing worker capabilities. Actual
-    // stat calls obtain live allocation/blocks; cohort setup must not stat every
-    // host disk object even when no task will query it.
-    fn stat_node_fields(&self, node: &Node, mount: Option<&OpenMount>) -> Result<[u8; 128]> {
+    fn stat_node_fields(node: &Node, device: u64) -> [u8; 128] {
         let mut out = [0; 128];
-        let device = mount
-            .filter(|m| m.kind == mounts::Kind::Overlay)
-            .map_or(node.device, |m| m.device());
         out[..8].copy_from_slice(&device.to_le_bytes());
         out[8..16].copy_from_slice(&node.inode.to_le_bytes());
         let metadata = node.file_metadata();
@@ -3916,7 +3916,7 @@ impl Vfs {
             out[offset..offset + 8].copy_from_slice(&t.seconds.to_le_bytes());
             out[offset + 8..offset + 16].copy_from_slice(&(t.nanos as u64).to_le_bytes());
         }
-        Ok(out)
+        out
     }
     fn stat_inode(&self, inode: &NodeRef, mount: Option<&OpenMount>) -> Result<[u8; 128]> {
         let (mut out, directory) = {

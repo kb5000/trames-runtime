@@ -581,7 +581,7 @@ impl LocalSocket {
             truncated: received.truncated,
             rights,
             credentials: if self.passcred.load(Ordering::Relaxed) {
-                received.credentials.or(Some([0, 65534, 65534]))
+                received.credentials.or(Some([0, u32::MAX, u32::MAX]))
             } else {
                 None
             },

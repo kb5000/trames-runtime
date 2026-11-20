@@ -187,7 +187,7 @@ impl channel::Resource {
                     truncated: received.truncated,
                     rights,
                     credentials: if received.options[0] != 0 {
-                        received.credentials.or(Some([0, 65534, 65534]))
+                        received.credentials.or(Some([0, u32::MAX, u32::MAX]))
                     } else {
                         None
                     },
