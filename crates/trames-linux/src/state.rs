@@ -850,12 +850,12 @@ impl Linux {
         Self::check(memory, a[4], 256, Access::Write)?;
         let (stat, mount) = if path.is_empty() && flags & 0x1000 != 0 {
             if a[0] as i32 == -100 {
-                vfs.stat_at_with_mount(-100, b".", false)?
+                vfs.statx_at(-100, b".", false)?
             } else {
-                vfs.stat_fd_with_mount(a[0] as u32)?
+                vfs.statx_fd(a[0] as u32)?
             }
         } else {
-            vfs.stat_at_with_mount(a[0] as i32, path, flags & 0x100 != 0)?
+            vfs.statx_at(a[0] as i32, path, flags & 0x100 != 0)?
         };
         Self::finish_statx(a, memory, stat, mount)
     }
@@ -863,11 +863,15 @@ impl Linux {
         a: [u64; 6],
         memory: &mut impl CpuMemory,
         stat: [u8; 128],
-        mount: u64,
+        mount: trames_vfs::StatMount,
     ) -> Result<u64> {
         let mut out = [0u8; 256];
         out[..4].copy_from_slice(&0x17ffu32.to_le_bytes()); // BASIC_STATS and MNT_ID; no birth time.
         out[4..8].copy_from_slice(&stat[56..60]);
+        const ATTR_MOUNT_ROOT: u64 = 0x2000;
+        out[8..16]
+            .copy_from_slice(&(if mount.is_root { ATTR_MOUNT_ROOT } else { 0 }).to_le_bytes());
+        out[56..64].copy_from_slice(&ATTR_MOUNT_ROOT.to_le_bytes());
         out[16..20].copy_from_slice(&stat[20..24]);
         out[20..24].copy_from_slice(&stat[24..28]);
         out[24..28].copy_from_slice(&stat[28..32]);
@@ -887,7 +891,7 @@ impl Linux {
             out[offset..offset + 4].copy_from_slice(&(major as u32).to_le_bytes());
             out[offset + 4..offset + 8].copy_from_slice(&(minor as u32).to_le_bytes());
         }
-        out[144..152].copy_from_slice(&mount.to_le_bytes());
+        out[144..152].copy_from_slice(&mount.id.to_le_bytes());
         memory.write(a[4], &out).map_err(|_| Errno(14))?;
         Ok(0)
     }

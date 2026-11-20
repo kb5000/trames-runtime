@@ -1953,6 +1953,20 @@ fn hardlinked_symlinks_keep_inode_identity_and_resolve_relative_to_each_parent()
 }
 
 #[test]
+fn persistent_guest_cwd_is_reported_by_the_source_worker() {
+    let dir = Temp::new();
+    let mut owner = dir.open();
+    owner.mkdir_at(AT_FDCWD, b"/work", 0o755).unwrap();
+    owner.chdir(b"/work").unwrap();
+    assert!(owner.namespace_host_work());
+    let queries = owner.path_queries();
+    assert!(matches!(
+        queries.namespace_attempt(NamespaceCall::Cwd),
+        NamespaceAttempt::Complete(Ok(FileValue::Bytes(path))) if path == b"/work\0"
+    ));
+}
+
+#[test]
 fn socket_chown_on_disk_root_completes_on_source_without_filesystem_handoff() {
     let dir = Temp::new();
     let mut owner = dir.open();

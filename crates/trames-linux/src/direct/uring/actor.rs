@@ -198,7 +198,7 @@ impl Execution {
                 self.paths
                     .lock()
                     .unwrap()
-                    .uring_stat(
+                    .uring_statx(
                         request.file.as_ref(),
                         s.fd(),
                         request.path.as_deref()?,

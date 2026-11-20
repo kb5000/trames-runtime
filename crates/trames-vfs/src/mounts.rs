@@ -800,7 +800,9 @@ impl Vfs {
         })
     }
     pub(super) fn root_location(&self) -> Result<ResolvedPath> {
-        let paths = self.context.paths.borrow();
+        self.root_location_in(&self.context.paths.borrow())
+    }
+    pub(super) fn root_location_in(&self, paths: &fs_context::Paths) -> Result<ResolvedPath> {
         if let Some(n) = &paths.root_node {
             self.location(n, &paths.root_mount)
         } else {
@@ -899,7 +901,13 @@ impl Vfs {
         Err(Errno(40))
     }
     pub(super) fn path_visible(&self, path: &ResolvedPath) -> Result<Vec<u8>> {
-        let root = self.root_location()?;
+        self.render_path::<false>(path, &self.root_location()?)
+    }
+    pub(super) fn render_path<const GETCWD: bool>(
+        &self,
+        path: &ResolvedPath,
+        root: &ResolvedPath,
+    ) -> Result<Vec<u8>> {
         let mut at = path.clone();
         let mut suffix = Vec::new();
         for _ in self.mount_walk() {
@@ -907,16 +915,17 @@ impl Vfs {
             // Both namespace roots can still name the same filesystem root;
             // finish that original ancestry rather than exposing its backing
             // bind source (e.g. /system/apex instead of /apex) on proc FD links.
-            let same_root = at
-                .mount
-                .as_ref()
-                .zip(root.mount.as_ref())
-                .is_some_and(|(a, b)| {
-                    a.parent.borrow().is_none()
-                        && b.parent.borrow().is_none()
-                        && a.fs.same_data(&b.fs)
-                        && Arc::ptr_eq(&a.root, &b.root)
-                });
+            let same_root = !GETCWD
+                && at
+                    .mount
+                    .as_ref()
+                    .zip(root.mount.as_ref())
+                    .is_some_and(|(a, b)| {
+                        a.parent.borrow().is_none()
+                            && b.parent.borrow().is_none()
+                            && a.fs.same_data(&b.fs)
+                            && Arc::ptr_eq(&a.root, &b.root)
+                    });
             if (at.mount.as_ref().map(|m| m.id) == root.mount.as_ref().map(|m| m.id) || same_root)
                 && below(&at.key, &root.key)
             {
@@ -940,7 +949,19 @@ impl Vfs {
             let mut tail = at.key[cut..].to_vec();
             tail.extend(suffix);
             suffix = tail;
-            let a = m.parent.borrow().clone().ok_or(Errno(2))?;
+            let Some(a) = m.parent.borrow().clone() else {
+                if GETCWD {
+                    // Linux getcwd labels a still-linked cwd outside fs.root.
+                    let mut out = b"(unreachable)".to_vec();
+                    if suffix.is_empty() {
+                        out.push(b'/');
+                    } else {
+                        out.extend(suffix);
+                    }
+                    return Ok(out);
+                }
+                return Err(Errno(2));
+            };
             at = ResolvedPath {
                 proc_binding: None,
                 key: a.key(),
@@ -2193,6 +2214,27 @@ mod tests {
         v.import_file(b"/src/file", b"shared".to_vec()).unwrap();
         v
     }
+    #[test]
+    fn getcwd_renders_an_outside_bind_directory_until_its_name_is_removed() {
+        let mut v = setup();
+        v.mkdir_at(AT_FDCWD, b"/src/sub", 0o755).unwrap();
+        v.mount(Some(b"/src"), b"/dst", None, 4096, None).unwrap();
+        v.chdir(b"/dst/sub").unwrap();
+        let mut peer = v.clone();
+        v.chroot(b"/new").unwrap();
+        assert_eq!(
+            v.cwd_name::<true>(&v.context.paths.borrow()).unwrap(),
+            b"(unreachable)/dst/sub"
+        );
+        assert_eq!(v.cwd(), Err(Errno(2)));
+        assert_eq!(
+            peer.cwd_name::<true>(&peer.context.paths.borrow()).unwrap(),
+            b"/dst/sub"
+        );
+        peer.unlink_at(AT_FDCWD, b"/src/sub", true).unwrap();
+        assert_eq!(v.cwd_name::<true>(&v.context.paths.borrow()), Err(Errno(2)));
+    }
+
     #[test]
     fn proc_lookup_follows_the_mount_across_bind_and_overmount() {
         let mut v = setup();

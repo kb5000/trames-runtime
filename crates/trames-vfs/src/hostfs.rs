@@ -279,6 +279,9 @@ pub(super) struct HostFile {
     length_generation: AtomicU64,
 }
 impl HostFile {
+    pub(super) fn matches_stat(&self, stat: &[u8; 128]) -> bool {
+        stat[..8] == self.identity.0.to_le_bytes() && stat[8..16] == self.identity.1.to_le_bytes()
+    }
     pub fn chmod(&self, _node: &NodeRef, mode: u32) -> Result<()> {
         self.root.writable()?;
         let file = self.any_file()?;
@@ -1075,6 +1078,26 @@ mod tests {
     }
     fn size(stat: [u8; 128]) -> u64 {
         u64::from_le_bytes(stat[48..56].try_into().unwrap())
+    }
+    #[test]
+    fn statx_follows_host_bind_mount_identity_after_detach() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.0.join("a"), b"data").unwrap();
+        std::fs::hard_link(fixture.0.join("a"), fixture.0.join("alias")).unwrap();
+        let mut v = fixture.vfs(false);
+        v.import_file(b"/mounted", vec![]).unwrap();
+        v.mount(Some(b"/host/a"), b"/mounted", None, 4096, None)
+            .unwrap();
+        assert!(v.statx_at(AT_FDCWD, b"/host", false).unwrap().1.is_root);
+        for p in [b"/host/a".as_slice(), b"/host/alias"] {
+            assert!(!v.statx_at(AT_FDCWD, p, false).unwrap().1.is_root);
+        }
+        let mount = v.statx_at(AT_FDCWD, b"/mounted", false).unwrap().1;
+        assert!(mount.is_root);
+        let fd = v.open_at(AT_FDCWD, b"/mounted", O_PATH, 0).unwrap();
+        v.umount(b"/mounted", 2).unwrap();
+        assert_eq!(v.statx_fd(fd).unwrap().1, mount);
+        assert!(!v.statx_at(AT_FDCWD, b"/mounted", false).unwrap().1.is_root);
     }
     #[test]
     fn bidirectional_bytes_live_size_and_retained_replacement() {

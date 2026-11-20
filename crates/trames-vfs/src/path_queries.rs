@@ -361,16 +361,26 @@ impl PathQueries {
         path: &[u8],
         flags: u32,
     ) -> Option<Result<([u8; 128], u64)>> {
+        self.uring_statx(file, dirfd, path, flags)
+            .map(|result| result.map(|(stat, mount)| (stat, mount.id)))
+    }
+    pub fn uring_statx(
+        &self,
+        file: Option<&UringFile>,
+        dirfd: i32,
+        path: &[u8],
+        flags: u32,
+    ) -> Option<Result<([u8; 128], StatMount)>> {
         let operation = |v: &mut Vfs| {
             let operation = |v: &mut Vfs, dirfd: i32| {
                 if path.is_empty() && flags & 0x1000 != 0 {
                     if dirfd == AT_FDCWD {
-                        v.stat_at_with_mount(AT_FDCWD, b".", false)
+                        v.statx_at(AT_FDCWD, b".", false)
                     } else {
-                        v.stat_fd_with_mount(dirfd as u32)
+                        v.statx_fd(dirfd as u32)
                     }
                 } else {
-                    v.stat_at_with_mount(dirfd, path, flags & 0x100 != 0)
+                    v.statx_at(dirfd, path, flags & 0x100 != 0)
                 }
             };
             if let Some(file) = file {
@@ -572,7 +582,7 @@ impl PathQueries {
             view.open_at_resolve_published::<false>(dirfd, path, flags, mode, policy, Some(files));
         (!deferred.swap(false, Ordering::Relaxed)).then_some(result)
     }
-    fn query<T>(&self, operation: impl FnOnce(&Vfs) -> Result<T>) -> Option<Result<T>> {
+    pub(super) fn query<T>(&self, operation: impl FnOnce(&Vfs) -> Result<T>) -> Option<Result<T>> {
         let view = self.view.borrow();
         let deferred = &view.query.as_ref().unwrap().deferred;
         deferred.store(false, Ordering::Relaxed);
@@ -585,9 +595,22 @@ impl PathQueries {
         path: &[u8],
         nofollow: bool,
     ) -> Option<Result<([u8; 128], u64)>> {
-        self.query(|v| v.stat_at_with_mount(dirfd, path, nofollow))
+        self.statx_at(dirfd, path, nofollow)
+            .map(|result| result.map(|(stat, mount)| (stat, mount.id)))
+    }
+    pub fn statx_at(
+        &self,
+        dirfd: i32,
+        path: &[u8],
+        nofollow: bool,
+    ) -> Option<Result<([u8; 128], StatMount)>> {
+        self.query(|v| v.statx_at(dirfd, path, nofollow))
     }
     pub fn stat_fd_with_mount(&self, fd: u32) -> Option<Result<([u8; 128], u64)>> {
+        self.statx_fd(fd)
+            .map(|result| result.map(|(stat, mount)| (stat, mount.id)))
+    }
+    pub fn statx_fd(&self, fd: u32) -> Option<Result<([u8; 128], StatMount)>> {
         let view = self.view.borrow();
         Some((|| {
             let descriptor = view
@@ -600,7 +623,7 @@ impl PathQueries {
             view.stat_open(&open).map(|stat| {
                 (
                     view.credentials.user_namespace.stat(stat),
-                    Vfs::open_mount_id(&open),
+                    StatMount::for_open(&open),
                 )
             })
         })())
@@ -620,7 +643,7 @@ impl PathQueries {
         view.cache_file_type(&open, reading)
     }
     pub fn stat_fd(&self, fd: u32) -> Option<Result<[u8; 128]>> {
-        self.stat_fd_with_mount(fd).map(|r| r.map(|(stat, _)| stat))
+        self.statx_fd(fd).map(|r| r.map(|(stat, _)| stat))
     }
     pub fn mount_id_at(&self, dirfd: i32, path: &[u8], nofollow: bool) -> Option<Result<u64>> {
         self.query(|v| v.mount_id_at(dirfd, path, nofollow))

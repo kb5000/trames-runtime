@@ -130,10 +130,10 @@ pub(super) fn call(
             let empty = path.is_empty() && flags & 0x1000 != 0;
             let fd = a[0] as i32;
             let metadata = if empty && fd != AT_FDCWD {
-                q.stat_fd_with_mount(a[0] as u32)?
+                q.statx_fd(a[0] as u32)?
             } else {
                 let path = if empty { b".".as_slice() } else { &path };
-                q.stat_at_with_mount(fd, path, flags & 0x100 != 0)?
+                q.statx_at(fd, path, flags & 0x100 != 0)?
             };
             Some(metadata.and_then(|(stat, mount)| Linux::finish_statx(a, memory, stat, mount)))
         }

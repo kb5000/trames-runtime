@@ -337,11 +337,7 @@ impl NamespaceCall {
             Self::Chdir(path) => v.chdir(path)?,
             Self::Fchdir(fd) => v.chdir_fd(*fd)?,
             Self::Chroot(path) => v.chroot(path)?,
-            Self::Cwd => {
-                let mut bytes = v.cwd()?;
-                bytes.push(0);
-                return Ok(FileValue::Bytes(bytes));
-            }
+            Self::Cwd => return v.cwd_reply(&v.context.paths.borrow()),
             Self::Statfs { fd, path } => {
                 return path
                     .as_ref()
@@ -367,6 +363,14 @@ pub enum NamespaceAttempt {
     Retained(FileWork),
 }
 impl Vfs {
+    fn cwd_reply(&self, paths: &fs_context::Paths) -> Result<FileValue> {
+        let mut name = self.cwd_name::<true>(paths)?;
+        if name.len() >= MAX_PATH {
+            return Err(Errno(36));
+        }
+        name.push(0);
+        Ok(FileValue::Bytes(name))
+    }
     pub fn namespace_host_work(&self) -> bool {
         let native = |fs: &FsHandle| {
             #[cfg(all(feature = "hostfs", unix))]
@@ -454,6 +458,31 @@ impl PathQueries {
     /// The ordinary short path borrows only this caller's existing control
     /// view. No private VFS, namespace graph or descriptor table is copied.
     pub fn namespace_attempt(&self, call: NamespaceCall) -> NamespaceAttempt {
+        if matches!(call, NamespaceCall::Cwd) {
+            let reply = self.query(|view| {
+                // Both names in the private volume come from its in-memory
+                // directory index, even when the guest volume is persistent.
+                // Capture the pair once, including for concurrent CLONE_FS peers.
+                let paths = view.context.paths.borrow();
+                if paths
+                    .cwd_mount
+                    .as_ref()
+                    .zip(paths.root_mount.as_ref())
+                    .is_some_and(|(cwd, root)| {
+                        cwd.kind == mounts::Kind::Root
+                            && Arc::ptr_eq(&cwd.shared, &root.shared)
+                            && cwd.parent.borrow().is_none()
+                    })
+                {
+                    view.cwd_reply(&paths)
+                } else {
+                    view.query.as_ref().unwrap().defer()
+                }
+            });
+            if let Some(reply) = reply {
+                return NamespaceAttempt::Complete(reply);
+            }
+        }
         struct Restore<'a> {
             view: &'a mut Vfs,
             accepted: Option<BTreeMap<u32, Option<Result<SharedFd>>>>,

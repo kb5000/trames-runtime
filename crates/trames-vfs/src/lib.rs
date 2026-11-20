@@ -644,6 +644,24 @@ struct MetadataTarget {
     node: NodeRef,
     _magic: Option<ResolvedInode>,
 }
+/// Mount information belonging to the same resolved path or open description as stat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StatMount {
+    pub id: u64,
+    pub is_root: bool,
+}
+impl StatMount {
+    fn for_open(open: &OpenDescription) -> Self {
+        Self {
+            id: Vfs::open_mount_id(open),
+            is_root: open.mount.as_ref().is_some_and(|m| {
+                open.node.as_ref().is_some_and(|n| Arc::ptr_eq(n, &m.root))
+                    || m.kind == mounts::Kind::Nsfs && open.namespace_resource.is_some()
+            }),
+        }
+    }
+}
+
 enum ResolvedTarget {
     Inode(ResolvedInode),
     Descriptor(OpenHandle),
@@ -1677,12 +1695,11 @@ impl Vfs {
         Self::filesystem_used_bytes(&self.fs.borrow())
     }
     pub fn cwd(&self) -> Result<Vec<u8>> {
-        {
-            let paths = self.context.paths.borrow();
-            self.path_visible(
-                &self.location(paths.cwd_node.as_ref().ok_or(Errno(2))?, &paths.cwd_mount)?,
-            )
-        }
+        self.cwd_name::<false>(&self.context.paths.borrow())
+    }
+    fn cwd_name<const GETCWD: bool>(&self, paths: &fs_context::Paths) -> Result<Vec<u8>> {
+        let location = self.location(paths.cwd_node.as_ref().ok_or(Errno(2))?, &paths.cwd_mount)?;
+        self.render_path::<GETCWD>(&location, &self.root_location_in(paths)?)
     }
     fn path_of(&self, node: &NodeRef) -> Result<Vec<u8>> {
         if let Some(path) = self.pseudo.borrow().path_of(node) {
@@ -4014,10 +4031,24 @@ impl Vfs {
         path: &[u8],
         nofollow: bool,
     ) -> Result<([u8; 128], u64)> {
+        self.statx_at(dirfd, path, nofollow)
+            .map(|(stat, mount)| (stat, mount.id))
+    }
+    pub fn statx_at(
+        &self,
+        dirfd: i32,
+        path: &[u8],
+        nofollow: bool,
+    ) -> Result<([u8; 128], StatMount)> {
         self.stat_at_raw(dirfd, path, nofollow)
             .map(|(stat, mount)| (self.credentials.user_namespace.stat(stat), mount))
     }
-    fn stat_at_raw(&self, dirfd: i32, path: &[u8], nofollow: bool) -> Result<([u8; 128], u64)> {
+    fn stat_at_raw(
+        &self,
+        dirfd: i32,
+        path: &[u8],
+        nofollow: bool,
+    ) -> Result<([u8; 128], StatMount)> {
         let (p, magic) =
             self.resolve_entry_policy(dirfd, path, !nofollow, !nofollow, 0, !nofollow)?;
         match magic {
@@ -4025,40 +4056,59 @@ impl Vfs {
                 let open = open.borrow();
                 return self
                     .stat_open(&open)
-                    .map(|stat| (stat, Self::open_mount_id(&open)));
+                    .map(|stat| (stat, StatMount::for_open(&open)));
             }
             Some(ResolvedTarget::Inode(file)) => {
-                let id = file.mount.as_ref().map_or(1, |m| m.id);
+                let mount = StatMount {
+                    id: file.mount.as_ref().map_or(1, |m| m.id),
+                    is_root: file
+                        .mount
+                        .as_ref()
+                        .is_some_and(|m| Arc::ptr_eq(&file.node, &m.root)),
+                };
                 return self
                     .stat_inode(
                         &file.node,
                         file.mount.clone().map(OpenMount::Owner).as_ref(),
                     )
-                    .map(|stat| (stat, id));
+                    .map(|stat| (stat, mount));
             }
             None => {}
         }
         let id = p.mount.as_ref().map_or(1, |m| m.id);
         #[cfg(all(feature = "hostfs", unix))]
         if let Some(host) = &p.filesystem(self).host {
-            return host.stat_at(&p.key).map(|stat| (stat, id));
+            let stat = host.stat_at(&p.key)?;
+            let is_root = p
+                .mount
+                .as_ref()
+                .and_then(|m| m.root.host.get())
+                .is_some_and(|root| root.matches_stat(&stat));
+            return Ok((stat, StatMount { id, is_root }));
         }
         let n = self.node(&p)?;
+        let is_root = p
+            .mount
+            .as_ref()
+            .map_or_else(|| p.key == b"/", |m| Arc::ptr_eq(&n, &m.root));
         let mount = p.mount.map(OpenMount::Owner);
         let out = self.stat_inode(&n, mount.as_ref());
-        out.map(|stat| (stat, id))
+        out.map(|stat| (stat, StatMount { id, is_root }))
     }
     pub fn stat_fd(&self, fd: u32) -> Result<[u8; 128]> {
         self.stat_fd_with_mount(fd).map(|(stat, _)| stat)
     }
     /// One membership lookup accepts the original OFD for the entire query.
     pub fn stat_fd_with_mount(&self, fd: u32) -> Result<([u8; 128], u64)> {
+        self.statx_fd(fd).map(|(stat, mount)| (stat, mount.id))
+    }
+    pub fn statx_fd(&self, fd: u32) -> Result<([u8; 128], StatMount)> {
         let descriptor = self.descriptor(fd)?;
         let open = descriptor.open.borrow();
         self.stat_open(&open).map(|stat| {
             (
                 self.credentials.user_namespace.stat(stat),
-                Self::open_mount_id(&open),
+                StatMount::for_open(&open),
             )
         })
     }
