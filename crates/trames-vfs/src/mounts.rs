@@ -485,6 +485,10 @@ impl MountData {
 pub(super) struct Table {
     pub(super) user_namespace: UserNamespace,
     pub id: u64,
+    // The guest volume (/dev/vda1 at boot) is mounted at this namespace's
+    // root slot. Its bootstrap parent has an ID but no guest-visible pathname.
+    // Pivot replaces the volume in the slot and preserves the parent identity.
+    root_parent_id: u64,
     pub root: Arc<Mount>,
     pub mounts: Vec<Arc<Mount>>,
     pub events: Arc<watch::MountEvents>,
@@ -494,16 +498,17 @@ pub(super) struct Table {
     original: Option<std::sync::Weak<SharedCell<Table>>>,
 }
 impl Table {
-    fn new(id: u64, root: Arc<Mount>, mounts: Vec<Arc<Mount>>) -> Self {
-        Self {
+    fn new(root: Arc<Mount>, mounts: Vec<Arc<Mount>>) -> Result<Self> {
+        Ok(Self {
+            root_parent_id: new_mount_id()?,
             user_namespace: UserNamespace::default(),
-            id,
+            id: NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed),
             root,
             mounts,
             events: Arc::default(),
             admin: Arc::default(),
             original: None,
-        }
+        })
     }
     pub(super) fn project(source: &Arc<SharedCell<Self>>) -> Self {
         let table = source.borrow();
@@ -513,6 +518,7 @@ impl Table {
         Self {
             user_namespace: table.user_namespace.clone(),
             id: table.id,
+            root_parent_id: table.root_parent_id,
             root: project(&table.root),
             mounts: table.mounts.iter().map(&mut project).collect(),
             events: table.events.clone(),
@@ -721,17 +727,14 @@ impl Vfs {
             })),
         })));
         self.pseudo.borrow_mut().enabled = enabled;
+        let table = Table::new(root.clone(), mounts)?;
+        self.register_mounts(&table.mounts)?;
         {
             let mut paths = self.context.paths.borrow_mut();
             paths.cwd_mount = Some(root.clone());
-            paths.root_mount = Some(root.clone());
+            paths.root_mount = Some(root);
         }
-        self.register_mounts(&mounts)?;
-        self.mounts = Some(MountNamespace::create(Table::new(
-            NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed),
-            root,
-            mounts,
-        )));
+        self.mounts = Some(MountNamespace::create(table));
         Ok(())
     }
     // Resolve owner topology only for pathname/namespace operations. Ordinary
@@ -1009,7 +1012,8 @@ impl Vfs {
         let root = copies[&old.root.id].clone();
         let mounts: Vec<_> = mounts.iter().map(|m| copies[&m.id].clone()).collect();
         drop(old);
-        self.register_mounts(&mounts)?;
+        let mut table = Table::new(root, mounts)?;
+        self.register_mounts(&table.mounts)?;
         // CLONE_NEWNS/unshare also detaches fs_struct. Keep the VFS API correct
         // when called directly with a shared context, not only through Kernel.
         if self.context.paths.has_observers() {
@@ -1020,7 +1024,6 @@ impl Vfs {
             remap(&mut paths.cwd_mount);
             remap(&mut paths.root_mount);
         }
-        let mut table = Table::new(NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed), root, mounts);
         table.user_namespace = self.credentials.user_namespace.clone();
         if let Some(admin) = shared_admin {
             table.admin = admin;
@@ -1653,73 +1656,74 @@ impl Vfs {
         self.pivot_root_locked(new_root, put_old)
     }
     pub(super) fn pivot_root_locked(&mut self, new_root: &[u8], put_old: &[u8]) -> Result<()> {
-        if !self.credentials.has_ns_cap(
-            &self
-                .mounts
-                .as_ref()
-                .map_or_else(UserNamespace::default, |n| {
-                    n.0.borrow().user_namespace.clone()
-                }),
-            capabilities::SYS_ADMIN,
-        ) {
+        let ns = self.mounts.as_ref().ok_or(Errno(22))?;
+        if !self
+            .credentials
+            .has_ns_cap(&ns.0.borrow().user_namespace, capabilities::SYS_ADMIN)
+        {
             return Err(Errno(1));
         }
         let new = self.resolve(AT_FDCWD, new_root)?;
-        let old = self.resolve(AT_FDCWD, put_old)?;
-        let new_mount = new.mount.as_ref().ok_or(Errno(22))?.clone();
-        let old_mount = old.mount.as_ref().ok_or(Errno(22))?.clone();
-        let old_node = self.node(&old)?;
-        if !matches!(new_mount.root.borrow().content, Content::Directory)
-            || !matches!(old_node.borrow().content, Content::Directory)
-        {
+        if !matches!(self.node(&new)?.borrow().content, Content::Directory) {
             return Err(Errno(20));
         }
-        let ns = self.mounts.as_ref().ok_or(Errno(22))?;
-        let current_root = self.root_location()?;
-        if !self.is_mount_root(&new)
-            || !Arc::ptr_eq(&new_mount, &old_mount)
-            || !below(&old.key, &new.key)
-            || !self.is_mount_root(&current_root)
-        {
-            return Err(Errno(22));
+        let old = self.mount_location(put_old, true)?;
+        let old_node = self.node(&old)?;
+        if !matches!(old_node.borrow().content, Content::Directory) {
+            return Err(Errno(20));
         }
+        let current = self.root_location()?;
+        let previous = current.mount.as_ref().ok_or(Errno(22))?;
+        let new_mount = new.mount.as_ref().ok_or(Errno(22))?;
+        let old_mount = old.mount.as_ref().ok_or(Errno(22))?;
+        let original_link = previous.parent.borrow().clone();
+        let source_link = new_mount.parent.borrow().clone();
+        let shared_parent = |link: &Attachment| link.parent.propagation().shared.is_some();
         let mut table = ns.0.borrow_mut();
-        // A retained directory can name a detached or foreign namespace mount.
-        // It remains traversable, but cannot become this namespace's root.
-        if !table
-            .mounts
-            .iter()
-            .any(|mount| Arc::ptr_eq(mount, &new_mount))
+        if old_mount.propagation().shared.is_some()
+            || original_link.as_ref().is_some_and(shared_parent)
+            || source_link.as_ref().is_some_and(shared_parent)
+            || new_mount.inherited.load(Ordering::Relaxed) & LOCK_ATTACHMENT != 0
+            || [previous, new_mount, old_mount]
+                .iter()
+                .any(|m| !table.mounts.iter().any(|entry| Arc::ptr_eq(entry, m)))
         {
             return Err(Errno(22));
         }
-        if Arc::ptr_eq(&new_mount, &table.root)
-            || current_root
-                .mount
-                .as_ref()
-                .is_none_or(|m| !Arc::ptr_eq(m, &table.root))
-        {
+        if Arc::ptr_eq(previous, new_mount) || Arc::ptr_eq(previous, old_mount) {
             return Err(Errno(16));
         }
-        let previous = table.root.clone();
-        if previous.propagation() != propagation::State::default()
-            || new_mount.propagation() != propagation::State::default()
-            || new_mount
-                .parent
-                .borrow()
-                .as_ref()
-                .is_some_and(|a| a.parent.propagation() != propagation::State::default())
+        if source_link.is_none()
+            || !self.is_mount_root(&current)
+            || !self.is_mount_root(&new)
+            || mount_absolute(new_mount, &new.key, previous, table.mounts.len()).is_none()
+            || mount_absolute(old_mount, &old.key, new_mount, table.mounts.len()).is_none()
         {
             return Err(Errno(22));
         }
 
-        *new_mount.parent.borrow_mut() = None;
+        // Replace the caller's root at its original attachment. Other roots
+        // in this namespace keep their own mount and see the exchanged subtree.
+        // Check both ancestry chains before moving either edge.
+        *new_mount.parent.borrow_mut() = original_link;
         *previous.parent.borrow_mut() = Some(Attachment {
-            parent: new_mount.clone(),
+            parent: old_mount.clone(),
             node: old_node,
             fallback: old.key,
         });
-        table.root = new_mount.clone();
+        if previous
+            .inherited
+            .fetch_and(!LOCK_ATTACHMENT, Ordering::Relaxed)
+            & LOCK_ATTACHMENT
+            != 0
+        {
+            new_mount
+                .inherited
+                .fetch_or(LOCK_ATTACHMENT, Ordering::Relaxed);
+        }
+        if Arc::ptr_eq(&table.root, previous) {
+            table.root = new_mount.clone();
+        }
         let events = table.events.clone();
         drop(table);
         events.changed();
@@ -2068,7 +2072,11 @@ pub(super) fn table_text(snapshot: &NamespaceSnapshot, info: bool) -> Vec<u8> {
             };
             let root = if root.is_empty() { b"/".to_vec() } else { root };
             let dev = m.device();
-            let parent = m.parent.borrow().as_ref().map_or(m.id, |a| a.parent.id);
+            let parent = m
+                .parent
+                .borrow()
+                .as_ref()
+                .map_or(table.root_parent_id, |a| a.parent.id);
             text.push_str(&format!(
                 "{} {} {}:{} {} {} {}{} - {} {} {}{}\n",
                 m.id,
@@ -2380,6 +2388,32 @@ mod tests {
             original.upgrade().is_none(),
             "no mount namespace reference cycle"
         );
+    }
+    #[test]
+    fn pivot_preserves_the_root_slot_and_unrelated_fs_roots() {
+        let mut parent = setup();
+        let slot = parent.mounts.as_ref().unwrap().0.borrow().root_parent_id;
+        let original = parent.root_location().unwrap().mount.unwrap().id;
+        assert_ne!(slot, original);
+        parent
+            .mount(None, b"/new", Some(b"tmpfs"), 0, None)
+            .unwrap();
+        parent.mkdir_at(AT_FDCWD, b"/new/next", 0o755).unwrap();
+        parent
+            .mount(None, b"/new/next", Some(b"tmpfs"), 0, None)
+            .unwrap();
+        parent.mkdir_at(AT_FDCWD, b"/new/next/old", 0o755).unwrap();
+        let next = parent.mount_id_at(AT_FDCWD, b"/new/next", false).unwrap();
+        let mut child = parent.clone();
+        child.chroot(b"/new").unwrap();
+        child.pivot_root(b"/next", b"/next/old").unwrap();
+        assert_eq!(parent.root_location().unwrap().mount.unwrap().id, original);
+        assert_eq!(child.root_location().unwrap().mount.unwrap().id, next);
+        assert_eq!(parent.mount_id_at(AT_FDCWD, b"/new", false).unwrap(), next);
+        parent.pivot_root(b"/new", b"/new/old").unwrap();
+        let table = parent.mounts.as_ref().unwrap().0.borrow();
+        assert_eq!(table.root.id, next);
+        assert_eq!(table.root_parent_id, slot);
     }
     #[test]
     fn recursive_bind_preserves_nested_tmpfs_and_pivot_root() {

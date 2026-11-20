@@ -558,8 +558,18 @@ mod tests {
             format!("{}\n", capacity.budget_bytes / 512).as_bytes()
         );
         assert_eq!(read(&mut v, b"/sys/class/block/vda1/partition"), b"1\n");
-        assert!(read(&mut v, b"/proc/self/mountinfo")
-            .starts_with(b"1 1 253:1 / / rw,relatime - rootfs /dev/vda1 rw\n"));
+        let mounts = String::from_utf8(read(&mut v, b"/proc/self/mountinfo")).unwrap();
+        let mut fields = mounts.lines().next().unwrap().splitn(3, ' ');
+        assert_eq!(fields.next(), Some("1"));
+        let parent = fields.next().unwrap().parse::<u64>().unwrap();
+        assert!(parent > 1);
+        assert!(!mounts
+            .lines()
+            .any(|line| line.starts_with(&format!("{parent} "))));
+        assert_eq!(
+            fields.next(),
+            Some("253:1 / / rw,relatime - rootfs /dev/vda1 rw")
+        );
         let fd = v.open_at(AT_FDCWD, b"/dev/vda1", 2, 0).unwrap();
         assert_eq!(v.read(fd, 512), Err(Errno(95)));
         assert_eq!(v.write(fd, &[0; 512]), Err(Errno(95)));
