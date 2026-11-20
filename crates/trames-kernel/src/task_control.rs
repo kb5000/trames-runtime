@@ -15,6 +15,7 @@ use std::{
 
 #[derive(Default)]
 pub struct Group {
+    pub(crate) posix_timers: std::sync::OnceLock<Arc<crate::timers::CpuSchedule>>,
     pub(crate) cpu_intervals: crate::timers::CpuIntervals,
     job_ids: AtomicU64,
     wait_children: std::sync::OnceLock<Weak<crate::children::Children>>,

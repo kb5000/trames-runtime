@@ -191,6 +191,7 @@ pub struct IoContext {
     pub alt_stack: AltStack,
 }
 pub struct IoTask {
+    pub(crate) posix_timers: std::sync::OnceLock<Arc<crate::timers::CpuSchedule>>,
     pub proc_view: trames_vfs::ProcessView,
     proc_pid: RwLock<Option<Arc<proc_views::ProcPid>>>,
     proc_limits: std::sync::OnceLock<Arc<crate::limits::Limits>>,
@@ -219,6 +220,7 @@ pub struct IoTask {
 impl Default for IoTask {
     fn default() -> Self {
         Self {
+            posix_timers: Default::default(),
             proc_view: Default::default(),
             proc_pid: Default::default(),
             proc_limits: Default::default(),

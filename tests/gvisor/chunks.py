@@ -11,7 +11,7 @@ import subprocess
 import time
 import xml.etree.ElementTree as ET
 
-from run import TRACEE_WAIT, classify, execute, guest_terminal, guest_test_work, save, suite_flags, tracee_fixture_error
+from run import TRACEE_WAIT, classify, execute, guest_terminal, guest_test_work, save, suite_flags, child_check_failure
 
 
 class Progress:
@@ -56,9 +56,9 @@ def xml_rows(xml, code, expected, stderr=None):
         status='failed' if failed else 'skipped' if skipped is not None else 'passed'
         messages=[c.get('message','') for c in failed] if failed else [skipped.get('message','')] if skipped is not None else []
         rows.append(dict(case=name,status=status,messages=messages,seconds=float(case.get('time','0'))))
-    if len(rows) == 1 and rows[0]['status'] == 'passed':
-        if error := tracee_fixture_error(rows[0]['case'], stderr):
-            rows[0].update(status='fixture_failed', messages=[error])
+    for row in rows:
+        if row['status'] == 'passed' and (failure := child_check_failure(row['case'], stderr)):
+            row['status'], row['messages'] = failure
     return rows
 
 

@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Shared POSIX/interval timers. Existing executors drive the original deadline
 //! index; no timer thread, guest pointer retention or syscall RPC is required.
+mod cpu;
 use crate::signal::{Info, IoDirectory, IoTask, TimerTarget};
+use cpu::CpuClock;
+pub(crate) use cpu::CpuSchedule;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
@@ -21,7 +24,8 @@ pub trait TimerWake: Send + Sync {
 }
 struct Timer {
     tgid: u32,
-    clock: u64,
+    clock: u32,
+    cpu: Option<CpuClock>,
     signal: u32,
     value: u64,
     target: Option<TimerTarget>,
@@ -31,9 +35,46 @@ struct Timer {
 struct State {
     deleted: bool,
     deadline: Option<Instant>,
+    cpu_deadline: Option<Duration>,
     interval: Duration,
     overrun: i32,
 }
+fn period_remaining(elapsed: Duration, interval: Duration) -> Option<Duration> {
+    let period = interval.as_nanos();
+    if period == 0 {
+        return None;
+    }
+    let ns = period - elapsed.as_nanos() % period;
+    Some(Duration::new(
+        (ns / 1_000_000_000) as u64,
+        (ns % 1_000_000_000) as u32,
+    ))
+}
+
+impl Timer {
+    fn deliver(&self, id: i32, state: &mut State, elapsed: Duration) {
+        let extra = elapsed
+            .as_nanos()
+            .checked_div(state.interval.as_nanos())
+            .unwrap_or(0);
+        state.overrun = extra.min(i32::MAX as u128) as i32;
+        if self.signal != 0 {
+            state.overrun = self.target.as_ref().unwrap().signal(
+                self.signal,
+                Info {
+                    code: if id < 0 { 128 } else { -2 },
+                    timer: if id < 0 {
+                        None
+                    } else {
+                        Some((id, state.overrun, self.value))
+                    },
+                    ..Info::default()
+                },
+            );
+        }
+    }
+}
+
 struct Registry {
     next_id: i32,
     timers: BTreeMap<i32, Arc<Timer>>,
@@ -246,8 +287,10 @@ impl Timers {
             .cloned()
             .ok_or(Errno(22))
     }
-    fn retire(&self, id: i32, timer: &Timer) {
-        let mut state = timer.state.lock().unwrap();
+    fn retire(&self, id: i32, timer: &Timer, state: &mut State) {
+        if let Some(cpu) = &timer.cpu {
+            cpu.remove(id, state.cpu_deadline.take());
+        }
         state.deleted = true;
         let old = state.deadline.take();
         if timer.signal != 0 {
@@ -267,7 +310,7 @@ impl Timers {
                 .collect::<Vec<_>>()
         };
         for (id, timer) in removed {
-            self.retire(id, &timer);
+            self.retire(id, &timer, &mut timer.state.lock().unwrap());
         }
     }
     /// Called outside the execution-queue mutex. Timer state -> deadline index
@@ -296,37 +339,11 @@ impl Timers {
                 continue;
             }
             let now = Instant::now();
-            let elapsed = now.saturating_duration_since(deadline).as_nanos();
-            let extra = if state.interval.is_zero() {
-                0
-            } else {
-                elapsed / state.interval.as_nanos()
-            };
-            state.deadline = if state.interval.is_zero() {
-                None
-            } else {
-                let remaining = state.interval.as_nanos() - elapsed % state.interval.as_nanos();
-                now.checked_add(Duration::new(
-                    (remaining / 1_000_000_000) as u64,
-                    (remaining % 1_000_000_000) as u32,
-                ))
-            };
+            let elapsed = now.saturating_duration_since(deadline);
+            state.deadline =
+                period_remaining(elapsed, state.interval).and_then(|left| now.checked_add(left));
             self.reschedule(id, Some(deadline), state.deadline);
-            state.overrun = extra.min(i32::MAX as u128) as i32;
-            if timer.signal != 0 {
-                state.overrun = timer.target.as_ref().unwrap().signal(
-                    timer.signal,
-                    Info {
-                        code: if id < 0 { 128 } else { -2 },
-                        timer: if id < 0 {
-                            None
-                        } else {
-                            Some((id, state.overrun, timer.value))
-                        },
-                        ..Info::default()
-                    },
-                );
-            }
+            timer.deliver(id, &mut state, elapsed);
         }
     }
     #[allow(clippy::too_many_arguments)]
@@ -398,6 +415,7 @@ impl Timers {
                         Arc::new(Timer {
                             tgid,
                             clock: 1,
+                            cpu: None,
                             signal: 14,
                             value: 0,
                             target,
@@ -431,7 +449,8 @@ impl Timers {
             return Ok(0);
         }
         if number == 107 {
-            if !matches!(a[0] as u32, 0 | 1) {
+            let clock = a[0] as u32;
+            if clock > 3 {
                 return Err(Errno(22));
             }
             memory
@@ -469,6 +488,11 @@ impl Timers {
             if registry.timers.keys().filter(|id| **id > 0).count() >= 32 {
                 return Err(Errno(11));
             }
+            let cpu = if clock >= 2 {
+                Some(CpuClock::new(clock, signal != 0, caller, directory)?)
+            } else {
+                None
+            };
             let next = id.checked_add(1).ok_or(Errno(11))?;
             memory
                 .write_array(a[2], id.to_le_bytes())
@@ -478,7 +502,8 @@ impl Timers {
                 id,
                 Arc::new(Timer {
                     tgid,
-                    clock: a[0] as u32 as u64,
+                    clock,
+                    cpu,
                     signal,
                     value,
                     target,
@@ -499,11 +524,7 @@ impl Timers {
         match number {
             109 => Ok(state.overrun as u64),
             111 => {
-                state.deleted = true;
-                let old = state.deadline.take();
-                if timer.signal != 0 {
-                    self.reschedule(id, old, None);
-                }
+                self.retire(id, &timer, &mut state);
                 drop(state);
                 self.registry.write().unwrap().timers.remove(&id);
                 Ok(0)
@@ -518,6 +539,21 @@ impl Timers {
                 let new = if number == 110 {
                     let interval = duration(memory, a[2], false)?;
                     let value = duration(memory, a[2].checked_add(16).ok_or(Errno(14))?, false)?;
+                    Some((interval, value))
+                } else {
+                    None
+                };
+                if let Some(cpu) = &timer.cpu {
+                    return cpu.update(
+                        id,
+                        &timer,
+                        &mut state,
+                        new.map(|(interval, value)| (interval, value, a[1] & 1 != 0)),
+                        (number == 108 || output != 0).then_some(output),
+                        memory,
+                    );
+                }
+                let new = if let Some((interval, value)) = new {
                     let deadline = if value.is_zero() {
                         None
                     } else {
@@ -563,7 +599,7 @@ mod tests {
     use super::*;
     use crate::signal::IoTask;
     use trames_memory::{Memory, Permissions, PAGE_SIZE};
-    fn setup() -> (Timers, Arc<IoDirectory>, Arc<IoTask>, Memory) {
+    pub(super) fn setup() -> (Timers, Arc<IoDirectory>, Arc<IoTask>, Memory) {
         let directory = Arc::new(IoDirectory::default());
         let task = Arc::new(IoTask::default());
         directory.publish(&task, 42, 42, 42, 0, 0);
@@ -571,7 +607,7 @@ mod tests {
         m.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         (Timers::default(), directory, task, m)
     }
-    fn call(
+    pub(super) fn call(
         t: &Timers,
         d: &IoDirectory,
         m: &mut Memory,

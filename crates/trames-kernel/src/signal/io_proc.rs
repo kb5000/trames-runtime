@@ -82,6 +82,12 @@ impl IoTask {
         let group = self.lifecycle();
         let mut elapsed = None;
         let mut now = || *elapsed.get_or_insert_with(|| group.cpu_time());
+        if let Some(schedule) = self.posix_timers.get() {
+            schedule.charge(|| self.proc_view.elapsed());
+        }
+        if let Some(schedule) = group.posix_timers.get() {
+            schedule.charge(&mut now);
+        }
         if group.cpu_intervals.armed() {
             for (due, sig) in group.cpu_intervals.expire(now()).into_iter().zip([26, 27]) {
                 if due {

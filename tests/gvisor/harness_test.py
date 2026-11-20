@@ -55,6 +55,17 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(guest_terminal('pty', 'command'), ('--no-pty', 'command'))
         self.assertEqual(guest_terminal('host_pty', 'command')[0], '--pty')
 
+    def test_itimer_child_fairness_failure_overrides_only_its_own_xml_case(self):
+        case = 'ItimerTest.DeliversSIGALRMToMainThread'
+        body = '<testcase classname="ItimerTest" name="DeliversSIGALRMToMainThread"/>'
+        path = self.xml(body)
+        stderr = path.with_suffix('.stderr')
+        stderr.write_text('Check failed: num <= worker_threshold: worker received too many samples\n')
+        self.assertEqual(classify(path, 0, False, case)[0], 'failed')
+        path = self.xml(body + '<testcase classname="T" name="Other"/>')
+        rows = xml_rows(path, 0, [case, 'T.Other'], stderr)
+        self.assertEqual([row['status'] for row in rows], ['failed', 'passed'])
+
     def test_global_fixture_failure_never_becomes_a_passing_skip(self):
         path=self.xml('<testcase classname="T" name="A"><skipped/></testcase><testcase classname="" name=""><failure message="missing prerequisite"/></testcase>')
         rows=xml_rows(path,1,['T.A'])

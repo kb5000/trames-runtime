@@ -114,13 +114,24 @@ def list_cases(binary):
 TRACEE_WAIT = 'WaitTest.TraceeWALL'
 
 
-def tracee_fixture_error(case, stderr):
-    # The parent accepts ECHILD on native Linux, even when its child aborted.
-    if case != TRACEE_WAIT or stderr is None or not stderr.is_file():
+# Some upstream parents can accept a child terminated by a signal. Each
+# diagnostic here belongs to a specific child and test in the pinned source.
+CHILD_CHECKS = {
+    TRACEE_WAIT: ('fixture_failed', 'Check failed: ptrace(PTRACE_TRACEME, 0, nullptr, nullptr) == 0'),
+    'ItimerTest.DeliversSIGALRMToMainThread': ('failed', 'Check failed: num <= worker_threshold: worker received too many samples'),
+}
+
+
+def child_check_failure(case, stderr):
+    check = CHILD_CHECKS.get(case)
+    if check is None or stderr is None or not stderr.is_file():
         return None
-    failure = 'Check failed: ptrace(PTRACE_TRACEME, 0, nullptr, nullptr) == 0'
+    status, prefix = check
     with stderr.open(errors='replace') as stream:
-        return next((line.rstrip() for line in stream if line.startswith(failure)), None)
+        for line in stream:
+            if line.startswith(prefix):
+                return status, [line.rstrip()]
+    return None
 
 
 def classify(xml, code, timed_out, expected):
@@ -145,8 +156,8 @@ def classify(xml, code, timed_out, expected):
         return 'failed', failures
     if case.find('skipped') is not None:
         return 'skipped', [case.find('skipped').get('message', '')]
-    if code == 0 and (error := tracee_fixture_error(expected, xml.with_suffix('.stderr'))):
-        return 'fixture_failed', [error]
+    if code == 0 and (failure := child_check_failure(expected, xml.with_suffix('.stderr'))):
+        return failure
     return ('passed' if code == 0 else 'crashed'), []
 
 def reuse_rows(args, plan):
