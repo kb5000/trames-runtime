@@ -474,6 +474,7 @@ impl Socket {
             v6_only: state.v6_only,
             reuse: state.reuse,
             nodelay: state.nodelay,
+            abort_on_close: state.abort_on_close,
             keepalive: state.keepalive,
             keep_idle: state.keep_idle,
             keep_interval: state.keep_interval,
@@ -1246,7 +1247,20 @@ impl Socket {
 }
 
 impl Socket {
+    pub fn linger(&self) -> Result<[u8; 8]> {
+        Ok(crate::linger_bytes(
+            self.state.borrow().abort_on_close.then_some(Duration::ZERO),
+        ))
+    }
     pub fn set_option_bytes(&self, level: u32, name: u32, value: &[u8]) -> Result<()> {
+        if (level, name) == (1, 13) {
+            let linger = crate::parse_linger(value)?;
+            if linger.is_some_and(|d| !d.is_zero()) {
+                return Err(NetError(95));
+            }
+            self.state.borrow_mut().abort_on_close = linger.is_some();
+            return Ok(());
+        }
         if (level, name) == (58, 1) && self.family == 10 && self.kind == 4 {
             if value.len() != 32 {
                 return Err(NetError(22));

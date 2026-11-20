@@ -1117,7 +1117,21 @@ impl Socket {
             }
         })
     }
+    pub fn linger(&self) -> Result<[u8; 8]> {
+        self.native
+            .control()
+            .linger()
+            .map(crate::linger_bytes)
+            .map_err(from_io)
+    }
     pub fn set_option_bytes(&self, level: u32, name: u32, value: &[u8]) -> Result<()> {
+        if (level, name) == (1, 13) {
+            return self
+                .native
+                .control()
+                .set_linger(crate::parse_linger(value)?)
+                .map_err(from_io);
+        }
         if (level, name) == (58, 1) && self.family == 10 && self.kind == 4 {
             if value.len() != 32 {
                 return Err(NetError(22));

@@ -146,6 +146,7 @@ struct State {
     v6_only: bool,
     reuse: bool,
     nodelay: bool,
+    abort_on_close: bool,
     keepalive: bool,
     keep_idle: u32,
     keep_interval: u32,
@@ -1325,6 +1326,7 @@ impl Network {
                 v6_only: family == 10 && matches!(kind, 3 | 4),
                 reuse: false,
                 nodelay: false,
+                abort_on_close: false,
                 keepalive: false,
                 keep_idle: 7200,
                 keep_interval: 75,
@@ -1369,12 +1371,19 @@ impl Network {
 impl Drop for Socket {
     fn drop(&mut self) {
         let mut i = self.network.0.fabric.0.borrow_mut();
+        let now = i.now();
         if let Some(n) = i.nodes.get_mut(&self.network.0.key) {
             n.dirty = true;
-            for h in self.state.borrow_mut().handles.drain(..) {
+            let mut state = self.state.borrow_mut();
+            let abort = state.abort_on_close;
+            for h in state.handles.drain(..) {
                 if self.kind == 1 {
                     let s = n.sockets.get_mut::<tcp::Socket>(h);
                     if s.is_listening() || s.state() == tcp::State::Closed {
+                        n.sockets.remove(h);
+                    } else if abort {
+                        s.abort();
+                        n.iface.poll(now, &mut n.port, &mut n.sockets);
                         n.sockets.remove(h);
                     } else {
                         s.close();
@@ -1392,6 +1401,33 @@ impl Drop for Socket {
 #[cfg(test)]
 mod shared_lifetime_tests {
     use super::*;
+    #[test]
+    fn abortive_close_reaches_the_virtual_peer() {
+        let fabric = Fabric::new().unwrap();
+        let network = fabric.environment(2, NetworkMode::Full).unwrap();
+        let listener = network.socket(2, 1, 0).unwrap();
+        let address = "127.0.0.1:34031".parse().unwrap();
+        listener.bind(address).unwrap();
+        listener.listen(1).unwrap();
+        let abort = crate::linger_bytes(Some(Duration::ZERO));
+        listener.set_option_bytes(1, 13, &abort).unwrap();
+        let client = network.socket(2, 1, 0).unwrap();
+        assert_eq!(client.connect(address), Err(NetError(115)));
+        for _ in 0..100 {
+            if client.connect_complete().unwrap() {
+                break;
+            }
+        }
+        let (peer, _) = listener.accept().unwrap();
+        assert_eq!(peer.linger(), Ok(abort));
+        drop(peer);
+        for _ in 0..100 {
+            if client.poll(0x19).unwrap() & (8 | 16) != 0 {
+                break;
+            }
+        }
+        assert!(client.poll(0x19).unwrap() & (8 | 16) != 0);
+    }
     #[test]
     fn unspecified_connect_tcp_info_and_half_close_share_original_transport() {
         let fabric = Fabric::new().unwrap();

@@ -28,6 +28,19 @@ pub use native::{
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 pub use virtualnet::{Fabric, LinkStats, NetworkInfo, NetworkStats, WireWait};
 type Result<T> = std::result::Result<T, NetError>;
+fn parse_linger(value: &[u8]) -> Result<Option<Duration>> {
+    let bytes = value.get(..8).ok_or(NetError(22))?;
+    let on = i32::from_le_bytes(bytes[..4].try_into().unwrap()) != 0;
+    let seconds = u32::from_le_bytes(bytes[4..].try_into().unwrap());
+    Ok(on.then(|| Duration::from_secs(seconds.into())))
+}
+fn linger_bytes(value: Option<Duration>) -> [u8; 8] {
+    let mut out = [0; 8];
+    out[..4].copy_from_slice(&i32::from(value.is_some()).to_le_bytes());
+    out[4..].copy_from_slice(&(value.unwrap_or_default().as_secs() as u32).to_le_bytes());
+    out
+}
+
 #[derive(Clone)]
 pub struct SocketInfo {
     /// Identity of the socket's creating network namespace, retained across setns.
@@ -657,6 +670,15 @@ impl Socket {
         }?;
         info.namespace_id = self.namespace.id();
         Some(info)
+    }
+    pub fn linger(&self) -> Result<[u8; 8]> {
+        let _operation = self.operation.read_recursive();
+        match &self.backend {
+            SocketBackend::Native(s) => s.linger(),
+            SocketBackend::Hybrid(s) => s.linger(),
+            SocketBackend::Virtual(s) => s.linger(),
+            _ => Err(NetError(92)),
+        }
     }
     pub fn tcp_info(&self) -> Result<[u8; 104]> {
         let _operation = self.operation.read_recursive();

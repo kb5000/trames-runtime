@@ -505,6 +505,7 @@ impl Vfs {
             return Err(Errno(22));
         }
         let attached = |m: &Arc<Mount>| ns.0.borrow().mounts.iter().any(|old| Arc::ptr_eq(old, m));
+        let _change = self.path_change();
         if attached(moved) {
             if !attached(&parent) {
                 return Err(Errno(22));
@@ -562,7 +563,7 @@ fn topology_root(mount: &Arc<Mount>) -> Arc<Mount> {
     }
     root
 }
-pub(crate) fn check_overlay_layer(mount: &Arc<Mount>, credentials: &Credentials) -> Result<()> {
+fn check_layer_owner(mount: &Arc<Mount>, credentials: &Credentials) -> Result<()> {
     // The layer can outlive the originating FD. Keep its creator's user
     // namespace on the root even after the detached tree owner is released.
     if topology_root(mount)
@@ -571,6 +572,26 @@ pub(crate) fn check_overlay_layer(mount: &Arc<Mount>, credentials: &Credentials)
         .is_some_and(|origin| !credentials.has_ns_cap(&origin.owner, capabilities::SYS_ADMIN))
     {
         return Err(Errno(1));
+    }
+    Ok(())
+}
+pub(crate) fn check_overlay_layer(vfs: &Vfs, at: &ResolvedPath) -> Result<()> {
+    let mount = at.mount.as_ref().ok_or(Errno(22))?;
+    check_layer_owner(mount, &vfs.credentials)?;
+    let root = topology_root(mount);
+    if let Some(origin) = root.anonymous_tree.get() {
+        if let Some(tree) = origin.tree.upgrade() {
+            if hides_locked_child(&tree.members.borrow(), mount, &at.key) {
+                return Err(Errno(22));
+            }
+        }
+    } else {
+        let table = vfs.mounts.as_ref().ok_or(Errno(22))?.0.borrow();
+        if !table.mounts.iter().any(|m| Arc::ptr_eq(m, mount))
+            || hides_locked_child(&table.mounts, mount, &at.key)
+        {
+            return Err(Errno(22));
+        }
     }
     Ok(())
 }
@@ -593,11 +614,11 @@ mod tests {
         let fd = v.open_tree(AT_FDCWD, b"/", 1).unwrap();
         let desc = v.descriptor(fd).unwrap();
         let mount = v.mount_for_path(desc.open.borrow().mount.as_ref()).unwrap();
-        assert_eq!(check_overlay_layer(&mount, &v.credentials), Ok(()));
+        assert_eq!(check_layer_owner(&mount, &v.credentials), Ok(()));
         drop(desc);
         v.close(fd).unwrap();
         v.unshare_user().unwrap();
-        assert_eq!(check_overlay_layer(&mount, &v.credentials), Err(Errno(1)));
+        assert_eq!(check_layer_owner(&mount, &v.credentials), Err(Errno(1)));
     }
     #[test]
     fn descriptor_exhaustion_preserves_context_and_reconfiguration_reaches_bind_aliases() {

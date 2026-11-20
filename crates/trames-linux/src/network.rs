@@ -123,6 +123,9 @@ pub(super) fn control(
             })
         }
         209 => {
+            if (a[1], a[2]) == (1, 13) {
+                return read_option(memory, a, || socket.linger().map_err(net));
+            }
             if (a[1], a[2]) == (6, 11) {
                 return read_option(memory, a, || socket.tcp_info().map_err(net));
             }
@@ -379,6 +382,7 @@ pub(crate) fn direct_control(
                 .set_option_bytes(a[1] as u32, a[2] as u32, value)
                 .map_err(net)
         }),
+        209 if (a[1], a[2]) == (1, 13) => read_option(memory, a, || control.linger().map_err(net)),
         209 if (a[1], a[2]) == (6, 11) => {
             read_option(memory, a, || control.tcp_info().map_err(net))
         }

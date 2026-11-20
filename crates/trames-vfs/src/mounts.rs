@@ -38,13 +38,39 @@ fn hides_locked_child(mounts: &[Arc<Mount>], parent: &Arc<Mount>, key: &[u8]) ->
 pub(super) struct MountPolicy {
     limit: std::sync::atomic::AtomicU32,
     groups: propagation::Groups,
+    path_changes: AtomicU64,
 }
 impl Default for MountPolicy {
     fn default() -> Self {
         Self {
             limit: std::sync::atomic::AtomicU32::new(128),
             groups: Default::default(),
+            path_changes: AtomicU64::new(0),
         }
+    }
+}
+// The low word counts active writers, including overlapping renames on different
+// filesystems. The high word distinguishes completed changes during a scoped walk.
+pub(super) struct PathChange(Arc<MountPolicy>);
+impl Drop for PathChange {
+    fn drop(&mut self) {
+        self.0
+            .path_changes
+            .fetch_add((1u64 << 32) - 1, Ordering::Release);
+    }
+}
+impl Vfs {
+    pub(super) fn path_change(&self) -> PathChange {
+        let policy = self.pseudo.borrow().mount_policy.clone();
+        policy.path_changes.fetch_add(1, Ordering::AcqRel);
+        PathChange(policy)
+    }
+    pub(super) fn path_sequence(&self) -> u64 {
+        self.pseudo
+            .borrow()
+            .mount_policy
+            .path_changes
+            .load(Ordering::Acquire)
     }
 }
 impl MountPolicy {
@@ -1209,6 +1235,7 @@ impl Vfs {
         {
             return Err(Errno(22));
         }
+        let _change = self.path_change();
         if flags & (PRIVATE | SLAVE | SHARED) != 0 {
             return self.change_propagation(&target, flags);
         }
@@ -1666,6 +1693,7 @@ impl Vfs {
         if !self.is_mount_root(&target) {
             return Err(Errno(22));
         }
+        let _change = self.path_change();
         let result = self.unmount_propagated(mount, flags);
         drop(target);
         self.reap_detached_mounts();
@@ -1684,6 +1712,7 @@ impl Vfs {
         {
             return Err(Errno(1));
         }
+        let _change = self.path_change();
         let new = self.resolve(AT_FDCWD, new_root)?;
         if !matches!(self.node(&new)?.borrow().content, Content::Directory) {
             return Err(Errno(20));

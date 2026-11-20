@@ -1874,6 +1874,8 @@ impl Vfs {
             return Err(Errno(36));
         }
         let scoped = policy & (8 | 16) != 0;
+        let sequence = scoped.then(|| self.path_sequence());
+        let mut climbed = false;
         let boundary = if scoped {
             Some(self.base(dirfd)?)
         } else {
@@ -1918,6 +1920,12 @@ impl Vfs {
                 continue;
             }
             if part == b".." {
+                if let Some(seq) = sequence {
+                    climbed = true;
+                    if seq as u32 != 0 || self.path_sequence() != seq {
+                        return Err(Errno(11));
+                    }
+                }
                 if boundary.as_ref() == Some(&current) {
                     if policy & 8 != 0 {
                         return Err(Errno(18));
@@ -2092,6 +2100,9 @@ impl Vfs {
             if !matches!(node.borrow().content, Content::Directory) {
                 return Err(Errno(20));
             }
+        }
+        if climbed && sequence != Some(self.path_sequence()) {
+            return Err(Errno(11));
         }
         Ok((current, None))
     }

@@ -166,6 +166,7 @@ impl Vfs {
                 }
             }
         }
+        let _change = self.path_change();
         let parent_times = directory::EntryTimes::lock(Some(&old_parent), Some(&new_parent));
         let mut fs = filesystem.borrow_mut();
         let mut moves = Vec::new();
@@ -512,6 +513,31 @@ impl Vfs {
 mod namei_tests {
     use super::*;
 
+    #[test]
+    fn scoped_parent_walk_retries_until_all_path_changes_finish() {
+        let mut v = Vfs::default();
+        v.mkdir_at(AT_FDCWD, b"/a", 0o755).unwrap();
+        let first = v.path_change();
+        let second = v.path_change();
+        drop(first);
+        for policy in [8, 16] {
+            assert_eq!(
+                v.open_at_resolve(AT_FDCWD, b"a/..", O_DIRECTORY, 0, policy),
+                Err(Errno(11))
+            );
+            let fd = v
+                .open_at_resolve(AT_FDCWD, b"a", O_DIRECTORY, 0, policy)
+                .unwrap();
+            v.close(fd).unwrap();
+        }
+        let fd = v.open_at(AT_FDCWD, b"a/..", O_DIRECTORY, 0).unwrap();
+        v.close(fd).unwrap();
+        drop(second);
+        let fd = v
+            .open_at_resolve(AT_FDCWD, b"a/..", O_DIRECTORY, 0, 8)
+            .unwrap();
+        v.close(fd).unwrap();
+    }
     fn setting(v: &mut Vfs, name: &str, value: &[u8]) -> Result<usize> {
         let path = format!("/proc/sys/fs/protected_{name}");
         let fd = v.open_at(AT_FDCWD, path.as_bytes(), 1, 0)?;

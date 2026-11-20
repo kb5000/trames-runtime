@@ -599,7 +599,7 @@ impl Vfs {
         let layer = |path: &[u8], lower_layer: bool| -> Result<Layer> {
             let at = self.mount_location(path, true)?;
             let mount = at.mount.as_ref().ok_or(Errno(22))?;
-            mounts::fd::check_overlay_layer(mount, &self.credentials)?;
+            mounts::fd::check_overlay_layer(self, &at)?;
             let fs = at.filesystem(self);
             match at.mount.as_ref().map(|m| m.kind) {
                 Some(mounts::Kind::Root | mounts::Kind::Tmpfs) => {}

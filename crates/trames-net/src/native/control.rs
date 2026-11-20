@@ -44,6 +44,9 @@ impl DirectControl {
         };
         address.map_err(from_io)?.as_socket().ok_or(NetError(5))
     }
+    pub fn linger(&self) -> Result<[u8; 8]> {
+        self.socket.upgrade().ok_or(NetError(9))?.linger()
+    }
     pub fn tcp_info(&self) -> Result<[u8; 104]> {
         self.socket.upgrade().ok_or(NetError(9))?.tcp_info()
     }
@@ -70,10 +73,10 @@ impl DirectControl {
             204 | 205 | 210 => true,
             208 => matches!(
                 (level, name),
-                (1, 2 | 6..=9) | (6, 1 | 4..=6) | (0, 2) | (41, 16 | 26)
+                (1, 2 | 6..=9 | 13) | (6, 1 | 4..=6) | (0, 2) | (41, 16 | 26)
             ),
             209 => {
-                matches!((level, name), (1, 2..=4 | 7..=9 | 30 | 38 | 39) | (6, 1 | 4..=6 | 11) | (41, 26))
+                matches!((level, name), (1, 2..=4 | 7..=9 | 13 | 30 | 38 | 39) | (6, 1 | 4..=6 | 11) | (41, 26))
             }
             _ => false,
         }
@@ -124,13 +127,17 @@ impl DirectControl {
         {
             return Err(NetError(105));
         }
-        socket.native.set_option(
-            self.family,
-            1,
-            level,
-            name,
-            i32::from_le_bytes(value[..4].try_into().unwrap()),
-        )?;
+        if (level, name) == (1, 13) {
+            socket.set_option_bytes(level, name, value)?;
+        } else {
+            socket.native.set_option(
+                self.family,
+                1,
+                level,
+                name,
+                i32::from_le_bytes(value[..4].try_into().unwrap()),
+            )?;
+        }
         if let Some(options) = options.as_mut() {
             options.retain(|(l, n, _)| (*l, *n) != (level, name));
             options.push((level, name, value.to_vec()));
@@ -313,6 +320,15 @@ mod tests {
         std::thread::spawn(move || {
             assert_eq!(control.get_option(1, 4), Ok(0));
             assert!(control.direct_tcp().is_some());
+            let linger = crate::linger_bytes(Some(Duration::from_secs(2)));
+            assert_eq!(
+                control.set_option_bytes(1, 13, &linger[..4]),
+                Err(NetError(22))
+            );
+            control.set_option_bytes(1, 13, &linger).unwrap();
+            assert_eq!(control.linger(), Ok(linger));
+            control.set_option_bytes(1, 13, &[0; 8]).unwrap();
+            assert_eq!(control.linger(), Ok([0; 8]));
             control.set_option_bytes(1, 9, &1i32.to_le_bytes()).unwrap();
             assert_eq!(control.get_option(1, 9), Ok(1));
             control
