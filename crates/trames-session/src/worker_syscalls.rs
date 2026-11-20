@@ -1061,7 +1061,7 @@ impl Snapshot {
                 std::array::from_fn(|i| cpu.x(i)),
                 memory,
                 self.started,
-                self.io_signals.tgid(),
+                &self.io_signals,
                 &self.io_routes.directory,
                 &self.io_routes.namespace,
             ),

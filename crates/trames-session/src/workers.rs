@@ -936,10 +936,10 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                 result
                             };
                             // A lone runnable task can retain this assignment indefinitely.
-                            // Inspect CPU limits at quantum boundaries and amortize checks
+                            // Inspect CPU timers and limits at quantum boundaries and amortize checks
                             // for workloads repeatedly entering the kernel before a quantum.
                             if matches!(result, SliceOutcome::Yield { .. }) || chunks & 255 == 0 {
-                                if let Some(snapshot) = &work.syscalls { snapshot.io_signals.check_cpu_limit(); }
+                                if let Some(snapshot) = &work.syscalls { snapshot.io_signals.check_cpu_timers(); }
                             }
                             if let Some(wait) = C::take_hardware_wait(&mut engine) {
                                 parked_hardware = Some(wait);

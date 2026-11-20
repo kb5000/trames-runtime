@@ -2578,7 +2578,7 @@ mod tests {
                         [1, 0, 0x8300, 0, 0, 0],
                         &mut p.memory,
                         Instant::now(),
-                        1,
+                        &p.signals.io,
                         &p.signals.io_directory,
                         p.linux.vfs.pid_namespace(),
                     )

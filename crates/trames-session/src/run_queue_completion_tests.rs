@@ -302,7 +302,7 @@ fn unlocked_timer_delivery_observes_completion_before_sleep() {
                 [0, 0x1000, 0, 0, 0, 0],
                 &mut memory,
                 Instant::now(),
-                42,
+                &task,
                 &directory,
                 &trames_vfs::PidNamespace::default(),
             )

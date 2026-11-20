@@ -431,7 +431,18 @@ impl IoTask {
         )? {
             queue.changed();
         }
-        self.wake_job(shared);
+        // CPU sampling prefers the interrupted task. Keep the signal shared so
+        // another eligible thread can take it when this task masks it or exits.
+        if shared
+            && matches!(sig, 26 | 27)
+            && info.code == 128
+            && self.live()
+            && self.eligible_mask(!self.mask()) & (1 << (sig - 1)) != 0
+        {
+            self.wake();
+        } else {
+            self.wake_job(shared);
+        }
         Ok(())
     }
     fn job_timer(&self, sig: u32, shared: bool, info: Info) -> i32 {

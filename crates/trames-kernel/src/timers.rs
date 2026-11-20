@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Shared POSIX/interval timers. Existing executors drive the original deadline
 //! index; no timer thread, guest pointer retention or syscall RPC is required.
-use crate::signal::{Info, IoDirectory, TimerTarget};
+use crate::signal::{Info, IoDirectory, IoTask, TimerTarget};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, RwLock, Weak,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -79,7 +79,6 @@ fn export(
     micros: bool,
     lazy: bool,
 ) -> Result<(), Errno> {
-    let mut bytes = [0; 32];
     let now = Instant::now();
     let left = state.deadline.map_or(Duration::ZERO, |deadline| {
         if lazy && deadline <= now && !state.interval.is_zero() {
@@ -90,7 +89,18 @@ fn export(
             deadline.saturating_duration_since(now)
         }
     });
-    for (chunk, d) in bytes.chunks_exact_mut(16).zip([state.interval, left]) {
+    write_times(memory, address, state.interval, left, micros)
+}
+
+fn write_times(
+    memory: &mut impl CpuMemory,
+    address: u64,
+    interval: Duration,
+    left: Duration,
+    micros: bool,
+) -> Result<(), Errno> {
+    let mut bytes = [0; 32];
+    for (chunk, d) in bytes.chunks_exact_mut(16).zip([interval, left]) {
         chunk[..8].copy_from_slice(&d.as_secs().to_le_bytes());
         chunk[8..].copy_from_slice(
             &(if micros {
@@ -103,6 +113,82 @@ fn export(
     }
     memory.write_array(address, bytes).map_err(|_| Errno(14))
 }
+#[derive(Default)]
+struct CpuInterval {
+    deadline: Option<Duration>,
+    interval: Duration,
+}
+
+/// Process-owned ITIMER_VIRTUAL and ITIMER_PROF. Guest CPU accounting currently
+/// attributes all charged execution to user time, so both use the group clock.
+#[derive(Default)]
+pub(crate) struct CpuIntervals {
+    armed: AtomicBool,
+    entries: Mutex<[CpuInterval; 2]>,
+}
+impl CpuIntervals {
+    pub(crate) fn armed(&self) -> bool {
+        self.armed.load(Ordering::Relaxed)
+    }
+    fn publish(&self, entries: &[CpuInterval; 2]) {
+        self.armed.store(
+            entries.iter().any(|e| e.deadline.is_some()),
+            Ordering::Relaxed,
+        );
+    }
+    fn call(
+        &self,
+        index: usize,
+        now: impl FnOnce() -> Duration,
+        new: Option<(Duration, Duration)>,
+        output: Option<u64>,
+        memory: &mut impl CpuMemory,
+    ) -> Result<u64, Errno> {
+        let mut entries = self.entries.lock().unwrap();
+        let entry = &mut entries[index];
+        let now = now();
+        if let Some(address) = output {
+            let left = entry.deadline.map_or(Duration::ZERO, |d| {
+                d.saturating_sub(now).max(Duration::from_micros(1))
+            });
+            write_times(memory, address, entry.interval, left, true)?;
+        }
+        if let Some((interval, value)) = new {
+            entry.interval = interval;
+            entry.deadline = (!value.is_zero()).then(|| now.saturating_add(value));
+            self.publish(&entries);
+        }
+        Ok(0)
+    }
+    pub(crate) fn expire(&self, now: Duration) -> [bool; 2] {
+        let mut entries = self.entries.lock().unwrap();
+        let mut expired = [false; 2];
+        for (entry, due) in entries.iter_mut().zip(&mut expired) {
+            let Some(deadline) = entry.deadline else {
+                continue;
+            };
+            if now < deadline {
+                continue;
+            }
+            *due = true;
+            entry.deadline = if entry.interval.is_zero() {
+                None
+            } else {
+                let period = entry.interval.as_nanos();
+                let left = period - (now - deadline).as_nanos() % period;
+                now.checked_add(Duration::new(
+                    (left / 1_000_000_000) as u64,
+                    (left % 1_000_000_000) as u32,
+                ))
+            };
+        }
+        if expired.contains(&true) {
+            self.publish(&entries);
+        }
+        expired
+    }
+}
+
 impl Timers {
     pub fn bind(&self, wake: Weak<dyn TimerWake>) {
         *self.wake.lock().unwrap() = Some(wake);
@@ -250,13 +336,15 @@ impl Timers {
         a: [u64; 6],
         memory: &mut impl CpuMemory,
         started: Instant,
-        tgid: u32,
+        caller: &IoTask,
         directory: &IoDirectory,
         namespace: &PidNamespace,
     ) -> Result<u64, Errno> {
+        let tgid = caller.tgid();
         if matches!(number, 102 | 103) {
-            if a[0] != 0 {
-                return Err(Errno(if a[0] <= 2 { 95 } else { 22 }));
+            let which = a[0] as u32;
+            if which > 2 {
+                return Err(Errno(22));
             }
             let id = -(tgid as i32);
             let output = if number == 102 { a[1] } else { a[2] };
@@ -265,15 +353,38 @@ impl Timers {
                     .check(output, 32, Access::Write)
                     .map_err(|_| Errno(14))?;
             }
-            let new = if number == 103 {
-                let interval = duration(memory, a[1], true)?;
-                let value = duration(memory, a[1].checked_add(16).ok_or(Errno(14))?, true)?;
+            let times = match (number, a[1]) {
+                (102, _) => None,
+                (103, 0) => Some((Duration::ZERO, Duration::ZERO)),
+                (_, at) => Some((
+                    duration(memory, at, true)?,
+                    duration(memory, at.checked_add(16).ok_or(Errno(14))?, true)?,
+                )),
+            };
+            if which != 0 {
+                let group = caller.lifecycle();
+                return group.cpu_intervals.call(
+                    (which - 1) as usize,
+                    || group.cpu_time(),
+                    times,
+                    (number == 102 || output != 0).then_some(output),
+                    memory,
+                );
+            }
+            let new = if let Some((interval, value)) = times {
                 let deadline = if value.is_zero() {
                     None
                 } else {
                     Some(Instant::now().checked_add(value).ok_or(Errno(22))?)
                 };
-                Some((interval, deadline))
+                Some((
+                    if value.is_zero() {
+                        Duration::ZERO
+                    } else {
+                        interval
+                    },
+                    deadline,
+                ))
             } else {
                 None
             };
@@ -467,11 +578,77 @@ mod tests {
         n: u32,
         a: [u64; 6],
     ) -> Result<u64, Errno> {
-        t.call(n, a, m, Instant::now(), 42, d, &PidNamespace::default())
+        t.call(
+            n,
+            a,
+            m,
+            Instant::now(),
+            &d.proc_task(42).unwrap(),
+            d,
+            &PidNamespace::default(),
+        )
     }
     fn create(t: &Timers, d: &IoDirectory, m: &mut Memory) -> i32 {
         call(t, d, m, 107, [1, 0, 0x1000, 0, 0, 0]).unwrap();
         m.read_u64(0x1000).unwrap() as i32
+    }
+    #[test]
+    fn cpu_intervals_share_execution_across_threads_and_keep_independent_phase() {
+        let (timers, directory, leader, mut memory) = setup();
+        let peer = Arc::new(IoTask::default());
+        peer.share_process(&leader);
+        directory.publish(&peer, 43, 42, 42, 0, 0);
+        let group = leader.lifecycle();
+        group.register(&leader, 42);
+        group.register(&peer, 43);
+        // One-shot virtual alarm after 10us, profiling every 4us starting at 7us.
+        for (which, period, value) in [(1, 0u64, 10u64), (2, 4, 7)] {
+            memory.write_array(0x1108, period.to_le_bytes()).unwrap();
+            memory.write_array(0x1118, value.to_le_bytes()).unwrap();
+            call(
+                &timers,
+                &directory,
+                &mut memory,
+                103,
+                [which, 0x1100, 0x1100, 0, 0, 0],
+            )
+            .unwrap();
+            assert_eq!(memory.read_array::<32>(0x1100).unwrap(), [0; 32]);
+        }
+        assert!(timers.next_deadline().is_none());
+        assert!(!IoTask::default().lifecycle().cpu_intervals.armed());
+        timers.clear_process(42, true);
+        leader.proc_view.account(Duration::from_micros(4), 0);
+        peer.proc_view.account(Duration::from_micros(2), 1);
+        peer.check_cpu_timers();
+        assert_eq!(leader.process().bits(), 0);
+        peer.proc_view.account(Duration::from_micros(11), 1);
+        peer.check_cpu_timers();
+        for sig in [26, 27] {
+            assert_eq!(leader.process().take(sig).unwrap().code, 128);
+        }
+        leader.check_cpu_timers();
+        assert_eq!(leader.process().bits(), 0);
+        call(
+            &timers,
+            &directory,
+            &mut memory,
+            102,
+            [1, 0x1200, 0, 0, 0, 0],
+        )
+        .unwrap();
+        assert_eq!(memory.read_array::<32>(0x1200).unwrap(), [0; 32]);
+        call(
+            &timers,
+            &directory,
+            &mut memory,
+            103,
+            [2, 0, 0x1200, 0, 0, 0],
+        )
+        .unwrap();
+        assert_eq!(memory.read_u64(0x1208).unwrap(), 4);
+        assert_eq!(memory.read_u64(0x1218).unwrap(), 2);
+        assert!(!group.cpu_intervals.armed());
     }
     #[test]
     fn timer_abi_faults_aliases_and_retirement_preserve_original_state() {

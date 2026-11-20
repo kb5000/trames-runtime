@@ -298,7 +298,7 @@ impl<C: Cpu> Kernel<C> {
                         a,
                         &mut p.memory,
                         self.started,
-                        p.tgid,
+                        &p.signals.io,
                         &p.signals.io_directory,
                         p.linux.vfs.pid_namespace(),
                     )

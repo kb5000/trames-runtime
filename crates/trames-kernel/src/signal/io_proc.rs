@@ -76,13 +76,31 @@ impl IoTask {
         cpu: usize,
     ) {
         self.proc_view.finish_accounting(began, elapsed, cpu);
-        self.check_cpu_limit();
+        self.check_cpu_timers();
     }
-    pub fn check_cpu_limit(&self) {
+    pub fn check_cpu_timers(&self) {
+        let group = self.lifecycle();
+        let mut elapsed = None;
+        let mut now = || *elapsed.get_or_insert_with(|| group.cpu_time());
+        if group.cpu_intervals.armed() {
+            for (due, sig) in group.cpu_intervals.expire(now()).into_iter().zip([26, 27]) {
+                if due {
+                    let _ = self.job_signal(
+                        sig,
+                        true,
+                        Info {
+                            code: 128,
+                            ..Info::default()
+                        },
+                        false,
+                    );
+                }
+            }
+        }
         if let Some(signal) = self
             .proc_limits
             .get()
-            .and_then(|limits| limits.cpu_signal(|| self.lifecycle().cpu_time()))
+            .and_then(|limits| limits.cpu_signal(now))
         {
             let _ = self.job_signal(
                 signal,
