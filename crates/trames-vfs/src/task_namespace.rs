@@ -129,6 +129,7 @@ enum Change {
     Unshare(u64),
     CloseRange(u32, u32, u32),
     Setns(NamespaceHandle, u64),
+    Join(PidfdNamespaces, u64),
 }
 pub struct TaskNamespaceWork {
     state: TaskNamespaces,
@@ -143,7 +144,25 @@ pub enum TaskNamespaceAttempt {
     Complete(TaskNamespaces, Result<u64>),
     Waiting(TaskNamespaceWork),
 }
+enum SetnsDescriptor {
+    Namespace(NamespaceHandle),
+    Pid(Arc<PidFd>),
+}
 impl Vfs {
+    fn setns_descriptor(&self, fd: u32) -> Result<SetnsDescriptor> {
+        let descriptor = self.descriptor(fd)?;
+        let open = descriptor.open.borrow();
+        if let Some(ns) = &open.namespace {
+            return Ok(SetnsDescriptor::Namespace(ns.clone()));
+        }
+        match &open.control {
+            Some(events::SharedControl::Pid(pid)) if open.flags.get() & O_PATH == 0 => {
+                Ok(SetnsDescriptor::Pid(pid.clone()))
+            }
+            _ => Err(Errno(22)),
+        }
+    }
+
     /// An accepted host filesystem operation retains the original Files/fs and
     /// namespace resources. Read pending source bindings without consuming the
     /// cold owner's publication; later unshare cannot retarget accepted work.
@@ -173,23 +192,28 @@ impl Vfs {
         kind: u64,
         single_threaded: bool,
     ) -> TaskNamespaceOwnerAttempt {
-        let namespace = (|| {
-            self.descriptor(fd)?
-                .open
-                .borrow()
-                .namespace
-                .clone()
-                .ok_or(Errno(22))
-        })();
-        match namespace {
-            Ok(NamespaceHandle::User(_)) if !single_threaded => {
+        self.setns_task_with_pidfd(fd, kind, single_threaded, |_, _| Err(Errno(22)))
+    }
+    pub fn setns_task_with_pidfd(
+        &mut self,
+        fd: u32,
+        kind: u64,
+        single_threaded: bool,
+        resolve: impl FnOnce(&Arc<PidFd>, u64) -> Result<PidfdNamespaces>,
+    ) -> TaskNamespaceOwnerAttempt {
+        match self.setns_descriptor(fd) {
+            Ok(SetnsDescriptor::Pid(pidfd)) => self
+                .task_namespaces()
+                .join_pidfd(pidfd, kind, single_threaded, resolve)
+                .run_owner(self),
+            Ok(SetnsDescriptor::Namespace(NamespaceHandle::User(_))) if !single_threaded => {
                 TaskNamespaceOwnerAttempt::Complete(Err(Errno(22)))
             }
-            Ok(namespace @ NamespaceHandle::Mount(_)) => self
+            Ok(SetnsDescriptor::Namespace(namespace @ NamespaceHandle::Mount(_))) => self
                 .task_namespaces()
                 .setns_target(Ok(namespace), kind)
                 .run_owner(self),
-            Ok(namespace) => {
+            Ok(SetnsDescriptor::Namespace(namespace)) => {
                 TaskNamespaceOwnerAttempt::Complete(self.set_namespace(namespace, kind).map(|()| 0))
             }
             Err(error) => TaskNamespaceOwnerAttempt::Complete(Err(error)),
@@ -337,29 +361,73 @@ impl TaskNamespaces {
             admin: None,
         }
     }
-    pub fn setns_checked(self, fd: u32, kind: u64, single_threaded: bool) -> TaskNamespaceWork {
-        if single_threaded {
-            return self.setns(fd, kind);
-        }
-        let mut work = self.setns(fd, kind);
-        if matches!(work.change, Ok(Change::Setns(NamespaceHandle::User(_), _))) {
-            work.change = Err(Errno(22));
-        }
-        work
-    }
     pub fn setns(self, fd: u32, kind: u64) -> TaskNamespaceWork {
-        let namespace = (|| {
-            self.view
-                .view
-                .borrow()
-                .descriptor(fd)?
-                .open
-                .borrow()
-                .namespace
-                .clone()
-                .ok_or(Errno(22))
+        self.setns_checked(fd, kind, true)
+    }
+    pub fn setns_checked(self, fd: u32, kind: u64, single_threaded: bool) -> TaskNamespaceWork {
+        self.setns_with_pidfd(fd, kind, single_threaded, |_, _| Err(Errno(22)))
+    }
+    pub fn setns_with_pidfd(
+        self,
+        fd: u32,
+        kind: u64,
+        single_threaded: bool,
+        resolve: impl FnOnce(&Arc<PidFd>, u64) -> Result<PidfdNamespaces>,
+    ) -> TaskNamespaceWork {
+        let target = self.view.view.borrow().setns_descriptor(fd);
+        match target {
+            Ok(SetnsDescriptor::Pid(pidfd)) => {
+                self.join_pidfd(pidfd, kind, single_threaded, resolve)
+            }
+            Ok(SetnsDescriptor::Namespace(NamespaceHandle::User(_))) if !single_threaded => {
+                self.setns_target(Err(Errno(22)), kind)
+            }
+            Ok(SetnsDescriptor::Namespace(ns)) => self.setns_target(Ok(ns), kind),
+            Err(error) => self.setns_target(Err(error), kind),
+        }
+    }
+    fn join_pidfd(
+        self,
+        pidfd: Arc<PidFd>,
+        flags: u64,
+        single_threaded: bool,
+        resolve: impl FnOnce(&Arc<PidFd>, u64) -> Result<PidfdNamespaces>,
+    ) -> TaskNamespaceWork {
+        const TYPES: u64 = CLONE_NEWUSER
+            | CLONE_NEWNS
+            | CLONE_NEWUTS
+            | CLONE_NEWIPC
+            | CLONE_NEWPID
+            | CLONE_NEWCGROUP
+            | CLONE_NEWNET;
+        let mut admin = None;
+        let change = (|| {
+            if flags == 0 || flags & !TYPES != 0 {
+                return Err(Errno(22));
+            }
+            let namespaces = resolve(&pidfd, flags)?;
+            let view = self.view.view.borrow();
+            let mut user = &view.credentials.user_namespace;
+            for ns in &namespaces.0 {
+                if matches!(ns, NamespaceHandle::User(_)) && !single_threaded {
+                    return Err(Errno(22));
+                }
+                // Linux checks the original caller's authority in both the
+                // destination and the proposed user namespace before commit.
+                view.check_namespace_in(ns, user, flags != CLONE_NEWNS)?;
+                match ns {
+                    NamespaceHandle::User(proposed) => user = proposed,
+                    NamespaceHandle::Mount(ns) => admin = Some(ns.0.borrow().admin.clone()),
+                    _ => {}
+                }
+            }
+            Ok(Change::Join(namespaces, flags))
         })();
-        self.setns_target(namespace, kind)
+        TaskNamespaceWork {
+            state: self,
+            change,
+            admin,
+        }
     }
     fn setns_target(self, namespace: Result<NamespaceHandle>, kind: u64) -> TaskNamespaceWork {
         let mut admin = None;
@@ -430,6 +498,7 @@ impl Change {
             ),
             Change::Setns(NamespaceHandle::Mount(_), _) => (false, true),
             Change::Setns(..) => (false, false),
+            Change::Join(..) => (false, false),
         };
         if let Change::CloseRange(first, last, flags) = *self {
             if !files {
@@ -488,6 +557,16 @@ impl Change {
             }
             Change::CloseRange(first, last, flags) => view.close_range(first, last, flags)?,
             Change::Setns(namespace, kind) => view.set_namespace(namespace, kind)?,
+            Change::Join(namespaces, flags) => {
+                // All memberships are validated. Mount is the only fallible
+                // install and updates shared root/cwd only after it succeeds.
+                for ns in namespaces.0 {
+                    view.install_namespace(ns)?;
+                }
+                if flags & CLONE_NEWIPC != 0 {
+                    view.retire_sem_undo(view.lock_owner);
+                }
+            }
         }
         Ok(())
     }
@@ -793,6 +872,97 @@ mod tests {
         );
         drop(state);
     }
+    #[test]
+    fn pidfd_join_checks_original_authority_before_changing_any_membership() {
+        let mut owner = Vfs::default();
+        let mut target = owner.clone_with_resources(false, false);
+        target.unshare_user().unwrap();
+        // UTS still belongs to the initial user namespace. Even though the
+        // caller owns the child user namespace, it lacks SYS_ADMIN in the
+        // initial namespace. Joining both must leave its credentials intact.
+        owner.credentials.caps.effective &= !(1 << capabilities::SYS_ADMIN);
+        let original_user = owner.credentials.user_namespace.clone();
+        let source = target.pidfd_namespace_source();
+        let pidfd = Arc::new(PidFd::new(2, false, false));
+        let fd = owner
+            .descriptor_factory()
+            .reserve_pidfd(pidfd, 0)
+            .unwrap()
+            .publish()
+            .unwrap();
+        let flags = CLONE_NEWUSER | CLONE_NEWUTS;
+        let result = owner.setns_task_with_pidfd(fd, flags, true, |_, flags| source.select(flags));
+        assert!(matches!(
+            result,
+            TaskNamespaceOwnerAttempt::Complete(Err(Errno(1)))
+        ));
+        assert_eq!(owner.credentials.user_namespace, original_user);
+        assert!(!owner.credentials.has_local_cap(capabilities::SYS_ADMIN));
+
+        target.unshare_uts().unwrap();
+        target.unshare_ipc().unwrap();
+        target.unshare_pid().unwrap();
+        let source = target.pidfd_namespace_source();
+        // PID still belongs to the initial namespace. Select it separately
+        // after the join to distinguish active PID from PID-for-children.
+        let pid = source.select(CLONE_NEWPID).unwrap();
+        assert!(
+            matches!(&pid.0[..], [NamespaceHandle::Pid(n)] if n.id() == target.pid_ns.id() && n.id() != target.pid_children.id())
+        );
+        let (state, result) = complete(owner.task_namespaces().setns_with_pidfd(
+            fd,
+            flags | CLONE_NEWIPC,
+            true,
+            |_, mask| source.select(mask),
+        ));
+        assert_eq!(result, Ok(0));
+        owner.adopt_task_namespaces(state);
+        assert_eq!(
+            owner.credentials.user_namespace,
+            target.credentials.user_namespace
+        );
+        assert_eq!(owner.uts.id(), target.uts.id());
+        assert!(Arc::ptr_eq(&owner.ipc_namespace, &target.ipc_namespace));
+    }
+
+    #[test]
+    fn parked_pidfd_join_keeps_original_mount_and_uts_after_fd_reuse() {
+        let mut owner = Vfs::default();
+        let mut target = owner.clone_with_resources(false, false);
+        target.unshare_mounts().unwrap();
+        target.unshare_uts().unwrap();
+        let original = target.mounts.clone().unwrap();
+        let uts = target.uts.id();
+        let admin = target.mount_admin().unwrap();
+        let lease = admin.enter();
+        let source = target.pidfd_namespace_source();
+        let pidfd = Arc::new(PidFd::new(2, false, false));
+        let fd = owner
+            .descriptor_factory()
+            .reserve_pidfd(pidfd, 0)
+            .unwrap()
+            .publish()
+            .unwrap();
+        let TaskNamespaceAttempt::Waiting(work) = owner
+            .task_namespaces()
+            .setns_with_pidfd(fd, CLONE_NEWNS | CLONE_NEWUTS, true, |_, flags| {
+                source.select(flags)
+            })
+            .run()
+        else {
+            panic!("target mount is busy")
+        };
+        owner.close(fd).unwrap();
+        assert_eq!(owner.eventfd(0, 0).unwrap(), fd);
+        drop(target);
+        drop(lease);
+        let (state, result) = complete(work);
+        assert_eq!(result, Ok(0));
+        owner.adopt_task_namespaces(state);
+        assert_eq!(owner.mounts.as_ref().unwrap().id(), original.id());
+        assert_eq!(owner.uts.id(), uts);
+    }
+
     #[test]
     fn accepted_setns_retains_target_across_wait_close_and_fd_reuse() {
         let mut owner = Vfs::default();

@@ -386,7 +386,46 @@ impl NamespaceSnapshot {
         }
     }
 }
+/// Strong references for one accepted pidfd setns, in Linux validation order.
+pub struct PidfdNamespaces(pub(super) Vec<NamespaceHandle>);
+
 impl SharedNamespaceSnapshot {
+    pub(super) fn select(&self, flags: u64) -> Result<PidfdNamespaces> {
+        let mut handles = Vec::with_capacity(flags.count_ones() as usize);
+        if flags & CLONE_NEWUSER != 0 {
+            handles.push(NamespaceHandle::User(
+                UserNamespace::upgrade(&self.user).map_err(|_| Errno(3))?,
+            ));
+        }
+        if flags & CLONE_NEWNS != 0 {
+            handles.push(NamespaceHandle::Mount(MountNamespace(
+                self.mount.upgrade().ok_or(Errno(3))?,
+            )));
+        }
+        if flags & CLONE_NEWUTS != 0 {
+            handles.push(NamespaceHandle::Uts(UtsNamespace(
+                self.uts.upgrade().ok_or(Errno(3))?,
+            )));
+        }
+        if flags & CLONE_NEWIPC != 0 {
+            handles.push(NamespaceHandle::Ipc(self.ipc.upgrade().ok_or(Errno(3))?));
+        }
+        if flags & CLONE_NEWPID != 0 {
+            handles.push(NamespaceHandle::Pid(PidNamespace(
+                self.pid.upgrade().ok_or(Errno(3))?,
+            )));
+        }
+        if flags & CLONE_NEWCGROUP != 0 {
+            handles.push(NamespaceHandle::Cgroup(
+                self.cgroup.upgrade().ok_or(Errno(3))?,
+            ));
+        }
+        if flags & CLONE_NEWNET != 0 {
+            handles.push(NamespaceHandle::Net(self.net.upgrade().ok_or(Errno(3))?));
+        }
+        Ok(PidfdNamespaces(handles))
+    }
+
     pub fn metadata(&self) -> NamespaceSnapshot {
         NamespaceSnapshot {
             user: self.user.clone(),
@@ -441,6 +480,24 @@ impl SharedNamespaceSnapshot {
 }
 
 impl Vfs {
+    /// PIDFD joins need the active namespace bindings only. Avoid projecting
+    /// mount topology or looking up root/cwd when publishing a task.
+    pub fn pidfd_namespace_source(&self) -> SharedNamespaceSnapshot {
+        SharedNamespaceSnapshot {
+            user: self.credentials.user_namespace.weak(),
+            uts: Arc::downgrade(&self.uts.0),
+            net: Arc::downgrade(&self.root_network),
+            ipc: Arc::downgrade(&self.ipc_namespace),
+            cgroup: Arc::downgrade(&self.cgroup_namespace),
+            pid: Arc::downgrade(&self.pid_ns.0),
+            mount: self
+                .mounts
+                .as_ref()
+                .and_then(MountNamespace::original)
+                .map_or_else(Default::default, |ns| Arc::downgrade(&ns.0)),
+            ..Default::default()
+        }
+    }
     pub fn namespace_snapshot(&self) -> NamespaceSnapshot {
         let paths = self.context.paths.borrow();
         NamespaceSnapshot {
@@ -583,6 +640,14 @@ impl Vfs {
         if kind != 0 && kind != ns.kind() {
             return Err(Errno(22));
         }
+        self.check_namespace_in(ns, &self.credentials.user_namespace, false)
+    }
+    pub(super) fn check_namespace_in(
+        &self,
+        ns: &NamespaceHandle,
+        user: &UserNamespace,
+        private_mount_fs: bool,
+    ) -> Result<()> {
         if let NamespaceHandle::User(target) = ns {
             if target == &self.credentials.user_namespace || self.context_shared() {
                 return Err(Errno(22));
@@ -595,6 +660,7 @@ impl Vfs {
         if !self
             .credentials
             .has_ns_cap(&ns.owner(), capabilities::SYS_ADMIN)
+            || !self.credentials.has_ns_cap(user, capabilities::SYS_ADMIN)
         {
             return Err(Errno(1));
         }
@@ -604,10 +670,10 @@ impl Vfs {
             }
         }
         if matches!(ns, NamespaceHandle::Mount(_)) {
-            if !self.credentials.has_local_cap(capabilities::SYS_CHROOT) {
+            if !self.credentials.has_ns_cap(user, capabilities::SYS_CHROOT) {
                 return Err(Errno(1));
             }
-            if self.context_shared() {
+            if !private_mount_fs && self.context_shared() {
                 return Err(Errno(22));
             }
         }
@@ -615,6 +681,14 @@ impl Vfs {
     }
     pub(super) fn set_namespace(&mut self, ns: NamespaceHandle, kind: u64) -> Result<()> {
         self.check_namespace(&ns, kind)?;
+        let ipc = matches!(ns, NamespaceHandle::Ipc(_));
+        self.install_namespace(ns)?;
+        if ipc {
+            self.retire_sem_undo(self.lock_owner);
+        }
+        Ok(())
+    }
+    pub(super) fn install_namespace(&mut self, ns: NamespaceHandle) -> Result<()> {
         match ns {
             NamespaceHandle::User(ns) => self.credentials.enter_user_namespace(ns),
             NamespaceHandle::Net(ns) => {

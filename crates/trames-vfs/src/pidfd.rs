@@ -93,7 +93,12 @@ mod tests {
         let mut owner = Credentials::user(12, 34);
         owner.caps.permitted = 1;
         let dumpable = sender.dumpable_state();
-        target.publish_files(&owner, &sender.shared_files(), dumpable.clone());
+        target.publish_pidfd_resources(
+            &owner,
+            &sender.shared_files(),
+            dumpable.clone(),
+            sender.pidfd_namespace_source(),
+        );
 
         let mut caller = owner.clone();
         caller.fsuid = 99;

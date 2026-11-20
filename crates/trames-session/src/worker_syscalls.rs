@@ -191,7 +191,12 @@ impl<C: Cpu> crate::workers::Work<C> {
         } else if number == 436 {
             state.close_range(args[0] as u32, args[1] as u32, args[2] as u32)
         } else {
-            state.setns_checked(args[0] as u32, args[1], single_threaded)
+            state.setns_with_pidfd(
+                args[0] as u32,
+                args[1] as u32 as u64,
+                single_threaded,
+                |pidfd, flags| snapshot.io_routes.pidfd_namespaces(task, pidfd, flags),
+            )
         }
     }
     pub fn finish_namespaces(
@@ -202,11 +207,13 @@ impl<C: Cpu> crate::workers::Work<C> {
         let snapshot = self.syscalls.as_mut().expect("namespace task");
         if result.is_ok() && state.changed() {
             let resources = state.resources();
+            let proc_resources = state.proc_resources();
             let credentials = &resources.credentials;
-            snapshot.io_signals.credentials().publish_files(
+            snapshot.io_signals.credentials().publish_pidfd_resources(
                 credentials,
                 &resources.files,
                 resources.dumpable.clone(),
+                proc_resources.namespaces().clone(),
             );
             snapshot.io_routes.uid = credentials.uid;
             snapshot.io_routes.euid = credentials.euid;
@@ -240,7 +247,7 @@ impl<C: Cpu> crate::workers::Work<C> {
             snapshot
                 .io_signals
                 .proc_view
-                .replace_resources(state.proc_resources());
+                .replace_resources(proc_resources);
         }
         snapshot.namespaces = Some(state);
         self.trace.finish(

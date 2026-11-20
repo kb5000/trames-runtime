@@ -112,10 +112,11 @@ impl Birth {
     ) {
         p.seccomp.bind(&p.signals.io, id);
         self.publish_proc(id, p);
-        p.signals.io.credentials().publish_files(
+        p.signals.io.credentials().publish_pidfd_resources(
             &p.linux.vfs.credentials,
             &p.linux.vfs.shared_files(),
             p.linux.vfs.dumpable_state(),
+            p.linux.vfs.pidfd_namespace_source(),
         );
         self.limits.publish(
             id,

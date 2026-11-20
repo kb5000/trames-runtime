@@ -7,7 +7,7 @@ type Result<T> = std::result::Result<T, Errno>;
 
 pub fn credential_entry(number: u32, a: [u64; 6]) -> bool {
     matches!(number, 90 | 91 | 143..=152 | 158 | 159 | 174..=177)
-        || number == 167 && matches!(a[0], 3 | 4 | 7 | 8 | 23 | 24 | 27 | 28 | 38 | 39 | 47)
+        || number == 167 && matches!(a[0], 3 | 4 | 7 | 8 | 23 | 24 | 27 | 28 | 35 | 38 | 39 | 47)
 }
 pub fn credential_mutation(number: u32, a: [u64; 6]) -> bool {
     matches!(number, 91 | 143..=147 | 149 | 151 | 152 | 159)
@@ -179,6 +179,18 @@ fn invoke(
                 groups.sort_unstable();
                 c.groups = groups;
                 Ok(0)
+            }
+        }
+        167 if a[0] == 35 => {
+            // PR_SET_MM validates unused arguments before checking authority
+            // in the initial guest user namespace. MM setters are unsupported.
+            let option = a[1] as u32;
+            if a[4] != 0 || a[3] != 0 && !matches!(option, 12 | 14 | 15) {
+                Err(Errno(22))
+            } else if !c.has_cap(capabilities::SYS_RESOURCE) {
+                Err(Errno(1))
+            } else {
+                Err(Errno(22))
             }
         }
         167 => c.caps.prctl(a),

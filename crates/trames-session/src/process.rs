@@ -2104,13 +2104,20 @@ impl<C: Cpu> Kernel<C> {
                         .vfs
                         .close_range_task(a[0] as u32, a[1] as u32, a[2] as u32)
                 } else {
-                    p.linux.vfs.setns_task(a[0] as u32, a[1], single_threaded)
+                    let routes = trames_kernel::signal::IoRoutes {
+                        directory: p.signals.io_directory.clone(),
+                        namespace: p.linux.vfs.pid_namespace().clone(),
+                        uid: p.linux.vfs.credentials.uid,
+                        euid: p.linux.vfs.credentials.euid,
+                    };
+                    p.linux.vfs.setns_task_with_pidfd(a[0] as u32, a[1] as u32 as u64, single_threaded,
+                        |pidfd, flags| routes.pidfd_namespaces(&p.signals.io, pidfd, flags))
                 };
                 match attempt {
                     trames_vfs::TaskNamespaceOwnerAttempt::Complete(result) => {
                         if result.is_ok() && (number != 436 || a[2] & 2 != 0) {
-                            p.signals.io.credentials().publish_files(&p.linux.vfs.credentials,
-                                &p.linux.vfs.shared_files(), p.linux.vfs.dumpable_state());
+                            p.signals.io.credentials().publish_pidfd_resources(&p.linux.vfs.credentials,
+                                &p.linux.vfs.shared_files(), p.linux.vfs.dumpable_state(), p.linux.vfs.pidfd_namespace_source());
                         }
                         result.map(Some)
                     },

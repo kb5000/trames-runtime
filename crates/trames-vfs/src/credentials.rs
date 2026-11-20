@@ -7,9 +7,10 @@ use super::*;
 #[derive(Default)]
 pub struct CredentialState {
     current: std::sync::RwLock<Credentials>,
-    files: std::sync::Mutex<Option<PidfdFiles>>,
+    pidfd: std::sync::Mutex<Option<PidfdResources>>,
 }
-struct PidfdFiles {
+struct PidfdResources {
+    namespaces: SharedNamespaceSnapshot,
     table: std::sync::Weak<fd_table::Membership>,
     dumpable: Dumpable,
 }
@@ -17,7 +18,7 @@ impl CredentialState {
     pub fn new(credentials: Credentials) -> Self {
         Self {
             current: std::sync::RwLock::new(credentials),
-            files: Default::default(),
+            pidfd: Default::default(),
         }
     }
     pub fn read(&self) -> std::sync::RwLockReadGuard<'_, Credentials> {
@@ -26,17 +27,19 @@ impl CredentialState {
     pub fn publish(&self, credentials: &Credentials) {
         self.current.write().unwrap().clone_from(credentials);
     }
-    /// Publish the files_struct and mm at the same credential boundary as
+    /// Publish Files, namespace membership and mm at the same credential boundary as
     /// exec/unshare. A pidfd does not own the target table or keep it alive.
-    pub fn publish_files(
+    pub fn publish_pidfd_resources(
         &self,
         credentials: &Credentials,
         files: &SharedFiles,
         dumpable: Dumpable,
+        namespaces: SharedNamespaceSnapshot,
     ) {
         let mut target = self.current.write().unwrap();
         target.clone_from(credentials);
-        *self.files.lock().unwrap() = Some(PidfdFiles {
+        *self.pidfd.lock().unwrap() = Some(PidfdResources {
+            namespaces,
             table: Arc::downgrade(&files.0),
             dumpable,
         });
@@ -48,13 +51,34 @@ impl CredentialState {
         fd: u32,
         into: &SharedFiles,
     ) -> Result<u32> {
+        self.with_pidfd_resources(caller, same_group, |resources| {
+            let files = resources.table.upgrade().ok_or(Errno(3))?;
+            into.receive_pidfd_slot(&files, fd)
+        })
+    }
+    pub fn pidfd_namespaces(
+        &self,
+        caller: &Credentials,
+        same_group: bool,
+        flags: u64,
+    ) -> Result<PidfdNamespaces> {
+        self.with_pidfd_resources(caller, same_group, |resources| {
+            resources.namespaces.select(flags)
+        })
+    }
+    fn with_pidfd_resources<T>(
+        &self,
+        caller: &Credentials,
+        same_group: bool,
+        accept: impl FnOnce(&PidfdResources) -> Result<T>,
+    ) -> Result<T> {
         let target = self.current.read().unwrap();
-        let binding = self.files.lock().unwrap();
-        let files = binding.as_ref().ok_or(Errno(3))?;
-        // PTRACE_MODE_ATTACH_REALCREDS uses real IDs and permitted capabilities.
+        let binding = self.pidfd.lock().unwrap();
+        let resources = binding.as_ref().ok_or(Errno(3))?;
+        // Both READ_REALCREDS (setns) and ATTACH_REALCREDS (getfd) compare real IDs and permitted capabilities.
         if !same_group
             && !caller.has_ns_cap(&target.user_namespace, capabilities::SYS_PTRACE)
-            && (!files.dumpable.get()
+            && (!resources.dumpable.get()
                 || caller.user_namespace != target.user_namespace
                 || [target.uid, target.euid, target.suid]
                     .iter()
@@ -66,8 +90,7 @@ impl CredentialState {
         {
             return Err(Errno(1));
         }
-        let files = files.table.upgrade().ok_or(Errno(3))?;
-        into.receive_pidfd_slot(&files, fd)
+        accept(resources)
     }
     /// Directory/bootstrap compatibility; both signal target IDs change together.
     pub fn publish_signal_ids(&self, uid: u32, suid: u32) {

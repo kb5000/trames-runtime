@@ -423,6 +423,9 @@ impl Vfs {
     }
 }
 impl ProcResources {
+    pub fn namespaces(&self) -> &SharedNamespaceSnapshot {
+        &self.namespaces
+    }
     pub fn with_task_name(mut self, name: TaskName) -> Self {
         self.name = Some(name);
         self

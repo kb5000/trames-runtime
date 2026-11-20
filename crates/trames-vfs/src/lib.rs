@@ -172,7 +172,7 @@ mod storage;
 #[cfg(test)]
 mod storage_tests;
 pub use credentials::{CredentialState, Credentials, Dumpable, ExecCredentials};
-pub use linux_namespace::{NamespaceProjection, SharedNamespaceSnapshot};
+pub use linux_namespace::{NamespaceProjection, PidfdNamespaces, SharedNamespaceSnapshot};
 pub use pseudo::{FdInfo, ProcessInfo, RuntimeInfo};
 use std::{
     cell::{Cell, OnceCell, RefCell},

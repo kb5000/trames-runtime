@@ -170,10 +170,11 @@ impl<C: Cpu> Kernel<C> {
             if wait.ready() {
                 if let Some((state, result)) = wait.run() {
                     p.linux.vfs.adopt_task_namespaces(state);
-                    p.signals.io.credentials().publish_files(
+                    p.signals.io.credentials().publish_pidfd_resources(
                         &p.linux.vfs.credentials,
                         &p.linux.vfs.shared_files(),
                         p.linux.vfs.dumpable_state(),
+                        p.linux.vfs.pidfd_namespace_source(),
                     );
                     p.signals
                         .io

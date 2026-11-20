@@ -124,18 +124,7 @@ impl IoRoutes {
             return Err(Errno(22));
         }
         let (pidfd, _) = flags.pidfd(a[0] as u32)?;
-        let target = self
-            .directory
-            .proc_task(pidfd.pid())
-            .filter(|t| t.live())
-            .ok_or(Errno(3))?;
-        if !target
-            .lifecycle()
-            .pidfd()
-            .is_some_and(|current| Arc::ptr_eq(&current, &pidfd))
-        {
-            return Err(Errno(3));
-        }
+        let target = self.live_pidfd_target(&pidfd)?;
         let credentials = caller.credentials().read().clone();
         target
             .credentials()
@@ -146,6 +135,35 @@ impl IoRoutes {
                 into.files(),
             )
             .map(u64::from)
+    }
+
+    fn live_pidfd_target(&self, pidfd: &Arc<trames_vfs::PidFd>) -> Result<Arc<IoTask>, Errno> {
+        let target = self
+            .directory
+            .proc_task(pidfd.pid())
+            .filter(|t| t.live())
+            .ok_or(Errno(3))?;
+        if !target
+            .lifecycle()
+            .pidfd()
+            .is_some_and(|current| Arc::ptr_eq(&current, pidfd))
+        {
+            return Err(Errno(3));
+        }
+        Ok(target)
+    }
+
+    pub fn pidfd_namespaces(
+        &self,
+        caller: &IoTask,
+        pidfd: &Arc<trames_vfs::PidFd>,
+        flags: u64,
+    ) -> Result<trames_vfs::PidfdNamespaces, Errno> {
+        let target = self.live_pidfd_target(pidfd)?;
+        let credentials = caller.credentials().read().clone();
+        target
+            .credentials()
+            .pidfd_namespaces(&credentials, target.tgid() == caller.tgid(), flags)
     }
 
     pub fn pidfd_send(
