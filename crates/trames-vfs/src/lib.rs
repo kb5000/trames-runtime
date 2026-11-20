@@ -716,6 +716,8 @@ impl ProcRefresh {
             || matches!(
                 path,
                 b"/proc/cpuinfo"
+                    | b"/proc/cmdline"
+                    | b"/proc/bootconfig"
                     | b"/proc/version"
                     | b"/proc/swaps"
                     | b"/proc/partitions"
@@ -2574,6 +2576,7 @@ impl Vfs {
                 && network_control.is_none()
                 && self.uses_pseudo(&p)
                 && self.pseudo_readonly(&p)
+                && !node.is_some_and(|n| n.seq_file)
                 && (flags & 3 != 0
                     || flags & O_TRUNC != 0
                     || flags & O_CREAT != 0 && !self.proc_directory_tree(&p))
@@ -2598,7 +2601,8 @@ impl Vfs {
                     let n = node.borrow();
                     n.volatile && matches!(n.content, Content::File(_))
                 };
-                if flags & (O_PATH | 3) == 0
+                if flags & O_PATH == 0
+                    && (flags & 3 == 0 || node.seq_file)
                     && oom.is_none()
                     && network_control.is_none()
                     && mount_file.is_none()
@@ -2773,6 +2777,7 @@ impl Vfs {
         };
         let truncate = existed
             && flags & 0x200 != 0
+            && !node.seq_file
             && !Self::cgroup_mount(&p)
             && oom.is_none()
             && network_control.is_none();
@@ -3530,7 +3535,14 @@ impl Vfs {
             return Ok(count);
         }
         let node = o.node.clone().ok_or(Errno(29))?;
-        self.pseudo_immutable(&node)?;
+        self.pseudo_immutable(&node).map_err(|e| {
+            // proc_reg_write returns EIO when the entry has no write operation.
+            if node.seq_file {
+                Errno(5)
+            } else {
+                e
+            }
+        })?;
         {
             let n = node.borrow();
             if n.seals.is_none() {

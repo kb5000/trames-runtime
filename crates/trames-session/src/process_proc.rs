@@ -85,6 +85,7 @@ impl<C: Cpu> Kernel<C> {
             boot_time: self.boot_time,
             cpus: self.cpu_count,
             features: C::feature_names(),
+            counter_hz: C::counter_frequency(),
             task_limit: self.task_capacity.limit(),
             limits: self.memory_limits,
             host,

@@ -1236,6 +1236,7 @@ impl<C: Cpu> Kernel<C> {
                     .map(|t| (t.as_millis() / 10) as u64)
                     .collect(),
                 cpu_features: C::feature_names(),
+                cpu_counter_hz: C::counter_frequency(),
                 processes,
                 uptime: self.started.elapsed(),
                 monotonic_origin: Some(self.started),

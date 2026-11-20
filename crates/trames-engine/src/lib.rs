@@ -93,6 +93,11 @@ pub trait Cpu: Registers + Default + Clone + Send + 'static {
         None
     }
 
+    /// Frequency of the guest architectural delay timer, for ARM64 cpuinfo.
+    fn counter_frequency() -> u64 {
+        Self::clock_sample().map_or(0, |sample| sample.frequency)
+    }
+
     /// Prepare the thread-affine engine on its worker before the first CPU
     /// entry of an assignment. Software engines use their existing local poll.
     fn execution_interrupt(

@@ -889,6 +889,30 @@ impl ProcessInfo {
         out.into_bytes()
     }
 }
+impl RuntimeInfo {
+    fn cpuinfo(&self) -> Vec<u8> {
+        use std::fmt::Write;
+        // ARM64 derives BogoMIPS from the architectural delay timer. Trames
+        // exposes a generic guest CPU and does not advertise a vendor MIDR.
+        let hundredths = self.cpu_counter_hz / 5_000;
+        let mut text = String::new();
+        for cpu in 0..self.cpu_count.max(1) {
+            writeln!(text, "processor\t: {cpu}").unwrap();
+            writeln!(text, "model name\t: Trames AArch64").unwrap();
+            writeln!(
+                text,
+                "BogoMIPS\t: {}.{:02}",
+                hundredths / 100,
+                hundredths % 100
+            )
+            .unwrap();
+            writeln!(text, "Features\t: {}", self.cpu_features).unwrap();
+            text.push_str("CPU implementer\t: 0x00\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: 0x000\nCPU revision\t: 0\n\n");
+        }
+        text.into_bytes()
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct RuntimeInfo {
     pub cpu_count: usize,
@@ -896,6 +920,7 @@ pub struct RuntimeInfo {
     pub task_limit: usize,
     pub per_cpu_ticks: Vec<u64>,
     pub cpu_features: &'static str,
+    pub cpu_counter_hz: u64,
     pub processes: Vec<ProcessInfo>,
     pub uptime: Duration,
     /// Original guest CLOCK_MONOTONIC epoch, also used by sync-file timestamps.
@@ -1120,6 +1145,9 @@ impl PseudoFs {
                 | b"/proc/diskstats"
                 | b"/proc/version"
                 | b"/proc/cmdline"
+                | b"/proc/cgroups"
+                | b"/proc/bootconfig"
+                | b"/proc/filesystems"
                 | b"/proc/loadavg"
         );
         let node = Arc::new(inode);
@@ -1603,6 +1631,9 @@ impl Vfs {
         publication: Option<&DirectFiles>,
         reservation: fd_table::ReservedFd,
     ) -> Result<u32> {
+        if flags & O_DIRECTORY != 0 {
+            return Err(Errno(20));
+        }
         let original = accepted.borrow();
         if original.socket.is_some()
             || original.local.is_some()
@@ -1610,9 +1641,6 @@ impl Vfs {
             || original.native_image.is_some()
         {
             return Err(Errno(6));
-        }
-        if flags & O_DIRECTORY != 0 {
-            return Err(Errno(20));
         }
         if flags & O_PATH == 0
             && ((flags & 3 != 1 && original.flags.get() & 3 == 1)
@@ -2016,7 +2044,7 @@ impl Vfs {
                 let available = r.available_memory.map_or(free, |bytes| (bytes as u64 / 1024).min(total));
                 return Ok(regular(format!("MemTotal: {total:8} kB\nMemFree: {free:8} kB\nMemAvailable: {available:8} kB\nBuffers: 0 kB\nCached: 0 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n").into_bytes()));
             }
-            b"/proc/cpuinfo" => return Ok(regular((0..r.cpu_count.max(1)).map(|cpu|format!("processor\t: {cpu}\nmodel name\t: Trames AArch64 interpreter\nCPU architecture: 8\nFeatures\t: {}\n\n",r.cpu_features)).collect::<String>().into_bytes())),
+            b"/proc/cpuinfo" => return Ok(regular(r.cpuinfo())),
             b"/proc/swaps" => return Ok(regular(b"Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n".to_vec())),
             b"/proc/partitions" => return Ok(regular(format!("major minor  #blocks  name\n\n 253 0 {} vda\n 253 1 {} vda1\n",self.capacity().budget_bytes/1024,self.capacity().budget_bytes/1024).into_bytes())),
             b"/proc/devices" => return Ok(regular(b"Character devices:\n  1 mem\n  5 /dev/tty\n136 pts\n\nBlock devices:\n253 virtblk\n".to_vec())),

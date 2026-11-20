@@ -413,6 +413,47 @@ mod published_tests {
         )
     }
     #[test]
+    fn global_proc_text_keeps_read_access_and_rejects_writes_after_open() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(
+            1,
+            RuntimeInfo {
+                cpu_count: 2,
+                cpu_counter_hz: 24_000_000,
+                ..Default::default()
+            },
+        );
+        for path in [
+            b"/proc/cpuinfo".as_slice(),
+            b"/proc/cmdline",
+            b"/proc/filesystems",
+        ] {
+            let fd = v.open_at(AT_FDCWD, path, 2 | O_TRUNC, 0).unwrap();
+            let bytes = v.pread(fd, 2048, 0).unwrap();
+            assert!(!bytes.is_empty());
+            if path == b"/proc/cpuinfo" {
+                assert_eq!(
+                    std::str::from_utf8(&bytes)
+                        .unwrap()
+                        .matches("BogoMIPS\t: 48.00")
+                        .count(),
+                    2
+                );
+            }
+            assert_eq!(v.pwrite(fd, b"x", 0), Err(Errno(5)));
+            assert_eq!(v.pread(fd, 2048, 0).unwrap(), bytes);
+            v.close(fd).unwrap();
+        }
+        assert_eq!(
+            ProcRefresh::for_path(b"/proc/cmdline"),
+            ProcRefresh::Independent
+        );
+        assert_eq!(
+            ProcRefresh::for_path(b"/proc/1/cmdline"),
+            ProcRefresh::Arguments
+        );
+    }
+    #[test]
     fn all_published_global_metadata_uses_the_original_resource_on_source() {
         let mut owner = Vfs::default();
         owner.set_runtime_info(

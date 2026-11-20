@@ -253,7 +253,8 @@ mod tests {
             Err(Errno(30))
         );
         mount.flags.set(mount.flags.get() & !mounts::MS_RDONLY);
-        assert_eq!(v.open_at(AT_FDCWD, b"/proc/stat", 1, 0), Err(Errno(30)));
+        let stat = v.open_at(AT_FDCWD, b"/proc/stat", 1, 0).unwrap();
+        assert_eq!(v.write(stat, b"x"), Err(Errno(5)));
         assert_eq!(
             v.open_at(AT_FDCWD, b"/proc/1/new", 0x41, 0o644),
             Err(Errno(2))

@@ -19,6 +19,7 @@ pub(super) struct Source {
     pub boot_time: u64,
     pub cpus: usize,
     pub features: &'static str,
+    pub counter_hz: u64,
     pub task_limit: usize,
     pub limits: crate::MemoryLimits,
     pub host: Option<Arc<dyn Fn() -> trames_linux::HostMemoryInfo + Send + Sync>>,
@@ -281,6 +282,14 @@ impl ProcSource for Source {
             retained,
             content,
         } = query;
+        if path == b"/proc/cpuinfo" {
+            return RuntimeInfo {
+                cpu_count: self.cpus,
+                cpu_features: self.features,
+                cpu_counter_hz: self.counter_hz,
+                ..Default::default()
+            };
+        }
         // This body consumes only global memory fields. Host-managed memory
         // already has their original provider; no task directory, per-mm pager,
         // process projection or CPU/load sample is a dependency of meminfo.
@@ -404,6 +413,7 @@ impl ProcSource for Source {
             cpu_count: self.cpus,
             task_limit: self.task_limit,
             cpu_features: self.features,
+            cpu_counter_hz: self.counter_hz,
             cpu_user_ticks: per_cpu_ticks.iter().sum(),
             per_cpu_ticks,
             processes,
