@@ -221,6 +221,14 @@ impl LiveEpoll {
             at.ok().map(|i| index[i].1.lock().unwrap().events),
             nested,
         )?;
+        let new_state = || {
+            // A proc change carries EPOLLERR even with an empty interest mask.
+            let change_error = events & 0x80000000 != 0
+                && target
+                    .original_open()
+                    .is_some_and(|open| open.borrow().proc_watch().is_some());
+            events::WatchState::new(events, data, change_error)
+        };
         match (op, at) {
             (1, Ok(_)) => return Err(Errno(17)),
             (2 | 3, Err(_)) => return Err(Errno(2)),
@@ -228,7 +236,7 @@ impl LiveEpoll {
                 index[at].1.lock().unwrap().armed = false;
                 Arc::make_mut(&mut index).remove(at);
             }
-            (3, Ok(at)) => *index[at].1.lock().unwrap() = events::WatchState::new(events, data),
+            (3, Ok(at)) => *index[at].1.lock().unwrap() = new_state(),
             (1, Err(_)) => {
                 if index.len() >= 1024 {
                     Arc::make_mut(&mut index).retain(|w| w.2.live());
@@ -237,14 +245,8 @@ impl LiveEpoll {
                     return Err(Errno(28));
                 }
                 let at = index.binary_search_by_key(&key, |w| w.0).unwrap_err();
-                Arc::make_mut(&mut index).insert(
-                    at,
-                    (
-                        key,
-                        Arc::new(Mutex::new(events::WatchState::new(events, data))),
-                        target,
-                    ),
-                );
+                Arc::make_mut(&mut index)
+                    .insert(at, (key, Arc::new(Mutex::new(new_state())), target));
             }
             _ => unreachable!(),
         }
@@ -310,7 +312,7 @@ pub(super) fn control(
             && t.bridge.is_none()
             && t.pipe.is_none()
             && t.kernel_log.is_none()
-            && t.mount_file.is_none()
+            && t.proc_watch().is_none()
             && !resource_control
             && !t
                 .node
@@ -325,7 +327,7 @@ pub(super) fn control(
         && t.local.is_none()
         && t.pipe.is_none()
         && t.kernel_log.is_none()
-        && t.mount_file.is_none()
+        && t.proc_watch().is_none()
         && !resource_control
         && t.socket.as_ref().and_then(|s| s.poll_epoch()).is_none()
         && !matches!(

@@ -1,48 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Mount-table events share the existing executor's resource subscriptions.
 use super::*;
-use crate::readiness::Readiness;
+use crate::readiness::ProcWatch;
 
-#[derive(Default)]
-pub(crate) struct MountEvents {
-    generation: AtomicU64,
-    pub readiness: Arc<Readiness>,
-}
-impl MountEvents {
-    pub fn changed(&self) {
-        self.generation.fetch_add(1, Ordering::Relaxed);
-        self.readiness.notify_locked();
-    }
-}
-pub(crate) struct MountWatch {
-    events: Arc<MountEvents>,
-    observed: AtomicU64,
-}
-impl MountWatch {
-    pub fn poll(&self, events: u16) -> (u16, [u64; 2]) {
-        let ready = self.peek(events);
-        if events != 0 {
-            self.acknowledge(ready.1[0]);
-        }
-        ready
-    }
-    pub fn peek(&self, events: u16) -> (u16, [u64; 2]) {
-        let generation = self.events.generation.load(Ordering::Relaxed);
-        let changed = self.observed.load(Ordering::Relaxed) != generation;
-        (
-            (events & 0x41) | if changed { 8 | (events & 2) } else { 0 },
-            [generation, 0],
-        )
-    }
-    pub fn acknowledge(&self, generation: u64) {
-        self.observed.store(generation, Ordering::Relaxed);
-    }
-    pub fn subscribe(&self, signal: &Arc<IoSignal>) -> IoSubscription {
-        self.events.readiness.subscribe(signal)
-    }
-}
 pub(crate) struct MountFile {
-    pub watch: Arc<MountWatch>,
+    pub watch: Arc<ProcWatch>,
     snapshot: SharedNamespaceSnapshot,
     info: bool,
     // Open proc mount files pin their original namespace and process root.
@@ -90,15 +52,11 @@ impl Vfs {
             .as_ref()
             .and_then(|(m, n)| Some((m.upgrade()?, n.upgrade()?)));
         let events = namespace.borrow().events.clone();
-        let generation = events.generation.load(Ordering::Relaxed);
         let root_use = root
             .as_ref()
             .map(|(mount, _)| MountUse::new(mount.identity.clone()));
         Some(Arc::new(MountFile {
-            watch: Arc::new(MountWatch {
-                events,
-                observed: AtomicU64::new(generation),
-            }),
+            watch: events.watch(poll_mask::READ_NORMAL),
             snapshot: snapshot.shared(),
             info: key == b"mountinfo",
             _namespace: namespace,

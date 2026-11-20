@@ -340,6 +340,17 @@ impl SharedOpenDescription {
                     .map(|end| end.pair.slave.clone())
             })
     }
+    fn proc_watch(&self) -> Option<&Arc<readiness::ProcWatch>> {
+        if let Some(file) = &self.mount_file {
+            return Some(&file.watch);
+        }
+        match &self.sysctl_control {
+            Some(sysctl::Control::UtsName(_, watch)) if self.flags.get() & O_PATH == 0 => {
+                Some(watch)
+            }
+            _ => None,
+        }
+    }
     fn proc_control(&self) -> bool {
         self.oom.is_some()
             || self.sysctl_control.is_some()
@@ -1321,17 +1332,6 @@ impl Vfs {
         let open = d.open.borrow();
         Self::poll_open(&open, events, pending, self.signal_reader.borrow().as_ref())
     }
-    fn peek_poll_open(
-        o: &OpenDescription,
-        events: u16,
-        pending: u64,
-        reader: Option<&Arc<dyn SignalReader>>,
-    ) -> u16 {
-        o.mount_file.as_ref().map_or_else(
-            || Self::poll_open(o, events, pending, reader),
-            |file| file.watch.peek(events).0,
-        )
-    }
     fn poll_open(
         o: &OpenDescription,
         events: u16,
@@ -1368,8 +1368,8 @@ impl Vfs {
         if let Some(events::SharedControl::Sync(file)) = &o.control {
             return file.poll(events).0;
         }
-        if let Some(file) = &o.mount_file {
-            return file.watch.poll(events).0;
+        if let Some(watch) = o.proc_watch() {
+            return watch.poll(events).0;
         }
         if let Some(end) = &o.pty {
             return end.pair.poll(end.master, events);
@@ -2561,7 +2561,10 @@ impl Vfs {
                 if let Some(mount) = &p.mount {
                     mount.writable_data(node)?;
                 }
-                if let Some(control @ sysctl::Control::UserNamespaces(..)) = &network_control {
+                if let Some(
+                    control @ (sysctl::Control::UserNamespaces(..) | sysctl::Control::UtsName(..)),
+                ) = &network_control
+                {
                     if !control.authorized(&self.credentials, self.lock_owner) {
                         return Err(Errno(13));
                     }
@@ -3308,7 +3311,7 @@ impl Vfs {
         }
         if let Some(control) = &o.sysctl_control {
             let mut position = o.file_position.lock().unwrap();
-            let data = control.read(position.value, count)?;
+            let data = control.read(position.value, count, &self.uts)?;
             position.value += data.len() as u64;
             drop(position);
             o.notify_read(&data);
@@ -3496,19 +3499,16 @@ impl Vfs {
             return Err(Errno(9));
         }
         if let Some(control) = &o.sysctl_control {
-            if matches!(control, sysctl::Control::Comm { .. }) {
-                // Linux comm_write leaves the shared file position unchanged.
-                return control.write(bytes, 0, &self.credentials, self.lock_owner);
-            }
-            let mut position = o.file_position.lock().unwrap();
-            let count = control.write(
-                bytes,
-                offset.unwrap_or(position.value),
-                &self.credentials,
-                self.lock_owner,
-            )?;
-            if offset.is_none() {
-                position.value += count as u64;
+            let count = if let Some(mut explicit) = offset {
+                control.write(bytes, &mut explicit, self)?
+            } else if matches!(control, sysctl::Control::Comm { .. }) {
+                control.write(bytes, &mut 0, self)?
+            } else {
+                control.write(bytes, &mut o.file_position.lock().unwrap().value, self)?
+            };
+            // Wake callbacks may inspect this same open description.
+            if let sysctl::Control::UtsName(domain, _) = control {
+                self.uts.notify_name(*domain);
             }
             return Ok(count);
         }
@@ -3703,7 +3703,7 @@ impl Vfs {
         }
         if let Some(control) = &o.sysctl_control {
             return control
-                .read(offset, count)
+                .read(offset, count, &self.uts)
                 .inspect(|data| o.notify_read(data));
         }
         if let Some(data) = Self::oom_read(&o, offset, count)? {

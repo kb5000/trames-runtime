@@ -491,7 +491,7 @@ pub(super) struct Table {
     root_parent_id: u64,
     pub root: Arc<Mount>,
     pub mounts: Vec<Arc<Mount>>,
-    pub events: Arc<watch::MountEvents>,
+    pub events: Arc<readiness::ProcEvents>,
     pub(super) admin: Arc<admin::Admin>,
     // A query-local topology snapshot is observation, never mutable authority.
     // Accepted nsfs opens upgrade this original resource instead.

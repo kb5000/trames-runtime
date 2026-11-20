@@ -7,6 +7,7 @@ pub(super) const MAX_USER_NAMESPACES: &[u8] = b"/proc/sys/user/max_user_namespac
 pub(super) enum Control {
     Network(network::Control),
     NrOpen(DescriptorCeiling),
+    UtsName(bool, Arc<readiness::ProcWatch>),
     MountMax(Arc<mounts::MountPolicy>),
     Comm {
         task: Arc<dyn ProcTask>,
@@ -18,6 +19,7 @@ pub(super) enum Control {
 impl Control {
     pub fn reopen(&self, credentials: &Credentials) -> Self {
         match self {
+            Self::UtsName(domain, watch) => Self::UtsName(*domain, watch.reopen()),
             Self::UserMap(control) => Self::UserMap(Arc::new(control.reopen(credentials))),
             _ => self.clone(),
         }
@@ -27,6 +29,7 @@ impl Control {
             Self::Comm { task, thread_entry } => {
                 *thread_entry && task.comm().is_some_and(|(group, _)| group == tgid)
             }
+            Self::UtsName(..) => credentials.euid == 0,
             Self::UserMap(control) => control.authorized(credentials),
             Self::Network(control) => control.authorized(credentials),
             Self::UserNamespaces(owner, _) => {
@@ -39,13 +42,19 @@ impl Control {
             }
         }
     }
-    pub fn read(&self, offset: u64, count: usize) -> Result<Vec<u8>> {
+    pub fn read(&self, offset: u64, count: usize, uts: &UtsNamespace) -> Result<Vec<u8>> {
         let value = match self {
             Self::Comm { task, .. } => {
                 let (_, name) = task.comm().ok_or(Errno(3))?;
                 let mut bytes = name.get();
                 bytes.push(b'\n');
                 return Ok(slice(&bytes, offset, count));
+            }
+            Self::UtsName(domain, _) => {
+                let mut name = uts.name(*domain);
+                name.truncate(name.iter().position(|&b| b == 0).unwrap_or(name.len()));
+                name.push(b'\n');
+                return Ok(slice(&name, offset, count));
             }
             Self::UserMap(control) => return control.read(offset, count),
             Self::Network(control) => return control.read(offset, count),
@@ -56,14 +65,18 @@ impl Control {
         let bytes = format!("{value}\n").into_bytes();
         Ok(slice(&bytes, offset, count))
     }
-    pub fn write(
-        &self,
-        bytes: &[u8],
-        offset: u64,
-        credentials: &Credentials,
-        tgid: u32,
-    ) -> Result<usize> {
-        match self {
+    pub fn write(&self, bytes: &[u8], position: &mut u64, caller: &Vfs) -> Result<usize> {
+        let offset = *position;
+        let credentials = &caller.credentials;
+        let tgid = caller.lock_owner;
+        let n = match self {
+            Self::UtsName(domain, _) => {
+                if !self.authorized(credentials, tgid) {
+                    return Err(Errno(13));
+                }
+                caller.uts.write_sysctl(*domain, bytes, position);
+                return Ok(bytes.len());
+            }
             Self::Comm { task, .. } => {
                 let (group, name) = task.comm().ok_or(Errno(3))?;
                 if group != tgid {
@@ -71,7 +84,7 @@ impl Control {
                 }
                 let bytes_to_copy = &bytes[..bytes.len().min(15)];
                 name.set(bytes_to_copy.split(|b| *b == 0).next().unwrap_or_default());
-                Ok(bytes.len())
+                return Ok(bytes.len());
             }
             Self::UserMap(control) => control.write(bytes, offset, credentials),
             Self::Network(control) => control.write(bytes, offset, control.authorized(credentials)),
@@ -98,7 +111,9 @@ impl Control {
                 }
                 Ok(bytes.len())
             }
-        }
+        }?;
+        *position += n as u64;
+        Ok(n)
     }
 }
 fn slice(bytes: &[u8], offset: u64, count: usize) -> Vec<u8> {
@@ -109,6 +124,14 @@ fn slice(bytes: &[u8], offset: u64, count: usize) -> Vec<u8> {
 }
 impl Vfs {
     pub(super) fn sysctl_control(&self, path: &ResolvedPath) -> Option<Control> {
+        let domain = match path.as_ref() {
+            b"/proc/sys/kernel/hostname" => Some(false),
+            b"/proc/sys/kernel/domainname" => Some(true),
+            _ => None,
+        };
+        if let Some(domain) = domain.filter(|_| self.uses_pseudo(path)) {
+            return Some(Control::UtsName(domain, self.uts.watch_name(domain)));
+        }
         if path.ends_with(b"/comm") && self.uses_pseudo(path) {
             let rest = path.strip_prefix(b"/proc/")?;
             let mut parts = rest.split(|b| *b == b'/');
@@ -153,5 +176,105 @@ impl Vfs {
         } else {
             self.network_control(path).map(Control::Network)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HOST: &[u8] = b"/proc/sys/kernel/hostname";
+    const DOMAIN: &[u8] = b"/proc/sys/kernel/domainname";
+
+    #[test]
+    fn uts_sysctl_offsets_and_change_cursors_follow_open_descriptions() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, RuntimeInfo::default());
+        let fd = v.open_at(AT_FDCWD, HOST, 2, 0).unwrap();
+        let alias = v.dup(fd, 0, false).unwrap();
+        let independent = v.open_at(AT_FDCWD, HOST, 0, 0).unwrap();
+        let domain = v.open_at(AT_FDCWD, DOMAIN, 0, 0).unwrap();
+
+        assert_eq!(v.poll(fd, 0x145), 0x145);
+        assert_eq!(v.write(fd, b"co"), Ok(2));
+        assert_eq!(v.write(alias, b"dex\nignored"), Ok(11));
+        assert_eq!(v.uts_name(false), b"codex");
+        assert_eq!(v.pread(fd, 2, 4).unwrap(), b"x\n");
+        assert_eq!(v.poll(alias, 0x147), 0x4b);
+        assert_eq!(v.poll(fd, 0), 0);
+        assert_eq!(v.poll(independent, 0), 8);
+        assert_eq!(v.poll(independent, 0), 0);
+        assert_eq!(v.poll(domain, 0), 0);
+
+        // Linux consumes the input count for a write past the string, while
+        // keeping the shared offset and the name in place.
+        assert_eq!(v.write(alias, b"more"), Ok(4));
+        assert_eq!(v.seek(fd, 0, 1), Ok(13));
+        assert_eq!(v.uts_name(false), b"codex");
+        assert_eq!(v.pwrite(fd, b"X\0Y", 2), Ok(3));
+        assert_eq!(v.uts_name(false), b"coX");
+        assert_eq!(v.pwrite(fd, &[b'z'; 70], 0), Ok(70));
+        assert_eq!(v.uts_name(false), vec![b'z'; 64]);
+
+        let fresh = v.open_at(AT_FDCWD, HOST, 0, 0).unwrap();
+        assert_eq!(v.poll(fresh, 0), 0);
+        v.credentials.euid = 1000;
+        assert_eq!(v.open_at(AT_FDCWD, HOST, 2, 0), Err(Errno(13)));
+        assert_eq!(v.pwrite(fd, b"denied", 0), Err(Errno(13)));
+        assert_eq!(v.poll(fresh, 0), 0);
+    }
+
+    #[test]
+    fn uts_epoll_error_has_a_new_edge_for_each_change() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, RuntimeInfo::default());
+        let fd = v.open_at(AT_FDCWD, HOST, 0, 0).unwrap();
+        let ep = v.epoll_create(0).unwrap();
+        v.epoll_ctl(ep, 1, fd, 0x80000000, 17).unwrap();
+        for _ in 0..3 {
+            v.set_uts_name(false, b"same").unwrap();
+            assert_eq!(v.epoll_wait(ep, 1, |_, _| Ok(None)).unwrap(), [(8, 17)]);
+        }
+        assert!(v.epoll_wait(ep, 1, |_, _| Ok(None)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn inherited_uts_fd_uses_callers_namespace_and_guest_wide_table_events() {
+        let mut parent = Vfs::default();
+        parent.set_runtime_info(1, RuntimeInfo::default());
+        let fd = parent.open_at(AT_FDCWD, HOST, 2, 0).unwrap();
+        let mut child = parent.clone();
+        child.unshare_uts().unwrap();
+        let target = child
+            .shared_files()
+            .lookup(fd)
+            .unwrap()
+            .unwrap()
+            .file_target()
+            .unwrap();
+        let work = FileWork::from_vfs(
+            &child,
+            target,
+            FileCommand::Write {
+                bytes: b"child".to_vec(),
+                offset: Some(0),
+            },
+        );
+        let FileOutcome::Complete(reply) = std::thread::spawn(move || work.run()).join().unwrap()
+        else {
+            panic!("UTS write did not complete on the worker");
+        };
+        assert!(matches!(reply.result, Ok(FileValue::Count(5))));
+        assert_eq!(child.pread(fd, 64, 0).unwrap(), b"child\n");
+        assert_eq!(parent.pread(fd, 64, 0).unwrap(), b"trames\n");
+        assert_eq!(parent.poll(fd, 2), 10);
+        assert_eq!(child.poll(fd, 2), 0);
+
+        let mut other = Vfs::default();
+        other.set_runtime_info(1, RuntimeInfo::default());
+        let unrelated = other.open_at(AT_FDCWD, HOST, 0, 0).unwrap();
+        child.set_uts_name(false, b"again").unwrap();
+        assert_eq!(other.poll(unrelated, 0), 0);
+        assert_eq!(parent.poll(fd, 0), 8);
     }
 }

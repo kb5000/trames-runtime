@@ -809,6 +809,9 @@ impl PathQueries {
             .map_or(&original.fs, |mount| &mount.fs)
             .clone();
         let mut view = Vfs::empty(fs);
+        if matches!(open.sysctl_control, Some(sysctl::Control::UtsName(..))) {
+            view.uts = original.uts.clone();
+        }
         view.credentials = original.credentials.clone();
         view.file_size_limit = original.file_size_limit.clone();
         view.query = Some(original.query.as_ref().map_or_else(

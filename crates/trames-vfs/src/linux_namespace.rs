@@ -101,15 +101,22 @@ impl Drop for CgroupNamespace {
     }
 }
 
+#[derive(Default)]
+struct UtsFamily {
+    live: std::sync::atomic::AtomicUsize,
+    // The kernel has one poll counter per sysctl table entry. Names themselves
+    // belong to each UTS namespace, notifications span this guest kernel.
+    changes: [std::sync::OnceLock<Arc<readiness::ProcEvents>>; 2],
+}
 struct Uts {
     pub(super) user_namespace: UserNamespace,
     inode: u64,
     names: std::sync::Mutex<[Vec<u8>; 2]>,
-    live: Arc<std::sync::atomic::AtomicUsize>,
+    family: Arc<UtsFamily>,
 }
 impl Drop for Uts {
     fn drop(&mut self) {
-        self.live.fetch_sub(1, Ordering::Relaxed);
+        self.family.live.fetch_sub(1, Ordering::Relaxed);
     }
 }
 #[derive(Clone)]
@@ -121,29 +128,31 @@ impl Default for UtsNamespace {
     }
 }
 impl UtsNamespace {
-    fn new(names: [Vec<u8>; 2], live: Arc<std::sync::atomic::AtomicUsize>) -> Result<Self> {
-        Self::with_owner(names, live, UserNamespace::default())
+    fn new(names: [Vec<u8>; 2], family: Arc<UtsFamily>) -> Result<Self> {
+        Self::with_owner(names, family, UserNamespace::default())
     }
     fn with_owner(
         names: [Vec<u8>; 2],
-        live: Arc<std::sync::atomic::AtomicUsize>,
+        family: Arc<UtsFamily>,
         user_namespace: UserNamespace,
     ) -> Result<Self> {
-        live.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-            (n < MAX_NAMESPACES).then_some(n + 1)
-        })
-        .map_err(|_| Errno(28))?;
+        family
+            .live
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n < MAX_NAMESPACES).then_some(n + 1)
+            })
+            .map_err(|_| Errno(28))?;
         let inode = NEXT_INODE
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| {
-                live.fetch_sub(1, Ordering::Relaxed);
+                family.live.fetch_sub(1, Ordering::Relaxed);
                 Errno(28)
             })?;
         Ok(Self(Arc::new(Uts {
             user_namespace,
             inode,
             names: std::sync::Mutex::new(names),
-            live,
+            family,
         })))
     }
     pub fn id(&self) -> u64 {
@@ -152,10 +161,37 @@ impl UtsNamespace {
     pub fn name(&self, domain: bool) -> Vec<u8> {
         self.0.names.lock().unwrap()[usize::from(domain)].clone()
     }
+    pub(super) fn watch_name(&self, domain: bool) -> Arc<readiness::ProcWatch> {
+        self.0.family.changes[usize::from(domain)]
+            .get_or_init(Default::default)
+            .watch(poll_mask::READ_NORMAL | poll_mask::WRITE_NORMAL)
+    }
+    pub(super) fn notify_name(&self, domain: bool) {
+        if let Some(events) = self.0.family.changes[usize::from(domain)].get() {
+            events.changed();
+        }
+    }
+    pub(super) fn write_sysctl(&self, domain: bool, bytes: &[u8], offset: &mut u64) {
+        let mut names = self.0.names.lock().unwrap();
+        let name = &mut names[usize::from(domain)];
+        let len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+        if !bytes.is_empty() && *offset <= len as u64 {
+            name.truncate(*offset as usize);
+            let room = 64 - name.len();
+            name.extend(
+                bytes
+                    .iter()
+                    .copied()
+                    .take(room)
+                    .take_while(|&b| b != 0 && b != b'\n'),
+            );
+            *offset += bytes.len() as u64;
+        }
+    }
     fn copy(&self, owner: UserNamespace) -> Result<Self> {
         Self::with_owner(
             self.0.names.lock().unwrap().clone(),
-            self.0.live.clone(),
+            self.0.family.clone(),
             owner,
         )
     }
@@ -182,6 +218,7 @@ impl UtsAccess {
             return Err(Errno(22));
         }
         self.namespace.0.names.lock().unwrap()[usize::from(domain)] = name.to_vec();
+        self.namespace.notify_name(domain);
         Ok(())
     }
 }
@@ -1014,7 +1051,7 @@ mod tests {
         let mut v = Vfs::default();
         let root = v.uts_capability();
         let old = v.namespace_snapshot().uts;
-        let quota = v.uts.0.live.clone();
+        let quota = v.uts.0.family.clone();
         v.unshare_uts().unwrap();
         let isolated = v.uts_capability();
         std::thread::scope(|scope| {
@@ -1023,7 +1060,7 @@ mod tests {
         });
         assert_eq!(v.uts_name(false), b"private-worker");
         assert_eq!(root.names()[0], b"original-worker");
-        assert_eq!(quota.load(Ordering::Relaxed), 2);
+        assert_eq!(quota.live.load(Ordering::Relaxed), 2);
         v.credentials = Credentials::user(1000, 1000);
         let denied = v.uts_capability();
         std::thread::spawn(move || {
@@ -1033,10 +1070,10 @@ mod tests {
         .join()
         .unwrap();
         assert!(old.upgrade().is_none());
-        assert_eq!(quota.load(Ordering::Relaxed), 1);
+        assert_eq!(quota.live.load(Ordering::Relaxed), 1);
         drop(v);
         std::thread::spawn(move || drop(isolated)).join().unwrap();
-        assert_eq!(quota.load(Ordering::Relaxed), 0);
+        assert_eq!(quota.live.load(Ordering::Relaxed), 0);
     }
     #[test]
     fn concurrent_namespace_reservations_do_not_exceed_quota() {
@@ -1066,7 +1103,7 @@ mod tests {
             .iter()
             .filter_map(|r| r.as_ref().err())
             .all(|e| *e == Errno(28)));
-        assert_eq!(ns.0.live.load(Ordering::Relaxed), MAX_NAMESPACES);
+        assert_eq!(ns.0.family.live.load(Ordering::Relaxed), MAX_NAMESPACES);
         std::thread::spawn(move || drop(results)).join().unwrap();
         assert!(ns.copy(ns.0.user_namespace.clone()).is_ok());
     }

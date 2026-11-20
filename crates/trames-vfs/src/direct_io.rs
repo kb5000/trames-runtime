@@ -267,7 +267,7 @@ enum ByteResource {
     Cgroup(Arc<cgroup::CgroupFile>, Option<cgroup::CgroupAccess>),
     TcpPoll(trames_net::TcpPoll),
     SocketPoll(std::sync::Weak<NetSocket>),
-    Mounts(Arc<mounts::watch::MountWatch>),
+    ProcWatch(Arc<readiness::ProcWatch>),
     Regular,
     Bpf,
     SimpleDevice(simple_device::Kind),
@@ -559,8 +559,8 @@ impl DirectFd {
     pub(super) fn shared_byte(open: &SharedOpenDescription) -> Option<Self> {
         let resource = if let Some(console) = open.console.get() {
             ByteResource::Console(console.clone())
-        } else if let Some(file) = &open.mount_file {
-            ByteResource::Mounts(file.watch.clone())
+        } else if let Some(watch) = open.proc_watch() {
+            ByteResource::ProcWatch(watch.clone())
         } else if let Some(log) = &open.kernel_log {
             ByteResource::Kmsg(log.clone())
         } else if let Some(bridge) = &open.bridge {
@@ -816,7 +816,7 @@ impl DirectFd {
                 signal,
             )],
             ByteResource::Tun(file) => file.subscribe(signal).into_iter().collect(),
-            ByteResource::Mounts(watch) => vec![watch.subscribe(signal)],
+            ByteResource::ProcWatch(watch) => vec![watch.subscribe(signal)],
             ByteResource::MessageQueue(q) => vec![q.subscribe(signal)],
             ByteResource::Cgroup(file, _) => vec![file.subscribe(signal)],
             ByteResource::Bpf
@@ -898,8 +898,8 @@ impl DirectFd {
     pub(super) fn snapshot(open: &OpenDescription) -> Option<Self> {
         let resource = if let Some(console) = open.console.get() {
             ByteResource::Console(console.clone())
-        } else if let Some(file) = &open.mount_file {
-            ByteResource::Mounts(file.watch.clone())
+        } else if let Some(watch) = open.proc_watch() {
+            ByteResource::ProcWatch(watch.clone())
         } else if let Some(log) = &open.kernel_log {
             ByteResource::Kmsg(log.clone())
         } else if let Some(bridge) = &open.bridge {
@@ -963,9 +963,9 @@ impl DirectFd {
         if let Some(fd) = Self::snapshot_tcp_poll(open) {
             return Some(fd);
         }
-        if let Some(file) = &open.mount_file {
+        if let Some(watch) = open.proc_watch() {
             return Some(Self {
-                resource: ByteResource::Mounts(file.watch.clone()),
+                resource: ByteResource::ProcWatch(watch.clone()),
                 flags: open.flags.get(),
                 status: open.flags.clone(),
                 _file: None,
@@ -996,7 +996,7 @@ impl DirectFd {
                 | ByteResource::PollOnly(_)
                 | ByteResource::Bpf
                 | ByteResource::Regular
-                | ByteResource::Mounts(_)
+                | ByteResource::ProcWatch(_)
         )
     }
     pub fn poll_resources(&self) -> Vec<Arc<dyn DirectPoll>> {
@@ -1297,13 +1297,10 @@ impl DirectFd {
         }
     }
     fn poll(&self, events: u16) -> (u16, [u64; 2]) {
-        let ready = self.peek_poll(events);
-        if let ByteResource::Mounts(watch) = &self.resource {
-            if events != 0 {
-                watch.acknowledge(ready.1[0]);
-            }
+        if let ByteResource::ProcWatch(watch) = &self.resource {
+            return watch.poll(events);
         }
-        ready
+        self.peek_poll(events)
     }
     pub(super) fn peek_poll(&self, events: u16) -> (u16, [u64; 2]) {
         match &self.resource {
@@ -1317,7 +1314,7 @@ impl DirectFd {
             }),
             ByteResource::MessageQueue(q) => q.poll(events),
             ByteResource::Tun(file) => file.poll(events),
-            ByteResource::Mounts(watch) => watch.peek(events),
+            ByteResource::ProcWatch(watch) => watch.peek(events),
             ByteResource::Bpf => (0, [0; 2]),
             ByteResource::Regular | ByteResource::SimpleDevice(_) | ByteResource::Device(_) => (
                 events & (poll_mask::READ_NORMAL | poll_mask::WRITE_NORMAL),
@@ -1404,7 +1401,7 @@ impl DirectFd {
         }
     }
     pub(super) fn acknowledge(&self, epoch: [u64; 2]) {
-        if let ByteResource::Mounts(watch) = &self.resource {
+        if let ByteResource::ProcWatch(watch) = &self.resource {
             watch.acknowledge(epoch[0]);
         }
     }
@@ -1629,7 +1626,7 @@ impl DirectFd {
             | ByteResource::Bpf
             | ByteResource::Regular
             | ByteResource::UnixControl(_)
-            | ByteResource::Mounts(_) => Err(Errno(22)),
+            | ByteResource::ProcWatch(_) => Err(Errno(22)),
             ByteResource::Pipe { data, read, .. } => {
                 if !read {
                     return Some(Err(Errno(9)));
@@ -1729,7 +1726,7 @@ impl DirectFd {
                 .upgrade()
                 .map_or(Err(Errno(9)), |b| b.write(bytes).map_err(Errno)),
             ByteResource::SimpleDevice(_) => unreachable!("typed device write"),
-            ByteResource::Mounts(_) => Err(Errno(22)),
+            ByteResource::ProcWatch(_) => Err(Errno(22)),
             ByteResource::Event(counter) => counter.write(bytes),
             ByteResource::Epoll(_)
             | ByteResource::TcpPoll(_)

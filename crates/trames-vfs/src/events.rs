@@ -102,15 +102,17 @@ pub(super) struct WatchState {
     pub events: u32,
     pub data: u64,
     pub armed: bool,
+    proc_change_error: bool,
     last_ready: u16,
     last_epoch: [u64; 2],
 }
 impl WatchState {
-    pub(super) fn new(events: u32, data: u64) -> Self {
+    pub(super) fn new(events: u32, data: u64, proc_change_error: bool) -> Self {
         Self {
             events,
             data,
             armed: true,
+            proc_change_error,
             last_ready: 0,
             last_epoch: [0; 2],
         }
@@ -118,6 +120,7 @@ impl WatchState {
     pub fn ready(&self, ready: u16, epoch: [u64; 2]) -> bool {
         self.events & 0x80000000 == 0
             || poll_mask::new_edges(ready, self.last_ready, epoch, self.last_epoch) != 0
+            || ready & 8 != 0 && self.proc_change_error && epoch[0] != self.last_epoch[0]
     }
     pub fn observe(&mut self, ready: u16, epoch: [u64; 2]) -> Option<(u32, u64)> {
         if !self.armed {
@@ -195,10 +198,7 @@ impl Anonymous {
                             return Ok(None);
                         };
                         let open = open.borrow();
-                        Ok(Some((
-                            Vfs::peek_poll_open(&open, requested, pending, reader),
-                            Vfs::poll_epoch_with(&open, reader),
-                        )))
+                        Ok(Some(Vfs::peek_poll_open(&open, requested, pending, reader)))
                     })
                     .is_ok_and(|ready| ready.is_some())
                 }) {
@@ -339,6 +339,22 @@ impl Vfs {
     pub(super) fn poll_epoch(o: &OpenDescription) -> [u64; 2] {
         Self::poll_epoch_with(o, None)
     }
+    fn peek_poll_open(
+        o: &OpenDescription,
+        events: u16,
+        pending: u64,
+        reader: Option<&Arc<dyn SignalReader>>,
+    ) -> (u16, [u64; 2]) {
+        o.proc_watch().map_or_else(
+            || {
+                (
+                    Self::poll_open(o, events, pending, reader),
+                    Self::poll_epoch_with(o, reader),
+                )
+            },
+            |watch| watch.peek(events),
+        )
+    }
     fn poll_epoch_with(o: &OpenDescription, reader: Option<&Arc<dyn SignalReader>>) -> [u64; 2] {
         if let Some(SharedControl::MessageQueue(q)) = &o.control {
             return q.poll(0).1;
@@ -365,8 +381,8 @@ impl Vfs {
         if let Some(SharedControl::Cgroup(file)) = &o.control {
             return file.poll(0).1;
         }
-        if let Some(file) = &o.mount_file {
-            return file.watch.poll(0).1;
+        if let Some(watch) = o.proc_watch() {
+            return watch.peek(0).1;
         }
         if let Some(log) = &o.kernel_log {
             return log.poll(0).1;
@@ -460,9 +476,11 @@ impl Vfs {
             }
         }
         let reader = self.signal_reader.borrow();
-        Ok(Some((
-            Self::peek_poll_open(&open, events, pending, reader.as_ref()),
-            Self::poll_epoch_with(&open, reader.as_ref()),
+        Ok(Some(Self::peek_poll_open(
+            &open,
+            events,
+            pending,
+            reader.as_ref(),
         )))
     }
     pub fn epoll_ready_signals(
@@ -513,8 +531,8 @@ impl Vfs {
                 })?
             {
                 if let Some(open) = target.original_open() {
-                    if let Some(file) = &open.borrow().mount_file {
-                        file.watch.acknowledge(epoch[0]);
+                    if let Some(watch) = open.borrow().proc_watch() {
+                        watch.acknowledge(epoch[0]);
                     }
                 }
                 result.push(event);

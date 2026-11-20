@@ -3,6 +3,67 @@
 pub(super) use trames_shared::Readiness;
 pub use trames_shared::{IoSignal, IoSubscription, IoWake};
 
+use crate::poll_mask;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+
+/// A proc table's change counter is shared by all opens. Each open file
+/// description owns its cursor; dup shares it and a new open starts current.
+#[derive(Default)]
+pub(crate) struct ProcEvents {
+    generation: AtomicU64,
+    readiness: Arc<Readiness>,
+}
+
+impl ProcEvents {
+    pub fn changed(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        self.readiness.notify_atomic();
+    }
+    pub fn watch(self: &Arc<Self>, normal: u16) -> Arc<ProcWatch> {
+        Arc::new(ProcWatch {
+            events: self.clone(),
+            observed: AtomicU64::new(self.generation.load(Ordering::Relaxed)),
+            normal,
+        })
+    }
+}
+
+pub(crate) struct ProcWatch {
+    events: Arc<ProcEvents>,
+    observed: AtomicU64,
+    normal: u16,
+}
+impl ProcWatch {
+    pub fn reopen(&self) -> Arc<Self> {
+        self.events.watch(self.normal)
+    }
+    pub fn poll(&self, interest: u16) -> (u16, [u64; 2]) {
+        let ready = self.peek(interest);
+        self.acknowledge(ready.1[0]);
+        ready
+    }
+    pub fn peek(&self, interest: u16) -> (u16, [u64; 2]) {
+        let generation = self.events.generation.load(Ordering::Relaxed);
+        let mask = if generation == self.observed.load(Ordering::Relaxed) {
+            interest & self.normal
+        } else {
+            (interest & (poll_mask::READ_NORMAL | 2)) | 8
+        };
+        (mask, [generation, 0])
+    }
+    pub fn acknowledge(&self, generation: u64) {
+        if self.observed.load(Ordering::Relaxed) < generation {
+            self.observed.fetch_max(generation, Ordering::Relaxed);
+        }
+    }
+    pub fn subscribe(&self, signal: &Arc<IoSignal>) -> IoSubscription {
+        self.events.readiness.subscribe(signal)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
