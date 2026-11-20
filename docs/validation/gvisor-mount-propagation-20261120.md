@@ -15,7 +15,9 @@ The Mac hardware executor ran all 158 original cases from mount and mount_fd in 
 
 The seven previous failures and the previously skipped MountMax case also passed under the iPad interpreter on the Mac. The iOS ARM64 FFI build passed. No physical iPad run was performed. A VFS regression exercises a lower ceiling than the existing tree, subsequent increases through a sibling namespace and rejection of a zero limit.
 
-The cumulative inventory carries forward cases outside these two suites. Its 3,163 entries contain 2,857 passes, 161 failures, 117 skips, 25 timeouts, two missing results and one fixture failure.
+A further 114 cases in chroot, pivot_root, statfs and overlay produced identical case-by-case results on 14cfa30 and 40e45d2 (86 passed, 20 failed, seven skipped, one missing result). Both versions failed ChrootTest.ProcMemSelfMapsNoEscapeProcOpen, which an older inventory had marked as passing. File-backed mapping names in /proc/self/maps can retain the guest path prefix outside the current chroot. The two-version comparison corrects that historical entry.
+
+After refreshing all 272 results and carrying forward the others, the cumulative 3,163 entries contain 2,856 passes, 162 failures, 117 skips, 25 timeouts, two missing results and one fixture failure. Shared runtime CI passed 8/8 steps and Mac product CI passed 14/14 steps on the tested implementation.
 
 ## Main-path performance
 
