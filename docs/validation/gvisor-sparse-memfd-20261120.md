@@ -12,9 +12,13 @@ Quota accounting tracks contiguous ranges of touched pages. A guest can request 
 
 ## Compatibility and scope
 
-Mac hardware execution reran all 202 selected upstream cases across memfd, fallocate, truncate, pread64, pwrite64, mmap and madvise. Original XML confirms 200 passes and two skips. Pread64Test.Overflow changed from failing at ftruncate to passing the complete test. Every other selected case retained its previous classification. The cumulative 3,240-case inventory contains 3,018 passes, 112 failures, 83 skips, 25 timeouts, one fixture failure and one missing result.
+The Mac hardware executor reran all 202 selected upstream cases across memfd, fallocate, truncate, pread64, pwrite64, mmap and madvise. Original XML confirms 201 passes and one skip. Pread64Test.Overflow changed from failing at ftruncate to passing the entire test. MemfdTest.TmpfsFilesHaveSealSeal previously skipped because the test directory was on the guest root filesystem. Moving it to tmpfs exposed EINVAL on F_GET_SEALS. Named tmpfs regular files now report F_SEAL_SEAL, reject further sealing with EPERM, and remain writable across unlink. The seal query uses the open file's retained mount.
 
-The Mac-hosted iPad interpreter ran the overflow case and the 21-case memfd suite. Original XML confirms 21 passes and one upstream skip because the test directory is on a different filesystem than tmpfs. An independent ARM64 guest program verified a zero initial block count after maximum-size extension, tail reads and writes, shared mmap coherence across the 1 TiB boundary, and zeroes after shrinking and regrowing the file on both executors. The iPad FFI compiled for aarch64-apple-ios. Physical iPad execution was outside this batch.
+The harness mounts a private tmpfs as the memfd suite's working directory on native Linux and Trames. Reference and candidate both executed all 21 memfd cases successfully. Results from the old fixture cannot satisfy the new plan's cache key. Original XML stays on the test store for collection. AllocateTest.FallocateKeepSize still skips on the default test filesystem. It passed separately on tmpfs on both Trames executors.
+
+The cumulative 3,240-case inventory contains 3,019 passes, 112 failures, 82 skips, 25 timeouts, one fixture failure and one missing result. Other suites retain their previous evidence.
+
+The Mac-hosted iPad interpreter passed the overflow case, all 21 memfd cases and the tmpfs keep-size allocation test. An independent ARM64 guest program verified a zero initial block count after maximum-size extension, tail reads and writes, shared mmap coherence across the 1 TiB boundary, and zeroes after shrink and regrowth on both executors. The iPad FFI compiled for aarch64-apple-ios. Physical iPad execution was outside this batch.
 
 ## Performance
 
@@ -22,14 +26,14 @@ Both Mac runners used the same guest environment for each workload with alternat
 
 | Workload | Before (ms) | After (ms) | Elapsed time change |
 | --- | ---: | ---: | ---: |
-| memfd_hot_pwrite_4k | 44.01 | 43.97 | -0.09% |
-| memfd_hot_pread_4k | 34.39 | 34.27 | -0.34% |
-| memory | 177.01 | 175.44 | -0.89% |
-| mmap_fault_unmap | 133.81 | 131.90 | -1.43% |
-| file_pread_pwrite | 94.47 | 93.94 | -0.57% |
-| fork_wait | 19.37 | 19.53 | +0.83% |
-| getuid | 103.51 | 103.60 | +0.09% |
-| ordinary_stat | 19.09 | 18.97 | -0.62% |
-| ordinary_open | 73.71 | 73.76 | +0.07% |
+| memfd_hot_pwrite_4k | 45.04 | 45.96 | +2.05% |
+| memfd_hot_pread_4k | 34.64 | 35.21 | +1.65% |
+| memory | 174.17 | 175.05 | +0.51% |
+| mmap_fault_unmap | 132.57 | 132.96 | +0.29% |
+| file_pread_pwrite | 94.39 | 95.10 | +0.76% |
+| fork_wait | 19.32 | 19.07 | -1.30% |
+| getuid | 102.54 | 103.42 | +0.85% |
+| ordinary_stat | 18.97 | 19.13 | +0.85% |
+| ordinary_open | 72.71 | 73.69 | +1.35% |
 
-Local XML, independent guest probes and timing samples are under `target/gvisor-sparse-shm-20261120` in the iPad worktree.
+A separate 32-pair repeat of the two memfd workloads measured −0.76% for writes and +0.40% for reads. Local XML, independent guest probes and timing samples are under `target/gvisor-sparse-shm-20261120` in the iPad worktree. The native Linux reference XML is under `target/local-ci/io/gvisor-sparse-memfd-native-20261120`.

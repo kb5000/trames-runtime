@@ -159,6 +159,16 @@ mod tests {
         u64::from_le_bytes(v.stat_fd(fd).unwrap()[64..72].try_into().unwrap()) / 8
     }
     #[test]
+    fn named_tmpfs_files_keep_the_default_seal_after_unlink() {
+        let (mut v, fd) = mount(4);
+        assert_eq!(v.seals(fd, None), Ok(1));
+        assert_eq!(v.seals(fd, Some(8)), Err(Errno(1)));
+        v.unlink_at(AT_FDCWD, b"/tmp/file", false).unwrap();
+        assert_eq!(v.seals(fd, None), Ok(1));
+        assert_eq!(v.pwrite(fd, b"x", 0), Ok(1));
+    }
+
+    #[test]
     fn tmpfs_sparse_ranges_survive_unlink_and_overlapping_reservations() {
         let (mut v, fd) = mount(4);
         let far = 1 << 40;

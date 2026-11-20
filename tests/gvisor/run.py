@@ -78,6 +78,13 @@ def suite_flags(suite):
     # fixture otherwise skips all setgid cases on a single-group rootfs.
     return ['--groups=0,1'] if suite == 'setgid' else []
 
+def guest_test_work(suite):
+    if suite == 'memfd':
+        # Keep the original XML on persistent storage for the later export.
+        return 'mkdir -p "$1/tmpfs"; mount -t tmpfs -o mode=1777 tmpfs "$1/tmpfs"; cd "$1/tmpfs"; export TEST_TMPDIR="$PWD"; '
+    return 'mkdir -p "$1"; cd "$1"; export TEST_TMPDIR="$1"; '
+
+
 def guest_terminal(suite, wrapper):
     if suite == 'host_pty':
         # Keep an inherited copy even when the shell backgrounds the test and
@@ -149,7 +156,7 @@ def reuse_rows(args, plan):
     old = {s['name']:s['sha256'] for s in previous['suites']}
     if old != {s['name']:s['sha256'] for s in plan['suites']}:
         raise RuntimeError('Cannot reuse results from different binaries')
-    for key in ['kernel','uid','runtime_sha256','nofile','network','cpus','rootfs_sha256','runfiles_sha256','process_context','native_init_sha256','fresh_store','host_pty_fixture','setgid_fixture']:
+    for key in ['kernel','uid','runtime_sha256','nofile','network','cpus','rootfs_sha256','runfiles_sha256','process_context','native_init_sha256','fresh_store','host_pty_fixture','setgid_fixture','memfd_tmpfs_fixture']:
         if key in plan and previous.get(key) != plan[key]:
             raise RuntimeError('Cannot reuse results with a different '+key)
     return {(r['suite'],r['case']):dict(r,reused_from=str(args.reuse.resolve()/'logs'/(r.get('log_stem') or str(i))))
@@ -195,6 +202,8 @@ def native(args, output):
         plan['host_pty_fixture'] = True
     if any(s['name'] == 'setgid' for s in plan['suites']):
         plan['setgid_fixture'] = suite_flags('setgid')
+    if any(s['name'] == 'memfd' for s in plan['suites']):
+        plan['memfd_tmpfs_fixture'] = True
     save(output/'plan.json', plan)
     cache=reuse_rows(args,plan)
     rows = []
@@ -216,9 +225,13 @@ def native(args, output):
                 work = temp / str(index)
                 work.mkdir()
                 xml = output / 'logs' / (str(index) + '.xml')
+                fixture = []
+                if suite['name'] == 'memfd':
+                    # unshare creates a fresh mount namespace for this case.
+                    fixture = ['/bin/sh', '-ec', 'mount -t tmpfs -o mode=1777 tmpfs "$TEST_TMPDIR"; cd "$TEST_TMPDIR"; exec "$@"', 'gvisor-memfd']
                 argv = ['unshare', '--mount', '--uts', '--ipc', '--net', '--pid', '--fork', '--kill-child=KILL', '--mount-proc',
                         '--', *([str(args.native_init)] if args.native_init else []), '/usr/bin/env', '-u', 'TEST_ON_GVISOR', '-u', 'GVISOR_SAVE_TEST', 'TEST_TMPDIR=' + str(work), 'TEST_SRCDIR='+str(binaries/'runfiles'), 'RUNFILES_DIR='+str(binaries/'runfiles'),
-                        str(binary), *suite_flags(suite['name']), '--gtest_color=no', '--gtest_filter=' + case, '--gtest_output=xml:' + str(xml)]
+                        *fixture, str(binary), *suite_flags(suite['name']), '--gtest_color=no', '--gtest_filter=' + case, '--gtest_output=xml:' + str(xml)]
                 code, timed, seconds = execute(argv, output/'logs'/(str(index)+'.stdout'), output/'logs'/(str(index)+'.stderr'), watchdog(args, suite['name'], case), cwd=work, min_free=int(args.min_free_gib*1024**3), host_pty=suite['name']=='host_pty')
                 status, messages = classify(xml, code, timed, case)
                 rows.append(dict(suite=suite['name'], case=case, status=status, code=code, seconds=seconds, messages=messages))
@@ -249,6 +262,8 @@ def trames(args, output):
         plan['host_pty_fixture'] = True
     if any(s['name'] == 'setgid' for s in plan['suites']):
         plan['setgid_fixture'] = suite_flags('setgid')
+    if any(s['name'] == 'memfd' for s in plan['suites']):
+        plan['memfd_tmpfs_fixture'] = True
     save(output/'plan.json', plan)
     cache=reuse_rows(args,plan)
     registry = output/'registry'
@@ -313,7 +328,7 @@ def trames(args, output):
             work = '/tmp/gvisor-'+token+'-'+str(index)
             guest_xml = work+'/result.xml'
             xml = output/'logs'/(str(index)+'.xml')
-            wrapper = 'export TEST_SRCDIR=/opt/gvisor/runfiles RUNFILES_DIR=/opt/gvisor/runfiles; mkdir -p "$1"; cd "$1"; export TEST_TMPDIR="$1"; unset TEST_ON_GVISOR GVISOR_SAVE_TEST; shift; exec "$@"'
+            wrapper = 'export TEST_SRCDIR=/opt/gvisor/runfiles RUNFILES_DIR=/opt/gvisor/runfiles; ' + guest_test_work(suite['name']) + 'unset TEST_ON_GVISOR GVISOR_SAVE_TEST; shift; exec "$@"'
             if suite['name']=='posix_acl':
                 wrapper='mkdir -p /dev/shm; mount -t tmpfs -o mode=1777 tmpfs /dev/shm; '+wrapper
             if args.network=='internal':

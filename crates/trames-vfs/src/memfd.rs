@@ -331,7 +331,19 @@ impl Vfs {
         }
         let node = o.node.as_ref().ok_or(Errno(22))?;
         let mut n = node.borrow_mut();
-        let current = n.seals.ok_or(Errno(22))?;
+        // Named shmem inodes start permanently seal-sealed. Keep their normal
+        // filesystem backing and quota even after unlink or a lazy unmount.
+        let current = match n.seals {
+            Some(seals) => seals,
+            None if matches!(n.content, Content::File(_))
+                && o.mount
+                    .as_ref()
+                    .is_some_and(|m| matches!(m.identity.kind, mounts::Kind::Tmpfs)) =>
+            {
+                1
+            }
+            None => return Err(Errno(22)),
+        };
         let Some(add) = add else { return Ok(current) };
         if add & !31 != 0 {
             return Err(Errno(22));

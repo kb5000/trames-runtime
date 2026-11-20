@@ -11,7 +11,7 @@ import subprocess
 import time
 import xml.etree.ElementTree as ET
 
-from run import TRACEE_WAIT, classify, execute, guest_terminal, save, suite_flags, tracee_fixture_error
+from run import TRACEE_WAIT, classify, execute, guest_terminal, guest_test_work, save, suite_flags, tracee_fixture_error
 
 
 class Progress:
@@ -95,7 +95,7 @@ def run(args,output,plan,env,runner,name,store,snapshot,cache,timeout):
             shutil.rmtree(store);subprocess.run(['/bin/cp','-cR',str(snapshot),str(store)],check=True)
         stem='chunk-%06d'%serial;serial+=1
         work='/tmp/gvisor-'+stem;guest_xml=work+'/result.xml';xml=output/'logs'/(stem+'.xml')
-        wrapper='export TEST_SRCDIR=/opt/gvisor/runfiles RUNFILES_DIR=/opt/gvisor/runfiles; mkdir -p "$1"; cd "$1"; export TEST_TMPDIR="$1"; unset TEST_ON_GVISOR GVISOR_SAVE_TEST; shift; "$@" & child=$!; wait "$child"'
+        wrapper='export TEST_SRCDIR=/opt/gvisor/runfiles RUNFILES_DIR=/opt/gvisor/runfiles; ' + guest_test_work(suite) + 'unset TEST_ON_GVISOR GVISOR_SAVE_TEST; shift; "$@" & child=$!; wait "$child"'
         if suite=='posix_acl':
             # Match native Linux's existing tmpfs fixture, without changing the
             # original binary or treating an unexercised ACL as a passing case.
