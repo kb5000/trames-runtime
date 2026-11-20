@@ -119,9 +119,9 @@ impl Prepared {
         // The original VFS checks access after the raw ABI imports its buffers.
         // O_PATH read behavior and the original write access order are retained.
         if if read {
-            flags & trames_vfs::O_PATH != 0 || flags & 3 == 1
+            !trames_vfs::fd_can_read(flags)
         } else {
-            flags & 3 == 0
+            !trames_vfs::fd_can_write(flags)
         } {
             return Err(Errno(9));
         }

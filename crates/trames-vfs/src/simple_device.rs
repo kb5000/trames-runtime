@@ -75,7 +75,7 @@ impl SharedOpenDescription {
             return None;
         }
         let flags = self.flags.get();
-        if flags & O_PATH != 0 || flags & 3 == 1 {
+        if !fd_can_read(flags) {
             return Some(Err(Errno(9)));
         }
         let count = copy();
@@ -97,7 +97,7 @@ impl SharedOpenDescription {
     }
     pub(super) fn simple_read(&self, kind: Kind, count: usize) -> Result<Vec<u8>> {
         let flags = self.flags.get();
-        if flags & O_PATH != 0 || flags & 3 == 1 {
+        if !fd_can_read(flags) {
             return Err(Errno(9));
         }
         let result = kind.read(count);
@@ -111,7 +111,7 @@ impl SharedOpenDescription {
     }
     pub(super) fn simple_write(&self, kind: Kind, bytes: &[u8]) -> Result<usize> {
         let flags = self.flags.get();
-        if flags & O_PATH != 0 || flags & 3 == 0 {
+        if !fd_can_write(flags) {
             return Err(Errno(9));
         }
         let result = kind.write(bytes);

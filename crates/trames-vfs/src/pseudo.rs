@@ -1643,8 +1643,8 @@ impl Vfs {
             return Err(Errno(6));
         }
         if flags & O_PATH == 0
-            && ((flags & 3 != 1 && original.flags.get() & 3 == 1)
-                || (flags & 3 != 0 && original.flags.get() & 3 == 0))
+            && ((flags & 3 != 1 && !fd_can_read(original.flags.get()))
+                || (flags & 3 != 0 && !fd_can_write(original.flags.get())))
         {
             return Err(Errno(13));
         }

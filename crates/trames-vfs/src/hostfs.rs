@@ -250,16 +250,22 @@ fn encode_stat(root: &Root, meta: &libc::stat) -> [u8; 128] {
 
 struct FileState {
     key: Vec<u8>,
-    handles: [Vec<std::sync::Weak<OpenFile>>; 3],
+    handles: [Vec<std::sync::Weak<OpenFile>>; 4],
     metadata: std::sync::Weak<OpenFile>,
 }
 impl FileState {
     fn retained(&mut self, write: Option<bool>) -> Option<Arc<OpenFile>> {
-        for access in [2, 0, 1] {
-            if write.is_some_and(|write| if write { access == 0 } else { access == 1 }) {
+        for access in [2u32, 0, 1, 3] {
+            if write.is_some_and(|write| {
+                if write {
+                    !fd_can_write(access)
+                } else {
+                    !fd_can_read(access)
+                }
+            }) {
                 continue;
             }
-            let handles = &mut self.handles[access];
+            let handles = &mut self.handles[access as usize];
             while let Some(handle) = handles.last() {
                 if let Some(file) = handle.upgrade() {
                     return Some(file);
@@ -1079,6 +1085,20 @@ mod tests {
     fn size(stat: [u8; 128]) -> u64 {
         u64::from_le_bytes(stat[48..56].try_into().unwrap())
     }
+    #[test]
+    fn control_only_open_keeps_host_file_metadata_across_unlink() {
+        let root = Fixture::new();
+        let mut v = root.vfs(false);
+        let fd = v
+            .open_at(AT_FDCWD, b"/host/file", O_CREAT | 3, 0o600)
+            .unwrap();
+        let other = v.open_at(AT_FDCWD, b"/host/file", 3, 0).unwrap();
+        v.unlink_at(AT_FDCWD, b"/host/file", false).unwrap();
+        assert_eq!(v.stat_fd(fd).unwrap(), v.stat_fd(other).unwrap());
+        assert_eq!(v.write(fd, b"x"), Err(Errno(9)));
+        assert_eq!(v.read(other, 1), Err(Errno(9)));
+    }
+
     #[test]
     fn statx_follows_host_bind_mount_identity_after_detach() {
         let fixture = Fixture::new();

@@ -174,9 +174,10 @@ def reuse_rows(args, plan):
             for i,r in enumerate(json.loads((args.reuse/'results.json').read_text())) if r['status'] in (['passed','skipped','failed','no_result','crashed','invalid_result','mismatched_result'] if args.reuse_completed else ['passed','skipped'])}
 
 
-# These upstream cases block SIGALRM and expect the full 30-second wait to
-# expire. The default worker watchdog must also allow startup and XML export.
-SIGNAL_WAIT_TIMEOUTS = {
+# These upstream cases include a deliberate wait. Allow it to finish and
+# leave time for guest startup and XML export.
+UPSTREAM_WAIT_TIMEOUTS = {
+    'flock': {'FlockTest.BlockingLockNoBlockingForSharedLocks': 45},
     'ppoll': {'PpollTest.SignalMaskBlocksSignal': 45},
     'vfork': {'VforkTest.ParentStopsUntilChildExecves': 40},
     'pselect': {'PselectTest.SignalMaskBlocksSignal': 45},
@@ -185,7 +186,7 @@ SIGNAL_WAIT_TIMEOUTS = {
 def watchdog(args, suite, case):
     if suite in args.suite_timeouts:
         return args.suite_timeouts[suite]
-    return max(args.timeout, SIGNAL_WAIT_TIMEOUTS.get(suite, {}).get(case, 0))
+    return max(args.timeout, UPSTREAM_WAIT_TIMEOUTS.get(suite, {}).get(case, 0))
 
 
 def native(args, output):
@@ -207,7 +208,7 @@ def native(args, output):
         if args.case_filter: selected=[case for case in selected if fnmatch.fnmatchcase(case,args.case_filter)]
         plan['suites'].append({'name': name, 'sha256': digest(path), 'available': len(cases), 'cases': selected})
     if not any(s['cases'] for s in plan['suites']):raise RuntimeError('No cases selected')
-    plan['case_execution'] = dict(timeout_base=args.timeout, suite_timeouts=args.suite_timeouts, upstream_wait_timeouts=SIGNAL_WAIT_TIMEOUTS)
+    plan['case_execution'] = dict(timeout_base=args.timeout, suite_timeouts=args.suite_timeouts, upstream_wait_timeouts=UPSTREAM_WAIT_TIMEOUTS)
     if args.native_init:plan['native_init_sha256']=digest(args.native_init)
     if any(s['name'] == 'host_pty' for s in plan['suites']):
         plan['host_pty_fixture'] = True
@@ -261,7 +262,7 @@ def trames(args, output):
     if not any(s['cases'] for s in plan['suites']):raise RuntimeError('No cases selected')
     plan['runtime_sha256']=digest(args.runner.resolve())
     plan['process_context']='pid2' if args.network=='internal' else 'pid1'
-    plan['case_execution']={'chunk_size':args.chunk_size,'fresh_store':args.fresh_store,'timeout_base':args.timeout,'suite_timeouts':args.suite_timeouts,'upstream_wait_timeouts':SIGNAL_WAIT_TIMEOUTS,'reference_timing_extension':'max(base,min(90,native_seconds*3+2))'}
+    plan['case_execution']={'chunk_size':args.chunk_size,'fresh_store':args.fresh_store,'timeout_base':args.timeout,'suite_timeouts':args.suite_timeouts,'upstream_wait_timeouts':UPSTREAM_WAIT_TIMEOUTS,'reference_timing_extension':'max(base,min(90,native_seconds*3+2))'}
     plan['fresh_store']=args.fresh_store
     plan['network']=args.network
     plan['cpus']=args.cpus

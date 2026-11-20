@@ -369,7 +369,7 @@ impl Vfs {
         Arc::ptr_eq(&self.kernel_log, &reader.kernel_log)
             && self.fds.entries().values().any(|d| {
                 let open = d.open.borrow();
-                open.kernel_log.is_some() && open.flags.get() & 3 != 0
+                open.kernel_log.is_some() && fd_can_write(open.flags.get())
             })
     }
     pub fn log(&self, priority: u32, message: &str) {

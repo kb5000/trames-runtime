@@ -33,8 +33,11 @@ pub struct PipeEndpoint {
 }
 impl PipeEndpoint {
     fn open(data: Arc<PipeResource>, flags: u32, fifo: bool) -> Result<Arc<Self>> {
-        let read = flags & 3 != 1;
-        let write = flags & 3 != 0;
+        let read = fd_can_read(flags);
+        let write = fd_can_write(flags);
+        if !read && !write {
+            return Err(Errno(22));
+        }
         let mut p = data.lock().unwrap();
         // Admission and reader/writer publication form one pipe transaction.
         // Another worker's last close cannot fit between the ENXIO check and

@@ -246,6 +246,16 @@ pub const O_NOATIME: u32 = 0x40000;
 pub const O_CLOEXEC: u32 = 0x80000;
 pub const O_NONBLOCK: u32 = 0x800;
 pub const O_PATH: u32 = 0x200000;
+
+/// The guest OFD access mode determines data access after open. Mode 3
+/// checks both permissions at open but grants neither read nor write.
+pub const fn fd_can_read(flags: u32) -> bool {
+    flags & (O_PATH | 1) == 0
+}
+
+pub const fn fd_can_write(flags: u32) -> bool {
+    matches!(flags & (O_PATH | 3), 1 | 2)
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Errno(pub u32);
 impl fmt::Display for Errno {
@@ -2530,10 +2540,7 @@ impl Vfs {
         } else {
             flags
         };
-        if flags & !ALLOWED != 0
-            || flags & 3 == 3
-            || flags & (O_CREAT | O_DIRECTORY) == (O_CREAT | O_DIRECTORY)
-        {
+        if flags & !ALLOWED != 0 || flags & (O_CREAT | O_DIRECTORY) == (O_CREAT | O_DIRECTORY) {
             return Err(Errno(22));
         }
         if flags & 0x40 != 0 && path.last() == Some(&b'/') {
@@ -2766,9 +2773,6 @@ impl Vfs {
             {
                 return Err(Errno(1));
             }
-            if matches!(n.content, Content::Socket(_)) && flags & O_PATH == 0 {
-                return Err(Errno(6));
-            }
             if matches!(n.content, Content::Symlink(_)) && flags & O_PATH == 0 {
                 return Err(Errno(if flags & O_DIRECTORY != 0 { 20 } else { 40 }));
             }
@@ -2794,6 +2798,9 @@ impl Vfs {
             {
                 return Err(Errno(13));
             }
+            if matches!(n.content, Content::Socket(_)) && flags & O_PATH == 0 {
+                return Err(Errno(6));
+            }
             if flags & O_PATH == 0
                 && p.mount
                     .as_ref()
@@ -2806,12 +2813,14 @@ impl Vfs {
                 return Err(Errno(13));
             }
         }
-        if flags & O_PATH == 0 && (flags & 3 != 0 || flags & 0x200 != 0) {
+        if fd_can_write(flags) || flags & O_TRUNC != 0 {
             self.overlay_prepare(&p, &node, flags & 0x200 != 0)?;
         }
         let disk_file = if flags & O_PATH == 0 {
             match &node.borrow().content {
-                Content::File(data) => data.private_lease(flags & 3 != 0 || flags & 0x200 != 0)?,
+                Content::File(data) => {
+                    data.private_lease(fd_can_write(flags) || flags & O_TRUNC != 0)?
+                }
                 _ => None,
             }
         } else {
@@ -3051,7 +3060,7 @@ impl Vfs {
         let number = reservation.publish(descriptor, self.query.is_none().then_some(&self.fds))?;
         if let (Some(end), Some(task)) = (automatic_terminal, self.terminal_task()) {
             end.pair.bind_signal_route(task.clone());
-            let _ = task.acquire(&end.pair, false, flags & 3 != 1, true);
+            let _ = task.acquire(&end.pair, false, fd_can_read(flags), true);
         }
         Ok(number)
     }
@@ -3208,14 +3217,14 @@ impl Vfs {
         }
         let source_pipe = {
             let o = source.borrow();
-            if o.flags.get() & O_PATH != 0 || o.flags.get() & 3 == 1 {
+            if !fd_can_read(o.flags.get()) {
                 return Err(Errno(9));
             }
             o.pipe.as_ref().map(|p| (p.pipe.clone(), p.read))
         };
         let dest_pipe = {
             let o = dest.borrow();
-            if o.flags.get() & O_PATH != 0 || o.flags.get() & 3 == 0 {
+            if !fd_can_write(o.flags.get()) {
                 return Err(Errno(9));
             }
             if o.flags.get() & 0x400 != 0 {
@@ -3344,7 +3353,7 @@ impl Vfs {
         if let Some(kind) = o.node.as_ref().and_then(|n| n.simple_device) {
             return o.simple_read(kind, count);
         }
-        if o.flags.get() & O_PATH != 0 || o.flags.get() & 3 == 1 {
+        if !fd_can_read(o.flags.get()) {
             return Err(Errno(9));
         }
         if let Some(events::SharedControl::MessageQueue(q)) = &o.control {
@@ -3463,7 +3472,7 @@ impl Vfs {
         if let Some(kind) = o.node.as_ref().and_then(|n| n.simple_device) {
             return o.simple_write(kind, bytes);
         }
-        if o.flags.get() & 3 == 0 {
+        if !fd_can_write(o.flags.get()) {
             return Err(Errno(9));
         }
         if let Some(events::SharedControl::MessageQueue(_)) = &o.control {
@@ -3568,7 +3577,7 @@ impl Vfs {
         }
         let available = self.description_available_bytes(&o);
         let memfd_available = self.memfd_available();
-        if o.flags.get() & 3 == 0 {
+        if !fd_can_write(o.flags.get()) {
             return Err(Errno(9));
         }
         if let Some(control) = &o.sysctl_control {
@@ -3786,7 +3795,7 @@ impl Vfs {
         if let Some(kind) = o.node.as_ref().and_then(|n| n.simple_device) {
             return o.simple_read(kind, count);
         }
-        if o.flags.get() & O_PATH != 0 || o.flags.get() & 3 == 1 {
+        if !fd_can_read(o.flags.get()) {
             return Err(Errno(9));
         }
         if let Some(file) = &o.mount_file {

@@ -44,7 +44,7 @@ impl Request {
             if priority >= 32768 {
                 return Err(Errno(22));
             }
-            if flags & 3 == 0 {
+            if !trames_vfs::fd_can_write(flags) {
                 return Err(Errno(9));
             }
             if a[2] > file.queue.message_size() as u64 {
@@ -56,7 +56,7 @@ impl Request {
             }
             Operation::Send(data.into(), priority)
         } else {
-            if flags & 3 == 1 {
+            if !trames_vfs::fd_can_read(flags) {
                 return Err(Errno(9));
             }
             Operation::Receive

@@ -193,7 +193,7 @@ impl FileClose {
         Arc::new(Self {
             source: node.notifications.source().clone(),
             link,
-            mask: (if flags & 3 != 0 {
+            mask: (if fd_can_write(flags) {
                 CLOSE_WRITE
             } else {
                 CLOSE_NOWRITE

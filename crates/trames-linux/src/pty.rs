@@ -124,7 +124,7 @@ pub fn terminal_control(
     let pair = &end.pair;
     if request == 0x540e {
         return TerminalIo::Complete(
-            task.acquire(pair, address == 1, flags & 3 != 1, false)
+            task.acquire(pair, address == 1, trames_vfs::fd_can_read(flags), false)
                 .map(|()| 0),
         );
     }

@@ -982,7 +982,7 @@ impl MappingFile {
         if o.flags.get() & O_PATH != 0 {
             return Err(Errno(9));
         }
-        if o.flags.get() & 3 == 1 || shared && writable && o.flags.get() & 3 != 2 {
+        if !fd_can_read(o.flags.get()) || shared && writable && o.flags.get() & 3 != 2 {
             return Err(Errno(13));
         }
         Ok(true)
@@ -1036,7 +1036,7 @@ impl MappingFile {
         if o.flags.get() & O_PATH != 0 {
             return Err(Errno(9));
         }
-        if o.flags.get() & 3 == 1 {
+        if !fd_can_read(o.flags.get()) {
             return Err(Errno(13));
         }
         if shared && writable && o.flags.get() & 3 != 2 {

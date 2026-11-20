@@ -155,11 +155,7 @@ impl StreamTransfer {
         let mut transfer = Self::new(input, output, Ok(None), Ok(None), count, true, flags);
         let source = &transfer.input.open;
         let dest = &transfer.output.open;
-        if source.flags.get() & 3 == 1
-            || source.flags.get() & O_PATH != 0
-            || dest.flags.get() & 3 == 0
-            || dest.flags.get() & O_PATH != 0
-        {
+        if !fd_can_read(source.flags.get()) || !fd_can_write(dest.flags.get()) {
             return Err(Errno(9));
         }
         let (Some(reader), Some(writer)) = (&source.pipe, &dest.pipe) else {
@@ -312,11 +308,7 @@ impl StreamTransfer {
         if self.mode != TransferMode::Sendfile && self.flags & !15 != 0 {
             return Err(Errno(22));
         }
-        if source.flags.get() & O_PATH != 0
-            || source.flags.get() & 3 == 1
-            || dest.flags.get() & O_PATH != 0
-            || dest.flags.get() & 3 == 0
-        {
+        if !fd_can_read(source.flags.get()) || !fd_can_write(dest.flags.get()) {
             return Err(Errno(9));
         }
         if self.mode != TransferMode::Tee && dest.flags.get() & 0x400 != 0 {

@@ -1104,13 +1104,13 @@ impl DirectSyscalls {
         memory: &mut impl CpuMemory,
     ) -> Result<u64, Errno> {
         let read = |count| {
-            if fd.flags & trames_vfs::O_PATH != 0 || fd.flags & 3 == 1 {
+            if !trames_vfs::fd_can_read(fd.flags) {
                 return Err(Errno(9));
             }
             fd.tcp.recv(count, 0).map_err(|e| Errno(e.0))
         };
         let write = |bytes: &[u8]| {
-            if fd.flags & trames_vfs::O_PATH != 0 || fd.flags & 3 == 0 {
+            if !trames_vfs::fd_can_write(fd.flags) {
                 return Err(Errno(9));
             }
             fd.tcp

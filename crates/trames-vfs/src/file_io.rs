@@ -425,8 +425,8 @@ impl DirectFile {
         self.locks.conflict(requested)
     }
     pub fn record_lock_set(&self, requested: RecordLock) -> Result<()> {
-        if (requested.kind == 0 && self.prepared.0.flags & 3 == 1)
-            || (requested.kind == 1 && self.prepared.0.flags & 3 == 0)
+        if (requested.kind == 0 && !fd_can_read(self.prepared.0.flags))
+            || (requested.kind == 1 && !fd_can_write(self.prepared.0.flags))
         {
             return Err(Errno(9));
         }
@@ -450,7 +450,7 @@ impl DirectFile {
         if offset.is_some_and(|n| n > i64::MAX as u64) {
             return Some(Err(Errno(22)));
         }
-        if self.prepared.0.flags & O_PATH != 0 || self.prepared.0.flags & 3 == 1 {
+        if !fd_can_read(self.prepared.0.flags) {
             return Some(Err(Errno(9)));
         }
         if count == 0 {
@@ -498,7 +498,7 @@ impl DirectFile {
         if offset.is_some_and(|n| n > i64::MAX as u64) {
             return Some(Err(Errno(22)));
         }
-        let denied = self.prepared.0.flags & O_PATH != 0 || self.prepared.0.flags & 3 == 0;
+        let denied = !fd_can_write(self.prepared.0.flags);
         if denied && offset.is_none() {
             return Some(Err(Errno(9)));
         }

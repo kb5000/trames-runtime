@@ -417,7 +417,8 @@ impl RecordFile {
     }
     fn writable(&self, requested: RecordLock) -> Result<()> {
         let flags = self.flags();
-        if requested.kind == 0 && flags & 3 == 1 || requested.kind == 1 && flags & 3 == 0 {
+        if requested.kind == 0 && !fd_can_read(flags) || requested.kind == 1 && !fd_can_write(flags)
+        {
             Err(Errno(9))
         } else {
             Ok(())

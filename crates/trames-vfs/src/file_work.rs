@@ -23,7 +23,7 @@ impl FileTarget {
         if !file.live_payload() {
             return None;
         }
-        if open.flags.get() & O_PATH != 0 || open.flags.get() & 3 == 1 {
+        if !fd_can_read(open.flags.get()) {
             return Some(proc_file::ProcRead::Complete(Err(Errno(9))));
         }
         if let Some(offset) = offset {
@@ -74,7 +74,7 @@ impl FileTarget {
         if !file.live_payload() {
             return None;
         }
-        if open.flags.get() & O_PATH != 0 || open.flags.get() & 3 == 1 {
+        if !fd_can_read(open.flags.get()) {
             return Some(Err(Errno(9)));
         }
         if let Some(offset) = offset {
@@ -856,7 +856,7 @@ impl FileCommand {
                     count,
                     offset: None,
                 } => {
-                    if flags & O_PATH != 0 || flags & 3 == 1 {
+                    if !fd_can_read(flags) {
                         return Err(Errno(9));
                     }
                     return console.read(*count).map(FileValue::Bytes);
@@ -865,7 +865,7 @@ impl FileCommand {
                     bytes,
                     offset: None,
                 } => {
-                    if flags & O_PATH != 0 || flags & 3 == 0 {
+                    if !fd_can_write(flags) {
                         return Err(Errno(9));
                     }
                     return console.write(bytes).map(|n| FileValue::Count(n as u64));
@@ -1020,7 +1020,7 @@ impl Vfs {
         }
     }
     pub fn check_sendfile_modes(input: u32, output: u32) -> Result<()> {
-        if (input | output) & O_PATH != 0 || input & 3 == 1 || output & 3 == 0 {
+        if !fd_can_read(input) || !fd_can_write(output) {
             return Err(Errno(9));
         }
         if output & 0x400 != 0 {

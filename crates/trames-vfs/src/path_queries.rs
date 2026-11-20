@@ -879,6 +879,69 @@ mod tests {
     }
 
     #[test]
+    fn control_only_open_retains_metadata_without_byte_access() {
+        let mut v = Vfs::default();
+        v.import_file(b"/file", b"contents".to_vec()).unwrap();
+        let mut epoch = FileEpoch::default();
+        let files = epoch.capture(&v, true);
+        let fd = v
+            .path_queries()
+            .open_at_resolve(AT_FDCWD, b"/file", 3, 0, 0, &files)
+            .unwrap()
+            .unwrap();
+        assert_eq!(v.flags(fd).unwrap() & 3, 3);
+        assert_eq!(v.seek(fd, 2, 0), Ok(2));
+        assert_eq!(v.read(fd, 1), Err(Errno(9)));
+        assert_eq!(v.write(fd, b"x"), Err(Errno(9)));
+        assert_eq!(v.pread(fd, 1, 0), Err(Errno(9)));
+        assert_eq!(v.pwrite(fd, b"x", 0), Err(Errno(9)));
+        assert_eq!(v.truncate_fd(fd, 0), Err(Errno(22)));
+        assert_eq!(
+            v.mapping_pages(fd, 0, 4096, false, false).err(),
+            Some(Errno(13))
+        );
+        for kind in [0, 1] {
+            assert_eq!(
+                v.record_lock_set(
+                    fd,
+                    RecordLock {
+                        kind,
+                        start: 0,
+                        end: 1,
+                        owner: 1
+                    }
+                ),
+                Err(Errno(9))
+            );
+        }
+        assert_eq!(v.seek(fd, 0, 1), Ok(2));
+        let normal = v.open_at(AT_FDCWD, b"/file", 0, 0).unwrap();
+        assert_eq!(v.read(normal, 8).unwrap(), b"contents");
+    }
+
+    #[test]
+    fn control_only_open_requires_both_permissions_and_socket_open_checks_access_first() {
+        let mut v = Vfs::default();
+        v.import_file(b"/file", Vec::new()).unwrap();
+        v.mknod_at(AT_FDCWD, b"/sock", 0o140111, 0).unwrap();
+        for mode in [0o004, 0o002, 0o006] {
+            v.credentials = Credentials::default();
+            v.chmod_at(AT_FDCWD, b"/file", mode).unwrap();
+            v.credentials = Credentials::user(123, 456);
+            let result = v.open_at(AT_FDCWD, b"/file", 3, 0);
+            if mode == 0o006 {
+                v.close(result.unwrap()).unwrap();
+            } else {
+                assert_eq!(result, Err(Errno(13)));
+            }
+        }
+        assert_eq!(v.open_at(AT_FDCWD, b"/sock", O_NONBLOCK, 0), Err(Errno(13)));
+        v.open_at(AT_FDCWD, b"/sock", O_PATH, 0).unwrap();
+        v.credentials = Credentials::default();
+        assert_eq!(v.open_at(AT_FDCWD, b"/sock", O_NONBLOCK, 0), Err(Errno(6)));
+    }
+
+    #[test]
     fn readonly_open_truncates_once_without_granting_write_or_ftruncate_authority() {
         let mut owner = Vfs::default();
         owner.import_file(b"/file", b"old bytes".to_vec()).unwrap();

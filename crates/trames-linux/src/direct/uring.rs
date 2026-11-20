@@ -217,7 +217,7 @@ impl RequestOps for Request {
             if selected.is_some() {
                 let empty = match &resource.object {
                     Object::Byte(f) => f.poll_ready(1) == Some(0),
-                    Object::Tcp(f) if f.flags & trames_vfs::O_PATH == 0 && f.flags & 3 != 1 => {
+                    Object::Tcp(f) if trames_vfs::fd_can_read(f.flags) => {
                         f.tcp.recv(1, 2 | 0x40).is_err_and(|e| e.0 == 11)
                     }
                     _ => false,
@@ -265,7 +265,7 @@ impl RequestOps for Request {
                         cache,
                     )?,
                     Object::Tcp(f) => {
-                        if f.flags & trames_vfs::O_PATH != 0 || f.flags & 3 == 0 {
+                        if !trames_vfs::fd_can_write(f.flags) {
                             Err(Errno(9))
                         } else {
                             f.tcp.send(scratch, flags).map_err(|e| Errno(e.0))
@@ -291,7 +291,7 @@ impl RequestOps for Request {
                     f.read(count, (s.offset() != u64::MAX).then_some(s.offset()), cache)?
                 }
                 Object::Tcp(f) => {
-                    if f.flags & trames_vfs::O_PATH != 0 || f.flags & 3 == 1 {
+                    if !trames_vfs::fd_can_read(f.flags) {
                         Err(Errno(9))
                     } else {
                         f.tcp.recv(count, flags).map_err(|e| Errno(e.0))

@@ -61,7 +61,7 @@ impl Vfs {
         {
             let descriptor = self.descriptor(fd)?;
             let open = descriptor.open.borrow();
-            if open.flags.get() & O_PATH != 0 || open.flags.get() & 3 == 0 {
+            if !fd_can_write(open.flags.get()) {
                 return Err(Errno(9));
             }
             if open.pipe.is_some() {
@@ -105,7 +105,7 @@ impl Vfs {
         } else {
             self.fd_available_bytes(fd)?
         };
-        if !opening && open.flags.get() & 3 == 0 {
+        if !opening && !fd_can_write(open.flags.get()) {
             return Err(Errno(22));
         }
         self.pseudo_immutable(&node)?;
@@ -312,7 +312,7 @@ impl Vfs {
         Self::shared_file_open(&open)
     }
     pub(super) fn shared_file_open(open: &OpenDescription) -> Result<trames_shared::SharedFile> {
-        if open.flags.get() & O_PATH != 0 || open.flags.get() & 3 == 1 {
+        if !fd_can_read(open.flags.get()) {
             return Err(Errno(9));
         }
         let node = open.node.as_ref().ok_or(Errno(19))?.borrow();

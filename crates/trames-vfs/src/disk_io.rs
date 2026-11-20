@@ -218,7 +218,7 @@ impl Vfs {
         if offset.is_some_and(|offset| offset > i64::MAX as u64) {
             return Err(Errno(22));
         }
-        if o.flags.get() & O_PATH != 0 || o.flags.get() & 3 == 1 {
+        if !fd_can_read(o.flags.get()) {
             return Err(Errno(9));
         }
         let mut file_position = o.file_position.lock().unwrap();

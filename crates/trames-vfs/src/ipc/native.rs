@@ -53,7 +53,7 @@ impl WaylandAuth {
                 .ok_or(Errno(9))?
         } else {
             let flags = file.open.flags.get();
-            if flags & O_PATH != 0 || flags & 3 == 1 {
+            if !fd_can_read(flags) {
                 return Err(Errno(9));
             }
             let node = file.open.node.as_ref().ok_or(Errno(19))?.borrow();
@@ -563,7 +563,7 @@ impl Connection {
                                     ));
                                     return Ok((writer.into_fd(), None));
                                 }
-                                if open.flags.get() & 3 == 1 {
+                                if !fd_can_read(open.flags.get()) {
                                     return Err(Errno(9));
                                 }
                                 if let Some(image) = &open.native_image {

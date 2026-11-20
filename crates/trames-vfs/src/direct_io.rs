@@ -424,7 +424,7 @@ impl DirectFd {
         }
     }
     pub fn check_read_access(&self) -> Result<()> {
-        if self.flags & O_PATH != 0 || self.flags & 3 == 1 {
+        if !fd_can_read(self.flags) {
             Err(Errno(9))
         } else {
             Ok(())
@@ -1165,7 +1165,7 @@ impl DirectFd {
         count: usize,
         access: Option<pty::TerminalAccess>,
     ) -> Option<Result<Vec<u8>>> {
-        if self.flags & O_PATH != 0 || self.flags & 3 == 1 {
+        if !fd_can_read(self.flags) {
             return Some(Err(Errno(9)));
         }
         match &self.resource {
@@ -1178,7 +1178,7 @@ impl DirectFd {
         bytes: &[u8],
         access: Option<pty::TerminalAccess>,
     ) -> Option<Result<usize>> {
-        if self.flags & O_PATH != 0 || self.flags & 3 == 0 {
+        if !fd_can_write(self.flags) {
             return Some(Err(Errno(9)));
         }
         match &self.resource {
@@ -1191,7 +1191,7 @@ impl DirectFd {
         count: usize,
         task: &dyn pty::TerminalTask,
     ) -> pty::TerminalIo<Vec<u8>> {
-        if self.flags & O_PATH != 0 || self.flags & 3 == 1 {
+        if !fd_can_read(self.flags) {
             return pty::TerminalIo::Complete(Err(Errno(9)));
         }
         let ByteResource::Pty { data, master } = &self.resource else {
@@ -1204,7 +1204,7 @@ impl DirectFd {
         bytes: &[u8],
         task: &dyn pty::TerminalTask,
     ) -> pty::TerminalIo<usize> {
-        if self.flags & O_PATH != 0 || self.flags & 3 == 0 {
+        if !fd_can_write(self.flags) {
             return pty::TerminalIo::Complete(Err(Errno(9)));
         }
         let ByteResource::Pty { data, master } = &self.resource else {
@@ -1481,16 +1481,16 @@ impl DirectFd {
             return Err(Errno(22));
         }
         if let ByteResource::Device(device) = self.resource {
-            if self.flags & O_PATH != 0 || self.flags & 3 == 0 {
+            if !fd_can_write(self.flags) {
                 return Err(Errno(9));
             }
             return device.write(bytes);
         }
         if let ByteResource::MessageQueue(_) = &self.resource {
-            return Err(Errno(if self.flags & 3 == 0 { 9 } else { 22 }));
+            return Err(Errno(if !fd_can_write(self.flags) { 9 } else { 22 }));
         }
         if let ByteResource::Cgroup(file, Some(caller)) = &self.resource {
-            if self.flags & O_PATH != 0 || self.flags & 3 == 0 {
+            if !fd_can_write(self.flags) {
                 return Err(Errno(9));
             }
             return file.cgroup_write(caller, bytes)?.ok_or(Errno(19));
@@ -1507,7 +1507,11 @@ impl DirectFd {
     pub fn positioned_terminal_error(&self, write: bool, offset: u64) -> Errno {
         if offset > i64::MAX as u64 {
             Errno(22)
-        } else if self.flags & O_PATH != 0 || self.flags & 3 == u32::from(!write) {
+        } else if !(if write {
+            fd_can_write(self.flags)
+        } else {
+            fd_can_read(self.flags)
+        }) {
             Errno(9)
         } else {
             Errno(29)
@@ -1576,7 +1580,7 @@ impl DirectFd {
     /// None requests the original owner before consuming any bytes or rights.
     pub fn read_attempt(&self, count: usize) -> Option<Result<Vec<u8>>> {
         if self.is_unix() {
-            if self.flags & O_PATH != 0 || self.flags & 3 == 1 {
+            if !fd_can_read(self.flags) {
                 return Some(Err(Errno(9)));
             }
             let received = match &self.resource {
@@ -1594,7 +1598,7 @@ impl DirectFd {
                     .and_then(|f| f.open.simple_read(kind, count)),
             );
         }
-        if self.flags & O_PATH != 0 || self.flags & 3 == 1 {
+        if !fd_can_read(self.flags) {
             return Some(Err(Errno(9)));
         }
         Some(match &self.resource {
@@ -1666,7 +1670,7 @@ impl DirectFd {
     /// MSG_TRUNC reports the original packet length without extending the
     /// copied data. Both paths use the original Unix byte/rights algorithm.
     pub fn recv_counted(&self, count: usize, flags: u32) -> Option<Result<(Vec<u8>, usize)>> {
-        if self.flags & O_PATH != 0 || self.flags & 3 == 1 {
+        if !fd_can_read(self.flags) {
             return Some(Err(Errno(9)));
         }
         let (data, side) = self.local_data()?;
@@ -1695,7 +1699,7 @@ impl DirectFd {
         flags: u32,
         credentials: Option<[u32; 3]>,
     ) -> Result<usize> {
-        if self.flags & O_PATH != 0 || self.flags & 3 == 0 {
+        if !fd_can_write(self.flags) {
             return Err(Errno(9));
         }
         match &self.resource {
@@ -1718,7 +1722,7 @@ impl DirectFd {
                 .open
                 .simple_write(kind, bytes);
         }
-        if self.flags & O_PATH != 0 || self.flags & 3 == 0 {
+        if !fd_can_write(self.flags) {
             return Err(Errno(9));
         }
         match &self.resource {

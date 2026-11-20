@@ -227,8 +227,8 @@ impl DirectSyscalls {
             .unwrap_or(Err(Errno(9)))?;
         let flags = file.filesystem_target().status_flags();
         if flags & trames_vfs::O_PATH != 0
-            || matches!(op, 0 | 7) && flags & 3 == 1
-            || matches!(op, 1 | 8) && flags & 3 == 0
+            || matches!(op, 0 | 7) && !trames_vfs::fd_can_read(flags)
+            || matches!(op, 1 | 8) && !trames_vfs::fd_can_write(flags)
         {
             return Err(Errno(9));
         }
