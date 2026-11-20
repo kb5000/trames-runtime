@@ -84,16 +84,16 @@ impl SparseFile {
         }
         self.length = length;
     }
-    pub fn read(&self, offset: u64, count: usize) -> Vec<u8> {
+    pub fn read(&self, offset: u64, count: usize) -> Result<Vec<u8>> {
         let end = offset + count as u64;
         let within = (offset % PAGE_SIZE) as usize;
         if count <= PAGE_SIZE as usize - within {
-            return self.bytes.get(&(offset / PAGE_SIZE)).map_or_else(
+            return Ok(self.bytes.get(&(offset / PAGE_SIZE)).map_or_else(
                 || vec![0; count],
                 |page| page[within..within + count].to_vec(),
-            );
+            ));
         }
-        let mut out = vec![0; count];
+        let mut out = trames_shared::read_buffer(count).map_err(storage::host_errno)?;
         for (&index, page) in self
             .bytes
             .range(offset / PAGE_SIZE..end.div_ceil(PAGE_SIZE))
@@ -104,7 +104,7 @@ impl SparseFile {
             out[(from - offset) as usize..(to - offset) as usize]
                 .copy_from_slice(&page[(from - base) as usize..(to - base) as usize]);
         }
-        out
+        Ok(out)
     }
     pub fn write(&mut self, offset: u64, bytes: &[u8]) -> Result<usize> {
         let mut written = 0;
@@ -204,8 +204,8 @@ mod tests {
         assert_eq!(copy.bytes.len(), 1);
         assert_eq!(copy.extents.len(), 1);
         assert_eq!(copy.charge.size(), limit);
-        assert_eq!(copy.read(limit - 1, 1), b"x");
-        assert_eq!(copy.read(0, 1), [0]);
+        assert_eq!(copy.read(limit - 1, 1).unwrap(), b"x");
+        assert_eq!(copy.read(0, 1).unwrap(), [0]);
     }
     #[test]
     fn tmpfs_faults_charge_once_and_report_the_accessed_alias() {

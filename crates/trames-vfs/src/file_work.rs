@@ -312,8 +312,8 @@ pub enum FileOutcome {
     Complete(FileReply),
     /// No bytes committed: the source task parks on the accepted endpoint.
     Waiting(FileWork),
-    /// A genuine mapping-layout boundary, with original input retained. There
-    /// have been no output effects; a copy retains its accepted input bytes.
+    /// A mapping-layout boundary. A copy retains its committed prefix, current
+    /// offsets and accepted input for the chunk awaiting the layout change.
     Layout(FileWork),
     /// A namespace call met an original owner-only task/proc/mount resource,
     /// before effects. Its copied operands and accepted shared FDs survive.
@@ -997,7 +997,13 @@ pub struct FileCopy {
     pub to: Result<Option<u64>>,
     pub count: u64,
     pub range: bool,
-    stage: Option<(u64, Option<u64>, Vec<u8>)>,
+    stage: Option<CopyStage>,
+    copied: u64,
+}
+struct CopyStage {
+    from: u64,
+    to: Option<u64>,
+    bytes: Option<Vec<u8>>,
 }
 impl Vfs {
     pub const MAX_RW_COUNT: u64 = i32::MAX as u64 & !(trames_memory::PAGE_SIZE - 1);
@@ -1056,6 +1062,16 @@ impl Vfs {
         Ok(count)
     }
 }
+pub(super) fn repeat_tail(seed: &[u8], count: usize) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(count);
+    bytes.extend_from_slice(seed);
+    while bytes.len() < count {
+        let n = bytes.len().min(count - bytes.len());
+        bytes.extend_from_within(..n);
+    }
+    bytes
+}
+
 impl FileCopy {
     pub fn new(
         from: Result<Option<u64>>,
@@ -1069,6 +1085,7 @@ impl FileCopy {
             count,
             range,
             stage: None,
+            copied: 0,
         }
     }
     fn execute(&mut self, v: &mut Vfs, input: u32, output: u32) -> Result<FileValue> {
@@ -1103,32 +1120,114 @@ impl FileCopy {
                     Vfs::check_io_range(v.seek(output, 0, 1)?, self.count.min(Vfs::MAX_RW_COUNT))?;
                 }
             }
-            let bytes = v.pread(
-                input,
-                self.count.min(storage::MAX_TRANSFER as u64) as usize,
-                from,
-            )?;
-            self.stage = Some((from, to, bytes));
+            self.start(from, to);
         }
-        let (from, to, bytes) = self.stage.as_ref().unwrap();
-        let written = if let Some(to) = to {
-            v.pwrite(output, bytes, *to)?
-        } else {
-            v.write(output, bytes)?
-        } as u64;
-        if self.from?.is_none() {
-            v.seek(input, (from + written) as i64, 0)?;
-        }
-        if let Some(to) = to {
-            if self.to?.is_none() {
-                v.seek(output, (to + written) as i64, 0)?;
+        self.drive(v, input, output)
+    }
+
+    /// Joined ABI execution has already imported and validated both offsets.
+    pub fn copy_prepared(
+        mut self,
+        v: &mut Vfs,
+        input: u32,
+        output: u32,
+        from: u64,
+        to: Option<u64>,
+    ) -> Result<u64> {
+        self.start(from, to);
+        self.drive(v, input, output)?;
+        Ok(self.copied)
+    }
+
+    fn start(&mut self, from: u64, to: Option<u64>) {
+        self.count = self.count.min(Vfs::MAX_RW_COUNT);
+        self.stage = Some(CopyStage {
+            from,
+            to,
+            bytes: None,
+        });
+    }
+
+    fn drive(&mut self, v: &mut Vfs, input: u32, output: u32) -> Result<FileValue> {
+        loop {
+            let chunk = self.chunk_size();
+            let stage = self.stage.as_mut().unwrap();
+            let (from, to) = (stage.from, stage.to);
+            if stage.bytes.is_none() {
+                match v.pread(input, chunk, from) {
+                    Ok(bytes) if self.copied > 0 && bytes.is_empty() => {
+                        return Ok(self.result(from, to))
+                    }
+                    Ok(bytes) => stage.bytes = Some(bytes),
+                    Err(e) if self.copied == 0 => return Err(e),
+                    Err(_) => return Ok(self.result(from, to)),
+                }
             }
+            let bytes = stage.bytes.as_ref().unwrap();
+            let mut offered = bytes.len();
+            let result = if let Some(to) = to {
+                v.pwrite(output, bytes, to)
+            } else if !bytes.is_empty() && bytes.len() < chunk {
+                let out = v.descriptor(output)?;
+                let source = v.descriptor(input)?.open.borrow().data_node();
+                let same = source
+                    .zip(out.open.borrow().node.clone())
+                    .is_some_and(|(s, d)| s.regular_file && Arc::ptr_eq(&s, &d));
+                if same {
+                    v.file_write_description_inner::<true>(
+                        &out,
+                        bytes,
+                        None,
+                        (from, chunk),
+                        &mut offered,
+                    )
+                } else {
+                    v.write_description(&out, bytes)
+                }
+            } else {
+                v.write(output, bytes)
+            };
+            let written = match result {
+                Ok(n) => n,
+                // A deferred layout keeps this stage and the cumulative count.
+                // The outer file transaction retries it before publishing a reply.
+                Err(e) if self.copied == 0 => return Err(e),
+                Err(_) => return Ok(self.result(from, to)),
+            };
+            let short = written < offered;
+            let written = written as u64;
+            let from = from + written;
+            let to = to.map(|p| p + written);
+            self.copied += written;
+            if self.from?.is_none() {
+                v.seek(input, from as i64, 0)?;
+            }
+            if let Some(to) = to {
+                if self.to?.is_none() {
+                    v.seek(output, to as i64, 0)?;
+                }
+            }
+            if short || written == 0 || self.copied == self.count {
+                return Ok(self.result(from, to));
+            }
+            self.stage = Some(CopyStage {
+                from,
+                to,
+                bytes: None,
+            });
         }
-        Ok(FileValue::Transfer {
-            count: written,
-            from: from + written,
-            to: to.map(|to| to + written),
-        })
+    }
+
+    fn chunk_size(&self) -> usize {
+        (self.count - self.copied).min(storage::MAX_TRANSFER as u64) as usize
+    }
+
+    fn result(&self, from: u64, to: Option<u64>) -> FileValue {
+        FileValue::Transfer {
+            count: self.copied,
+            from,
+            to,
+        }
     }
 }
 impl Vfs {

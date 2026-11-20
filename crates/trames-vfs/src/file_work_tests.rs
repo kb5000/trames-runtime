@@ -357,3 +357,77 @@ fn retained_file_work_observes_live_process_limit_and_reports_size_signal() {
     }
     assert_eq!(v.pread(fd, 10, 0).unwrap(), b"abc");
 }
+
+#[test]
+fn same_inode_forward_copy_repeats_only_at_eof_and_preserves_offsets() {
+    for shared in [false, true] {
+        let mut v = Vfs::default();
+        let fd = if shared {
+            v.memfd_create(b"copy", 0).unwrap()
+        } else {
+            v.import_file(b"/copy", vec![]).unwrap();
+            v.open_at(AT_FDCWD, b"/copy", 2, 0).unwrap()
+        };
+        v.write(fd, b"abcde").unwrap();
+        let count = storage::MAX_TRANSFER as u64 + 17;
+        let command = FileCommand::Copy {
+            input: target(&v, fd),
+            transfer: RefCell::new(FileCopy::new(Ok(Some(2)), Ok(None), count, false)),
+        };
+        let work = FileWork::from_vfs(&v, target(&v, fd), command);
+        assert!(
+            matches!(value(work), Ok(FileValue::Transfer { count: n, from, to: None }) if n == count && from == count+2)
+        );
+        assert_eq!(v.seek(fd, 0, 1), Ok(count + 5));
+        let data = v.pread(fd, count as usize + 5, 0).unwrap();
+        assert_eq!(&data[..5], b"abcde");
+        assert!(data[5..]
+            .iter()
+            .zip(b"cde".iter().cycle())
+            .all(|(a, b)| a == b));
+        v.set_file_size_limit(count + 9);
+        let tail = FileCopy::new(Ok(Some(count + 2)), Ok(None), 64, false);
+        assert_eq!(tail.copy_prepared(&mut v, fd, fd, count + 2, None), Ok(4));
+        assert_eq!(v.seek(fd, 0, 1), Ok(count + 9));
+    }
+}
+
+#[test]
+fn file_copy_resumes_after_a_committed_chunk_and_a_layout_wait() {
+    let mut v = Vfs::default();
+    let block = storage::MAX_TRANSFER;
+    v.import_file(b"/source", vec![0x51; block + 7]).unwrap();
+    v.import_file(b"/target", vec![0; block]).unwrap();
+    let source = v.open_at(AT_FDCWD, b"/source", 2, 0).unwrap();
+    let output = v.open_at(AT_FDCWD, b"/target", 2, 0).unwrap();
+    let mut memory = Memory::default();
+    memory
+        .map_backed(
+            0x10000,
+            v.mapping_pages(output, 0, PAGE_SIZE, true, true).unwrap(),
+            true,
+            Permissions::RW,
+            false,
+        )
+        .unwrap();
+    let work = FileWork::from_vfs(
+        &v,
+        target(&v, output),
+        FileCommand::Copy {
+            input: target(&v, source),
+            transfer: RefCell::new(FileCopy::new(Ok(None), Ok(None), (block + 7) as u64, true)),
+        },
+    );
+    let FileOutcome::Layout(work) = work.run() else {
+        panic!("growth needs layout custody")
+    };
+    assert_eq!(v.seek(source, 0, 1), Ok(block as u64));
+    assert_eq!(v.seek(output, 0, 1), Ok(block as u64));
+    v.pwrite(source, b"changed", block as u64).unwrap();
+    v.pwrite(output, b"X", block as u64 - 1).unwrap();
+    memory.commit_parallel().unwrap();
+    assert!(
+        matches!(value(work.exclusive()), Ok(FileValue::Transfer {count,from,to:Some(to)}) if count==(block+7) as u64 && from==count && to==count)
+    );
+    assert_eq!(v.pread(output, 8, block as u64 - 1).unwrap(), b"XQQQQQQQ");
+}

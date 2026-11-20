@@ -261,7 +261,14 @@ impl Linux {
         access: Access,
         regular: bool,
     ) -> Result<usize> {
-        let count = a[2].min(MAX_WRITE as u64) as usize;
+        // A regular read returns the available file bytes up to MAX_RW_COUNT.
+        // Writes and stream operations still use their own bounded staging.
+        let limit = if regular && access == Access::Write {
+            Vfs::MAX_RW_COUNT
+        } else {
+            MAX_WRITE as u64
+        };
+        let count = a[2].min(limit) as usize;
         if !regular {
             Self::check(memory, a[1], count, access)?;
             return Ok(count);
@@ -2150,6 +2157,34 @@ mod tests {
             l.syscall(69, [fd, 0x1000, 1025, 0, 0, 0], &mut m, &mut io),
             Err(Errno(22))
         );
+    }
+    #[test]
+    fn large_regular_read_and_pread_stop_at_destination_fault_or_eof() {
+        let mut linux = Linux::new(0x3000);
+        let mut mem = Memory::default();
+        let base = 0x10000u64;
+        let mapped = MAX_WRITE + 4096;
+        mem.map(base, mapped as u64, Permissions::RW).unwrap();
+        let len = mapped + 37;
+        let data: Vec<_> = (0..len).map(|i| (i % 239) as u8).collect();
+        linux.vfs.import_file(b"/large", data.clone()).unwrap();
+        let fd = linux.vfs.open_at(-100, b"/large", 0, 0).unwrap();
+        let mut io = CapturedOutput::default();
+        for (number, offset, expected) in [(67, 81, len - 81), (63, 0, mapped)] {
+            let args = [fd as u64, base, (len + 100) as u64, offset, 0, 0];
+            assert_eq!(
+                linux.syscall(number, args, &mut mem, &mut io),
+                Ok(expected as u64)
+            );
+            assert_eq!(
+                mem.read_array::<17>(base + expected as u64 - 17).unwrap(),
+                data[offset as usize + expected - 17..offset as usize + expected]
+            );
+            assert_eq!(
+                linux.vfs.seek(fd, 0, 1),
+                Ok(if number == 63 { expected as u64 } else { 0 })
+            );
+        }
     }
     #[test]
     fn regular_file_fault_advances_only_the_transferred_prefix() {

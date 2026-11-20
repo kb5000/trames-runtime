@@ -105,6 +105,9 @@ impl CopyParameters {
         };
         if !copy {
             Vfs::check_io_range(from_offset, count)?;
+            if vfs.regular_file_fd(output)? {
+                Vfs::check_io_range(vfs.seek(output, 0, 1)?, count.min(Vfs::MAX_RW_COUNT))?;
+            }
         }
         let to_offset = if copy {
             let to = regular_file(vfs, output, true)?;
@@ -258,29 +261,33 @@ impl Linux {
                     from_offset,
                     to_offset,
                 } = CopyParameters::prepare(&mut self.vfs, number as u32, a, memory)?;
-                let bytes =
-                    self.vfs
-                        .pread(input, (count.min(MAX_WRITE as u64)) as usize, from_offset)?;
-                let written = if let Some(to) = to_offset {
-                    self.vfs.pwrite(output, &bytes, to)? as u64
+                let written = if self.vfs.regular_file_fd(output)? {
+                    let transfer = trames_vfs::FileCopy::new(
+                        Ok((in_pointer != 0).then_some(from_offset)),
+                        Ok(to_offset.filter(|_| out_pointer != 0)),
+                        count,
+                        number == 285,
+                    );
+                    transfer.copy_prepared(&mut self.vfs, input, output, from_offset, to_offset)?
                 } else {
-                    self.write_bytes(output, &bytes, io)?
+                    let bytes =
+                        self.vfs
+                            .pread(input, count.min(MAX_WRITE as u64) as usize, from_offset)?;
+                    let n = self.write_bytes(output, &bytes, io)?;
+                    if in_pointer == 0 {
+                        self.vfs.seek(input, (from_offset + n) as i64, 0)?;
+                    }
+                    n
                 };
-                if in_pointer == 0 {
-                    self.vfs.seek(input, (from_offset + written) as i64, 0)?;
-                } else {
+                if in_pointer != 0 {
                     memory
                         .write(in_pointer, &(from_offset + written).to_le_bytes())
                         .map_err(|_| Errno(14))?;
                 }
-                if let Some(to) = to_offset {
-                    if out_pointer == 0 {
-                        self.vfs.seek(output, (to + written) as i64, 0)?;
-                    } else {
-                        memory
-                            .write(out_pointer, &(to + written).to_le_bytes())
-                            .map_err(|_| Errno(14))?;
-                    }
+                if let Some(to) = to_offset.filter(|_| out_pointer != 0) {
+                    memory
+                        .write(out_pointer, &(to + written).to_le_bytes())
+                        .map_err(|_| Errno(14))?;
                 }
                 Ok(written)
             }

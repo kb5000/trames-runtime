@@ -511,7 +511,7 @@ impl PlainFile {
         }
         let end = (offset + page).min(file.length);
         file.reserve(offset, end)?;
-        Ok(file.read(offset, (end - offset) as usize))
+        file.read(offset, (end - offset) as usize)
     }
     pub fn truncate(&self, length: u64) -> Result<()> {
         let mut data = self.bytes.write().unwrap();
@@ -589,17 +589,20 @@ impl Bytes {
         count: usize,
         cache: Option<&mut DiskReadCache>,
     ) -> Result<Vec<u8>> {
-        let count = count
-            .min(storage::MAX_TRANSFER)
-            .min(self.len().saturating_sub(offset) as usize);
+        let count = count.min(self.len().saturating_sub(offset) as usize);
         if count == 0 {
             return Ok(Vec::new());
         }
         match self {
-            Self::Tmpfs(file) => Ok(file.read(offset, count)),
-            Self::Memory(b) => Ok(b[offset as usize..offset as usize + count].to_vec()),
+            Self::Tmpfs(file) => file.read(offset, count),
+            Self::Memory(b) => {
+                let mut out = Vec::new();
+                out.try_reserve_exact(count).map_err(|_| Errno(12))?;
+                out.extend_from_slice(&b[offset as usize..offset as usize + count]);
+                Ok(out)
+            }
             Self::Disk(d) => {
-                let mut bytes = vec![0; count];
+                let mut bytes = trames_shared::read_buffer(count).map_err(storage::host_errno)?;
                 #[cfg(unix)]
                 let n = if let Some(cache) = cache {
                     cache.file(&d.backing, false)?.read_at(&mut bytes, offset)

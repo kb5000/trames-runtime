@@ -3546,6 +3546,17 @@ impl Vfs {
         bytes: &[u8],
         offset: Option<u64>,
     ) -> Result<usize> {
+        self.file_write_description_inner::<false>(descriptor, bytes, offset, (0, 0), &mut 0)
+    }
+
+    fn file_write_description_inner<const COPY_TAIL: bool>(
+        &mut self,
+        descriptor: &Descriptor,
+        bytes: &[u8],
+        offset: Option<u64>,
+        tail: (u64, usize),
+        offered: &mut usize,
+    ) -> Result<usize> {
         let file_size_limit = self.file_size_limit.get();
         let o = descriptor.open.borrow();
         if offset.is_some() && o.pipe.is_some() {
@@ -3602,7 +3613,7 @@ impl Vfs {
         })?;
         {
             let n = node.borrow();
-            if n.seals.is_none() {
+            if !COPY_TAIL && n.seals.is_none() {
                 if let Content::File(storage::FileData::Plain(data)) = &n.content {
                     let bytes = &bytes[..bytes.len().min(storage::MAX_TRANSFER)];
                     if bytes.is_empty() {
@@ -3660,6 +3671,22 @@ impl Vfs {
                     b.len()
                 } else {
                     offset.unwrap_or(file_position.value)
+                };
+                // A forward copy whose output starts at EOF consumes its own writes.
+                // Under this inode and OFD lock each following byte in the chunk
+                // repeats the original tail. Ordinary writes take the borrowed path.
+                let expanded;
+                let bytes = if COPY_TAIL
+                    && position == b.len()
+                    && tail.0.checked_add(bytes.len() as u64) == Some(position)
+                    && tail.1 > bytes.len()
+                    && !bytes.is_empty()
+                {
+                    expanded = file_work::repeat_tail(bytes, tail.1);
+                    *offered = expanded.len();
+                    &expanded[..]
+                } else {
+                    bytes
                 };
                 let plain = seals.is_none() && matches!(b, storage::FileData::Plain(_));
                 let bytes = if plain {

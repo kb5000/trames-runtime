@@ -383,9 +383,7 @@ impl FileData {
                 _ => Err(Errno(5)),
             },
             Self::Shared(file) => {
-                let count = count
-                    .min(MAX_TRANSFER)
-                    .min(self.len().saturating_sub(offset) as usize);
+                let count = count.min(self.len().saturating_sub(offset) as usize);
                 if count == 0 {
                     Ok(Vec::new())
                 } else {

@@ -62,6 +62,15 @@ fn registry() -> &'static Mutex<BTreeMap<Key, Entry>> {
     static FILES: OnceLock<Mutex<BTreeMap<Key, Entry>>> = OnceLock::new();
     FILES.get_or_init(Mutex::default)
 }
+/// Staging for a read whose length has already been shortened to EOF.
+pub fn read_buffer(size: usize) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(size)
+        .map_err(|_| io::ErrorKind::OutOfMemory)?;
+    bytes.resize(size, 0);
+    Ok(bytes)
+}
 fn invalid() -> io::Error {
     io::Error::from(io::ErrorKind::InvalidInput)
 }
@@ -465,7 +474,7 @@ impl SharedFile {
             .len()
             .saturating_sub(usize::try_from(offset).unwrap_or(usize::MAX))
             .min(count);
-        let mut bytes = vec![0; size];
+        let mut bytes = read_buffer(size)?;
         if size != 0 {
             if self.0.owned && offset + size as u64 > WINDOW as u64 {
                 self.read_windows(offset as usize, &mut bytes)?;

@@ -88,6 +88,9 @@ impl DiskReadJob {
         // Revalidate guest admission each time; only the private object handle
         // is cached. First open keeps regular/O_NOFOLLOW/metadata confinement.
         let file = cache.file(&self.backing, false)?;
+        bytes
+            .try_reserve_exact(self.count.saturating_sub(bytes.len()))
+            .map_err(|_| Errno(12))?;
         bytes.resize(self.count, 0);
         #[cfg(unix)]
         let count = file
@@ -220,9 +223,8 @@ impl Vfs {
         }
         let mut file_position = o.file_position.lock().unwrap();
         let position = offset.unwrap_or(file_position.value);
-        let size = count
-            .min(storage::MAX_TRANSFER)
-            .min(usize::try_from(length.saturating_sub(position)).unwrap_or(usize::MAX));
+        let size =
+            count.min(usize::try_from(length.saturating_sub(position)).unwrap_or(usize::MAX));
         // Preserve zero/EOF reads without spawning work or opening a host file.
         if size == 0 {
             return Ok(None);
