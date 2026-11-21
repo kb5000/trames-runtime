@@ -2239,7 +2239,7 @@ impl<C: Cpu> Kernel<C> {
                 self.thread_signal(pid, p, a[1] as u32, Some(a[0] as u32), a[2] as u32)
                     .map(Some)
             },
-            number @ 154..=157 => {
+            number @ (117 | 154..=157) => {
                 if p.signals.io.tgid() == 0 || matches!(number,154|157) && p.family.registry().is_none() {
                     self.publish_io_tasks(Some((pid, p)));
                 }
@@ -2252,7 +2252,11 @@ impl<C: Cpu> Kernel<C> {
                     uid: p.linux.vfs.credentials.uid,
                     euid: p.linux.vfs.credentials.euid,
                 };
-                routes.job_call(&p.signals.io, number, a).expect("original job authority").map(Some)
+                if number == 117 {
+                    routes.ptrace(&p.signals.io, a).map(Some)
+                } else {
+                    routes.job_call(&p.signals.io, number, a).expect("original job authority").map(Some)
+                }
             },
             101 | 115 => {
                 p.state = match crate::worker_syscalls::sleep_wait(&p.memory,number,a,self.started,Some(p.linux.boot_clock()),&p.signals.io,None)? {

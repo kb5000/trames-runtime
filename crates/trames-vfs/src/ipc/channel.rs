@@ -296,6 +296,20 @@ impl Resource {
     ) -> Result<usize> {
         self.send_ancillary(side, bytes, flags, None, identity, false)
     }
+    /// The immediate syscall path can only commit a whole blocking write.
+    /// Decide while holding the same queue lock as the enqueue.
+    pub(crate) fn try_send_whole(
+        &self,
+        side: usize,
+        bytes: &[u8],
+        flags: u32,
+        identity: Option<[u32; 3]>,
+    ) -> Result<usize> {
+        if flags & !(0x40 | 0x4000 | 0x40000000) != 0 {
+            return Err(Errno(95));
+        }
+        self.send_ancillary_charged::<false, true>(side, bytes, flags, None, identity, false, None)
+    }
     pub(super) fn send_shared(
         &self,
         side: usize,
@@ -352,7 +366,7 @@ impl Resource {
         source: Arc<DatagramSource>,
         explicit: bool,
     ) -> Result<usize> {
-        self.send_ancillary_charged::<true>(
+        self.send_ancillary_charged::<true, false>(
             1,
             bytes,
             flags,
@@ -376,10 +390,12 @@ impl Resource {
         if flags & !(0x40 | 0x4000 | 0x40000000) != 0 {
             return Err(Errno(95));
         }
-        self.send_ancillary_charged::<false>(side, bytes, flags, rights, identity, explicit, None)
+        self.send_ancillary_charged::<false, false>(
+            side, bytes, flags, rights, identity, explicit, None,
+        )
     }
     #[allow(clippy::too_many_arguments)]
-    fn send_ancillary_charged<const ADDRESSED: bool>(
+    fn send_ancillary_charged<const ADDRESSED: bool, const WHOLE: bool>(
         &self,
         side: usize,
         bytes: &[u8],
@@ -414,7 +430,8 @@ impl Resource {
             // AF_UNIX flow control uses the sender's SO_SNDBUF. SO_RCVBUF is
             // observable but does not constrain the peer's write budget.
             let room = data.send_limit[side].saturating_sub(data.used[peer]);
-            if (self.kind != 1 && (room < bytes.len() || queue.len() >= 128))
+            if (WHOLE && room < bytes.len())
+                || (self.kind != 1 && (room < bytes.len() || queue.len() >= 128))
                 || (self.kind == 1 && room == 0 && !bytes.is_empty())
             {
                 return Err(Errno(11));

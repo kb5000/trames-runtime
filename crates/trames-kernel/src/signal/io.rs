@@ -16,6 +16,8 @@ mod guest;
 mod job;
 #[path = "io_proc.rs"]
 mod proc_views;
+#[path = "io_ptrace.rs"]
+mod ptrace;
 #[path = "io_scheduling.rs"]
 mod scheduling;
 #[path = "io_terminal.rs"]

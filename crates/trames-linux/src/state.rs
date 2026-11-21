@@ -242,7 +242,7 @@ impl Linux {
     }
     /// Regular files can transfer the mapped prefix. check() already walked the
     /// pages in order, so a precise memory fault needs no second page walk.
-    fn file_buffer_prefix(
+    pub(crate) fn file_buffer_prefix(
         memory: &impl CpuMemory,
         address: u64,
         count: usize,
@@ -414,7 +414,7 @@ impl Linux {
         }
         Ok(total)
     }
-    fn iovec_at(memory: &impl CpuMemory, at: u64) -> Result<(u64, u64)> {
+    pub(crate) fn iovec_at(memory: &impl CpuMemory, at: u64) -> Result<(u64, u64)> {
         let v = memory.read_array::<16>(at).map_err(|_| Errno(14))?;
         Ok((
             u64::from_le_bytes(v[..8].try_into().unwrap()),

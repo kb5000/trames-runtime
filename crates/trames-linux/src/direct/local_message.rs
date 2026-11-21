@@ -189,6 +189,14 @@ impl DirectSyscalls {
         (factory, identity): (&trames_vfs::DescriptorFactory, [u32; 3]),
         standalone: bool,
     ) -> Option<Result<RetainedByte, Errno>> {
+        if StreamWrite::accepts(fd, number, args) {
+            return Some(
+                StreamWrite::new(number, args, memory, Some(identity)).map(|write| RetainedByte {
+                    fd: fd.clone(),
+                    operation: ByteOperation::Stream(Arc::new(write)),
+                }),
+            );
+        }
         if matches!(number, 243 | 269) {
             return Some(Batch::new(number, args, memory).map(|batch| RetainedByte {
                 fd: fd.clone(),
@@ -334,6 +342,9 @@ impl DirectSyscalls {
         self.terminal_stop.set(false);
         if let ByteOperation::Tcp(tcp) = &file.operation {
             return Some(self.transfer_tcp(tcp, number, args, memory));
+        }
+        if let ByteOperation::Stream(write) = &file.operation {
+            return Some(write.progress(&file.fd, memory, &mut self.scratch.borrow_mut()));
         }
         if let ByteOperation::Pipe(write) = &file.operation {
             let mut write = write.lock().unwrap();

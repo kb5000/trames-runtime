@@ -31,7 +31,9 @@ pub(crate) mod namespace;
 mod netlink;
 pub(crate) mod signal_read;
 mod socket_wait;
+mod stream_write;
 pub use file::{FileBoundary, FileCheckpoint, FileExecutor, FileOutput, FilePending, FileResult};
+use stream_write::StreamWrite;
 pub(crate) mod uring;
 pub use socket_wait::RetainedSocket;
 pub use uring::{UringActor, UringBackground, UringEnter, UringEpoch, UringSnapshot};
@@ -81,6 +83,7 @@ pub struct RetainedByte {
 #[derive(Clone)]
 enum ByteOperation {
     Plain,
+    Stream(Arc<StreamWrite>),
     Pipe(Arc<std::sync::Mutex<PipeWrite>>),
     Message(Arc<local_message::AcceptedMessage>),
     Signal(Arc<signal_read::SignalRead>),
@@ -98,6 +101,10 @@ impl RetainedByte {
         self.partial_write().map(Ok)
     }
     pub fn partial_write(&self) -> Option<u64> {
+        if let ByteOperation::Stream(write) = &self.operation {
+            let n = write.written();
+            return (n != 0).then_some(n as u64);
+        }
         if let ByteOperation::Pipe(write) = &self.operation {
             let n = write.lock().unwrap().written;
             (n != 0).then_some(n as u64)
@@ -1959,7 +1966,7 @@ impl DirectSyscalls {
             );
         direct.terminal = self.terminal;
         direct.task_signal = self.task_signal.clone();
-        let file = if file.fd.is_unix() && file.message().is_none() {
+        let file = if file.fd.is_unix() && matches!(file.operation, ByteOperation::Plain) {
             match direct.prepare_packet_byte(&file, number, args, memory) {
                 Some(Ok(file)) => file,
                 Some(Err(error)) => return self.complete(number, args, Err(error)),
@@ -2104,7 +2111,19 @@ impl DirectSyscalls {
                 })));
             }
         }
-        let result = if matches!(number, 63 | 65 | 286)
+        let result = if matches!(file.operation, ByteOperation::Plain)
+            && StreamWrite::accepts(&file.fd, number, args)
+        {
+            let write = match StreamWrite::new(number, args, memory, self.local_identity) {
+                Ok(write) => write,
+                Err(error) => return self.complete_byte(&file, Err(error)),
+            };
+            let result = write.progress(&file.fd, memory, &mut self.scratch.borrow_mut());
+            if result == Err(Errno(11)) {
+                file.operation = ByteOperation::Stream(Arc::new(write));
+            }
+            Some(result)
+        } else if matches!(number, 63 | 65 | 286)
             && file.fd.is_signalfd()
             && matches!(file.operation, ByteOperation::Plain)
         {
@@ -2127,6 +2146,11 @@ impl DirectSyscalls {
             Some(Err(Errno(11)))
                 if self.terminal_stop.get()
                     || !file.fd.nonblocking() && socket_flags(number, args) & 0x40 == 0 => {}
+            Some(Err(Errno(11))) => {
+                // F_SETFL may have enabled O_NONBLOCK while a blocking call was making progress.
+                let result = file.interrupted(memory).unwrap_or(Err(Errno(11)));
+                return self.complete_byte(&file, result);
+            }
             Some(result) => {
                 let result = if checkpoint_pipe {
                     self.byte_pipe_signal(&file.fd, number, args, result)
@@ -2524,7 +2548,17 @@ impl DirectSyscalls {
                     return Some(Err(error));
                 }
             };
-            return match self.transfer_fd(&file.fd, number, args, memory)? {
+            let result = if StreamWrite::accepts(&file.fd, number, args) {
+                match StreamWrite::new(number, args, memory, self.local_identity) {
+                    Ok(write) => {
+                        write.try_whole(&file.fd, memory, &mut self.scratch.borrow_mut())?
+                    }
+                    Err(error) => Err(error),
+                }
+            } else {
+                self.transfer_fd(&file.fd, number, args, memory)?
+            };
+            return match result {
                 Err(Errno(11))
                     if self.terminal_stop.get()
                         || !file.fd.nonblocking() && socket_flags(number, args) & 0x40 == 0 =>
@@ -4306,6 +4340,113 @@ mod tests {
                     assert_eq!(vfs.read(reader, 65536).unwrap(), bytes[65536..]);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn unix_stream_resumes_the_original_vectors_and_returns_partial_progress() {
+        for number in [64, 66, 206] {
+            for close in [false, true] {
+                let mut vfs = Vfs::default();
+                let [tx, rx] = vfs.socketpair(1, 1, 0).unwrap();
+                let direct = DirectSyscalls::new(vfs.direct_descriptors());
+                let target: Arc<dyn IoWake> = Arc::new(Target);
+                let mut memory = Memory::default();
+                let size = crate::MAX_WRITE + 8192;
+                memory
+                    .map(0x1000, (size + 8192) as u64, Permissions::RW)
+                    .unwrap();
+                let data: Vec<_> = (0..size).map(|i| (i % 251) as u8).collect();
+                memory.write(0x2000, &data).unwrap();
+                let args = if number == 66 {
+                    // Cross the staging boundary inside the second iovec.
+                    for (i, word) in [0x2000, 17, u64::MAX, 0, 0x2011, (size - 17) as u64]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        memory
+                            .write_array(0x1100 + 8 * i as u64, word.to_le_bytes())
+                            .unwrap();
+                    }
+                    [tx as u64, 0x1100, 3, u64::MAX, 0, 0]
+                } else {
+                    [tx as u64, 0x2000, size as u64, 0, 0, 0]
+                };
+                assert_eq!(direct.invoke(number, args, &mut memory), None);
+                assert_eq!(vfs.readable_bytes(rx).unwrap(), Some(0));
+                let mut wait = pending(
+                    direct
+                        .start(number, args, &mut memory, 1, &Arc::downgrade(&target), None)
+                        .unwrap(),
+                );
+                let count = wait
+                    .retained_byte
+                    .as_ref()
+                    .unwrap()
+                    .interrupted(&mut memory)
+                    .unwrap()
+                    .unwrap();
+                assert!(count > 0 && count < size as u64);
+                memory.write(0x1100, &[0; 48]).unwrap();
+                if close {
+                    vfs.close(rx).unwrap();
+                    assert_eq!(complete(direct.resume(wait, &mut memory)), Ok(count));
+                    continue;
+                }
+                let mut received = Vec::new();
+                loop {
+                    received.extend(vfs.read(rx, 61753).unwrap());
+                    match direct.resume(wait, &mut memory) {
+                        IoAttempt::Blocked(next) => wait = next,
+                        attempt => {
+                            assert_eq!(complete(attempt), Ok(size as u64));
+                            break;
+                        }
+                    }
+                }
+                received.extend(vfs.read(rx, size).unwrap());
+                assert_eq!(received, data);
+            }
+        }
+    }
+
+    #[test]
+    fn unix_stream_timeout_nonblock_and_fault_preserve_queued_prefix() {
+        for timeout in [true, false] {
+            let mut v = Vfs::default();
+            let [tx, rx] = v.socketpair(1, 1, 0).unwrap();
+            let socket = v.local_socket(tx).unwrap().unwrap();
+            socket.set_reuse(7, 1024).unwrap();
+            let room = socket.buffer_size(false);
+            let d = DirectSyscalls::new(v.direct_descriptors());
+            let mut m = Memory::default();
+            m.map(0x1000, 0x10000, Permissions::RW).unwrap();
+            let target: Arc<dyn IoWake> = Arc::new(Target);
+            let args = [tx as u64, 0x1000, 65536, 0, 0, 0];
+            assert_eq!(d.invoke(64, args, &mut m), None);
+            assert_eq!(v.readable_bytes(rx).unwrap(), Some(0));
+            let mut wait = pending(
+                d.start(64, args, &mut m, 1, &Arc::downgrade(&target), None)
+                    .unwrap(),
+            );
+            if timeout {
+                wait.deadline = Some(Instant::now());
+            } else {
+                v.set_status_flags(tx, O_NONBLOCK).unwrap();
+            }
+            assert_eq!(complete(d.resume(wait, &mut m)), Ok(room as u64));
+            assert_eq!(v.read(rx, 65536).unwrap().len(), room);
+            v.set_status_flags(tx, 0).unwrap();
+            let fault = [tx as u64, 0x10ffd, 16, 0, 0, 0];
+            m.write(0x10ffd, b"end").unwrap();
+            assert_eq!(
+                complete(
+                    d.start(64, fault, &mut m, 1, &Arc::downgrade(&target), None)
+                        .unwrap()
+                ),
+                Ok(3)
+            );
+            assert_eq!(v.read(rx, 16).unwrap(), b"end");
         }
     }
 

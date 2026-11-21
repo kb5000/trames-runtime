@@ -886,7 +886,7 @@ impl Snapshot {
         // futex/epoll checkpoint. Ordinary unfiltered calls keep the old path.
         if !matches!(
             cpu.x(8) as u32,
-            25 | 92 | 98..=101 | 113..=115 | 124 | 139 | 154..=157 | 163 | 164 | 261 | 166 | 168 | 169 | 172..=179 | 270 | 271 | 278
+            25 | 92 | 98..=101 | 113..=115 | 117 | 124 | 139 | 154..=157 | 163 | 164 | 261 | 166 | 168 | 169 | 172..=179 | 270 | 271 | 278
         ) && !(cpu.x(8) as u32 == 29
             && trames_vfs::DescriptorControl::status_ioctl_request(cpu.x(1) as u32))
             && !(matches!(cpu.x(8) as u32, 160..=162) && self.uts.is_some())
@@ -951,6 +951,9 @@ impl Snapshot {
             // Cross-mm access has no retained target-mm admission yet. Keep
             // its unsupported result terminal on this source, without fallback.
             270 | 271 => Err(Errno(38)),
+            117 => self
+                .io_routes
+                .ptrace(&self.io_signals, std::array::from_fn(|i| cpu.x(i))),
             number @ 154..=157 => self.io_routes.job_call(
                 &self.io_signals,
                 number,

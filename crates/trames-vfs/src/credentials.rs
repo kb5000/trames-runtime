@@ -66,6 +66,11 @@ impl CredentialState {
             resources.namespaces.select(flags)
         })
     }
+    /// PTRACE_ATTACH uses the same objective credentials and dumpability
+    /// transaction as pidfd_getfd. The caller has already excluded its own group.
+    pub fn check_trace_attach(&self, caller: &Credentials) -> Result<()> {
+        self.with_pidfd_resources(caller, false, |_| Ok(()))
+    }
     fn with_pidfd_resources<T>(
         &self,
         caller: &Credentials,

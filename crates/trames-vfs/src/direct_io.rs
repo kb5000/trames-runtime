@@ -1700,6 +1700,18 @@ impl DirectFd {
     pub fn send(&self, bytes: &[u8], flags: u32) -> Result<usize> {
         self.send_credentials(bytes, flags, None)
     }
+    pub fn try_send_whole_stream(
+        &self,
+        bytes: &[u8],
+        flags: u32,
+        identity: Option<[u32; 3]>,
+    ) -> Result<usize> {
+        if !fd_can_write(self.flags) {
+            return Err(Errno(9));
+        }
+        let (data, side) = self.local_data().ok_or(Errno(88))?;
+        data.try_send_whole(side, bytes, flags, identity)
+    }
     pub fn send_credentials(
         &self,
         bytes: &[u8],
