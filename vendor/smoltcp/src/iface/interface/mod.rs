@@ -114,6 +114,29 @@ pub struct Interface {
     fragmenter: Fragmenter,
 }
 
+/// Transport events owned by this interface. The caller already holds the
+/// interface exclusively while advancing a protocol or consuming a datagram.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TransportCounters {
+    pub active_opens: u64,
+    pub passive_opens: u64,
+    pub attempt_fails: u64,
+    pub estab_resets: u64,
+    pub in_segs: u64,
+    pub out_segs: u64,
+    pub out_rsts: u64,
+    pub retrans_segs: u64,
+    pub orig_data_sent: u64,
+    pub syn_retrans: u64,
+    pub dsack_recv: u64,
+    pub dsack_ofo_recv: u64,
+    pub udp_in: u64,
+    pub udp_out: u64,
+    pub udp_no_ports: u64,
+    pub udp_rcvbuf_errors: u64,
+    pub udp_invalid: u64,
+}
+
 /// The device independent part of an Ethernet network interface.
 ///
 /// Separating the device from the data required for processing and dispatching makes
@@ -122,6 +145,7 @@ pub struct Interface {
 /// methods on the `Interface` in this time (since its `device` field is borrowed
 /// exclusively). However, it is still possible to call methods on its `inner` field.
 pub struct InterfaceInner {
+    pub(crate) counters: TransportCounters,
     caps: DeviceCapabilities,
     now: Instant,
     rand: Rand,
@@ -244,6 +268,7 @@ impl Interface {
             },
             fragmenter: Fragmenter::new(),
             inner: InterfaceInner {
+                counters: TransportCounters::default(),
                 now,
                 caps,
                 hardware_addr: config.hardware_addr,
@@ -384,6 +409,14 @@ impl Interface {
 
     pub fn routes_mut(&mut self) -> &mut Routes {
         &mut self.inner.routes
+    }
+
+    pub fn transport_counters(&self) -> TransportCounters {
+        self.inner.counters
+    }
+
+    pub fn record_udp_read_v4(&mut self) {
+        self.inner.counters.udp_in += 1;
     }
 
     /// Whether new TCP handshakes on this interface negotiate selective acknowledgments.
@@ -1333,7 +1366,18 @@ impl InterfaceInner {
                 emit_ip(&ip_repr, tx_buffer);
                 Ok(())
             }),
+        }?;
+        match packet.payload() {
+            #[cfg(feature = "socket-tcp")]
+            IpPayload::Tcp(tcp) => {
+                self.counters.out_segs += 1;
+                self.counters.out_rsts += u64::from(tcp.control == TcpControl::Rst);
+            }
+            #[cfg(all(feature = "socket-udp", feature = "proto-ipv4"))]
+            IpPayload::Udp(..) if matches!(ip_repr, IpRepr::Ipv4(_)) => self.counters.udp_out += 1,
+            _ => {}
         }
+        Ok(())
     }
 }
 

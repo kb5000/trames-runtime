@@ -2,6 +2,31 @@
 //! Namespace-owned Internet socket tables for procfs.
 use super::Credentials;
 
+pub(super) fn transport_statistics(
+    network: Option<&trames_net::Network>,
+    name: &[u8],
+) -> Option<Vec<u8>> {
+    let (c, established) = network?.transport_counters()?;
+    let text = match name {
+        b"snmp" => format!(
+            "Tcp: ActiveOpens PassiveOpens AttemptFails EstabResets CurrEstab InSegs OutSegs RetransSegs OutRsts\n\
+             Tcp: {} {} {} {} {} {} {} {} {}\n\
+             Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors\n\
+             Udp: {} {} {} {} {}\n",
+            c.active_opens, c.passive_opens, c.attempt_fails, c.estab_resets, established,
+            c.in_segs, c.out_segs, c.retrans_segs, c.out_rsts, c.udp_in, c.udp_no_ports,
+            c.udp_invalid + c.udp_rcvbuf_errors, c.udp_out, c.udp_rcvbuf_errors,
+        ),
+        b"netstat" => format!(
+            "TcpExt: TCPOrigDataSent TCPSynRetrans TCPDSACKRecv TCPDSACKOfoRecv\n\
+             TcpExt: {} {} {} {}\n",
+            c.orig_data_sent, c.syn_retrans, c.dsack_recv, c.dsack_ofo_recv,
+        ),
+        _ => return None,
+    };
+    Some(text.into_bytes())
+}
+
 pub(super) fn table(
     network: Option<&trames_net::Network>,
     key: &[u8],

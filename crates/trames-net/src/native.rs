@@ -571,6 +571,18 @@ impl Socket {
         );
         sources
     }
+    pub fn tcp_readable_bytes(&self) -> Result<usize> {
+        if self.native.state.connection() == Connection::Listening {
+            return Err(NetError(22));
+        }
+        let mut bytes: libc::c_int = 0;
+        // The kernel writes one integer while this endpoint owns the host FD.
+        if unsafe { libc::ioctl(self.native.as_fd().as_raw_fd(), libc::FIONREAD, &mut bytes) } == -1
+        {
+            return Err(from_io(std::io::Error::last_os_error()));
+        }
+        Ok(bytes.max(0) as usize)
+    }
     pub fn info(&self) -> super::SocketInfo {
         super::SocketInfo {
             namespace_id: 0, // Filled by the public socket wrapper.

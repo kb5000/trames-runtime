@@ -18,6 +18,7 @@ impl InterfaceInner {
             &self.caps.checksum
         ));
 
+        self.counters.in_segs += 1;
         for tcp_socket in sockets
             .items_mut()
             .filter_map(|i| Socket::downcast_mut(&mut i.socket))

@@ -837,6 +837,20 @@ impl<'a> Socket<'a> {
         self.state
     }
 
+    fn record_reset(&self, cx: &mut Context) {
+        match self.state {
+            State::SynSent | State::SynReceived => cx.counters.attempt_fails += 1,
+            State::Established | State::CloseWait => cx.counters.estab_resets += 1,
+            _ => {}
+        }
+    }
+
+    /// Close the original endpoint and account for its transition.
+    pub fn abort_with_context(&mut self, cx: &mut Context) {
+        self.record_reset(cx);
+        self.abort();
+    }
+
     fn reset(&mut self) {
         let rx_cap_log2 =
             mem::size_of::<usize>() * 8 - self.rx_buffer.capacity().leading_zeros() as usize;
@@ -996,6 +1010,7 @@ impl<'a> Socket<'a> {
             local: local_endpoint,
             remote: remote_endpoint,
         });
+        cx.counters.active_opens += 1;
         self.set_state(State::SynSent);
 
         let seq = Self::random_seq_no(cx);
@@ -1737,6 +1752,21 @@ impl<'a> Socket<'a> {
             }
         }
 
+        if self.remote_has_sack {
+            if let (Some(ack), Some((left, right))) = (repr.ack_number, repr.sack_ranges[0]) {
+                let (left, right) = (TcpSeqNumber(left as i32), TcpSeqNumber(right as i32));
+                if left < right {
+                    if right <= ack {
+                        cx.counters.dsack_recv += 1;
+                    } else if repr.sack_ranges[1].is_some_and(|(l, r)| {
+                        TcpSeqNumber(l as i32) <= left && right <= TcpSeqNumber(r as i32)
+                    }) {
+                        cx.counters.dsack_ofo_recv += 1;
+                    }
+                }
+            }
+        }
+
         // Disregard control flags we don't care about or shouldn't act on yet.
         let mut control = repr.control;
         control = control.quash_psh();
@@ -1759,6 +1789,7 @@ impl<'a> Socket<'a> {
             // reason is TCP simultaneous open).
             (State::SynReceived, TcpControl::Rst) if self.listen_endpoint.port != 0 => {
                 tcp_trace!("received RST");
+                cx.counters.attempt_fails += 1;
                 self.tuple = None;
                 self.set_state(State::Listen);
                 return None;
@@ -1767,6 +1798,7 @@ impl<'a> Socket<'a> {
             // RSTs in any other state close the socket.
             (_, TcpControl::Rst) => {
                 tcp_trace!("received RST");
+                self.record_reset(cx);
                 self.set_state(State::Closed);
                 self.tuple = None;
                 return None;
@@ -1774,6 +1806,7 @@ impl<'a> Socket<'a> {
 
             // SYN packets in the LISTEN state change it to SYN-RECEIVED.
             (State::Listen, TcpControl::Syn) => {
+                cx.counters.passive_opens += 1;
                 tcp_trace!("received SYN");
                 if let Some(max_seg_size) = repr.max_seg_size {
                     if max_seg_size == 0 {
@@ -2295,6 +2328,7 @@ impl<'a> Socket<'a> {
         // Check if any state needs to be changed because of a timer.
         if self.timed_out(cx.now()) {
             // If a timeout expires, we should abort the connection.
+            self.record_reset(cx);
             net_debug!("timeout exceeded");
             self.set_state(State::Closed);
         } else if !self.seq_to_transmit(cx) {
@@ -2543,6 +2577,12 @@ impl<'a> Socket<'a> {
         self.remote_last_win = repr.window_len;
 
         if repr.segment_len() > 0 {
+            if self.rtte.max_seq_sent.is_some_and(|end| repr.seq_number < end) {
+                cx.counters.retrans_segs += 1;
+                cx.counters.syn_retrans += u64::from(repr.control == TcpControl::Syn);
+            } else if !repr.payload.is_empty() {
+                cx.counters.orig_data_sent += 1;
+            }
             self.rtte
                 .on_send(cx.now(), repr.seq_number + repr.segment_len());
             self.congestion_controller

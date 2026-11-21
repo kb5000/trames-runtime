@@ -2371,6 +2371,10 @@ impl Vfs {
                         .map(|ns| ns.network.borrow().clone());
                     let info = network.as_ref().and_then(|n| n.info());
                     return Ok(match parts[i + 1] {
+                        name @ (b"snmp" | b"netstat") => {
+                            proc_inet::transport_statistics(network.as_ref(), name)
+                                .and_then(regular)
+                        }
                         b"tcp" | b"tcp6" | b"udp" | b"udp6" | b"raw" | b"raw6" | b"icmp"
                         | b"icmp6" => regular(proc_inet::table(
                             network.as_ref(),
@@ -3067,6 +3071,13 @@ impl Vfs {
                         names.extend(p.fds.iter().map(|f| f.fd.to_string().into_bytes()));
                     }
                     if parts[depth] == b"net" {
+                        if p.namespaces
+                            .net
+                            .upgrade()
+                            .is_some_and(|ns| ns.network.borrow().has_guest_transport())
+                        {
+                            names.extend([b"snmp".to_vec(), b"netstat".to_vec()]);
+                        }
                         names.extend(
                             [
                                 "route", "if_inet6", "dev", "tcp", "tcp6", "udp", "udp6", "raw",

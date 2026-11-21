@@ -1265,6 +1265,20 @@ impl Network {
         inner.tick();
         Ok(())
     }
+    pub(super) fn transport_counters(&self) -> Option<(smoltcp::iface::TransportCounters, usize)> {
+        let fabric = self.0.fabric.0.borrow();
+        let node = fabric.nodes.get(&self.0.key)?;
+        let established = node
+            .sockets
+            .iter()
+            .filter(|(_, socket)| {
+                matches!(socket, smoltcp::socket::Socket::Tcp(t)
+                if matches!(t.state(), tcp::State::Established | tcp::State::CloseWait))
+            })
+            .count();
+        Some((node.iface.transport_counters(), established))
+    }
+
     pub(super) fn port_range(&self) -> [u16; 2] {
         let range = self.0.port_range.get();
         [range as u16, (range >> 16) as u16]
@@ -1414,8 +1428,9 @@ impl Drop for Socket {
                     let s = n.sockets.get_mut::<tcp::Socket>(h);
                     if s.is_listening() || s.state() == tcp::State::Closed {
                         n.sockets.remove(h);
-                    } else if abort {
-                        s.abort();
+                    } else if abort || s.recv_queue() != 0 {
+                        // Linux aborts a stream whose final owner discards unread data.
+                        s.abort_with_context(n.iface.context());
                         n.iface.poll(now, &mut n.port, &mut n.sockets);
                         n.sockets.remove(h);
                     } else {
@@ -1601,6 +1616,30 @@ mod shared_lifetime_tests {
             socket.bind("10.0.0.2:0".parse().unwrap()).unwrap();
             assert_eq!(socket.local_addr().unwrap().port(), expected);
         }
+    }
+
+    #[test]
+    fn udp_counters_follow_the_receiving_namespace_and_ignore_peeks() {
+        let fabric = Fabric::new().unwrap();
+        let clients = fabric.environment(2, NetworkMode::Full).unwrap();
+        let servers = fabric.environment(3, NetworkMode::Full).unwrap();
+        let tx = clients.socket(2, 2, 0).unwrap();
+        let rx = servers.socket(2, 2, 0).unwrap();
+        let endpoint = "10.0.0.3:34112".parse().unwrap();
+        rx.bind(endpoint).unwrap();
+        tx.send(b"sample", 0, Some(endpoint)).unwrap();
+        assert_eq!(rx.recv(1, MSG_PEEK).unwrap().data, b"s");
+        let sent = clients.transport_counters().unwrap().0;
+        let pending = servers.transport_counters().unwrap().0;
+        assert_eq!((sent.udp_out, sent.udp_in), (1, 0));
+        assert_eq!((pending.udp_out, pending.udp_in), (0, 0));
+        assert_eq!(rx.recv(1, 0).unwrap().data, b"s");
+        assert_eq!(servers.transport_counters().unwrap().0.udp_in, 1);
+        drop(rx);
+        tx.send(b"dropped", 0, Some(endpoint)).unwrap();
+        fabric.tick();
+        assert_eq!(servers.transport_counters().unwrap().0.udp_no_ports, 1);
+        assert_eq!(clients.transport_counters().unwrap().0.udp_no_ports, 0);
     }
 
     #[test]

@@ -399,6 +399,14 @@ impl Network {
             Backend::Virtual(n) => (!n.is_isolated()).then(|| n.info()),
         }
     }
+    /// Counters describe the guest transport in this namespace. Native host
+    /// traffic has no per-guest protocol counters.
+    pub fn transport_counters(&self) -> Option<(smoltcp::iface::TransportCounters, usize)> {
+        match &self.0 {
+            Backend::Virtual(stack) => stack.transport_counters(),
+            Backend::Native(_) => None,
+        }
+    }
     pub fn links(&self) -> Option<[LinkStats; 2]> {
         match &self.0 {
             Backend::Native(n) => Some(n.links()),
@@ -743,6 +751,18 @@ impl Socket {
         }?;
         info.namespace_id = self.namespace.id();
         Some(info)
+    }
+    pub fn tcp_readable_bytes(&self) -> Result<Option<usize>> {
+        if self.kind != 1 {
+            return Ok(None);
+        }
+        let _operation = self.operation.read_recursive();
+        match &self.backend {
+            SocketBackend::Native(s) => s.tcp_readable_bytes().map(Some),
+            SocketBackend::Hybrid(s) => s.tcp_readable_bytes().map(Some),
+            SocketBackend::Virtual(s) => s.tcp_readable_bytes().map(Some),
+            _ => Ok(None),
+        }
     }
     pub fn linger(&self) -> Result<[u8; 8]> {
         let _operation = self.operation.read_recursive();

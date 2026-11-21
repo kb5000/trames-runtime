@@ -571,11 +571,13 @@ impl<'a> Socket<'a> {
 
         match self.rx_buffer.enqueue(size, metadata) {
             Ok(buf) => buf.copy_from_slice(payload),
-            Err(_) => net_trace!(
-                "udp:{}:{}: buffer full, dropped incoming packet",
-                self.endpoint,
-                remote_endpoint
-            ),
+            Err(_) => {
+                #[cfg(feature = "proto-ipv4")]
+                if matches!(ip_repr, IpRepr::Ipv4(_)) {
+                    cx.counters.udp_rcvbuf_errors += 1;
+                }
+                net_trace!("udp:{}:{}: buffer full, dropped incoming packet", self.endpoint, remote_endpoint);
+            }
         }
 
         #[cfg(feature = "async")]

@@ -16,13 +16,17 @@ impl InterfaceInner {
         ip_payload: &'frame [u8],
     ) -> Option<Packet<'frame>> {
         let (src_addr, dst_addr) = (ip_repr.src_addr(), ip_repr.dst_addr());
-        let udp_packet = check!(UdpPacket::new_checked(ip_payload));
-        let udp_repr = check!(UdpRepr::parse(
-            &udp_packet,
-            &src_addr,
-            &dst_addr,
-            &self.caps.checksum
-        ));
+        let parsed = UdpPacket::new_checked(ip_payload).and_then(|packet| {
+            let repr = UdpRepr::parse(&packet, &src_addr, &dst_addr, &self.caps.checksum)?;
+            Ok((packet, repr))
+        });
+        let Ok((udp_packet, udp_repr)) = parsed else {
+            #[cfg(feature = "proto-ipv4")]
+            if matches!(ip_repr, IpRepr::Ipv4(_)) {
+                self.counters.udp_invalid += 1;
+            }
+            return None;
+        };
 
         #[cfg(feature = "socket-udp")]
         {
@@ -57,6 +61,14 @@ impl InterfaceInner {
                 dns_socket.process(self, &ip_repr, &udp_repr, udp_packet.payload());
                 return None;
             }
+        }
+
+        #[cfg(feature = "proto-ipv4")]
+        if matches!(ip_repr, IpRepr::Ipv4(_))
+            && !self.is_broadcast(&dst_addr)
+            && !dst_addr.is_multicast()
+        {
+            self.counters.udp_no_ports += 1;
         }
 
         // The packet wasn't handled by a socket, send an ICMP port unreachable packet.

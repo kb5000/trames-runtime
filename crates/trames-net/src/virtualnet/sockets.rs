@@ -892,10 +892,31 @@ impl Socket {
         if !buffered {
             i.tick();
         }
+        let mut state = self.state.borrow_mut();
         if self.kind == 1 {
-            self.before_io()?;
+            if state.connection == Connection::Connecting {
+                return Err(NetError(11));
+            }
+            if let Some(error) = state.error {
+                // An established stream delivers buffered bytes before its
+                // pending reset. SO_ERROR and writes can still consume it.
+                let drain_first = error == 104
+                    && (buffered
+                        || state
+                            .handles
+                            .first()
+                            .and_then(|h| {
+                                i.nodes
+                                    .get(&self.network.0.key)
+                                    .map(|n| n.sockets.get::<tcp::Socket>(*h).can_recv())
+                            })
+                            .unwrap_or(false));
+                if !drain_first && count != 0 {
+                    state.error = None;
+                    return Err(NetError(error));
+                }
+            }
         }
-        let state = self.state.borrow();
         if state.read_closed || self.kind == 1 && count == 0 {
             return Ok(Received {
                 packet_address: None,
@@ -999,6 +1020,9 @@ impl Socket {
                     };
                     if flags & MSG_PEEK == 0 {
                         let _ = s.recv();
+                        if source.is_ipv4() {
+                            n.iface.record_udp_read_v4();
+                        }
                     }
                     return Ok(Received {
                         packet_address: None,
@@ -1196,6 +1220,19 @@ impl Socket {
         drop(state);
         i.driver_dirty = true;
         Ok(())
+    }
+    pub fn tcp_readable_bytes(&self) -> Result<usize> {
+        let mut fabric = self.network.0.fabric.0.borrow_mut();
+        fabric.tick();
+        let state = self.state.borrow();
+        if state.connection == Connection::Listening {
+            return Err(NetError(22));
+        }
+        let node = fabric.nodes.get(&self.network.0.key).ok_or(NetError(100))?;
+        Ok(state
+            .handles
+            .first()
+            .map_or(0, |h| node.sockets.get::<tcp::Socket>(*h).recv_queue()))
     }
     pub fn tcp_info(&self) -> Result<[u8; 104]> {
         if self.kind != 1 {

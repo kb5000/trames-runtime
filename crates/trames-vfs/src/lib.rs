@@ -1367,6 +1367,10 @@ impl Vfs {
         if let Some(socket) = &open.local {
             return socket.readable_bytes().map(Some);
         }
+        if let Some(socket) = open.socket.clone() {
+            drop(open);
+            return socket.tcp_readable_bytes().map_err(|e| Errno(e.0));
+        }
         if let Some(end) = &open.pipe {
             return Ok(Some(end.data.lock().unwrap().bytes.len()));
         }

@@ -528,6 +528,13 @@ impl Socket {
             self.native()?.linger()
         }
     }
+    pub fn tcp_readable_bytes(&self) -> Result<usize> {
+        if self.path.get() == Path::Guest {
+            self.guest()?.tcp_readable_bytes()
+        } else {
+            self.native()?.tcp_readable_bytes()
+        }
+    }
     pub fn tcp_info(&self) -> Result<[u8; 104]> {
         if self.path.get() == Path::Guest {
             self.guest()?.tcp_info()
