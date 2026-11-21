@@ -15,7 +15,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-from run import digest, list_cases, save
+from run import SUITE_FIXTURES, digest, list_cases, save
 
 HERE=Path(__file__).resolve().parent
 
@@ -90,7 +90,7 @@ def main():
         if a.reference_timings:cmd+=['--reference-timings',str(a.reference_timings.resolve())]
         if a.platform=='trames':cmd+=['--chunk-size',str(a.chunk_size)]
         if a.reuse:
-            cmd+=['--reuse',str((a.reuse/('worker-%02d'%index)).resolve())]
+            cmd+=['--reuse',str(a.reuse.resolve())]
             if a.reuse_completed:cmd+=['--reuse-completed']
         for override in a.suite_timeout:cmd+=['--suite-timeout',override]
         if a.platform=='native':
@@ -119,7 +119,7 @@ def main():
     merged.sort(key=lambda r:(r['suite'],r['case']))
     final=dict(plans[0] if plans else plan,suites=plan['suites'],discovery_errors=discovery_errors,workers=outcomes)
     for worker_plan in plans:
-        for fixture in ('host_pty_fixture', 'setgid_fixture', 'multiprocess_fixture'):
+        for fixture in SUITE_FIXTURES:
             if fixture in worker_plan:
                 final[fixture] = worker_plan[fixture]
     save(out/'plan.json',final);save(out/'results.json',merged)

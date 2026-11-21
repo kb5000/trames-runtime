@@ -11,7 +11,7 @@ import subprocess
 import time
 import xml.etree.ElementTree as ET
 
-from run import TRACEE_WAIT, classify, execute, guest_terminal, guest_test_work, save, suite_flags, child_check_failure
+from run import executed_case, TRACEE_WAIT, classify, execute, guest_terminal, guest_test_work, save, suite_flags, child_check_failure
 
 
 class Progress:
@@ -50,6 +50,7 @@ def xml_rows(xml, code, expected, stderr=None):
     if global_failures:
         messages=[f.get('message','') for c in global_failures for f in c.findall('failure')]
         return [dict(case=name,status='fixture_failed',messages=messages,seconds=float(c.get('time','0'))) for c,name in zip(cases,names)]
+    if not all(executed_case(case) for case in cases):return None
     rows=[]
     for case,name in zip(cases,names):
         failed=case.findall('failure');skipped=case.find('skipped')

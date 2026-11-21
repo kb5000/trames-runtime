@@ -141,6 +141,13 @@ def child_check_failure(case, stderr):
     return None
 
 
+def executed_case(case):
+    # Older GoogleTest versions omitted these attributes. Modern XML also
+    # lists suppressed tests, which have neither a failure nor a skip child.
+    expected = 'skipped' if case.find('skipped') is not None else 'completed'
+    return case.get('status', 'run') == 'run' and case.get('result', expected) == expected
+
+
 def classify(xml, code, timed_out, expected):
     if timed_out:
         return str(timed_out), []
@@ -161,24 +168,91 @@ def classify(xml, code, timed_out, expected):
     failures = [f.get('message', '') for f in case.findall('failure')]
     if failures:
         return 'failed', failures
-    if case.find('skipped') is not None:
+    if not executed_case(case):
+        return 'invalid_result', []
+    if case.find('skipped') is not None and code == 0:
         return 'skipped', [case.find('skipped').get('message', '')]
     if code == 0 and (failure := child_check_failure(expected, xml.with_suffix('.stderr'))):
         return failure
     return ('passed' if code == 0 else 'crashed'), []
 
+# These flags describe the named suites, not the worker or its other tests.
+SUITE_FIXTURES = {
+    'host_pty_fixture': {'host_pty'},
+    'setgid_fixture': {'setgid'},
+    'multiprocess_fixture': {'concurrency'},
+    'memfd_tmpfs_fixture': {'memfd'},
+    'writable_sysfs_fixture': {'mount', 'rename'},
+}
+
+def evidence_stem(directory, row, index):
+    if row.get('reused_from'):
+        return Path(row['reused_from'])
+    if row.get('evidence_stem'):
+        return Path(row['evidence_stem'])
+    if row.get('logs'):
+        return directory / row['logs']
+    return directory / 'logs' / (row.get('log_stem') or str(index))
+
+def reusable_xml(stem):
+    try:
+        cases = ET.parse(stem.with_suffix('.xml')).findall('.//testcase')
+    except (FileNotFoundError, ET.ParseError):
+        return None, {}
+    outcomes = {}
+    for case in cases:
+        name = case.get('classname', '') + '.' + case.get('name', '')
+        if name in outcomes or name == '.' and case.find('failure') is not None:
+            return None, {}
+        outcomes[name] = None
+        if executed_case(case) and case.find('failure') is None:
+            outcomes[name] = 'skipped' if case.find('skipped') is not None else 'passed'
+    return int(any(c.find('failure') is not None for c in cases)), outcomes
+
+
 def reuse_rows(args, plan):
     if not args.reuse:
         return {}
-    previous = json.loads((args.reuse/'plan.json').read_text())
-    old = {s['name']:s['sha256'] for s in previous['suites']}
-    if old != {s['name']:s['sha256'] for s in plan['suites']}:
+    directory = args.reuse.resolve()
+    previous = json.loads((directory / 'plan.json').read_text())
+    old = {s['name']: s['sha256'] for s in previous['suites']}
+    suites = {s['name']: s['sha256'] for s in plan['suites']}
+    selected = {s['name']: set(s['cases']) for s in plan['suites']}
+    shared = old.keys() & suites.keys()
+    if not shared:
+        return {}
+    if any(old[name] != suites[name] for name in shared):
         raise RuntimeError('Cannot reuse results from different binaries')
-    for key in ['kernel','uid','runtime_sha256','nofile','network','cpus','rootfs_sha256','runfiles_sha256','process_context','native_init_sha256','fresh_store','host_pty_fixture','setgid_fixture','memfd_tmpfs_fixture','writable_sysfs_fixture','multiprocess_fixture','custom_rootfs']:
-        if key in plan and previous.get(key) != plan[key]:
-            raise RuntimeError('Cannot reuse results with a different '+key)
-    return {(r['suite'],r['case']):dict(r,reused_from=str(args.reuse.resolve()/'logs'/(r.get('log_stem') or str(i))))
-            for i,r in enumerate(json.loads((args.reuse/'results.json').read_text())) if r['status'] in (['passed','skipped','failed','no_result','crashed','invalid_result','mismatched_result'] if args.reuse_completed else ['passed','skipped'])}
+    for key in ('kernel', 'uid', 'runtime_sha256', 'nofile', 'machine', 'network',
+                'cpus', 'rootfs_sha256', 'runfiles_sha256', 'process_context',
+                'native_init_sha256', 'fresh_store', 'custom_rootfs'):
+        if previous.get(key) != plan.get(key):
+            raise RuntimeError('Cannot reuse results with a different ' + key)
+    for key, owners in SUITE_FIXTURES.items():
+        if owners & shared and previous.get(key) != plan.get(key):
+            raise RuntimeError('Cannot reuse results with a different ' + key)
+
+    eligible = {'passed', 'skipped'}
+    if args.reuse_completed:
+        eligible.update(('failed', 'no_result', 'crashed', 'invalid_result', 'mismatched_result'))
+    rows = {}
+    reports = {}
+    for index, row in enumerate(json.loads((directory / 'results.json').read_text())):
+        if row['suite'] in shared and row['status'] in eligible and row['case'] in selected[row['suite']]:
+            stem = evidence_stem(directory, row, index)
+            if row['status'] in ('passed', 'skipped'):
+                if stem not in reports:
+                    reports[stem] = reusable_xml(stem)
+                exit_code, outcomes = reports[stem]
+                if row.get('code') != exit_code or outcomes.get(row['case']) != row['status']:
+                    continue
+                if row['status'] == 'passed' and child_check_failure(row['case'], stem.with_suffix('.stderr')):
+                    continue
+            key = (row['suite'], row['case'])
+            if key in rows:
+                raise ValueError(f'Duplicate cached result for {key}')
+            rows[key] = dict(row, reused_from=str(stem))
+    return rows
 
 
 # These upstream cases include a deliberate wait. Allow it to finish and
@@ -299,6 +373,11 @@ def trames(args, output):
         plan['memfd_tmpfs_fixture'] = True
     save(output/'plan.json', plan)
     cache=reuse_rows(args,plan)
+    selected = [(s['name'], case) for s in plan['suites'] for case in s['cases']]
+    if all(key in cache for key in selected):
+        rows = [cache[key] for key in selected]
+        save(output/'results.json', rows)
+        return rows
     registry = output/'registry'
     env = dict(os.environ, TRAMES_HOME=str(registry))
     runner = str(args.runner.resolve())
@@ -424,6 +503,7 @@ def main():
     summary=dict(platform=a.platform,cases=len(rows),counts=dict(collections.Counter(r['status'] for r in rows)))
     save(out/'summary.json',summary)
     print(json.dumps(summary),flush=True)
-    if a.platform=='trames' and not a.keep_registry:shutil.rmtree(out/'registry')
+    if a.platform == 'trames' and not a.keep_registry and (out/'registry').is_dir():
+        shutil.rmtree(out/'registry')
 
 if __name__ == '__main__':main()

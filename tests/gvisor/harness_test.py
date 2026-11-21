@@ -101,12 +101,48 @@ class EvidenceTests(unittest.TestCase):
         observed=[(s['name'],case) for g in groups for s in g for case in s['cases']]
         self.assertEqual(set(observed),expected);self.assertEqual(len(observed),len(expected))
     def test_reuse_rejects_another_runtime_or_elf(self):
-        plan={'suites':[{'name':'one','sha256':'elf-a'}],'runtime_sha256':'runtime-a','cpus':2,'fresh_store':True}
-        (self.root/'plan.json').write_text(json.dumps(plan));(self.root/'results.json').write_text(json.dumps([dict(suite='one',case='T.Pass',status='passed')]))
+        plan={'suites':[{'name':'one','sha256':'elf-a','cases':['T.Pass']}],'runtime_sha256':'runtime-a','cpus':2,'fresh_store':True}
+        (self.root/'plan.json').write_text(json.dumps(plan));(self.root/'results.json').write_text(json.dumps([dict(suite='one',case='T.Pass',status='passed',code=0)]))
         args=argparse.Namespace(reuse=self.root,reuse_completed=False)
+        (self.root/'logs').mkdir()
+        (self.root/'logs/0.xml').write_text('<testsuite><testcase classname="T" name="Pass"/></testsuite>')
         self.assertEqual(len(reuse_rows(args,plan)),1)
         with self.assertRaises(RuntimeError):reuse_rows(args,dict(plan,runtime_sha256='runtime-b'))
-        with self.assertRaises(RuntimeError):reuse_rows(args,dict(plan,suites=[{'name':'one','sha256':'elf-b'}]))
+        with self.assertRaises(RuntimeError):reuse_rows(args,dict(plan,suites=[{'name':'one','sha256':'elf-b','cases':['T.Pass']}]))
+
+    def test_suppressed_xml_with_successful_exit_cannot_pass(self):
+        path = self.xml('<testcase classname="T" name="A" status="notrun" result="suppressed"/>')
+        self.assertIsNone(xml_rows(path, 0, ['T.A']))
+        self.assertEqual(classify(path, 0, False, 'T.A')[0], 'invalid_result')
+
+    def test_repartition_and_second_reuse_keep_the_original_xml(self):
+        plan = dict(suites=[dict(name='a', sha256='a', cases=['T.A']), dict(name='memfd', sha256='m', cases=['M.Test'])],
+                    memfd_tmpfs_fixture=True)
+        (self.root/'plan.json').write_text(json.dumps(plan))
+        stem = self.root/'worker-01/logs/chunk-000004'
+        stem.parent.mkdir(parents=True)
+        stem.with_suffix('.xml').write_text('<testsuite><testcase classname="T" name="A"/></testsuite>')
+        row = dict(suite='a', case='T.A', status='passed', code=0, logs='worker-01/logs/chunk-000004')
+        (self.root/'results.json').write_text(json.dumps([row]))
+        args = argparse.Namespace(reuse=self.root, reuse_completed=False)
+        subset = dict(suites=[plan['suites'][0], dict(name='new', sha256='b', cases=['B.Test'])])
+        first = reuse_rows(args, subset)
+        self.assertEqual(first['a','T.A']['reused_from'], str(stem.resolve()))
+        second = self.root/'second'
+        second.mkdir()
+        (second/'plan.json').write_text(json.dumps(subset))
+        (second/'results.json').write_text(json.dumps(list(first.values())))
+        args.reuse = second
+        self.assertEqual(reuse_rows(args, subset), first)
+        stem.with_suffix('.xml').write_text('<testsuite><testcase classname="U" name="B"/></testsuite>')
+        self.assertFalse(reuse_rows(args, subset))
+        stem.with_suffix('.xml').unlink()
+        self.assertFalse(reuse_rows(args, subset))
+        args.reuse = self.root
+        with self.assertRaisesRegex(RuntimeError, 'memfd_tmpfs_fixture'):
+            reuse_rows(args, dict(suites=[plan['suites'][1]]))
+        with self.assertRaisesRegex(RuntimeError, 'custom_rootfs'):
+            reuse_rows(args, dict(subset, custom_rootfs=True))
 
 
 if __name__=='__main__':unittest.main()

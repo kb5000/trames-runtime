@@ -1359,6 +1359,9 @@ impl Socket {
         Ok(out)
     }
     pub fn get_option(&self, level: u32, name: u32) -> Result<i32> {
+        if self.family == 2 && self.kind == 2 && level == 41 {
+            return Err(NetError(95));
+        }
         if (level, name) == (1, 36) {
             return Ok(self.mark.get() as i32);
         }

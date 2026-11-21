@@ -13,14 +13,14 @@ from pathlib import Path
 import shutil
 import xml.etree.ElementTree as ET
 
-from run import child_check_failure
+from run import child_check_failure, evidence_stem, executed_case
 
 
 def normalize(source,output):
     output.mkdir(parents=True,exist_ok=False)
     rows=json.loads((source/'results.json').read_text());cache={};refined=0;passes=0
-    for row in rows:
-        stem=Path(row['reused_from']) if row.get('reused_from') else source/row['logs']
+    for index, row in enumerate(rows):
+        stem=evidence_stem(source, row, index)
         row['evidence_stem']=str(stem.resolve());xml=stem.with_suffix('.xml')
         if xml.exists() and xml not in cache:
             try:cache[xml]=ET.parse(xml).findall('.//testcase')
@@ -32,7 +32,7 @@ def normalize(source,output):
             row['classification_refined_from']=row['status'];row['status']='fixture_failed'
             row['messages']=[f.get('message','') for c in fixture for f in c.findall('failure')];refined+=1
         elif row['status']=='passed':
-            assert len(matching)==1 and not matching[0].findall('failure') and matching[0].find('skipped') is None, ('Missing original passing XML',row['suite'],row['case'])
+            assert len(matching)==1 and executed_case(matching[0]) and not matching[0].findall('failure') and matching[0].find('skipped') is None, ('Missing original passing XML',row['suite'],row['case'])
             assert row['code'] in (0,1),row
             if row['code']==1:assert any(c.findall('failure') for c in cases),row
             if failure := child_check_failure(row['case'], stem.with_suffix('.stderr')):

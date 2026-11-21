@@ -1337,6 +1337,9 @@ impl Socket {
         Ok(out)
     }
     pub fn get_option(&self, level: u32, name: u32) -> Result<i32> {
+        if self.family == 2 && self.kind == 2 && level == 41 {
+            return Err(NetError(95));
+        }
         match (level, name) {
             (0, 11) if self.family == 2 && self.kind == 2 => {
                 Ok(i32::from(self.dns_receive_errors.get()))

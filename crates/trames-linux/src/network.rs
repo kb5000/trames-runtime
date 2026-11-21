@@ -349,6 +349,11 @@ fn query_address(
     output.write_bytes(memory, &address)?;
     Ok(0)
 }
+// Linux SOL_IP accepts a byte or an int for these scalar header options.
+// Each value these options return fits in one byte (including the receive flags).
+fn ipv4_header_option(a: [u64; 6]) -> bool {
+    a[1] as u32 == 0 && matches!(a[2] as u32, 1 | 2 | 8 | 12 | 13)
+}
 fn read_option<const N: usize>(
     memory: &mut impl CpuMemory,
     a: [u64; 6],
@@ -359,7 +364,11 @@ fn read_option<const N: usize>(
     if capacity > i32::MAX as u32 {
         return Err(Errno(22));
     }
-    let count = (capacity as usize).min(N);
+    let count = if N == 4 && (1..4).contains(&capacity) && ipv4_header_option(a) {
+        1
+    } else {
+        (capacity as usize).min(N)
+    };
     Linux::check(memory, a[3], count, Access::Write)?;
     let value = read()?;
     memory.write(a[3], &value[..count]).map_err(|_| Errno(14))?;
@@ -373,6 +382,17 @@ fn write_option(
     a: [u64; 6],
     write: impl FnOnce(&[u8]) -> Result<()>,
 ) -> Result<u64> {
+    if ipv4_header_option(a) {
+        let size = a[4] as u32 as i32;
+        let value = match size {
+            ..0 => return Err(Errno(22)),
+            0 => 0,
+            1..=3 => u32::from(memory.read_array::<1>(a[3]).map_err(|_| Errno(14))?[0]),
+            _ => u32_at(memory, a[3])?,
+        };
+        write(&value.to_le_bytes())?;
+        return Ok(0);
+    }
     if a[4] < 4 || a[4] > 65536 {
         return Err(Errno(22));
     }
@@ -833,6 +853,38 @@ mod tests {
         assert_eq!(socket.connect_complete(), Err(NetError(111)));
         assert!(v.direct_tcp_fd(fd).is_none());
     }
+    #[test]
+    fn ipv4_scalar_options_touch_only_the_abi_value() {
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        memory.write(0x1fff, &[0xc3]).unwrap();
+        for option in [1, 2, 8, 12, 13] {
+            for width in [1, 2, 3] {
+                let args = [0, 0, option, 0x1fff, width, 0];
+                write_option(&memory, args, |value| {
+                    assert_eq!(value, 0xc3u32.to_le_bytes());
+                    Ok(())
+                })
+                .unwrap();
+                memory.write(0x1000, &(width as u32).to_le_bytes()).unwrap();
+                read_option(&mut memory, [0, 0, option, 0x1fff, 0x1000, 0], || {
+                    Ok(0xc3u32.to_le_bytes())
+                })
+                .unwrap();
+                assert_eq!(u32_at(&memory, 0x1000).unwrap(), 1);
+            }
+        }
+        write_option(&memory, [0, 0, 1, u64::MAX, 0, 0], |value| {
+            assert_eq!(value, [0; 4]);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            write_option(&memory, [0, 41, 67, 0x1fff, 3, 0], |_| Ok(())),
+            Err(Errno(22))
+        );
+    }
+
     #[test]
     fn direct_and_owner_controls_share_copyout_and_option_error_order() {
         let cases: [(u32, [u64; 6]); 17] = [

@@ -192,7 +192,10 @@ The default disk floor is 8 GiB. Neither condition becomes a pass or skip.
 
 Batch partitions balance complete case lists, splitting large parameterized
 groups across workers without duplication. Raw worker plans, XML/stdout/stderr
-and merged outcomes remain linked. To continue a previous partition with exact
+and merged outcomes remain linked. Changing the worker count or selecting a
+subset of suites reuses each matching case by name. A second continuation still
+points back to the original XML. Missing or mismatched passing XML triggers a
+fresh run. Fully cached partitions skip guest setup. With matching
 runtime/ELF/rootfs/network/CPU/runfile fingerprints, use `--reuse OLD_BATCH`.
 `--reuse-completed` also retains unchanged, already confirmed assertion/abort
 results; timeouts are retried. Completed singleton results can be reused by a
