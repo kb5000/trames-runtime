@@ -367,6 +367,11 @@ impl Group {
     pub fn stopped(&self) -> bool {
         self.stopped.load(Ordering::Relaxed)
     }
+    /// Orphan notifications require a completed job stop, after all active
+    /// members have acknowledged it. A running member can still be quiescing.
+    pub(crate) fn job_stop_complete(&self) -> bool {
+        self.stopped() && matches!(self.state.lock().unwrap().stop, Some((_, true)))
+    }
     pub fn bind(&self, child: &Arc<Child>, parent: Option<&Arc<Group>>, tgid: u32, uid: u32) {
         child.bind_credentials(Arc::new(trames_vfs::CredentialState::new(
             trames_vfs::Credentials::user(uid, 0),

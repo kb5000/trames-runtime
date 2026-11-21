@@ -6,8 +6,12 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+import subprocess
 
-from batch import partition
+from inventory import inventory
+from run import digest
+from batch import case_keys, missing_cases, partition
 from chunks import Progress, xml_rows
 from run import classify, execute, guest_terminal, reuse_rows, watchdog
 
@@ -98,6 +102,43 @@ class EvidenceTests(unittest.TestCase):
         progress=Progress(path,['T.Parent'],lambda _:5);progress.remaining();since=progress.since
         with path.open('a') as stream:stream.write('[ RUN      ] Child.Other\n[       OK ] Child.Other (1 ms)\n')
         progress.remaining();self.assertEqual(progress.active,'T.Parent');self.assertEqual(progress.since,since)
+    def test_discovery_keeps_disabled_cases_and_reports_missing_modified_or_failed_suites(self):
+        binaries = self.root / 'bin'
+        binaries.mkdir()
+        entries = []
+        for name in ('ok', 'disabled', 'exit', 'duplicate', 'modified', 'missing'):
+            binary = binaries / (name + '_test')
+            binary.write_bytes(name.encode())
+            entries.append(dict(suite=name, sha256=digest(binary)))
+        (binaries/'missing_test').unlink()
+        (binaries/'modified_test').write_bytes(b'different build')
+        (self.root/'build-record.json').write_text(json.dumps(dict(binaries=entries)))
+        def listing(argv, **kwargs):
+            suite = Path(argv[0]).stem
+            if suite == 'exit_test':
+                raise subprocess.CalledProcessError(1, argv, output='T.\n  Partial\n')
+            stdout = {'ok_test':'T.\n  A/0  # parameter\n  DISABLED_B\n',
+                      'disabled_test':'DISABLED_T.\n  B\n',
+                      'duplicate_test':'T.\n  A\n  A\n'}[suite]
+            return subprocess.CompletedProcess(argv, 0, stdout=stdout)
+        with patch('run.subprocess.run', side_effect=listing):
+            result = inventory(binaries)
+        self.assertEqual((result['enabled'], result['disabled']), (1, 2))
+        self.assertEqual(result['groups'][0]['enabled'], ['T.A/0'])
+        self.assertEqual({r['suite'] for r in result['discovery_errors']},
+                         {'exit', 'duplicate', 'modified', 'missing'})
+
+    def test_batch_rejects_duplicate_requests_and_unexpected_worker_results(self):
+        with self.assertRaises(ValueError):
+            case_keys([dict(name='a', cases=['T.A', 'T.A'])])
+        expected = {('a', 'T.A'), ('a', 'T.B')}
+        row = dict(suite='a', case='T.A')
+        self.assertEqual(missing_cases(expected, [row]), [('a', 'T.B')])
+        with self.assertRaises(ValueError):
+            missing_cases(expected, [row, row])
+        with self.assertRaises(ValueError):
+            missing_cases(expected, [dict(suite='a', case='T.C')])
+
     def test_partition_is_complete_without_duplicates(self):
         suites=[dict(name=name,sha256=name,cases=[name+'.'+str(i) for i in range(count)]) for name,count in [('large',1464),('medium',913),('small',11),('tiny',4)]]
         groups=partition(suites,4)

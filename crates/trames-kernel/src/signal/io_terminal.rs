@@ -145,7 +145,7 @@ impl TerminalSignals for TerminalRoute {
             .iter()
             .filter(|t| t.tgid() == session && t.group() != group)
         {
-            task.parent_death(
+            task.lifecycle_signal(
                 1,
                 Info {
                     code: 128,

@@ -99,10 +99,12 @@ def guest_terminal(suite, wrapper):
         return '--pty', 'exec 3<&0; test -t 3; export TEST_HOST_PTY_FD=3; ' + wrapper
     return '--no-pty', wrapper
 
-def list_cases(binary):
-    result = subprocess.run([str(binary), '--gtest_list_tests'], capture_output=True, text=True, timeout=20, check=True)
+def discover_cases(binary):
+    result = subprocess.run([str(binary), '--gtest_list_tests'], capture_output=True,
+                            text=True, timeout=20, check=True)
     suite = None
-    cases = []
+    enabled, disabled = [], []
+    seen = set()
     for raw in result.stdout.splitlines():
         line = raw.split('#', 1)[0].rstrip()
         if not line:
@@ -110,13 +112,23 @@ def list_cases(binary):
         if not raw.startswith(' ') and line.endswith('.'):
             suite = line[:-1]
         elif raw.startswith('  ') and suite:
-            case = line.strip()
-            name = suite + '.' + case
-            if not any(part.startswith('DISABLED_') for part in re.split(r'[./]', name)):
-                cases.append(name)
-    if not cases:
+            name = suite + '.' + line.strip()
+            if name in seen:
+                raise RuntimeError(f'{binary}: duplicate GoogleTest case {name}')
+            seen.add(name)
+            is_disabled = any(part.startswith('DISABLED_') for part in re.split(r'[./]', name))
+            (disabled if is_disabled else enabled).append(name)
+    if not seen:
         raise RuntimeError('No gtest cases listed: ' + str(binary))
-    return cases
+    return enabled, disabled
+
+
+def list_cases(binary):
+    enabled, _ = discover_cases(binary)
+    if not enabled:
+        raise RuntimeError('No enabled gtest cases: ' + str(binary))
+    return enabled
+
 
 TRACEE_WAIT = 'WaitTest.TraceeWALL'
 

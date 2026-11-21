@@ -189,7 +189,7 @@ impl Parents {
             n.notify();
         }
         for (target, signal) in notifications {
-            target.parent_death(signal, info);
+            target.lifecycle_signal(signal, info);
         }
     }
 }

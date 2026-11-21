@@ -51,7 +51,7 @@ impl IoTask {
 
     /// A trusted lifecycle producer, using the child's original policy/queues.
     /// No guest sender permission or owner Process projection is involved.
-    pub(crate) fn parent_death(&self, signal: u32, info: Info) {
+    pub(crate) fn lifecycle_signal(&self, signal: u32, info: Info) {
         if matches!(signal, 9 | 18..=22) {
             let _ = self.job_signal(signal, true, info, self.ancestor_sender(info.sender));
             return;

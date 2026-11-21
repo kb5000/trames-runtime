@@ -752,7 +752,9 @@ impl IoDirectory {
                     .lifecycle()
                     .parent()
                     .and_then(|p| p.live_task())
-                    .is_some_and(|parent| parent.session() == session && parent.group() != pgrp)
+                    .is_some_and(|parent| {
+                        parent.tgid() != 1 && parent.session() == session && parent.group() != pgrp
+                    })
             })
     }
     pub fn discard_process(&self, tgid: u32, sig: u32) -> bool {

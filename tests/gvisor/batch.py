@@ -15,7 +15,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-from run import SUITE_FIXTURES, digest, list_cases, save
+from run import SUITE_FIXTURES, digest, discover_cases, save
 
 HERE=Path(__file__).resolve().parent
 
@@ -24,7 +24,7 @@ def partition(suites, jobs):
     groups=[[] for _ in range(jobs)]
     loads=[0]*jobs
     for suite in sorted(suites,key=lambda s:(-len(s['cases']),s['name'])):
-        chunks=[suite['cases'][i:i+250] for i in range(0,len(suite['cases']),250)] or [[]]
+        chunks=[suite['cases'][i:i+250] for i in range(0,len(suite['cases']),250)]
         for chunk in chunks:
             worker=min(range(jobs),key=lambda n:loads[n])
             present=next((s for s in groups[worker] if s['name']==suite['name']),None)
@@ -32,6 +32,23 @@ def partition(suites, jobs):
                 present=dict(suite,cases=[]);groups[worker].append(present)
             present['cases'].extend(chunk);loads[worker]+=len(chunk)
     return [sorted(g,key=lambda s:s['name']) for g in groups if g]
+
+
+def case_keys(suites):
+    keys = [(s['name'], case) for s in suites for case in s['cases']]
+    if len(keys) != len(set(keys)):
+        raise ValueError('Duplicate case in requested plan')
+    return set(keys)
+
+
+def missing_cases(expected, rows):
+    observed = {(row['suite'], row['case']) for row in rows}
+    if len(observed) != len(rows):
+        raise ValueError('Duplicate case in worker results')
+    unexpected = observed - expected
+    if unexpected:
+        raise ValueError(f'Unexpected cases in worker results: {sorted(unexpected)}')
+    return sorted(expected - observed)
 
 
 def main():
@@ -67,10 +84,11 @@ def main():
         for binary in record['binaries']:
             name=binary['suite'];path=binaries/(name+'_test')
             try:
-                assert digest(path)==binary['sha256']
-                cases=list_cases(path)
+                if digest(path) != binary['sha256']:
+                    raise ValueError('ELF hash differs from build record')
+                cases, _ = discover_cases(path)
                 suites.append(dict(name=name,sha256=binary['sha256'],available=len(cases),cases=cases))
-            except (subprocess.SubprocessError,AssertionError,RuntimeError) as error:
+            except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as error:
                 discovery_errors.append(dict(suite=name,error=str(error)))
         plan=dict(schema_version=1,suites=suites,discovery_errors=discovery_errors)
     else:
@@ -79,6 +97,7 @@ def main():
         if not reference.is_file():reference=a.reference/'requested-plan.json'
         plan=json.loads(reference.read_text())
     save(out/'requested-plan.json',plan)
+    expected = case_keys(plan['suites'])
     groups=partition(plan['suites'],a.jobs)
     print('Selected',sum(len(s['cases']) for s in plan['suites']),'cases in',len(plan['suites']),'groups;',len(groups),'workers',flush=True)
 
@@ -102,8 +121,10 @@ def main():
             result=subprocess.run(cmd,stdout=log,stderr=subprocess.STDOUT)
         return dict(worker=index,exit_code=result.returncode,output=str(destination))
 
-    with ThreadPoolExecutor(max_workers=len(groups)) as pool:
-        outcomes=list(pool.map(lambda pair:worker(*pair),enumerate(groups)))
+    outcomes = []
+    if groups:
+        with ThreadPoolExecutor(max_workers=len(groups)) as pool:
+            outcomes=list(pool.map(lambda pair:worker(*pair),enumerate(groups)))
     save(out/'workers.json',outcomes)
     merged=[];plans=[]
     for outcome in outcomes:
@@ -112,21 +133,22 @@ def main():
         if (directory/'results.json').is_file():
             for index,row in enumerate(json.loads((directory/'results.json').read_text())):
                 merged.append(dict(row,logs=str(Path(directory.name)/'logs'/(row.get('log_stem') or str(index)))))
-    expected={(s['name'],case) for s in plan['suites'] for case in s['cases']}
-    observed={(r['suite'],r['case']) for r in merged}
-    assert len(observed)==len(merged),'duplicate cases in partitions'
-    for suite,case in sorted(expected-observed):merged.append(dict(suite=suite,case=case,status='not_run_worker_error',code=None,seconds=0,messages=[]))
+    for suite,case in missing_cases(expected, merged):merged.append(dict(suite=suite,case=case,status='not_run_worker_error',code=None,seconds=0,messages=[]))
     merged.sort(key=lambda r:(r['suite'],r['case']))
     final=dict(plans[0] if plans else plan,suites=plan['suites'],discovery_errors=discovery_errors,workers=outcomes)
     for worker_plan in plans:
         for fixture in SUITE_FIXTURES:
             if fixture in worker_plan:
                 final[fixture] = worker_plan[fixture]
+    if a.platform == 'trames':
+        final['reference_discovery_errors'] = plan.get('reference_discovery_errors', plan.get('discovery_errors', []))
     save(out/'plan.json',final);save(out/'results.json',merged)
     counts=dict(collections.Counter(r['status'] for r in merged))
     summary=dict(platform=a.platform,groups=len(plan['suites']),cases=len(merged),counts=counts,discovery_errors=discovery_errors,worker_errors=[r for r in outcomes if r['exit_code']])
+    if 'reference_discovery_errors' in final:
+        summary['reference_discovery_errors'] = final['reference_discovery_errors']
     save(out/'summary.json',summary);print(json.dumps(summary,indent=2),flush=True)
-    return 1 if summary['worker_errors'] else 0
+    return int(bool(summary['worker_errors'] or discovery_errors or not expected))
 
 
 if __name__=='__main__':raise SystemExit(main())

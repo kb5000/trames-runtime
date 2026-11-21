@@ -186,6 +186,47 @@ impl State {
             .get(&family.id.load(Ordering::Relaxed))
             .filter(|e| Arc::ptr_eq(&e.family, family))
     }
+    /// A live parent in another group of the same session prevents orphaning.
+    /// Linux excludes the global init process when evaluating this relationship.
+    fn job_link(&self, member: &Entry) -> Option<u32> {
+        let parent = member.parent.upgrade()?;
+        let parent = self.original(&parent)?;
+        if !parent.family.live() || parent.binding.id == 1 {
+            return None;
+        }
+        let (group, session) = member.binding.control.job_ids();
+        let (other, parent_session) = parent.binding.control.job_ids();
+        (group != 0 && group != other && session == parent_session).then_some(group)
+    }
+    fn orphan_targets(&self, groups: Vec<u32>) -> Vec<Arc<crate::signal::IoTask>> {
+        if groups.is_empty() {
+            return Vec::new();
+        }
+        // An exiting service can have children in many different job groups.
+        // Collect the affected memberships in one pass through the family graph.
+        let mut affected: BTreeMap<_, Vec<&Entry>> =
+            groups.into_iter().map(|g| (g, Vec::new())).collect();
+        for member in self.entries.values().filter(|e| e.family.live()) {
+            if let Some(members) = affected.get_mut(&member.binding.control.job_ids().0) {
+                members.push(member);
+            }
+        }
+        let mut targets = Vec::new();
+        for members in affected.into_values() {
+            if members
+                .iter()
+                .any(|m| m.binding.control.job_stop_complete())
+                && !members.iter().any(|m| self.job_link(m).is_some())
+            {
+                targets.extend(
+                    members
+                        .into_iter()
+                        .filter_map(|m| m.binding.control.survivor().map(|(_, t)| t)),
+                );
+            }
+        }
+        targets
+    }
     fn parent_of(&self, family: &Arc<Family>) -> Option<Arc<Family>> {
         self.original(family)?.parent.upgrade()
     }
@@ -356,14 +397,24 @@ impl Families {
     /// The actual graph decides adoption and namespace victims. CPU/mm/native
     /// teardown belongs to the caller's lifecycle custody, not this graph.
     pub fn retire(&self, family: &Arc<Family>, parents: &Parents) -> Retirement {
-        let (retirement, notices, exits) = {
+        let (retirement, notices, exits, orphaned) = {
             let mut state = self.0.lock().unwrap();
             let Some(entry) = state.original(family) else {
                 return Retirement::default();
             };
-            if !family.live.swap(false, Ordering::Relaxed) {
+            if !family.live() {
                 return Retirement::default();
             }
+            // Only an edge removed by this exit can newly orphan a group. Ordinary
+            // same-group fork/exit does not scan other processes or allocate a list.
+            let mut affected = Vec::new();
+            affected.extend(state.job_link(entry));
+            for child in entry.children.keys().filter_map(|id| state.entries.get(id)) {
+                if child.family.live() {
+                    affected.extend(state.job_link(child));
+                }
+            }
+            family.live.store(false, Ordering::Relaxed);
             let namespace = entry.binding.namespace.clone();
             let id = entry.binding.id;
             if namespace.is_nested() && namespace.init() == id {
@@ -452,13 +503,31 @@ impl Families {
                     ));
                 }
             }
-            (Retirement::default(), notices, exits)
+            (
+                Retirement::default(),
+                notices,
+                exits,
+                state.orphan_targets(affected),
+            )
         };
         for notice in notices {
             notice.notify();
         }
         for (notice, signo, info) in exits {
             notice.signal(signo, info);
+        }
+        // Both signals are process-directed. Queue HUP for every member before
+        // continuing any of them, using the original task signal resources.
+        for signal in [1, 18] {
+            for target in &orphaned {
+                target.lifecycle_signal(
+                    signal,
+                    Info {
+                        code: 128,
+                        ..Default::default()
+                    },
+                );
+            }
         }
         retirement
     }
@@ -652,6 +721,46 @@ mod tests {
             )
         }
     }
+    #[test]
+    fn orphan_transition_notifies_every_process_only_after_the_last_job_link_is_lost() {
+        for same_group_as_parent in [false, true] {
+            for (retain_link, stop) in [(true, true), (false, false), (false, true)] {
+                let families = Arc::new(Families::default());
+                let parents = Parents::default();
+                let ns = PidNamespace::default();
+                let init = Process::new(&families, &parents, &ns, 1, 0);
+                let reaper = Process::new(&families, &parents, &ns, 10, 1);
+                let parent = Process::new(&families, &parents, &ns, 20, 10);
+                let stopped = Process::new(&families, &parents, &ns, 30, 20);
+                let running = Process::new(&families, &parents, &ns, 40, 30);
+                init.signals.io.lifecycle().set_job_ids(1, 1);
+                reaper.signals.io.lifecycle().set_job_ids(10, 10);
+                parent.signals.io.lifecycle().set_job_ids(20, 10);
+                let group = if same_group_as_parent { 20 } else { 30 };
+                for p in [&stopped, &running] {
+                    p.signals.io.lifecycle().set_job_ids(group, 10);
+                }
+                reaper.family.set_subreaper(retain_link);
+                if stop {
+                    stopped.signals.io.lifecycle().consume_stop(19, || true);
+                }
+                families.retire(&parent.family, &parents);
+                assert_eq!(
+                    stopped.signals.io.lifecycle().stopped(),
+                    stop && retain_link
+                );
+                for p in [&stopped, &running] {
+                    let hup = p.signals.io.process().take(1);
+                    assert_eq!(
+                        hup.map(|info| info.code),
+                        (stop && !retain_link).then_some(128)
+                    );
+                }
+                assert!(reaper.signals.io.process().take(1).is_none());
+            }
+        }
+    }
+
     #[test]
     fn adoption_moves_original_parent_scalar_threads_wait_and_later_job_notices_together() {
         let families = Arc::new(Families::default());
