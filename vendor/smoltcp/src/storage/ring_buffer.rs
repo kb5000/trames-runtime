@@ -62,6 +62,25 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
         }
     }
 
+    /// Grow in logical order, retaining out-of-order TCP data as well as
+    /// committed bytes. Leave the ring intact if the allocation is declined.
+    #[cfg(feature = "alloc")]
+    pub(crate) fn try_grow_owned(&mut self, needed: usize, limit: usize)
+    where
+        T: Default + Clone,
+    {
+        let ManagedSlice::Owned(storage) = &mut self.storage else {
+            return;
+        };
+        let target = needed.max(storage.len().saturating_mul(2)).min(limit);
+        if target <= storage.len() || storage.try_reserve_exact(target - storage.len()).is_err() {
+            return;
+        }
+        storage.rotate_left(self.read_at);
+        self.read_at = 0;
+        storage.resize(target, T::default());
+    }
+
     /// Clear the ring buffer.
     pub fn clear(&mut self) {
         self.read_at = 0;
@@ -441,6 +460,22 @@ mod test {
         ring.resize_owned(2);
         let mut bytes = [0; 6];
         assert_eq!(ring.dequeue_slice(&mut bytes), 6);
+        assert_eq!(&bytes, b"abcdef");
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn demand_growth_preserves_out_of_order_bytes_across_wrap() {
+        let mut ring = RingBuffer::new(vec![0; 8]);
+        assert_eq!(ring.enqueue_slice(b"12345ab"), 7);
+        ring.dequeue_allocated(5);
+        assert_eq!(ring.write_unallocated(2, b"ef"), 2);
+        ring.try_grow_owned(10, 12);
+        assert_eq!(ring.capacity(), 12);
+        assert_eq!(ring.enqueue_slice(b"cd"), 2);
+        ring.enqueue_unallocated(2);
+        let mut bytes = [0; 6];
+        assert_eq!(ring.dequeue_slice(&mut bytes), bytes.len());
         assert_eq!(&bytes, b"abcdef");
     }
 

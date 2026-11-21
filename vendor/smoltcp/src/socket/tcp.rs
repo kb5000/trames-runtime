@@ -421,6 +421,11 @@ pub struct Socket<'a> {
     rtte: RttEstimator,
     assembler: Assembler,
     rx_buffer: SocketBuffer<'a>,
+    // Largest wire window allowed by TCP sequence arithmetic is 1 GiB.
+    // Zero growth budgets keep upstream fixed/borrowed rings fixed.
+    rx_growth: usize,
+    tx_growth: usize,
+    tx_growth_blocked: bool,
     rx_limit: usize,
     tx_limit: usize,
     rx_fin_received: bool,
@@ -549,6 +554,9 @@ impl<'a> Socket<'a> {
             timer: Timer::new(),
             rtte: RttEstimator::default(),
             assembler: Assembler::new(),
+            rx_growth: 0,
+            tx_growth: 0,
+            tx_growth_blocked: false,
             rx_limit: usize::MAX,
             tx_limit: usize::MAX,
             tx_buffer,
@@ -1097,13 +1105,20 @@ impl<'a> Socket<'a> {
         self.abort();
     }
 
+    fn initial_window_shift(&self) -> u8 {
+        let initial = self.rx_buffer.capacity();
+        let target = initial.max(self.rx_growth.min(self.rx_limit));
+        let shift = (usize::BITS - target.leading_zeros()).saturating_sub(16);
+        // A small initial ring must still advertise at least one scaled unit.
+        shift.min(initial.max(1).ilog2()).min(14) as u8
+    }
+
     fn reset(&mut self) {
         #[cfg(feature = "std")]
         if let Some(stamps) = self.receive_timestamps.as_deref_mut() {
             *stamps = Default::default();
         }
-        let rx_cap_log2 =
-            mem::size_of::<usize>() * 8 - self.rx_buffer.capacity().leading_zeros() as usize;
+        let shift = self.initial_window_shift();
 
         self.state = State::Closed;
         self.stalled_since = None;
@@ -1128,7 +1143,7 @@ impl<'a> Socket<'a> {
         self.remote_win_len = 0;
         self.remote_win_scale = None;
         self.remote_has_sack = false;
-        self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
+        self.remote_win_shift = shift;
         self.remote_mss = DEFAULT_MSS;
         self.remote_last_ts = None;
         self.cork_until = None;
@@ -1424,7 +1439,9 @@ impl<'a> Socket<'a> {
             return false;
         }
 
-        self.tx_buffer.len() < self.tx_limit && !self.tx_buffer.is_full()
+        self.tx_buffer.len() < self.tx_limit
+            && (!self.tx_buffer.is_full()
+                || (self.tx_buffer.len() < self.tx_growth && !self.tx_growth_blocked))
     }
 
     /// Update a Linux-owned queue without invalidating bytes already sent,
@@ -1432,6 +1449,7 @@ impl<'a> Socket<'a> {
     #[cfg(feature = "alloc")]
     pub fn resize_owned_buffer(&mut self, receive: bool, bytes: usize) {
         if receive {
+            self.rx_growth = 0;
             self.rx_limit = bytes;
             let before_handshake = matches!(self.state, State::Closed | State::Listen);
             if bytes > self.rx_buffer.capacity() || before_handshake {
@@ -1442,8 +1460,27 @@ impl<'a> Socket<'a> {
                     (usize::BITS - bytes.leading_zeros()).saturating_sub(16) as u8;
             }
         } else {
+            self.tx_growth = 0;
             self.tx_limit = bytes;
             self.tx_buffer.resize_owned(bytes);
+        }
+    }
+
+    /// Raise the logical queue ceiling without allocating the requested maximum.
+    /// Receive credit expands only as admitted data fills the current window.
+    #[cfg(feature = "alloc")]
+    pub fn set_owned_buffer_budget(&mut self, receive: bool, bytes: usize) {
+        let growth = bytes.min(1 << 30);
+        if receive {
+            self.rx_growth = growth;
+            self.rx_limit = growth;
+            if matches!(self.state, State::Closed | State::Listen) {
+                self.remote_win_shift = self.initial_window_shift();
+            }
+        } else {
+            self.tx_growth_blocked = false;
+            self.tx_growth = bytes.min(i32::MAX as usize);
+            self.tx_limit = self.tx_growth;
         }
     }
 
@@ -1470,7 +1507,7 @@ impl<'a> Socket<'a> {
         !self.rx_buffer.is_empty()
     }
 
-    fn send_impl<'b, F, R>(&'b mut self, f: F) -> Result<R, SendError>
+    fn send_impl<'b, F, R>(&'b mut self, _request: usize, f: F) -> Result<R, SendError>
     where
         F: FnOnce(&'b mut SocketBuffer<'a>) -> (usize, R),
     {
@@ -1479,6 +1516,19 @@ impl<'a> Socket<'a> {
         }
 
         let old_length = self.tx_buffer.len();
+        #[cfg(feature = "alloc")]
+        if self.tx_growth > self.tx_buffer.capacity() && _request > self.tx_buffer.window() {
+            let capacity = self.tx_buffer.capacity();
+            self.tx_buffer
+                .try_grow_owned(old_length.saturating_add(_request), self.tx_growth);
+            if self.tx_buffer.capacity() == capacity {
+                // Wait for an ACK to free a slot after allocation pressure.
+                // A later send with space available may retry growth.
+                self.tx_growth_blocked = true;
+            } else {
+                self.tx_growth_blocked = false;
+            }
+        }
         let (size, result) = f(&mut self.tx_buffer);
         if size > 0 {
             // The connection might have been idle for a long time, and so remote_last_ts
@@ -1508,7 +1558,7 @@ impl<'a> Socket<'a> {
         F: FnOnce(&'b mut [u8]) -> (usize, R),
     {
         let room = self.tx_limit.saturating_sub(self.tx_buffer.len());
-        self.send_impl(|buffer| {
+        self.send_impl(1, |buffer| {
             buffer.enqueue_many_with(|slice| {
                 let take = room.min(slice.len());
                 f(&mut slice[..take])
@@ -1525,7 +1575,7 @@ impl<'a> Socket<'a> {
     pub fn send_slice(&mut self, data: &[u8]) -> Result<usize, SendError> {
         let take = data.len()
             .min(self.tx_limit.saturating_sub(self.tx_buffer.len()));
-        self.send_impl(|tx_buffer| {
+        self.send_impl(take, |tx_buffer| {
             let size = tx_buffer.enqueue_slice(&data[..take]);
             (size, size)
         })
@@ -2498,6 +2548,13 @@ impl<'a> Socket<'a> {
                 self.rx_buffer.len() + contig_len
             );
             self.rx_buffer.enqueue_unallocated(contig_len);
+            #[cfg(feature = "alloc")]
+            if self.rx_growth > self.rx_buffer.capacity()
+                && self.rx_buffer.len() >= self.rx_buffer.window()
+            {
+                self.rx_buffer
+                    .try_grow_owned(self.rx_buffer.len(), self.rx_growth.min(self.rx_limit));
+            }
             self.deferred_until = None;
 
             // There's new data in rx_buffer, notify waiting task if any.

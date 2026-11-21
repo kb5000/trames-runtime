@@ -265,6 +265,17 @@ impl<'a> Socket<'a> {
             .then_some((self.peer.is_some(), self.specific_bind, self.bind_order))
     }
 
+    /// Change a guest-owned queue's limit without backing unused capacity.
+    #[cfg(feature = "alloc")]
+    pub fn set_owned_buffer_budget(&mut self, receive: bool, packets: usize, bytes: usize) {
+        let queue = if receive {
+            &mut self.rx_buffer
+        } else {
+            &mut self.tx_buffer
+        };
+        queue.set_owned_budget(packets, bytes);
+    }
+
     /// Configure the receive budget without losing queued datagrams.
     #[cfg(feature = "alloc")]
     pub fn resize_receive_buffer(&mut self, packets: usize, bytes: usize) {
@@ -462,6 +473,8 @@ impl<'a> Socket<'a> {
             return Err(SendError::Unaddressable);
         }
 
+        #[cfg(feature = "alloc")]
+        self.tx_buffer.prepare_datagram(size);
         let payload_buf = self
             .tx_buffer
             .enqueue(size, meta)
@@ -503,6 +516,8 @@ impl<'a> Socket<'a> {
             return Err(SendError::Unaddressable);
         }
 
+        #[cfg(feature = "alloc")]
+        self.tx_buffer.prepare_datagram(max_size);
         let size = self
             .tx_buffer
             .enqueue_with_infallible(max_size, meta, f)
@@ -691,6 +706,8 @@ impl<'a> Socket<'a> {
 
         #[cfg(feature = "alloc")]
         let edge = self.readable_token.filter(|_| self.rx_buffer.is_empty());
+        #[cfg(feature = "alloc")]
+        self.rx_buffer.prepare_datagram(size);
         #[cfg(feature = "std")]
         let slot = if size > self.rx_buffer.payload_capacity() && self.linux_receive {
             self.rx_buffer.enqueue_oversized_datagram(size, metadata)

@@ -43,6 +43,7 @@ impl<H> PacketMetadata<H> {
 pub struct PacketBuffer<'a, H: 'a> {
     metadata_ring: RingBuffer<'a, PacketMetadata<H>>,
     payload_ring: RingBuffer<'a, u8>,
+    dynamic: bool,
     packet_limit: usize,
     payload_limit: usize,
 }
@@ -60,6 +61,7 @@ impl<'a, H> PacketBuffer<'a, H> {
         let metadata_ring = RingBuffer::new(metadata_storage);
         let payload_ring = RingBuffer::new(payload_storage);
         PacketBuffer {
+            dynamic: false,
             packet_limit: metadata_ring.capacity(),
             payload_limit: payload_ring.capacity(),
             metadata_ring,
@@ -290,6 +292,90 @@ impl<'a, H> PacketBuffer<'a, H> {
         self.payload_ring.len()
     }
 
+    #[cfg(feature = "alloc")]
+    pub(crate) fn set_owned_budget(&mut self, packets: usize, bytes: usize)
+    where
+        H: Copy,
+    {
+        if packets < self.metadata_ring.capacity() || bytes < self.payload_ring.capacity() {
+            self.resize_owned(
+                packets.min(self.metadata_ring.capacity()),
+                bytes.min(self.payload_ring.capacity()),
+            );
+        }
+        self.packet_limit = packets;
+        self.payload_limit = bytes;
+        self.dynamic = true;
+    }
+
+    /// Reserve room for this datagram only. Repacking removes any wrap padding
+    /// and preserves the metadata and payload of every admitted record.
+    #[cfg(feature = "alloc")]
+    pub(crate) fn prepare_datagram(&mut self, size: usize)
+    where
+        H: Copy,
+    {
+        if !self.dynamic {
+            return;
+        }
+        let records = self.metadata_ring.len();
+        let used = self.payload_ring.len();
+        if records >= self.packet_limit || size > self.payload_limit.saturating_sub(used) {
+            return;
+        }
+        let old_slots = self.metadata_ring.capacity();
+        let old_bytes = self.payload_ring.capacity();
+        let free = old_bytes - used;
+        let tail = if used == 0 {
+            old_bytes
+        } else {
+            self.payload_ring.contiguous_window()
+        };
+        let wraps = tail < size;
+        let need_bytes = free < size || wraps && free - tail < size;
+        let need_slot = old_slots - records < 1 + usize::from(wraps);
+        if !(need_bytes && old_bytes < self.payload_limit
+            || need_slot && old_slots < self.packet_limit)
+        {
+            return;
+        }
+
+        let bytes = if need_bytes {
+            old_bytes
+                .saturating_mul(2)
+                .max(used + size)
+                .min(self.payload_limit)
+        } else {
+            old_bytes
+        };
+        let slots = if need_slot {
+            old_slots
+                .saturating_mul(2)
+                .max(records + 1)
+                .min(self.packet_limit)
+        } else {
+            old_slots
+        };
+        let mut meta = alloc::vec::Vec::new();
+        let mut payload = alloc::vec::Vec::new();
+        if meta.try_reserve_exact(slots).is_err() || payload.try_reserve_exact(bytes).is_err() {
+            return;
+        }
+        meta.resize(slots, PacketMetadata::EMPTY);
+        payload.resize(bytes, 0);
+        let mut grown = Self::new(meta, payload);
+        while let Ok((header, data)) = self.dequeue() {
+            grown
+                .enqueue(data.len(), header)
+                .expect("room for retained datagram")
+                .copy_from_slice(data);
+        }
+        grown.packet_limit = self.packet_limit;
+        grown.payload_limit = self.payload_limit;
+        grown.dynamic = true;
+        *self = grown;
+    }
+
     /// Resize owned storage while preserving all queued datagrams and metadata.
     /// Shrinking limits future enqueue, but does not discard already queued data.
     #[cfg(feature = "alloc")]
@@ -326,6 +412,40 @@ mod test {
 
     fn buffer() -> PacketBuffer<'static, ()> {
         PacketBuffer::new(vec![PacketMetadata::EMPTY; 4], vec![0u8; 16])
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn on_demand_budgets_keep_wrapped_payload_and_empty_datagrams() {
+        let mut q = buffer();
+        q.set_owned_budget(1 << 23, 1 << 30);
+        assert_eq!(
+            (q.metadata_ring.capacity(), q.payload_ring.capacity()),
+            (4, 16)
+        );
+        let push = |q: &mut PacketBuffer<'_, ()>, data: &[u8]| {
+            q.prepare_datagram(data.len());
+            q.enqueue(data.len(), ()).unwrap().copy_from_slice(data);
+        };
+        push(&mut q, b"abcdefgh");
+        push(&mut q, b"ijkl");
+        q.dequeue().unwrap();
+        push(&mut q, b"mnopqr");
+        for _ in 0..8 {
+            push(&mut q, b"");
+        }
+        push(&mut q, b"0123456789abcdef");
+        assert!(q.metadata_ring.capacity() < 64 && q.payload_ring.capacity() < 128);
+        q.set_owned_budget(2, 12);
+        assert!(q.enqueue(1, ()).is_err());
+        assert_eq!(q.dequeue().unwrap().1, b"ijkl");
+        assert_eq!(q.dequeue().unwrap().1, b"mnopqr");
+        for _ in 0..8 {
+            assert!(q.dequeue().unwrap().1.is_empty());
+        }
+        assert_eq!(q.dequeue().unwrap().1, b"0123456789abcdef");
+        push(&mut q, b"fresh");
+        assert_eq!(q.dequeue().unwrap().1, b"fresh");
     }
 
     #[test]

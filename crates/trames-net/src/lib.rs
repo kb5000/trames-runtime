@@ -98,8 +98,12 @@ pub struct ReceivedIp {
 
 // Linux treats the requested int as unsigned, clamps it, then doubles it.
 fn socket_buffer_size(option: u32, value: i32) -> usize {
-    let requested = (value as u32 as usize).min(MAX_BUFFER / 2);
-    (2 * requested).max(if option == 8 { 2304 } else { 4608 })
+    let requested = if matches!(option, 32 | 33) {
+        value.clamp(0, i32::MAX / 2) as usize
+    } else {
+        (value as u32 as usize).min(MAX_BUFFER / 2)
+    };
+    (2 * requested).max(if matches!(option, 8 | 33) { 2304 } else { 4608 })
 }
 
 #[derive(Clone)]

@@ -489,14 +489,22 @@ impl Socket {
             return Err(NetError(95));
         }
         let state = self.state.borrow();
-        if !matches!(state.connection, Connection::Idle | Connection::Listening) {
-            return Err(NetError(22));
+        match state.connection {
+            Connection::Listening => return Ok(()),
+            Connection::Idle => {}
+            _ => return Err(NetError(22)),
         }
-        let bound = state.bound.ok_or(NetError(22))?;
+        let bound = state.bound;
         drop(state);
-        if self.state.borrow().connection == Connection::Listening {
-            return Ok(());
-        }
+        let bound = match bound {
+            Some(address) => address,
+            None => {
+                // An unbound Linux TCP listener acquires an ephemeral port
+                // in its own network namespace on the first listen.
+                self.ensure_bound()?;
+                self.state.borrow().bound.ok_or(NetError(22))?
+            }
+        };
         let addresses = self.addresses(bound);
         let backlog = (backlog as usize)
             .saturating_add(1)
@@ -1620,13 +1628,16 @@ impl Socket {
                 state.hop_message = if name == 8 { 8 } else { 52 };
             }
             (255, 7) if self.family == 10 && self.kind == 4 && value == 2 => {}
-            (1, 7 | 8) => {
+            (1, 32 | 33) if !matches!(self.kind, 1 | 2) => return Err(NetError(92)),
+            (1, 7 | 8 | 32 | 33) => {
                 if !matches!(self.kind, 1 | 2) && (value <= 0 || value as usize > MAX_BUFFER) {
                     return Err(NetError(22));
                 }
                 if matches!(self.kind, 1 | 2) {
                     let bytes = crate::socket_buffer_size(name, value);
-                    if name == 8 {
+                    let mut writable = None;
+                    let receive = matches!(name, 8 | 33);
+                    if receive {
                         state.receive_buffer = bytes;
                         if let Some(errors) = &state.udp_errors {
                             errors.set_budget(bytes);
@@ -1638,8 +1649,12 @@ impl Socket {
                     for h in &state.handles {
                         if self.kind == 1 {
                             let socket = n.sockets.get_mut::<tcp::Socket>(*h);
-                            socket.resize_owned_buffer(name == 8, bytes);
-                            if name == 8 && state.window_clamp != 0 {
+                            let was_writable = socket.can_send();
+                            configure_tcp_buffer(socket, receive, bytes);
+                            if !receive && !was_writable && socket.can_send() {
+                                writable = n.tcp_waiters.get(h).cloned();
+                            }
+                            if receive && state.window_clamp != 0 {
                                 socket.set_receive_window_limit(
                                     bytes.min(state.window_clamp as usize),
                                 );
@@ -1647,12 +1662,9 @@ impl Socket {
                             continue;
                         }
                         let s = n.sockets.get_mut::<udp::Socket>(*h);
-                        if name == 8 {
-                            s.resize_receive_buffer(packet_slots(bytes), bytes);
-                        } else {
-                            s.resize_send_buffer(packet_slots(bytes), bytes);
-                        }
+                        configure_udp_buffer(s, receive, bytes);
                     }
+                    i.notifications.extend(writable);
                 }
             }
             (0, 33 | 34) if self.kind == 1 => return Err(NetError(22)),

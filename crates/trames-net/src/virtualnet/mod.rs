@@ -290,11 +290,24 @@ fn address(a: IpEndpoint) -> SocketAddr {
 fn tcp_socket() -> tcp::Socket<'static> {
     tcp_socket_with_buffers(BUFFER, BUFFER)
 }
+fn initial_buffer(bytes: usize) -> usize {
+    if bytes > MAX_BUFFER {
+        BUFFER
+    } else {
+        bytes
+    }
+}
 fn tcp_socket_with_buffers(receive: usize, send: usize) -> tcp::Socket<'static> {
     let mut s = tcp::Socket::new(
-        tcp::SocketBuffer::new(vec![0; receive]),
-        tcp::SocketBuffer::new(vec![0; send]),
+        tcp::SocketBuffer::new(vec![0; initial_buffer(receive)]),
+        tcp::SocketBuffer::new(vec![0; initial_buffer(send)]),
     );
+    if receive > MAX_BUFFER {
+        configure_tcp_buffer(&mut s, true, receive);
+    }
+    if send > MAX_BUFFER {
+        configure_tcp_buffer(&mut s, false, send);
+    }
     s.set_ack_delay(Some(smoltcp::time::Duration::from_millis(10)));
     s.set_handshake_timeout(smoltcp::time::Duration::from_secs(60));
     s
@@ -376,17 +389,38 @@ impl SocketMeta {
         (u64::from(self.family) << 32) | u64::from(self.uid.get())
     }
 }
+fn configure_tcp_buffer(socket: &mut tcp::Socket, receive: bool, bytes: usize) {
+    if bytes > MAX_BUFFER {
+        socket.set_owned_buffer_budget(receive, bytes);
+    } else {
+        socket.resize_owned_buffer(receive, bytes);
+    }
+}
+fn configure_udp_buffer(socket: &mut udp::Socket, receive: bool, bytes: usize) {
+    if bytes > MAX_BUFFER {
+        socket.set_owned_buffer_budget(receive, packet_slots(bytes), bytes);
+    } else if receive {
+        socket.resize_receive_buffer(packet_slots(bytes), bytes);
+    } else {
+        socket.resize_send_buffer(packet_slots(bytes), bytes);
+    }
+}
 fn udp_socket_with_buffers(receive: usize, send: usize) -> udp::Socket<'static> {
-    udp::Socket::new(
+    let buffer = |bytes: usize| {
+        let initial = initial_buffer(bytes);
         udp::PacketBuffer::new(
-            vec![udp::PacketMetadata::EMPTY; packet_slots(receive)],
-            vec![0; receive],
-        ),
-        udp::PacketBuffer::new(
-            vec![udp::PacketMetadata::EMPTY; packet_slots(send)],
-            vec![0; send],
-        ),
-    )
+            vec![udp::PacketMetadata::EMPTY; packet_slots(initial)],
+            vec![0; initial],
+        )
+    };
+    let mut socket = udp::Socket::new(buffer(receive), buffer(send));
+    if receive > MAX_BUFFER {
+        configure_udp_buffer(&mut socket, true, receive);
+    }
+    if send > MAX_BUFFER {
+        configure_udp_buffer(&mut socket, false, send);
+    }
+    socket
 }
 fn make_node(id: u8, now: smoltcp::time::Instant) -> Result<Node> {
     let mut port = Port::default();
@@ -2205,6 +2239,97 @@ mod shared_lifetime_tests {
         client.shutdown(1).unwrap();
         assert!(signal.ready());
         assert_eq!(peer.recv(1, 0).unwrap().length, 0);
+    }
+
+    #[test]
+    fn forced_udp_buffers_admit_more_than_the_regular_maximum_and_shrink_losslessly() {
+        let fabric = Fabric::new().unwrap();
+        let net = fabric.environment(2, NetworkMode::Full).unwrap();
+        let rx = net.socket(2, 2, 0).unwrap();
+        let tx = net.socket(2, 2, 0).unwrap();
+        let addr = "127.0.0.1:34371".parse().unwrap();
+        rx.set_option(1, 33, i32::MAX).unwrap();
+        rx.bind(addr).unwrap();
+        tx.set_option(1, 32, i32::MAX).unwrap();
+        assert_eq!(tx.get_option(1, 7), Ok(i32::MAX - 1));
+        let mut data = [0x51; 1024];
+        for id in 0..384u32 {
+            data[..4].copy_from_slice(&id.to_le_bytes());
+            assert_eq!(tx.send(&data, 0, Some(addr)), Ok(data.len()));
+        }
+        rx.set_option(1, 8, 4096).unwrap();
+        assert_eq!(rx.get_option(1, 8), Ok(8192));
+        for id in 0..384u32 {
+            data[..4].copy_from_slice(&id.to_le_bytes());
+            assert_eq!(rx.recv(1024, 0).unwrap().data, data);
+        }
+    }
+
+    #[test]
+    fn forced_tcp_budgets_follow_the_listener_and_grow_with_live_data() {
+        let fabric = Fabric::new().unwrap();
+        let net = fabric.environment(2, NetworkMode::Full).unwrap();
+        let listener = net.socket(2, 1, 0).unwrap();
+        listener.set_option(1, 33, i32::MAX).unwrap();
+        let addr = "127.0.0.1:34372".parse().unwrap();
+        listener.bind(addr).unwrap();
+        listener.listen(8).unwrap();
+        let client = net.socket(2, 1, 0).unwrap();
+        client.set_option(1, 32, i32::MAX).unwrap();
+        assert_eq!(client.connect(addr), Err(NetError(115)));
+        assert!(client.connect_complete().unwrap());
+        let (peer, _) = listener.accept().unwrap();
+        assert_eq!(peer.get_option(1, 8), Ok(i32::MAX - 1));
+        assert_eq!(client.get_option(1, 7), Ok(i32::MAX - 1));
+        let capacity = |socket: &Socket, receive| {
+            let guard = fabric.0.borrow();
+            let handle = socket.state.borrow().handles[0];
+            let tcp = guard.nodes[&net.0.key].sockets.get::<tcp::Socket>(handle);
+            if receive {
+                tcp.recv_capacity()
+            } else {
+                tcp.send_capacity()
+            }
+        };
+        assert_eq!(capacity(&peer, true), BUFFER);
+        assert_eq!(capacity(&client, false), BUFFER);
+        let data: Vec<u8> = (0..(2 * MAX_BUFFER)).map(|i| (i % 251) as u8).collect();
+        assert_eq!(client.send(&data, 0, None), Ok(data.len()));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while peer.tcp_readable_bytes().unwrap() < data.len() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(capacity(&peer, true) >= data.len());
+        assert_eq!(capacity(&client, false), data.len());
+        peer.set_option(1, 33, -1).unwrap();
+        assert_eq!(peer.get_option(1, 8), Ok(2304));
+        assert_eq!(peer.recv(data.len(), 0).unwrap().data, data);
+    }
+
+    #[test]
+    fn raising_the_send_budget_wakes_a_blocked_stream_writer() {
+        let fabric = Fabric::new().unwrap();
+        let net = fabric.environment(2, NetworkMode::Full).unwrap();
+        let listener = net.socket(2, 1, 0).unwrap();
+        let addr = "127.0.0.1:34373".parse().unwrap();
+        listener.bind(addr).unwrap();
+        listener.listen(1).unwrap();
+        let client = net.socket(2, 1, 0).unwrap();
+        assert_eq!(client.connect(addr), Err(NetError(115)));
+        assert!(client.connect_complete().unwrap());
+        let (_peer, _) = listener.accept().unwrap();
+        let data = vec![23; BUFFER];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while client.send(&data, 0, None).is_ok() {
+            assert!(Instant::now() < deadline);
+        }
+        let (_target, signal) = tcp_io_waiter();
+        let _sub = client.subscribe_tcp_ready(&signal).unwrap();
+        assert!(!signal.ready());
+        client.set_option(1, 32, 2 * MAX_BUFFER as i32).unwrap();
+        assert!(signal.ready());
+        assert_eq!(client.send(&data, 0, None), Ok(BUFFER));
     }
 
     #[test]

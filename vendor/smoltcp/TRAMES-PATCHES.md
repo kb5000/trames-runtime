@@ -121,3 +121,10 @@ bound socket takes precedence. Reuse-port groups apply their usual reply-flow
 selection. The observer receives the reporter address, code and quoted UDP
 payload and can notify the existing readable waiter. IPv4 quotations may end
 before the original packet's declared total length.
+
+Guest-owned TCP and UDP queues can accept a privileged Linux socket buffer
+budget above the ordinary limit. The socket retains the logical ceiling while
+its rings grow on demand. TCP receive growth preserves sequence offsets for
+out-of-order segments and the scale negotiated at connection setup. UDP
+growth repacks whole datagrams, including empty records, in arrival order.
+Borrowed rings used by other callers retain their fixed capacity.
