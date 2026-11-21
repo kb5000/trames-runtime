@@ -100,7 +100,7 @@ impl<C: Cpu> Lifecycle<C> {
                             return Ok(false);
                         }
                     }
-                    let image = match result.take() {
+                    let image = match result.take().map_err(exec::ImageError::launch_errno) {
                         Ok(image) => image,
                         Err(error) => {
                             work.process.fail(error.0);

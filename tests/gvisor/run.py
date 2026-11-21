@@ -260,7 +260,14 @@ def reuse_rows(args, plan):
 UPSTREAM_WAIT_TIMEOUTS = {
     'flock': {'FlockTest.BlockingLockNoBlockingForSharedLocks': 45},
     'ppoll': {'PpollTest.SignalMaskBlocksSignal': 45},
-    'vfork': {'VforkTest.ParentStopsUntilChildExecves': 40},
+    'vfork': {
+        # The original children sleep for 10s before exit, and the two-child
+        # case adds a preceding 5s wait. Keep startup and scheduling headroom.
+        'VforkTest.ParentStopsUntilChildExits': 20,
+        'VforkTest.ParentStopsUntilChildExecves': 40,
+        'VforkTest.ExecedChildExitDoesntUnstopParent': 30,
+        'VforkTest.SigchldReceivedDuringVforkIsDelivered': 20,
+    },
     'sigstop': {'SigstopTest.Correctness': 45},
     # The workers take turns to accrue 20 CPU seconds each. The idle
     # variant also sleeps between turns, extending the wall time further.

@@ -16,6 +16,7 @@ pub const MAX_ELF_SIZE: usize = 256 * 1024 * 1024;
 pub enum ElfError {
     Invalid(&'static str),
     Unsupported(&'static str),
+    SegmentMapping(&'static str),
     Interpreter(u32),
     Memory(MemoryError),
 }
@@ -23,6 +24,7 @@ impl fmt::Display for ElfError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Invalid(s) => write!(f, "invalid ELF: {s}"),
+            Self::SegmentMapping(s) => write!(f, "cannot map ELF image: {s}"),
             Self::Unsupported(s) => write!(f, "unsupported ELF: {s}"),
             Self::Interpreter(n) => write!(f, "guest ELF interpreter: Linux errno {n}"),
             Self::Memory(e) => e.fmt(f),
@@ -49,7 +51,6 @@ pub struct LoadedElf {
 #[derive(Debug)]
 struct Segment {
     offset: usize,
-    address: u64,
     filesz: usize,
     memsz: u64,
     permissions: Permissions,
@@ -104,21 +105,31 @@ pub fn load_with_files(
     mut resolve: impl FnMut(&[u8]) -> Result<(Vec<u8>, Option<MappingFileInfo>), ElfError>,
 ) -> Result<LoadedElf, ElfError> {
     let mut memory = Memory::new(memory_limit);
-    let main = map_image(bytes, &mut memory, 0x4000_0000, main_file)?;
-    let (start_entry, interpreter_base) = if let Some(path) = &main.interpreter {
-        let (interpreter, file) = resolve(path)?;
-        let loader = map_image(&interpreter, &mut memory, INTERPRETER_BASE, file.as_ref())
-            .map_err(|err| match err {
+    let header = Header::parse(bytes, 0x4000_0000)?;
+    // Linux opens and validates PT_INTERP before begin_new_exec. A missing
+    // loader must still return ENOENT even if a later PT_LOAD cannot map.
+    let interpreter = header.interpreter.map(&mut resolve).transpose()?;
+    let loader_header = interpreter
+        .as_ref()
+        .map(|(bytes, _)| {
+            let header = Header::parse(bytes, INTERPRETER_BASE).map_err(|err| match err {
                 ElfError::Invalid(_) | ElfError::Unsupported(_) => ElfError::Interpreter(80),
                 other => other,
             })?;
-        if loader.interpreter.is_some() {
-            return Err(ElfError::Invalid("nested PT_INTERP"));
-        }
-        (loader.entry, loader.bias)
-    } else {
-        (main.entry, 0)
-    };
+            if header.interpreter.is_some() {
+                return Err(ElfError::Invalid("nested PT_INTERP"));
+            }
+            Ok(header)
+        })
+        .transpose()?;
+    let main = map_image(bytes, &mut memory, header, main_file)?;
+    let (start_entry, interpreter_base) =
+        if let Some(((bytes, file), header)) = interpreter.as_ref().zip(loader_header) {
+            let loader = map_image(bytes, &mut memory, header, file.as_ref())?;
+            (loader.entry, loader.bias)
+        } else {
+            (main.entry, 0)
+        };
     Ok(LoadedElf {
         memory,
         entry: main.entry,
@@ -133,84 +144,111 @@ struct Image {
     entry: u64,
     phdr: Option<u64>,
     phnum: u16,
-    interpreter: Option<Vec<u8>>,
     bias: u64,
     end: u64,
+}
+struct Header<'a> {
+    bias: u64,
+    phoff: usize,
+    phend: usize,
+    phnum: u16,
+    interpreter: Option<&'a [u8]>,
+}
+impl<'a> Header<'a> {
+    fn parse(bytes: &'a [u8], dynamic_bias: u64) -> Result<Self, ElfError> {
+        use ElfError::{Invalid, Unsupported};
+        if bytes.len() < EH_SIZE || bytes.len() > MAX_ELF_SIZE {
+            return Err(Invalid("file size"));
+        }
+        if &bytes[..4] != b"\x7fELF" {
+            return Err(Invalid("magic"));
+        }
+        if bytes[4] != 2 || bytes[5] != 1 || bytes[6] != 1 {
+            return Err(Unsupported("requires ELF64 little-endian version 1"));
+        }
+        let bias = match u16_at(bytes, 16) {
+            2 => 0,
+            3 => dynamic_bias,
+            _ => return Err(Unsupported("requires ET_EXEC or ET_DYN")),
+        };
+        if u16_at(bytes, 18) != 183 {
+            return Err(Unsupported("machine must be AArch64"));
+        }
+        if u32_at(bytes, 20) != 1 {
+            return Err(Invalid("header version"));
+        }
+        if u32_at(bytes, 48) != 0 {
+            return Err(Invalid("AArch64 e_flags must be zero"));
+        }
+        let phoff =
+            usize::try_from(u64_at(bytes, 32)).map_err(|_| Invalid("program header offset"))?;
+        let phnum = u16_at(bytes, 56);
+        if u16_at(bytes, 54) != PH_SIZE as u16 || phnum == 0 || phnum > 1024 || phoff < EH_SIZE {
+            return Err(Invalid("program header table"));
+        }
+        let phend = phoff
+            .checked_add(phnum as usize * PH_SIZE)
+            .filter(|&end| end <= bytes.len())
+            .ok_or(Invalid("truncated program headers"))?;
+        let mut interpreter = None;
+        for pos in (phoff..phend).step_by(PH_SIZE) {
+            if u32_at(bytes, pos) != 3 {
+                continue;
+            }
+            if interpreter.is_some() {
+                return Err(Invalid("duplicate PT_INTERP"));
+            }
+            let offset = usize::try_from(u64_at(bytes, pos + 8))
+                .map_err(|_| Invalid("interpreter offset"))?;
+            let size = usize::try_from(u64_at(bytes, pos + 32))
+                .map_err(|_| Invalid("interpreter size"))?;
+            let end = offset
+                .checked_add(size)
+                .filter(|&e| e <= bytes.len())
+                .ok_or(Invalid("interpreter range"))?;
+            if !(2..=4096).contains(&size) {
+                return Err(Invalid("interpreter size"));
+            }
+            let path = &bytes[offset..end];
+            if path[size - 1] != 0 {
+                return Err(Invalid("interpreter path"));
+            }
+            let name = path.split(|&c| c == 0).next().unwrap();
+            if name.is_empty() {
+                return Err(ElfError::Interpreter(13));
+            }
+            interpreter = Some(name);
+        }
+        Ok(Self {
+            bias,
+            phoff,
+            phend,
+            phnum,
+            interpreter,
+        })
+    }
 }
 fn map_image(
     bytes: &[u8],
     memory: &mut Memory,
-    dynamic_bias: u64,
+    header: Header<'_>,
     file: Option<&MappingFileInfo>,
 ) -> Result<Image, ElfError> {
-    use ElfError::{Invalid, Unsupported};
-    if bytes.len() < EH_SIZE || bytes.len() > MAX_ELF_SIZE {
-        return Err(Invalid("file size"));
-    }
-    if &bytes[..4] != b"\x7fELF" {
-        return Err(Invalid("magic"));
-    }
-    if bytes[4] != 2 || bytes[5] != 1 || bytes[6] != 1 {
-        return Err(Unsupported("requires ELF64 little-endian version 1"));
-    }
-    let bias = match u16_at(bytes, 16) {
-        2 => 0,
-        3 => dynamic_bias,
-        _ => return Err(Unsupported("requires ET_EXEC or ET_DYN")),
-    };
-    if u16_at(bytes, 18) != 183 {
-        return Err(Unsupported("machine must be AArch64"));
-    }
-    if u32_at(bytes, 20) != 1 {
-        return Err(Invalid("header version"));
-    }
-    if u32_at(bytes, 48) != 0 {
-        return Err(Invalid("AArch64 e_flags must be zero"));
-    }
+    use ElfError::{Invalid, SegmentMapping};
+    let Header {
+        bias,
+        phoff,
+        phend,
+        phnum,
+        interpreter,
+    } = header;
     let entry = u64_at(bytes, 24)
         .checked_add(bias)
-        .ok_or(Invalid("entry overflow"))?;
-    let phoff = usize::try_from(u64_at(bytes, 32)).map_err(|_| Invalid("program header offset"))?;
-    let phnum = u16_at(bytes, 56);
-    if u16_at(bytes, 54) != PH_SIZE as u16 || phnum == 0 || phnum > 1024 || phoff < EH_SIZE {
-        return Err(Invalid("program header table"));
-    }
-    let phend = phoff
-        .checked_add(phnum as usize * PH_SIZE)
-        .filter(|&end| end <= bytes.len())
-        .ok_or(Invalid("truncated program headers"))?;
-    let mut segments: Vec<Segment> = Vec::new();
-    let mut interpreter = None;
+        .ok_or(SegmentMapping("entry overflow"))?;
+    let mut segments = Vec::new();
     for pos in (phoff..phend).step_by(PH_SIZE) {
-        match u32_at(bytes, pos) {
-            3 => {
-                if interpreter.is_some() {
-                    return Err(Invalid("duplicate PT_INTERP"));
-                }
-                let offset = usize::try_from(u64_at(bytes, pos + 8))
-                    .map_err(|_| Invalid("interpreter offset"))?;
-                let size = usize::try_from(u64_at(bytes, pos + 32))
-                    .map_err(|_| Invalid("interpreter size"))?;
-                let end = offset
-                    .checked_add(size)
-                    .filter(|&e| e <= bytes.len())
-                    .ok_or(Invalid("interpreter range"))?;
-                if !(2..=4096).contains(&size) {
-                    return Err(Invalid("interpreter size"));
-                }
-                let path = &bytes[offset..end];
-                if path[size - 1] != 0 {
-                    return Err(Invalid("interpreter path"));
-                }
-                let name = path.split(|&c| c == 0).next().unwrap();
-                if name.is_empty() {
-                    return Err(ElfError::Interpreter(13));
-                }
-                interpreter = Some(name.to_vec());
-                continue;
-            }
-            1 => {}
-            _ => continue,
+        if u32_at(bytes, pos) != 1 {
+            continue;
         }
         let flags = u32_at(bytes, pos + 4);
         if flags & !7 != 0 {
@@ -220,13 +258,13 @@ fn map_image(
             usize::try_from(u64_at(bytes, pos + 8)).map_err(|_| Invalid("segment offset"))?;
         let address = u64_at(bytes, pos + 16)
             .checked_add(bias)
-            .ok_or(Invalid("segment bias overflow"))?;
+            .ok_or(SegmentMapping("segment bias overflow"))?;
         let filesz =
             usize::try_from(u64_at(bytes, pos + 32)).map_err(|_| Invalid("segment size"))?;
         let memsz = u64_at(bytes, pos + 40);
         let align = u64_at(bytes, pos + 48);
         if filesz as u64 > memsz {
-            return Err(Invalid("p_filesz exceeds p_memsz"));
+            return Err(SegmentMapping("p_filesz exceeds p_memsz"));
         }
         if filesz != 0
             && offset
@@ -236,7 +274,7 @@ fn map_image(
             return Err(Invalid("segment outside file"));
         }
         if filesz != 0 && address % PAGE_SIZE != offset as u64 % PAGE_SIZE {
-            return Err(Invalid("segment page offset"));
+            return Err(SegmentMapping("segment page offset"));
         }
         if align > 1 && (!align.is_power_of_two() || address % align != offset as u64 % align) {
             return Err(Invalid("segment alignment"));
@@ -244,14 +282,14 @@ fn map_image(
         let end = address
             .checked_add(memsz)
             .filter(|&end| address < ADDRESS_LIMIT && end <= ADDRESS_LIMIT)
-            .ok_or(Invalid("segment address range"))?;
+            .ok_or(SegmentMapping("segment address range"))?;
         if memsz == 0 {
             continue;
         }
         let base = address & !(PAGE_SIZE - 1);
         let page_end = end
             .checked_add(PAGE_SIZE - 1)
-            .ok_or(Invalid("page range"))?
+            .ok_or(SegmentMapping("page range"))?
             & !(PAGE_SIZE - 1);
         let permissions = Permissions {
             read: flags & 4 != 0,
@@ -260,7 +298,6 @@ fn map_image(
         };
         segments.push(Segment {
             offset,
-            address,
             filesz,
             memsz,
             permissions,
@@ -268,12 +305,15 @@ fn map_image(
             size: page_end - base,
         });
     }
-    if !entry.is_multiple_of(4)
-        || !segments
-            .iter()
-            .any(|s| s.permissions.execute && entry >= s.address && entry < s.address + s.memsz)
+    // PT_INTERP supplies the first instruction. The main entry is AT_ENTRY
+    // data for that loader, including executables with no main entry point.
+    if interpreter.is_none()
+        && (!entry.is_multiple_of(4)
+            || !segments
+                .iter()
+                .any(|s| s.permissions.execute && (s.base..s.base + s.size).contains(&entry)))
     {
-        return Err(Invalid("entry is not aligned inside an executable segment"));
+        return Err(Invalid("entry is not aligned inside an executable mapping"));
     }
     let mut phdr = None;
     let end = segments
@@ -284,7 +324,7 @@ fn map_image(
     // A fixed segment in a single image may replace an earlier segment.
     // A separately placed PIE interpreter must not replace the main image.
     if bias != 0 && segments.iter().any(|s| !memory.is_free(s.base, s.size)) {
-        return Err(Invalid("dynamic image address collision"));
+        return Err(SegmentMapping("dynamic image address collision"));
     }
     for s in segments {
         match memory.map(s.base, s.size, Permissions::RW) {
@@ -322,7 +362,6 @@ fn map_image(
         entry,
         phdr,
         phnum,
-        interpreter,
         bias,
         end,
     })
@@ -389,6 +428,17 @@ mod tests {
         assert_eq!(maps.matches("/image").count(), 1);
     }
 
+    #[test]
+    fn executable_page_prefix_is_an_entry_and_retains_file_bytes() {
+        let mut b = image();
+        b[72..80].copy_from_slice(&120u64.to_le_bytes());
+        b[80..88].copy_from_slice(&0x1078u64.to_le_bytes());
+        b[96..104].copy_from_slice(&4u64.to_le_bytes());
+        b[24..32].copy_from_slice(&0x1000u64.to_le_bytes());
+        let loaded = load(&b, 4096).unwrap();
+        assert_eq!(loaded.start_entry, 0x1000);
+        assert_eq!(loaded.memory.read_array::<4>(0x1000).unwrap(), *b"\x7fELF");
+    }
     #[test]
     fn rejects_truncation_and_malformed_segments() {
         for end in 0..EH_SIZE + PH_SIZE {
@@ -478,11 +528,38 @@ mod tests {
             .unwrap();
         e.memory.write(0x7000_1078, &42u64.to_le_bytes()).unwrap();
         assert_eq!(e.memory.read_u64(0x7000_1078).unwrap(), 42);
+        // The interpreter starts even when AT_ENTRY falls outside the main image.
+        main[24..32].copy_from_slice(&0u64.to_le_bytes());
+        let interpreted = load_with_interpreter(&main, 8192, |_| Ok(loader.clone())).unwrap();
+        assert_eq!(interpreted.entry, 0x4000_0000);
+        assert_eq!(interpreted.start_entry, INTERPRETER_BASE + 0x1078);
+
         main[192] = b'x';
         load_with_interpreter(&main, 8192, |name| {
             assert_eq!(name, b"xlib/ld-test.so");
             Ok(loader.clone())
         })
         .unwrap();
+
+        // An invalid segment in main cannot hide an earlier interpreter error.
+        main[72..80].copy_from_slice(&1u64.to_le_bytes());
+        assert!(matches!(
+            load_with_interpreter(&main, 8192, |_| Err(ElfError::Interpreter(2))),
+            Err(ElfError::Interpreter(2))
+        ));
+        assert!(matches!(
+            load_with_interpreter(&main, 8192, |_| Ok(vec![0; 64])),
+            Err(ElfError::Interpreter(80))
+        ));
+        assert!(matches!(
+            load_with_interpreter(&main, 8192, |_| Ok(loader.clone())),
+            Err(ElfError::SegmentMapping(_))
+        ));
+        main[72..80].copy_from_slice(&0u64.to_le_bytes());
+        loader[72..80].copy_from_slice(&1u64.to_le_bytes());
+        assert!(matches!(
+            load_with_interpreter(&main, 8192, |_| Ok(loader.clone())),
+            Err(ElfError::SegmentMapping(_))
+        ));
     }
 }

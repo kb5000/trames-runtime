@@ -1137,7 +1137,7 @@ impl<C: Cpu> Kernel<C> {
         self.publish_task(1, &root);
         let (child, request) = birth::Birth::capture(self).prepare_host(&root, request)?;
         drop(root);
-        let image = request.load()?;
+        let image = request.load().map_err(exec::ImageError::launch_errno)?;
         let child = birth::Birth::capture(self).finish_host(child, image)?;
         let id = child.id;
         self.processes.insert(id, child.process);
@@ -5878,7 +5878,7 @@ mod tests {
             k.processes.insert(1, p);
             let producer = std::thread::spawn(move || {
                 std::thread::sleep(delay);
-                pending.complete(Err(Errno(5)));
+                pending.complete(Err(Errno(5).into()));
             });
             let result = k.drive(&mut trames_linux::CapturedOutput::default(), 1000);
             producer.join().unwrap();

@@ -1,6 +1,25 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Exec prepares an image before committing task/resource replacement.
 use super::*;
+#[derive(Debug)]
+pub(crate) enum ImageError {
+    Rejected(Errno),
+    Unmappable,
+}
+impl From<Errno> for ImageError {
+    fn from(errno: Errno) -> Self {
+        Self::Rejected(errno)
+    }
+}
+impl ImageError {
+    // A host launch has no old guest program or PID to terminate.
+    pub(super) fn launch_errno(self) -> Errno {
+        match self {
+            Self::Rejected(errno) => errno,
+            Self::Unmappable => Errno(8),
+        }
+    }
+}
 impl<C: Cpu> Kernel<C> {
     #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn exec(
@@ -39,8 +58,13 @@ impl<C: Cpu> Kernel<C> {
         clock_origin: Instant,
     ) -> Result<(), Errno> {
         // Used only to load a not-yet-admitted host-spawn child (or by tests).
-        let image =
-            Self::prepare_exec_strings(p, dirfd, path, argv, envp, flags, budget, clock_origin)?;
+        let mut image =
+            Self::prepare_exec_strings(p, dirfd, path, argv, envp, flags, budget, clock_origin)
+                .map_err(ImageError::launch_errno)?;
+        image
+            .memory
+            .inherit_total_limit(&p.memory)
+            .map_err(|_| Errno(12))?;
         drop(Self::install_exec(p, image, clock_origin));
         Ok(())
     }
@@ -63,25 +87,36 @@ impl<C: Cpu> Kernel<C> {
             put_args(&mut p.cpu, a);
             return Ok(None);
         }
-        if let Some(pending) = p.exec_pending.take() {
-            let mut image = pending.take()?;
-            image
-                .memory
-                .inherit_total_limit(&p.memory)
-                .map_err(|_| Errno(12))?;
-            return Ok(Some(image));
-        }
-        let (dirfd, a, flags) = if number == 221 {
-            (AT_FDCWD, a, 0)
+        let image = if let Some(pending) = p.exec_pending.take() {
+            pending.take()
         } else {
-            (a[0] as i32, [a[1], a[2], a[3], 0, 0, 0], a[4] as u32)
+            let (dirfd, a, flags) = if number == 221 {
+                (AT_FDCWD, a, 0)
+            } else {
+                (a[0] as i32, [a[1], a[2], a[3], 0, 0, 0], a[4] as u32)
+            };
+            let path = Linux::path(&p.memory, a[0])?;
+            let mut budget_bytes = trames_linux::image::EXEC_ARGUMENT_BYTES;
+            let argv = strings(&p.memory, a[1], &mut budget_bytes)?;
+            let envp = strings(&p.memory, a[2], &mut budget_bytes)?;
+            Self::prepare_exec_strings(p, dirfd, path, argv, envp, flags, budget, clock_origin)
         };
-        let path = Linux::path(&p.memory, a[0])?;
-        let mut budget_bytes = trames_linux::image::EXEC_ARGUMENT_BYTES;
-        let argv = strings(&p.memory, a[1], &mut budget_bytes)?;
-        let envp = strings(&p.memory, a[2], &mut budget_bytes)?;
-        Self::prepare_exec_strings(p, dirfd, path, argv, envp, flags, budget, clock_origin)
-            .map(Some)
+        match image {
+            Ok(mut image) => {
+                image
+                    .memory
+                    .inherit_total_limit(&p.memory)
+                    .map_err(|_| Errno(12))?;
+                Ok(Some(image))
+            }
+            Err(ImageError::Rejected(errno)) => Err(errno),
+            Err(ImageError::Unmappable) => {
+                // Equivalent to a Linux segment mapping failure past begin_new_exec.
+                // An already accepted fatal group status wins over this SIGSEGV.
+                p.signals.io.lifecycle().request_exit(11);
+                Ok(None)
+            }
+        }
     }
     #[allow(clippy::too_many_arguments)]
     fn prepare_exec_strings(
@@ -93,18 +128,13 @@ impl<C: Cpu> Kernel<C> {
         flags: u32,
         budget: usize,
         clock_origin: Instant,
-    ) -> Result<Image<C>, Errno> {
+    ) -> Result<Image<C>, ImageError> {
         // In-memory/solo lookup retains its original fast failure path. Do not
         // clone descriptor context for ENOENT/EACCES or resolve the inode twice.
         let file = p.linux.vfs.executable_file_at(dirfd, &path, flags)?;
         let mut request = Request::new(p, dirfd, path, argv, envp, flags, budget, clock_origin);
         request.file = Some(file);
-        let mut image = request.load()?;
-        image
-            .memory
-            .inherit_total_limit(&p.memory)
-            .map_err(|_| Errno(12))?;
-        Ok(image)
+        request.load()
     }
     pub(super) fn install_exec(
         p: &mut Process<C>,
@@ -1450,7 +1480,7 @@ impl Request {
         request.file = file;
         Ok(request)
     }
-    pub(crate) fn load<C: Cpu>(self) -> Result<Image<C>, Errno> {
+    pub(crate) fn load<C: Cpu>(self) -> Result<Image<C>, ImageError> {
         let Self {
             vfs,
             mut file,
@@ -1483,7 +1513,7 @@ impl Request {
                     }
                     Err(e) if e.0 == 13 => denied = true,
                     Err(e) if matches!(e.0, 2 | 20) => {}
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(e.into()),
                 }
             }
             let (found, open) = found.ok_or(Errno(if denied { 13 } else { 2 }))?;
@@ -1492,10 +1522,10 @@ impl Request {
         }
         let budget = options.memory_limits.per_process;
         if path.is_empty() && flags & 0x1000 == 0 {
-            return Err(Errno(2));
+            return Err(Errno(2).into());
         }
         if flags & !0x1100 != 0 {
-            return Err(Errno(22));
+            return Err(Errno(22).into());
         }
         let via_fd = path.is_empty() || !path.starts_with(b"/") && dirfd != AT_FDCWD;
         let filename = if via_fd {
@@ -1521,10 +1551,10 @@ impl Request {
             let bytes = file.bytes()?;
             if let Some((interpreter, optional)) = trames_vfs::script_interpreter(&bytes)? {
                 if depth == 0 && inaccessible {
-                    return Err(Errno(2));
+                    return Err(Errno(2).into());
                 }
                 if depth == 5 {
-                    return Err(Errno(40));
+                    return Err(Errno(40).into());
                 }
                 let mut next = vec![interpreter.clone()];
                 if let Some(argument) = optional {
@@ -1544,12 +1574,15 @@ impl Request {
             let mut execute_vfs = vfs;
             let mut credentials = execute_vfs.exec_credentials(&file)?;
             let exec_error = |e| match e {
-                RuntimeError::Arguments(_) => Errno(7),
+                RuntimeError::Elf(trames_elf::ElfError::SegmentMapping(_)) => {
+                    ImageError::Unmappable
+                }
+                RuntimeError::Arguments(_) => Errno(7).into(),
                 RuntimeError::Memory(_)
                 | RuntimeError::Configuration(_)
-                | RuntimeError::Elf(trames_elf::ElfError::Memory(_)) => Errno(12),
-                RuntimeError::Elf(trames_elf::ElfError::Interpreter(n)) => Errno(n),
-                _ => Errno(8),
+                | RuntimeError::Elf(trames_elf::ElfError::Memory(_)) => Errno(12).into(),
+                RuntimeError::Elf(trames_elf::ElfError::Interpreter(n)) => Errno(n).into(),
+                _ => Errno(8).into(),
             };
             // Resolve PT_INTERP as the caller, before installing set-ID credentials.
             let elf = Runtime::<C>::load_elf(
@@ -1578,7 +1611,7 @@ impl Request {
             )
             .map_err(|_| Errno(12))?;
             if runtime.memory.resident_bytes() > budget {
-                return Err(Errno(12));
+                return Err(Errno(12).into());
             }
             runtime.linux.command_name.set(
                 &(filename
@@ -1602,7 +1635,7 @@ impl Request {
                 externally_shared_fs: false,
             });
         }
-        Err(Errno(40))
+        Err(Errno(40).into())
     }
 }
 pub(crate) trait Executor<C: Cpu>: Send + Sync {
@@ -1619,9 +1652,9 @@ impl<C: Cpu> Preparation<C> {
             Self::Disk(pending) => pending.ready(),
         }
     }
-    pub(super) fn take(self) -> Result<Image<C>, Errno> {
+    pub(super) fn take(self) -> Result<Image<C>, ImageError> {
         match self {
-            Self::Error(error) => Err(error),
+            Self::Error(error) => Err(error.into()),
             Self::Disk(pending) => pending.take().expect("ready image result"),
         }
     }
@@ -1636,7 +1669,7 @@ impl<C: Cpu> Preparation<C> {
     }
 }
 pub(crate) struct Pending<C: Cpu> {
-    result: std::sync::Mutex<Option<Result<Image<C>, Errno>>>,
+    result: std::sync::Mutex<Option<Result<Image<C>, ImageError>>>,
     ready: std::sync::atomic::AtomicBool,
     readiness: Arc<trames_shared::Readiness>,
 }
@@ -1648,7 +1681,7 @@ impl<C: Cpu> Pending<C> {
             readiness: Arc::default(),
         }
     }
-    pub(crate) fn complete(&self, result: Result<Image<C>, Errno>) {
+    pub(crate) fn complete(&self, result: Result<Image<C>, ImageError>) {
         *self.result.lock().unwrap() = Some(result);
         self.ready.store(true, std::sync::atomic::Ordering::Release);
         self.readiness.notify_locked();
@@ -1656,7 +1689,7 @@ impl<C: Cpu> Pending<C> {
     pub(super) fn ready(&self) -> bool {
         self.ready.load(std::sync::atomic::Ordering::Acquire)
     }
-    fn take(&self) -> Option<Result<Image<C>, Errno>> {
+    fn take(&self) -> Option<Result<Image<C>, ImageError>> {
         self.result.lock().unwrap().take()
     }
     pub(super) fn subscribe(

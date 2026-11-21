@@ -145,10 +145,17 @@ impl<C: Cpu> Lifecycle<C> {
             job.stats.syscalls += 1;
             let mut image = match image {
                 Ok(Some(image)) => image,
-                Ok(None) => unreachable!("image admission waits before effects"),
-                Err(error) => {
-                    p.cpu.set_x(0, super::super::error(error));
-                    job.work.trace.record(p.cpu.x(0));
+                Ok(None) | Err(_) => {
+                    if let Err(error) = image {
+                        p.cpu.set_x(0, super::super::error(error));
+                        job.work.trace.record(p.cpu.x(0));
+                    } else {
+                        debug_assert!(
+                            group.termination().is_some(),
+                            "image I/O completed before admission"
+                        );
+                        report.exit_groups.push(group.clone());
+                    }
                     p.signals.begin_io();
                     job.work.cpu = std::mem::take(&mut p.cpu);
                     control.finish(job.stop_hold());

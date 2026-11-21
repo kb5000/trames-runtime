@@ -211,7 +211,7 @@ impl<C: Cpu> DiskJob<C> {
                 work.result
                     .complete(work.bytes, work.offset, Err(trames_vfs::Errno(5)))
             }
-            Self::Image(_, result) => result.complete(Err(trames_vfs::Errno(5))),
+            Self::Image(_, result) => result.complete(Err(trames_vfs::Errno(5).into())),
             Self::Host(work, _) => work.fail(),
         }
     }
@@ -232,7 +232,7 @@ impl<C: Cpu> DiskJob<C> {
             }
             Self::Image(request, result) => result.complete(
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| request.load()))
-                    .unwrap_or(Err(trames_vfs::Errno(5))),
+                    .unwrap_or(Err(trames_vfs::Errno(5).into())),
             ),
         }
     }
