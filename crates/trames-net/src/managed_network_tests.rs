@@ -19,6 +19,7 @@ fn configured() -> Network {
             1002,
             PolicyRoute {
                 route: Route {
+                    onlink: false,
                     destination: Address {
                         ip: ip("0.0.0.0"),
                         prefix: 0,
@@ -153,6 +154,7 @@ fn ipv6_disable_retires_addresses_and_tables_and_secret_is_namespace_owned() {
             1002,
             PolicyRoute {
                 route: Route {
+                    onlink: false,
                     destination: Address {
                         ip: ip("::"),
                         prefix: 0,
@@ -482,4 +484,54 @@ fn managed_marked_tcp_delivers_original_stream_and_live_prohibit_blocks_writes()
     assert_eq!(r.data, b"tcp-reply");
     rule(&n, 9000, 8, 0, 0, 0, Some([10001, 10001]));
     assert_eq!(s.send(b"prohibited", 0, None), Err(NetError(13)));
+}
+
+#[test]
+fn loopback_aliases_share_a_prefix_route_and_leave_room_to_restore_ipv6() {
+    let n = Network::virtual_network(&Fabric::new().unwrap(), 2, NetworkMode::Full).unwrap();
+    let ns = n.namespace_id();
+    let mut g = n.1.graph.write().unwrap();
+    let address = |ip, prefix| Address { ip, prefix };
+    let first = address(ip("192.0.2.1"), 24);
+    let second = address(ip("192.0.2.2"), 24);
+    g.address(ns, 1, first, true, false).unwrap();
+    let before = g.device(ns, 1).unwrap();
+    g.address(ns, 1, second, true, false).unwrap();
+    let after = g.device(ns, 1).unwrap();
+    let mut changes = Vec::new();
+    crate::rtnetlink::address_changes(&before, &after, &mut changes);
+    assert_eq!(changes.iter().map(|c| c.1).collect::<Vec<_>>(), [20]);
+    assert_eq!(
+        g.routes(ns)
+            .iter()
+            .filter(|r| r.destination == first.network())
+            .count(),
+        1
+    );
+    g.address(ns, 1, first, false, false).unwrap();
+    assert_eq!(
+        g.source(ns, ip("192.0.2.42")).unwrap(),
+        (second.ip, 1, None)
+    );
+
+    let localhost = address(ip("::1"), 128);
+    g.address(ns, 1, localhost, false, false).unwrap();
+    for host in 1..=3 {
+        g.address(ns, 1, address([198, 51, 100, host].into(), 32), true, false)
+            .unwrap();
+    }
+    let extra = address(ip("203.0.113.1"), 32);
+    assert_eq!(g.address(ns, 1, extra, true, false), Err(NetError(28)));
+    g.address(ns, 1, localhost, true, false).unwrap();
+    drop(g);
+    n.set_loopback_up(false).unwrap();
+    assert!(!n.loopback_up());
+    n.set_loopback_up(true).unwrap();
+    assert!(n
+        .devices()
+        .into_iter()
+        .find(|d| d.index == 1)
+        .unwrap()
+        .addresses
+        .contains(&localhost));
 }

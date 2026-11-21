@@ -979,7 +979,13 @@ impl Inner {
                         continue;
                     }
                     if let Some(index) = injected {
-                        if h.protocol == 17 && multicast::group(h.tuple.destination.ip()) {
+                        if h.protocol == 17
+                            && multicast::group_on(
+                                Some(view),
+                                Some(index),
+                                h.tuple.destination.ip(),
+                            )
+                        {
                             self.group_input(source, view, index, &mut p);
                             continue;
                         }
@@ -1274,6 +1280,7 @@ impl Node {
             return;
         }
         self.dirty = true;
+        self.iface.set_any_ip(true);
         self.configuration_revision = revision;
         self.configuration_lo = owner.loopback_up.get();
         let mut addresses = view.addresses(true);
@@ -1421,6 +1428,9 @@ impl Drop for Namespace {
     }
 }
 impl Network {
+    pub(super) fn loopback(&self) -> Arc<crate::netdev::Loopback> {
+        self.0.loopback_up.clone()
+    }
     pub(super) fn fabric(&self) -> Fabric {
         self.0.fabric.clone()
     }

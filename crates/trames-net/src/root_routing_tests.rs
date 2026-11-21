@@ -188,6 +188,7 @@ fn root_bind_conflict_rolls_back_native_half_and_preserves_socket_quota() {
 fn default_route(n: &Network, device: u32, gateway: &str) {
     let gateway: std::net::IpAddr = gateway.parse().unwrap();
     let r = netdev::Route {
+        onlink: false,
         destination: netdev::Address {
             ip: if gateway.is_ipv4() {
                 "0.0.0.0".parse().unwrap()

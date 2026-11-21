@@ -174,6 +174,7 @@ pub(crate) fn link_data(g: &Topology, d: &Device) -> Vec<u8> {
     data
 }
 pub(crate) struct Reply {
+    pub route_flags: u16,
     pub messages: Vec<Vec<u8>>,
     pub changes: Vec<(u64, u16, u32, Vec<u8>)>,
     pub retained_namespaces: Vec<Network>,
@@ -233,6 +234,7 @@ pub(crate) fn request(
             messages.push(message(2, 0, seq, port, &ack));
         }
         return Ok(Reply {
+            route_flags: 0,
             messages,
             changes: vec![],
             retained_namespaces: vec![],
@@ -270,6 +272,7 @@ pub(crate) fn request(
     let mut graph = namespace.graph.write().unwrap();
     let mut changes = vec![];
     let mut out = vec![];
+    let mut route_flags = 0;
     let mut execute = || -> Result<()> {
         if flags & !(1 | 4 | 0x100 | 0x200 | 0x400) != 0 {
             return Err(NetError(95));
@@ -650,10 +653,8 @@ pub(crate) fn request(
                         }
                         let current = target.unwrap_or(ns);
                         let after = graph.device(current, d.index)?;
-                        if current == ns && d.up && !after.up {
-                            for a in d.addresses.iter().filter(|a| !after.addresses.contains(a)) {
-                                changes.push((ns, 21, 0x100, address_data(&d, *a)));
-                            }
+                        if current == ns {
+                            address_changes(&d, &after, &mut changes);
                         }
                         changes.push((current, 16, 1, link_data(&graph, &after)));
                     }
@@ -703,7 +704,7 @@ pub(crate) fn request(
                     return Err(NetError(1));
                 }
                 if a.iter().any(|(k, _)| !matches!(k, 1 | 2 | 3 | 4 | 8))
-                    || request[18] & !(if family == 10 { 0x82 } else { 0x80 }) != 0
+                    || request[18] & !0x82 != 0
                 {
                     return Err(NetError(95));
                 }
@@ -737,7 +738,7 @@ pub(crate) fn request(
                     }
                 }
                 if let Some(f) = get(&a, 8) {
-                    if u32v(f)? & !(if family == 10 { 0x82 } else { 0x80 }) != 0 {
+                    if u32v(f)? & !0x82 != 0 {
                         return Err(NetError(95));
                     }
                 }
@@ -758,13 +759,10 @@ pub(crate) fn request(
                     return Err(NetError(95));
                 }
                 let address = Address { ip: addr, prefix };
+                let before = graph.device(ns, index)?;
                 graph.address(ns, index, address, kind == 20, flags & 0x100 != 0)?;
-                changes.push((
-                    ns,
-                    kind,
-                    if family == 2 { 0x10 } else { 0x100 },
-                    address_data(&graph.device(ns, index)?, address),
-                ));
+                let after = graph.device(ns, index)?;
+                address_changes(&before, &after, &mut changes);
             }
             24..=26 => {
                 if request.len() < 28 {
@@ -807,6 +805,7 @@ pub(crate) fn request(
                             return Err(NetError(101));
                         }
                         let mut data = route_data(Route {
+                            onlink: false,
                             destination: Address {
                                 ip: destination,
                                 prefix: request[17],
@@ -868,7 +867,7 @@ pub(crate) fn request(
                 if request[18..20] != [0; 2]
                     || !matches!(request[22], 0 | 253)
                     || kind == 24 && !matches!(route_kind, 1 | 6 | 7 | 8 | 9)
-                    || request[24..28] != [0; 4]
+                    || u32v(&request[24..28])? & !4 != 0
                     || a.iter().any(|(k, _)| !matches!(k, 1 | 4 | 5 | 6 | 7 | 15))
                 {
                     return Err(NetError(95));
@@ -898,23 +897,14 @@ pub(crate) fn request(
                 };
                 let gateway = get(&a, 5)
                     .map(|v| ip(family, v.get(..width).ok_or(NetError(34))?))
-                    .transpose()?;
+                    .transpose()?
+                    .filter(|ip| *ip != IpAddr::V4(Ipv4Addr::UNSPECIFIED));
                 let mut device = get(&a, 4).map(u32v).transpose()?.unwrap_or(0);
                 if kind == 24 && route_kind == 1 && device == 0 {
                     let gw = gateway.ok_or(NetError(19))?;
                     device = graph
-                        .devices(ns)
-                        .into_iter()
-                        .filter(|d| d.up && d.master.is_none())
-                        .flat_map(|d| {
-                            d.addresses
-                                .into_iter()
-                                .filter(|a| a.contains(gw))
-                                .map(move |a| (std::cmp::Reverse(a.prefix), d.index))
-                        })
-                        .min()
-                        .ok_or(NetError(101))?
-                        .1;
+                        .gateway_device(ns, gw, None)
+                        .ok_or(NetError(if gw.is_ipv4() { 101 } else { 113 }))?;
                 }
                 if let Some(source) = get(&a, 7) {
                     if !graph
@@ -927,6 +917,7 @@ pub(crate) fn request(
                     }
                 }
                 let route = Route {
+                    onlink: u32v(&request[24..28])? & 4 != 0,
                     destination,
                     device,
                     gateway,
@@ -952,6 +943,19 @@ pub(crate) fn request(
                 } else {
                     entry
                 };
+                if kind == 24 {
+                    let existed = graph
+                        .policy_routes(ns)
+                        .iter()
+                        .any(|(t, e)| *t == table && e.route.destination == route.destination);
+                    route_flags = if !existed {
+                        0x600
+                    } else if flags & 0x100 != 0 {
+                        0x100
+                    } else {
+                        0x400
+                    };
+                }
                 graph.policy_route(
                     ns,
                     table,
@@ -978,6 +982,7 @@ pub(crate) fn request(
         let mut data = (-(e.0 as i32)).to_le_bytes().to_vec();
         data.extend_from_slice(request);
         return Ok(Reply {
+            route_flags: 0,
             messages: vec![message(2, 0, seq, port, &data)],
             changes: vec![],
             retained_namespaces,
@@ -991,6 +996,7 @@ pub(crate) fn request(
         out.push(message(2, 0, seq, port, &data));
     }
     Ok(Reply {
+        route_flags,
         messages: out,
         changes,
         retained_namespaces,
@@ -1007,6 +1013,50 @@ pub(crate) fn neighbor_data(e: crate::netdev::NeighborEntry) -> Vec<u8> {
         attr(&mut data, 2, &mac);
     }
     data
+}
+pub(crate) fn address_changes(
+    before: &Device,
+    after: &Device,
+    changes: &mut Vec<(u64, u16, u32, Vec<u8>)>,
+) {
+    for (source, other, add) in [(before, after, false), (after, before, true)] {
+        for (index, a) in source.addresses.iter().enumerate() {
+            if !other.addresses.contains(a) {
+                changes.push((
+                    source.namespace,
+                    if add { 20 } else { 21 },
+                    if a.ip.is_ipv4() { 0x10 } else { 0x100 },
+                    address_data(source, *a),
+                ));
+            }
+            // A connected route belongs to the whole prefix. Removing just
+            // one alias or replacing an address on the same subnet keeps it.
+            if source.up
+                && !(other.up && other.addresses.iter().any(|b| b.network() == a.network()))
+                && !source.addresses[..index]
+                    .iter()
+                    .any(|b| b.network() == a.network())
+            {
+                changes.push(prefix_change(source.namespace, source.index, *a, add));
+            }
+        }
+    }
+}
+fn prefix_change(ns: u64, device: u32, address: Address, add: bool) -> (u64, u16, u32, Vec<u8>) {
+    let route = Route {
+        onlink: false,
+        destination: address.network(),
+        device,
+        gateway: None,
+        metric: 0,
+        protocol: 2,
+    };
+    (
+        ns,
+        if add { 24 } else { 25 },
+        if address.ip.is_ipv4() { 0x40 } else { 0x400 },
+        route_data(route),
+    )
 }
 pub(crate) fn address_data(d: &Device, a: Address) -> Vec<u8> {
     let mut data = vec![
@@ -1075,6 +1125,9 @@ fn route_data(r: Route) -> Vec<u8> {
         0,
         0,
     ];
+    if r.onlink {
+        data[8] |= 4;
+    }
     if r.destination.prefix != 0 {
         attr(&mut data, 1, &octets(r.destination.ip));
     }

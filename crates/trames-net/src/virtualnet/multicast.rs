@@ -8,6 +8,18 @@ pub(super) fn group(ip: IpAddr) -> bool {
     matches!(ip, IpAddr::V4(v) if v.is_multicast() || v.is_broadcast())
 }
 
+pub(super) fn group_on(
+    view: Option<&crate::netdev::View>,
+    interface: Option<u32>,
+    ip: IpAddr,
+) -> bool {
+    // /31 and /32 have no broadcast. Every directed broadcast on a shorter
+    // prefix ends in two one bits, so most unicast sends avoid the graph.
+    group(ip)
+        || matches!(ip, IpAddr::V4(v) if u32::from(v) & 3 == 3 &&
+        view.is_some_and(|vnet| vnet.graph.read().unwrap().directed_broadcast(vnet.namespace,interface,v)))
+}
+
 pub(super) struct Options {
     interface: u32,
     address: Ipv4Addr,
@@ -57,6 +69,9 @@ impl State {
 }
 
 impl Socket {
+    pub(super) fn udp_group(&self, ip: IpAddr) -> bool {
+        group_on(self.network.0.routing.get(), None, ip)
+    }
     fn group_link(&self, index: u32, address: IpAddr, dest: IpAddr) -> Result<(Device, Ipv4Addr)> {
         let view = self.network.0.routing.get().ok_or(NetError(95))?;
         let graph = view.graph.read().unwrap();
@@ -153,7 +168,7 @@ impl Socket {
         info: Option<crate::PacketInfo>,
     ) -> Result<(Device, Ipv4Addr)> {
         let state = self.state.borrow();
-        if dest.ip() == IpAddr::V4(Ipv4Addr::BROADCAST) && !state.broadcast {
+        if !dest.ip().is_multicast() && !state.broadcast {
             return Err(NetError(13));
         }
         let mc = state
@@ -178,7 +193,7 @@ impl Socket {
                 state
                     .bound
                     .map(|b| b.ip())
-                    .filter(|a| !a.is_unspecified() && !group(*a))
+                    .filter(|a| !a.is_unspecified() && !self.udp_group(*a))
             })
             .unwrap_or_else(|| IpAddr::V4(mc.map_or(Ipv4Addr::UNSPECIFIED, |o| o.address)));
         drop(state);

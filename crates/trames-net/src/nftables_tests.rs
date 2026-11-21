@@ -427,6 +427,7 @@ fn routed_filter_blocks_active_tcp_without_touching_native_path() {
             .route(
                 n.namespace_id(),
                 crate::netdev::Route {
+                    onlink: false,
                     destination: crate::netdev::Address {
                         ip: "0.0.0.0".parse().unwrap(),
                         prefix: 0,

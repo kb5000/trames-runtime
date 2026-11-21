@@ -488,6 +488,7 @@ fn route_get_uses_namespace_routes_and_selected_source_without_mutating_them() {
         .route(
             n.namespace_id(),
             netdev::Route {
+                onlink: false,
                 destination: Address {
                     ip: Ipv4Addr::UNSPECIFIED.into(),
                     prefix: 0,
@@ -569,6 +570,7 @@ fn routes_require_configuration_and_namespace_teardown_removes_veth_peer() {
         Err(NetError(101))
     );
     let route = netdev::Route {
+        onlink: false,
         destination: Address {
             ip: Ipv4Addr::UNSPECIFIED.into(),
             prefix: 0,
@@ -620,6 +622,7 @@ fn explicit_static_routes_work_and_teardown_notifies_without_enabling_host_egres
         Err(NetError(101))
     );
     let route = netdev::Route {
+        onlink: false,
         destination: Address {
             ip: "198.51.100.2".parse().unwrap(),
             prefix: 32,

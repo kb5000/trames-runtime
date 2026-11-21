@@ -22,7 +22,7 @@ pub(super) struct Namespace {
     pub(crate) fabric: Arc<crate::protocol::Group>,
     pub(crate) driver: Arc<crate::protocol::Driver>,
     listeners: Arc<SharedState<Vec<Weak<Socket>>>>,
-    loopback: Option<std::sync::Arc<crate::netdev::Loopback>>,
+    pub(super) loopback: Option<std::sync::Arc<crate::netdev::Loopback>>,
     pub(super) ping_range: Cell<[u32; 2]>,
     pub(super) unprivileged_port: Cell<u16>,
     pub(super) port_config: parking_lot::Mutex<()>,
@@ -147,7 +147,9 @@ impl Namespace {
         let stack = fabric.dynamic_environment(
             n.mode(),
             view,
-            std::sync::Arc::new(crate::netdev::Loopback::new(true)),
+            self.loopback
+                .clone()
+                .unwrap_or_else(|| Arc::new(crate::netdev::Loopback::new(true))),
         )?;
         fabric.bind_driver(&self.fabric.changed);
         self.stack
@@ -163,16 +165,6 @@ impl Namespace {
     }
     pub fn loopback_up(&self) -> bool {
         self.loopback.as_ref().is_none_or(|lo| lo.get())
-    }
-    pub fn set_loopback_up(&self, up: bool) -> Result<()> {
-        match &self.loopback {
-            Some(lo) => {
-                lo.set(up);
-                Ok(())
-            }
-            None if up => Ok(()),
-            None => Err(NetError(95)),
-        }
     }
 }
 impl Drop for Namespace {
@@ -308,8 +300,30 @@ fn notify_deferred(
     changes: Vec<(u64, u16, u32, Vec<u8>)>,
     wakes: &mut Notifications,
 ) {
+    notify_request(listeners, changes, wakes, None);
+}
+fn notify_request(
+    listeners: &Arc<SharedState<Vec<Weak<Socket>>>>,
+    changes: Vec<(u64, u16, u32, Vec<u8>)>,
+    wakes: &mut Notifications,
+    request: Option<(u16, u32, u32, u16)>,
+) {
+    if changes.is_empty() {
+        return;
+    }
     let listeners = live_listeners(listeners);
     for (ns, kind, group, data) in changes {
+        let (flags, seq, port) = match request {
+            Some((op, seq, port, route_flags)) if op == kind && matches!(kind, 24 | 25) => {
+                (route_flags, seq, port)
+            }
+            Some((op, seq, port, _)) if op == kind && matches!(kind, 20 | 21) && group == 0x10 => {
+                (0, seq, port)
+            }
+            _ if kind == 24 => (0x600, 0, 0),
+            _ => (0, 0, 0),
+        };
+        let mut packet = None;
         for listener in &listeners {
             if listener.protocol != 0
                 || listener.namespace.id() != ns
@@ -317,8 +331,8 @@ fn notify_deferred(
             {
                 continue;
             }
-            let p = message(kind, 0, 0, 0, &data);
-            enqueue(listener, &p, source(0, group), wakes);
+            let p = packet.get_or_insert_with(|| message(kind, flags, seq, port, &data));
+            enqueue(listener, p, source(0, group), wakes);
         }
     }
 }
@@ -645,7 +659,17 @@ impl Socket {
             )?;
             wakes.1.extend(r.retained_namespaces);
             self.namespace.link_wakes(&r.changes, wakes);
-            notify_deferred(&self.namespace.listeners, r.changes, wakes);
+            notify_request(
+                &self.namespace.listeners,
+                r.changes,
+                wakes,
+                Some((
+                    u16::from_le_bytes(request[4..6].try_into().unwrap()),
+                    u32::from_le_bytes(request[8..12].try_into().unwrap()),
+                    self.port.get(),
+                    r.route_flags,
+                )),
+            );
             let generated = r.messages;
             if replies.len() + generated.len() > 128 {
                 return Err(NetError(105));

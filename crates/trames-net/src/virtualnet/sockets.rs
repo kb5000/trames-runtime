@@ -441,7 +441,7 @@ impl Socket {
         if self.state.borrow().bound.is_some() {
             return Err(NetError(22));
         }
-        if !(self.own(a.ip()) || self.kind == 2 && multicast::group(a.ip())) {
+        if !(self.own(a.ip()) || self.kind == 2 && self.udp_group(a.ip())) {
             return Err(NetError(99));
         }
         if self.kind == 4 {
@@ -733,7 +733,7 @@ impl Socket {
         }
         // UDP connect is also Linux's source-route probe: a zero destination
         // port selects the source without establishing a getpeername peer.
-        let group_source = if self.kind == 2 && multicast::group(a.ip()) {
+        let group_source = if self.kind == 2 && self.udp_group(a.ip()) {
             Some(IpAddr::V4(self.group_source(a, None)?.1))
         } else {
             None
@@ -1038,7 +1038,7 @@ impl Socket {
                 initial.peer.ok_or(NetError(89))?
             };
             drop(initial);
-            if multicast::group(a.ip()) {
+            if self.udp_group(a.ip()) {
                 return self.send_group(a, bytes, control);
             }
             self.destination(a)?;
@@ -1077,7 +1077,7 @@ impl Socket {
             if a.is_ipv6() && state.bound.is_some_and(|b| b.is_ipv4()) {
                 return Err(NetError(97));
             }
-            let group_bound = state.bound.is_some_and(|b| multicast::group(b.ip()));
+            let group_bound = state.bound.is_some_and(|b| self.udp_group(b.ip()));
             let selected = if let Some(info) = info.filter(|i| !i.address.is_unspecified()) {
                 Some(info.address)
             } else if group_bound || state.bound.is_some_and(|b| b.ip().is_unspecified()) {

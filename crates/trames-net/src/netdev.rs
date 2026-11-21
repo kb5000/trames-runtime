@@ -47,7 +47,7 @@ mod ipv6;
 mod policy;
 pub(crate) use policy::{Context as RouteContext, Entry as PolicyRoute, Rule};
 const MAX_LINKS: usize = 256;
-const MAX_ADDRESSES: usize = 6; // Plus the two loopback addresses in smoltcp.
+const MAX_ADDRESSES: usize = 8; // Matches the packet stack interface address capacity.
 const MAX_ROUTES: usize = 64;
 #[path = "ethernet_neighbor.rs"]
 mod ethernet_neighbor;
@@ -152,6 +152,7 @@ pub struct Address {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Route {
+    pub onlink: bool,
     pub destination: Address,
     pub device: u32,
     pub gateway: Option<IpAddr>,
@@ -264,7 +265,7 @@ impl Topology {
         prefix: Option<u8>,
     ) -> Result<()> {
         let d = self.device(id, index)?;
-        if d.kind == DeviceKind::Loopback
+        if d.kind == DeviceKind::Loopback && self.spaces[&id].lo.is_none()
             || d.kind == DeviceKind::Direct && !self.spaces[&id].managed_uplink
         {
             return Err(NetError(95));
@@ -297,6 +298,12 @@ impl Topology {
             } else {
                 24
             });
+        if previous.is_none()
+            && !address.is_unspecified()
+            && !self.address_slot_available(id, index, address.into())
+        {
+            return Err(NetError(28));
+        }
         let d = self.devices.get_mut(&(id, index)).unwrap();
         if let Some(old) = previous {
             d.addresses.retain(|a| *a != old);
@@ -433,6 +440,7 @@ impl Topology {
             ] {
                 if !ip.is_unspecified() {
                     self.spaces.get_mut(&id).unwrap().routes.push(Route {
+                        onlink: false,
                         destination: Address {
                             ip: if ip.is_ipv4() {
                                 Ipv4Addr::UNSPECIFIED.into()
@@ -537,6 +545,7 @@ impl Topology {
         space.routes.retain(|r| r.device != 2);
         for a in addresses {
             space.routes.push(Route {
+                onlink: false,
                 destination: Address {
                     ip: if a.ip.is_ipv4() {
                         Ipv4Addr::UNSPECIFIED.into()
@@ -755,7 +764,30 @@ impl Topology {
             }
             if let Some(up) = up {
                 match &self.spaces[&id].lo {
-                    Some(lo) => lo.set(up),
+                    Some(lo) => {
+                        let addr = Address {
+                            ip: Ipv6Addr::LOCALHOST.into(),
+                            prefix: 128,
+                        };
+                        let dev = self.devices.get_mut(&(id, index)).unwrap();
+                        if old.up != up {
+                            if up {
+                                if dev.ipv6[2] == 0 && !dev.addresses.contains(&addr) {
+                                    dev.addresses.push(addr);
+                                }
+                            } else {
+                                let all = self.spaces[&id].ipv6_all[4];
+                                let keep = if all == 0 { dev.ipv6[4] } else { all } > 0;
+                                dev.addresses.retain(|a| match a.ip {
+                                    IpAddr::V4(_) => true,
+                                    IpAddr::V6(ip) => {
+                                        keep && !ip.is_unicast_link_local() && !ip.is_loopback()
+                                    }
+                                });
+                            }
+                        }
+                        lo.set(up)
+                    }
                     None if up => {}
                     None => return Err(NetError(95)),
                 }
@@ -892,6 +924,23 @@ impl Topology {
             }
         }
     }
+    fn address_slot_available(&self, id: u64, index: u32, ip: IpAddr) -> bool {
+        // The kernel restores ::1 on loopback-up. Reserve its slot while it
+        // is absent, including when aliases arrive through SIOCSIFADDR.
+        let used: usize = self
+            .devices
+            .range((id, 0)..=(id, u32::MAX))
+            .map(|(_, d)| {
+                d.addresses.len()
+                    + usize::from(
+                        d.kind == DeviceKind::Loopback
+                            && !(index == d.index && ip == Ipv6Addr::LOCALHOST)
+                            && !d.addresses.iter().any(|a| a.ip == Ipv6Addr::LOCALHOST),
+                    )
+            })
+            .sum();
+        used < MAX_ADDRESSES
+    }
     pub fn address(
         &mut self,
         id: u64,
@@ -910,7 +959,7 @@ impl Topology {
         if add && address.ip.is_ipv6() && d.ipv6[2] != 0 {
             return Err(NetError(13));
         }
-        if d.kind == DeviceKind::Loopback
+        if d.kind == DeviceKind::Loopback && self.spaces[&id].lo.is_none()
             || d.kind == DeviceKind::Direct && !self.spaces[&id].managed_uplink
             || d.master.is_some()
         {
@@ -922,15 +971,7 @@ impl Topology {
         if add && d.addresses.contains(&address) {
             return if replace { Ok(()) } else { Err(NetError(17)) };
         }
-        if add
-            && self
-                .devices(id)
-                .iter()
-                .filter(|d| d.kind != DeviceKind::Loopback)
-                .map(|d| d.addresses.len())
-                .sum::<usize>()
-                >= MAX_ADDRESSES
-        {
+        if add && !self.address_slot_available(id, index, address.ip) {
             return Err(NetError(28));
         }
         let d = self.devices.get_mut(&(id, index)).unwrap();
@@ -947,10 +988,22 @@ impl Topology {
             .spaces
             .get(&id)
             .map_or_else(Vec::new, |s| s.routes.clone());
-        for d in self.devices(id) {
-            if d.up {
-                for a in d.addresses {
+        for (_, d) in self.devices.range((id, 0)..=(id, u32::MAX)) {
+            let up = if d.kind == DeviceKind::Loopback {
+                self.spaces[&id].lo.as_ref().is_none_or(|lo| lo.get())
+            } else {
+                d.up
+            };
+            if up {
+                for (i, a) in d.addresses.iter().enumerate() {
+                    if d.addresses[..i]
+                        .iter()
+                        .any(|other| other.network() == a.network())
+                    {
+                        continue;
+                    }
                     routes.push(Route {
+                        onlink: false,
                         destination: a.network(),
                         device: d.index,
                         gateway: None,
@@ -961,6 +1014,22 @@ impl Topology {
             }
         }
         routes
+    }
+    // A gateway must be reachable by a connected prefix or an installed
+    // direct route. A route through a second gateway cannot establish this.
+    pub(super) fn gateway_device(&self, id: u64, ip: IpAddr, device: Option<u32>) -> Option<u32> {
+        self.routes(id)
+            .into_iter()
+            .filter(|r| {
+                r.gateway.is_none()
+                    && r.destination.contains(ip)
+                    && device.is_none_or(|index| index == r.device)
+                    && self
+                        .device(id, r.device)
+                        .is_ok_and(|d| d.up && d.master.is_none())
+            })
+            .min_by_key(|r| (std::cmp::Reverse(r.destination.prefix), r.metric, r.device))
+            .map(|r| r.device)
     }
     pub fn route(
         &mut self,
@@ -976,19 +1045,25 @@ impl Topology {
         {
             return Err(NetError(95));
         }
-        if let Some(g) = route.gateway {
+        if let Some(g) = route.gateway.filter(|_| add) {
             if g.is_ipv4() != route.destination.ip.is_ipv4()
                 || g.is_unspecified()
                 || g.is_multicast()
-                || !d.addresses.iter().any(|a| a.contains(g))
+                || !(route.onlink && d.up
+                    || matches!(g, IpAddr::V6(ip) if ip.is_unicast_link_local()) && d.up
+                    || self.gateway_device(id, g, Some(d.index)).is_some())
             {
                 return Err(NetError(101));
             }
         }
         let routes = &mut self.spaces.get_mut(&id).ok_or(NetError(2))?.routes;
-        let at = routes
-            .iter()
-            .position(|r| r.destination == route.destination && r.metric == route.metric);
+        let at = routes.iter().position(|r| {
+            r.destination == route.destination
+                && r.metric == route.metric
+                && (exclusive
+                    || replace
+                    || (r.device == route.device && r.gateway == route.gateway))
+        });
         if add {
             if let Some(at) = at {
                 if exclusive || !replace {
@@ -1012,46 +1087,38 @@ impl Topology {
         self.changed();
         Ok(())
     }
+    // Linux IPv4 local routes cover the configured loopback prefix. IPv6
+    // addresses and ordinary interfaces own only their assigned addresses.
+    fn local_source(&self, id: u64, ip: IpAddr) -> Option<IpAddr> {
+        let mut subnet = None;
+        for (_, d) in self.devices.range((id, 0)..=(id, u32::MAX)) {
+            let lo = d.kind == DeviceKind::Loopback;
+            if lo && self.spaces[&id].lo.as_ref().is_some_and(|flag| !flag.get()) {
+                continue;
+            }
+            for a in &d.addresses {
+                if a.ip == ip {
+                    return Some(ip);
+                }
+                if lo && ip.is_ipv4() && a.contains(ip) {
+                    subnet.get_or_insert(a.ip);
+                }
+            }
+        }
+        subnet
+    }
     pub fn own(&self, id: u64, ip: IpAddr) -> bool {
-        self.devices(id).iter().any(|d| {
-            d.addresses.iter().any(|a| {
-                a.ip == ip || d.kind == DeviceKind::Loopback && ip.is_loopback() && a.contains(ip)
-            }) && (d.kind != DeviceKind::Loopback || d.up)
-        })
+        self.local_source(id, ip).is_some()
     }
     pub fn source(&self, id: u64, destination: IpAddr) -> Result<(IpAddr, u32, Option<IpAddr>)> {
         self.source_for(id, destination, RouteContext::default())
     }
     fn source_main(&self, id: u64, destination: IpAddr) -> Result<(IpAddr, u32, Option<IpAddr>)> {
-        if self.own(id, destination) {
-            let d = self
-                .devices(id)
-                .into_iter()
-                .find(|d| {
-                    d.addresses.iter().any(|a| {
-                        a.ip == destination
-                            || d.kind == DeviceKind::Loopback
-                                && destination.is_loopback()
-                                && a.contains(destination)
-                    })
-                })
-                .unwrap();
-            let source = d
-                .addresses
-                .iter()
-                .find(|a| a.ip == destination)
-                .or_else(|| d.addresses.iter().find(|a| a.contains(destination)))
-                .ok_or(NetError(99))?
-                .ip;
-            return Ok((
-                source,
-                if d.kind == DeviceKind::Loopback {
-                    d.index
-                } else {
-                    1
-                },
-                None,
-            ));
+        if let Some(source) = self.local_source(id, destination) {
+            return Ok((source, 1, None));
+        }
+        if destination.is_loopback() {
+            return Err(NetError(if destination.is_ipv4() { 101 } else { 99 }));
         }
         let mut routes = self.routes(id);
         routes.sort_by_key(|r| (std::cmp::Reverse(r.destination.prefix), r.metric));
@@ -1068,6 +1135,11 @@ impl Topology {
             }
         }
         Err(NetError(101))
+    }
+    pub(super) fn directed_broadcast(&self, id: u64, interface: Option<u32>, ip: Ipv4Addr) -> bool {
+        let range = (id, interface.unwrap_or(0))..=(id, interface.unwrap_or(u32::MAX));
+        self.devices.range(range).any(|(_,d)| d.addresses.iter().any(|a|
+            matches!(a.ip, IpAddr::V4(local) if a.prefix<=30 && u32::from(local) | u32::MAX.checked_shr(a.prefix.into()).unwrap_or(0)==u32::from(ip))))
     }
     pub fn address_type(&self, id: u64, ip: IpAddr) -> u32 {
         if self.own(id, ip) || ip.is_loopback() {

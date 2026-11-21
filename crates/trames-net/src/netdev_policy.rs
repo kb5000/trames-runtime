@@ -201,8 +201,13 @@ impl Topology {
         }
         if entry.kind == 1 {
             let d = self.device(id, route.device)?;
-            if let Some(g) = route.gateway {
-                if !d.addresses.iter().any(|a| a.contains(g)) {
+            if let Some(g) = route.gateway.filter(|_| add) {
+                if g.is_multicast()
+                    || g.is_unspecified()
+                    || !(route.onlink && d.up
+                        || self.gateway_device(id, g, Some(d.index)).is_some()
+                        || matches!(g, IpAddr::V6(ip) if ip.is_unicast_link_local()) && d.up)
+                {
                     return Err(NetError(101));
                 }
             }

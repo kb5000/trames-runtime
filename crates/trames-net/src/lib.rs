@@ -297,22 +297,31 @@ impl Network {
         if self.1.native.get().is_some() {
             self.1.root_stack()?;
         }
-        self.1.graph.write().unwrap().change_link(
-            self.namespace_id(),
-            index,
-            None,
-            None,
-            Some(up),
-            None,
-            None,
-            None,
-        )
+        let changes = {
+            let ns = self.namespace_id();
+            let mut graph = self.1.graph.write().unwrap();
+            let before = graph.device(ns, index)?;
+            graph.change_link(ns, index, None, None, Some(up), None, None, None)?;
+            if before.up == up {
+                return Ok(());
+            }
+            let after = graph.device(ns, index)?;
+            let mut changes = Vec::new();
+            rtnetlink::address_changes(&before, &after, &mut changes);
+            changes.push((ns, 16, 1, rtnetlink::link_data(&graph, &after)));
+            changes
+        };
+        self.1.notify(changes);
+        Ok(())
     }
     pub fn loopback_up(&self) -> bool {
         self.1.loopback_up()
     }
     pub fn set_loopback_up(&self, up: bool) -> Result<()> {
-        self.1.set_loopback_up(up)
+        if self.1.loopback.is_none() {
+            return if up { Ok(()) } else { Err(NetError(95)) };
+        }
+        self.set_device_up(1, up)
     }
     pub fn new(mode: NetworkMode) -> Self {
         Self::with_native(mode, netlink::Namespace::default())
@@ -320,11 +329,11 @@ impl Network {
     fn with_native(mode: NetworkMode, namespace: netlink::Namespace) -> Self {
         let native = native::Network::new(mode);
         let namespace = Arc::new(namespace);
-        namespace
-            .graph
-            .write()
-            .unwrap()
-            .add_space(namespace.id(), None, native.info());
+        namespace.graph.write().unwrap().add_space(
+            namespace.id(),
+            namespace.loopback.clone(),
+            native.info(),
+        );
         namespace
             .native
             .set(native.clone())
@@ -336,7 +345,9 @@ impl Network {
     /// Configurable guest IP link with the existing userspace/native gateway;
     /// host interface addresses and routes remain outside guest control.
     pub fn managed_uplink(mode: NetworkMode) -> Result<Self> {
-        let network = Self::with_native(mode, netlink::Namespace::packet_stack());
+        let mut namespace = netlink::Namespace::packet_stack();
+        namespace.loopback = Some(Arc::new(netdev::Loopback::new(true)));
+        let network = Self::with_native(mode, namespace);
         network.1.graph.write().unwrap().manage_uplink(
             network.namespace_id(),
             matches!(mode, NetworkMode::Full | NetworkMode::Outbound),
@@ -356,26 +367,7 @@ impl Network {
             graph.ioctl_ipv4(self.namespace_id(), index, address, prefix)?;
             let after = graph.device(self.namespace_id(), index)?;
             let mut changes = Vec::new();
-            for (a, kind) in before
-                .addresses
-                .iter()
-                .filter(|a| !after.addresses.contains(a))
-                .map(|a| (a, 21))
-                .chain(
-                    after
-                        .addresses
-                        .iter()
-                        .filter(|a| !before.addresses.contains(a))
-                        .map(|a| (a, 20)),
-                )
-            {
-                changes.push((
-                    self.namespace_id(),
-                    kind,
-                    0x10,
-                    rtnetlink::address_data(&after, *a),
-                ));
-            }
+            rtnetlink::address_changes(&before, &after, &mut changes);
             changes
         };
         self.1.notify(changes);
@@ -383,15 +375,17 @@ impl Network {
     }
     pub fn virtual_network(fabric: &Fabric, id: u8, mode: NetworkMode) -> Result<Self> {
         let stack = fabric.environment(id, mode)?;
-        let namespace = Arc::new(netlink::Namespace::packet_stack());
+        let mut namespace = netlink::Namespace::packet_stack();
+        namespace.loopback = Some(stack.loopback());
+        let namespace = Arc::new(namespace);
         *namespace.fabric.borrow_mut() = Some(fabric.clone());
         fabric.bind_driver(&namespace.fabric.changed);
         namespace.nft_packet_hooks.set(false);
-        namespace
-            .graph
-            .write()
-            .unwrap()
-            .add_space(namespace.id(), None, Some(stack.info()));
+        namespace.graph.write().unwrap().add_space(
+            namespace.id(),
+            namespace.loopback.clone(),
+            Some(stack.info()),
+        );
         namespace
             .stack
             .set(stack.clone())
