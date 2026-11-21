@@ -2110,6 +2110,7 @@ impl Vfs {
             b"/proc/sys/vm/overcommit_memory" => return Ok(regular(b"2\n".to_vec())),
             b"/proc/sys/net/bridge/bridge-nf-call-iptables"|b"/proc/sys/net/bridge/bridge-nf-call-ip6tables"|b"/proc/sys/net/ipv4/ip_forward"|b"/proc/sys/net/ipv4/conf/all/forwarding"|b"/proc/sys/net/ipv6/conf/all/forwarding"=>return Ok(Some((file(Vec::new()),0o100644))),
             b"/proc/sys/net/bridge"|b"/proc/sys/net/ipv4/conf"|b"/proc/sys/net/ipv4/conf/all"|b"/proc/sys/net/ipv6"|b"/proc/sys/net/ipv6/conf"|b"/proc/sys/net/ipv6/conf/all"=>return Ok(directory()),
+            b"/proc/sys/net/ipv4/ip_local_port_range" | b"/proc/sys/net/ipv4/tcp_sack" if self.network.has_guest_transport() => return Ok(Some((file(Vec::new()),0o100644))),
             b"/proc/sys/net/ipv4/ip_local_port_range" => return Ok(regular(b"49152\t65535\n".to_vec())),
             b"/proc/sys/net/ipv4/ip_default_ttl" => return Ok(regular(b"64\n".to_vec())),
             b"/proc/sys/net/ipv4/ping_group_range" | b"/proc/sys/net/ipv4/ip_unprivileged_port_start" => return Ok(Some((file(Vec::new()),0o100644))),
@@ -2931,6 +2932,9 @@ impl Vfs {
             .collect(),
             _ => Vec::new(),
         };
+        if path == b"/proc/sys/net/ipv4" && self.network.has_guest_transport() {
+            names.push(b"tcp_sack".to_vec());
+        }
         if self.pseudo.borrow().video_device.load(Ordering::Relaxed) {
             match path {
                 b"/dev" => names.push(b"dri".to_vec()),

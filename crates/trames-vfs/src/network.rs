@@ -87,6 +87,8 @@ impl SocketOperation {
 pub(super) enum Sysctl {
     PingRange,
     UnprivilegedPort,
+    LocalPortRange,
+    TcpSack,
     Forwarding(bool),
     BridgeFilter(bool),
     Ipv6(u32, usize),
@@ -119,6 +121,8 @@ impl Sysctl {
         match path {
             b"/proc/sys/net/ipv4/ping_group_range" => Some(Self::PingRange),
             b"/proc/sys/net/ipv4/ip_unprivileged_port_start" => Some(Self::UnprivilegedPort),
+            b"/proc/sys/net/ipv4/ip_local_port_range" => Some(Self::LocalPortRange),
+            b"/proc/sys/net/ipv4/tcp_sack" => Some(Self::TcpSack),
             b"/proc/sys/net/ipv4/ip_forward" | b"/proc/sys/net/ipv4/conf/all/forwarding" => {
                 Some(Self::Forwarding(false))
             }
@@ -146,6 +150,11 @@ impl Control {
                 let [a, b] = n.ping_range();
                 format!("{a}\t{b}\n")
             }
+            Sysctl::LocalPortRange => {
+                let [low, high] = n.local_port_range();
+                format!("{low}\t{high}\n")
+            }
+            Sysctl::TcpSack => format!("{}\n", u8::from(n.tcp_sack().map_err(|e| Errno(e.0))?)),
             Sysctl::UnprivilegedPort => format!("{}\n", n.unprivileged_port()),
             Sysctl::BridgeFilter(ipv6) => format!("{}\n", u8::from(n.bridge_filter(ipv6))),
             Sysctl::Forwarding(ipv6) => format!("{}\n", u8::from(n.forwarding(ipv6))),
@@ -200,8 +209,14 @@ impl Control {
             (Sysctl::PingRange, [a, b]) if *a != u32::MAX && *b != u32::MAX => {
                 n.set_ping_range([*a, *b])
             }
-            (Sysctl::UnprivilegedPort, [port]) if *port <= u16::MAX as u32 => {
-                n.set_unprivileged_port(*port as u16)
+            (Sysctl::UnprivilegedPort, [port]) if *port <= u16::MAX as u32 => n
+                .set_unprivileged_port(*port as u16)
+                .map_err(|e| Errno(e.0))?,
+            (Sysctl::LocalPortRange, [low, high]) if *low <= 65535 && *high <= 65535 => n
+                .set_local_port_range(*low as u16, *high as u16)
+                .map_err(|e| Errno(e.0))?,
+            (Sysctl::TcpSack, [enabled]) if *enabled <= 1 => {
+                n.set_tcp_sack(*enabled != 0).map_err(|e| Errno(e.0))?
             }
             (Sysctl::BridgeFilter(ipv6), [enabled]) if *enabled <= 1 => {
                 n.set_bridge_filter(ipv6, *enabled != 0)

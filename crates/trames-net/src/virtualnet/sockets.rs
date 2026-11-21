@@ -245,7 +245,13 @@ impl Socket {
         let Some(n) = i.nodes.get(&self.network.0.key) else {
             return false;
         };
-        let dual = self.family == 10 && !self.state.borrow().v6_only;
+        let (dual, reuse_udp) = {
+            let state = self.state.borrow();
+            (
+                self.family == 10 && !state.v6_only,
+                self.kind == 2 && state.reuse,
+            )
+        };
         let free = n
             .registry
             .iter()
@@ -256,7 +262,7 @@ impl Socket {
                 let Some(b) = state.bound else {
                     return true;
                 };
-                if a.port() != b.port() {
+                if a.port() != b.port() || reuse_udp && state.reuse {
                     return true;
                 }
                 let same_family =
@@ -287,20 +293,22 @@ impl Socket {
         // peer's TIME_WAIT even after our local endpoint has fully closed.
         // The namespace binding lock already serializes port selection.
         let cursor = self.network.0.ephemeral_port.get();
-        let first = if cursor == 0 {
+        let [low, high] = self.network.port_range();
+        let span = u32::from(high) - u32::from(low) + 1;
+        let first = if (low..=high).contains(&cursor) {
+            u32::from(cursor - low)
+        } else {
             let mut seed = [0; 2];
             getrandom::fill(&mut seed).map_err(|_| NetError(5))?;
-            u16::from_ne_bytes(seed) % 16384
-        } else {
-            cursor - 49152
+            u32::from(u16::from_ne_bytes(seed)) % span
         };
-        for n in 0..16384u32 {
-            let p = 49152 + ((first as u32 + n) % 16384) as u16;
+        for n in 0..span {
+            let p = low + ((first + n) % span) as u16;
             if self.port_free(SocketAddr::new(ip, p)) {
                 self.network
                     .0
                     .ephemeral_port
-                    .set(49152 + ((u32::from(p) - 49152 + 1) % 16384) as u16);
+                    .set(if p == high { low } else { p + 1 });
                 return Ok(p);
             }
         }
@@ -371,10 +379,15 @@ impl Socket {
             let addresses = self.addresses(a);
             let mut i = self.network.0.fabric.0.borrow_mut();
             let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
+            n.udp_bind_order += 1;
             let mut handles = Vec::new();
             for address in addresses {
                 let state = self.state.borrow();
                 let mut s = udp_socket_with_buffers(state.receive_buffer, state.send_buffer);
+                s.set_bind_priority(n.udp_bind_order, !a.ip().is_unspecified());
+                if state.reuse {
+                    s.allow_shared_delivery();
+                }
                 drop(state);
                 s.set_hop_limit(Some(self.state.borrow().hop_limit));
                 s.bind(IpListenEndpoint {
@@ -534,6 +547,7 @@ impl Socket {
             self.ensure_bound()?;
         }
         if self.kind != 1 {
+            let mut fabric = self.network.0.fabric.0.borrow_mut();
             let mut s = self.state.borrow_mut();
             if self.kind == 2 && s.bound.is_some_and(|b| b.ip().is_unspecified()) {
                 let source = if let Some(view) = self.network.0.routing.get() {
@@ -550,6 +564,17 @@ impl Socket {
                     self.network.0.info.ipv6.into()
                 };
                 s.bound.as_mut().unwrap().set_ip(source);
+            }
+            if self.kind == 2 {
+                let node = fabric
+                    .nodes
+                    .get_mut(&self.network.0.key)
+                    .ok_or(NetError(100))?;
+                for handle in &s.handles {
+                    node.sockets
+                        .get_mut::<udp::Socket>(*handle)
+                        .set_receive_peer((a.port() != 0).then(|| endpoint(a)));
+                }
             }
             s.peer = Some(a);
             s.connection = Connection::Connected;
@@ -717,6 +742,11 @@ impl Socket {
             if state.write_closed {
                 return Err(NetError(32));
             }
+            // A mapped local IPv4 address fixes the source family, even on
+            // an AF_INET6 descriptor with spare wildcard receive handles.
+            if a.is_ipv6() && state.bound.is_some_and(|b| b.is_ipv4()) {
+                return Err(NetError(97));
+            }
             let selected = if let Some(info) = info.filter(|i| !i.address.is_unspecified()) {
                 Some(info.address)
             } else if state.bound.is_some_and(|b| b.ip().is_unspecified()) {
@@ -745,7 +775,17 @@ impl Socket {
                     })
                 })
                 .copied()
-                .ok_or(NetError(99))?;
+                .ok_or_else(|| {
+                    if a.is_ipv4()
+                        && state
+                            .bound
+                            .is_some_and(|b| b.is_ipv6() && !b.ip().is_unspecified())
+                    {
+                        NetError(101)
+                    } else {
+                        NetError(99)
+                    }
+                })?;
             n.dirty = true;
             let sent = n
                 .sockets
@@ -1141,9 +1181,11 @@ impl Socket {
             let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
             for h in &state.handles {
                 if self.kind == 2 {
-                    n.sockets
-                        .get_mut::<udp::Socket>(*h)
-                        .set_hop_limit(Some(state.hop_limit));
+                    let socket = n.sockets.get_mut::<udp::Socket>(*h);
+                    if (level, name) == (1, 2) && value != 0 {
+                        socket.allow_shared_delivery();
+                    }
+                    socket.set_hop_limit(Some(state.hop_limit));
                 } else {
                     n.sockets
                         .get_mut::<icmp::Socket>(*h)
@@ -1171,6 +1213,7 @@ impl Socket {
         let mut out = [0; 104];
         out[0] = state_code;
         if let Some(socket) = socket {
+            out[5] = u8::from(socket.sack_negotiated()) << 1;
             let [rto, rtt, variance, mss, cwnd, window] = socket.transport_info();
             for (offset, value) in [
                 (8, rto),

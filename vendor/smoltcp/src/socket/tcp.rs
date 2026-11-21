@@ -455,6 +455,8 @@ pub struct Socket<'a> {
     remote_win_scale: Option<u8>,
     /// Whether or not the remote supports selective ACK as described in RFC 2018.
     remote_has_sack: bool,
+    // Active handshakes retain the offer across retransmits and sysctl changes.
+    offered_sack: bool,
     /// The maximum number of data octets that the remote side may receive.
     remote_mss: usize,
     /// The timestamp of the last packet received.
@@ -538,6 +540,7 @@ impl<'a> Socket<'a> {
             remote_win_shift: rx_cap_log2.saturating_sub(16) as u8,
             remote_win_scale: None,
             remote_has_sack: false,
+            offered_sack: true,
             remote_mss: DEFAULT_MSS,
             remote_last_ts: None,
             local_rx_last_ack: None,
@@ -811,8 +814,6 @@ impl<'a> Socket<'a> {
         Some(self.tuple?.remote)
     }
 
-    /// Return the connection state, in terms of the TCP state machine.
-    #[inline]
     /// Original transport estimates for Linux TCP_INFO, in microseconds/bytes.
     /// Reading diagnostics does not advance the protocol or allocate buffers.
     pub fn transport_info(&self) -> [u32; 6] {
@@ -825,6 +826,13 @@ impl<'a> Socket<'a> {
             self.rx_buffer.capacity().saturating_sub(self.rx_buffer.len()).min(u32::MAX as usize) as u32,
         ]
     }
+    /// SACK as negotiated with the peer on the current connection.
+    pub fn sack_negotiated(&self) -> bool {
+        self.remote_has_sack
+    }
+
+    /// Return the connection state, in terms of the TCP state machine.
+    #[inline]
     pub fn state(&self) -> State {
         self.state
     }
@@ -849,6 +857,7 @@ impl<'a> Socket<'a> {
         self.remote_last_win = 0;
         self.remote_win_len = 0;
         self.remote_win_scale = None;
+        self.remote_has_sack = false;
         self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
         self.remote_mss = DEFAULT_MSS;
         self.remote_last_ts = None;
@@ -982,6 +991,7 @@ impl<'a> Socket<'a> {
         }
 
         self.reset();
+        self.offered_sack = cx.tcp_sack;
         self.tuple = Some(Tuple {
             local: local_endpoint,
             remote: remote_endpoint,
@@ -1783,7 +1793,7 @@ impl<'a> Socket<'a> {
                 self.local_seq_no = Self::random_seq_no(cx);
                 self.remote_seq_no = repr.seq_number + 1;
                 self.remote_last_seq = self.local_seq_no;
-                self.remote_has_sack = repr.sack_permitted;
+                self.remote_has_sack = cx.tcp_sack && repr.sack_permitted;
                 self.remote_win_scale = repr.window_scale;
                 // Remote doesn't support window scaling, don't do it.
                 if self.remote_win_scale.is_none() {
@@ -1835,7 +1845,7 @@ impl<'a> Socket<'a> {
                 self.remote_seq_no = repr.seq_number + 1;
                 self.remote_last_seq = self.local_seq_no + 1;
                 self.remote_last_ack = Some(repr.seq_number);
-                self.remote_has_sack = repr.sack_permitted;
+                self.remote_has_sack = self.offered_sack && repr.sack_permitted;
                 self.remote_win_scale = repr.window_scale;
                 // Remote doesn't support window scaling, don't do it.
                 if self.remote_win_scale.is_none() {
@@ -2391,7 +2401,7 @@ impl<'a> Socket<'a> {
                 if self.state == State::SynSent {
                     repr.ack_number = None;
                     repr.window_scale = Some(self.remote_win_shift);
-                    repr.sack_permitted = true;
+                    repr.sack_permitted = self.offered_sack;
                 } else {
                     repr.sack_permitted = self.remote_has_sack;
                     repr.window_scale = self.remote_win_scale.map(|_| self.remote_win_shift);

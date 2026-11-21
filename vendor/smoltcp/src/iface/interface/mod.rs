@@ -142,6 +142,8 @@ pub struct InterfaceInner {
     tag: u16,
     ip_addrs: Vec<IpCidr, IFACE_MAX_ADDR_COUNT>,
     any_ip: bool,
+    #[cfg(feature = "socket-tcp")]
+    pub(crate) tcp_sack: bool,
     routes: Routes,
     #[cfg(feature = "multicast")]
     multicast: multicast::State,
@@ -247,6 +249,8 @@ impl Interface {
                 hardware_addr: config.hardware_addr,
                 ip_addrs: Vec::new(),
                 any_ip: false,
+                #[cfg(feature = "socket-tcp")]
+                tcp_sack: true,
                 routes: Routes::new(),
                 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
                 neighbor_cache: NeighborCache::new(),
@@ -380,6 +384,17 @@ impl Interface {
 
     pub fn routes_mut(&mut self) -> &mut Routes {
         &mut self.inner.routes
+    }
+
+    /// Whether new TCP handshakes on this interface negotiate selective acknowledgments.
+    #[cfg(feature = "socket-tcp")]
+    pub fn tcp_sack(&self) -> bool {
+        self.inner.tcp_sack
+    }
+
+    #[cfg(feature = "socket-tcp")]
+    pub fn set_tcp_sack(&mut self, enabled: bool) {
+        self.inner.tcp_sack = enabled;
     }
 
     /// Enable or disable the AnyIP capability.

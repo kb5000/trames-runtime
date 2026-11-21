@@ -80,6 +80,7 @@ struct Inner {
     revision: u64,
 }
 struct Node {
+    udp_bind_order: u64,
     id: u8,
     owner: Weak<NamespaceData>,
     iface: Interface,
@@ -117,6 +118,7 @@ struct NamespaceData {
     mode: NetworkMode,
     live: Arc<Quota>,
     ephemeral_port: Cell<u16>,
+    port_range: Cell<u32>,
     binding: parking_lot::Mutex<()>,
     finished: Cell<bool>,
     isolated: Cell<bool>,
@@ -259,6 +261,7 @@ fn make_node(id: u8, now: smoltcp::time::Instant) -> Result<Node> {
         iface.set_any_ip(true);
     }
     Ok(Node {
+        udp_bind_order: 0,
         id,
         owner: Weak::new(),
         iface,
@@ -460,6 +463,7 @@ impl Fabric {
                 mode,
                 live: Arc::new(Quota::default()),
                 ephemeral_port: Cell::new(0),
+                port_range: Cell::new((65535 << 16) | 49152),
                 binding: parking_lot::Mutex::new(()),
                 finished: Cell::new(false),
                 isolated: Cell::new(false),
@@ -502,6 +506,7 @@ impl Fabric {
                 mode,
                 live: Arc::new(Quota::default()),
                 ephemeral_port: Cell::new(0),
+                port_range: Cell::new((65535 << 16) | 49152),
                 binding: parking_lot::Mutex::new(()),
                 finished: Cell::new(false),
                 isolated: Cell::new(true),
@@ -1260,6 +1265,34 @@ impl Network {
         inner.tick();
         Ok(())
     }
+    pub(super) fn port_range(&self) -> [u16; 2] {
+        let range = self.0.port_range.get();
+        [range as u16, (range >> 16) as u16]
+    }
+    pub(super) fn set_port_range(&self, low: u16, high: u16) {
+        self.0
+            .port_range
+            .set(u32::from(low) | (u32::from(high) << 16));
+    }
+    pub(super) fn tcp_sack(&self) -> Result<bool> {
+        let fabric = self.0.fabric.0.borrow();
+        Ok(fabric
+            .nodes
+            .get(&self.0.key)
+            .ok_or(NetError(100))?
+            .iface
+            .tcp_sack())
+    }
+    pub(super) fn set_tcp_sack(&self, enabled: bool) -> Result<()> {
+        let mut fabric = self.0.fabric.0.borrow_mut();
+        fabric
+            .nodes
+            .get_mut(&self.0.key)
+            .ok_or(NetError(100))?
+            .iface
+            .set_tcp_sack(enabled);
+        Ok(())
+    }
     pub(super) fn mode(&self) -> NetworkMode {
         self.0.mode
     }
@@ -1568,6 +1601,73 @@ mod shared_lifetime_tests {
             socket.bind("10.0.0.2:0".parse().unwrap()).unwrap();
             assert_eq!(socket.local_addr().unwrap().port(), expected);
         }
+    }
+
+    #[test]
+    fn sack_negotiation_survives_later_namespace_changes() {
+        for (active, passive) in [(false, false), (false, true), (true, false), (true, true)] {
+            let fabric = Fabric::new().unwrap();
+            let clients = fabric.environment(2, NetworkMode::Full).unwrap();
+            let servers = fabric.environment(3, NetworkMode::Full).unwrap();
+            let listener = servers.socket(2, 1, 0).unwrap();
+            let address = "10.0.0.3:34012".parse().unwrap();
+            listener.bind(address).unwrap();
+            listener.listen(1).unwrap();
+            clients.set_tcp_sack(active).unwrap();
+            servers.set_tcp_sack(passive).unwrap();
+            let client = clients.socket(2, 1, 0).unwrap();
+            assert_eq!(client.connect(address), Err(NetError(115)));
+            assert!((0..100).any(|_| client.connect_complete().unwrap()));
+            let (accepted, _) = listener.accept().unwrap();
+            clients.set_tcp_sack(!active).unwrap();
+            servers.set_tcp_sack(!passive).unwrap();
+            for end in [&client, &accepted] {
+                assert_eq!(end.tcp_info().unwrap()[5] & 2 != 0, active && passive);
+            }
+        }
+    }
+
+    #[test]
+    fn shared_udp_binding_delivers_once_and_prefers_the_connected_peer() {
+        let fabric = Fabric::new().unwrap();
+        let clients = fabric.environment(2, NetworkMode::Full).unwrap();
+        let servers = fabric.environment(3, NetworkMode::Full).unwrap();
+        let destination = "10.0.0.3:41012".parse().unwrap();
+        let source = "10.0.0.2:41011".parse().unwrap();
+        let sender = clients.socket(2, 2, 0).unwrap();
+        sender.bind(source).unwrap();
+        let first = servers.socket(2, 2, 0).unwrap();
+        let last = servers.socket(2, 2, 0).unwrap();
+        for sock in [&first, &last] {
+            sock.set_option(1, 2, 1).unwrap();
+            sock.bind(destination).unwrap();
+        }
+        assert_eq!(sender.send(b"a", 0, Some(destination)), Ok(1));
+        assert_eq!(last.recv(1, 0).unwrap().data, b"a");
+        assert!(matches!(first.recv(1, 0), Err(NetError(11))));
+        first.connect(source).unwrap();
+        assert_eq!(sender.send(b"b", 0, Some(destination)), Ok(1));
+        assert_eq!(first.recv(1, 0).unwrap().data, b"b");
+        let other = clients.socket(2, 2, 0).unwrap();
+        assert_eq!(other.send(b"c", 0, Some(destination)), Ok(1));
+        assert_eq!(last.recv(1, 0).unwrap().data, b"c");
+        drop(last);
+        assert_eq!(sender.send(b"d", 0, Some(destination)), Ok(1));
+        assert_eq!(first.recv(1, 0).unwrap().data, b"d");
+    }
+
+    #[test]
+    fn ephemeral_range_and_privileged_floor_are_namespace_local() {
+        let fabric = Fabric::new().unwrap();
+        let first = crate::Network::virtual_network(&fabric, 2, NetworkMode::Full).unwrap();
+        let second = crate::Network::virtual_network(&fabric, 3, NetworkMode::Full).unwrap();
+        first.set_local_port_range(65534, 65535).unwrap();
+        assert_eq!(first.local_port_range(), [65534, 65535]);
+        assert_eq!(second.local_port_range(), [49152, 65535]);
+        assert_eq!(first.set_unprivileged_port(65535), Err(NetError(22)));
+        first.set_unprivileged_port(65534).unwrap();
+        assert_eq!(first.set_local_port_range(65533, 65535), Err(NetError(22)));
+        assert_eq!(first.local_port_range(), [65534, 65535]);
     }
 
     #[test]

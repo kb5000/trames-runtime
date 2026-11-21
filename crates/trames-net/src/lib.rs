@@ -165,8 +165,45 @@ impl Network {
     pub fn unprivileged_port(&self) -> u16 {
         self.1.unprivileged_port.get()
     }
-    pub fn set_unprivileged_port(&self, port: u16) {
+    pub fn set_unprivileged_port(&self, port: u16) -> Result<()> {
+        let _config = self.1.port_config.lock();
+        if port > self.local_port_range()[0] {
+            return Err(NetError(22));
+        }
         self.1.unprivileged_port.set(port);
+        Ok(())
+    }
+    pub fn has_guest_transport(&self) -> bool {
+        matches!(self.0, Backend::Virtual(_))
+    }
+    pub fn local_port_range(&self) -> [u16; 2] {
+        match &self.0 {
+            Backend::Virtual(stack) => stack.port_range(),
+            Backend::Native(_) => [49152, 65535],
+        }
+    }
+    pub fn set_local_port_range(&self, low: u16, high: u16) -> Result<()> {
+        let Backend::Virtual(stack) = &self.0 else {
+            return Err(NetError(95));
+        };
+        let _config = self.1.port_config.lock();
+        if low == 0 || low > high || low < self.unprivileged_port() {
+            return Err(NetError(22));
+        }
+        stack.set_port_range(low, high);
+        Ok(())
+    }
+    pub fn tcp_sack(&self) -> Result<bool> {
+        let Backend::Virtual(stack) = &self.0 else {
+            return Err(NetError(95));
+        };
+        stack.tcp_sack()
+    }
+    pub fn set_tcp_sack(&self, enabled: bool) -> Result<()> {
+        let Backend::Virtual(stack) = &self.0 else {
+            return Err(NetError(95));
+        };
+        stack.set_tcp_sack(enabled)
     }
     /// A new Linux network namespace starts with an unconfigured, down lo and
     /// no external devices. Its stack never binds a host listener.

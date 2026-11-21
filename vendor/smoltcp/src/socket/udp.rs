@@ -119,6 +119,10 @@ impl std::error::Error for RecvError {}
 #[derive(Debug)]
 pub struct Socket<'a> {
     endpoint: IpListenEndpoint,
+    peer: Option<IpEndpoint>,
+    bind_order: u64,
+    specific_bind: bool,
+    reusable: bool,
     rx_buffer: PacketBuffer<'a>,
     tx_buffer: PacketBuffer<'a>,
     /// The time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
@@ -134,6 +138,10 @@ impl<'a> Socket<'a> {
     pub fn new(rx_buffer: PacketBuffer<'a>, tx_buffer: PacketBuffer<'a>) -> Socket<'a> {
         Socket {
             endpoint: IpListenEndpoint::default(),
+            peer: None,
+            bind_order: 0,
+            specific_bind: false,
+            reusable: false,
             rx_buffer,
             tx_buffer,
             hop_limit: None,
@@ -142,6 +150,27 @@ impl<'a> Socket<'a> {
             #[cfg(feature = "async")]
             tx_waker: WakerRegistration::new(),
         }
+    }
+
+    /// Preserve the original guest binding across per-address receive handles.
+    pub fn set_bind_priority(&mut self, order: u64, specific: bool) {
+        self.bind_order = order;
+        self.specific_bind = specific;
+    }
+
+    /// Existing shared bindings remain shared when future reuse is disabled.
+    pub fn allow_shared_delivery(&mut self) {
+        self.reusable = true;
+    }
+
+    /// A connected datagram receiver only matches packets from its peer.
+    pub fn set_receive_peer(&mut self, peer: Option<IpEndpoint>) {
+        self.peer = peer;
+    }
+
+    pub(crate) fn shared_priority(&self) -> Option<(bool, bool, u64)> {
+        self.reusable
+            .then_some((self.peer.is_some(), self.specific_bind, self.bind_order))
     }
 
     /// Configure the receive budget without losing queued datagrams.
@@ -491,6 +520,12 @@ impl<'a> Socket<'a> {
 
     pub(crate) fn accepts(&self, cx: &mut Context, ip_repr: &IpRepr, repr: &UdpRepr) -> bool {
         if self.endpoint.port != repr.dst_port {
+            return false;
+        }
+        if self
+            .peer
+            .is_some_and(|peer| peer.addr != ip_repr.src_addr() || peer.port != repr.src_port)
+        {
             return false;
         }
         if self.endpoint.addr.is_some()
