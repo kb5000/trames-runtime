@@ -352,19 +352,15 @@ impl PathQueries {
             }
         };
         let result = self.uring_query(operation);
-        if result.is_some()
-            || self
-                .view
-                .borrow()
-                .query
-                .as_ref()
-                .unwrap()
-                .prepared
-                .borrow()
-                .open
-                .is_some()
-        {
+        if result.is_some() {
             return result;
+        }
+        {
+            let view = self.view.borrow();
+            let prepared = view.query.as_ref().unwrap().prepared.borrow();
+            if prepared.open.is_some() || prepared.fuse.is_some() {
+                return None;
+            }
         }
         self.uring_original(None, operation).0
     }
@@ -624,7 +620,13 @@ impl PathQueries {
         self.statx_fd(fd)
             .map(|result| result.map(|(stat, mount)| (stat, mount.id)))
     }
+    pub fn statx_fd_cached(&self, fd: u32) -> Option<Result<([u8; 128], StatMount)>> {
+        self.statx_fd_mode::<true>(fd)
+    }
     pub fn statx_fd(&self, fd: u32) -> Option<Result<([u8; 128], StatMount)>> {
+        self.statx_fd_mode::<false>(fd)
+    }
+    fn statx_fd_mode<const CACHED: bool>(&self, fd: u32) -> Option<Result<([u8; 128], StatMount)>> {
         let view = self.view.borrow();
         let result = (|| {
             let descriptor = view
@@ -634,6 +636,11 @@ impl PathQueries {
                 .files
                 .observation_descriptor(fd)?;
             let open = descriptor.open.borrow();
+            if CACHED {
+                if let Some(events::SharedControl::FuseFile(file)) = &open.control {
+                    return file.cached_stat(&view);
+                }
+            }
             view.stat_open(&open).map(|stat| {
                 (
                     view.credentials.user_namespace.stat(stat),

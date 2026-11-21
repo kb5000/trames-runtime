@@ -130,7 +130,11 @@ pub(super) fn call(
             let empty = path.is_empty() && flags & 0x1000 != 0;
             let fd = a[0] as i32;
             let metadata = if empty && fd != AT_FDCWD {
-                q.statx_fd(a[0] as u32)?
+                if flags & 0x4000 != 0 {
+                    q.statx_fd_cached(a[0] as u32)?
+                } else {
+                    q.statx_fd(a[0] as u32)?
+                }
             } else {
                 let path = if empty { b".".as_slice() } else { &path };
                 q.statx_at(fd, path, flags & 0x100 != 0)?

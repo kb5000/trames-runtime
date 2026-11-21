@@ -2061,7 +2061,7 @@ impl Vfs {
             b"/proc/cmdline" => return Ok(regular(b"selinux=0\n".to_vec())),
             b"/proc/bootconfig" => return Ok(regular(Vec::new())),
             b"/proc/cgroups" => return Ok(regular(self.cgroup_subsystems())),
-            b"/proc/filesystems" => return Ok(regular(b"nodev\tproc\nnodev\tsysfs\nnodev\tdevpts\nnodev\trootfs\nnodev\ttmpfs\nnodev\tcgroup2\nnodev\tmqueue\nnodev\toverlay\n".to_vec())),
+            b"/proc/filesystems" => return Ok(regular(b"nodev\tproc\nnodev\tsysfs\nnodev\tdevpts\nnodev\trootfs\nnodev\ttmpfs\nnodev\tcgroup2\nnodev\tmqueue\nnodev\toverlay\nnodev\tfuse\n".to_vec())),
             b"/proc/stat" => {
                 let user = r.cpu_user_ticks;
                 let idle = r.idle.as_millis() / 10;

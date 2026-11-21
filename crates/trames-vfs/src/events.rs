@@ -47,6 +47,7 @@ pub(super) enum SharedControl {
     MountTree(Arc<mounts::fd::DetachedTree>),
     MessageQueue(Arc<posix_mq::Queue>),
     Fuse(Arc<fuse::Device>),
+    FuseFile(Arc<fuse::File>),
     Tun(Arc<trames_net::tun::Connection>, UserNamespace),
     Sync(Arc<sync_file::File>),
     Binder(Arc<binder::Connection>),
@@ -85,7 +86,8 @@ impl SharedControl {
                 }
                 Anonymous::Sync(file.clone())
             }
-            Self::Fuse(_)
+            Self::FuseFile(_)
+            | Self::Fuse(_)
             | Self::MessageQueue(_)
             | Self::Tun(..)
             | Self::Cgroup(_)

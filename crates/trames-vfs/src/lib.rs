@@ -1882,6 +1882,27 @@ impl Vfs {
         policy: u64,
         stop_magic: bool,
     ) -> Result<ResolvedEntry> {
+        self.resolve_entry_operation(
+            dirfd,
+            path,
+            follow_final,
+            retain_magic,
+            policy,
+            stop_magic,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_entry_operation(
+        &self,
+        dirfd: i32,
+        path: &[u8],
+        follow_final: bool,
+        retain_magic: bool,
+        policy: u64,
+        stop_magic: bool,
+        operation: Option<fuse::PathOperation>,
+    ) -> Result<ResolvedEntry> {
         self.begin_proc_query();
         if path.is_empty() {
             return Err(Errno(2));
@@ -1926,7 +1947,8 @@ impl Vfs {
             if !matches!(n.content, Content::Directory) {
                 return Err(Errno(20));
             }
-            if !self.allowed(&n, 1) {
+            if !self.allowed(&n, 1) && !current.mount.as_ref().is_some_and(|m| m.fs.fuse.is_some())
+            {
                 return Err(Errno(13));
             }
             let parent_owner = n.uid;
@@ -1971,6 +1993,65 @@ impl Vfs {
             current = self.follow_mounts(current)?;
             self.bind_proc_path(&mut current)?;
             Self::check_resolve_mount(&parent, &current, policy)?;
+            if let Some(operation) = operation {
+                if let Some((m, fs)) = current
+                    .mount
+                    .as_ref()
+                    .and_then(|m| m.fs.fuse.as_ref().map(|fs| (m, fs)))
+                {
+                    // The ordinary walker has selected this mount and checked
+                    // the parent. Only simple descendants stay inside it.
+                    if current.key != b"/" {
+                        if parent.key != b"/"
+                            || !parts.is_empty()
+                                && (self
+                                    .mount_registry
+                                    .borrow()
+                                    .iter()
+                                    .filter_map(std::sync::Weak::upgrade)
+                                    .any(|child| {
+                                        child
+                                            .parent
+                                            .borrow()
+                                            .as_ref()
+                                            .is_some_and(|at| Arc::ptr_eq(&at.parent, m))
+                                    })
+                                    || parts.iter().any(|p| p == b"." || p == b".."))
+                        {
+                            return Err(Errno(95));
+                        }
+                        if parts.iter().any(|p| p.len() > 255) {
+                            return Err(Errno(36));
+                        }
+                        let query = self.query.as_ref().ok_or(Errno(95))?;
+                        let open = if let fuse::PathOperation::Open(flags) = operation {
+                            let mut path = current.key.clone();
+                            for part in &parts {
+                                path.push(b'/');
+                                path.extend_from_slice(part);
+                            }
+                            Some((path, flags))
+                        } else {
+                            None
+                        };
+                        let mut pending = fuse::Metadata::lookup(
+                            self,
+                            m,
+                            fs,
+                            part,
+                            parts,
+                            follow_final,
+                            trailing,
+                            operation,
+                        )?;
+                        if let Some((path, flags)) = open {
+                            pending.prepare_open(self.open_id(), m.shared.clone(), path, flags);
+                        }
+                        query.prepared.borrow_mut().fuse = Some(Box::new(pending));
+                        return query.defer();
+                    }
+                }
+            }
             if !parts.is_empty() || follow_final || trailing {
                 if policy & (2 | 4 | 8 | 16) != 0 && self.is_proc_magic_link(&current) {
                     // Explicit NO_MAGICLINKS/NO_SYMLINKS takes precedence;
@@ -2161,7 +2242,15 @@ impl Vfs {
             let node = open.node.as_ref().ok_or(Errno(2))?;
             return Self::symlink_text(node, open.mount.as_deref(), Errno(2));
         }
-        let dest = self.resolve_final(dirfd, path, false)?;
+        let (dest, _) = self.resolve_entry_operation(
+            dirfd,
+            path,
+            false,
+            false,
+            0,
+            false,
+            Some(fuse::PathOperation::Readlink),
+        )?;
         self.check_proc_inspection(&dest, true)?;
         if let Some(target) = self.proc_directory_readlink(&dest)? {
             return Ok(target);
@@ -2586,14 +2675,26 @@ impl Vfs {
             .as_ref()
             .map_or_else(|| self.shared_files(), |q| q.files.clone());
         let reservation = membership.reserve()?;
-        let (mut p, target) = self.resolve_entry_policy(
+        let resolved = self.resolve_entry_operation(
             dirfd,
             path,
             flags & O_NOFOLLOW == 0 && flags & 0xc0 != 0xc0,
             true,
             policy,
             true,
-        )?;
+            (!PATH_TRUNCATE && policy == 0).then_some(fuse::PathOperation::Open(flags)),
+        );
+        let (mut p, target) = match resolved {
+            Ok(entry) => entry,
+            Err(e) => {
+                if let Some(q) = &self.query {
+                    if let Some(work) = q.prepared.borrow_mut().fuse.as_mut() {
+                        work.reserve_open(reservation);
+                    }
+                }
+                return Err(e);
+            }
+        };
         let magic = match target {
             Some(ResolvedTarget::Inode(file)) => Some(file),
             Some(ResolvedTarget::Descriptor(open)) => {
@@ -4154,8 +4255,15 @@ impl Vfs {
         path: &[u8],
         nofollow: bool,
     ) -> Result<([u8; 128], StatMount)> {
-        let (p, magic) =
-            self.resolve_entry_policy(dirfd, path, !nofollow, !nofollow, 0, !nofollow)?;
+        let (p, magic) = self.resolve_entry_operation(
+            dirfd,
+            path,
+            !nofollow,
+            !nofollow,
+            0,
+            !nofollow,
+            Some(fuse::PathOperation::Stat),
+        )?;
         match magic {
             Some(ResolvedTarget::Descriptor(open)) => {
                 let open = open.borrow();
@@ -4242,6 +4350,11 @@ impl Vfs {
         self.cache_file_type(&self.descriptor(fd)?.open.borrow(), reading)
     }
     fn stat_open(&self, o: &OpenDescription) -> Result<[u8; 128]> {
+        if let Some(events::SharedControl::FuseFile(file)) = &o.control {
+            let q = self.query.as_ref().ok_or(Errno(95))?;
+            q.prepared.borrow_mut().fuse = Some(Box::new(file.stat(self)?));
+            return q.defer();
+        }
         if let Some(namespace) = &o.namespace_resource {
             return Ok(Self::namespace_stat(namespace.id()));
         }

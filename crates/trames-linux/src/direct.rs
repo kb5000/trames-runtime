@@ -719,13 +719,15 @@ impl DirectSyscalls {
         } else {
             match crate::path_queries::call(paths, number, a, memory) {
                 Some(result) => result,
-                None if matches!(number, 48 | 79 | 80 | 291 | 439) => {
+                None if matches!(number, 48 | 78 | 79 | 80 | 291 | 439) => {
                     return self.prepare_filesystem_work(
                         number,
                         a,
                         paths.take_fuse_stat()?,
                         if matches!(number, 48 | 439) {
                             FileOutput::None
+                        } else if number == 78 {
+                            FileOutput::Readlink(a[2], a[3])
                         } else {
                             FileOutput::FuseStat(number, a)
                         },
@@ -785,9 +787,7 @@ impl DirectSyscalls {
                 args[2] as u32,
                 self.lock_context.as_ref()?.owner,
             ),
-            57 => files
-                .close(args[0] as u32, self.lock_context.as_ref()?.owner)
-                .map(|r| r.map(|()| 0)),
+            57 => self.close_membership(args).map(|r| r.map(|_| 0)),
             25 if matches!(args[1], 0 | 1030) => {
                 if args[2] >= files.descriptor_limit() as u64 {
                     return files.lookup(args[0] as u32).map(|r| r.and(Err(Errno(22))));

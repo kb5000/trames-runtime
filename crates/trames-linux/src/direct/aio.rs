@@ -54,6 +54,7 @@ impl Work {
     }
 }
 struct Request {
+    waiting: Option<trames_vfs::FileWork>,
     pipe: Option<(trames_vfs::DirectFd, trames_vfs::FileCommand)>,
     object: u64,
     data: u64,
@@ -276,6 +277,7 @@ impl DirectSyscalls {
         Ok((
             Request {
                 pipe: None,
+                waiting: None,
                 object: address,
                 data: u64_at(0),
                 result: Arc::default(),
@@ -484,8 +486,30 @@ impl DirectSyscalls {
                 let mut remaining = batch.requests.len();
                 while remaining != 0 {
                     remaining -= 1;
-                    let request = batch.requests.pop_front().unwrap();
-                    let outcome = if let Some((pipe, command)) = &request.pipe {
+                    let mut request = batch.requests.pop_front().unwrap();
+                    let outcome = if let Some(work) = request.waiting.take() {
+                        if context.state.lock().unwrap().dead {
+                            Some(trames_vfs::FileOutcome::Complete(trames_vfs::FileReply {
+                                result: Err(Errno(125)),
+                                file_size_signal: false,
+                                scratch: None,
+                            }))
+                        } else if work.ready() {
+                            Some(work.run())
+                        } else {
+                            subscriptions.extend(
+                                work.wait_sources(&signal)
+                                    .map_err(|_| Errno(5))?
+                                    .subscriptions,
+                            );
+                            if work.ready() {
+                                remaining += 1;
+                            }
+                            request.waiting = Some(work);
+                            batch.requests.push_back(request);
+                            continue;
+                        }
+                    } else if let Some((pipe, command)) = &request.pipe {
                         // Subscribe before checking the original pipe. A blocking
                         // endpoint returns the slot while readers/writers progress.
                         subscriptions.extend(pipe.subscribe(&signal));
@@ -523,8 +547,18 @@ impl DirectSyscalls {
                         continue;
                     };
                     let result = match outcome {
-                        trames_vfs::FileOutcome::Waiting(_) => {
-                            unreachable!("AIO has no stream transfer command")
+                        trames_vfs::FileOutcome::Waiting(work) => {
+                            subscriptions.extend(
+                                work.wait_sources(&signal)
+                                    .map_err(|_| Errno(5))?
+                                    .subscriptions,
+                            );
+                            if work.ready() {
+                                remaining += 1;
+                            }
+                            request.waiting = Some(work);
+                            batch.requests.push_back(request);
+                            continue;
                         }
                         trames_vfs::FileOutcome::Complete(reply) => {
                             if reply.file_size_signal {

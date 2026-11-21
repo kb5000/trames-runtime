@@ -36,6 +36,8 @@ struct Entry {
     interrupt: Interrupt,
     caller: Caller,
     reply: Option<Arc<Completion>>,
+    one_way: bool,
+    flushing: Option<Arc<File>>,
 }
 struct Queue {
     phase: Phase,
@@ -48,7 +50,47 @@ struct Queue {
 }
 struct Completion {
     result: Mutex<Option<Result<Vec<u8>>>>,
+    cleanup: Option<(std::sync::Weak<Connection>, Caller, ReplyResource)>,
     changed: Arc<Readiness>,
+}
+enum ReplyResource {
+    Lookup,
+    Open { node: u64, flags: u32 },
+}
+// A successful reply can arrive after its guest waiter has gone.
+impl Drop for Completion {
+    fn drop(&mut self) {
+        let Some((connection, caller, resource)) = &self.cleanup else {
+            return;
+        };
+        let Some(Ok(bytes)) = self.result.get_mut().unwrap().take() else {
+            return;
+        };
+        let Some(c) = connection.upgrade() else {
+            return;
+        };
+        match resource {
+            ReplyResource::Lookup => {
+                if let Some(node) = lookup_id(&bytes) {
+                    c.forget(node, *caller);
+                }
+            }
+            ReplyResource::Open { node, flags } => {
+                if let Some(fh) = bytes.get(..8) {
+                    c.release(
+                        *node,
+                        *caller,
+                        u64::from_le_bytes(fh.try_into().unwrap()),
+                        *flags,
+                    );
+                }
+            }
+        }
+    }
+}
+pub(super) fn lookup_id(bytes: &[u8]) -> Option<u64> {
+    let node = u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?);
+    (node > 1).then_some(node)
 }
 impl Completion {
     fn finish(&self, result: Result<Vec<u8>>) {
@@ -118,7 +160,11 @@ impl Drop for Request {
             q.pending.retain(|&id| id != self.id);
             q.requests.remove(&self.id);
         } else {
-            entry.reply = None;
+            // Keep the completion until the daemon replies so an abandoned
+            // LOOKUP can return the reference granted by that reply.
+            if self.completion.cleanup.is_none() {
+                entry.reply = None;
+            }
             if enabled && entry.interrupt == Interrupt::None {
                 entry.interrupt = Interrupt::Queued;
                 q.interrupts.push_back(self.id);
@@ -155,6 +201,8 @@ impl Connection {
             interrupt: Interrupt::None,
             caller,
             reply: None,
+            one_way: false,
+            flushing: None,
         };
         Arc::new(Self {
             queue: Mutex::new(Queue {
@@ -184,6 +232,15 @@ impl Connection {
         q.next = id.checked_add(2).ok_or(Errno(75))?;
         let completion = Arc::new(Completion {
             result: Mutex::default(),
+            cleanup: match opcode {
+                1 => Some(ReplyResource::Lookup),
+                14 if body.len() >= 4 => Some(ReplyResource::Open {
+                    node,
+                    flags: u32::from_le_bytes(body[..4].try_into().unwrap()),
+                }),
+                _ => None,
+            }
+            .map(|resource| (Arc::downgrade(self), caller, resource)),
             changed: Arc::default(),
         });
         q.requests.insert(
@@ -193,6 +250,8 @@ impl Connection {
                 interrupt: Interrupt::None,
                 caller,
                 reply: Some(completion.clone()),
+                one_way: false,
+                flushing: None,
             },
         );
         q.pending.push_back(id);
@@ -204,6 +263,50 @@ impl Connection {
             connection: self.clone(),
             completion,
         })
+    }
+    pub(super) fn forget(&self, node: u64, caller: Caller) {
+        self.background(2, node, caller, &1u64.to_le_bytes(), None);
+    }
+    pub(super) fn release(&self, node: u64, caller: Caller, fh: u64, flags: u32) {
+        let mut body = [0; 24];
+        body[..8].copy_from_slice(&fh.to_le_bytes());
+        body[8..12].copy_from_slice(&flags.to_le_bytes());
+        self.background(18, node, caller, &body, None);
+    }
+    pub(super) fn background(
+        &self,
+        opcode: u32,
+        node: u64,
+        caller: Caller,
+        body: &[u8],
+        flushing: Option<Arc<File>>,
+    ) {
+        let mut q = self.queue.lock().unwrap();
+        if q.phase == Phase::Aborted {
+            return;
+        }
+        let id = q.next;
+        let Some(next) = id.checked_add(2) else {
+            return;
+        };
+        q.next = next;
+        q.requests.insert(
+            id,
+            Entry {
+                message: Some(
+                    packet(id, opcode, node, caller, body).expect("fixed cleanup packet length"),
+                ),
+                interrupt: Interrupt::None,
+                caller,
+                reply: None,
+                one_way: opcode == 2,
+                flushing,
+            },
+        );
+        q.pending.push_back(id);
+        q.epoch = q.epoch.wrapping_add(1);
+        drop(q);
+        self.changed.notify_atomic();
     }
     pub fn poll(&self, mask: u16) -> (u16, [u64; 2]) {
         let q = self.queue.lock().unwrap();
@@ -251,7 +354,11 @@ impl Connection {
         if interrupted {
             e.interrupt = Interrupt::Queued;
         }
+        let one_way = e.one_way;
         q.pending.pop_front();
+        if one_way {
+            q.requests.remove(&id);
+        }
         if interrupted {
             q.interrupts.push_back(id);
             q.epoch = q.epoch.wrapping_add(1);
@@ -318,6 +425,11 @@ impl Connection {
                 q.interrupts.retain(|&n| n != id);
             }
             drop(q);
+            if let Some(file) = entry.flushing {
+                if err == -38 {
+                    file.disable_flush();
+                }
+            }
             if let Some(c) = entry.reply {
                 c.finish(if err == 0 {
                     Ok(bytes[16..].to_vec())

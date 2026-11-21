@@ -4,7 +4,7 @@ use super::*;
 use std::sync::OnceLock;
 
 mod mount;
-pub(crate) use mount::{option_fd, prepare, Metadata, Mounted};
+pub(crate) use mount::{option_fd, prepare, File, Metadata, Mounted, PathOperation};
 mod transport;
 pub use transport::{Caller, Connection, Request};
 

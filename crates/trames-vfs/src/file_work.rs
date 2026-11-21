@@ -239,6 +239,9 @@ impl SharedFd {
         {
             return Some(FileTarget(self.clone()));
         }
+        if matches!(open.control, Some(events::SharedControl::FuseFile(_))) {
+            return Some(FileTarget(self.clone()));
+        }
         if open.control.is_some()
             || !open.proc_control() && !open.node.as_ref().is_some_and(|node| node.regular_file)
         {
@@ -406,9 +409,26 @@ impl FileWork {
     pub fn fuse_signal_request(&self) -> Option<Arc<fuse::Request>> {
         self.fuse_request().map(|p| p.request.clone())
     }
+    fn position_wait(&self) -> Option<&fuse::File> {
+        if !matches!(
+            self.command,
+            FileCommand::Read { offset: None, .. } | FileCommand::Write { offset: None, .. }
+        ) {
+            return None;
+        }
+        let target = self.target.as_ref()?;
+        if let Some(events::SharedControl::FuseFile(file)) = &target.0.open.control {
+            Some(file)
+        } else {
+            None
+        }
+    }
     pub fn waiting(&self) -> bool {
         if let Some(p) = &self.fuse_stat {
             return !p.ready();
+        }
+        if let Some(file) = self.position_wait() {
+            return file.busy();
         }
         if self.console_wait().is_some() {
             return !self.ready();
@@ -420,6 +440,9 @@ impl FileWork {
     pub fn ready(&self) -> bool {
         if let Some(p) = &self.fuse_stat {
             return p.ready();
+        }
+        if let Some(file) = self.position_wait() {
+            return !file.busy();
         }
         if let Some((console, writing)) = self.console_wait() {
             return console
@@ -440,6 +463,13 @@ impl FileWork {
         if let Some(p) = &self.fuse_stat {
             return Ok(TransferWait {
                 subscriptions: vec![p.subscribe(signal)],
+                native: vec![],
+                deadline: None,
+            });
+        }
+        if let Some(file) = self.position_wait() {
+            return Ok(TransferWait {
+                subscriptions: vec![file.subscribe_position(signal)],
                 native: vec![],
                 deadline: None,
             });
@@ -674,6 +704,12 @@ impl FileWork {
         target: FileTarget,
         mut command: FileCommand,
     ) -> FileOutcome {
+        if matches!(
+            target.0.open.control,
+            Some(events::SharedControl::FuseFile(_))
+        ) {
+            return Self::new(paths, target, command).run();
+        }
         if let Some(result) = target.proc_read(&command) {
             return Self::proc_outcome(result, || Self::new(paths, target, command));
         }
@@ -727,7 +763,7 @@ impl FileWork {
         self
     }
     pub fn run(mut self) -> FileOutcome {
-        if let Some(p) = &self.fuse_stat {
+        if let Some(p) = &mut self.fuse_stat {
             return match p.take() {
                 Some(result) => FileOutcome::Complete(FileReply {
                     result,
@@ -736,6 +772,26 @@ impl FileWork {
                 }),
                 None => FileOutcome::Waiting(self),
             };
+        }
+        if let Some(target) = &self.target {
+            if let Some(events::SharedControl::FuseFile(file)) = &target.0.open.control {
+                let pending = file.operation(
+                    &self.paths.view.borrow(),
+                    &self.command,
+                    &target.0.open.file_position,
+                );
+                return match pending {
+                    Ok(op) => {
+                        self.fuse_stat = op.map(Box::new);
+                        FileOutcome::Waiting(self)
+                    }
+                    Err(error) => FileOutcome::Complete(FileReply {
+                        result: Err(error),
+                        file_size_signal: false,
+                        scratch: None,
+                    }),
+                };
+            }
         }
         if let Some(result) = self
             .target
@@ -832,6 +888,27 @@ impl PathQueries {
     }
     /// The path resolver has already accepted the original inode and reserved
     /// its unpublished FD. No pathname/input lookup is repeated after waiting.
+    pub fn close_file(
+        &self,
+        files: &SharedFiles,
+        fd: u32,
+        owner: u32,
+    ) -> Option<Result<Option<FileWork>>> {
+        Some(files.close_slot(fd, owner)?.and_then(|slot| {
+            let Some(Ok(open)) = slot.shared_open() else {
+                return Ok(None);
+            };
+            let Some(events::SharedControl::FuseFile(file)) = &open.control else {
+                return Ok(None);
+            };
+            let Some(flush) = file.flush(&self.view.borrow())? else {
+                return Ok(None);
+            };
+            let mut work = FileWork::sync_all(self.retain_context());
+            work.fuse_stat = Some(Box::new(flush));
+            Ok(Some(work))
+        }))
+    }
     pub fn take_fuse_stat(&self) -> Option<FileWork> {
         let pending = self
             .view
@@ -847,6 +924,9 @@ impl PathQueries {
         Some(work)
     }
     pub fn take_open_work(&self) -> Option<FileWork> {
+        if let Some(work) = self.take_fuse_stat() {
+            return Some(work);
+        }
         let open = self
             .view
             .borrow()
@@ -877,6 +957,10 @@ impl PathQueries {
         let mut view = Vfs::empty(fs);
         if matches!(open.sysctl_control, Some(sysctl::Control::UtsName(..))) {
             view.uts = original.uts.clone();
+        }
+        if matches!(open.control, Some(events::SharedControl::FuseFile(_))) {
+            view.pid = original.pid;
+            view.pid_ns = original.pid_ns.clone();
         }
         view.lock_owner = original.lock_owner;
         view.credentials = original.credentials.clone();

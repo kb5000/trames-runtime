@@ -574,7 +574,7 @@ impl NamespaceWork {
         self.execute(&mut paths.view.borrow_mut())
     }
     fn execute(&mut self, view: &mut Vfs) -> NamespaceRun {
-        if let Some(f) = &self.fuse {
+        if let Some(f) = &mut self.fuse {
             return f
                 .take()
                 .map_or(NamespaceRun::Waiting, NamespaceRun::Complete);

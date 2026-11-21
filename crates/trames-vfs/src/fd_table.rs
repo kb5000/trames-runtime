@@ -37,6 +37,13 @@ pub(super) struct ProcDescriptor {
     pub mount: Option<Arc<mounts::MountData>>,
 }
 impl Slot {
+    fn flush_implicit(&self, owner: u32) {
+        if let SlotOpen::Shared(open) = &self.open {
+            if let Some(events::SharedControl::FuseFile(file)) = &open.control {
+                file.flush_implicit(owner);
+            }
+        }
+    }
     fn release_record_locks(&self, owner: u32) {
         match &self.open {
             SlotOpen::Shared(open) => open.release_record_locks(owner),
@@ -244,6 +251,7 @@ impl TaskFiles {
         // Neither an owner projection nor the membership mutex is borrowed.
         if let Some(owner) = lock_owner {
             for slot in removed.values() {
+                slot.flush_implicit(owner);
                 slot.release_record_locks(owner);
             }
         }
@@ -397,6 +405,7 @@ impl SharedFiles {
             retired
         };
         if let Some(retired) = retired {
+            retired.flush_implicit(owner);
             retired.release_record_locks(owner);
             drop(retired);
         }
@@ -911,12 +920,9 @@ impl SharedFiles {
             self.changed(&mut entries);
             old
         };
-        if let Some(Slot {
-            open: SlotOpen::Shared(open),
-            ..
-        }) = removed
-        {
-            open.release_record_locks(lock_owner);
+        if let Some(slot) = removed {
+            slot.flush_implicit(lock_owner);
+            slot.release_record_locks(lock_owner);
         }
         Some(Ok(new))
     }
@@ -943,6 +949,7 @@ impl SharedFiles {
             removed
         };
         for slot in &removed {
+            slot.flush_implicit(owner);
             slot.release_record_locks(owner);
         }
         // Complete controls and native callbacks release outside Files' mutex.
@@ -950,6 +957,10 @@ impl SharedFiles {
         Ok(())
     }
     pub fn close(&self, fd: u32, lock_owner: u32) -> Option<Result<()>> {
+        self.close_slot(fd, lock_owner)
+            .map(|r| r.map(|slot| slot.flush_implicit(lock_owner)))
+    }
+    pub(super) fn close_slot(&self, fd: u32, lock_owner: u32) -> Option<Result<Slot>> {
         let removed = {
             let mut entries = self.0.entries.lock().unwrap();
             let Some(slot) = entries.get(&fd) else {
@@ -974,8 +985,7 @@ impl SharedFiles {
             old
         };
         removed.release_record_locks(lock_owner);
-        drop(removed); // Final original close runs outside membership.
-        Some(Ok(()))
+        Some(Ok(removed)) // Final close runs outside membership.
     }
 }
 

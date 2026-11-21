@@ -581,7 +581,15 @@ impl Vfs {
                     };
             }
         }
-        let path = view.resolve_final(dirfd, path, !nofollow)?;
+        let (path, _) = view.resolve_entry_operation(
+            dirfd,
+            path,
+            !nofollow,
+            false,
+            0,
+            false,
+            Some(fuse::PathOperation::Access(mode)),
+        )?;
         let node = view.node(&path)?;
         if let Some((m, fs)) = path
             .mount

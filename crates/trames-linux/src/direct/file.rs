@@ -75,6 +75,7 @@ impl FileResult {
 
 #[derive(Clone)]
 pub enum FileOutput {
+    Readlink(u64, u64),
     FuseStat(u32, [u64; 6]),
     None,
     Write,
@@ -122,6 +123,14 @@ impl FileOutput {
             trames_vfs::FileValue::Count(count) => Ok(count),
             trames_vfs::FileValue::Bytes(bytes) => {
                 match self {
+                    Self::Readlink(address, capacity) => {
+                        let count = bytes.len().min(*capacity as usize);
+                        Linux::check(memory, *address, count, Access::Write)?;
+                        memory
+                            .write(*address, &bytes[..count])
+                            .map_err(|_| Errno(14))?;
+                        return Ok(count as u64);
+                    }
                     Self::Scalar(address) => {
                         memory.write(*address, &bytes).map_err(|_| Errno(14))?
                     }
@@ -146,6 +155,11 @@ impl FileOutput {
                 Ok(bytes.len() as u64)
             }
             trames_vfs::FileValue::FuseStat(stat, mount) => {
+                if let Self::Stat(address) = self {
+                    Linux::check(memory, *address, 128, Access::Write)?;
+                    memory.write(*address, &stat).map_err(|_| Errno(14))?;
+                    return Ok(0);
+                }
                 let Self::FuseStat(number, args) = self else {
                     unreachable!("FUSE metadata output")
                 };
@@ -308,7 +322,7 @@ impl DirectSyscalls {
             || matches!(number, 45..=47 | 56 | 62..=71 | 76..=77 | 80..=84 | 227 | 267 | 285..=287 | 437)
     }
     pub fn file_entry(number: u32, args: [u64; 6]) -> bool {
-        Self::file_call(number) || number == 25 && matches!(args[1], 1033 | 1034)
+        number == 57 || Self::file_call(number) || number == 25 && matches!(args[1], 1033 | 1034)
     }
     fn read_zero_file(
         &self,
@@ -330,6 +344,31 @@ impl DirectSyscalls {
         self.file_completed.set(self.file_completed.get() + 1);
         Some(result)
     }
+    pub(super) fn close_membership(&self, args: [u64; 6]) -> Option<Result<u64, Errno>> {
+        let files = self.membership.as_ref()?;
+        let owner = self.lock_context.as_ref()?.owner;
+        if let Some(paths) = &self.paths {
+            if self.file_prepared(57, args) {
+                return None;
+            }
+            match paths.close_file(files, args[0] as u32, owner)? {
+                Ok(Some(work)) => {
+                    *self.file_prepared.borrow_mut() = Some(PreparedFileCall {
+                        number: 57,
+                        args,
+                        action: PreparedAction::Host {
+                            work,
+                            output: FileOutput::None,
+                        },
+                    });
+                    None
+                }
+                other => Some(other.map(|_| 0)),
+            }
+        } else {
+            files.close(args[0] as u32, owner).map(|r| r.map(|_| 0))
+        }
+    }
     pub fn start_file_call(
         &self,
         number: u32,
@@ -340,6 +379,13 @@ impl DirectSyscalls {
     ) -> Option<IoAttempt> {
         if !Self::file_entry(number, args) {
             return None;
+        }
+        if number == 57 {
+            if let Some(value) = self.close_membership(args) {
+                self.record_fd_control();
+                return Some(IoAttempt::Complete(value));
+            }
+            return self.start_prepared_file(number, args, memory, pid, target);
         }
         if number == 227 {
             return self.start_memory_sync(args, memory, pid, target);
