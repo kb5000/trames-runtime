@@ -1245,7 +1245,20 @@ impl InterfaceInner {
 
         // Emit function for the IP header and payload.
         let emit_ip = |repr: &IpRepr, tx_buffer: &mut [u8]| {
-            repr.emit(&mut *tx_buffer, &self.caps.checksum);
+            match repr {
+                #[cfg(feature = "proto-ipv4")]
+                IpRepr::Ipv4(v4) => v4.emit_with_class(
+                    &mut Ipv4Packet::new_unchecked(&mut *tx_buffer),
+                    &caps.checksum,
+                    meta.traffic_class,
+                ),
+                #[cfg(feature = "proto-ipv6")]
+                IpRepr::Ipv6(v6) => {
+                    let mut header = Ipv6Packet::new_unchecked(&mut *tx_buffer);
+                    v6.emit(&mut header);
+                    header.set_traffic_class(meta.traffic_class);
+                }
+            }
 
             let payload = &mut tx_buffer[repr.header_len()..];
             packet.emit_payload(repr, payload, &caps)

@@ -415,14 +415,14 @@ impl Socket {
         }
     }
     pub fn send(&self, bytes: &[u8], flags: u32, address: Option<SocketAddr>) -> Result<usize> {
-        self.send_control(bytes, flags, address, None)
+        self.send_control(bytes, flags, address, Default::default())
     }
     pub fn send_control(
         &self,
         bytes: &[u8],
         flags: u32,
         address: Option<SocketAddr>,
-        info: Option<crate::PacketInfo>,
+        info: crate::DatagramControl,
     ) -> Result<usize> {
         if self.kind != 1
             && self.path.get() != Path::Guest
@@ -456,8 +456,8 @@ impl Socket {
             self.guest()?.send_control(bytes, flags, address, info)
         } else {
             let native = self.native()?;
-            let result = if let Some(info) = info {
-                native.send_packet(bytes, flags, address, info)
+            let result = if info != Default::default() {
+                native.send_datagram(bytes, flags, address, info)
             } else {
                 native.send(bytes, flags, address)
             };

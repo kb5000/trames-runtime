@@ -59,6 +59,26 @@ pub struct PacketInfo {
     pub address: std::net::IpAddr,
     pub interface: u32,
 }
+/// Optional fields of one IP header.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IpFields {
+    pub hop_limit: Option<u8>,
+    pub traffic_class: Option<u8>,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DatagramControl {
+    pub packet_info: Option<PacketInfo>,
+    /// IPv4 and IPv6 overrides, selected after resolving the wire destination.
+    pub fields: [IpFields; 2],
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReceivedIp {
+    pub fields: IpFields,
+    pub ipv6: bool,
+    /// Also deliver IPv6 packet info for an IPv4 datagram on a dual-stack socket.
+    pub mapped_info: bool,
+}
+
 #[derive(Clone)]
 pub struct Network(Backend, Arc<netlink::Namespace>);
 #[derive(Clone)]
@@ -831,43 +851,61 @@ impl Socket {
         bytes: &[u8],
         flags: u32,
         destination: Option<SocketAddr>,
-        mut info: PacketInfo,
+        info: PacketInfo,
+    ) -> Result<usize> {
+        self.send_datagram(
+            bytes,
+            flags,
+            destination,
+            DatagramControl {
+                packet_info: Some(info),
+                ..Default::default()
+            },
+        )
+    }
+    pub fn send_datagram(
+        &self,
+        bytes: &[u8],
+        flags: u32,
+        destination: Option<SocketAddr>,
+        mut control: DatagramControl,
     ) -> Result<usize> {
         let _operation = self.operation.read_recursive();
-        self.namespace.refresh_native();
-        let graph = self.namespace.graph.read().unwrap();
-        let owned_ip = match info.address {
-            std::net::IpAddr::V6(ip) => ip
-                .to_ipv4_mapped()
-                .map_or(info.address, std::net::IpAddr::V4),
-            ip => ip,
-        };
-        if info.interface != 0 {
-            let device = graph.device(self.namespace.id(), info.interface)?;
-            if info.address.is_unspecified() {
-                info.address = device
-                    .addresses
-                    .iter()
-                    .find(|a| a.ip.is_ipv4() == info.address.is_ipv4())
-                    .ok_or(NetError(99))?
-                    .ip;
-            } else if !device.addresses.iter().any(|a| {
-                a.ip == owned_ip
-                    || device.kind == DeviceKind::Loopback
-                        && owned_ip.is_loopback()
-                        && a.contains(owned_ip)
-            }) {
+        if let Some(info) = &mut control.packet_info {
+            self.namespace.refresh_native();
+            let graph = self.namespace.graph.read().unwrap();
+            let owned_ip = match info.address {
+                std::net::IpAddr::V6(ip) => ip
+                    .to_ipv4_mapped()
+                    .map_or(info.address, std::net::IpAddr::V4),
+                ip => ip,
+            };
+            if info.interface != 0 {
+                let device = graph.device(self.namespace.id(), info.interface)?;
+                if info.address.is_unspecified() {
+                    info.address = device
+                        .addresses
+                        .iter()
+                        .find(|a| a.ip.is_ipv4() == info.address.is_ipv4())
+                        .ok_or(NetError(99))?
+                        .ip;
+                } else if !device.addresses.iter().any(|a| {
+                    a.ip == owned_ip
+                        || device.kind == DeviceKind::Loopback
+                            && owned_ip.is_loopback()
+                            && a.contains(owned_ip)
+                }) {
+                    return Err(NetError(99));
+                }
+            }
+            if !owned_ip.is_unspecified() && !graph.own(self.namespace.id(), owned_ip) {
                 return Err(NetError(99));
             }
         }
-        if !owned_ip.is_unspecified() && !graph.own(self.namespace.id(), owned_ip) {
-            return Err(NetError(99));
-        }
-        drop(graph);
         match &self.backend {
-            SocketBackend::Native(s) => s.send_packet(bytes, flags, destination, info),
-            SocketBackend::Virtual(s) => s.send_control(bytes, flags, destination, Some(info)),
-            SocketBackend::Hybrid(s) => s.send_control(bytes, flags, destination, Some(info)),
+            SocketBackend::Native(s) => s.send_datagram(bytes, flags, destination, control),
+            SocketBackend::Virtual(s) => s.send_control(bytes, flags, destination, control),
+            SocketBackend::Hybrid(s) => s.send_control(bytes, flags, destination, control),
             _ => Err(NetError(95)),
         }
     }

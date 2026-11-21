@@ -387,6 +387,7 @@ pub struct Received {
     /// Sender credentials requested on an original guest-kernel netlink socket.
     pub credentials: Option<[u32; 3]>,
     pub packet_info: Option<crate::PacketInfo>,
+    pub ip: crate::ReceivedIp,
     pub data: Vec<u8>,
     pub address: Option<SocketAddr>,
     pub length: usize,
@@ -843,6 +844,22 @@ impl Socket {
         };
         self.native.control().shutdown(how).map_err(from_io)
     }
+    pub fn send_datagram(
+        &self,
+        bytes: &[u8],
+        flags: u32,
+        address: Option<SocketAddr>,
+        control: crate::DatagramControl,
+    ) -> Result<usize> {
+        if control.fields != [crate::IpFields::default(); 2] {
+            return Err(NetError(95));
+        }
+        if let Some(info) = control.packet_info {
+            self.send_packet(bytes, flags, address, info)
+        } else {
+            self.send(bytes, flags, address)
+        }
+    }
     pub fn send_packet(
         &self,
         bytes: &[u8],
@@ -1056,6 +1073,7 @@ impl Socket {
                     packet_address: None,
                     netlink_address: None,
                     credentials: None,
+                    ip: Default::default(),
                     packet_info: None,
                     data: Vec::new(),
                     address: None,
@@ -1068,6 +1086,7 @@ impl Socket {
                     packet_address: None,
                     netlink_address: None,
                     credentials: None,
+                    ip: Default::default(),
                     packet_info: None,
                     data: Vec::new(),
                     address: None,
@@ -1117,6 +1136,7 @@ impl Socket {
             packet_address: None,
             netlink_address: None,
             credentials: None,
+            ip: Default::default(),
             packet_info,
             data,
             address,

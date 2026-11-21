@@ -690,6 +690,7 @@ impl Socket {
         let packet = queue.front().ok_or(NetError(11))?;
         let bytes = &packet.data;
         let result = Received {
+            ip: Default::default(),
             packet_info: None,
             packet_address: None,
             netlink_address: Some(packet.source),

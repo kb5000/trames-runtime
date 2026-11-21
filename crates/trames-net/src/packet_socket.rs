@@ -320,6 +320,7 @@ impl Socket {
             netlink_address: None,
             packet_address: Some(*address),
             credentials: None,
+            ip: Default::default(),
             packet_info: None,
             data: packet[..n].to_vec(),
             address: None,

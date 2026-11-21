@@ -596,10 +596,19 @@ impl Repr {
         packet: &mut Packet<T>,
         checksum_caps: &ChecksumCapabilities,
     ) {
+        self.emit_with_class(packet, checksum_caps, 0);
+    }
+
+    pub(crate) fn emit_with_class<T: AsRef<[u8]> + AsMut<[u8]>>(
+        &self,
+        packet: &mut Packet<T>,
+        checksum_caps: &ChecksumCapabilities,
+        class: u8,
+    ) {
         packet.set_version(4);
         packet.set_header_len(field::DST_ADDR.end as u8);
-        packet.set_dscp(0);
-        packet.set_ecn(0);
+        packet.set_dscp(class >> 2);
+        packet.set_ecn(class & 3);
         let total_len = packet.header_len() as u16 + self.payload_len as u16;
         packet.set_total_len(total_len);
         packet.set_ident(0);

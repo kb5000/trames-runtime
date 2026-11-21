@@ -632,7 +632,7 @@ impl<'a> Socket<'a> {
                 packet_meta.endpoint.addr,
                 IpProtocol::Udp,
                 repr.header_len() + payload_buf.len(),
-                hop_limit,
+                packet_meta.meta.hop_limit.unwrap_or(hop_limit),
             );
 
             emit(cx, packet_meta.meta, (ip_repr, repr, payload_buf))

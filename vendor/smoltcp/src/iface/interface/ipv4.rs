@@ -91,6 +91,11 @@ impl InterfaceInner {
         frag: &'a mut FragmentsBuffer,
     ) -> Option<Packet<'a>> {
         let ipv4_repr = check!(Ipv4Repr::parse(ipv4_packet, &self.caps.checksum));
+        let meta = PacketMeta {
+            traffic_class: ipv4_packet.dscp() << 2 | ipv4_packet.ecn(),
+            hop_limit: Some(ipv4_repr.hop_limit),
+            ..meta
+        };
         if !self.is_unicast_v4(ipv4_repr.src_addr) && !ipv4_repr.src_addr.is_unspecified() {
             // Discard packets with non-unicast source addresses but allow unspecified
             net_debug!("non-unicast or unspecified source address");
@@ -454,7 +459,7 @@ impl InterfaceInner {
 
             let mut packet =
                 Ipv4Packet::new_unchecked(&mut tx_buffer[..frag.ipv4.repr.buffer_len()]);
-            frag.ipv4.repr.emit(&mut packet, &caps.checksum);
+            frag.ipv4.repr.emit_with_class(&mut packet, &caps.checksum, frag.buffer[1]);
             packet.set_ident(frag.ipv4.ident);
             packet.set_more_frags(more_frags);
             packet.set_dont_frag(false);

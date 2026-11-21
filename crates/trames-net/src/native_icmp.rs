@@ -246,6 +246,7 @@ impl Socket {
             packet_address: None,
             netlink_address: None,
             credentials: None,
+            ip: Default::default(),
             packet_info: None,
             data,
             address: Some(address),

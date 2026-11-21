@@ -192,51 +192,79 @@ fn packet_control(
     memory: &impl CpuMemory,
     address: u64,
     size: u64,
-) -> Result<Option<trames_net::PacketInfo>> {
+) -> Result<Option<trames_net::DatagramControl>> {
+    if size == 0 {
+        return Ok(None);
+    }
+    if size < 16 {
+        return Err(Errno(22));
+    }
     let mut offset = 0;
-    let mut info = None;
+    let mut control = trames_net::DatagramControl::default();
     while size - offset >= 16 {
         let length = u64_at(memory, address + offset)?;
         if length < 16 || length > size - offset {
             return Err(Errno(22));
         }
-        if info.is_some() {
-            return Err(Errno(22));
-        }
         let level = u32_at(memory, address + offset + 8)?;
         let kind = u32_at(memory, address + offset + 12)?;
         let data = address + offset + 16;
-        info = Some(match (level, kind, length) {
-            (0, 8, 28) => {
-                let mut ip = [0; 4];
-                memory.read(data + 4, &mut ip).map_err(|_| Errno(14))?;
-                trames_net::PacketInfo {
-                    address: std::net::Ipv4Addr::from(ip).into(),
-                    interface: u32_at(memory, data)?,
+        match (level, kind, length) {
+            (0, 8, 28) | (41, 50, 36) => {
+                if control.packet_info.is_some() {
+                    return Err(Errno(22));
+                }
+                let info = if level == 0 {
+                    let mut ip = [0; 4];
+                    memory.read(data + 4, &mut ip).map_err(|_| Errno(14))?;
+                    trames_net::PacketInfo {
+                        address: std::net::Ipv4Addr::from(ip).into(),
+                        interface: u32_at(memory, data)?,
+                    }
+                } else {
+                    let mut ip = [0; 16];
+                    memory.read(data, &mut ip).map_err(|_| Errno(14))?;
+                    trames_net::PacketInfo {
+                        address: std::net::Ipv6Addr::from(ip).into(),
+                        interface: u32_at(memory, data + 16)?,
+                    }
+                };
+                control.packet_info = Some(info);
+            }
+            (0, 1, 20) => {
+                control.fields[0].traffic_class =
+                    Some(u8::try_from(u32_at(memory, data)?).map_err(|_| Errno(22))?);
+            }
+            (0, 1, 17) => {
+                let mut byte = [0];
+                memory.read(data, &mut byte).map_err(|_| Errno(14))?;
+                control.fields[0].traffic_class = Some(byte[0]);
+            }
+            (0, 2, 20) => {
+                let value = u32_at(memory, data)?;
+                if !(1..=255).contains(&value) {
+                    return Err(Errno(22));
+                }
+                control.fields[0].hop_limit = Some(value as u8);
+            }
+            (41, 52 | 67, 20) => {
+                let value = u32_at(memory, data)? as i32;
+                if !(-1..=255).contains(&value) {
+                    return Err(Errno(22));
+                }
+                let value = u8::try_from(value).ok();
+                if kind == 52 {
+                    control.fields[1].hop_limit = value;
+                } else {
+                    control.fields[1].traffic_class = value;
                 }
             }
-            (41, 50, 36) => {
-                let mut ip = [0; 16];
-                memory.read(data, &mut ip).map_err(|_| Errno(14))?;
-                trames_net::PacketInfo {
-                    address: std::net::Ipv6Addr::from(ip).into(),
-                    interface: u32_at(memory, data + 16)?,
-                }
-            }
-            (0, 8, _) | (41, 50, _) => return Err(Errno(22)),
+            (0, 1 | 2 | 8, _) | (41, 50 | 52 | 67, _) => return Err(Errno(22)),
             _ => return Err(Errno(95)),
-        });
-        let padded = (length + 7) & !7;
-        if padded > size - offset {
-            offset = size;
-        } else {
-            offset += padded;
         }
+        offset += ((length + 7) & !7).min(size - offset);
     }
-    if size != 0 && info.is_none() {
-        return Err(Errno(22));
-    }
-    Ok(info)
+    Ok(Some(control))
 }
 fn push_control(out: &mut Vec<u8>, level: u32, kind: u32, payload: &[u8]) {
     let size = 16 + payload.len();

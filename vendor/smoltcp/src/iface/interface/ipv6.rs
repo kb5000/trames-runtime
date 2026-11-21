@@ -192,6 +192,11 @@ impl InterfaceInner {
         ipv6_packet: &Ipv6Packet<&'frame [u8]>,
     ) -> Option<Packet<'frame>> {
         let ipv6_repr = check!(Ipv6Repr::parse(ipv6_packet));
+        let meta = PacketMeta {
+            traffic_class: ipv6_packet.traffic_class(),
+            hop_limit: Some(ipv6_repr.hop_limit),
+            ..meta
+        };
 
         if !ipv6_repr.src_addr.x_is_unicast() {
             // Discard packets with non-unicast source addresses.

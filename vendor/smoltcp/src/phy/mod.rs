@@ -139,9 +139,8 @@ pub use self::tuntap_interface::TunTapInterface;
 /// [`Device`] implementations or by the user when sending/receiving packets from a
 /// socket.
 ///
-/// Metadata fields are enabled via Cargo features. If no field is enabled, this
-/// struct becomes zero-sized, which allows the compiler to optimize it out as if
-/// the packet metadata mechanism didn't exist at all.
+/// UDP carries the IP traffic class and hop limit with each datagram.
+/// The optional packet ID is controlled by the `packetmeta-id` feature.
 ///
 /// Currently only UDP sockets allow setting/retrieving packet metadata. The metadata
 /// for packets emitted with other sockets will be all default values.
@@ -162,6 +161,10 @@ pub use self::tuntap_interface::TunTapInterface;
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Default)]
 #[non_exhaustive]
 pub struct PacketMeta {
+    /// The eight traffic class bits (DSCP and ECN) from the wire.
+    pub traffic_class: u8,
+    /// On transmit, None selects the socket default.
+    pub hop_limit: Option<u8>,
     #[cfg(feature = "packetmeta-id")]
     pub id: u32,
 }

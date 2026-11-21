@@ -136,6 +136,13 @@ enum Connection {
     Listening,
     Failed(u32),
 }
+#[derive(Clone, Copy, Default)]
+struct UdpOptions {
+    fields: crate::IpFields,
+    receive_class: bool,
+    receive_hops: bool,
+    receive_info: bool,
+}
 struct State {
     handles: Vec<SocketHandle>,
     connection: Connection,
@@ -157,7 +164,7 @@ struct State {
     icmp_pending: Option<(Vec<u8>, IpAddr)>,
     hop_limit: u8,
     receive_hops: bool,
-    receive_packet_info: bool,
+    udp_options: [UdpOptions; 2],
     last_hop: Option<u8>,
     broadcast: bool,
     icmp6_filter: [u8; 32],
@@ -1382,7 +1389,7 @@ impl Network {
                 icmp_pending: None,
                 hop_limit: 64,
                 receive_hops: false,
-                receive_packet_info: false,
+                udp_options: Default::default(),
                 last_hop: None,
                 broadcast: false,
                 icmp6_filter: [0; 32],
@@ -1642,6 +1649,53 @@ mod shared_lifetime_tests {
         }
         let ping = net.socket(2, 2, 1).unwrap();
         assert_eq!(ping.readable_bytes(), Err(NetError(25)));
+    }
+
+    #[test]
+    fn udp_header_overrides_stay_with_one_datagram_across_peeks() {
+        let fabric = Fabric::new().unwrap();
+        let net = crate::Network::virtual_network(&fabric, 2, NetworkMode::Full).unwrap();
+        for (family, address) in [(2, "127.0.0.1:34113"), (10, "[::1]:34113")] {
+            let v6 = family == 10;
+            let level = if v6 { 41 } else { 0 };
+            let socket = net.socket(family, 2, 0).unwrap();
+            let address = address.parse().unwrap();
+            socket.bind(address).unwrap();
+            socket.connect(address).unwrap();
+            socket
+                .set_option(level, if v6 { 51 } else { 12 }, 1)
+                .unwrap();
+            socket
+                .set_option(level, if v6 { 66 } else { 13 }, 1)
+                .unwrap();
+            socket
+                .set_option(level, if v6 { 16 } else { 2 }, 32)
+                .unwrap();
+            socket
+                .set_option(level, if v6 { 67 } else { 1 }, 0x23)
+                .unwrap();
+            let defaults = crate::IpFields {
+                hop_limit: Some(32),
+                traffic_class: Some(0x23),
+            };
+            let once = crate::IpFields {
+                hop_limit: Some(if v6 { 0 } else { 1 }),
+                traffic_class: Some(0xc3),
+            };
+            let mut control = crate::DatagramControl::default();
+            control.fields[usize::from(v6)] = once;
+            socket.send(b"a", 0, None).unwrap();
+            socket.send_datagram(b"b", 0, None, control).unwrap();
+            socket.send(b"c", 0, None).unwrap();
+            for (byte, fields) in [(b'a', defaults), (b'b', once), (b'c', defaults)] {
+                for flags in [MSG_PEEK, 0] {
+                    let record = socket.recv(4, flags).unwrap();
+                    assert_eq!(record.data, [byte]);
+                    assert_eq!(record.ip.fields, fields);
+                    assert_eq!(record.ip.ipv6, v6);
+                }
+            }
+        }
     }
 
     #[test]
