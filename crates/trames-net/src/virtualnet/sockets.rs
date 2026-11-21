@@ -580,8 +580,8 @@ impl Socket {
             congestion: state.congestion,
             fin_wait_seconds: state.fin_wait_seconds,
             linger: state.linger,
-            udp_low_water: 1,
-            udp_no_check: false,
+            receive_low_water: state.receive_low_water,
+            no_check: state.no_check,
             timestamp_option: 0,
             last_packet_ns: None,
             keepalive: state.keepalive,
@@ -1034,7 +1034,7 @@ impl Socket {
                             let mut meta = smoltcp::phy::PacketMeta::default();
                             meta.traffic_class =
                                 fields.traffic_class.or(defaults.traffic_class).unwrap_or(0);
-                            meta.omit_udp_checksum = state.udp_no_check && a.is_ipv4();
+                            meta.omit_udp_checksum = state.no_check && a.is_ipv4();
                             meta.hop_limit = fields.hop_limit.or(defaults.hop_limit);
                             meta
                         },
@@ -1098,7 +1098,8 @@ impl Socket {
     pub fn recv(&self, count: usize, flags: u32) -> Result<Received> {
         // One UDP receive always consumes at most one record. MSG_WAITALL
         // cannot extend it. MSG_CTRUNC is an output flag.
-        let ignored = MSG_NOSIGNAL | 8 | if self.kind == 2 { 0x100 } else { 0 };
+        let wait_all = flags & 0x100 != 0;
+        let ignored = MSG_NOSIGNAL | 8 | if matches!(self.kind, 1 | 2) { 0x100 } else { 0 };
         let flags = flags & !ignored;
         if flags & !(MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT) != 0 {
             return Err(NetError(95));
@@ -1165,6 +1166,7 @@ impl Socket {
         }
         if self.kind == 1 && count == 0 && state.connection == Connection::Connected {
             return Ok(Received {
+                stream_minimum: 0,
                 packet_address: None,
                 netlink_address: None,
                 credentials: None,
@@ -1179,6 +1181,7 @@ impl Socket {
         if self.kind == 1 && state.connection != Connection::Connected {
             if matches!(state.connection, Connection::Failed(_)) {
                 return Ok(Received {
+                    stream_minimum: 0,
                     packet_address: None,
                     netlink_address: None,
                     credentials: None,
@@ -1200,6 +1203,7 @@ impl Socket {
                     return Err(NetError(11));
                 }
                 return Ok(Received {
+                    stream_minimum: 0,
                     packet_address: None,
                     netlink_address: None,
                     credentials: None,
@@ -1230,6 +1234,25 @@ impl Socket {
                 bytes.truncate(size);
                 (bytes, size)
             };
+            let stream_minimum = if state.read_closed
+                || !matches!(
+                    s.state(),
+                    tcp::State::Established | tcp::State::FinWait1 | tcp::State::FinWait2
+                ) {
+                0
+            } else {
+                state.receive_low_water as usize
+            };
+            if flags & (MSG_PEEK | MSG_DONTWAIT) == MSG_PEEK && stream_minimum != 0 {
+                let target = if wait_all {
+                    count
+                } else {
+                    count.min(stream_minimum)
+                };
+                if size < target {
+                    s.wait_for_readable_bytes(target);
+                }
+            }
             // Dequeuing preserves the cumulative ACK number. Only a newly
             // advertisable window needs an extra fabric poll.
             let advertise = flags & MSG_PEEK == 0 && size != 0 && s.window_to_update();
@@ -1239,6 +1262,7 @@ impl Socket {
                 i.tick();
             }
             Ok(Received {
+                stream_minimum,
                 packet_address: None,
                 netlink_address: None,
                 credentials: None,
@@ -1334,6 +1358,7 @@ impl Socket {
                         }
                     }
                     return Ok(Received {
+                        stream_minimum: 0,
                         packet_address: None,
                         netlink_address: None,
                         credentials: None,
@@ -1352,6 +1377,7 @@ impl Socket {
             }
             if state.read_closed && flags & MSG_DONTWAIT == 0 {
                 return Ok(Received {
+                    stream_minimum: 0,
                     packet_address: None,
                     netlink_address: None,
                     credentials: None,
@@ -1368,25 +1394,34 @@ impl Socket {
     }
     pub fn poll(&self, events: u16) -> Result<u16> {
         self.fabric().tick();
-        let i = self.network.0.fabric.0.borrow();
+        let mut i = self.network.0.fabric.0.borrow_mut();
         let state = self.state.borrow();
         if matches!(state.connection, Connection::Failed(_)) {
             return Ok(events & (1 | 4 | 0x40 | 0x100 | 0x2000)
                 | 16
                 | if state.error.is_some() { 8 } else { 0 });
         }
-        let n = i.nodes.get(&self.network.0.key).ok_or(NetError(100))?;
+        let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
         let mut ready = if state.error.is_some() { 8 } else { 0 };
         for h in &state.handles {
             if self.kind == 1 {
-                let s = n.sockets.get::<tcp::Socket>(*h);
+                let s = n.sockets.get_mut::<tcp::Socket>(*h);
                 if state.connection == Connection::Listening {
                     if matches!(s.state(), tcp::State::Established | tcp::State::CloseWait) {
                         ready |= 1 | 0x40;
                     }
                 } else if state.connection == Connection::Connected {
-                    if s.can_recv() || !s.may_recv() || state.read_closed {
+                    let threshold = (state.receive_low_water as usize).min(state.receive_buffer);
+                    if s.recv_queue() >= threshold
+                        || !matches!(
+                            s.state(),
+                            tcp::State::Established | tcp::State::FinWait1 | tcp::State::FinWait2
+                        )
+                        || state.read_closed
+                    {
                         ready |= 1 | 0x40;
+                    } else if threshold > 1 && events & (1 | 0x40) != 0 {
+                        s.wait_for_readable_bytes(threshold);
                     }
                     if matches!(
                         s.state(),
@@ -1496,10 +1531,10 @@ impl Socket {
             (1, 29 | 35 | 63 | 64) if self.kind == 2 => {
                 state.timestamp_option = if value == 0 { 0 } else { name };
             }
-            (1, 11) if self.kind == 2 => state.udp_no_check = value != 0,
+            (1, 11) if matches!(self.kind, 1 | 2) => state.no_check = value != 0,
             (1, 16) => return Err(NetError(95)),
-            (1, 18) if self.kind == 2 => {
-                state.udp_low_water = if value < 0 { i32::MAX } else { value.max(1) };
+            (1, 18) if matches!(self.kind, 1 | 2) => {
+                state.receive_low_water = if value < 0 { i32::MAX } else { value.max(1) };
             }
             (1, 9) => state.keepalive = value != 0,
             (1, 6) => state.broadcast = value != 0,
@@ -1516,11 +1551,11 @@ impl Socket {
             }
             (255, 7) if self.family == 10 && self.kind == 4 && value == 2 => {}
             (1, 7 | 8) => {
-                if self.kind != 2 && (value <= 0 || value as usize > MAX_BUFFER) {
+                if !matches!(self.kind, 1 | 2) && (value <= 0 || value as usize > MAX_BUFFER) {
                     return Err(NetError(22));
                 }
-                if self.kind == 2 {
-                    let bytes = crate::udp_buffer_size(name, value);
+                if matches!(self.kind, 1 | 2) {
+                    let bytes = crate::socket_buffer_size(name, value);
                     if name == 8 {
                         state.receive_buffer = bytes;
                     } else {
@@ -1528,6 +1563,12 @@ impl Socket {
                     }
                     let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
                     for h in &state.handles {
+                        if self.kind == 1 {
+                            n.sockets
+                                .get_mut::<tcp::Socket>(*h)
+                                .resize_owned_buffer(name == 8, bytes);
+                            continue;
+                        }
                         let s = n.sockets.get_mut::<udp::Socket>(*h);
                         if name == 8 {
                             s.resize_receive_buffer(packet_slots(bytes), bytes);
@@ -1756,15 +1797,15 @@ impl Socket {
             (1, 29 | 35 | 63 | 64) if self.kind == 2 => {
                 Ok(i32::from(state.timestamp_option == name))
             }
-            (1, 11) if self.kind == 2 => Ok(i32::from(state.udp_no_check)),
+            (1, 11) if matches!(self.kind, 1 | 2) => Ok(i32::from(state.no_check)),
             (1, 16) => Err(NetError(95)),
-            (1, 18) if self.kind == 2 => Ok(state.udp_low_water),
+            (1, 18) if matches!(self.kind, 1 | 2) => Ok(state.receive_low_water),
             (1, 9) => Ok(i32::from(state.keepalive)),
             (1, 6) => Ok(i32::from(state.broadcast)),
             (0, 2) if self.family == 2 => Ok(state.hop_limit as i32),
             (41, 16) if self.family == 10 => Ok(state.hop_limit as i32),
             (0, 12) | (41, 51 | 8) => Ok(i32::from(state.receive_hops)),
-            (1, 7 | 8) => Ok(if self.kind == 2 {
+            (1, 7 | 8) => Ok(if matches!(self.kind, 1 | 2) {
                 if name == 8 {
                     state.receive_buffer
                 } else {
@@ -2003,6 +2044,7 @@ impl Socket {
         }
         if state.read_closed {
             return Ok(Received {
+                stream_minimum: 0,
                 packet_address: None,
                 netlink_address: None,
                 credentials: None,
@@ -2065,6 +2107,7 @@ impl Socket {
         let (data, peer) = state.icmp_pending.as_ref().ok_or(NetError(11))?;
         let length = data.len();
         let received = Received {
+            stream_minimum: 0,
             packet_address: None,
             netlink_address: None,
             credentials: None,
@@ -2144,6 +2187,7 @@ impl Socket {
         }
         if state.read_closed {
             return Ok(Received {
+                stream_minimum: 0,
                 packet_address: None,
                 netlink_address: None,
                 credentials: None,
@@ -2180,6 +2224,7 @@ impl Socket {
         let (data, peer) = state.icmp_pending.as_ref().unwrap();
         let length = data.len();
         let received = Received {
+            stream_minimum: 0,
             packet_address: None,
             netlink_address: None,
             credentials: None,

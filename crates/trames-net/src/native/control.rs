@@ -169,7 +169,7 @@ impl Endpoint {
             }
             (1, 7 | 8) => {
                 let bytes = if kind == 2 {
-                    let size = crate::udp_buffer_size(name, value);
+                    let size = crate::socket_buffer_size(name, value);
                     if cfg!(target_os = "linux") {
                         size / 2
                     } else {

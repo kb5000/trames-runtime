@@ -331,6 +331,7 @@ impl Endpoint {
             return Err(NetError(71));
         }
         let empty = || Received {
+            stream_minimum: 0,
             packet_address: None,
             netlink_address: None,
             credentials: None,
@@ -378,6 +379,7 @@ impl Endpoint {
             self.pump();
         }
         Ok(Received {
+            stream_minimum: 0,
             packet_address: None,
             netlink_address: None,
             credentials: None,

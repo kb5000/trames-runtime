@@ -700,6 +700,7 @@ impl Socket {
         let result = Received {
             ip: Default::default(),
             packet_info: None,
+            stream_minimum: 0,
             packet_address: None,
             netlink_address: Some(packet.source),
             credentials: self.pass_credentials.get().then_some([0, 0, 0]),

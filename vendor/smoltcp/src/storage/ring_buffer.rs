@@ -45,6 +45,23 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
         }
     }
 
+    /// Resize owned storage, preserving wrapped bytes including unallocated
+    /// positions that TCP's out-of-order assembler may have populated.
+    #[cfg(feature = "alloc")]
+    pub fn resize_owned(&mut self, capacity: usize)
+    where
+        T: Default + Clone,
+    {
+        if let ManagedSlice::Owned(storage) = &mut self.storage {
+            let capacity = capacity.max(self.length);
+            if capacity != storage.len() {
+                storage.rotate_left(self.read_at);
+                self.read_at = 0;
+                storage.resize(capacity, T::default());
+            }
+        }
+    }
+
     /// Clear the ring buffer.
     pub fn clear(&mut self) {
         self.read_at = 0;
@@ -410,6 +427,22 @@ impl<'a, T: 'a> From<ManagedSlice<'a, T>> for RingBuffer<'a, T> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn resize_preserves_wrapped_and_out_of_order_bytes() {
+        let mut ring = RingBuffer::new(vec![0; 8]);
+        assert_eq!(ring.enqueue_slice(b"12345ab"), 7);
+        ring.dequeue_allocated(5);
+        assert_eq!(ring.write_unallocated(2, b"ef"), 2);
+        ring.resize_owned(16);
+        assert_eq!(ring.enqueue_slice(b"cd"), 2);
+        ring.enqueue_unallocated(2);
+        ring.resize_owned(2);
+        let mut bytes = [0; 6];
+        assert_eq!(ring.dequeue_slice(&mut bytes), 6);
+        assert_eq!(&bytes, b"abcdef");
+    }
 
     #[test]
     fn test_buffer_length_changes() {

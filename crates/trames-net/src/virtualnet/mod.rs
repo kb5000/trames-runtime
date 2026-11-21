@@ -204,8 +204,8 @@ struct State {
     congestion: tcp::CongestionControl,
     fin_wait_seconds: i32,
     linger: Option<Duration>,
-    udp_low_water: i32,
-    udp_no_check: bool,
+    receive_low_water: i32,
+    no_check: bool,
     timestamp_option: u32,
     last_packet_ns: Option<u64>,
     keepalive: bool,
@@ -272,9 +272,12 @@ fn address(a: IpEndpoint) -> SocketAddr {
     SocketAddr::new(addr(a.addr), a.port)
 }
 fn tcp_socket() -> tcp::Socket<'static> {
+    tcp_socket_with_buffers(BUFFER, BUFFER)
+}
+fn tcp_socket_with_buffers(receive: usize, send: usize) -> tcp::Socket<'static> {
     let mut s = tcp::Socket::new(
-        tcp::SocketBuffer::new(vec![0; BUFFER]),
-        tcp::SocketBuffer::new(vec![0; BUFFER]),
+        tcp::SocketBuffer::new(vec![0; receive]),
+        tcp::SocketBuffer::new(vec![0; send]),
     );
     s.set_ack_delay(Some(smoltcp::time::Duration::from_millis(10)));
     s.set_handshake_timeout(smoltcp::time::Duration::from_secs(60));
@@ -297,7 +300,7 @@ impl State {
     }
 
     fn new_tcp_socket(&self) -> tcp::Socket<'static> {
-        let mut socket = tcp_socket();
+        let mut socket = tcp_socket_with_buffers(self.receive_buffer, self.send_buffer);
         if socket.congestion_control() != self.congestion {
             socket.set_congestion_control(self.congestion);
         }
@@ -1556,8 +1559,8 @@ impl Network {
                 congestion: tcp::CongestionControl::Cubic,
                 fin_wait_seconds: 60,
                 linger: None,
-                udp_low_water: 1,
-                udp_no_check: false,
+                receive_low_water: 1,
+                no_check: false,
                 timestamp_option: 0,
                 last_packet_ns: None,
                 keepalive: false,
@@ -2181,7 +2184,21 @@ mod shared_lifetime_tests {
         assert!(!signal.ready());
         client.send(b"x", 0, None).unwrap();
         assert!(signal.ready());
-        assert_eq!(peer.recv(1, 0).unwrap().data, b"x");
+        client.set_option(6, 1, 1).unwrap();
+        peer.set_option(1, 18, 6).unwrap();
+        assert_eq!(peer.poll(1).unwrap(), 0);
+        assert_eq!(peer.recv(4, MSG_PEEK | 0x100).unwrap().data, b"x");
+        signal.reset();
+        client.send(b"yz", 0, None).unwrap();
+        assert!(!signal.ready());
+        client.send(b"4", 0, None).unwrap();
+        assert!(signal.ready());
+        assert_eq!(peer.poll(1).unwrap(), 0);
+        signal.reset();
+        client.send(b"56", 0, None).unwrap();
+        assert!(signal.ready());
+        assert_eq!(peer.poll(1).unwrap(), 1);
+        assert_eq!(peer.recv(6, 0).unwrap().data, b"xyz456");
         signal.reset();
         client.shutdown(1).unwrap();
         assert!(signal.ready());

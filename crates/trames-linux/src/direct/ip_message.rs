@@ -20,6 +20,7 @@ pub(super) struct Message {
 struct State {
     completed: u64,
     requested: u64,
+    batch_header: Option<u64>,
     active: Option<Prepared>,
     terminal: Option<Result<u64, Errno>>,
     finished: bool,
@@ -80,15 +81,38 @@ impl Message {
             .map_or(result, |receive| receive.finish(result, memory))
     }
     pub fn partial_receive(&self, memory: &mut impl CpuMemory) -> Option<Result<u64, Errno>> {
-        self.receive.as_ref()?;
         let mut state = self.state.lock().unwrap();
-        if state.completed == 0 {
-            return None;
+        if state.finished {
+            return state.terminal;
         }
-        let result = self.finish(Ok(state.completed), memory);
+        let result = self.partial_result(&state, memory)?;
         state.terminal = Some(result);
         state.finished = true;
         Some(result)
+    }
+    fn partial_result(
+        &self,
+        state: &State,
+        memory: &mut impl CpuMemory,
+    ) -> Option<Result<u64, Errno>> {
+        let prefix = state.active.as_ref().and_then(Prepared::partial);
+        if let Some(header) = state.batch_header {
+            let extra = match prefix {
+                Some(n) => match header
+                    .checked_add(56)
+                    .and_then(|at| memory.write(at, &(n as u32).to_le_bytes()).ok())
+                {
+                    Some(()) => 1,
+                    None if state.completed == 0 => return Some(Err(Errno(14))),
+                    None => 0,
+                },
+                None => 0,
+            };
+            let count = state.completed + extra;
+            (count != 0).then(|| self.finish(Ok(count), memory))
+        } else {
+            prefix.map(Ok)
+        }
     }
     pub fn pipe_signal(&self) -> bool {
         self.pipe.load(Ordering::Relaxed)
@@ -163,6 +187,9 @@ impl Message {
                 } else {
                     a[1]
                 };
+                if batch {
+                    state.batch_header = Some(header);
+                }
                 if state.active.is_none() {
                     if !receive {
                         state.requested = crate::network_batch::requested(memory, header)?;
@@ -182,9 +209,9 @@ impl Message {
                 let mut transfer = || {
                     state
                         .active
-                        .as_ref()
+                        .as_mut()
                         .unwrap()
-                        .progress(socket, memory, &mut send)
+                        .progress(socket, memory, true, &mut send)
                 };
                 // Preserve the existing per-message publication boundary, not
                 // a batch-wide socket lock. No Files lookup enters this guard.
@@ -193,20 +220,25 @@ impl Message {
                 } else {
                     transfer()
                 }?;
-                if batch {
-                    // The original ABI copies msg_len after transport effects.
-                    memory
-                        .write(
-                            header.checked_add(56).ok_or(Errno(14))?,
-                            &(sent as u32).to_le_bytes(),
-                        )
-                        .map_err(|_| Errno(14))?;
-                }
                 Ok(sent)
             })();
             match result {
                 Ok(sent) if !batch => state.terminal = Some(Ok(sent)),
                 Ok(sent) => {
+                    // msg_len copyout follows the transport effect. A failed
+                    // copyout must never replay a send or count this item.
+                    let header = state.batch_header.unwrap();
+                    if header
+                        .checked_add(56)
+                        .is_none_or(|at| memory.write(at, &(sent as u32).to_le_bytes()).is_err())
+                    {
+                        state.terminal = Some(if state.completed == 0 {
+                            Err(Errno(14))
+                        } else {
+                            Ok(state.completed)
+                        });
+                        continue;
+                    }
                     state.completed += 1;
                     state.active = None;
                     if !receive && sent < state.requested
@@ -225,6 +257,13 @@ impl Message {
                     return Err(Errno(11));
                 }
                 Err(error) => {
+                    if state.active.as_ref().and_then(Prepared::partial).is_some() {
+                        if let Some(partial) = self.partial_result(&state, memory) {
+                            state.terminal = Some(partial);
+                            state.finished = true;
+                            return partial;
+                        }
+                    }
                     if error.0 == 32 && signals_pipe(number, a) {
                         self.pipe.store(true, Ordering::Relaxed);
                     }
@@ -270,6 +309,69 @@ mod tests {
         let fd = v.socket(2, 2, 0).unwrap();
         let op = v.socket_operation(fd).unwrap();
         (v, fd, op)
+    }
+    #[test]
+    fn guest_tcp_retained_reads_preserve_vector_offsets_peeks_and_partial_batches() {
+        let mut v = Vfs::default();
+        v.configure_local_fabric(NetworkMode::Full).unwrap();
+        let listener = v.socket(2, 1, 0).unwrap();
+        let l = v.socket_fd(listener).unwrap();
+        l.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        l.listen(1).unwrap();
+        let fd = v.socket(2, 1, 0).unwrap();
+        let tx = v.socket_fd(fd).unwrap();
+        v.socket_operation(fd).unwrap().set_option(6, 1, 1).unwrap();
+        assert!(matches!(
+            tx.connect(l.local_addr().unwrap()),
+            Ok(()) | Err(trames_net::NetError(115))
+        ));
+        let (peer, _) = v.accept(listener, 0).unwrap();
+        let rx = v.socket_operation(peer).unwrap();
+        for (number, flags, interrupt) in [
+            (212, 0x100, false),
+            (212, 0x102, false),
+            (212, 0x120, false),
+            (243, 0, true),
+        ] {
+            let mut m = memory();
+            m.write_array(0x1018, 2u64.to_le_bytes()).unwrap();
+            m.write_array(0x1310, 0x1500u64.to_le_bytes()).unwrap();
+            m.write(0x1400, b"---").unwrap();
+            m.write(0x1500, b"---").unwrap();
+            let args = if number == 243 {
+                rx.set_option(1, 18, 6).unwrap();
+                [peer as u64, 0x1000, 1, flags, 0, 0]
+            } else {
+                [peer as u64, 0x1000, flags, 0, 0, 0]
+            };
+            let call = Message::new(number, args, &m, 16, true).unwrap();
+            let progress =
+                |m: &mut Memory| call.progress_with(&rx, number, args, m, |_, _, _| unreachable!());
+            assert_eq!(tx.send(b"abcd", 0, None).unwrap(), 4);
+            assert_eq!(progress(&mut m), Err(Errno(11)));
+            if interrupt {
+                assert_eq!(call.partial_receive(&mut m), Some(Ok(1)));
+                assert_eq!(m.read_array::<4>(0x1038).unwrap(), 4u32.to_le_bytes());
+                assert_eq!(m.read_array::<3>(0x1500).unwrap(), *b"d--");
+                assert_eq!(progress(&mut m), Ok(1));
+            } else {
+                assert_eq!(progress(&mut m), Err(Errno(11)));
+                assert_eq!(tx.send(b"ef", 0, None).unwrap(), 2);
+                assert_eq!(progress(&mut m), Ok(6));
+                let trunc = flags & 0x20 != 0;
+                assert_eq!(
+                    &m.read_array::<3>(0x1400).unwrap(),
+                    if trunc { b"---" } else { b"abc" }
+                );
+                assert_eq!(
+                    &m.read_array::<3>(0x1500).unwrap(),
+                    if trunc { b"---" } else { b"def" }
+                );
+                if flags & 2 != 0 {
+                    assert_eq!(rx.recv(6, 0).unwrap().data, b"abcdef");
+                }
+            }
+        }
     }
     #[test]
     fn raw_ip_nonblocking_timeout_and_netlink_exclusion_use_existing_semantics() {

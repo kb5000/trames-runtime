@@ -248,7 +248,7 @@ impl Socket {
             .traffic_class
             .or(state.udp_options[0].fields.traffic_class)
             .unwrap_or(0);
-        let no_checksum = state.udp_no_check;
+        let no_checksum = state.no_check;
         let loopback = !multicast || dev.index == 1 || state.multicast_value(34) != 0;
         drop(state);
         let view = self.network.0.routing.get().ok_or(NetError(95))?;

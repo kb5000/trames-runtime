@@ -847,7 +847,7 @@ impl Linux {
             socket.address_size(),
             socket.is_stream(),
         )?
-        .progress(socket, memory, |bytes, flags, peer| {
+        .progress(socket, memory, false, |bytes, flags, peer| {
             vfs.socket_send_bytes(socket, bytes, flags, peer)
         })
     }

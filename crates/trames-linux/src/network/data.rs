@@ -7,6 +7,10 @@ enum Buffer {
     Vectored(Vectors),
     RawVectors(Vec<(u64, usize)>, usize),
 }
+const MSG_PEEK: u32 = 2;
+const MSG_DONTWAIT: u32 = 0x40;
+const MSG_WAITALL: u32 = 0x100;
+
 impl Buffer {
     fn size(&self) -> usize {
         match self {
@@ -14,6 +18,37 @@ impl Buffer {
             Self::Vectored(vectors) => vectors.size,
             Self::RawVectors(_, size) => *size,
         }
+    }
+    fn write_at(&self, memory: &mut impl CpuMemory, offset: usize, mut bytes: &[u8]) -> Result<()> {
+        if offset == 0 {
+            return self.write(memory, bytes);
+        }
+        let parts = match self {
+            Self::Scalar(pointer, _) => {
+                return memory
+                    .write(*pointer + offset as u64, bytes)
+                    .map_err(|_| Errno(14))
+            }
+            Self::Vectored(vectors) => &vectors.parts,
+            Self::RawVectors(parts, _) => parts,
+        };
+        let mut skip = offset;
+        for &(pointer, length) in parts {
+            if bytes.is_empty() {
+                break;
+            }
+            if skip >= length {
+                skip -= length;
+                continue;
+            }
+            let n = (length - skip).min(bytes.len());
+            memory
+                .write(pointer + skip as u64, &bytes[..n])
+                .map_err(|_| Errno(14))?;
+            bytes = &bytes[n..];
+            skip = 0;
+        }
+        Ok(())
     }
     fn write(&self, memory: &mut impl CpuMemory, bytes: &[u8]) -> Result<()> {
         match self {
@@ -69,6 +104,7 @@ enum Transfer {
     },
 }
 pub(crate) struct Prepared {
+    transferred: usize,
     flags: u32,
     address_size: usize,
     transfer: Transfer,
@@ -154,6 +190,7 @@ impl Prepared {
             return Err(Errno(9));
         }
         Ok(Self {
+            transferred: 0,
             flags: 0,
             address_size: 0,
             transfer,
@@ -249,33 +286,54 @@ impl Prepared {
             _ => return Err(Errno(38)),
         };
         Ok(Self {
+            transferred: 0,
             address_size,
             flags: a[if matches!(number, 206 | 207) { 3 } else { 2 }] as u32,
             transfer,
         })
     }
+    pub fn partial(&self) -> Option<u64> {
+        (self.transferred != 0).then_some(self.transferred as u64)
+    }
     pub fn progress(
-        &self,
+        &mut self,
         socket: &trames_vfs::SocketOperation,
         memory: &mut impl CpuMemory,
-        send: impl FnOnce(&[u8], u32, Option<&[u8]>) -> Result<usize>,
+        retained: bool,
+        mut send: impl FnMut(&[u8], u32, Option<&[u8]>) -> Result<usize>,
     ) -> Result<u64> {
         match &self.transfer {
-            Transfer::Send { bytes, peer, info } => {
-                let sent = if let Some(info) = info {
+            Transfer::Send { bytes, peer, info } => loop {
+                let remaining = &bytes[self.transferred..];
+                let result = if let Some(info) = info {
                     let peer = peer
                         .as_deref()
                         .map(trames_net::decode_address)
                         .transpose()
                         .map_err(net)?;
                     socket
-                        .send_datagram(bytes, self.flags, peer, *info)
-                        .map_err(net)?
+                        .send_datagram(remaining, self.flags, peer, *info)
+                        .map_err(net)
                 } else {
-                    send(bytes, self.flags, peer.as_deref())?
+                    send(remaining, self.flags, peer.as_deref())
                 };
-                Ok(sent as u64)
-            }
+                let sent = match result {
+                    Ok(sent) => sent,
+                    Err(Errno(11)) => return Err(Errno(11)),
+                    Err(_) if self.transferred != 0 => return Ok(self.transferred as u64),
+                    Err(error) => return Err(error),
+                };
+                self.transferred += sent;
+                if self.transferred >= bytes.len()
+                    || sent == 0
+                    || !retained
+                    || self.flags & MSG_DONTWAIT != 0
+                    || socket.flags() & trames_vfs::O_NONBLOCK != 0
+                    || !socket.is_guest_tcp()
+                {
+                    return Ok(self.transferred as u64);
+                }
+            },
             Transfer::Receive {
                 buffer,
                 address,
@@ -287,8 +345,19 @@ impl Prepared {
                     } else {
                         0
                     };
-                let received = socket.recv(buffer.size(), flags).map_err(net)?;
-                buffer.write(memory, &received.data)?;
+                let offset = if flags & MSG_PEEK != 0 {
+                    0
+                } else {
+                    self.transferred
+                };
+                let received = match socket.recv(buffer.size() - offset, flags) {
+                    Ok(packet) => packet,
+                    Err(e) if e.0 != 11 && self.transferred != 0 => {
+                        return Ok(self.transferred as u64)
+                    }
+                    Err(e) => return Err(net(e)),
+                };
+                buffer.write_at(memory, offset, &received.data)?;
                 if let Some(output) = address {
                     output.write_bytes(memory, &socket.received_address(&received))?;
                 }
@@ -369,11 +438,27 @@ impl Prepared {
                         .write(output.header + 48, &flags.to_le_bytes())
                         .map_err(|_| Errno(14))?;
                 }
-                Ok(if self.flags & MSG_TRUNC != 0 {
+                let copied = if flags & MSG_TRUNC != 0 {
                     received.length
                 } else {
                     received.data.len()
-                } as u64)
+                };
+                self.transferred = offset + copied;
+                let target = if flags & MSG_WAITALL != 0 {
+                    buffer.size()
+                } else {
+                    buffer.size().min(received.stream_minimum)
+                };
+                if retained
+                    && flags & MSG_DONTWAIT == 0
+                    && received.stream_minimum != 0
+                    && copied != 0
+                    && self.transferred < target
+                {
+                    Err(Errno(11))
+                } else {
+                    Ok(self.transferred as u64)
+                }
             }
         }
     }

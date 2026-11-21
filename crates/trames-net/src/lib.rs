@@ -85,7 +85,7 @@ pub struct ReceivedIp {
 }
 
 // Linux treats the requested int as unsigned, clamps it, then doubles it.
-fn udp_buffer_size(option: u32, value: i32) -> usize {
+fn socket_buffer_size(option: u32, value: i32) -> usize {
     let requested = (value as u32 as usize).min(MAX_BUFFER / 2);
     (2 * requested).max(if option == 8 { 2304 } else { 4608 })
 }
@@ -643,6 +643,14 @@ impl Socket {
             _reservation: reservation,
             changed: Arc::default(),
         })
+    }
+    pub fn is_guest_tcp(&self) -> bool {
+        self.is_stream()
+            && match &self.backend {
+                SocketBackend::Virtual(_) => true,
+                SocketBackend::Hybrid(socket) => socket.uses_guest_transport(),
+                _ => false,
+            }
     }
     pub fn is_stream(&self) -> bool {
         self.kind == 1

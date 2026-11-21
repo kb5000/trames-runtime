@@ -59,7 +59,8 @@ can travel independently. MSG_TRUNC advances the receive ring and sequence
 space through the ordinary receive path without copying payload bytes.
 
 A connected stream with an I/O subscriber records its original socket handle
-when an incoming segment makes the receive queue readable, frees a full
+when an incoming segment makes the queue readable, crosses an armed byte
+threshold for poll or a blocking peek, frees a full
 transmit queue, or changes the connection state. The interface drains those
 handles after polling. Trames notifies the socket waiters after releasing the
 fabric lock. Protocol timers still drive delayed ACKs and loss recovery.
@@ -70,3 +71,12 @@ slot can request another one from its owner after the interface poll.
 An unmatched SYN for a full queue is dropped so the client may retry.
 Acceptance releases the queue association. An incoming RST before accept
 returns the transport to the same listener.
+
+The TCP socket accepts live changes to its owned receive and transmit rings.
+Ring growth preserves wrapped and out-of-order bytes. Shrinking an established
+receive queue limits future advertisements while honoring credit already sent
+to the peer. The larger allocation stays with the connection through close.
+Shrinking a transmit queue below its occupancy keeps the outstanding bytes
+and blocks new writes until the queue falls below the new limit. Applications
+that only set buffers before connect or listen allocate the requested sizes
+when the protocol sockets are created.

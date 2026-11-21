@@ -104,6 +104,9 @@ impl Socket {
             .update(|revision| revision.wrapping_add(1));
         Ok(s)
     }
+    pub fn uses_guest_transport(&self) -> bool {
+        self.path.get() == Path::Guest
+    }
     pub fn subscribe_tcp_ready(
         &self,
         signal: &Arc<trames_shared::IoSignal>,

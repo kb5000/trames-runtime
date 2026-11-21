@@ -383,6 +383,9 @@ pub struct Socket {
     >,
 }
 pub struct Received {
+    /// Remaining input can arrive on a guest byte stream. Zero denotes a
+    /// completed record, shutdown, or a transport with its own read policy.
+    pub stream_minimum: usize,
     /// Non-IP source identity, retained with the individual netlink datagram.
     pub(crate) netlink_address: Option<[u8; 12]>,
     pub(crate) packet_address: Option<[u8; 20]>,
@@ -1073,6 +1076,7 @@ impl Socket {
                     return Err(NetError(107));
                 }
                 return Ok(Received {
+                    stream_minimum: 0,
                     packet_address: None,
                     netlink_address: None,
                     credentials: None,
@@ -1086,6 +1090,7 @@ impl Socket {
             }
             if count == 0 {
                 return Ok(Received {
+                    stream_minimum: 0,
                     packet_address: None,
                     netlink_address: None,
                     credentials: None,
@@ -1148,6 +1153,7 @@ impl Socket {
         };
         data.truncate(length.min(count));
         Ok(Received {
+            stream_minimum: 0,
             packet_address: None,
             netlink_address: None,
             credentials: None,

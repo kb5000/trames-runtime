@@ -410,6 +410,8 @@ pub struct Socket<'a> {
     rtte: RttEstimator,
     assembler: Assembler,
     rx_buffer: SocketBuffer<'a>,
+    rx_limit: usize,
+    tx_limit: usize,
     rx_fin_received: bool,
     tx_buffer: SocketBuffer<'a>,
     /// Interval after which, if no inbound packets are received, the connection is aborted.
@@ -480,6 +482,8 @@ pub struct Socket<'a> {
     quick_ack: bool,
     #[cfg(feature = "alloc")]
     observer: Option<crate::iface::SocketHandle>,
+    #[cfg(feature = "alloc")]
+    read_wake_at: usize,
 
     /// The congestion control algorithm.
     congestion_controller: congestion::AnyController,
@@ -523,6 +527,8 @@ impl<'a> Socket<'a> {
             timer: Timer::new(),
             rtte: RttEstimator::default(),
             assembler: Assembler::new(),
+            rx_limit: usize::MAX,
+            tx_limit: usize::MAX,
             tx_buffer,
             rx_buffer,
             rx_fin_received: false,
@@ -558,6 +564,8 @@ impl<'a> Socket<'a> {
             quick_ack: false,
             #[cfg(feature = "alloc")]
             observer: None,
+            #[cfg(feature = "alloc")]
+            read_wake_at: usize::MAX,
             tsval_generator: None,
             last_remote_tsval: 0,
             congestion_controller: congestion::AnyController::new(),
@@ -702,7 +710,14 @@ impl<'a> Socket<'a> {
     /// Used in internal calculations as well as packet generation.
     #[inline]
     fn scaled_window(&self) -> u16 {
-        u16::try_from(self.rx_buffer.window() >> self.remote_win_shift).unwrap_or(u16::MAX)
+        let desired = self.rx_limit.min(self.rx_buffer.capacity())
+            .saturating_sub(self.rx_buffer.len());
+        let scaled = u16::try_from(desired >> self.remote_win_shift).unwrap_or(u16::MAX);
+        if self.rx_limit < self.rx_buffer.capacity() {
+            scaled.max(self.last_scaled_window().unwrap_or(0))
+        } else {
+            scaled
+        }
     }
 
     /// Return the last window field value, including scaling according to RFC 1323.
@@ -719,7 +734,8 @@ impl<'a> Socket<'a> {
         let next_ack = self.remote_seq_no + self.rx_buffer.len();
 
         let last_win = (self.remote_last_win as usize) << self.remote_win_shift;
-        let last_win_adjusted = last_ack + last_win - next_ack;
+        let end = last_ack + last_win;
+        let last_win_adjusted = if end > next_ack { end - next_ack } else { 0 };
 
         Some(u16::try_from(last_win_adjusted >> self.remote_win_shift).unwrap_or(u16::MAX))
     }
@@ -904,6 +920,13 @@ impl<'a> Socket<'a> {
     #[cfg(feature = "alloc")]
     pub fn observe_io(&mut self, handle: Option<crate::iface::SocketHandle>) {
         self.observer = handle;
+    }
+
+    /// Arm the nearest outstanding low-water or non-consuming read. Waiters
+    /// share one notification source and recheck their own target on wake.
+    #[cfg(feature = "alloc")]
+    pub fn wait_for_readable_bytes(&mut self, bytes: usize) {
+        self.read_wake_at = self.read_wake_at.min(bytes);
     }
 
     pub fn quick_ack(&self) -> bool {
@@ -1271,7 +1294,27 @@ impl<'a> Socket<'a> {
             return false;
         }
 
-        !self.tx_buffer.is_full()
+        self.tx_buffer.len() < self.tx_limit && !self.tx_buffer.is_full()
+    }
+
+    /// Update a Linux-owned queue without invalidating bytes already sent,
+    /// reassembly offsets, or receive credit previously advertised to the peer.
+    #[cfg(feature = "alloc")]
+    pub fn resize_owned_buffer(&mut self, receive: bool, bytes: usize) {
+        if receive {
+            self.rx_limit = bytes;
+            let before_handshake = matches!(self.state, State::Closed | State::Listen);
+            if bytes > self.rx_buffer.capacity() || before_handshake {
+                self.rx_buffer.resize_owned(bytes);
+            }
+            if before_handshake {
+                self.remote_win_shift =
+                    (usize::BITS - bytes.leading_zeros()).saturating_sub(16) as u8;
+            }
+        } else {
+            self.tx_limit = bytes;
+            self.tx_buffer.resize_owned(bytes);
+        }
     }
 
     /// Return the maximum number of bytes inside the recv buffer.
@@ -1334,7 +1377,13 @@ impl<'a> Socket<'a> {
     where
         F: FnOnce(&'b mut [u8]) -> (usize, R),
     {
-        self.send_impl(|tx_buffer| tx_buffer.enqueue_many_with(f))
+        let room = self.tx_limit.saturating_sub(self.tx_buffer.len());
+        self.send_impl(|buffer| {
+            buffer.enqueue_many_with(|slice| {
+                let take = room.min(slice.len());
+                f(&mut slice[..take])
+            })
+        })
     }
 
     /// Enqueue a sequence of octets to be sent, and fill it from a slice.
@@ -1344,8 +1393,10 @@ impl<'a> Socket<'a> {
     ///
     /// See also [send](#method.send).
     pub fn send_slice(&mut self, data: &[u8]) -> Result<usize, SendError> {
+        let take = data.len()
+            .min(self.tx_limit.saturating_sub(self.tx_buffer.len()));
         self.send_impl(|tx_buffer| {
-            let size = tx_buffer.enqueue_slice(data);
+            let size = tx_buffer.enqueue_slice(&data[..take]);
             (size, size)
         })
     }
@@ -1636,12 +1687,18 @@ impl<'a> Socket<'a> {
     ) -> Option<(IpRepr, TcpRepr<'static>)> {
         #[cfg(feature = "alloc")]
         if let Some(handle) = self.observer {
-            let was_readable = self.can_recv();
-            let was_full = self.tx_buffer.is_full();
+            let before_rx = self.recv_queue();
+            let was_full = self.tx_buffer.len() >= self.tx_limit || self.tx_buffer.is_full();
             let state = self.state;
             let response = self.process_segment(cx, ip_repr, repr);
-            if (!was_readable && self.can_recv())
-                || (was_full && !self.tx_buffer.is_full())
+            let after_rx = self.recv_queue();
+            let reached = before_rx < self.read_wake_at && after_rx >= self.read_wake_at;
+            if reached {
+                self.read_wake_at = usize::MAX;
+            }
+            if (before_rx == 0 && after_rx != 0)
+                || reached
+                || (was_full && self.tx_buffer.len() < self.tx_limit && !self.tx_buffer.is_full())
                 || self.state != state
             {
                 cx.tcp_ready.push(handle);
@@ -6764,6 +6821,44 @@ mod test {
                 ..RECV_TEMPL
             }]
         );
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn shrinking_established_queues_honors_outstanding_credit_and_bytes() {
+        let mut s = socket_established_with_buffer_sizes(8, 8);
+        s.resize_owned_buffer(true, 2);
+        assert_eq!(s.scaled_window(), 8);
+        send!(s, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload: b"abcdefgh",
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.scaled_window(), 0);
+        let mut bytes = [0; 8];
+        assert_eq!(s.recv_slice(&mut bytes), Ok(8));
+        assert_eq!(&bytes, b"abcdefgh");
+        assert_eq!(s.scaled_window(), 2);
+
+        assert_eq!(s.send_slice(b"12345678"), Ok(8));
+        s.resize_owned_buffer(false, 2);
+        assert!(!s.can_send());
+        assert_eq!(s.send_slice(b"9"), Ok(0));
+        recv!(s, [TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 9),
+            window_len: 2,
+            payload: b"12345678",
+            ..RECV_TEMPL
+        }]);
+        send!(s, TcpRepr {
+            seq_number: REMOTE_SEQ + 9,
+            ack_number: Some(LOCAL_SEQ + 9),
+            ..SEND_TEMPL
+        });
+        assert!(s.can_send());
+        assert_eq!(s.send_slice(b"xyz"), Ok(2));
     }
 
     #[test]

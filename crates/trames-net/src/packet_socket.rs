@@ -318,6 +318,7 @@ impl Socket {
         let n = count.min(packet.len());
         let result = Received {
             netlink_address: None,
+            stream_minimum: 0,
             packet_address: Some(*address),
             credentials: None,
             ip: Default::default(),
