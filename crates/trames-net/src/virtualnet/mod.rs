@@ -163,7 +163,11 @@ struct State {
     udp_readable: Option<Arc<trames_shared::Readiness>>,
     udp_group: Option<u64>,
     nodelay: bool,
-    abort_on_close: bool,
+    linger: Option<Duration>,
+    udp_low_water: i32,
+    udp_no_check: bool,
+    timestamp_option: u32,
+    last_packet_ns: Option<u64>,
     keepalive: bool,
     keep_idle: u32,
     keep_interval: u32,
@@ -245,6 +249,7 @@ fn udp_socket() -> udp::Socket<'static> {
 impl State {
     fn bound_udp_handle(&self, local: SocketAddr, specific: bool) -> Result<udp::Socket<'static>> {
         let mut socket = udp_socket_with_buffers(self.receive_buffer, self.send_buffer);
+        socket.capture_receive_time();
         socket.set_bind_priority(self.udp_bind_order, specific);
         if self.udp_readable.is_some() {
             socket.observe_readable(self.udp_bind_order);
@@ -1425,7 +1430,11 @@ impl Network {
                 udp_readable: None,
                 udp_group: None,
                 nodelay: false,
-                abort_on_close: false,
+                linger: None,
+                udp_low_water: 1,
+                udp_no_check: false,
+                timestamp_option: 0,
+                last_packet_ns: None,
                 keepalive: false,
                 keep_idle: 7200,
                 keep_interval: 75,
@@ -1478,7 +1487,7 @@ impl Drop for Socket {
             if state.udp_readable.is_some() {
                 n.udp_readers.remove(&state.udp_bind_order);
             }
-            let abort = state.abort_on_close;
+            let abort = state.linger == Some(Duration::ZERO);
             for h in state.handles.drain(..) {
                 if self.kind == 1 {
                     let s = n.sockets.get_mut::<tcp::Socket>(h);
@@ -1744,6 +1753,31 @@ mod shared_lifetime_tests {
                     assert_eq!(record.ip.ipv6, v6);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn udp_timestamp_stays_with_the_packet_across_peeks_and_option_changes() {
+        let fabric = Fabric::new().unwrap();
+        let net = crate::Network::virtual_network(&fabric, 2, NetworkMode::Full).unwrap();
+        let socket = net.socket(2, 2, 0).unwrap();
+        let address = "127.0.0.1:34114".parse().unwrap();
+        socket.bind(address).unwrap();
+        socket.connect(address).unwrap();
+        assert_eq!(socket.last_packet_ns(), Err(NetError(2)));
+        socket.send(b"first", 0, None).unwrap();
+        assert!(socket.recv(8, 0).unwrap().ip.timestamp.is_none());
+        let first = socket.last_packet_ns().unwrap();
+        assert_ne!(first, 0);
+        socket.send(b"second", 0, None).unwrap();
+        let mut previous = None;
+        for (kind, flags) in [(35, MSG_PEEK), (63, MSG_PEEK), (64, 0)] {
+            socket.set_option(1, kind, 1).unwrap();
+            let (returned_kind, ns) = socket.recv(8, flags).unwrap().ip.timestamp.unwrap();
+            assert_eq!(returned_kind, kind);
+            assert_ne!(ns, 0);
+            assert_eq!(previous.replace(ns).unwrap_or(ns), ns);
+            assert_eq!(socket.last_packet_ns(), Ok(first));
         }
     }
 

@@ -1208,7 +1208,10 @@ impl InterfaceInner {
 
         // Dispatch IP/Ethernet:
 
-        let caps = self.caps.clone();
+        let mut caps = self.caps.clone();
+        if meta.omit_udp_checksum {
+            caps.checksum.udp = crate::phy::Checksum::None;
+        }
 
         #[cfg(feature = "proto-ipv4-fragmentation")]
         let ipv4_id = self.next_ipv4_frag_ident();

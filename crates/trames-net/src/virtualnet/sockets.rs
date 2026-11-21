@@ -477,6 +477,9 @@ impl Socket {
         Ok(())
     }
     pub fn accept(&self) -> Result<(Arc<Socket>, SocketAddr)> {
+        if self.kind != 1 {
+            return Err(NetError(95));
+        }
         self.fabric().tick();
         let reservation = self.network.reserve()?;
         let mut i = self.network.0.fabric.0.borrow_mut();
@@ -522,7 +525,11 @@ impl Socket {
             udp_readable: None,
             udp_group: None,
             nodelay: state.nodelay,
-            abort_on_close: state.abort_on_close,
+            linger: state.linger,
+            udp_low_water: 1,
+            udp_no_check: false,
+            timestamp_option: 0,
+            last_packet_ns: None,
             keepalive: state.keepalive,
             keep_idle: state.keep_idle,
             keep_interval: state.keep_interval,
@@ -551,7 +558,13 @@ impl Socket {
         Ok((socket, self.presented(peer)))
     }
     pub fn connect(&self, a: SocketAddr) -> Result<()> {
-        let mut a = self.normalize(a)?;
+        // Dual-stack UDP accepts a sockaddr_in directly on connect (glibc
+        // probes available address families this way).
+        let mut a = if self.kind == 2 && self.family == 10 && a.is_ipv4() {
+            self.normalize(self.presented(a))?
+        } else {
+            self.normalize(a)?
+        };
         // Linux treats a connect to an unspecified address as local loopback.
         if a.ip().is_unspecified() {
             a.set_ip(if a.is_ipv4() {
@@ -854,6 +867,7 @@ impl Socket {
                     bytes,
                     smoltcp::socket::udp::UdpMetadata {
                         endpoint: endpoint(a),
+                        received_ns: 0,
                         local_address: info
                             .filter(|i| !i.address.is_unspecified())
                             .map(|i| ip(i.address))
@@ -865,6 +879,7 @@ impl Socket {
                             let mut meta = smoltcp::phy::PacketMeta::default();
                             meta.traffic_class =
                                 fields.traffic_class.or(defaults.traffic_class).unwrap_or(0);
+                            meta.omit_udp_checksum = state.udp_no_check && a.is_ipv4();
                             meta.hop_limit = fields.hop_limit.or(defaults.hop_limit);
                             meta
                         },
@@ -924,7 +939,10 @@ impl Socket {
         Ok(count)
     }
     pub fn recv(&self, count: usize, flags: u32) -> Result<Received> {
-        let flags = flags & !MSG_NOSIGNAL;
+        // One UDP receive always consumes at most one record. MSG_WAITALL
+        // cannot extend it. MSG_CTRUNC is an output flag.
+        let ignored = MSG_NOSIGNAL | 8 | if self.kind == 2 { 0x100 } else { 0 };
+        let flags = flags & !ignored;
         if flags & !(MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT) != 0 {
             return Err(NetError(95));
         }
@@ -1072,7 +1090,10 @@ impl Socket {
                     let ipv6 = source.is_ipv6();
                     let options = state.udp_options[usize::from(ipv6)];
                     let mapped = !ipv6 && self.family == 10 && state.udp_options[1].receive_info;
+                    let stamp = meta.received_ns;
                     let mut headers = crate::ReceivedIp {
+                        timestamp: (state.timestamp_option != 0)
+                            .then_some((state.timestamp_option, stamp)),
                         spec_destination: None,
                         fields: crate::IpFields {
                             hop_limit: meta.meta.hop_limit.filter(|_| options.receive_hops),
@@ -1136,6 +1157,9 @@ impl Socket {
                     } else {
                         None
                     };
+                    if state.timestamp_option == 0 {
+                        state.last_packet_ns = Some(stamp);
+                    }
                     if flags & MSG_PEEK == 0 {
                         let _ = s.recv();
                         if source.is_ipv4() {
@@ -1299,6 +1323,14 @@ impl Socket {
                     state.udp_shared |= state.reuse_port;
                     state.udp_group = state.reuse_port.then(|| self.reuse_port_group());
                 }
+            }
+            (1, 29 | 35 | 63 | 64) if self.kind == 2 => {
+                state.timestamp_option = if value == 0 { 0 } else { name };
+            }
+            (1, 11) if self.kind == 2 => state.udp_no_check = value != 0,
+            (1, 16) => return Err(NetError(95)),
+            (1, 18) if self.kind == 2 => {
+                state.udp_low_water = if value < 0 { i32::MAX } else { value.max(1) };
             }
             (1, 9) => state.keepalive = value != 0,
             (1, 6) => state.broadcast = value != 0,
@@ -1507,6 +1539,12 @@ impl Socket {
             (0, 32 | 33 | 34 | 49) if self.kind == 2 => Ok(state.multicast_value(name)),
             (1, 2) => Ok(i32::from(state.reuse)),
             (1, 15) if self.kind == 2 => Ok(i32::from(state.reuse_port)),
+            (1, 29 | 35 | 63 | 64) if self.kind == 2 => {
+                Ok(i32::from(state.timestamp_option == name))
+            }
+            (1, 11) if self.kind == 2 => Ok(i32::from(state.udp_no_check)),
+            (1, 16) => Err(NetError(95)),
+            (1, 18) if self.kind == 2 => Ok(state.udp_low_water),
             (1, 9) => Ok(i32::from(state.keepalive)),
             (1, 6) => Ok(i32::from(state.broadcast)),
             (0, 2) if self.family == 2 => Ok(state.hop_limit as i32),
@@ -1532,10 +1570,14 @@ impl Socket {
 }
 
 impl Socket {
+    pub fn last_packet_ns(&self) -> Result<u64> {
+        if self.kind != 2 {
+            return Err(NetError(25));
+        }
+        self.state.borrow().last_packet_ns.ok_or(NetError(2))
+    }
     pub fn linger(&self) -> Result<[u8; 8]> {
-        Ok(crate::linger_bytes(
-            self.state.borrow().abort_on_close.then_some(Duration::ZERO),
-        ))
+        Ok(crate::linger_bytes(self.state.borrow().linger))
     }
     pub fn set_option_bytes(&self, level: u32, name: u32, value: &[u8]) -> Result<()> {
         if level == 0 && self.kind == 2 && matches!(name, 32 | 35 | 36) {
@@ -1543,10 +1585,10 @@ impl Socket {
         }
         if (level, name) == (1, 13) {
             let linger = crate::parse_linger(value)?;
-            if linger.is_some_and(|d| !d.is_zero()) {
+            if self.kind != 2 && linger.is_some_and(|d| !d.is_zero()) {
                 return Err(NetError(95));
             }
-            self.state.borrow_mut().abort_on_close = linger.is_some();
+            self.state.borrow_mut().linger = linger;
             return Ok(());
         }
         if (level, name) == (58, 1) && self.family == 10 && self.kind == 4 {

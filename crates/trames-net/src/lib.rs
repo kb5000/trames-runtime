@@ -73,6 +73,8 @@ pub struct DatagramControl {
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ReceivedIp {
+    /// Linux SCM type and wall-clock packet arrival time in nanoseconds.
+    pub timestamp: Option<(u32, u64)>,
     pub fields: IpFields,
     pub ipv6: bool,
     /// Also deliver IPv6 packet info for an IPv4 datagram on a dual-stack socket.
@@ -816,6 +818,13 @@ impl Socket {
             SocketBackend::Hybrid(s) => s.tcp_readable_bytes().map(Some),
             SocketBackend::Virtual(s) => s.tcp_readable_bytes().map(Some),
             _ => Ok(None),
+        }
+    }
+    pub fn last_packet_ns(&self) -> Result<u64> {
+        match &self.backend {
+            SocketBackend::Virtual(s) => s.last_packet_ns(),
+            SocketBackend::Hybrid(s) => s.last_packet_ns(),
+            _ => Err(NetError(25)),
         }
     }
     pub fn linger(&self) -> Result<[u8; 8]> {

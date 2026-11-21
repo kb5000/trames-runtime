@@ -24,6 +24,9 @@ pub struct UdpMetadata {
     /// heuristic (for IPv4).
     pub local_address: Option<IpAddress>,
     pub meta: PacketMeta,
+    /// Wall-clock nanoseconds at ingress when capture is active.
+    #[cfg(feature = "std")]
+    pub received_ns: u64,
 }
 
 impl<T: Into<IpEndpoint>> From<T> for UdpMetadata {
@@ -32,6 +35,8 @@ impl<T: Into<IpEndpoint>> From<T> for UdpMetadata {
             endpoint: value.into(),
             local_address: None,
             meta: PacketMeta::default(),
+            #[cfg(feature = "std")]
+            received_ns: 0,
         }
     }
 }
@@ -126,6 +131,8 @@ pub struct Socket<'a> {
     pub(crate) reuse_port_group: Option<u64>,
     #[cfg(feature = "alloc")]
     readable_token: Option<u64>,
+    #[cfg(feature = "std")]
+    capture_rx_time: bool,
     rx_buffer: PacketBuffer<'a>,
     tx_buffer: PacketBuffer<'a>,
     /// The time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
@@ -148,6 +155,8 @@ impl<'a> Socket<'a> {
             reuse_port_group: None,
             #[cfg(feature = "alloc")]
             readable_token: None,
+            #[cfg(feature = "std")]
+            capture_rx_time: false,
             rx_buffer,
             tx_buffer,
             hop_limit: None,
@@ -156,6 +165,12 @@ impl<'a> Socket<'a> {
             #[cfg(feature = "async")]
             tx_waker: WakerRegistration::new(),
         }
+    }
+
+    /// Keep packet arrival time for ancillary data and last-packet ioctls.
+    #[cfg(feature = "std")]
+    pub fn capture_receive_time(&mut self) {
+        self.capture_rx_time = true;
     }
 
     /// Preserve the original guest binding across per-address receive handles.
@@ -588,6 +603,15 @@ impl<'a> Socket<'a> {
         );
 
         let metadata = UdpMetadata {
+            #[cfg(feature = "std")]
+            received_ns: if self.capture_rx_time {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64
+            } else {
+                0
+            },
             endpoint: remote_endpoint,
             local_address: Some(ip_repr.dst_addr()),
             meta,

@@ -548,6 +548,16 @@ impl Socket {
             self.native()?.linger()
         }
     }
+    pub fn last_packet_ns(&self) -> Result<u64> {
+        if self.path.get() == Path::Native {
+            return Err(NetError(25));
+        }
+        self.guest
+            .borrow()
+            .as_ref()
+            .ok_or(NetError(2))?
+            .last_packet_ns()
+    }
     pub fn datagram_readable_bytes(&self) -> Result<usize> {
         match self.path.get() {
             Path::Guest => return Ok(self.guest()?.next_datagram_len(None)?.unwrap_or(0)),

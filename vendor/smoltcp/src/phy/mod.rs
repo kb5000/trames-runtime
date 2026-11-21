@@ -165,6 +165,8 @@ pub struct PacketMeta {
     pub traffic_class: u8,
     /// Guest ingress interface when explicitly supplied for group delivery.
     pub ingress_index: u32,
+    /// Emit an IPv4 UDP datagram with the optional checksum disabled.
+    pub omit_udp_checksum: bool,
     /// On transmit, None selects the socket default.
     pub hop_limit: Option<u8>,
     #[cfg(feature = "packetmeta-id")]

@@ -248,11 +248,16 @@ impl Socket {
             .traffic_class
             .or(state.udp_options[0].fields.traffic_class)
             .unwrap_or(0);
+        let no_checksum = state.udp_no_check;
         let loopback = !multicast || dev.index == 1 || state.multicast_value(34) != 0;
         drop(state);
         let view = self.network.0.routing.get().ok_or(NetError(95))?;
         let mut packet =
             crate::conntrack::message(SocketAddr::new(source.into(), port), dest, 17, 0, bytes);
+        if no_checksum {
+            // conntrack::message constructs a 20-byte IPv4 header.
+            packet[26..28].fill(0);
+        }
         packet[1] = class;
         packet[8] = ttl;
         smoltcp::wire::Ipv4Packet::new_unchecked(&mut packet).fill_checksum();

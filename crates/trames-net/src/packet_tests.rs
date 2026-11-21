@@ -109,6 +109,14 @@ fn tun_real_udp_both_directions_pi_and_final_close() {
         let p = tun.read(2048).unwrap();
         let offset = if flags & 0x1000 == 0 { 4 } else { 0 };
         assert_eq!(&p[offset + 28..], b"through tun");
+        for omit in [true, false] {
+            client.set_option(1, 11, i32::from(omit)).unwrap();
+            client
+                .send(b"checksum", 0, Some(addr("192.0.2.2", 7002)))
+                .unwrap();
+            let packet = tun.read(2048).unwrap();
+            assert_eq!(packet[offset + 26..offset + 28] == [0, 0], omit);
+        }
         let mut reply = udp4("192.0.2.2", "192.0.2.1", 7002, 7001, b"response");
         if offset == 4 {
             let mut pi = vec![0, 0, 8, 0];

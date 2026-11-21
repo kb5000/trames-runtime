@@ -550,16 +550,30 @@ impl Vectors {
         Ok(())
     }
 }
+fn socket_timestamp(ns: u64, nanos: bool) -> [u8; 16] {
+    let mut out = [0; 16];
+    out[..8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
+    let fraction = ns % 1_000_000_000;
+    out[8..].copy_from_slice(&(if nanos { fraction } else { fraction / 1000 }).to_le_bytes());
+    out
+}
 impl Linux {
     pub(crate) fn network_ioctl(
         vfs: &mut trames_vfs::Vfs,
         a: [u64; 6],
         memory: &mut impl CpuMemory,
     ) -> Result<u64> {
-        if vfs.local_socket(a[0] as u32)?.is_none() {
-            vfs.socket_fd(a[0] as u32)?;
-        }
         let request = a[1] as u32;
+        if vfs.local_socket(a[0] as u32)?.is_none() {
+            let socket = vfs.socket_fd(a[0] as u32)?;
+            if matches!(request, 0x8906 | 0x8907 | 0x80108906 | 0x80108907) {
+                let ns = socket.last_packet_ns().map_err(net)?;
+                memory
+                    .write_array(a[2], socket_timestamp(ns, request & 1 != 0))
+                    .map_err(|_| Errno(14))?;
+                return Ok(0);
+            }
+        }
         if request != 0x5421 {
             let devices = vfs.network_devices();
             if request == 0x8912 {
@@ -614,6 +628,7 @@ impl Linux {
                     | 0x891c
                     | 0x8921
                     | 0x8933
+                    | 0x8946
                     | 0x8942
                     | 0x8927
             ) {
@@ -623,7 +638,7 @@ impl Linux {
                 memory,
                 a[2],
                 40,
-                if matches!(request, 0x8914 | 0x8916 | 0x891c) {
+                if matches!(request, 0x8914 | 0x8916 | 0x891c | 0x8946) {
                     Access::Read
                 } else {
                     Access::Write
@@ -671,6 +686,20 @@ impl Linux {
                         return Err(Errno(95));
                     }
                     vfs.set_network_device_up(device.index, flags & 1 != 0)?;
+                    return Ok(0);
+                }
+                0x8946 => {
+                    let pointer = u64::from_le_bytes(entry[16..24].try_into().unwrap());
+                    let command = u32_at(memory, pointer)?;
+                    if command != 0x41 {
+                        return Err(Errno(95));
+                    }
+                    // ETHTOOL_GET_TS_INFO. Guest links expose no PHC or
+                    // SO_TIMESTAMPING hardware/software configuration modes.
+                    let mut info = [0; 44];
+                    info[..4].copy_from_slice(&command.to_le_bytes());
+                    info[8..12].copy_from_slice(&(-1i32).to_le_bytes());
+                    memory.write(pointer, &info).map_err(|_| Errno(14))?;
                     return Ok(0);
                 }
                 0x8942 => entry[16..20].copy_from_slice(&device.master.unwrap_or(0).to_le_bytes()),

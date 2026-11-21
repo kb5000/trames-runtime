@@ -308,6 +308,13 @@ impl Prepared {
                         ancillary.push(level, kind, &(hop as u32).to_le_bytes());
                     }
                     let ip = received.ip;
+                    if let Some((kind, ns)) = ip.timestamp {
+                        ancillary.push(
+                            1,
+                            kind,
+                            &super::socket_timestamp(ns, matches!(kind, 35 | 64)),
+                        );
+                    }
                     if let Some(hops) = ip.fields.hop_limit {
                         let (level, kind) = if ip.ipv6 { (41, 52) } else { (0, 2) };
                         ancillary.push(level, kind, &i32::from(hops).to_le_bytes());
