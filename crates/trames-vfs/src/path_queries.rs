@@ -4,6 +4,11 @@
 //! File, directory and admitted devpts opens publish real OFDs into live Files.
 use super::*;
 
+#[derive(Default)]
+pub(super) struct PreparedPath {
+    pub open: Option<file_work::PreparedOpen>,
+    pub fuse: Option<Box<fuse::Metadata>>,
+}
 #[derive(Clone)]
 pub(super) struct Authority {
     pub(super) files: SharedFiles,
@@ -17,7 +22,7 @@ pub(super) struct Authority {
     pub(super) original: bool,
     deferred: Arc<std::sync::atomic::AtomicBool>,
     pub(super) file_layout_exclusive: bool,
-    pub(super) open_work: Arc<SharedCell<Option<file_work::PreparedOpen>>>,
+    pub(super) prepared: Arc<SharedCell<PreparedPath>>,
     pub(super) namespace_uses: ActiveMounts,
 }
 #[derive(Default)]
@@ -67,7 +72,7 @@ impl Authority {
             original: false,
             deferred: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             file_layout_exclusive: false,
-            open_work: Default::default(),
+            prepared: Default::default(),
             namespace_uses: ActiveMounts::default(),
         }
     }
@@ -82,7 +87,7 @@ impl Authority {
             original: false,
             deferred: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             file_layout_exclusive: false,
-            open_work: Default::default(),
+            prepared: Default::default(),
             namespace_uses: ActiveMounts::default(),
         }
     }
@@ -230,7 +235,7 @@ impl Vfs {
                 .map_or_else(|| self.device_access(), |q| q.devices.clone()),
             deferred: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             file_layout_exclusive: false,
-            open_work: Default::default(),
+            prepared: Default::default(),
             namespace_uses: ActiveMounts::default(),
         });
         PathQueries {
@@ -239,6 +244,14 @@ impl Vfs {
     }
 }
 impl PathQueries {
+    pub fn fuse_clone(
+        &self,
+        fd: u32,
+        address: u64,
+        memory: &impl trames_memory::CpuMemory,
+    ) -> Result<u64> {
+        self.view.borrow().fuse_clone(fd, address, memory)
+    }
     pub fn pending_fifo_open(&self, fd: u32) -> Option<crate::FifoOpen> {
         self.view.borrow().shared_files().pending_fifo_open(fd)
     }
@@ -346,8 +359,9 @@ impl PathQueries {
                 .query
                 .as_ref()
                 .unwrap()
-                .open_work
+                .prepared
                 .borrow()
+                .open
                 .is_some()
         {
             return result;
@@ -612,7 +626,7 @@ impl PathQueries {
     }
     pub fn statx_fd(&self, fd: u32) -> Option<Result<([u8; 128], StatMount)>> {
         let view = self.view.borrow();
-        Some((|| {
+        let result = (|| {
             let descriptor = view
                 .query
                 .as_ref()
@@ -626,7 +640,12 @@ impl PathQueries {
                     StatMount::for_open(&open),
                 )
             })
-        })())
+        })();
+        if matches!(result, Err(Errno(95))) && view.query.as_ref().unwrap().take_deferred() {
+            None
+        } else {
+            Some(result)
+        }
     }
     pub fn stat_at(&self, dirfd: i32, path: &[u8], nofollow: bool) -> Option<Result<[u8; 128]>> {
         self.query(|v| v.stat_at_flags(dirfd, path, nofollow))

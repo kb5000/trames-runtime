@@ -1160,6 +1160,7 @@ impl PseudoFs {
 }
 #[derive(Clone, Copy)]
 pub(super) enum Device {
+    Fuse,
     Tun,
     SwSync,
     Binder(u8),
@@ -1191,6 +1192,7 @@ impl Device {
             0x103 => Content::Null,
             0x500 => Content::Terminal,
             value => Content::Device(match value {
+                0x0ae5 => Self::Fuse,
                 0x0ac8 => Self::Tun,
                 0x105 => Self::Zero,
                 0x107 => Self::Full,
@@ -1207,6 +1209,7 @@ impl Device {
     }
     pub(super) fn rdev(self) -> u64 {
         match self {
+            Self::Fuse => 0x0ae5,
             Self::Tun => 0x0ac8,
             Self::SwSync => 0xf200,
             Self::Binder(device) => 0xf100 + device as u64,
@@ -1227,7 +1230,7 @@ impl Device {
     pub(super) fn read(self, count: usize) -> Result<Vec<u8>> {
         let mut data = vec![0; count.min(storage::MAX_TRANSFER)];
         match self {
-            Self::Tun | Self::Binder(_) | Self::SwSync => return Err(Errno(22)),
+            Self::Fuse | Self::Tun | Self::Binder(_) | Self::SwSync => return Err(Errno(22)),
             Self::Unregistered(_) => return Err(Errno(6)),
             Self::Render => return Err(Errno(22)),
             Self::Zero | Self::Full => {}
@@ -1242,7 +1245,7 @@ impl Device {
     }
     pub(super) fn write(self, data: &[u8]) -> Result<usize> {
         match self {
-            Self::Tun | Self::Binder(_) | Self::SwSync => Err(Errno(22)),
+            Self::Fuse | Self::Tun | Self::Binder(_) | Self::SwSync => Err(Errno(22)),
             Self::Unregistered(_) => Err(Errno(6)),
             Self::Render => Err(Errno(22)),
             Self::Full => Err(Errno(28)),
@@ -1890,6 +1893,7 @@ impl Vfs {
                     | b"/dev/stdin"
                     | b"/dev/stdout"
                     | b"/dev/stderr"
+                    | b"/dev/fuse"
                     | b"/dev/kmsg"
                     | b"/dev/net"
                     | b"/dev/net/tun"
@@ -2021,6 +2025,7 @@ impl Vfs {
             }
             b"/dev/trames" if self.bridge.is_some()=>return Ok(directory()),
             b"/dev/net" => return Ok(Some((Content::Directory, 0o40755))),
+            b"/dev/fuse" => return Ok(Some((Content::Device(Device::Fuse), 0o20666))),
             b"/dev/net/tun" => return Ok(Some((Content::Device(Device::Tun), 0o20666))),
             b"/dev/kmsg" => return Ok(Some((Content::Device(Device::Kmsg),0o20600))),
             b"/dev/binder" => return Ok(Some((Content::Device(Device::Binder(0)),0o20666))),
@@ -2764,6 +2769,7 @@ impl Vfs {
             .map(|s| s.as_bytes().to_vec())
             .collect(),
             b"/dev" => [
+                "fuse",
                 "zero",
                 "full",
                 "random",

@@ -352,6 +352,7 @@ pub(super) struct NamespaceWork {
     call: NamespaceCall,
     host_work: bool,
     waiting: Option<Arc<mounts::admin::Admin>>,
+    fuse: Option<Box<fuse::Metadata>>,
 }
 pub(super) enum NamespaceRun {
     Complete(Result<FileValue>),
@@ -393,6 +394,19 @@ fn prepare_namespace(view: &mut Vfs, call: &NamespaceCall) -> bool {
     let operands = call.paths();
     let files = view.query.as_ref().unwrap().files.clone();
     let mut accepted = BTreeMap::new();
+    if let NamespaceCall::Mount {
+        kind: Some(kind),
+        data: Some(data),
+        flags,
+        ..
+    } = call
+    {
+        if kind == b"fuse" && flags & (32 | 4096 | 8192) == 0 {
+            if let Ok(fd) = fuse::option_fd(data, &view.credentials.user_namespace) {
+                accepted.insert(fd, files.query_lookup(fd));
+            }
+        }
+    }
     for (fd, path, _) in &operands {
         if path.is_none() || *fd != AT_FDCWD && path.is_some_and(|p| !p.starts_with(b"/")) {
             accepted
@@ -504,6 +518,7 @@ impl PathQueries {
                 call,
                 host_work,
                 waiting: None,
+                fuse: None,
             };
             let reply = if host_work {
                 NamespaceRun::Owner
@@ -530,27 +545,40 @@ impl PathQueries {
                 call,
                 host_work,
                 waiting: None,
+                fuse: None,
             },
         )
     }
 }
 impl NamespaceWork {
+    pub(super) fn fuse_request(&self) -> Option<&fuse::Metadata> {
+        self.fuse.as_deref()
+    }
     pub(super) fn host_work(&self) -> bool {
         self.host_work
     }
     pub(super) fn waiting(&self) -> bool {
-        self.waiting.is_some()
+        self.waiting.is_some() || self.fuse.is_some()
     }
     pub(super) fn ready(&self) -> bool {
         self.waiting.as_ref().is_none_or(|admin| admin.ready())
+            && self.fuse.as_ref().is_none_or(|f| f.ready())
     }
     pub(super) fn subscribe(&self, signal: &Arc<IoSignal>) -> Option<IoSubscription> {
-        self.waiting.as_ref().map(|admin| admin.subscribe(signal))
+        self.waiting
+            .as_ref()
+            .map(|admin| admin.subscribe(signal))
+            .or_else(|| self.fuse.as_ref().map(|f| f.subscribe(signal)))
     }
     pub(super) fn run(&mut self, paths: &PathQueries) -> NamespaceRun {
         self.execute(&mut paths.view.borrow_mut())
     }
     fn execute(&mut self, view: &mut Vfs) -> NamespaceRun {
+        if let Some(f) = &self.fuse {
+            return f
+                .take()
+                .map_or(NamespaceRun::Waiting, NamespaceRun::Complete);
+        }
         self.waiting = None;
         let admin = if self.call.topology() {
             match view.mount_admin() {
@@ -580,10 +608,14 @@ impl NamespaceWork {
         let uses = query.namespace_uses.finish();
         let deferred = query.take_deferred();
         drop(uses);
-        if deferred {
-            NamespaceRun::Owner
+        if !deferred {
+            return NamespaceRun::Complete(result);
+        }
+        if let Some(f) = query.prepared.borrow_mut().fuse.take() {
+            self.fuse = Some(f);
+            NamespaceRun::Waiting
         } else {
-            NamespaceRun::Complete(result)
+            NamespaceRun::Owner
         }
     }
     pub(super) fn run_owner(&self, paths: &PathQueries, owner: &mut Vfs) -> Result<FileValue> {

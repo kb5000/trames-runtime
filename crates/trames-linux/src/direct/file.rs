@@ -75,6 +75,7 @@ impl FileResult {
 
 #[derive(Clone)]
 pub enum FileOutput {
+    FuseStat(u32, [u64; 6]),
     None,
     Write,
     Scalar(u64),
@@ -144,6 +145,19 @@ impl FileOutput {
                 }
                 Ok(bytes.len() as u64)
             }
+            trames_vfs::FileValue::FuseStat(stat, mount) => {
+                let Self::FuseStat(number, args) = self else {
+                    unreachable!("FUSE metadata output")
+                };
+                if *number == 291 {
+                    Linux::finish_statx(*args, memory, stat, mount)
+                } else {
+                    let address = if *number == 80 { args[1] } else { args[2] };
+                    Linux::check(memory, address, 128, Access::Write)?;
+                    memory.write(address, &stat).map_err(|_| Errno(14))?;
+                    Ok(0)
+                }
+            }
             trames_vfs::FileValue::Stat(stat) => {
                 let Self::Stat(address) = self else {
                     unreachable!("accepted stat output")
@@ -163,10 +177,32 @@ pub struct FilePending {
     waiting: Option<Arc<Mutex<Option<trames_vfs::FileWork>>>>,
 }
 impl FilePending {
+    pub fn fuse_interrupt_needed(&self) -> bool {
+        self.waiting.as_ref().is_some_and(|w| {
+            w.lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|w| w.fuse_interrupt_needed())
+        })
+    }
+    pub fn fuse_interrupt(&self) {
+        let request = self.waiting.as_ref().and_then(|w| {
+            w.lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|work| work.fuse_signal_request())
+        });
+        if let Some(request) = request {
+            request.interrupt();
+        }
+    }
     pub fn interruptible(&self) -> bool {
-        self.waiting
-            .as_ref()
-            .is_some_and(|w| w.lock().unwrap().is_some())
+        self.waiting.as_ref().is_some_and(|w| {
+            w.lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|w| !w.waits_for_fuse())
+        })
     }
     pub(super) fn native_wait_fds(&self) -> Vec<trames_vfs::HostFd> {
         self.waiting.as_ref().map_or_else(Vec::new, |w| {

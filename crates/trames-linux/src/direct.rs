@@ -520,6 +520,13 @@ impl DirectSyscalls {
         // WRITE_READ can consume write commands before parking. The legacy
         // single-assignment probe must leave it untouched for start_binder;
         // returning EAGAIN here would lose the retained read operation.
+        if args[1] as u32 == trames_vfs::fuse::CLONE {
+            return Some(
+                self.paths
+                    .as_ref()?
+                    .fuse_clone(args[0] as u32, args[2], memory),
+            );
+        }
         if self.supports_binder(29, args) {
             return None;
         }
@@ -710,7 +717,23 @@ impl DirectSyscalls {
                 Err(e) => Err(e),
             }
         } else {
-            crate::path_queries::call(paths, number, a, memory)?
+            match crate::path_queries::call(paths, number, a, memory) {
+                Some(result) => result,
+                None if matches!(number, 48 | 79 | 80 | 291 | 439) => {
+                    return self.prepare_filesystem_work(
+                        number,
+                        a,
+                        paths.take_fuse_stat()?,
+                        if matches!(number, 48 | 439) {
+                            FileOutput::None
+                        } else {
+                            FileOutput::FuseStat(number, a)
+                        },
+                        memory,
+                    )
+                }
+                None => return None,
+            }
         };
         self.completed.set(self.completed.get() + 1);
         self.file_completed.set(self.file_completed.get() + 1);

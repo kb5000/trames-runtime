@@ -60,6 +60,7 @@ mod shared_cell;
 mod simple_device;
 use shared_cell::SharedCell;
 mod flock;
+pub mod fuse;
 use fd_table::{Descriptor, DescriptorTable};
 pub use fd_table::{FileTableOwner, FileTableRetirement};
 pub use fd_table::{SharedFd, SharedFiles};
@@ -1384,6 +1385,9 @@ impl Vfs {
         if let Some(events::SharedControl::MessageQueue(q)) = &o.control {
             return q.poll(events).0;
         }
+        if let Some(events::SharedControl::Fuse(file)) = &o.control {
+            return file.poll(events).0;
+        }
         if let Some(events::SharedControl::Tun(file, _)) = &o.control {
             return if o.flags.get() & O_PATH != 0 {
                 32
@@ -1671,6 +1675,12 @@ impl Vfs {
             .is_some_and(|m| m.kind == mounts::Kind::Cgroup && m.root.borrow().links == 0)
         {
             return Err(Errno(19));
+        }
+        if let Some(fs) = path.mount().and_then(|m| m.fs.fuse.as_ref()) {
+            fs.check(&self.credentials)?;
+            if path.key() != b"/" {
+                return Err(Errno(95));
+            }
         }
         if self.uses_pseudo(path) {
             if key == b"/proc" || key.starts_with(b"/proc/") {
@@ -2659,6 +2669,13 @@ impl Vfs {
             }
             Ok(())
         };
+        if p.mount
+            .as_ref()
+            .is_some_and(|m| m.kind == mounts::Kind::Fuse)
+            && flags & O_PATH == 0
+        {
+            return Err(Errno(95));
+        }
         let mut runtime_file = None;
         let mut existed = match forced_node.clone().map_or_else(|| self.node(&p), Ok) {
             Ok(node) => {
@@ -2970,6 +2987,9 @@ impl Vfs {
                 Content::MessageQueue(ref q) => {
                     Some(events::SharedControl::MessageQueue(q.clone()))
                 }
+                Content::Device(pseudo::Device::Fuse) => Some(events::SharedControl::Fuse(
+                    fuse::Device::new(self.credentials.user_namespace.clone()),
+                )),
                 Content::Device(pseudo::Device::Tun) => Some(events::SharedControl::Tun(
                     self.network.open_tun(),
                     self.root_network.user_namespace.clone(),
@@ -3072,7 +3092,7 @@ impl Vfs {
                     file.file_target()
                 };
                 if let Some(target) = target {
-                    *query.open_work.borrow_mut() = Some(file_work::PreparedOpen {
+                    query.prepared.borrow_mut().open = Some(file_work::PreparedOpen {
                         _truncate_access: write_access,
                         reservation,
                         target,
@@ -3388,6 +3408,11 @@ impl Vfs {
         if let Some(events::SharedControl::MessageQueue(q)) = &o.control {
             return Ok(q.read(&o.file_position, count));
         }
+        if let Some(events::SharedControl::Fuse(file)) = &o.control {
+            let file = file.clone();
+            drop(o);
+            return file.connection()?.read(count);
+        }
         if let Some(events::SharedControl::Tun(file, _)) = &o.control {
             let file = file.clone();
             drop(o);
@@ -3506,6 +3531,11 @@ impl Vfs {
         }
         if let Some(events::SharedControl::MessageQueue(_)) = &o.control {
             return Err(Errno(22));
+        }
+        if let Some(events::SharedControl::Fuse(file)) = &o.control {
+            let file = file.clone();
+            drop(o);
+            return file.connection()?.write(bytes);
         }
         if let Some(events::SharedControl::Tun(file, _)) = &o.control {
             let file = file.clone();
@@ -4005,6 +4035,12 @@ impl Vfs {
         out
     }
     fn stat_inode(&self, inode: &NodeRef, mount: Option<&OpenMount>) -> Result<[u8; 128]> {
+        if let Some((m, fs)) = mount.and_then(|m| m.fs.fuse.as_ref().map(|fs| (m, fs))) {
+            let query = self.query.as_ref().ok_or(Errno(95))?;
+            let pending = fuse::Metadata::start(self, m, fs)?;
+            query.prepared.borrow_mut().fuse = Some(Box::new(pending));
+            return query.defer();
+        }
         let (mut out, directory) = {
             let node = inode.borrow();
             (

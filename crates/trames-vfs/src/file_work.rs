@@ -294,6 +294,7 @@ pub enum FileCommand {
     },
 }
 pub enum FileValue {
+    FuseStat([u8; 128], StatMount),
     Stat([u8; 128]),
     Transfer {
         count: u64,
@@ -331,6 +332,7 @@ pub struct FileWork {
     sync_targets: Option<Vec<storage::FilesystemSync>>,
     namespace: Option<Box<namespace_work::NamespaceWork>>,
     proc_wait: Vec<trames_memory::MemoryRead>,
+    fuse_stat: Option<Box<fuse::Metadata>>,
 }
 struct FileActive(Arc<Inode>);
 impl Drop for FileActive {
@@ -390,7 +392,24 @@ impl FileWork {
         }
     }
 
+    fn fuse_request(&self) -> Option<&fuse::Metadata> {
+        self.fuse_stat
+            .as_deref()
+            .or_else(|| self.namespace.as_ref().and_then(|ns| ns.fuse_request()))
+    }
+    pub fn waits_for_fuse(&self) -> bool {
+        self.fuse_request().is_some()
+    }
+    pub fn fuse_interrupt_needed(&self) -> bool {
+        self.fuse_request().is_some_and(|p| p.needs_interrupt())
+    }
+    pub fn fuse_signal_request(&self) -> Option<Arc<fuse::Request>> {
+        self.fuse_request().map(|p| p.request.clone())
+    }
     pub fn waiting(&self) -> bool {
+        if let Some(p) = &self.fuse_stat {
+            return !p.ready();
+        }
         if self.console_wait().is_some() {
             return !self.ready();
         }
@@ -399,6 +418,9 @@ impl FileWork {
             || matches!(&self.command, FileCommand::Transfer(t) if t.borrow().waits())
     }
     pub fn ready(&self) -> bool {
+        if let Some(p) = &self.fuse_stat {
+            return p.ready();
+        }
         if let Some((console, writing)) = self.console_wait() {
             return console
                 .io
@@ -415,6 +437,13 @@ impl FileWork {
         }
     }
     pub fn wait_sources(&self, signal: &Arc<IoSignal>) -> std::io::Result<TransferWait> {
+        if let Some(p) = &self.fuse_stat {
+            return Ok(TransferWait {
+                subscriptions: vec![p.subscribe(signal)],
+                native: vec![],
+                deadline: None,
+            });
+        }
         if let Some((console, writing)) = self.console_wait() {
             let subscriptions = console.io.subscribe(signal);
             let native: Vec<_> = console
@@ -525,9 +554,13 @@ impl FileWork {
             sync_targets: None,
             namespace: None,
             proc_wait: Vec::new(),
+            fuse_stat: None,
         }
     }
     pub fn host_work(&self) -> bool {
+        if self.fuse_stat.is_some() {
+            return false;
+        }
         if let Some(namespace) = &self.namespace {
             return namespace.host_work();
         }
@@ -548,6 +581,7 @@ impl FileWork {
             sync_targets: None,
             namespace: None,
             proc_wait: Vec::new(),
+            fuse_stat: None,
         }
     }
     pub fn from_vfs(vfs: &Vfs, target: FileTarget, command: FileCommand) -> Self {
@@ -563,10 +597,12 @@ impl FileWork {
             sync_targets: None,
             namespace: None,
             proc_wait: Vec::new(),
+            fuse_stat: None,
         }
     }
     pub fn queued(mut self) -> Self {
-        if self.namespace.is_none()
+        if self.fuse_stat.is_none()
+            && self.namespace.is_none()
             && self.sync_targets.is_none()
             && (matches!(self.command, FileCommand::SyncAll)
                 || matches!(self.command, FileCommand::SyncFilesystem)
@@ -691,6 +727,16 @@ impl FileWork {
         self
     }
     pub fn run(mut self) -> FileOutcome {
+        if let Some(p) = &self.fuse_stat {
+            return match p.take() {
+                Some(result) => FileOutcome::Complete(FileReply {
+                    result,
+                    file_size_signal: false,
+                    scratch: None,
+                }),
+                None => FileOutcome::Waiting(self),
+            };
+        }
         if let Some(result) = self
             .target
             .as_ref()
@@ -768,7 +814,7 @@ impl PathQueries {
         view.query.as_ref().unwrap().clear_deferred();
         let result = view.open_at_resolve_published::<true>(AT_FDCWD, path, 1, 0, 0, None);
         let query = view.query.as_ref().unwrap();
-        let accepted = query.open_work.borrow_mut().take();
+        let accepted = query.prepared.borrow_mut().open.take();
         if let Some(open) = accepted {
             // The resolver owns the original OFD before any numeric publication.
             // Release only this hidden reservation; FD reuse cannot retarget it.
@@ -786,14 +832,29 @@ impl PathQueries {
     }
     /// The path resolver has already accepted the original inode and reserved
     /// its unpublished FD. No pathname/input lookup is repeated after waiting.
+    pub fn take_fuse_stat(&self) -> Option<FileWork> {
+        let pending = self
+            .view
+            .borrow()
+            .query
+            .as_ref()?
+            .prepared
+            .borrow_mut()
+            .fuse
+            .take()?;
+        let mut work = FileWork::sync_all(self.retain_context());
+        work.fuse_stat = Some(pending);
+        Some(work)
+    }
     pub fn take_open_work(&self) -> Option<FileWork> {
         let open = self
             .view
             .borrow()
             .query
             .as_ref()?
-            .open_work
+            .prepared
             .borrow_mut()
+            .open
             .take()?;
         let mut work = FileWork::new(self, open.target.clone(), FileCommand::TruncateOpen);
         work.open = Some(Box::new(open));

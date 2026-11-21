@@ -583,6 +583,21 @@ impl Vfs {
         }
         let path = view.resolve_final(dirfd, path, !nofollow)?;
         let node = view.node(&path)?;
+        if let Some((m, fs)) = path
+            .mount
+            .as_ref()
+            .and_then(|m| m.fs.fuse.as_ref().map(|fs| (m, fs)))
+        {
+            if mode & 2 != 0 && m.readonly() {
+                return Err(Errno(30));
+            }
+            let query = view.query.as_ref().ok_or(Errno(95))?;
+            if let Some(request) = fuse::Metadata::access(&view, m, fs, mode)? {
+                query.prepared.borrow_mut().fuse = Some(Box::new(request));
+                return query.defer();
+            }
+            return Ok(());
+        }
         if mode & 2 != 0 {
             if let Some(mount) = &path.mount {
                 mount.writable_data(Some(&node))?;

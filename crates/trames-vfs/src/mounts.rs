@@ -98,6 +98,7 @@ static NEXT_NAMESPACE: AtomicU64 = AtomicU64::new(0xe000_0000);
 pub(super) enum Kind {
     Root,
     Tmpfs,
+    Fuse,
     Proc,
     Sysfs,
     Devpts,
@@ -464,6 +465,8 @@ impl MountData {
     pub fn writable(&self) -> Result<()> {
         if self.readonly() {
             Err(Errno(30))
+        } else if self.kind == Kind::Fuse {
+            Err(Errno(95))
         } else {
             Ok(())
         }
@@ -1086,7 +1089,9 @@ impl Vfs {
             return false;
         }
         match path.mount().map(|m| m.kind) {
-            Some(Kind::Tmpfs | Kind::Cgroup | Kind::Nsfs | Kind::Mqueue | Kind::Overlay) => false,
+            Some(
+                Kind::Tmpfs | Kind::Fuse | Kind::Cgroup | Kind::Nsfs | Kind::Mqueue | Kind::Overlay,
+            ) => false,
             #[cfg(all(feature = "hostfs", unix))]
             Some(Kind::Host) => false,
             Some(Kind::Root) => {
@@ -1301,6 +1306,7 @@ impl Vfs {
         let mut devpts = None;
         let mut namespace = None;
         let mut bind_origin = None;
+        let mut fuse_binding = None;
         let mut tmpfs_mode = None;
         if flags & BIND != 0 {
             let (_, target) =
@@ -1409,6 +1415,12 @@ impl Vfs {
                 flags
             };
             match kind.ok_or(Errno(22))? {
+                b"fuse" => {
+                    let (fs, binding) = fuse::prepare(self, data.ok_or(Errno(22))?)?;
+                    fuse_binding = Some(binding);
+                    let root = fs.borrow().paths[b"/".as_slice()].clone();
+                    (fs, root, b"/".to_vec(), Kind::Fuse, flags & ATTRS)
+                }
                 b"overlay" => {
                     let (fs, readonly) =
                         self.overlay_mount(data.ok_or(Errno(22))?, flags & MS_RDONLY != 0)?;
@@ -1563,7 +1575,11 @@ impl Vfs {
         }
         let mut added = vec![root];
         added.extend(additions.iter().map(|m| copies[&m.id].clone()));
-        self.publish_mounts(&ns, added)
+        self.publish_mounts(&ns, added)?;
+        if let Some(binding) = fuse_binding {
+            binding.publish();
+        }
+        Ok(())
     }
     fn visible_pseudo_flags(&self, kind: Kind, attrs: u64) -> Result<u64> {
         if !matches!(kind, Kind::Proc | Kind::Sysfs) {
@@ -2009,6 +2025,7 @@ impl Mount {
         match self.kind {
             Kind::Root => "rootfs",
             Kind::Tmpfs => "tmpfs",
+            Kind::Fuse => "fuse",
             Kind::Proc => "proc",
             Kind::Sysfs => "sysfs",
             Kind::Devpts => "devpts",
@@ -2170,9 +2187,16 @@ impl Vfs {
             return host.statfs(stat_flags);
         }
         let mut out = [0; 120];
+        if let Some(fs) = &m.fs.fuse {
+            let query = self.query.as_ref().ok_or(Errno(95))?;
+            query.prepared.borrow_mut().fuse =
+                Some(Box::new(fuse::Metadata::statfs(self, m, fs, stat_flags)?));
+            return query.defer();
+        }
         let magic = match m.kind {
             Kind::Root => 0x5452414d4553u64,
             Kind::Tmpfs => 0x01021994,
+            Kind::Fuse => 0x65735546,
             Kind::Proc => 0x9fa0,
             Kind::Sysfs => 0x62656572,
             Kind::Devpts => 0x1cd1,

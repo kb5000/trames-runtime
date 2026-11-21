@@ -301,6 +301,7 @@ pub(super) fn control(
         t.control,
         Some(
             events::SharedControl::MessageQueue(_)
+                | events::SharedControl::Fuse(_)
                 | events::SharedControl::Tun(..)
                 | events::SharedControl::Cgroup(_)
                 | events::SharedControl::Binder(_)

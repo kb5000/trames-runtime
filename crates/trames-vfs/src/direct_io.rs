@@ -271,6 +271,7 @@ pub trait DirectPoll: Send + Sync {
 }
 #[derive(Clone)]
 enum ByteResource {
+    Fuse(Arc<fuse::Device>),
     MessageQueue(Arc<posix_mq::Queue>),
     Tun(Arc<trames_net::tun::Connection>),
     Console(console::ConsoleEndpoint),
@@ -593,6 +594,7 @@ impl DirectFd {
                 Some(events::SharedControl::MessageQueue(q)) => {
                     ByteResource::MessageQueue(q.clone())
                 }
+                Some(events::SharedControl::Fuse(file)) => ByteResource::Fuse(file.clone()),
                 Some(events::SharedControl::Tun(file, _)) => ByteResource::Tun(file.clone()),
                 Some(events::SharedControl::Pid(pid)) => ByteResource::PollOnly(pid.clone()),
                 Some(events::SharedControl::Sync(file)) => {
@@ -731,6 +733,7 @@ impl DirectFd {
             (ByteResource::SocketPoll(a), ByteResource::SocketPoll(b)) => {
                 std::sync::Weak::ptr_eq(a, b)
             }
+            (ByteResource::Fuse(a), ByteResource::Fuse(b)) => Arc::ptr_eq(a, b),
             (ByteResource::Tun(a), ByteResource::Tun(b)) => Arc::ptr_eq(a, b),
             (ByteResource::Kmsg(a), ByteResource::Kmsg(b)) => a.same_log(b),
             (ByteResource::Bridge(a), ByteResource::Bridge(b)) => std::sync::Weak::ptr_eq(a, b),
@@ -825,6 +828,7 @@ impl DirectFd {
                 tcp.poll_event_fd().map(Into::into),
                 signal,
             )],
+            ByteResource::Fuse(file) => vec![file.subscribe(signal)],
             ByteResource::Tun(file) => file.subscribe(signal).into_iter().collect(),
             ByteResource::ProcWatch(watch) => vec![watch.subscribe(signal)],
             ByteResource::MessageQueue(q) => vec![q.subscribe(signal)],
@@ -1323,6 +1327,7 @@ impl DirectFd {
                 )
             }),
             ByteResource::MessageQueue(q) => q.poll(events),
+            ByteResource::Fuse(file) => file.poll(events),
             ByteResource::Tun(file) => file.poll(events),
             ByteResource::ProcWatch(watch) => watch.peek(events),
             ByteResource::Bpf => (0, [0; 2]),
@@ -1624,6 +1629,7 @@ impl DirectFd {
             ByteResource::MessageQueue(q) => {
                 Ok(q.read(&self._file.as_ref()?.open.file_position, count))
             }
+            ByteResource::Fuse(file) => file.connection().and_then(|c| c.read(count)),
             ByteResource::Tun(file) => file.read(count).map_err(|e| Errno(e.0)),
             ByteResource::Kmsg(log) => log.read(count),
             ByteResource::Device(device) => {
@@ -1742,6 +1748,7 @@ impl DirectFd {
             }
             ByteResource::Cgroup(_, None) => Err(Errno(95)),
             ByteResource::MessageQueue(_) => Err(Errno(22)),
+            ByteResource::Fuse(file) => file.connection().and_then(|c| c.write(bytes)),
             ByteResource::Tun(file) => file.write(bytes).map_err(|e| Errno(e.0)),
             ByteResource::Kmsg(log) => log.write(bytes),
             ByteResource::Device(device) => device.write(bytes),

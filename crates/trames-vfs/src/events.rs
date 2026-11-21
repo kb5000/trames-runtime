@@ -46,6 +46,7 @@ pub(super) enum SharedControl {
     FsContext(Arc<mounts::fd::FsContext>),
     MountTree(Arc<mounts::fd::DetachedTree>),
     MessageQueue(Arc<posix_mq::Queue>),
+    Fuse(Arc<fuse::Device>),
     Tun(Arc<trames_net::tun::Connection>, UserNamespace),
     Sync(Arc<sync_file::File>),
     Binder(Arc<binder::Connection>),
@@ -84,9 +85,11 @@ impl SharedControl {
                 }
                 Anonymous::Sync(file.clone())
             }
-            Self::MessageQueue(_) | Self::Tun(..) | Self::Cgroup(_) | Self::Binder(_) => {
-                return None
-            }
+            Self::Fuse(_)
+            | Self::MessageQueue(_)
+            | Self::Tun(..)
+            | Self::Cgroup(_)
+            | Self::Binder(_) => return None,
             Self::Uring(ring) => Anonymous::Uring(ring.clone()),
             Self::Signal(mask) => Anonymous::Signal(mask.clone()),
             Self::Bpf(program) => Anonymous::Bpf(program.clone()),
@@ -358,6 +361,9 @@ impl Vfs {
     fn poll_epoch_with(o: &OpenDescription, reader: Option<&Arc<dyn SignalReader>>) -> [u64; 2] {
         if let Some(SharedControl::MessageQueue(q)) = &o.control {
             return q.poll(0).1;
+        }
+        if let Some(SharedControl::Fuse(file)) = &o.control {
+            return file.poll(0).1;
         }
         if let Some(SharedControl::Tun(file, _)) = &o.control {
             return file.poll(0).1;

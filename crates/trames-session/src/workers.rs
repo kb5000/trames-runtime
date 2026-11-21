@@ -663,6 +663,9 @@ impl<C: Cpu> Starter<C> {
                                         }
                                         continue;
                                     }
+                                    if disposition == trames_kernel::signal::Disposition::Handler {
+                                        if let Some(p)=job.io.as_ref().and_then(|io|io.file_pending()).or_else(||job.retry.as_ref()?.file.clone()) {p.fuse_interrupt();}
+                                    }
                                     let uninterruptible = matches!(&job.waiting,Some(crate::run_queue::WaitState::Namespace(_) | crate::run_queue::WaitState::Policy(_) | crate::run_queue::WaitState::Barrier(_))) || matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.gpu_pending.is_some() || job.io.as_ref().is_some_and(|io| io.file_pending().is_some_and(|f|!f.interruptible()) || io.number == 2)
                                         || job.retry.as_ref().is_some_and(|call| call.file.as_ref().is_some_and(|f|!f.interruptible()) || call.number == 2);
                                     if disposition == trames_kernel::signal::Disposition::Handler && !uninterruptible {

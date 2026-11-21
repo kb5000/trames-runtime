@@ -146,7 +146,7 @@ impl FileIo {
                         }
                         bytes.len() as u64
                     }
-                    FileValue::Stat(_) | FileValue::Transfer { .. } => {
+                    FileValue::FuseStat(..) | FileValue::Stat(_) | FileValue::Transfer { .. } => {
                         unreachable!("uring file operation")
                     }
                 };

@@ -124,7 +124,9 @@ impl DescriptorControl {
     fn change_async(open: &Arc<SharedOpenDescription>, fd: u32, enabled: bool) -> Result<bool> {
         // Linux F_SETFL ignores FASYNC for files lacking an fasync operation.
         // Resolve readiness only when a supported endpoint changes registration.
-        if open.pty.is_none() && open.pipe.is_none() && open.local.is_none() {
+        if let Some(events::SharedControl::Fuse(file)) = &open.control {
+            file.connection()?;
+        } else if open.pty.is_none() && open.pipe.is_none() && open.local.is_none() {
             // Known files without a Linux fasync callback. Other device types
             // retain their unsupported result until a notification source exists.
             if open.node.as_ref().is_some_and(|node| node.regular_file)

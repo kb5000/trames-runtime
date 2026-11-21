@@ -12,6 +12,9 @@ pub(crate) fn call(vfs: &mut Vfs, a: [u64; 6], memory: &mut impl CpuMemory) -> R
     if vfs.flags(a[0] as u32)? & trames_vfs::O_PATH != 0 {
         return Err(Errno(9));
     }
+    if a[1] as u32 == trames_vfs::fuse::CLONE {
+        return vfs.fuse_clone(a[0] as u32, a[2], memory);
+    }
     if a[1] as u32 != 0x5421 {
         if let Some(file) = vfs.tun_file(a[0] as u32)? {
             return tun_ioctl(vfs, &file, a[1] as u32, a[2], memory);

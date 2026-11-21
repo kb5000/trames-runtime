@@ -709,6 +709,8 @@ impl<C: Cpu> Job<C> {
         }
         self.work.syscalls.as_ref().is_some_and(|s| {
             s.next_io_signal().is_some_and(|(sig, _)| {
+                if s.actions.get(sig as usize).handler > 1 &&
+                    self.io.as_ref().and_then(|io|io.file_pending()).or_else(||self.retry.as_ref()?.file.clone()).is_some_and(|p|p.fuse_interrupt_needed()) {return true;}
                 (s.actions.get(sig as usize).handler <= 1
                     && !(matches!(sig, 19..=22) && self.stop_hold() == Some(true)))
                     || s.actions.get(sig as usize).handler > 1
