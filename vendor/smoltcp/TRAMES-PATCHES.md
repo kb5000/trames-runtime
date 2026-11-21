@@ -80,3 +80,22 @@ Shrinking a transmit queue below its occupancy keeps the outstanding bytes
 and blocks new writes until the queue falls below the new limit. Applications
 that only set buffers before connect or listen allocate the requested sizes
 when the protocol sockets are created.
+
+Guest TCP_USER_TIMEOUT uses ACK progress, a blocked zero-window send and
+transmitted keepalive probes to track delivery stalls. The existing transport
+timer expires the connection and wakes its socket subscribers. An ordinary
+idle connection has no delivery deadline. TCP_SYNCNT counts SYNs emitted by
+an active opener and checks the retry budget on retransmission expiry.
+
+TCP_WINDOW_CLAMP limits newly advertised credit, including the unscaled
+SYN window. The transport remembers whether the last advertisement used
+scaling so a live change can honor credit already granted. Window growth
+can trigger a standalone update after establishment. SYN retransmission
+continues to use the handshake timer.
+
+TCP_DEFER_ACCEPT holds an established socket in its listener slot until
+contiguous data, peer FIN or its deadline makes it acceptable. The guest
+poll and accept paths consult the same readiness condition. This models
+application-visible readiness using the existing transport timers. It does
+not reproduce Linux's wire-level treatment of bare ACKs during deferred
+accept.

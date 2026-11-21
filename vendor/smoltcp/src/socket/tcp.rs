@@ -417,6 +417,11 @@ pub struct Socket<'a> {
     /// Interval after which, if no inbound packets are received, the connection is aborted.
     timeout: Option<Duration>,
     handshake_timeout_only: bool,
+    syn_retries: Option<u8>,
+    syn_attempts: u8,
+    user_timeout: Option<Duration>,
+    stalled_since: Option<Instant>,
+    user_timeout_error: bool,
     /// Interval at which keep-alive packets will be sent.
     keep_alive: Option<Duration>,
     /// The time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
@@ -425,6 +430,8 @@ pub struct Socket<'a> {
     /// used every time the socket is reset back to the LISTEN state.
     listen_endpoint: IpListenEndpoint,
     accept_queue_capacity: usize,
+    defer_accept_secs: u32,
+    deferred_until: Option<Instant>,
     /// Current 4-tuple (local and remote endpoints).
     tuple: Option<Tuple>,
     /// The sequence number corresponding to the beginning of the transmit buffer.
@@ -441,6 +448,7 @@ pub struct Socket<'a> {
     remote_last_ack: Option<TcpSeqNumber>,
     /// The last window length sent.
     remote_last_win: u16,
+    last_window_unscaled: bool,
     /// The sending window scaling factor advertised to remotes which support RFC 1323.
     /// It is zero if the window <= 64KiB and/or the remote does not support it.
     remote_win_shift: u8,
@@ -534,16 +542,24 @@ impl<'a> Socket<'a> {
             rx_fin_received: false,
             timeout: None,
             handshake_timeout_only: false,
+            syn_retries: None,
+            syn_attempts: 0,
+            user_timeout: None,
+            stalled_since: None,
+            user_timeout_error: false,
             keep_alive: None,
             hop_limit: None,
             listen_endpoint: IpListenEndpoint::default(),
             accept_queue_capacity: 0,
+            defer_accept_secs: 0,
+            deferred_until: None,
             tuple: None,
             local_seq_no: TcpSeqNumber::default(),
             remote_seq_no: TcpSeqNumber::default(),
             remote_last_seq: TcpSeqNumber::default(),
             remote_last_ack: None,
             remote_last_win: 0,
+            last_window_unscaled: false,
             remote_win_len: 0,
             remote_win_shift: rx_cap_log2.saturating_sub(16) as u8,
             remote_win_scale: None,
@@ -733,11 +749,56 @@ impl<'a> Socket<'a> {
         let last_ack = self.remote_last_ack?;
         let next_ack = self.remote_seq_no + self.rx_buffer.len();
 
-        let last_win = (self.remote_last_win as usize) << self.remote_win_shift;
+        // SYN and SYN|ACK advertise an unscaled field even when both peers
+        // negotiate scaling for subsequent segments.
+        let shift = if self.last_window_unscaled { 0 } else { self.remote_win_shift };
+        let last_win = (self.remote_last_win as usize) << shift;
         let end = last_ack + last_win;
         let last_win_adjusted = if end > next_ack { end - next_ack } else { 0 };
 
         Some(u16::try_from(last_win_adjusted >> self.remote_win_shift).unwrap_or(u16::MAX))
+    }
+
+    /// Bound new receive credit without changing the physical ring or
+    /// withdrawing bytes the peer already has permission to send.
+    pub fn set_receive_window_limit(&mut self, bytes: usize) {
+        self.rx_limit = bytes;
+    }
+
+    pub fn set_syn_retries(&mut self, retries: u8) {
+        self.syn_retries = Some(retries);
+    }
+
+    pub fn set_user_timeout(&mut self, timeout: Option<Duration>) {
+        self.user_timeout = timeout;
+        if timeout.is_none() {
+            self.stalled_since = None;
+        }
+    }
+
+    pub fn user_timeout_error(&self) -> bool {
+        self.user_timeout_error
+    }
+
+    pub fn take_user_timeout_error(&mut self) -> bool {
+        core::mem::take(&mut self.user_timeout_error)
+    }
+
+    fn synchronized(&self) -> bool {
+        matches!(self.state, State::Established | State::CloseWait | State::FinWait1
+            | State::FinWait2 | State::Closing | State::LastAck)
+    }
+
+    fn awaiting_delivery(&self) -> bool {
+        self.rtte.max_seq_sent.is_some_and(|end| end > self.local_seq_no)
+            || (self.remote_win_len == 0 && !self.tx_buffer.is_empty())
+    }
+
+    fn idle_deadline(&self) -> Option<Instant> {
+        if self.handshake_timeout_only && self.state == State::SynSent && self.syn_attempts != 0 && self.syn_retries.is_some() {
+            return None;
+        }
+        Some(self.remote_last_ts? + self.timeout?)
     }
 
     /// Set the timeout duration.
@@ -806,6 +867,9 @@ impl<'a> Socket<'a> {
     /// to these error conditions.
     pub fn set_keep_alive(&mut self, interval: Option<Duration>) {
         self.keep_alive = interval;
+        if interval.is_none() && !self.awaiting_delivery() {
+            self.stalled_since = None;
+        }
         if self.keep_alive.is_some() {
             // If the connection is idle and we've just set the option, it would not take effect
             // until the next packet, unless we wind up the timer explicitly.
@@ -853,8 +917,21 @@ impl<'a> Socket<'a> {
         Ok(())
     }
 
+    pub fn accept_ready(&self) -> bool {
+        self.state == State::CloseWait || self.state == State::Established && self.deferred_until.is_none()
+    }
+
+    pub fn set_defer_accept(&mut self, seconds: u32) {
+        if let Some(end) = self.deferred_until {
+            self.deferred_until = (seconds != 0).then(|| end - Duration::from_secs(self.defer_accept_secs.into())
+                + Duration::from_secs(seconds.into()));
+        }
+        self.defer_accept_secs = seconds;
+    }
+
     pub fn leave_accept_queue(&mut self) {
         self.accept_queue_capacity = 0;
+        self.deferred_until = None;
     }
 
     pub(crate) fn queues_syn_for(&self, address: IpAddress, port: u16) -> bool {
@@ -982,6 +1059,10 @@ impl<'a> Socket<'a> {
             mem::size_of::<usize>() * 8 - self.rx_buffer.capacity().leading_zeros() as usize;
 
         self.state = State::Closed;
+        self.stalled_since = None;
+        self.user_timeout_error = false;
+        self.syn_attempts = 0;
+        self.deferred_until = None;
         self.timer = Timer::new();
         self.rtte = RttEstimator::default();
         self.assembler = Assembler::new();
@@ -995,6 +1076,7 @@ impl<'a> Socket<'a> {
         self.remote_last_seq = TcpSeqNumber::default();
         self.remote_last_ack = None;
         self.remote_last_win = 0;
+        self.last_window_unscaled = false;
         self.remote_win_len = 0;
         self.remote_win_scale = None;
         self.remote_has_sack = false;
@@ -1594,6 +1676,7 @@ impl<'a> Socket<'a> {
         // segments, is right-shifted by [advertised scale value] bits[...]
         reply_repr.window_len = self.scaled_window();
         self.remote_last_win = reply_repr.window_len;
+        self.last_window_unscaled = false;
 
         // If the remote supports selective acknowledgement, add the option to the outgoing
         // segment.
@@ -2050,6 +2133,9 @@ impl<'a> Socket<'a> {
                     self.tsval_generator = None;
                 }
                 self.set_state(State::SynReceived);
+                if self.accept_queue_capacity != 0 && self.defer_accept_secs != 0 {
+                    self.deferred_until = Some(cx.now() + Duration::from_secs(self.defer_accept_secs.into()));
+                }
                 self.timer.set_for_idle(cx.now(), self.keep_alive);
             }
 
@@ -2290,6 +2376,15 @@ impl<'a> Socket<'a> {
             }
         }
 
+        // A duplicate ACK or a zero-window update acknowledges no new bytes.
+        if self.user_timeout.is_some() {
+            if !self.synchronized() || !self.awaiting_delivery() {
+                self.stalled_since = None;
+            } else if ack_len > 0 || self.stalled_since.is_none() {
+                self.stalled_since = Some(cx.now());
+            }
+        }
+
         // update last remote tsval
         if let Some(timestamp) = repr.timestamp {
             self.last_remote_tsval = timestamp.tsval;
@@ -2332,6 +2427,7 @@ impl<'a> Socket<'a> {
                 self.rx_buffer.len() + contig_len
             );
             self.rx_buffer.enqueue_unallocated(contig_len);
+            self.deferred_until = None;
 
             // There's new data in rx_buffer, notify waiting task if any.
             #[cfg(feature = "async")]
@@ -2379,13 +2475,6 @@ impl<'a> Socket<'a> {
             Some(self.ack_reply(ip_repr, repr))
         } else {
             None
-        }
-    }
-
-    fn timed_out(&self, timestamp: Instant) -> bool {
-        match (self.remote_last_ts, self.timeout) {
-            (Some(remote_last_ts), Some(timeout)) => timestamp >= remote_last_ts + timeout,
-            (_, _) => false,
         }
     }
 
@@ -2495,9 +2584,9 @@ impl<'a> Socket<'a> {
     /// <https://elixir.bootlin.com/linux/v6.9.9/source/net/ipv4/tcp.c#L1472>.
     pub fn window_to_update(&self) -> bool {
         match self.state {
-            State::SynSent
-            | State::SynReceived
-            | State::Established
+            // Scaling takes effect after the handshake. Re-advertising
+            // credit during SYN-RECEIVED would emit another unscaled SYN.
+            State::Established
             | State::FinWait1
             | State::FinWait2 => {
                 let new_win = self.scaled_window();
@@ -2519,6 +2608,9 @@ impl<'a> Socket<'a> {
             return Ok(());
         }
 
+        if self.deferred_until.is_some_and(|end| cx.now() >= end) {
+            self.deferred_until = None;
+        }
         if self.cork && self.cork_until.is_none() && self.unsent_data() {
             self.cork_until = Some(cx.now() + Duration::from_millis(200));
         }
@@ -2538,7 +2630,25 @@ impl<'a> Socket<'a> {
             .pre_transmit(cx.now());
 
         // Check if any state needs to be changed because of a timer.
-        if self.timed_out(cx.now()) {
+        if self.user_timeout.is_some() && self.stalled_since.is_none()
+            && self.synchronized() && self.awaiting_delivery() {
+            self.stalled_since = Some(cx.now());
+        }
+        let delivery_expired = self.stalled_since.zip(self.user_timeout)
+            .is_some_and(|(start, limit)| self.synchronized() && cx.now() >= start + limit);
+        let retries_exhausted = self.state == State::SynSent
+            && (self.handshake_timeout_only || self.syn_retries.is_some())
+            && self.syn_attempts > self.syn_retries.unwrap_or(6)
+            && self.timer.should_retransmit(cx.now()).is_some();
+        if delivery_expired || retries_exhausted || self.idle_deadline().is_some_and(|end| cx.now() >= end) {
+            if delivery_expired {
+                self.user_timeout_error = true;
+                self.stalled_since = None;
+            }
+            #[cfg(feature = "alloc")]
+            if let Some(handle) = self.observer {
+                cx.tcp_ready.push(handle);
+            }
             // If a timeout expires, we should abort the connection.
             self.record_reset(cx);
             net_debug!("timeout exceeded");
@@ -2646,7 +2756,7 @@ impl<'a> Socket<'a> {
                 repr.control = TcpControl::Syn;
                 repr.seq_number = self.local_seq_no;
                 // window len must NOT be scaled in SYNs.
-                repr.window_len = u16::try_from(self.rx_buffer.window()).unwrap_or(u16::MAX);
+                repr.window_len = u16::try_from(self.rx_buffer.window().min(self.rx_limit)).unwrap_or(u16::MAX);
                 if self.state == State::SynSent {
                     repr.ack_number = None;
                     repr.window_scale = Some(self.remote_win_shift);
@@ -2764,6 +2874,13 @@ impl<'a> Socket<'a> {
         // for sure will not be successfully transmitted.
         ip_repr.set_payload_len(repr.buffer_len());
         emit(cx, (ip_repr, repr))?;
+        if self.state == State::SynSent && repr.control == TcpControl::Syn {
+            self.syn_attempts = self.syn_attempts.saturating_add(1);
+        }
+        if self.user_timeout.is_some() && self.synchronized()
+            && (is_keep_alive || !repr.payload.is_empty() || repr.control == TcpControl::Fin) {
+            self.stalled_since.get_or_insert(cx.now());
+        }
 
         // We've sent something, whether useful data or a keep-alive packet, so rewind
         // the keep-alive timer.
@@ -2794,6 +2911,7 @@ impl<'a> Socket<'a> {
         self.remote_last_seq = repr.seq_number + repr.segment_len();
         self.remote_last_ack = repr.ack_number;
         self.remote_last_win = repr.window_len;
+        self.last_window_unscaled = repr.control == TcpControl::Syn;
         if self.cork_until.is_some() && !self.unsent_data() {
             self.cork_until = None;
         }
@@ -2860,19 +2978,16 @@ impl<'a> Socket<'a> {
                 (true, AckDelayTimer::Immediate) => PollAt::Now,
             };
 
-            let timeout_poll_at = match (self.remote_last_ts, self.timeout) {
-                // If we're transmitting or retransmitting data, we need to poll at the moment
-                // when the timeout would expire.
-                (Some(remote_last_ts), Some(timeout)) => PollAt::Time(remote_last_ts + timeout),
-                // Otherwise we have no timeout.
-                (_, _) => PollAt::Ingress,
-            };
+            let timeout_poll_at = self.idle_deadline().map_or(PollAt::Ingress, PollAt::Time);
+            let delivery_poll_at = self.stalled_since.zip(self.user_timeout)
+                .map_or(PollAt::Ingress, |(start, limit)| PollAt::Time(start + limit));
 
             // We wait for the earliest of our timers to fire.
             let cork_poll_at = self.cork_until
                 .filter(|end| *end > cx.now())
                 .map_or(PollAt::Ingress, PollAt::Time);
-            *[self.timer.poll_at(), timeout_poll_at, delayed_ack_poll_at, cork_poll_at]
+            let accept_poll_at = self.deferred_until.map_or(PollAt::Ingress, PollAt::Time);
+            *[self.timer.poll_at(), timeout_poll_at, delayed_ack_poll_at, cork_poll_at, delivery_poll_at, accept_poll_at]
                 .iter()
                 .min()
                 .unwrap_or(&PollAt::Ingress)
@@ -7170,6 +7285,66 @@ mod test {
         let mut s = socket_listen();
         s.set_timeout(Some(Duration::from_millis(100)));
         assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Ingress);
+    }
+
+    #[test]
+    fn delivery_deadline_tracks_ack_progress_and_zero_window() {
+        let mut s = socket_established();
+        s.set_user_timeout(Some(Duration::from_millis(50)));
+        recv_nothing!(s, time 150);
+        recv_nothing!(s, time 500);
+        assert_eq!(s.state(), State::Established);
+        s.send_slice(b"abcdef").unwrap();
+        recv(&mut s, Instant::from_millis(510), |p| assert_eq!(p.unwrap().payload, b"abcdef"));
+        send!(s, time 530, TcpRepr {
+            seq_number: REMOTE_SEQ + 1, ack_number: Some(LOCAL_SEQ + 4), ..SEND_TEMPL
+        });
+        send!(s, time 570, TcpRepr {
+            seq_number: REMOTE_SEQ + 1, ack_number: Some(LOCAL_SEQ + 4), ..SEND_TEMPL
+        });
+        recv_nothing!(s, time 579);
+        recv(&mut s, Instant::from_millis(580), |p| assert_eq!(p.unwrap().control, TcpControl::Rst));
+        assert!(s.take_user_timeout_error());
+        assert!(!s.take_user_timeout_error());
+
+        let mut s = socket_established();
+        s.remote_win_len = 0;
+        s.set_user_timeout(Some(Duration::from_millis(50)));
+        s.send_slice(b"queued").unwrap();
+        recv_nothing!(s, time 100);
+        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Time(Instant::from_millis(150)));
+        recv(&mut s, Instant::from_millis(150), |p| assert_eq!(p.unwrap().control, TcpControl::Rst));
+        assert!(s.take_user_timeout_error());
+    }
+
+    #[test]
+    fn an_active_open_honors_the_syn_retry_limit() {
+        let mut s = socket();
+        s.socket.connect(&mut s.cx, REMOTE_END, LOCAL_END.port).unwrap();
+        s.set_syn_retries(1);
+        for time in [0, 700] {
+            recv(&mut s, Instant::from_millis(time), |p| assert_eq!(p.unwrap().control, TcpControl::Syn));
+        }
+        let PollAt::Time(end) = s.socket.poll_at(&mut s.cx) else { panic!("missing SYN timer") };
+        recv(&mut s, end, |p| assert_eq!(p.unwrap().control, TcpControl::Rst));
+        assert_eq!(s.state(), State::Closed);
+    }
+
+    #[test]
+    fn scaled_passive_handshake_respects_window_clamp() {
+        let mut s = socket_with_buffer_sizes(32768, 262144);
+        s.listen(LOCAL_END).unwrap();
+        s.set_receive_window_limit(2048);
+        send!(s, TcpRepr { control: TcpControl::Syn, seq_number: REMOTE_SEQ,
+            ack_number: None, window_scale: Some(2), ..SEND_TEMPL });
+        let mut seq = LOCAL_SEQ;
+        recv(&mut s, Instant::ZERO, |p| {
+            let syn = p.unwrap();
+            assert_eq!(syn.window_len, 2048);
+            seq = syn.seq_number;
+        });
+        send!(s, TcpRepr { seq_number: REMOTE_SEQ + 1, ack_number: Some(seq + 1), ..SEND_TEMPL });
+        assert_eq!(usize::from(s.scaled_window()) << s.remote_win_shift, 2048);
     }
 
     #[test]

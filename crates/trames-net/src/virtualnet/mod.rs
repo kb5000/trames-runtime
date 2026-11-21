@@ -203,6 +203,10 @@ struct State {
     quick_ack: bool,
     congestion: tcp::CongestionControl,
     fin_wait_seconds: i32,
+    syn_retries: Option<u8>,
+    defer_accept_secs: u32,
+    user_timeout_ms: u32,
+    window_clamp: u32,
     linger: Option<Duration>,
     receive_low_water: i32,
     no_check: bool,
@@ -303,6 +307,18 @@ impl State {
         let mut socket = tcp_socket_with_buffers(self.receive_buffer, self.send_buffer);
         if socket.congestion_control() != self.congestion {
             socket.set_congestion_control(self.congestion);
+        }
+        socket.set_defer_accept(self.defer_accept_secs);
+        if let Some(retries) = self.syn_retries {
+            socket.set_syn_retries(retries);
+        }
+        if self.user_timeout_ms != 0 {
+            socket.set_user_timeout(Some(smoltcp::time::Duration::from_millis(
+                self.user_timeout_ms.into(),
+            )));
+        }
+        if self.window_clamp != 0 {
+            socket.set_receive_window_limit(self.receive_buffer.min(self.window_clamp as usize));
         }
         socket.set_nagle_enabled(!self.nodelay);
         socket.set_cork(self.cork);
@@ -1558,6 +1574,10 @@ impl Network {
                 quick_ack: true,
                 congestion: tcp::CongestionControl::Cubic,
                 fin_wait_seconds: 60,
+                syn_retries: None,
+                defer_accept_secs: 0,
+                user_timeout_ms: 0,
+                window_clamp: 0,
                 linger: None,
                 receive_low_water: 1,
                 no_check: false,
@@ -2255,6 +2275,34 @@ mod shared_lifetime_tests {
             std::thread::yield_now();
         }
         assert_eq!(client.send(b"x", 0, None), Ok(1));
+    }
+
+    #[test]
+    fn inherited_delivery_deadline_wakes_and_reports_the_error_once() {
+        let fabric = Fabric::new().unwrap();
+        let net = fabric.environment(2, NetworkMode::Full).unwrap();
+        let listener = net.socket(2, 1, 0).unwrap();
+        let addr = "127.0.0.1:34037".parse().unwrap();
+        listener.bind(addr).unwrap();
+        listener.listen(1).unwrap();
+        listener.set_option(6, 18, 200).unwrap();
+        let client = net.socket(2, 1, 0).unwrap();
+        assert_eq!(client.connect(addr), Err(NetError(115)));
+        let (peer, _) = listener.accept().unwrap();
+        assert_eq!(peer.get_option(6, 18), Ok(200));
+        fabric.0.borrow_mut().started -= Duration::from_secs(2);
+        assert_eq!(peer.get_option(1, 4), Ok(0));
+        fabric.set_link_faults(1, 0);
+        assert_eq!(peer.send(b"data", 0, None), Ok(4));
+        let (_target, signal) = tcp_io_waiter();
+        let _subscription = peer.subscribe_tcp_ready(&signal).unwrap();
+        fabric.0.borrow_mut().started -= Duration::from_millis(201);
+        fabric.tick();
+        assert!(signal.ready());
+        assert_ne!(peer.poll(1).unwrap() & 8, 0);
+        assert_eq!(peer.get_option(1, 4), Ok(110));
+        assert_eq!(peer.get_option(1, 4), Ok(0));
+        assert_eq!(peer.poll(1).unwrap() & 8, 0);
     }
 
     #[test]

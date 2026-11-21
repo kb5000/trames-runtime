@@ -534,12 +534,7 @@ impl Socket {
         let index = state
             .handles
             .iter()
-            .position(|h| {
-                matches!(
-                    n.sockets.get::<tcp::Socket>(*h).state(),
-                    tcp::State::Established | tcp::State::CloseWait
-                )
-            })
+            .position(|h| n.sockets.get::<tcp::Socket>(*h).accept_ready())
             .ok_or(NetError(11))?;
         let handle = state.handles.swap_remove(index);
         let s = n.sockets.get_mut::<tcp::Socket>(handle);
@@ -579,6 +574,10 @@ impl Socket {
             quick_ack: state.quick_ack,
             congestion: state.congestion,
             fin_wait_seconds: state.fin_wait_seconds,
+            syn_retries: state.syn_retries,
+            defer_accept_secs: state.defer_accept_secs,
+            user_timeout_ms: state.user_timeout_ms,
+            window_clamp: state.window_clamp,
             linger: state.linger,
             receive_low_water: state.receive_low_water,
             no_check: state.no_check,
@@ -1084,7 +1083,7 @@ impl Socket {
         let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
         let s = n.sockets.get_mut::<tcp::Socket>(state.handles[0]);
         if !s.may_send() {
-            return Err(NetError(32));
+            return Err(NetError(if s.take_user_timeout_error() { 110 } else { 32 }));
         }
         let count = s.send_slice(bytes).map_err(|_| NetError(32))?;
         n.dirty |= count != 0;
@@ -1199,6 +1198,9 @@ impl Socket {
         if self.kind == 1 {
             let s = n.sockets.get_mut::<tcp::Socket>(state.handles[0]);
             if !s.can_recv() {
+                if s.take_user_timeout_error() {
+                    return Err(NetError(110));
+                }
                 if s.may_recv() && !state.read_closed {
                     return Err(NetError(11));
                 }
@@ -1407,7 +1409,7 @@ impl Socket {
             if self.kind == 1 {
                 let s = n.sockets.get_mut::<tcp::Socket>(*h);
                 if state.connection == Connection::Listening {
-                    if matches!(s.state(), tcp::State::Established | tcp::State::CloseWait) {
+                    if s.accept_ready() {
                         ready |= 1 | 0x40;
                     }
                 } else if state.connection == Connection::Connected {
@@ -1439,6 +1441,9 @@ impl Socket {
                     }
                     if s.state() == tcp::State::Closed {
                         ready |= 16;
+                        if s.user_timeout_error() {
+                            ready |= 8;
+                        }
                     }
                 }
             } else if self.kind == 4 {
@@ -1564,9 +1569,13 @@ impl Socket {
                     let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
                     for h in &state.handles {
                         if self.kind == 1 {
-                            n.sockets
-                                .get_mut::<tcp::Socket>(*h)
-                                .resize_owned_buffer(name == 8, bytes);
+                            let socket = n.sockets.get_mut::<tcp::Socket>(*h);
+                            socket.resize_owned_buffer(name == 8, bytes);
+                            if name == 8 && state.window_clamp != 0 {
+                                socket.set_receive_window_limit(
+                                    bytes.min(state.window_clamp as usize),
+                                );
+                            }
                             continue;
                         }
                         let s = n.sockets.get_mut::<udp::Socket>(*h);
@@ -1579,6 +1588,41 @@ impl Socket {
                 }
             }
             (0, 33 | 34) if self.kind == 1 => return Err(NetError(22)),
+            (6, 7) if self.kind == 1 => {
+                if !(1..=127).contains(&value) {
+                    return Err(NetError(22));
+                }
+                state.syn_retries = Some(value as u8);
+            }
+            (6, 9) if self.kind == 1 => {
+                // Linux rounds up to a whole SYN retransmission interval (1,
+                // 2, 4, ... seconds, capped at 120) and stores an 8-bit count.
+                let mut seconds = 0;
+                let mut interval = 1;
+                for _ in 0..255 {
+                    if seconds >= value {
+                        break;
+                    }
+                    seconds += interval;
+                    interval = (interval * 2).min(120);
+                }
+                state.defer_accept_secs = seconds as u32;
+            }
+            (6, 10) if self.kind == 1 => {
+                if value == 0
+                    && !matches!(state.connection, Connection::Idle | Connection::Failed(_))
+                {
+                    return Err(NetError(22));
+                }
+                state.window_clamp = if value == 0 {
+                    0
+                } else {
+                    value.max((crate::socket_buffer_size(8, 0) / 2) as i32) as u32
+                };
+            }
+            (6, 18) if self.kind == 1 => {
+                state.user_timeout_ms = value.try_into().map_err(|_| NetError(22))?;
+            }
             (6, 8) if self.kind == 1 => {
                 state.fin_wait_seconds = if value == 0 { 60 } else { value.clamp(-1, 120) };
                 return Ok(());
@@ -1632,6 +1676,16 @@ impl Socket {
                             s.push_corked(now);
                         }
                     }
+                    (6, 9) => s.set_defer_accept(state.defer_accept_secs),
+                    (6, 7) => s.set_syn_retries(state.syn_retries.unwrap()),
+                    (6, 10) => s.set_receive_window_limit(if state.window_clamp == 0 {
+                        state.receive_buffer
+                    } else {
+                        state.receive_buffer.min(state.window_clamp as usize)
+                    }),
+                    (6, 18) => s.set_user_timeout((state.user_timeout_ms != 0).then(|| {
+                        smoltcp::time::Duration::from_millis(state.user_timeout_ms.into())
+                    })),
                     (6, 2) => s.set_max_segment(state.max_segment),
                     (6, 3) => s.set_cork(state.cork),
                     (6, 12) => s.set_quick_ack(state.quick_ack),
@@ -1733,8 +1787,23 @@ impl Socket {
             return Ok(self.mark.get() as i32);
         }
         if (level, name) == (1, 4) {
-            let _ = self.connect_complete();
-            return Ok(self.state.borrow_mut().error.take().unwrap_or(0) as i32);
+            let mut i = self.network.0.fabric.0.borrow_mut();
+            i.tick();
+            let mut state = self.state.borrow_mut();
+            if let Some(error) = state.error.take() {
+                return Ok(error as i32);
+            }
+            if self.kind == 1 && state.connection == Connection::Connected {
+                let node = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
+                if node
+                    .sockets
+                    .get_mut::<tcp::Socket>(state.handles[0])
+                    .take_user_timeout_error()
+                {
+                    return Ok(110);
+                }
+            }
+            return Ok(0);
         }
         if self.kind == 1 && level == 6 && matches!(name, 2 | 12) {
             let fabric = self.network.0.fabric.0.borrow();
@@ -1815,6 +1884,10 @@ impl Socket {
                 BUFFER
             } as i32),
             (6, 3) if self.kind == 1 => Ok(i32::from(state.cork)),
+            (6, 7) if self.kind == 1 => Ok(state.syn_retries.unwrap_or(6).into()),
+            (6, 9) if self.kind == 1 => Ok(state.defer_accept_secs as i32),
+            (6, 10) if self.kind == 1 => Ok(state.window_clamp as i32),
+            (6, 18) if self.kind == 1 => Ok(state.user_timeout_ms as i32),
             (6, 8) if self.kind == 1 => Ok(state.fin_wait_seconds),
             (6, 1) if self.kind == 1 => Ok(i32::from(state.nodelay)),
             (6, 4) if self.kind == 1 => Ok(state.keep_idle as i32),

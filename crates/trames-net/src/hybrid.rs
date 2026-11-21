@@ -538,7 +538,10 @@ impl Socket {
         }
         // These controls belong to the guest TCP engine. A wildcard socket
         // also owns a BSD listener, so reject before changing either half.
-        if self.path.get() == Path::Both && level == 6 && matches!(name, 2 | 3 | 8 | 12 | 13) {
+        if self.path.get() == Path::Both
+            && level == 6
+            && matches!(name, 2 | 3 | 7..=10 | 12 | 13 | 18)
+        {
             return Err(NetError(92));
         }
         if matches!(self.path.get(), Path::Guest | Path::Both) {
