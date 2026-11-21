@@ -535,3 +535,47 @@ fn loopback_aliases_share_a_prefix_route_and_leave_room_to_restore_ipv6() {
         .addresses
         .contains(&localhost));
 }
+
+#[test]
+fn raw_udp_shares_unicast_and_multicast_packets_with_datagram_receivers() {
+    let network = Network::managed_uplink(NetworkMode::Full).unwrap();
+    let raw = network.socket(2, 3, 17).unwrap();
+    assert_eq!(raw.get_option(1, 38), Ok(17));
+    let udp = network.socket(2, 2, 0).unwrap();
+    udp.bind("0.0.0.0:43210".parse().unwrap()).unwrap();
+    let membership = [239, 7, 8, 9, 127, 0, 0, 1];
+    udp.set_option_bytes(0, 35, &membership).unwrap();
+    raw.set_option_bytes(0, 32, &[127, 0, 0, 1]).unwrap();
+    let sender = network.socket(2, 2, 0).unwrap();
+    let target = "127.0.0.1:43210".parse().unwrap();
+    sender.send(b"first", 0, Some(target)).unwrap();
+    assert_eq!(udp.recv(16, 0).unwrap().data, b"first");
+    let first = raw.recv(64, 0).unwrap();
+    assert_eq!(&first.data[28..], b"first");
+    raw.bind_authorized(&encode_address("0.0.0.0:17".parse().unwrap()), false)
+        .unwrap();
+    let segment = [0x82, 0x21, 0xa8, 0xca, 0, 12, 0, 0, 1, 2, 3, 4];
+    for destination in ["127.0.0.1:0", "239.7.8.9:0"] {
+        let destination = destination.parse().unwrap();
+        assert_eq!(raw.send(&segment, 0, Some(destination)), Ok(segment.len()));
+        let received = udp.recv(40, 0).unwrap();
+        assert_eq!(received.data, segment[8..]);
+        assert_eq!(received.address.unwrap().port(), 0x8221);
+        let packet = raw.recv(64, MSG_PEEK).unwrap().data;
+        assert_eq!(packet[9], 17);
+        assert_eq!(packet[20..], segment);
+        assert_eq!(raw.recv(64, 0).unwrap().data, packet);
+    }
+    let mut invalid_length = segment;
+    invalid_length[4..6].copy_from_slice(&100u16.to_be_bytes());
+    let mut control = DatagramControl::default();
+    control.fields[0].hop_limit = Some(41);
+    raw.set_option(0, 12, 1).unwrap();
+    raw.send_datagram(&invalid_length, 0, Some(target), control)
+        .unwrap();
+    let packet = raw.recv(64, 0).unwrap().data;
+    assert_eq!(packet[8], 41);
+    assert_eq!(&packet[20..], &invalid_length);
+    assert_eq!(raw.ancillary_hop(), Some((0, 2, 41)));
+    assert_eq!(udp.recv(32, MSG_DONTWAIT).err(), Some(NetError(11)));
+}

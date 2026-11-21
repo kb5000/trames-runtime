@@ -497,6 +497,11 @@ impl Network {
             ));
         }
         let backend = match &self.0 {
+            // Raw UDP operates on the guest IP link, including on a host-backed
+            // environment. Ordinary host sockets keep their native transport.
+            Backend::Native(_) if (family, kind, protocol) == (2, 3, 17) => {
+                SocketBackend::Virtual(self.1.root_stack()?.socket(family, kind, protocol)?)
+            }
             Backend::Native(n) => SocketBackend::Hybrid(hybrid::Socket::new(
                 n.clone(),
                 self.1.clone(),
@@ -1106,7 +1111,10 @@ impl Socket {
         if !restricted && !wildcard_family {
             return self.bind_bytes(bytes);
         }
-        if let Some(info) = self.info().filter(|s| matches!(s.protocol, 6 | 17)) {
+        if let Some(info) = self
+            .info()
+            .filter(|s| matches!(s.kind, 1 | 2) && matches!(s.protocol, 6 | 17))
+        {
             let address = if wildcard_family
                 && info.family == 2
                 && bytes.len() >= 16

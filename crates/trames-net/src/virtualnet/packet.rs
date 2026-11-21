@@ -1,6 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+/// Build the IPv4 envelope for a transport payload supplied by a raw socket.
+pub(super) fn raw_ipv4(
+    source: std::net::Ipv4Addr,
+    destination: std::net::Ipv4Addr,
+    protocol: u8,
+    ttl: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    let size = 20 + payload.len();
+    let mut packet = Vec::with_capacity(size);
+    packet.resize(20, 0);
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(&(size as u16).to_be_bytes());
+    packet[8] = ttl;
+    packet[9] = protocol;
+    packet[12..16].copy_from_slice(&source.octets());
+    packet[16..20].copy_from_slice(&destination.octets());
+    packet.extend_from_slice(payload);
+    packet
+}
 pub(super) const MTU: usize = 1500;
 const QUEUE: usize = 96;
 // Bound retained fragment memory, rather than letting a few lost datagrams

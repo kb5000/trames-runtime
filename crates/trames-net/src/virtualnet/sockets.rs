@@ -141,15 +141,7 @@ impl Socket {
             } else {
                 self.kind
             },
-            protocol: if self.kind == 1 {
-                6
-            } else if self.kind == 2 {
-                17
-            } else if self.family == 2 {
-                1
-            } else {
-                58
-            },
+            protocol: self.protocol.into(),
             state: code,
             local: state.bound.map(|a| self.presented(a)),
             peer: state.peer.map(|a| self.presented(a)),
@@ -428,6 +420,22 @@ impl Socket {
             .unwrap_or_else(|| self.wildcard());
         self.bind_locked(self.presented(requested), false)
     }
+    pub(super) fn open_raw(&self) -> Result<()> {
+        let mut i = self.network.0.fabric.0.borrow_mut();
+        let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
+        let socket = raw::Socket::new(
+            if self.family == 2 {
+                smoltcp::wire::IpVersion::Ipv4
+            } else {
+                smoltcp::wire::IpVersion::Ipv6
+            },
+            smoltcp::wire::IpProtocol::from(self.protocol),
+            raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 16], vec![0; BUFFER]),
+            raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 16], vec![0; BUFFER]),
+        );
+        self.state.borrow_mut().handles = vec![n.sockets.add(socket)];
+        Ok(())
+    }
     fn bind_locked(&self, a: SocketAddr, explicit: bool) -> Result<()> {
         self.fabric().tick();
         if self.family == 10 && a.is_ipv4() {
@@ -441,7 +449,7 @@ impl Socket {
         if self.state.borrow().bound.is_some() {
             return Err(NetError(22));
         }
-        if !(self.own(a.ip()) || self.kind == 2 && self.udp_group(a.ip())) {
+        if !(self.own(a.ip()) || (self.kind == 2 || self.raw_udp()) && self.udp_group(a.ip())) {
             return Err(NetError(99));
         }
         if self.kind == 4 {
@@ -463,24 +471,8 @@ impl Socket {
                 .map_err(|_| NetError(22))?;
             self.state.borrow_mut().handles = vec![n.sockets.add(s)];
         }
-        if self.kind == 4 {
-            let mut i = self.network.0.fabric.0.borrow_mut();
-            let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
-            let socket = raw::Socket::new(
-                if self.family == 2 {
-                    smoltcp::wire::IpVersion::Ipv4
-                } else {
-                    smoltcp::wire::IpVersion::Ipv6
-                },
-                if self.family == 2 {
-                    smoltcp::wire::IpProtocol::Icmp
-                } else {
-                    smoltcp::wire::IpProtocol::Icmpv6
-                },
-                raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 16], vec![0; BUFFER]),
-                raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 16], vec![0; BUFFER]),
-            );
-            self.state.borrow_mut().handles = vec![n.sockets.add(socket)];
+        if self.kind == 4 && self.state.borrow().handles.is_empty() {
+            self.open_raw()?;
         }
         if self.kind == 2 {
             let addresses = self.addresses(a);
@@ -678,7 +670,7 @@ impl Socket {
         };
         drop(state);
         drop(i);
-        let socket = self.network.wrap(self.family, 1, accepted, reservation);
+        let socket = self.network.wrap(self.family, 1, 6, accepted, reservation);
         socket.uid.set(self.uid.get());
         socket.mark.set(self.mark.get());
         socket.route_device.set(self.route_device.get());
@@ -733,7 +725,7 @@ impl Socket {
         }
         // UDP connect is also Linux's source-route probe: a zero destination
         // port selects the source without establishing a getpeername peer.
-        let group_source = if self.kind == 2 && self.udp_group(a.ip()) {
+        let group_source = if (self.kind == 2 || self.raw_udp()) && self.udp_group(a.ip()) {
             Some(IpAddr::V4(self.group_source(a, None)?.1))
         } else {
             None
@@ -1003,7 +995,7 @@ impl Socket {
                 self.destination(peer)?;
             }
         }
-        if control != Default::default() && self.kind != 2 {
+        if control != Default::default() && self.kind != 2 && !self.raw_udp() {
             return Err(NetError(95));
         }
         if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL) != 0 {
@@ -1019,7 +1011,7 @@ impl Socket {
             return self.send_icmp(bytes, destination);
         }
         if self.kind == 4 {
-            return self.send_raw(bytes, destination);
+            return self.send_raw(bytes, destination, control);
         }
         if self.kind == 2 {
             let initial = self.state.borrow();
@@ -1671,7 +1663,9 @@ impl Socket {
                 }
                 return Ok(());
             }
-            (0, 33 | 34 | 49) if self.kind == 2 => return state.multicast_scalar(name, value),
+            (0, 33 | 34 | 49) if self.kind == 2 || self.raw_udp() => {
+                return state.multicast_scalar(name, value)
+            }
             (1, 2) => {
                 state.reuse = value != 0;
                 state.shared_tcp_binding |= self.kind == 1 && state.reuse;
@@ -2025,20 +2019,12 @@ impl Socket {
                 self.kind as i32
             }),
             (1, 39) => Ok(self.family as i32),
-            (1, 38) => Ok(if self.kind == 1 {
-                6
-            } else if matches!(self.kind, 3 | 4) {
-                if self.family == 2 {
-                    1
-                } else {
-                    58
-                }
-            } else {
-                17
-            }),
+            (1, 38) => Ok(i32::from(self.protocol)),
             (1, 30) => Ok(i32::from(state.connection == Connection::Listening)),
             (0, 33 | 34) if self.kind == 1 => Ok(state.multicast_value(name)),
-            (0, 32 | 33 | 34 | 49) if self.kind == 2 => Ok(state.multicast_value(name)),
+            (0, 32 | 33 | 34 | 49) if self.kind == 2 || self.raw_udp() => {
+                Ok(state.multicast_value(name))
+            }
             (1, 2) => Ok(i32::from(state.reuse)),
             (1, 15) if matches!(self.kind, 1 | 2) => Ok(i32::from(state.reuse_port)),
             (1, 29 | 35 | 63 | 64) if matches!(self.kind, 1 | 2) => {
@@ -2245,7 +2231,7 @@ impl Socket {
             }
             return Ok(());
         }
-        if level == 0 && self.kind == 2 && matches!(name, 32 | 35 | 36) {
+        if level == 0 && (self.kind == 2 || self.raw_udp()) && matches!(name, 32 | 35 | 36) {
             return self.membership(name, value);
         }
         if (level, name) == (1, 13) {
@@ -2289,20 +2275,36 @@ impl Socket {
             }
         })
     }
-    fn send_raw(&self, bytes: &[u8], destination: Option<SocketAddr>) -> Result<usize> {
+    fn send_raw(
+        &self,
+        bytes: &[u8],
+        destination: Option<SocketAddr>,
+        control: crate::DatagramControl,
+    ) -> Result<usize> {
         let a = destination
             .map(|a| self.normalize(a))
             .transpose()?
             .or(self.state.borrow().peer)
             .ok_or(NetError(89))?;
+        if self.raw_udp() && self.udp_group(a.ip()) {
+            return self.send_group(a, bytes, control);
+        }
+        if control.packet_info.is_some() || control.fields[1] != Default::default() {
+            return Err(NetError(95));
+        }
         self.destination(a)?;
-        if bytes.len() < 8 || bytes.len() > 1400 {
+        let maximum = if self.raw_udp() {
+            packet::MTU - 20
+        } else {
+            1400
+        };
+        if bytes.len() < 8 || bytes.len() > maximum {
             return Err(NetError(90));
         }
         if self.state.borrow().bound.is_none() {
             self.ensure_bound()?;
         }
-        if bytes[0] == if self.family == 2 { 8 } else { 128 } && bytes[1] == 0 {
+        if !self.raw_udp() && bytes[0] == if self.family == 2 { 8 } else { 128 } && bytes[1] == 0 {
             let mut state = self.state.borrow_mut();
             let identifier = u16::from_be_bytes([bytes[4], bytes[5]]);
             if state.raw_identifiers.len() >= 32 && !state.raw_identifiers.contains(&identifier) {
@@ -2341,15 +2343,15 @@ impl Socket {
             let (IpAddr::V4(source), IpAddr::V4(destination)) = (source, a.ip()) else {
                 return Err(NetError(97));
             };
-            let mut header = vec![0; 20];
-            header[0] = 0x45;
-            header[2..4].copy_from_slice(&((20 + bytes.len()) as u16).to_be_bytes());
-            header[8] = state.hop_limit;
-            header[9] = 1;
-            header[12..16].copy_from_slice(&source.octets());
-            header[16..20].copy_from_slice(&destination.octets());
+            let mut header = packet::raw_ipv4(
+                source,
+                destination,
+                self.protocol,
+                control.fields[0].hop_limit.unwrap_or(state.hop_limit),
+                bytes,
+            );
+            header[1] = control.fields[0].traffic_class.unwrap_or(0);
             smoltcp::wire::Ipv4Packet::new_unchecked(&mut header).fill_checksum();
-            header.extend_from_slice(bytes);
             header
         } else {
             let (IpAddr::V6(source), IpAddr::V6(destination)) = (source, a.ip()) else {
@@ -2386,7 +2388,7 @@ impl Socket {
         }
     }
     fn recv_raw(&self, count: usize, flags: u32) -> Result<Received> {
-        if self.state.borrow().bound.is_none() {
+        if !self.raw_udp() && self.state.borrow().bound.is_none() {
             self.ensure_bound()?;
         }
         let mut fabric = self.network.0.fabric.0.borrow_mut();

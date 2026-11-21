@@ -269,12 +269,18 @@ impl Deref for Socket {
 }
 pub(super) struct SocketMeta {
     family: u32,
+    protocol: u8,
     kind: u32,
     state: SharedState<State>,
     mark: Cell<u32>,
     uid: Cell<u32>,
     route_device: Cell<u32>,
     connecting: std::sync::atomic::AtomicBool,
+}
+impl SocketMeta {
+    fn raw_udp(&self) -> bool {
+        self.kind == 4 && self.protocol == 17
+    }
 }
 fn v4(id: u8) -> Ipv4Addr {
     Ipv4Addr::new(10, 0, 0, id)
@@ -975,7 +981,18 @@ impl Inner {
                         p = complete;
                     }
                     if !packet::valid_transport(&p) {
-                        self.stats.dropped += 1;
+                        // Raw sockets observe local IP traffic before UDP validates its
+                        // header. Keep invalid transport data off forwarding paths and
+                        // out of UDP queues. Apply the normal local output/input hooks.
+                        let delivered = injected.is_none()
+                            && h.protocol == 17
+                            && h.tuple.destination.is_ipv4()
+                            && self.nodes.get_mut(&source).is_some_and(|node| {
+                                node.receive_local_raw(view, &mut p, h.tuple.destination.ip())
+                            });
+                        if !delivered {
+                            self.stats.dropped += 1;
+                        }
                         continue;
                     }
                     if let Some(index) = injected {
@@ -1236,6 +1253,54 @@ impl Inner {
     }
 }
 impl Node {
+    fn receive_local_raw(
+        &mut self,
+        view: &crate::netdev::View,
+        packet: &mut [u8],
+        dest: IpAddr,
+    ) -> bool {
+        if !self
+            .registry
+            .iter()
+            .filter_map(Weak::upgrade)
+            .any(|s| s.raw_udp())
+        {
+            return false;
+        }
+        let graph = view.graph.read().unwrap();
+        if !graph.own(view.namespace, dest) {
+            return false;
+        }
+        let Some((route, None)) = graph.route_one(view.namespace, None, packet) else {
+            return false;
+        };
+        if route.namespace != view.namespace || route.external || route.tunnel {
+            return false;
+        }
+        let Some(header) = packet::header(packet) else {
+            return false;
+        };
+        drop(graph);
+        let mut delivered = false;
+        for socket in self
+            .registry
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|s| s.raw_udp())
+        {
+            let state = socket.state.borrow();
+            if state.accepts_raw_udp(header.tuple, route.input) {
+                if let Some(handle) = state.handles.first() {
+                    self.sockets
+                        .get_mut::<raw::Socket>(*handle)
+                        .enqueue_ip_packet(packet);
+                    delivered = true;
+                }
+            }
+        }
+        delivered
+    }
+
     fn grow_accept_queue(&mut self, target: SocketAddr) {
         'listeners: for entry in &self.growing_listeners {
             let Some(listener) = entry.upgrade() else {
@@ -1576,7 +1641,12 @@ impl Network {
         if !matches!(family, 2 | 10) {
             return Err(NetError(97));
         }
-        if kind == 3 && !((family == 2 && protocol == 1) || (family == 10 && protocol == 58)) {
+        if kind == 4 {
+            return Err(NetError(94));
+        }
+        if kind == 3
+            && !((family == 2 && matches!(protocol, 1 | 17)) || (family == 10 && protocol == 58))
+        {
             return Err(NetError(93));
         }
         let kind = if kind == 3 {
@@ -1588,14 +1658,22 @@ impl Network {
             kind
         };
         match (kind, protocol) {
-            (1, 0 | 6) | (2, 0 | 17) | (3 | 4, 1 | 58) => {}
+            (1, 0 | 6) | (2, 0 | 17) | (3 | 4, 1 | 58) | (4, 17) => {}
             (1 | 2, _) => return Err(NetError(93)),
             _ => return Err(NetError(94)),
         };
         let reservation = self.reserve()?;
-        Ok(self.wrap(
+        let protocol = if protocol != 0 {
+            protocol as u8
+        } else if kind == 1 {
+            6
+        } else {
+            17
+        };
+        let socket = self.wrap(
             family,
             kind,
+            protocol,
             State {
                 handles: Vec::new(),
                 connection: Connection::Idle,
@@ -1654,14 +1732,26 @@ impl Network {
                 send_buffer: BUFFER,
             },
             reservation,
-        ))
+        );
+        if socket.raw_udp() {
+            socket.open_raw()?;
+        }
+        Ok(socket)
     }
-    fn wrap(&self, family: u32, kind: u32, state: State, reservation: Reservation) -> Arc<Socket> {
+    fn wrap(
+        &self,
+        family: u32,
+        kind: u32,
+        protocol: u8,
+        state: State,
+        reservation: Reservation,
+    ) -> Arc<Socket> {
         let s = Arc::new(Socket {
             network: self.clone(),
             meta: Arc::new(SocketMeta {
                 family,
                 kind,
+                protocol,
                 state: SharedState::new(state),
                 mark: Cell::new(0),
                 uid: Cell::new(0),

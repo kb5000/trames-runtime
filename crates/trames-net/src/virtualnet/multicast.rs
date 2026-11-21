@@ -41,6 +41,13 @@ impl Default for Options {
     }
 }
 impl State {
+    pub(super) fn accepts_raw_udp(&self, tuple: packet::Tuple, index: u32) -> bool {
+        self.bound
+            .is_none_or(|a| a.ip().is_unspecified() || a.ip() == tuple.destination.ip())
+            && self.peer.is_none_or(|a| a.ip() == tuple.source.ip())
+            && self.device.is_none_or(|d| d == index)
+    }
+
     pub(super) fn multicast_value(&self, name: u32) -> i32 {
         let options = self.multicast.as_deref();
         match name {
@@ -130,7 +137,12 @@ impl Socket {
             } else {
                 local
             };
-            self.group_link(index, address.into(), group.into())?
+            self.group_link(index, address.into(), group.into())
+                .map_err(|err| match (name, err.0) {
+                    (32, 19) => NetError(99),
+                    (35 | 36, 99 | 101) => NetError(19),
+                    _ => err,
+                })?
                 .0
                 .index
         };
@@ -235,10 +247,13 @@ impl Socket {
         bytes: &[u8],
         control: crate::DatagramControl,
     ) -> Result<usize> {
-        if dest.port() == 0 {
+        if self.raw_udp() && bytes.len() < 8 {
             return Err(NetError(22));
         }
-        if bytes.len() > 65507 {
+        if !self.raw_udp() && dest.port() == 0 {
+            return Err(NetError(22));
+        }
+        if bytes.len() > if self.raw_udp() { 65515 } else { 65507 } {
             return Err(NetError(90));
         }
         let (dev, source) = self.group_source(dest, control.packet_info)?;
@@ -267,12 +282,19 @@ impl Socket {
         let loopback = !multicast || dev.index == 1 || state.multicast_value(34) != 0;
         drop(state);
         let view = self.network.0.routing.get().ok_or(NetError(95))?;
-        let mut packet =
-            crate::conntrack::message(SocketAddr::new(source.into(), port), dest, 17, 0, bytes);
-        if no_checksum {
-            // conntrack::message constructs a 20-byte IPv4 header.
-            packet[26..28].fill(0);
-        }
+        let mut packet = if self.raw_udp() {
+            let IpAddr::V4(destination) = dest.ip() else {
+                return Err(NetError(97));
+            };
+            packet::raw_ipv4(source, destination, self.protocol, ttl, bytes)
+        } else {
+            let mut packet =
+                crate::conntrack::message(SocketAddr::new(source.into(), port), dest, 17, 0, bytes);
+            if no_checksum {
+                packet[26..28].fill(0);
+            }
+            packet
+        };
         packet[1] = class;
         packet[8] = ttl;
         smoltcp::wire::Ipv4Packet::new_unchecked(&mut packet).fill_checksum();
@@ -379,9 +401,25 @@ impl Inner {
             .registry
             .iter()
             .filter_map(Weak::upgrade)
-            .filter(|s| s.kind == 2)
+            .filter(|s| s.kind == 2 || s.raw_udp())
         {
             let state = s.state.borrow();
+            if s.raw_udp() {
+                if state.accepts_raw_udp(header.tuple, index)
+                    && (!group_ip.is_multicast()
+                        || state
+                            .multicast
+                            .as_ref()
+                            .is_none_or(|o| o.all || o.groups.contains(&membership)))
+                {
+                    if let Some(handle) = state.handles.first() {
+                        node.sockets
+                            .get_mut::<raw::Socket>(*handle)
+                            .enqueue_ip_packet(packet);
+                    }
+                }
+                continue;
+            }
             let Some(bound) = state.bound else { continue };
             if bound.port() != dst.port()
                 || !bound.ip().is_unspecified() && bound.ip() != dst.ip()

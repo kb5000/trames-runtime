@@ -348,6 +348,16 @@ impl<'a> Socket<'a> {
         true
     }
 
+    /// Queue a complete IP packet after the enclosing interface has selected
+    /// this socket. Preserve the original IP header, including its options.
+    pub fn enqueue_ip_packet(&mut self, packet: &[u8]) {
+        if let Ok(buf) = self.rx_buffer.enqueue(packet.len(), ()) {
+            buf.copy_from_slice(packet);
+            #[cfg(feature = "async")]
+            self.rx_waker.wake();
+        }
+    }
+
     pub(crate) fn process(&mut self, cx: &mut Context, ip_repr: &IpRepr, payload: &[u8]) {
         debug_assert!(self.accepts(ip_repr));
 
