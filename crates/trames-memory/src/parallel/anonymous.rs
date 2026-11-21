@@ -269,10 +269,35 @@ impl Anonymous {
     pub(super) fn mapped_end(&self, address: u64) -> Option<u64> {
         Some(self.range(address)?.end)
     }
-    pub(super) fn resident(&self, address: u64) -> u8 {
-        self.range(address)
-            .and_then(|range| range.store.lookup(address))
-            .map_or(0, |page| u8::from(page.charge.resident()))
+    pub(super) fn residency(&self, address: u64, pages: &mut [u8]) -> Result<(), MemoryError> {
+        let end = address + pages.len() as u64 * PAGE_SIZE;
+        let mut at = address;
+        while at < end {
+            if let Some(range) = self.range(at) {
+                let hi = end.min(range.end);
+                let indices =
+                    ((at - address) / PAGE_SIZE) as usize..((hi - address) / PAGE_SIZE) as usize;
+                range.store.residency(at, &mut pages[indices])?;
+                at = hi;
+            } else {
+                // Explicit frames and PROT_NONE reservations are handled by the
+                // caller. Skip to the next sparse extent in either publication.
+                let next = self
+                    .ranges
+                    .range(at..end)
+                    .next()
+                    .map_or(end, |(&base, _)| base);
+                at = self
+                    .live
+                    .ranges
+                    .lock()
+                    .unwrap()
+                    .range(at..next)
+                    .next()
+                    .map_or(next, |(&base, _)| base);
+            }
+        }
+        Ok(())
     }
     pub(super) fn overlaps(&self, start: u64, end: u64) -> bool {
         self.base_range(start).is_some()

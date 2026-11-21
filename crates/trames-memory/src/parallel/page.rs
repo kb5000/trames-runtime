@@ -106,6 +106,16 @@ impl MutablePage {
         // cold physical-export contract. Hardware actors never modify Bytes.
         unsafe { &*self.bytes.get() }
     }
+    pub(crate) fn native_page_resident(&self) -> Result<u8, crate::MemoryError> {
+        let storage = {
+            let _regions = self.lock_regions(u64::MAX);
+            match self.storage() {
+                Bytes::Hardware(storage) => storage.clone(),
+                _ => return Ok(1),
+            }
+        };
+        storage.page_resident()
+    }
     /// Retain a previously exported owner without touching guest bytes, paging
     /// in a source or revoking hardware access. Cold translation reuse only.
     pub(crate) fn retained_hardware(&self) -> Option<std::sync::Arc<dyn crate::HardwareStorage>> {

@@ -2084,6 +2084,10 @@ impl Vfs {
             b"/proc/sys/kernel/domainname" => { let mut n = self.uts_name(true); n.push(b'\n'); return Ok(Some((file(n), 0o100644))); },
             b"/proc/sys/kernel/overflowuid" | b"/proc/sys/kernel/overflowgid" => return Ok(Some((file(format!("{}\n", self.credentials.user_namespace.overflow().get(path.ends_with(b"gid"))).into_bytes()), 0o100644))),
             b"/proc/sys/kernel/cap_last_cap" => return Ok(regular(format!("{}\n", capabilities::LAST).into_bytes())),
+            // The guest ELF loader, initial stack and mmap search use fixed bases.
+            b"/proc/sys/kernel/randomize_va_space" => return Ok(regular(b"0\n".to_vec())),
+            // MAP_FIXED admits guest address zero. No low-address floor is configured.
+            b"/proc/sys/vm/mmap_min_addr" => return Ok(regular(b"0\n".to_vec())),
             b"/proc/sys/kernel/pid_max" => return Ok(regular(b"2147483647\n".to_vec())),
             b"/proc/sys/kernel/threads-max" => return Ok(regular(format!("{task_limit}\n").into_bytes())),
             sysctl::MAX_USER_NAMESPACES => return Ok(Some((file(format!("{}\n", self.user_namespace_limits().max()).into_bytes()), 0o100644))),
@@ -2896,6 +2900,7 @@ impl Vfs {
                 "overflowuid",
                 "overflowgid",
                 "threads-max",
+                "randomize_va_space",
                 "random",
             ]
             .iter()
@@ -2914,7 +2919,7 @@ impl Vfs {
                 b"suid_dumpable".to_vec(),
             ],
             b"/proc/sys/user" => vec![b"max_user_namespaces".to_vec()],
-            b"/proc/sys/vm" => vec![b"overcommit_memory".to_vec()],
+            b"/proc/sys/vm" => vec![b"overcommit_memory".to_vec(), b"mmap_min_addr".to_vec()],
             b"/proc/sys/net" => vec![b"ipv4".to_vec(), b"ipv6".to_vec(), b"bridge".to_vec()],
             b"/proc/sys/net/bridge" => vec![
                 b"bridge-nf-call-iptables".to_vec(),

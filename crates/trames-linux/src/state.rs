@@ -2373,6 +2373,30 @@ mod tests {
         assert!(m.is_reserved(at + PAGE_SIZE, PAGE_SIZE));
     }
     #[test]
+    fn proc_address_policy_matches_fixed_zero_and_repeatable_mmap_layout() {
+        let run = || {
+            let mut linux = Linux::new(0x3000);
+            linux.vfs.set_runtime_info(1, Default::default());
+            let mut m = memory();
+            for (path, expected) in [
+                (b"/proc/sys/vm/mmap_min_addr".as_slice(), b"0\n"),
+                (b"/proc/sys/kernel/randomize_va_space".as_slice(), b"0\n"),
+            ] {
+                let fd = linux.vfs.open_at(-100, path, 0, 0).unwrap();
+                assert_eq!(linux.vfs.pread(fd, 32, 0).unwrap(), expected);
+            }
+            assert_eq!(
+                linux.mmap([0, PAGE_SIZE, 3, 0x32, u64::MAX, 0], &mut m),
+                Ok(0)
+            );
+            linux
+                .mmap([0, PAGE_SIZE, 3, 0x22, u64::MAX, 0], &mut m)
+                .unwrap()
+        };
+        assert_eq!(run(), run());
+    }
+
+    #[test]
     fn accepted_mmap_hints_do_not_relocate_ordinary_allocations() {
         let mut linux = Linux::new(0x3000);
         let mut m = memory();

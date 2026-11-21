@@ -46,17 +46,23 @@ impl View {
     }
     pub(super) fn observe_resident(&self, address: u64, len: u64) -> Result<Vec<u8>, MemoryError> {
         self.observe_mapped(address, len)?;
-        Ok((address..address + len)
-            .step_by(PAGE_SIZE as usize)
-            .map(|base| {
-                if let Some(&index) = self.snapshot.pages.get(&base) {
-                    let frame = &self.snapshot.frames[index];
-                    u8::from(frame.charge.resident() && frame.error.is_none())
-                } else {
-                    self.snapshot.anonymous.resident(base)
-                }
-            })
-            .collect())
+        let mut pages = vec![0; (len / PAGE_SIZE) as usize];
+        self.snapshot.anonymous.residency(address, &mut pages)?;
+        for (&base, &index) in self.snapshot.pages.range(address..address + len) {
+            let frame = &self.snapshot.frames[index];
+            pages[((base - address) / PAGE_SIZE) as usize] = if frame.error.is_none() {
+                frame.charge.page_resident(
+                    frame
+                        .bytes
+                        .bytes
+                        .as_deref()
+                        .or_else(|| frame.bytes.loaded.get().map(Arc::as_ref)),
+                )?
+            } else {
+                0
+            };
+        }
+        Ok(pages)
     }
 }
 

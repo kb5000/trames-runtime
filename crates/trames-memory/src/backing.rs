@@ -436,23 +436,26 @@ impl Memory {
         }
         let end = Self::mapping_end(address, len)?;
         self.check_mapped_range(address, end)?;
-        Ok((address..end)
-            .step_by(PAGE_SIZE as usize)
-            .map(|base| {
-                self.pages.get(&base).map_or_else(
-                    || {
-                        self.anonymous
-                            .containing(base)
-                            .and_then(|(_, r)| r.store.lookup(base))
-                            .map_or(0, |p| u8::from(p.charge.resident()))
-                    },
-                    |&frame| {
-                        let page = self.frames[frame].as_ref().expect("page");
-                        u8::from(page.charge.resident() && page.check_backing(base).is_ok())
-                    },
-                )
-            })
-            .collect())
+        let mut pages = vec![0; ((end - address) / PAGE_SIZE) as usize];
+        for (base, range) in self.anonymous.overlapping(address, end) {
+            let lo = base.max(address);
+            let hi = range.end.min(end);
+            let first = ((lo - address) / PAGE_SIZE) as usize;
+            range.store.residency(
+                lo,
+                &mut pages[first..first + ((hi - lo) / PAGE_SIZE) as usize],
+            )?;
+        }
+        for (&base, &frame) in self.pages.range(address..end) {
+            let page = self.frames[frame].as_ref().expect("page");
+            pages[((base - address) / PAGE_SIZE) as usize] = if page.check_backing(base).is_ok() {
+                page.charge
+                    .page_resident(page.bytes.shared().map(Arc::as_ref))?
+            } else {
+                0
+            };
+        }
+        Ok(pages)
     }
     pub fn discard(&mut self, address: u64, len: u64) -> Result<(), MemoryError> {
         if let Some(shared) = &self.shared {

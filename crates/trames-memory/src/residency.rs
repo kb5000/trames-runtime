@@ -193,6 +193,13 @@ impl Charge {
             }
         }
     }
+    pub(super) fn page_resident(&self, bytes: Option<&SharedPage>) -> Result<u8, MemoryError> {
+        match self.state.load(Ordering::Relaxed) {
+            3 => bytes.map_or(Ok(1), SharedPage::native_page_resident),
+            2 => Ok(1),
+            _ => Ok(0),
+        }
+    }
     pub(super) fn resident(&self) -> bool {
         // Only quota membership: bytes are initialized before view publication
         // and shared CPU/native accesses use their own region/ARM ordering.

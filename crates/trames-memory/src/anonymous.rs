@@ -119,6 +119,39 @@ impl Store {
         }
         out
     }
+    /// Observe residency without creating page descriptors. A native range
+    /// owns physical residency even after a 4 KiB wrapper has been created.
+    pub(super) fn residency(&self, start: u64, pages: &mut [u8]) -> Result<(), MemoryError> {
+        let end = start + pages.len() as u64 * PAGE_SIZE;
+        if pages.len() == 1 {
+            pages[0] = u8::from(self.lookup(start).is_some_and(|p| p.charge.resident()));
+        } else {
+            pages.fill(0);
+            for shard in &self.pages {
+                for (&at, p) in shard.lock().unwrap().range(start..end) {
+                    pages[((at - start) / PAGE_SIZE) as usize] = u8::from(p.charge.resident());
+                }
+            }
+        }
+        if let Some(native) = &self.native {
+            let native = native.lock().unwrap();
+            let first = native
+                .ranges
+                .range(..=start)
+                .next_back()
+                .map_or(start, |(&at, _)| at);
+            for (&at, r) in native.ranges.range(first..end) {
+                let lo = start.max(at);
+                let hi = end.min(at + r.len() as u64);
+                if hi > lo {
+                    let indices =
+                        ((lo - start) / PAGE_SIZE) as usize..((hi - start) / PAGE_SIZE) as usize;
+                    r.residency((lo - at) as usize, &mut pages[indices])?;
+                }
+            }
+        }
+        Ok(())
+    }
     pub fn native_contains(&self, address: u64) -> bool {
         self.native.as_ref().is_some_and(|n| {
             n.lock()
@@ -211,6 +244,11 @@ struct RangePage {
 // SAFETY: a checked, retained subpage of the canonical complete range. Its
 // original hardware gate excludes actors before exposing any Rust byte borrow.
 unsafe impl crate::HardwareStorage for RangePage {
+    fn page_resident(&self) -> Result<u8, MemoryError> {
+        let mut flag = [0];
+        self.range.residency(self.offset, &mut flag)?;
+        Ok(flag[0])
+    }
     fn pointer(&self) -> *mut u8 {
         self.range.pointer().wrapping_add(self.offset)
     }
@@ -1053,6 +1091,14 @@ mod native_tests {
         fn resident_bytes(&self) -> usize {
             self.resident.load(Ordering::Relaxed)
         }
+        fn residency(&self, offset: usize, pages: &mut [u8]) -> Result<(), MemoryError> {
+            for (index, flag) in pages.iter_mut().enumerate() {
+                *flag = u8::from(
+                    self.resident_bytes() != 0 && offset / PAGE_SIZE as usize + index == 3,
+                );
+            }
+            Ok(())
+        }
     }
     fn setup(limit: usize) -> (Memory, Registry) {
         let mut m = Memory::new(limit);
@@ -1083,9 +1129,34 @@ mod native_tests {
                 .write(713);
         }
         native.resident.store(PAGE_SIZE as usize, Ordering::Relaxed);
+        assert_eq!(
+            CpuMemory::resident(&v, 0x202000, 3 * PAGE_SIZE),
+            Some(Ok(vec![0, 1, 0]))
+        );
+        assert!(m
+            .anonymous
+            .containing(0x203000)
+            .unwrap()
+            .1
+            .store
+            .lookup(0x203000)
+            .is_none());
         assert_eq!(v.read_array::<8>(0x203000).unwrap(), 713u64.to_le_bytes());
         assert_eq!(m.resident_bytes(), PAGE_SIZE as usize);
         drop(v);
+        m.commit_parallel().unwrap();
+        assert_eq!(m.resident(0x203000, 2 * PAGE_SIZE).unwrap(), [1, 0]);
+        native.resident.store(0, Ordering::Relaxed);
+        assert_eq!(m.resident(0x203000, PAGE_SIZE).unwrap(), [0]);
+        m.materialize_descriptors(0x203000, 1);
+        assert!(m.pages.contains_key(&0x203000));
+        assert_eq!(m.resident(0x203000, PAGE_SIZE).unwrap(), [0]);
+        let view = m.parallel_view(&mut r).unwrap();
+        assert_eq!(
+            CpuMemory::resident(&view, 0x203000, PAGE_SIZE),
+            Some(Ok(vec![0]))
+        );
+        drop(view);
         m.commit_parallel().unwrap();
         assert_eq!(m.read_array::<8>(0x203000).unwrap(), 713u64.to_le_bytes());
         let mut child = m.clone();

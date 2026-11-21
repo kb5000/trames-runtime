@@ -79,6 +79,11 @@ impl SharedMapping {
 /// or execution Views retain this owner while hardware can run. A stopped
 /// table may retain weak aliases only if it invalidates them before reuse.
 pub unsafe trait HardwareStorage: Send + Sync {
+    /// Ordinary exported slots are accounted per page. A slice of demand-paged
+    /// native RAM asks its physical owner even after leaving the sparse index.
+    fn page_resident(&self) -> Result<u8, crate::MemoryError> {
+        Ok(1)
+    }
     fn pointer(&self) -> *mut u8;
     fn physical_address(&self) -> u64;
     /// False only after this storage can never again have a hardware actor.
@@ -111,6 +116,24 @@ pub unsafe trait HardwareRange: HardwareStorage {
         self.len() == 0
     }
     fn resident_bytes(&self) -> usize;
+    /// Fill one byte per requested 4 KiB guest page with current physical residency.
+    /// Offset and length describe an aligned subrange of this allocation.
+    fn residency(&self, offset: usize, pages: &mut [u8]) -> Result<(), crate::MemoryError> {
+        // An aggregate distinguishes empty and full ranges only. A provider
+        // with partially resident RAM must supply its own page-level query.
+        let resident = self.resident_bytes();
+        if resident != 0 && resident != self.len() {
+            return Err(crate::MemoryError::BackingIo(95));
+        }
+        if !offset.is_multiple_of(crate::PAGE_SIZE as usize)
+            || pages.len() > self.len().saturating_sub(offset) / crate::PAGE_SIZE as usize
+            || offset > self.len()
+        {
+            return Err(crate::MemoryError::InvalidRange);
+        }
+        pages.fill(u8::from(resident != 0));
+        Ok(())
+    }
     /// Guest-page offsets whose bytes may differ from untouched zeroes, including
     /// compressed/paged-out storage. Returning every page is a safe fallback.
     /// Omitted pages must still be the original zeroes; residency alone is not
