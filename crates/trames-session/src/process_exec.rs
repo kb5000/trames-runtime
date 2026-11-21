@@ -137,6 +137,7 @@ impl<C: Cpu> Kernel<C> {
             .vfs
             .set_dumpable(dumpable)
             .expect("prepared dumpable value");
+        runtime.linux.personality = p.linux.personality.clone();
         runtime.linux.memory_policy = p.linux.memory_policy.clone();
         runtime.linux.trace = p.linux.trace;
         runtime.linux.task_limit = p.linux.task_limit;
@@ -546,10 +547,16 @@ mod tests {
             .unwrap();
         k.processes.insert(2, init);
         let mut leader = k.processes.remove(&3).unwrap();
+        assert_eq!(leader.linux.personality.call(0x0100_0000), Ok(0));
         k.syscall(3, &mut leader, 220, [0x10f00, 0, 0, 0, 0, 0], &mut output)
             .unwrap();
         k.processes.insert(3, leader);
         let mut thread = k.processes.remove(&4).unwrap();
+        assert_eq!(thread.linux.personality.call(0x0200_0000), Ok(0x0100_0000));
+        assert_eq!(
+            k.processes.read(&3).linux.personality.call(u32::MAX as u64),
+            Ok(0x0100_0000)
+        );
         let namespace = thread.linux.vfs.pid_namespace().clone();
         assert_eq!(namespace.hierarchy(4), vec![4, 3]);
         k.processes
@@ -576,6 +583,10 @@ mod tests {
         )
         .unwrap();
         assert!(k.backend_error.is_none());
+        assert_eq!(
+            thread.linux.personality.call(u32::MAX as u64),
+            Ok(0x0200_0000)
+        );
         assert_eq!(thread.rekey, Some(3));
         assert_eq!(namespace.local(3), 2);
         assert_eq!(

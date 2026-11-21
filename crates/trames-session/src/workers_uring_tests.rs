@@ -8,6 +8,7 @@ fn snapshot(direct: trames_linux::DirectSyscalls) -> crate::worker_syscalls::Sna
     crate::worker_syscalls::Snapshot {
         diagnostics: None,
         name: Default::default(),
+        personality: Default::default(),
         memory_policy: Default::default(),
         membarrier_registered: None,
         vfork_release: None,

@@ -10,6 +10,32 @@ pub fn uts_call(
     a: [u64; 6],
     memory: &mut impl CpuMemory,
 ) -> Result<u64, Errno> {
+    uts_call_with_release(uts, false, number, a, memory)
+}
+
+pub fn uts_call_for_task(
+    uts: &UtsAccess,
+    personality: &crate::TaskPersonality,
+    number: u32,
+    a: [u64; 6],
+    memory: &mut impl CpuMemory,
+) -> Result<u64, Errno> {
+    uts_call_with_release(
+        uts,
+        number == 160 && personality.uname26(),
+        number,
+        a,
+        memory,
+    )
+}
+
+fn uts_call_with_release(
+    uts: &UtsAccess,
+    uname26: bool,
+    number: u32,
+    a: [u64; 6],
+    memory: &mut impl CpuMemory,
+) -> Result<u64, Errno> {
     if number == 160 {
         Linux::check(memory, a[0], 390, Access::Write)?;
         let [hostname, domainname] = uts.names();
@@ -17,7 +43,11 @@ pub fn uts_call(
         for (i, text) in [
             b"Linux".as_slice(),
             hostname.as_slice(),
-            b"6.0.0-trames",
+            if uname26 {
+                b"2.6.60-trames"
+            } else {
+                b"6.0.0-trames"
+            },
             b"#1 Trames compatibility runtime",
             b"aarch64",
             domainname.as_slice(),
@@ -44,6 +74,27 @@ pub fn uts_call(
 mod tests {
     use super::*;
     use trames_memory::{Memory, Permissions, PAGE_SIZE};
+    #[test]
+    fn uname_release_tracks_the_calling_task() {
+        let access = trames_vfs::Vfs::default().uts_capability();
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        let parent = crate::TaskPersonality::default();
+        let child = parent.fork();
+        let worker = child.clone();
+        assert_eq!(worker.call(0x0002_0000), Ok(0));
+        assert_eq!(worker.call(8), Err(Errno(22)));
+        assert_eq!(child.call(u64::MAX), Ok(0x0002_0000));
+        for (task, expected) in [
+            (&parent, b"6.0.0-trames".as_slice()),
+            (&child, b"2.6.60-trames".as_slice()),
+        ] {
+            uts_call_for_task(&access, task, 160, [0x1000, 0, 0, 0, 0, 0], &mut memory).unwrap();
+            let release = memory.read_array::<65>(0x1000 + 130).unwrap();
+            assert_eq!(release.split(|&b| b == 0).next(), Some(expected));
+        }
+    }
+
     #[test]
     fn uts_abi_checks_faults_lengths_and_permission_without_changing_names() {
         let mut v = trames_vfs::Vfs::default();

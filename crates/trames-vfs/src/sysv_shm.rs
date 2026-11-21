@@ -6,8 +6,8 @@ use crate::sysv_ipc::{now, Permissions};
 use std::sync::Mutex;
 use trames_memory::{MemoryError, PageBacking, SegmentAttachment, SharedAnonymousPages, PAGE_SIZE};
 
-const MAX_SEGMENTS: u64 = 4096;
-const MAX_SIZE: u64 = u64::MAX - (1 << 24);
+pub(super) const MAX_SEGMENTS: u64 = 4096;
+pub(super) const MAX_SIZE: u64 = u64::MAX - (1 << 24);
 const SLOT_MASK: u32 = 32767;
 #[derive(Default)]
 pub(super) struct Segments(Mutex<Directory>);

@@ -119,7 +119,7 @@ def main():
     merged.sort(key=lambda r:(r['suite'],r['case']))
     final=dict(plans[0] if plans else plan,suites=plan['suites'],discovery_errors=discovery_errors,workers=outcomes)
     for worker_plan in plans:
-        for fixture in ('host_pty_fixture', 'setgid_fixture'):
+        for fixture in ('host_pty_fixture', 'setgid_fixture', 'multiprocess_fixture'):
             if fixture in worker_plan:
                 final[fixture] = worker_plan[fixture]
     save(out/'plan.json',final);save(out/'results.json',merged)

@@ -8,8 +8,8 @@ mod undo;
 use undo::Group;
 pub use undo::UndoMember;
 
-const MAX_SETS: u32 = 32000;
-const MAX_SEMS: u32 = 32000;
+pub(super) const MAX_SETS: u32 = 32000;
+pub(super) const MAX_SEMS: u32 = 32000;
 const MAX_VALUE: i32 = 32767;
 pub const MAX_OPS: usize = 500;
 const INDEX_MASK: u32 = 32767;

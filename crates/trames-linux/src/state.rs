@@ -79,6 +79,7 @@ pub struct Linux {
     pub executing_file: Option<std::sync::Arc<trames_vfs::ExecutingFile>>,
     pub executable_file: Option<std::sync::Arc<trames_vfs::ExecutableFile>>,
     pub memory_policy: std::sync::Arc<crate::TaskMemoryPolicy>,
+    pub personality: crate::TaskPersonality,
     pub command_name: trames_vfs::TaskName,
     pub argument_pointers: Vec<u64>,
     pub auxiliary: Vec<u8>,
@@ -124,6 +125,7 @@ impl Linux {
             executing_file: self.executing_file.clone(),
             executable_file: self.executable_file.clone(),
             memory_policy: std::sync::Arc::new(self.memory_policy.fork()),
+            personality: self.personality.fork(),
             command_name: self.command_name.fork(),
             argument_pointers: self.argument_pointers.clone(),
             auxiliary: self.auxiliary.clone(),
@@ -186,6 +188,7 @@ impl Linux {
             executing_file: None,
             executable_file: None,
             memory_policy: Default::default(),
+            personality: Default::default(),
             command_name: Default::default(),
             argument_pointers: Vec::new(),
             auxiliary: Vec::new(),
@@ -1601,13 +1604,6 @@ impl Linux {
             memory.read_u64(a[3] + 8).map_err(|_| Errno(14))?,
         ))
     }
-    /// The native AArch64 execution domain can only be queried/reselected.
-    pub fn personality(value: u64) -> Result<u64> {
-        match value as u32 {
-            0 | u32::MAX => Ok(0),
-            _ => Err(Errno(22)),
-        }
-    }
     trames_shared::syscall_dispatch! {
         number number, args a;
         pub(crate) fn syscall(
@@ -1622,7 +1618,7 @@ impl Linux {
             5..=17 | 33..=41 | 43 | 44 | 49..=55 | 88 | 180 | 181 | 276 | 279 | 428..=432 | 452 => {
                 crate::direct::namespace::owner(number as u32, a, memory, &mut self.vfs)
             },
-            92 => Self::personality(a[0]),
+            92 => self.personality.call(a[0]),
             425 => self.uring_setup(a, memory),
             426 => self
                 .uring_enter(a, memory, None, 0)
@@ -1647,7 +1643,7 @@ impl Linux {
             182 | 183 | 185..=193 => crate::direct::message::call(&self.vfs.descriptor_factory(), number as u32, a, memory, self.vfs.process_context()),
             280 => self.bpf_syscall(a, memory),
             number @ 160..=162 => {
-                crate::uts_call(&self.vfs.uts_capability(), number as u32, a, memory)
+                crate::uts_call_for_task(&self.vfs.uts_capability(), &self.personality, number as u32, a, memory)
             },
             71 | 76..=77 | 84 | 213 | 223 | 267 | 285 | 286 | 287 | 437 => {
                 self.file_syscall(number, a, memory, io)

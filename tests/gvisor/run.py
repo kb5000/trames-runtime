@@ -83,6 +83,8 @@ def guest_test_work(suite):
         # Keep the original XML on persistent storage for the later export.
         return 'mkdir -p "$1/tmpfs"; mount -t tmpfs -o mode=1777 tmpfs "$1/tmpfs"; cd "$1/tmpfs"; export TEST_TMPDIR="$PWD"; '
     work = 'mkdir -p "$1"; cd "$1"; export TEST_TMPDIR="$1"; '
+    if suite == 'concurrency':
+        return work + 'export GVISOR_PLATFORM_SUPPORT=MULTIPROCESS:TRUE; '
     if suite in ('rename','mount'):
         # The native reference has writable sysfs. Linux rejects even a
         # same-inode rename on an explicitly read-only mount.
@@ -172,7 +174,7 @@ def reuse_rows(args, plan):
     old = {s['name']:s['sha256'] for s in previous['suites']}
     if old != {s['name']:s['sha256'] for s in plan['suites']}:
         raise RuntimeError('Cannot reuse results from different binaries')
-    for key in ['kernel','uid','runtime_sha256','nofile','network','cpus','rootfs_sha256','runfiles_sha256','process_context','native_init_sha256','fresh_store','host_pty_fixture','setgid_fixture','memfd_tmpfs_fixture','writable_sysfs_fixture','custom_rootfs']:
+    for key in ['kernel','uid','runtime_sha256','nofile','network','cpus','rootfs_sha256','runfiles_sha256','process_context','native_init_sha256','fresh_store','host_pty_fixture','setgid_fixture','memfd_tmpfs_fixture','writable_sysfs_fixture','multiprocess_fixture','custom_rootfs']:
         if key in plan and previous.get(key) != plan[key]:
             raise RuntimeError('Cannot reuse results with a different '+key)
     return {(r['suite'],r['case']):dict(r,reused_from=str(args.reuse.resolve()/'logs'/(r.get('log_stem') or str(i))))
@@ -223,6 +225,8 @@ def native(args, output):
     if not any(s['cases'] for s in plan['suites']):raise RuntimeError('No cases selected')
     plan['case_execution'] = dict(timeout_base=args.timeout, suite_timeouts=args.suite_timeouts, upstream_wait_timeouts=UPSTREAM_WAIT_TIMEOUTS)
     if args.native_init:plan['native_init_sha256']=digest(args.native_init)
+    if any(s['name'] == 'concurrency' for s in plan['suites']):
+        plan['multiprocess_fixture'] = 'MULTIPROCESS:TRUE'
     if any(s['name'] == 'host_pty' for s in plan['suites']):
         plan['host_pty_fixture'] = True
     if any(s['name'] == 'setgid' for s in plan['suites']):
@@ -256,7 +260,7 @@ def native(args, output):
                     fixture = ['/bin/sh', '-ec', 'mount -t tmpfs -o mode=1777 tmpfs "$TEST_TMPDIR"; cd "$TEST_TMPDIR"; exec "$@"', 'gvisor-memfd']
                 argv = ['unshare', '--mount', '--uts', '--ipc', '--net', '--pid', '--fork', '--kill-child=KILL', '--mount-proc',
                         '--', *([str(args.native_init)] if args.native_init else []), '/usr/bin/env', '-u', 'TEST_ON_GVISOR', '-u', 'GVISOR_SAVE_TEST', 'TEST_TMPDIR=' + str(work), 'TEST_SRCDIR='+str(binaries/'runfiles'), 'RUNFILES_DIR='+str(binaries/'runfiles'),
-                        *fixture, str(binary), *suite_flags(suite['name']), '--gtest_color=no', '--gtest_filter=' + case, '--gtest_output=xml:' + str(xml)]
+                        *(['GVISOR_PLATFORM_SUPPORT=MULTIPROCESS:TRUE'] if suite['name'] == 'concurrency' else []), *fixture, str(binary), *suite_flags(suite['name']), '--gtest_color=no', '--gtest_filter=' + case, '--gtest_output=xml:' + str(xml)]
                 code, timed, seconds = execute(argv, output/'logs'/(str(index)+'.stdout'), output/'logs'/(str(index)+'.stderr'), watchdog(args, suite['name'], case), cwd=work, min_free=int(args.min_free_gib*1024**3), host_pty=suite['name']=='host_pty')
                 status, messages = classify(xml, code, timed, case)
                 rows.append(dict(suite=suite['name'], case=case, status=status, code=code, seconds=seconds, messages=messages))
@@ -285,6 +289,8 @@ def trames(args, output):
     plan['runfiles_sha256']={str(p.relative_to(binaries)):digest(p) for p in (binaries/'runfiles').rglob('*') if p.is_file()}
 
     plan.pop('kernel',None);plan.pop('uid',None);plan.pop('nofile',None);plan.pop('native_init_sha256',None)
+    if any(s['name'] == 'concurrency' for s in plan['suites']):
+        plan['multiprocess_fixture'] = 'MULTIPROCESS:TRUE'
     if any(s['name'] == 'host_pty' for s in plan['suites']):
         plan['host_pty_fixture'] = True
     if any(s['name'] == 'setgid' for s in plan['suites']):

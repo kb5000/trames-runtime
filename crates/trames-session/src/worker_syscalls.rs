@@ -85,6 +85,7 @@ impl ExitResources<'_> {
 pub(super) struct Snapshot {
     pub diagnostics: Option<trames_linux::SyscallDiagnostics>,
     pub name: trames_vfs::TaskName,
+    pub personality: trames_linux::TaskPersonality,
     pub memory_policy: Arc<trames_linux::TaskMemoryPolicy>,
     pub membarrier_registered: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub vfork_release: Option<Arc<trames_kernel::vfork::Release>>,
@@ -976,7 +977,7 @@ impl Snapshot {
                 cpu.x(1),
                 memory,
             ),
-            92 => trames_linux::Linux::personality(cpu.x(0)),
+            92 => self.personality.call(cpu.x(0)),
             96 => {
                 self.io_signals.thread_addresses()?.set_clear_tid(cpu.x(0));
                 Ok(self.identities[6])
@@ -1136,8 +1137,9 @@ impl Snapshot {
             136 => self
                 .io_signals
                 .pending_call(std::array::from_fn(|i| cpu.x(i)), memory),
-            number @ 160..=162 => trames_linux::uts_call(
+            number @ 160..=162 => trames_linux::uts_call_for_task(
                 self.uts.as_ref()?,
+                &self.personality,
                 number,
                 std::array::from_fn(|i| cpu.x(i)),
                 memory,
@@ -1419,6 +1421,7 @@ mod tests {
         let snapshot = Snapshot {
             diagnostics: None,
             name: Default::default(),
+            personality: Default::default(),
             memory_policy: Default::default(),
             membarrier_registered: None,
             vfork_release: None,
@@ -1565,6 +1568,7 @@ mod tests {
         let snapshot = Snapshot {
             diagnostics: None,
             name: Default::default(),
+            personality: Default::default(),
             memory_policy: Default::default(),
             membarrier_registered: None,
             vfork_release: None,
@@ -1633,6 +1637,7 @@ mod tests {
         let mut snapshot = Snapshot {
             diagnostics: None,
             name: Default::default(),
+            personality: Default::default(),
             memory_policy: Default::default(),
             membarrier_registered: None,
             vfork_release: None,
@@ -1744,6 +1749,7 @@ mod tests {
         let snapshot = Snapshot {
             diagnostics: None,
             name: Default::default(),
+            personality: Default::default(),
             memory_policy: Default::default(),
             membarrier_registered: None,
             vfork_release: None,
@@ -1820,6 +1826,7 @@ mod tests {
         let snapshot = Snapshot {
             diagnostics: None,
             name: Default::default(),
+            personality: Default::default(),
             memory_policy: Default::default(),
             membarrier_registered: None,
             vfork_release: None,
