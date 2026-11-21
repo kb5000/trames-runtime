@@ -1619,6 +1619,32 @@ mod shared_lifetime_tests {
     }
 
     #[test]
+    fn datagram_size_queries_preserve_empty_records_and_pending_delivery() {
+        let fabric = Fabric::new().unwrap();
+        let net = crate::Network::virtual_network(&fabric, 2, NetworkMode::Full).unwrap();
+        for (family, address) in [(2, "127.0.0.1:34113"), (10, "[::1]:34113")] {
+            let socket = net.socket(family, 2, 0).unwrap();
+            let address = address.parse().unwrap();
+            socket.bind(address).unwrap();
+            socket.connect(address).unwrap();
+            for payload in [b"".as_slice(), b"12", b"345"] {
+                socket.send(payload, 0, None).unwrap();
+            }
+            socket.shutdown(0).unwrap();
+            for length in [0, 2, 3] {
+                assert_eq!(socket.readable_bytes(), Ok(Some(length)));
+                assert_eq!(socket.recv(1, MSG_PEEK | MSG_TRUNC).unwrap().length, length);
+                assert_eq!(socket.readable_bytes(), Ok(Some(length)));
+                socket.recv(1, 0).unwrap();
+            }
+            assert!(matches!(socket.recv(1, MSG_DONTWAIT), Err(NetError(11))));
+            assert_eq!(socket.recv(1, 0).unwrap().length, 0);
+        }
+        let ping = net.socket(2, 2, 1).unwrap();
+        assert_eq!(ping.readable_bytes(), Err(NetError(25)));
+    }
+
+    #[test]
     fn udp_counters_follow_the_receiving_namespace_and_ignore_peeks() {
         let fabric = Fabric::new().unwrap();
         let clients = fabric.environment(2, NetworkMode::Full).unwrap();

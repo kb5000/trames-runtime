@@ -241,6 +241,23 @@ impl<'a, H> PacketBuffer<'a, H> {
         }
     }
 
+    /// Read lengths from the metadata ring without touching the payload or
+    /// consuming a zero-length record. Padding can occur at a wrap boundary.
+    pub fn first_matching_len(&self, mut accepts: impl FnMut(&H) -> bool) -> Option<usize> {
+        let len = self.metadata_ring.len();
+        let mut offset = 0;
+        while offset < len {
+            let records = self.metadata_ring.get_allocated(offset, len - offset);
+            for record in records {
+                if record.header.as_ref().is_some_and(&mut accepts) {
+                    return Some(record.size);
+                }
+            }
+            offset += records.len();
+        }
+        None
+    }
+
     /// Return the maximum number packets that can be stored.
     pub fn packet_capacity(&self) -> usize {
         self.packet_limit

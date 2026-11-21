@@ -571,6 +571,45 @@ impl Socket {
         );
         sources
     }
+    pub fn datagram_readable_bytes(&self) -> Result<usize> {
+        if self.kind != 2 {
+            return Err(NetError(25));
+        }
+        for (&address, dns) in self.dns.borrow().iter() {
+            if self.dns_peer.get() && address != self.dns_target.get() {
+                continue;
+            }
+            if let Some(len) = dns.next_datagram_len() {
+                return Ok(len);
+            }
+        }
+        if self.dns_peer.get() {
+            return Ok(0);
+        }
+        let fd = self.native.as_fd().as_raw_fd();
+        let mut bytes: libc::c_int = 0;
+        // Darwin FIONREAD includes the entire record queue and its overhead.
+        // SO_NREAD returns the first datagram length. Linux FIONREAD does too.
+        #[cfg(target_vendor = "apple")]
+        let result = {
+            let mut len = std::mem::size_of_val(&bytes) as libc::socklen_t;
+            unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_NREAD,
+                    (&mut bytes as *mut libc::c_int).cast(),
+                    &mut len,
+                )
+            }
+        };
+        #[cfg(not(target_vendor = "apple"))]
+        let result = unsafe { libc::ioctl(fd, libc::FIONREAD, &mut bytes) };
+        if result == -1 {
+            return Err(from_io(std::io::Error::last_os_error()));
+        }
+        Ok(bytes.max(0) as usize)
+    }
     pub fn tcp_readable_bytes(&self) -> Result<usize> {
         if self.native.state.connection() == Connection::Listening {
             return Err(NetError(22));

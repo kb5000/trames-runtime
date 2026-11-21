@@ -753,11 +753,23 @@ impl Socket {
         Some(info)
     }
     pub fn tcp_readable_bytes(&self) -> Result<Option<usize>> {
-        if self.kind != 1 {
+        if self.kind == 1 {
+            self.readable_bytes()
+        } else {
+            Ok(None)
+        }
+    }
+    pub fn readable_bytes(&self) -> Result<Option<usize>> {
+        if !matches!(self.kind, 1 | 2) {
             return Ok(None);
         }
         let _operation = self.operation.read_recursive();
         match &self.backend {
+            SocketBackend::Native(s) if self.kind == 2 => s.datagram_readable_bytes().map(Some),
+            SocketBackend::Hybrid(s) if self.kind == 2 => s.datagram_readable_bytes().map(Some),
+            SocketBackend::Virtual(s) if self.kind == 2 => {
+                Ok(Some(s.next_datagram_len(None)?.unwrap_or(0)))
+            }
             SocketBackend::Native(s) => s.tcp_readable_bytes().map(Some),
             SocketBackend::Hybrid(s) => s.tcp_readable_bytes().map(Some),
             SocketBackend::Virtual(s) => s.tcp_readable_bytes().map(Some),

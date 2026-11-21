@@ -228,7 +228,7 @@ impl Prepared {
     }
     pub fn progress(
         &self,
-        socket: &trames_net::Socket,
+        socket: &trames_vfs::SocketOperation,
         memory: &mut impl CpuMemory,
         send: impl FnOnce(&[u8], u32, Option<&[u8]>) -> Result<usize>,
     ) -> Result<u64> {
@@ -253,7 +253,13 @@ impl Prepared {
                 address,
                 message,
             } => {
-                let received = socket.recv(buffer.size(), self.flags).map_err(net)?;
+                let flags = self.flags
+                    | if socket.flags() & trames_vfs::O_NONBLOCK != 0 {
+                        0x40
+                    } else {
+                        0
+                    };
+                let received = socket.recv(buffer.size(), flags).map_err(net)?;
                 buffer.write(memory, &received.data)?;
                 if let Some(output) = address {
                     output.write_bytes(memory, &socket.received_address(&received))?;

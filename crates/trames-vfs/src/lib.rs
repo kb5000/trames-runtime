@@ -1369,7 +1369,7 @@ impl Vfs {
         }
         if let Some(socket) = open.socket.clone() {
             drop(open);
-            return socket.tcp_readable_bytes().map_err(|e| Errno(e.0));
+            return socket.readable_bytes().map_err(|e| Errno(e.0));
         }
         if let Some(end) = &open.pipe {
             return Ok(Some(end.data.lock().unwrap().bytes.len()));
@@ -3592,7 +3592,14 @@ impl Vfs {
         }
         if let Some(socket) = &o.socket {
             return socket
-                .recv(count, 0)
+                .recv(
+                    count,
+                    if o.flags.get() & O_NONBLOCK != 0 {
+                        0x40
+                    } else {
+                        0
+                    },
+                )
                 .map(|r| r.data)
                 .map_err(|e| Errno(e.0));
         }

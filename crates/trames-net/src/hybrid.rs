@@ -468,7 +468,10 @@ impl Socket {
         }
     }
     pub fn recv(&self, count: usize, flags: u32) -> Result<Received> {
-        if matches!(self.path.get(), Path::Guest | Path::Both) {
+        if self.path.get() == Path::Guest {
+            return self.guest()?.recv(count, flags);
+        }
+        if self.path.get() == Path::Both {
             let guest = self.guest()?;
             // A UDP sendto override does not change a connected socket's peer.
             for _ in 0..16 {
@@ -527,6 +530,18 @@ impl Socket {
         } else {
             self.native()?.linger()
         }
+    }
+    pub fn datagram_readable_bytes(&self) -> Result<usize> {
+        match self.path.get() {
+            Path::Guest => return Ok(self.guest()?.next_datagram_len(None)?.unwrap_or(0)),
+            Path::Both => {
+                if let Some(len) = self.guest()?.next_datagram_len(self.peer.get())? {
+                    return Ok(len);
+                }
+            }
+            _ => {}
+        }
+        self.native()?.datagram_readable_bytes()
     }
     pub fn tcp_readable_bytes(&self) -> Result<usize> {
         if self.path.get() == Path::Guest {

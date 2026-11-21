@@ -187,6 +187,13 @@ impl Endpoint {
             notify,
         }))
     }
+    pub fn next_datagram_len(&self) -> Option<usize> {
+        let state = self.state.lock().unwrap();
+        if state.read_closed {
+            return None;
+        }
+        state.replies.front().map(Vec::len)
+    }
     pub fn waiter(&self) -> Arc<UnixDatagram> {
         self.ready.clone()
     }

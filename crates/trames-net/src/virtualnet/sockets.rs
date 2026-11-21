@@ -662,7 +662,8 @@ impl Socket {
         let mut i = self.network.0.fabric.0.borrow_mut();
         let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
         let mut state = self.state.borrow_mut();
-        if state.connection != Connection::Connected {
+        let connected = state.connection == Connection::Connected;
+        if !connected && self.kind != 2 {
             return Err(NetError(107));
         }
         if how != 1 {
@@ -677,7 +678,11 @@ impl Socket {
         drop(state);
         drop(i);
         self.fabric().tick();
-        Ok(())
+        if connected {
+            Ok(())
+        } else {
+            Err(NetError(107))
+        }
     }
     // The caller has already progressed the original fabric. Never reacquire
     // it here just to recheck the same connection/error state.
@@ -917,7 +922,7 @@ impl Socket {
                 }
             }
         }
-        if state.read_closed || self.kind == 1 && count == 0 {
+        if self.kind == 1 && (state.read_closed || count == 0) {
             return Ok(Received {
                 packet_address: None,
                 netlink_address: None,
@@ -988,12 +993,10 @@ impl Socket {
         } else {
             for h in &state.handles {
                 let s = n.sockets.get_mut::<udp::Socket>(*h);
-                while let Ok((data, meta)) = s.peek() {
+                if let Ok((data, meta)) = s.peek() {
+                    // Peer filtering occurs on ingress. Datagrams queued before
+                    // connect retain their original source and delivery order.
                     let source = address(meta.endpoint);
-                    if state.peer.is_some_and(|peer| peer != source) {
-                        let _ = s.recv();
-                        continue;
-                    }
                     let size = data.len();
                     let bytes = data[..count.min(size)].to_vec();
                     let packet_info = if state.receive_packet_info {
@@ -1039,6 +1042,18 @@ impl Socket {
                         truncated: size > count,
                     });
                 }
+            }
+            if state.read_closed && flags & MSG_DONTWAIT == 0 {
+                return Ok(Received {
+                    packet_address: None,
+                    netlink_address: None,
+                    credentials: None,
+                    packet_info: None,
+                    data: Vec::new(),
+                    address: None,
+                    length: 0,
+                    truncated: false,
+                });
             }
             Err(NetError(11))
         }
@@ -1105,6 +1120,12 @@ impl Socket {
                 if s.can_send() {
                     ready |= 4;
                 }
+            }
+        }
+        if self.kind == 2 && state.read_closed {
+            ready |= 1 | 0x2000;
+            if state.write_closed {
+                ready |= 16;
             }
         }
         if self.kind != 1 && state.handles.is_empty() {
@@ -1220,6 +1241,21 @@ impl Socket {
         drop(state);
         i.driver_dirty = true;
         Ok(())
+    }
+    pub fn next_datagram_len(&self, peer: Option<SocketAddr>) -> Result<Option<usize>> {
+        if self.kind != 2 {
+            return Err(NetError(25));
+        }
+        let mut fabric = self.network.0.fabric.0.borrow_mut();
+        fabric.tick();
+        let node = fabric.nodes.get(&self.network.0.key).ok_or(NetError(100))?;
+        let peer = peer.map(|p| endpoint(SocketAddr::new(p.ip().to_canonical(), p.port())));
+        Ok(self
+            .state
+            .borrow()
+            .handles
+            .iter()
+            .find_map(|h| node.sockets.get::<udp::Socket>(*h).next_datagram_len(peer)))
     }
     pub fn tcp_readable_bytes(&self) -> Result<usize> {
         let mut fabric = self.network.0.fabric.0.borrow_mut();

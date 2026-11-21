@@ -502,6 +502,11 @@ impl<'a> Socket<'a> {
         Ok((length, endpoint))
     }
 
+    /// Payload length of the next receive record from an optional peer.
+    pub fn next_datagram_len(&self, peer: Option<IpEndpoint>) -> Option<usize> {
+        self.rx_buffer.first_matching_len(|metadata| peer.is_none_or(|p| p == metadata.endpoint))
+    }
+
     /// Return the amount of octets queued in the transmit buffer.
     ///
     /// Note that the Berkeley sockets interface does not have an equivalent of this API.
