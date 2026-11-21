@@ -1982,10 +1982,12 @@ impl Vfs {
                 }
                 let value = match parts[1..] {
                     [b"online"] => "1\n".to_string(),
-                    [b"topology", b"core_id"] => format!("{cpu}\n"),
-                    [b"topology", b"physical_package_id"] => "0\n".to_string(),
-                    [b"topology", b"thread_siblings_list"] => format!("{cpu}\n"),
-                    [b"topology", b"thread_siblings"] => format!("{:08x}\n", 1u32 << cpu),
+                    [b"topology", field] => {
+                        match cpu_topology::value(cpu, r.cpu_count.max(1), field) {
+                            Some(value) => value,
+                            None => return Ok(None),
+                        }
+                    }
                     _ => return Ok(None),
                 };
                 return Ok(regular(value.into_bytes()));
@@ -2012,7 +2014,7 @@ impl Vfs {
             b"/proc/sys/kernel" | b"/proc/sys/kernel/random" | b"/proc/sys/fs" | b"/proc/sys/vm" | b"/proc/sys/user" | b"/proc/sys/net" |
             b"/proc/sys/net/ipv4" | b"/dev/pts" => return Ok(directory()),
             b"/dev/tty" => return Ok(Some((Content::Terminal, 0o20666))),
-            b"/sys/devices/system/cpu/online"|b"/sys/devices/system/cpu/possible"|b"/sys/devices/system/cpu/present"=>return Ok(regular(if r.cpu_count.max(1)==1{b"0\n".to_vec()}else{format!("0-{}\n",r.cpu_count-1).into_bytes()})),
+            b"/sys/devices/system/cpu/online"|b"/sys/devices/system/cpu/possible"|b"/sys/devices/system/cpu/present"=>return Ok(regular(cpu_topology::list(r.cpu_count).into_bytes())),
             b"/sys/devices/system/cpu/offline"=>return Ok(regular(b"\n".to_vec())),
             b"/proc/self" => return Ok(link(own.map_or(current, |p| p.tgid).to_string().into_bytes())),
             b"/proc/thread-self" => return Ok(link(format!("{}/task/{}", own.map_or(current, |p| p.tgid), current).into_bytes())),
@@ -2369,67 +2371,12 @@ impl Vfs {
                     let info = network.as_ref().and_then(|n| n.info());
                     return Ok(match parts[i + 1] {
                         b"tcp" | b"tcp6" | b"udp" | b"udp6" | b"raw" | b"raw6" | b"icmp"
-                        | b"icmp6" => {
-                            let key = parts[i + 1];
-                            let family = if key.ends_with(b"6") { 10 } else { 2 };
-                            let (kind, protocol) = if key.starts_with(b"tcp") {
-                                (1, 6)
-                            } else if key.starts_with(b"udp") {
-                                (2, 17)
-                            } else if key.starts_with(b"raw") {
-                                (3, if family == 2 { 1 } else { 58 })
-                            } else {
-                                (2, if family == 2 { 1 } else { 58 })
-                            };
-                            let hex = |a: Option<std::net::SocketAddr>, port: Option<u16>| {
-                                let (address, p) = a.map_or(
-                                    (if family == 2 { vec![0; 4] } else { vec![0; 16] }, 0),
-                                    |a| {
-                                        (
-                                            match a.ip() {
-                                                std::net::IpAddr::V4(v) => v.octets().to_vec(),
-                                                std::net::IpAddr::V6(v) => v.octets().to_vec(),
-                                            },
-                                            a.port(),
-                                        )
-                                    },
-                                );
-                                format!(
-                                    "{}:{:04X}",
-                                    address
-                                        .chunks_exact(4)
-                                        .map(|p| format!(
-                                            "{:08X}",
-                                            u32::from_le_bytes(p.try_into().unwrap())
-                                        ))
-                                        .collect::<String>(),
-                                    port.unwrap_or(p)
-                                )
-                            };
-                            let mut data=String::from("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n");
-                            let mut seen = BTreeMap::new();
-                            for process in &r.processes {
-                                for fd in &process.fds {
-                                    if let Some(s) = fd.socket.as_ref().filter(|s| {
-                                        network
-                                            .as_ref()
-                                            .is_some_and(|n| n.namespace_id() == s.namespace_id)
-                                            && s.family == family
-                                            && s.kind == kind
-                                            && s.protocol == protocol
-                                    }) {
-                                        if seen.insert(fd.inode, ()).is_some() {
-                                            continue;
-                                        }
-                                        data.push_str(&format!("{:4}: {} {} {:02X} {:08X}:{:08X} 00:00000000 00000000 {:5} 0 {} 1 0000000000000000\n",seen.len()-1,hex(s.local,(kind==3).then_some(protocol as u16)),hex(s.peer,None),s.state,s.tx_queue.unwrap_or(0),s.rx_queue.unwrap_or(0),self.credentials.local_id(false,process.credentials.euid),fd.inode));
-                                    }
-                                }
-                            }
-                            regular(data.into_bytes())
-                        }
-                        b"unix" => regular(
-                            b"Num       RefCount Protocol Flags    Type St Inode Path\n".to_vec(),
-                        ),
+                        | b"icmp6" => regular(proc_inet::table(
+                            network.as_ref(),
+                            parts[i + 1],
+                            &self.credentials,
+                        )),
+                        b"unix" => regular(ipc::proc_unix(p.namespaces.net.upgrade().as_deref())),
                         b"dev" => {
                             let mut data=String::from("Inter-|   Receive                                                |  Transmit\n face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n");
                             if let Some(network) = &network {
@@ -2734,15 +2681,10 @@ impl Vfs {
                 return Ok(if parts.len() == 1 {
                     vec![b"online".to_vec(), b"topology".to_vec()]
                 } else if parts.len() == 2 && parts[1] == b"topology" {
-                    [
-                        "core_id",
-                        "physical_package_id",
-                        "thread_siblings_list",
-                        "thread_siblings",
-                    ]
-                    .iter()
-                    .map(|s| s.as_bytes().to_vec())
-                    .collect()
+                    cpu_topology::FILES
+                        .iter()
+                        .map(|s| s.as_bytes().to_vec())
+                        .collect()
                 } else {
                     Vec::new()
                 });
@@ -3252,10 +3194,12 @@ mod proc_probe_tests {
         for path in [
             b"/proc/self/fd/1".as_slice(),
             b"/proc/self/fdinfo/1",
-            b"/proc/self/net/tcp",
             b"/proc/sys/fs/file-nr",
         ] {
             assert_eq!(ProcRefresh::for_path(path), ProcRefresh::Descriptors);
+        }
+        for path in [b"/proc/self/net/tcp".as_slice(), b"/proc/self/net/unix"] {
+            assert_eq!(ProcRefresh::for_path(path), ProcRefresh::Metadata);
         }
         let fd = v.open_at(AT_FDCWD, b"/proc/self", O_DIRECTORY, 0).unwrap();
         assert_eq!(

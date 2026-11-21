@@ -19,19 +19,12 @@ fn socket_admission_lease_rolls_back_errors_and_releases_without_namespace_rc() 
     assert_eq!(root.live_sockets(), 1);
     // The real accounting lease has no owner graph. Split only in this
     // ownership test; ordinary sockets retain it through backend teardown.
-    let Socket {
-        backend,
-        namespace,
-        timeouts: _,
-        operation: _,
-        _reservation,
-        kind: _,
-        inode_owner: _,
-        changed: _,
-    } = Arc::try_unwrap(socket).ok().unwrap();
-    drop((backend, namespace));
+    let mut socket = Arc::try_unwrap(socket).ok().unwrap();
+    let replacement = Arc::new(socket_quota::Quota::default()).reserve().unwrap();
+    let reservation = std::mem::replace(&mut socket._reservation, replacement);
+    drop(socket);
     assert_eq!(root.live_sockets(), 1);
-    std::thread::spawn(move || drop(_reservation))
+    std::thread::spawn(move || drop(reservation))
         .join()
         .unwrap();
     assert_eq!(root.live_sockets(), 0);

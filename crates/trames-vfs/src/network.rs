@@ -382,7 +382,7 @@ impl Vfs {
         flags: u32,
         namespace: UserNamespace,
     ) -> Descriptor {
-        socket.initialize_inode_owner(owner.0, owner.1);
+        socket.publish_inode(id, owner);
         Descriptor {
             open: OpenHandle::new(OpenDescription {
                 shared: Arc::new(SharedOpenDescription {

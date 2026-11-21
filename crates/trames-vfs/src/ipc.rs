@@ -134,6 +134,8 @@ impl std::ops::Deref for LocalSocket {
 }
 
 pub struct LocalResource {
+    // Pending accepts have no file inode until installed as a description.
+    inode: AtomicU64,
     ownership: std::sync::Weak<ownership::Ownership>,
     namespace: Arc<SharedCell<LocalNamespace>>,
     network: Arc<linux_namespace::RootNetwork>,
@@ -194,6 +196,43 @@ pub(super) struct LocalNamespace {
     sockets: Vec<std::sync::Weak<LocalResource>>,
     next_autobind: u32,
 }
+pub(super) fn proc_unix(namespace: Option<&linux_namespace::RootNetwork>) -> Vec<u8> {
+    use std::io::Write;
+    let mut bytes = b"Num       RefCount Protocol Flags    Type St Inode Path\n".to_vec();
+    let Some(ns) = namespace else { return bytes };
+    // Do not take endpoint locks while holding the namespace binding lock.
+    let sockets: Vec<_> = ns
+        .local
+        .borrow()
+        .sockets
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .collect();
+    for socket in sockets {
+        let refs = Arc::strong_count(&socket);
+        let flags = if socket.listening() { 0x10000 } else { 0 };
+        let state = if socket.connected() { 3 } else { 1 };
+        let inode = socket.inode.load(Ordering::Relaxed);
+        write!(
+            bytes,
+            "0000000000000000: {refs:08X} 00000000 {flags:08X} {:04X} {state:02X} {inode}",
+            socket.kind
+        )
+        .unwrap();
+        let addr = socket.name.borrow();
+        let path = &addr[2..];
+        if !path.is_empty() {
+            bytes.push(b' ');
+            if path[0] == 0 {
+                bytes.extend(path.iter().map(|&c| if c == 0 { b'@' } else { c }));
+            } else {
+                bytes.extend_from_slice(path.split(|&c| c == 0).next().unwrap());
+            }
+        }
+        bytes.push(b'\n');
+    }
+    bytes
+}
 pub struct LocalReceived<R = LocalRights> {
     pub data: Vec<u8>,
     pub length: usize,
@@ -250,6 +289,7 @@ impl LocalResource {
         ownership: std::sync::Weak<ownership::Ownership>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            inode: AtomicU64::new(0),
             ownership,
             namespace: network.local.clone(),
             network,
@@ -673,6 +713,7 @@ impl Vfs {
         local: Arc<LocalResource>,
         flags: u32,
     ) -> Descriptor {
+        local.inode.store(id, Ordering::Relaxed);
         Descriptor {
             open: OpenHandle::new(OpenDescription {
                 shared: Arc::new(SharedOpenDescription {

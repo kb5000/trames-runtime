@@ -143,6 +143,16 @@ impl Network {
         };
         stack.fabric().unpublish(host, kind)
     }
+    /// Snapshot the live sockfs inodes in this network namespace. Endpoint
+    /// locks are acquired by readers after releasing the membership lock.
+    pub fn inet_inodes(&self) -> Vec<(u64, Arc<Socket>)> {
+        self.1
+            .inet_inodes
+            .lock()
+            .iter()
+            .filter_map(|(&(id, _), weak)| weak.upgrade().map(|socket| (id, socket)))
+            .collect()
+    }
     pub fn namespace_id(&self) -> u64 {
         self.1.id()
     }
@@ -402,6 +412,7 @@ impl Network {
     }
 }
 pub struct Socket {
+    proc_inode: std::sync::OnceLock<(u64, usize)>,
     inode_owner: Cell<u64>,
     // Immutable ABI type, retained across native/virtual endpoint transitions.
     kind: u32,
@@ -474,7 +485,31 @@ impl WaitSource {
         Ok(trames_shared::HostFd::retained(self.fd()?, keep))
     }
 }
+impl Drop for Socket {
+    fn drop(&mut self) {
+        if let Some(inode) = self.proc_inode.get() {
+            self.namespace.inet_inodes.lock().remove(inode);
+        }
+    }
+}
 impl Socket {
+    /// Called once for a fresh file description, including accepted sockets.
+    pub fn publish_inode(self: &Arc<Self>, id: u64, owner: (u32, u32)) {
+        self.initialize_inode_owner(owner.0, owner.1);
+        if matches!(
+            self.backend,
+            SocketBackend::Packet(_) | SocketBackend::Netlink(_)
+        ) {
+            return;
+        }
+        // Embedders may attach separate file-ID allocators to the same stack.
+        let key = (id, Arc::as_ptr(self) as usize);
+        self.proc_inode.set(key).expect("new socket inode");
+        self.namespace
+            .inet_inodes
+            .lock()
+            .insert(key, Arc::downgrade(self));
+    }
     pub fn inode_owner(&self) -> [u32; 2] {
         let v = self.inode_owner.get();
         [v as u32, (v >> 32) as u32]
@@ -517,6 +552,7 @@ impl Socket {
         kind: u32,
     ) -> Arc<Self> {
         Arc::new(Self {
+            proc_inode: Default::default(),
             inode_owner: Cell::new(0),
             kind: kind & 0xf,
             operation: parking_lot::RwLock::new(()),

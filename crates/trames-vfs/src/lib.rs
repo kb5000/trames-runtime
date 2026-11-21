@@ -155,7 +155,9 @@ mod oom;
 mod overlay;
 mod proc_file;
 mod proc_image;
+mod proc_inet;
 pub use proc_image::ProcImage;
+mod cpu_topology;
 mod proc_source;
 mod proc_time;
 mod pseudo;
@@ -768,9 +770,13 @@ impl ProcRefresh {
         }
         if path
             .split(|&c| c == b'/')
-            .any(|part| matches!(part, b"fd" | b"fdinfo" | b"net"))
+            .any(|part| matches!(part, b"fd" | b"fdinfo"))
         {
             return Self::Descriptors;
+        }
+        if path.split(|&c| c == b'/').any(|part| part == b"net") {
+            // Network tables consult the target's original namespace directly.
+            return Self::Metadata;
         }
         if path.ends_with(b"/cmdline") {
             return Self::Arguments;

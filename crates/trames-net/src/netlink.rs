@@ -9,8 +9,10 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 static NEXT_NAMESPACE: AtomicU64 = AtomicU64::new(1);
+type InetInodes = std::collections::BTreeMap<(u64, usize), Weak<super::Socket>>;
 pub(super) struct Namespace {
     id: u64,
+    pub(super) inet_inodes: parking_lot::Mutex<InetInodes>,
     pub(crate) native: std::sync::OnceLock<native::Network>,
     pub(crate) socket_count: std::sync::Arc<crate::socket_quota::Quota>,
     pub(crate) nft_packet_hooks: Cell<bool>,
@@ -41,6 +43,7 @@ impl Default for Namespace {
         let driver = Arc::new(crate::protocol::Driver::new(&fabric));
         Self {
             id,
+            inet_inodes: Default::default(),
             native: std::sync::OnceLock::new(),
             socket_count: std::sync::Arc::default(),
             nft_packet_hooks: Cell::new(true),
