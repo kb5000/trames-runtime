@@ -168,13 +168,22 @@ impl Endpoint {
                 self.control().set_keepalive(value != 0)
             }
             (1, 7 | 8) => {
-                if value <= 0 || value as usize > MAX_BUFFER {
-                    return Err(NetError(22));
-                }
-                if name == 7 {
-                    self.control().set_send_buffer_size(value as usize)
+                let bytes = if kind == 2 {
+                    let size = crate::udp_buffer_size(name, value);
+                    if cfg!(target_os = "linux") {
+                        size / 2
+                    } else {
+                        size
+                    }
+                } else if value > 0 && value as usize <= MAX_BUFFER {
+                    value as usize
                 } else {
-                    self.control().set_recv_buffer_size(value as usize)
+                    return Err(NetError(22));
+                };
+                if name == 7 {
+                    self.control().set_send_buffer_size(bytes)
+                } else {
+                    self.control().set_recv_buffer_size(bytes)
                 }
             }
             (6, 1) if kind == 1 => return self.set_nodelay(value),

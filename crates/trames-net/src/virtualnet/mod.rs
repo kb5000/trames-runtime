@@ -142,6 +142,7 @@ struct UdpOptions {
     receive_class: bool,
     receive_hops: bool,
     receive_info: bool,
+    original_destination: bool,
 }
 struct State {
     handles: Vec<SocketHandle>,

@@ -341,6 +341,10 @@ impl Prepared {
                             }
                         }
                     }
+                    if let Some(dst) = ip.original_destination {
+                        let (level, kind) = if dst.is_ipv4() { (0, 20) } else { (41, 74) };
+                        ancillary.push(level, kind, &encode_address(dst));
+                    }
                     let count = ancillary.bytes.len();
                     if count != 0 {
                         memory

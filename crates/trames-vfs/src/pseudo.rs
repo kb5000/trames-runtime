@@ -2114,9 +2114,9 @@ impl Vfs {
             b"/proc/sys/net/ipv4/ip_local_port_range" => return Ok(regular(b"49152\t65535\n".to_vec())),
             b"/proc/sys/net/ipv4/ip_default_ttl" => return Ok(regular(b"64\n".to_vec())),
             b"/proc/sys/net/ipv4/ping_group_range" | b"/proc/sys/net/ipv4/ip_unprivileged_port_start" => return Ok(Some((file(Vec::new()),0o100644))),
-            p if p.starts_with(b"/proc/sys/net/ipv6/conf/") && self.network.is_managed_uplink() => {
-                if super::network::Sysctl::ipv6_path(p).is_some() {return Ok(Some((file(Vec::new()),0o100644)));}
-                if matches!(p,b"/proc/sys/net/ipv6/conf/default"|b"/proc/sys/net/ipv6/conf/lo"|b"/proc/sys/net/ipv6/conf/eth0") {return Ok(directory());}
+            p if p.starts_with(b"/proc/sys/net/ipv6/conf/") => {
+                if super::network::Sysctl::ipv6_path(p, &self.network).is_some() {return Ok(Some((file(Vec::new()),0o100644)));}
+                if super::network::Sysctl::ipv6_scope(&p[b"/proc/sys/net/ipv6/conf/".len()..], &self.network).is_some() {return Ok(directory());}
             },
             _ => {},
         }
@@ -2885,42 +2885,31 @@ impl Vfs {
                 b"bridge-nf-call-iptables".to_vec(),
                 b"bridge-nf-call-ip6tables".to_vec(),
             ],
-            b"/proc/sys/net/ipv6/conf" if self.network.is_managed_uplink() => {
-                ["all", "default", "lo", "eth0"]
-                    .into_iter()
-                    .map(|s| s.as_bytes().to_vec())
-                    .collect()
+            b"/proc/sys/net/ipv6/conf" => {
+                let mut names = vec![b"all".to_vec(), b"default".to_vec()];
+                names.extend(self.network.devices().into_iter().map(|d| d.name));
+                names
             }
-            b"/proc/sys/net/ipv4/conf" | b"/proc/sys/net/ipv6/conf" => vec![b"all".to_vec()],
-            b"/proc/sys/net/ipv6/conf/default"
-            | b"/proc/sys/net/ipv6/conf/lo"
-            | b"/proc/sys/net/ipv6/conf/eth0"
-                if self.network.is_managed_uplink() =>
-            {
-                [
-                    "accept_ra",
-                    "use_tempaddr",
-                    "disable_ipv6",
-                    "addr_gen_mode",
-                    "stable_secret",
-                ]
-                .into_iter()
-                .map(|s| s.as_bytes().to_vec())
-                .collect()
-            }
-            b"/proc/sys/net/ipv6/conf/all" if self.network.is_managed_uplink() => [
-                "forwarding",
-                "accept_ra",
-                "use_tempaddr",
-                "disable_ipv6",
-                "addr_gen_mode",
-                "stable_secret",
-            ]
-            .into_iter()
-            .map(|s| s.as_bytes().to_vec())
-            .collect(),
-            b"/proc/sys/net/ipv4/conf/all" | b"/proc/sys/net/ipv6/conf/all" => {
-                vec![b"forwarding".to_vec()]
+            b"/proc/sys/net/ipv4/conf" => vec![b"all".to_vec()],
+            b"/proc/sys/net/ipv4/conf/all" => vec![b"forwarding".to_vec()],
+            p if p.starts_with(b"/proc/sys/net/ipv6/conf/") => {
+                let mut names = vec![b"keep_addr_on_down".to_vec()];
+                if p.ends_with(b"/all") {
+                    names.push(b"forwarding".to_vec());
+                }
+                if self.network.is_managed_uplink() {
+                    names.extend(
+                        [
+                            "accept_ra",
+                            "use_tempaddr",
+                            "disable_ipv6",
+                            "addr_gen_mode",
+                            "stable_secret",
+                        ]
+                        .map(|n| n.as_bytes().to_vec()),
+                    );
+                }
+                names
             }
             b"/proc/sys/net/ipv6" => vec![b"conf".to_vec()],
             b"/proc/sys/net/ipv4" => [

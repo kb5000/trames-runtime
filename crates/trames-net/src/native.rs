@@ -161,7 +161,8 @@ impl PreparedSocket {
             dns_receive_errors: Cell::new(false),
             echo: SharedState::default(),
             policy: None,
-            receive_packet_info: Cell::new(false),
+            receive_controls: Cell::new(0),
+            receive_control_update: Mutex::new(()),
             policy_forward: SharedState::default(),
         })
     }
@@ -370,7 +371,8 @@ pub struct Socket {
     dns_peer: Cell<bool>,
     dns_receive_errors: Cell<bool>,
     echo: SharedState<icmp::Echo>,
-    receive_packet_info: Cell<bool>,
+    receive_controls: Cell<u32>,
+    receive_control_update: Mutex<()>,
     // Attached while this socket is unique, before any capability/publication.
     policy: Option<Policy>,
     policy_forward: SharedState<
@@ -1100,26 +1102,38 @@ impl Socket {
         // for a zero-sized guest buffer. This preserves MSG_TRUNC and datagrams.
         let mut data = vec![0; if self.kind != 1 { 65536 } else { count }];
         let mut packet_info = None;
+        let mut original_destination = None;
         let (length, address) = match &self.native.socket {
             NativeSocket::Tcp(socket) => {
                 let length = direct::read_tcp(socket, &mut data, flags)?;
                 (length, None)
             }
             NativeSocket::Udp(socket) => {
-                if self.receive_packet_info.get() {
+                let controls = self.receive_controls.get();
+                if controls != 0 {
+                    let destination_port = if controls & 2 != 0 {
+                        Some(self.local_addr()?.port())
+                    } else {
+                        None
+                    };
                     let (length, peer, dest) = pktinfo::receive(
                         self.native.as_fd().as_raw_fd(),
                         &mut data,
                         flags & MSG_PEEK != 0,
                     )?;
-                    packet_info = dest.map(|ip| crate::PacketInfo {
-                        address: ip,
-                        interface: if unmapped(SocketAddr::new(ip, 0)).ip().is_loopback() {
-                            1
-                        } else {
-                            2
-                        },
-                    });
+                    original_destination = dest
+                        .zip(destination_port)
+                        .map(|(ip, port)| SocketAddr::new(ip, port));
+                    packet_info = dest
+                        .filter(|_| controls & 1 != 0)
+                        .map(|ip| crate::PacketInfo {
+                            address: ip,
+                            interface: if unmapped(SocketAddr::new(ip, 0)).ip().is_loopback() {
+                                1
+                            } else {
+                                2
+                            },
+                        });
                     (length, Some(peer))
                 } else {
                     let (length, address) = if flags & MSG_PEEK != 0 {
@@ -1137,7 +1151,10 @@ impl Socket {
             packet_address: None,
             netlink_address: None,
             credentials: None,
-            ip: Default::default(),
+            ip: crate::ReceivedIp {
+                original_destination,
+                ..Default::default()
+            },
             packet_info,
             data,
             address,
@@ -1249,18 +1266,20 @@ impl Socket {
                 return Ok(());
             }
         }
-        if matches!((level,name),(0,8)if self.family==2)
-            || matches!((level,name),(41,49)if self.family==10)
+        if matches!((level,name),(0,8|20)if self.family==2)
+            || matches!((level,name),(41,49|74)if self.family==10)
         {
             if self.kind != 2 {
                 return Err(NetError(92));
             }
-            pktinfo::enable(
-                self.native.as_fd().as_raw_fd(),
-                self.family == 10,
-                value != 0,
-            )?;
-            self.receive_packet_info.set(value != 0);
+            let _update = self.receive_control_update.lock().unwrap();
+            let old = self.receive_controls.get();
+            let bit = if matches!(name, 20 | 74) { 2 } else { 1 };
+            let new = if value != 0 { old | bit } else { old & !bit };
+            if (old == 0) != (new == 0) {
+                pktinfo::enable(self.native.as_fd().as_raw_fd(), self.family == 10, new != 0)?;
+            }
+            self.receive_controls.set(new);
             return Ok(());
         }
         self.native
@@ -1345,8 +1364,14 @@ impl Socket {
             (0, 11) if self.family == 2 && self.kind == 2 => {
                 Ok(i32::from(self.dns_receive_errors.get()))
             }
-            (0, 8) if self.family == 2 => Ok(i32::from(self.receive_packet_info.get())),
-            (41, 49) if self.family == 10 => Ok(i32::from(self.receive_packet_info.get())),
+            (0, 8) if self.family == 2 => Ok(i32::from(self.receive_controls.get() & 1 != 0)),
+            (0, 20) if self.family == 2 && self.kind == 2 => {
+                Ok(i32::from(self.receive_controls.get() & 2 != 0))
+            }
+            (41, 74) if self.family == 10 && self.kind == 2 => {
+                Ok(i32::from(self.receive_controls.get() & 2 != 0))
+            }
+            (41, 49) if self.family == 10 => Ok(i32::from(self.receive_controls.get() & 1 != 0)),
             (1, 3) => Ok(match self.kind {
                 3 => 2,
                 4 => 3,

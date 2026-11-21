@@ -43,7 +43,7 @@ impl Topology {
     }
     pub fn ipv6_knob(&self, id: u64, scope: u32, knob: usize) -> Result<i32> {
         let s = &self.spaces[&id];
-        if !s.managed_uplink {
+        if !s.managed_uplink && knob != 4 {
             return Err(NetError(95));
         }
         let values = match scope {
@@ -66,6 +66,7 @@ impl Topology {
             1 => (-1..=2).contains(&value),
             2 => (0..=1).contains(&value),
             3 => (0..=3).contains(&value),
+            4 => true,
             _ => false,
         };
         if !valid {

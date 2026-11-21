@@ -607,8 +607,13 @@ pub(crate) fn request(
                             changes.push((ns, 17, 1, link_data(&graph, &d)));
                         }
                         let current = target.unwrap_or(ns);
-                        let d = graph.device(current, d.index)?;
-                        changes.push((current, 16, 1, link_data(&graph, &d)));
+                        let after = graph.device(current, d.index)?;
+                        if current == ns && d.up && !after.up {
+                            for a in d.addresses.iter().filter(|a| !after.addresses.contains(a)) {
+                                changes.push((ns, 21, 0x100, address_data(&d, *a)));
+                            }
+                        }
+                        changes.push((current, 16, 1, link_data(&graph, &after)));
                     }
                 }
             }

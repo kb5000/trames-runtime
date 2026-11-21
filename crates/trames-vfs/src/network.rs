@@ -95,16 +95,27 @@ pub(super) enum Sysctl {
     StableSecret(u32),
 }
 impl Sysctl {
-    pub(super) fn ipv6_path(path: &[u8]) -> Option<Self> {
+    pub(super) fn ipv6_scope(name: &[u8], net: &trames_net::Network) -> Option<u32> {
+        match name {
+            b"all" => Some(0),
+            b"default" => Some(u32::MAX),
+            name => net
+                .devices()
+                .into_iter()
+                .find(|d| d.name == name)
+                .map(|d| d.index),
+        }
+    }
+    pub(super) fn ipv6_path(path: &[u8], net: &trames_net::Network) -> Option<Self> {
         let tail = path.strip_prefix(b"/proc/sys/net/ipv6/conf/")?;
         let cut = tail.iter().position(|b| *b == b'/')?;
-        let scope = match &tail[..cut] {
-            b"all" => 0,
-            b"default" => u32::MAX,
-            b"lo" => 1,
-            b"eth0" => 2,
-            _ => return None,
-        };
+        let scope = Self::ipv6_scope(&tail[..cut], net)?;
+        if &tail[cut + 1..] == b"keep_addr_on_down" {
+            return Some(Self::Ipv6(scope, 4));
+        }
+        if !net.is_managed_uplink() {
+            return None;
+        }
         if &tail[cut + 1..] == b"stable_secret" {
             return Some(Self::StableSecret(scope));
         }
@@ -117,7 +128,7 @@ impl Sysctl {
         };
         Some(Self::Ipv6(scope, knob))
     }
-    fn path(path: &[u8]) -> Option<Self> {
+    fn path(path: &[u8], net: &trames_net::Network) -> Option<Self> {
         match path {
             b"/proc/sys/net/ipv4/ping_group_range" => Some(Self::PingRange),
             b"/proc/sys/net/ipv4/ip_unprivileged_port_start" => Some(Self::UnprivilegedPort),
@@ -129,7 +140,7 @@ impl Sysctl {
             b"/proc/sys/net/ipv6/conf/all/forwarding" => Some(Self::Forwarding(true)),
             b"/proc/sys/net/bridge/bridge-nf-call-iptables" => Some(Self::BridgeFilter(false)),
             b"/proc/sys/net/bridge/bridge-nf-call-ip6tables" => Some(Self::BridgeFilter(true)),
-            _ => Self::ipv6_path(path),
+            _ => Self::ipv6_path(path, net),
         }
     }
 }
@@ -236,7 +247,7 @@ impl Vfs {
         }
         Some(Control {
             namespace: self.root_network.clone(),
-            kind: Sysctl::path(path)?,
+            kind: Sysctl::path(path, &self.network)?,
         })
     }
     /// Selected by the embedding app, never by guest syscalls. Forks share the

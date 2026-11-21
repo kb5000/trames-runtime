@@ -188,6 +188,93 @@ fn ipv6_disable_retires_addresses_and_tables_and_secret_is_namespace_owned() {
     assert_eq!(n.set_ipv6_knob(2, 2, 4), Err(NetError(22)));
 }
 #[test]
+fn link_down_obeys_namespace_and_interface_ipv6_retention() {
+    for (all, iface, retained) in [(0, 0, false), (0, 1, true), (-1, 1, false), (1, -1, true)] {
+        let n = configured();
+        let id = n.namespace_id();
+        n.set_device_up(2, true).unwrap();
+        n.set_ipv6_knob(0, 4, all).unwrap();
+        n.set_ipv6_knob(2, 4, iface).unwrap();
+        let global = Address {
+            ip: ip("fd00::27"),
+            prefix: 64,
+        };
+        let local = Address {
+            ip: ip("fe80::27"),
+            prefix: 64,
+        };
+        for a in [global, local] {
+            n.1.graph
+                .write()
+                .unwrap()
+                .address(id, 2, a, true, false)
+                .unwrap();
+        }
+        n.set_device_up(2, false).unwrap();
+        let addresses = n
+            .devices()
+            .into_iter()
+            .find(|d| d.index == 2)
+            .unwrap()
+            .addresses;
+        assert!(addresses.iter().any(|a| a.ip == ip("10.0.0.2")));
+        assert_eq!(addresses.contains(&global), retained);
+        assert!(!addresses.contains(&local));
+    }
+}
+
+#[test]
+fn udp_destination_and_packet_info_switch_independently() {
+    let fabric = Fabric::new().unwrap();
+    for network in [
+        Network::new(NetworkMode::Outbound),
+        Network::virtual_network(&fabric, 2, NetworkMode::Outbound).unwrap(),
+    ] {
+        for (family, level, original, info, any, loopback) in [
+            (2, 0, 20, 8, "0.0.0.0", "127.0.0.1"),
+            (10, 41, 74, 49, "::", "::1"),
+        ] {
+            let receiver = network.socket(family, 2, 0).unwrap();
+            receiver.bind(SocketAddr::new(ip(any), 0)).unwrap();
+            let dest = SocketAddr::new(ip(loopback), receiver.local_addr().unwrap().port());
+            let sender = network.socket(family, 2, 0).unwrap();
+            for (want_original, want_info) in
+                [(true, false), (true, true), (false, true), (false, false)]
+            {
+                receiver
+                    .set_option(level, info, i32::from(want_info))
+                    .unwrap();
+                receiver
+                    .set_option(level, original, i32::from(want_original))
+                    .unwrap();
+                sender.send(b"udp", 0, Some(dest)).unwrap();
+                for flags in [2, 0] {
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    let packet = loop {
+                        match receiver.recv(3, flags) {
+                            Ok(packet) => break packet,
+                            Err(NetError(11)) if Instant::now() < deadline => {
+                                wait(&[(receiver.clone(), 1)], Duration::from_millis(5)).unwrap();
+                            }
+                            Err(e) => panic!("recv {dest}, flags={flags}, original={want_original}, info={want_info}: {e:?}"),
+                        }
+                    };
+                    assert_eq!(packet.data, b"udp");
+                    assert_eq!(
+                        packet.ip.original_destination,
+                        want_original.then_some(dest)
+                    );
+                    assert_eq!(
+                        packet.packet_info.map(|p| p.address),
+                        want_info.then_some(dest.ip())
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn original_netd_zero_address_request_is_a_noop_and_dumps_accept_legacy_padding() {
     let n = Network::managed_uplink(NetworkMode::Outbound).unwrap();
     let nl = n.socket(16, 3, 0).unwrap();

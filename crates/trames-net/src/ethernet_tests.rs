@@ -647,7 +647,7 @@ fn udp_buffer_budget_controls_burst_capacity_and_preserves_queued_data_on_resize
     let rx = b.socket(2, 2, 0).unwrap();
     rx.set_option(1, 8, 8192).unwrap();
     rx.bind("10.0.0.3:34568".parse().unwrap()).unwrap();
-    assert_eq!(rx.get_option(1, 8), Ok(8192));
+    assert_eq!(rx.get_option(1, 8), Ok(16384));
     for n in 0u32..64 {
         let mut data = [0u8; 64];
         data[..4].copy_from_slice(&n.to_le_bytes());
@@ -656,7 +656,7 @@ fn udp_buffer_budget_controls_burst_capacity_and_preserves_queued_data_on_resize
     }
     // Shrinking retains existing packets, but rejects future enqueue until below budget.
     rx.set_option(1, 8, 512).unwrap();
-    assert_eq!(rx.get_option(1, 8), Ok(512));
+    assert_eq!(rx.get_option(1, 8), Ok(2304));
     tx.send(b"over budget", 0, Some("10.0.0.3:34568".parse().unwrap()))
         .unwrap();
     for n in 0u32..64 {
@@ -668,7 +668,7 @@ fn udp_buffer_budget_controls_burst_capacity_and_preserves_queued_data_on_resize
     tx.send(b"available", 0, Some("10.0.0.3:34568".parse().unwrap()))
         .unwrap();
     assert_eq!(rx.recv(100, 0).unwrap().data, b"available");
-    rx.set_option(1, 8, 4096).unwrap();
+    rx.set_option(1, 8, 2048).unwrap();
     for _ in 0..65 {
         tx.send(&[], 0, Some("10.0.0.3:34568".parse().unwrap()))
             .unwrap();

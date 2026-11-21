@@ -125,7 +125,7 @@ struct Link {
     master: Option<u32>,
     addresses: Vec<Address>,
     stats: Arc<Counters>,
-    ipv6: [i32; 4],
+    ipv6: [i32; 5],
     stable_secret: Option<std::net::Ipv6Addr>,
 }
 impl Link {
@@ -170,8 +170,8 @@ struct Space {
     direct: bool,
     managed_uplink: bool,
     policy: policy::Policy,
-    ipv6_all: [i32; 4],
-    ipv6_default: [i32; 4],
+    ipv6_all: [i32; 5],
+    ipv6_default: [i32; 5],
     stable_secret: Option<std::net::Ipv6Addr>,
     forwarding: [bool; 2],
     firewall: Arc<crate::nftables::Firewall>,
@@ -387,8 +387,8 @@ impl Topology {
                 direct: false,
                 managed_uplink: false,
                 policy: policy::Policy::default(),
-                ipv6_all: [1, 0, 0, 0],
-                ipv6_default: [1, 0, 0, 0],
+                ipv6_all: [1, 0, 0, 0, 0],
+                ipv6_default: [1, 0, 0, 0, 0],
                 stable_secret: None,
                 forwarding: [false; 2],
                 firewall: Arc::default(),
@@ -816,6 +816,16 @@ impl Topology {
                 .forget_device(index);
         }
         if let Some(up) = up {
+            if d.up && !up {
+                // All configured addresses are permanent. Linux retains only
+                // global-scope IPv6 addresses on an ordinary link-down.
+                let all = self.spaces[&id].ipv6_all[4];
+                let keep = if all == 0 { d.ipv6[4] } else { all } > 0;
+                d.addresses.retain(|a| match a.ip {
+                    IpAddr::V6(ip) => keep && !ip.is_unicast_link_local() && !ip.is_loopback(),
+                    IpAddr::V4(_) => true,
+                });
+            }
             d.up = up;
         }
         if let Some(master) = master {

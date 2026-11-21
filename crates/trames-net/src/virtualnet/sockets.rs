@@ -1024,6 +1024,16 @@ impl Socket {
                         },
                         ipv6,
                         mapped_info: mapped && options.receive_info,
+                        original_destination: if options.original_destination {
+                            meta.local_address.map(|ip| {
+                                SocketAddr::new(
+                                    addr(ip),
+                                    state.bound.expect("bound UDP endpoint").port(),
+                                )
+                            })
+                        } else {
+                            None
+                        },
                     };
                     let packet_info = if options.receive_info || mapped {
                         meta.local_address.map(|a| {
@@ -1174,12 +1184,13 @@ impl Socket {
         let mut i = self.network.0.fabric.0.borrow_mut();
         let mut state = self.state.borrow_mut();
         match (level, name) {
-            (0, 8 | 12 | 13) | (41, 49 | 51 | 66)
+            (0, 8 | 12 | 13 | 20) | (41, 49 | 51 | 66 | 74)
                 if self.kind == 2 && (level == 0 || self.family == 10) =>
             {
                 let options = &mut state.udp_options[usize::from(level == 41)];
                 match name {
                     8 | 49 => options.receive_info = value != 0,
+                    20 | 74 => options.original_destination = value != 0,
                     12 | 51 => options.receive_hops = value != 0,
                     _ => options.receive_class = value != 0,
                 }
@@ -1219,11 +1230,11 @@ impl Socket {
             }
             (255, 7) if self.family == 10 && self.kind == 4 && value == 2 => {}
             (1, 7 | 8) => {
-                if value <= 0 || value as usize > MAX_BUFFER {
+                if self.kind != 2 && (value <= 0 || value as usize > MAX_BUFFER) {
                     return Err(NetError(22));
                 }
                 if self.kind == 2 {
-                    let bytes = value as usize;
+                    let bytes = crate::udp_buffer_size(name, value);
                     if name == 8 {
                         state.receive_buffer = bytes;
                     } else {
@@ -1379,6 +1390,7 @@ impl Socket {
                 }
                 (0, 2) | (41, 16) => return Ok(i32::from(options.fields.hop_limit.unwrap_or(64))),
                 (0, 8) | (41, 49) => return Ok(i32::from(options.receive_info)),
+                (0, 20) | (41, 74) => return Ok(i32::from(options.original_destination)),
                 (0, 13) | (41, 66) => return Ok(i32::from(options.receive_class)),
                 (0, 12) | (41, 51) => return Ok(i32::from(options.receive_hops)),
                 _ => {}
