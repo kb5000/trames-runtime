@@ -473,6 +473,12 @@ pub struct Socket<'a> {
 
     /// Nagle's Algorithm enabled.
     nagle: bool,
+    cork: bool,
+    cork_until: Option<Instant>,
+    max_segment: usize,
+    quick_ack: bool,
+    #[cfg(feature = "alloc")]
+    observer: Option<crate::iface::SocketHandle>,
 
     /// The congestion control algorithm.
     congestion_controller: congestion::AnyController,
@@ -544,6 +550,12 @@ impl<'a> Socket<'a> {
             ack_delay_timer: AckDelayTimer::Idle,
             challenge_ack_timer: Instant::from_secs(0),
             nagle: true,
+            cork: false,
+            cork_until: None,
+            max_segment: usize::MAX,
+            quick_ack: false,
+            #[cfg(feature = "alloc")]
+            observer: None,
             tsval_generator: None,
             last_remote_tsval: 0,
             congestion_controller: congestion::AnyController::new(),
@@ -599,7 +611,7 @@ impl<'a> Socket<'a> {
         };
         self.congestion_controller
             .inner_mut()
-            .set_mss(self.remote_mss);
+            .set_mss(self.remote_mss.min(self.max_segment));
         self.congestion_controller
             .inner_mut()
             .set_remote_window(self.remote_win_len);
@@ -828,6 +840,64 @@ impl<'a> Socket<'a> {
         Some(self.tuple?.remote)
     }
 
+    /// Limit the advertised MSS and the maximum size of outgoing segments.
+    pub fn set_max_segment(&mut self, limit: Option<u16>) {
+        self.max_segment = limit.map_or(usize::MAX, usize::from);
+    }
+
+    pub fn send_mss(&self) -> usize {
+        self.remote_mss.min(self.max_segment)
+    }
+
+    pub fn set_cork(&mut self, enabled: bool) {
+        self.cork = enabled;
+        if !enabled {
+            self.cork_until = None;
+        }
+    }
+
+    /// TCP_NODELAY explicitly pushes pending data, even on a corked stream.
+    pub fn push_corked(&mut self, now: Instant) {
+        if self.cork && self.unsent_data() {
+            self.cork_until = Some(now);
+        }
+    }
+
+    fn unsent_data(&self) -> bool {
+        matches!(self.state, State::Established | State::CloseWait)
+            && self.local_seq_no + self.tx_buffer.len() > self.remote_last_seq
+    }
+
+    fn cork_allowance(&self, available: usize, mss: usize, now: Instant) -> usize {
+        if !self.cork || available >= mss
+            || !matches!(self.state, State::Established | State::CloseWait)
+            || self.cork_until.is_some_and(|end| now >= end)
+        {
+            return available;
+        }
+        // Loss recovery can resend a short segment without also releasing
+        // newly queued data beyond the highest sequence number sent.
+        self.rtte.max_seq_sent
+            .filter(|end| *end > self.remote_last_seq)
+            .map_or(0, |end| available.min(end - self.remote_last_seq))
+    }
+
+    #[cfg(feature = "alloc")]
+    pub fn observe_io(&mut self, handle: Option<crate::iface::SocketHandle>) {
+        self.observer = handle;
+    }
+
+    pub fn quick_ack(&self) -> bool {
+        self.quick_ack
+    }
+
+    pub fn set_quick_ack(&mut self, enabled: bool) {
+        self.quick_ack = enabled;
+        if enabled && self.ack_to_transmit() {
+            self.ack_delay_timer = AckDelayTimer::Immediate;
+        }
+    }
+
     /// Original transport estimates for Linux TCP_INFO, in microseconds/bytes.
     /// Reading diagnostics does not advance the protocol or allocate buffers.
     pub fn transport_info(&self) -> [u32; 6] {
@@ -835,7 +905,7 @@ impl<'a> Socket<'a> {
             self.rtte.retransmission_timeout().total_micros().min(u32::MAX as u64) as u32,
             self.rtte.rtt.saturating_mul(1000),
             self.rtte.deviation.saturating_mul(1000),
-            self.remote_mss.min(u32::MAX as usize) as u32,
+            self.send_mss().min(u32::MAX as usize) as u32,
             self.congestion_controller.inner().window().min(u32::MAX as usize) as u32,
             self.rx_buffer.capacity().saturating_sub(self.rx_buffer.len()).min(u32::MAX as usize) as u32,
         ]
@@ -889,6 +959,7 @@ impl<'a> Socket<'a> {
         self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
         self.remote_mss = DEFAULT_MSS;
         self.remote_last_ts = None;
+        self.cork_until = None;
         self.ack_delay_timer = AckDelayTimer::Idle;
         self.challenge_ack_timer = Instant::from_secs(0);
 
@@ -1311,6 +1382,15 @@ impl<'a> Socket<'a> {
         self.recv_impl(|rx_buffer| rx_buffer.dequeue_many_with(f))
     }
 
+    /// Advance the receive queue without copying the discarded bytes.
+    pub fn discard_received(&mut self, count: usize) -> Result<usize, RecvError> {
+        self.recv_impl(|buffer| {
+            let count = count.min(buffer.len());
+            buffer.dequeue_allocated(count);
+            (count, count)
+        })
+    }
+
     /// Dequeue a sequence of received octets, and fill a slice from it.
     ///
     /// This function returns the amount of octets actually dequeued, which is limited
@@ -1530,6 +1610,29 @@ impl<'a> Socket<'a> {
     }
 
     pub(crate) fn process(
+        &mut self,
+        cx: &mut Context,
+        ip_repr: &IpRepr,
+        repr: &TcpRepr,
+    ) -> Option<(IpRepr, TcpRepr<'static>)> {
+        #[cfg(feature = "alloc")]
+        if let Some(handle) = self.observer {
+            let was_readable = self.can_recv();
+            let was_full = self.tx_buffer.is_full();
+            let state = self.state;
+            let response = self.process_segment(cx, ip_repr, repr);
+            if (!was_readable && self.can_recv())
+                || (was_full && !self.tx_buffer.is_full())
+                || self.state != state
+            {
+                cx.tcp_ready.push(handle);
+            }
+            return response;
+        }
+        self.process_segment(cx, ip_repr, repr)
+    }
+
+    fn process_segment(
         &mut self,
         cx: &mut Context,
         ip_repr: &IpRepr,
@@ -1838,7 +1941,7 @@ impl<'a> Socket<'a> {
                     }
                     self.congestion_controller
                         .inner_mut()
-                        .set_mss(max_seg_size as usize);
+                        .set_mss((max_seg_size as usize).min(self.max_segment));
                     self.remote_mss = max_seg_size as usize
                 }
 
@@ -1895,7 +1998,7 @@ impl<'a> Socket<'a> {
                     self.remote_mss = max_seg_size as usize;
                     self.congestion_controller
                         .inner_mut()
-                        .set_mss(self.remote_mss);
+                        .set_mss(self.remote_mss.min(self.max_segment));
                 }
 
                 self.remote_seq_no = repr.seq_number + 1;
@@ -2157,6 +2260,7 @@ impl<'a> Socket<'a> {
         if let Some(ack_delay) = self.ack_delay {
             if self.ack_to_transmit() {
                 self.ack_delay_timer = match self.ack_delay_timer {
+                    _ if self.quick_ack => AckDelayTimer::Immediate,
                     AckDelayTimer::Idle => {
                         tcp_trace!("starting delayed ack timer");
                         AckDelayTimer::Waiting(cx.now() + ack_delay)
@@ -2210,7 +2314,7 @@ impl<'a> Socket<'a> {
         let local_mss = cx.ip_mtu() - ip_header_len - TCP_HEADER_LEN;
 
         // The effective max segment size, taking into account our and remote's limits.
-        let effective_mss = local_mss.min(self.remote_mss);
+        let effective_mss = local_mss.min(self.send_mss());
 
         // Have we sent data that hasn't been ACKed yet?
         let data_in_flight = self.remote_last_seq != self.local_seq_no;
@@ -2232,7 +2336,7 @@ impl<'a> Socket<'a> {
         };
 
         // Can we send at least 1 octet?
-        let mut can_send = max_send != 0;
+        let mut can_send = self.cork_allowance(max_send, effective_mss, cx.now()) != 0;
         // Can we send at least 1 full segment?
         let can_send_full = max_send >= effective_mss;
 
@@ -2249,7 +2353,7 @@ impl<'a> Socket<'a> {
         // * There's no data in flight
         // * We can send a full packet
         // * We have all the data we'll ever send (we're closing send)
-        if self.nagle && data_in_flight && !can_send_full && !want_fin {
+        if self.nagle && !self.cork && data_in_flight && !can_send_full && !want_fin {
             can_send = false;
         }
 
@@ -2302,7 +2406,7 @@ impl<'a> Socket<'a> {
     /// more data can be sent. According to the Linux kernel implementation, "significant" means
     /// doubling the receive window. The Linux kernel implementation can be found at
     /// <https://elixir.bootlin.com/linux/v6.9.9/source/net/ipv4/tcp.c#L1472>.
-    fn window_to_update(&self) -> bool {
+    pub fn window_to_update(&self) -> bool {
         match self.state {
             State::SynSent
             | State::SynReceived
@@ -2328,6 +2432,9 @@ impl<'a> Socket<'a> {
             return Ok(());
         }
 
+        if self.cork && self.cork_until.is_none() && self.unsent_data() {
+            self.cork_until = Some(cx.now() + Duration::from_millis(200));
+        }
         if self.remote_last_ts.is_none() {
             // We get here in exactly two cases:
             //  1) This socket just transitioned into SYN-SENT.
@@ -2492,11 +2599,12 @@ impl<'a> Socket<'a> {
                 // 1. remote window
                 // 2. MSS the remote is willing to accept, probably determined by their MTU
                 // 3. MSS we can send, determined by our MTU.
-                let size = win_limit
-                    .min(self.remote_mss)
-                    .min(cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN);
-
+                let mss = self.send_mss().min(cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN);
+                let size = win_limit.min(mss);
                 let offset = self.remote_last_seq - self.local_seq_no;
+                // An independent ACK may be due while a short tail is corked.
+                let available = size.min(self.tx_buffer.len().saturating_sub(offset));
+                let size = self.cork_allowance(available, mss, cx.now());
                 repr.payload = self.tx_buffer.get_allocated(offset, size);
 
                 // If we've sent everything we had in the buffer, follow it with the PSH or FIN
@@ -2557,7 +2665,7 @@ impl<'a> Socket<'a> {
         if repr.control == TcpControl::Syn {
             // Fill the MSS option. See RFC 6691 for an explanation of this calculation.
             let max_segment_size = cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN;
-            repr.max_seg_size = Some(max_segment_size as u16);
+            repr.max_seg_size = Some(max_segment_size.min(self.max_segment) as u16);
         }
 
         // Actually send the packet. If this succeeds, it means the packet is in
@@ -2574,6 +2682,9 @@ impl<'a> Socket<'a> {
         // the keep-alive timer.
         self.timer.rewind_keep_alive(cx.now(), self.keep_alive);
 
+        if self.quick_ack && self.ack_delay_timer != AckDelayTimer::Idle && self.ack_to_transmit() {
+            self.quick_ack = false;
+        }
         // Reset delayed-ack timer
         match self.ack_delay_timer {
             AckDelayTimer::Idle => {}
@@ -2596,6 +2707,9 @@ impl<'a> Socket<'a> {
         self.remote_last_seq = repr.seq_number + repr.segment_len();
         self.remote_last_ack = repr.ack_number;
         self.remote_last_win = repr.window_len;
+        if self.cork_until.is_some() && !self.unsent_data() {
+            self.cork_until = None;
+        }
 
         if repr.segment_len() > 0 {
             if self.rtte.max_seq_sent.is_some_and(|end| repr.seq_number < end) {
@@ -2668,7 +2782,10 @@ impl<'a> Socket<'a> {
             };
 
             // We wait for the earliest of our timers to fire.
-            *[self.timer.poll_at(), timeout_poll_at, delayed_ack_poll_at]
+            let cork_poll_at = self.cork_until
+                .filter(|end| *end > cx.now())
+                .map_or(PollAt::Ingress, PollAt::Time);
+            *[self.timer.poll_at(), timeout_poll_at, delayed_ack_poll_at, cork_poll_at]
                 .iter()
                 .min()
                 .unwrap_or(&PollAt::Ingress)
@@ -7521,6 +7638,55 @@ mod test {
     // =========================================================================================//
     // Tests for delayed ACK
     // =========================================================================================//
+
+    #[test]
+    fn cork_sends_full_segments_then_flushes_each_tail_on_its_deadline() {
+        let mut s = socket_established();
+        s.set_max_segment(Some(4));
+        s.set_cork(true);
+        s.send_slice(b"abcdef").unwrap();
+        recv(&mut s, Instant::from_millis(10), |p| assert_eq!(p.unwrap().payload, b"abcd"));
+        send!(s, time 11, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 5),
+            payload: b"x",
+            ..SEND_TEMPL
+        });
+        // The ACK for incoming data cannot piggyback the corked tail.
+        recv(&mut s, Instant::from_millis(11), |p| assert!(p.unwrap().payload.is_empty()));
+        recv_nothing!(s, time 209);
+        recv(&mut s, Instant::from_millis(210), |p| assert_eq!(p.unwrap().payload, b"ef"));
+        s.send_slice(b"g").unwrap();
+        // The previous tail times out exactly now. Only its two already
+        // transmitted bytes can be retransmitted while "g" is still corked.
+        recv(&mut s, Instant::from_millis(220), |p| assert_eq!(p.unwrap().payload, b"ef"));
+        s.push_corked(Instant::from_millis(221));
+        recv(&mut s, Instant::from_millis(221), |p| assert_eq!(p.unwrap().payload, b"g"));
+    }
+
+    #[test]
+    fn quick_ack_flushes_a_pending_ack_then_restores_delayed_acks() {
+        let mut s = socket_established();
+        s.set_ack_delay(Some(ACK_DELAY_DEFAULT));
+        send!(s, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload: b"x",
+            ..SEND_TEMPL
+        });
+        recv_nothing!(s);
+        s.set_quick_ack(true);
+        recv(&mut s, Instant::from_millis(1), |p| assert_eq!(p.unwrap().ack_number, Some(REMOTE_SEQ + 2)));
+        assert!(!s.quick_ack());
+        send!(s, time 2, TcpRepr {
+            seq_number: REMOTE_SEQ + 2,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload: b"y",
+            ..SEND_TEMPL
+        });
+        recv_nothing!(s, time 2);
+        recv(&mut s, Instant::from_millis(12), |p| assert_eq!(p.unwrap().ack_number, Some(REMOTE_SEQ + 3)));
+    }
 
     #[test]
     fn test_delayed_ack() {

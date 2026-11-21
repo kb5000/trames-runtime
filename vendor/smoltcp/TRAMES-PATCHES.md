@@ -49,3 +49,17 @@ handshake completes, including a transition directly to CLOSE-WAIT.
 The TCP unit tests cover the full-flight bound, reopening the window on ACK,
 and retransmission before and after the backed-off deadline. The trames-net
 integration tests exercise both controllers under packet loss and corruption.
+
+The Linux TCP options for corking, the MSS limit and a temporary quick ACK
+act on the original transport. Scheduling and packet construction both apply
+the cork limit. A full segment, uncork, explicit TCP_NODELAY push, close or
+200 ms deadline can release data. Retransmission can send outstanding bytes
+without flushing a newly appended short tail. An ACK owed to the other peer
+can travel independently. MSG_TRUNC advances the receive ring and sequence
+space through the ordinary receive path without copying payload bytes.
+
+A connected stream with an I/O subscriber records its original socket handle
+when an incoming segment makes the receive queue readable, frees a full
+transmit queue, or changes the connection state. The interface drains those
+handles after polling. Trames notifies the socket waiters after releasing the
+fabric lock. Protocol timers still drive delayed ACKs and loss recovery.

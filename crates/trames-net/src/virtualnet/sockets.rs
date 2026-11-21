@@ -1,6 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 impl Socket {
+    pub fn subscribe_tcp_ready(
+        &self,
+        signal: &Arc<trames_shared::IoSignal>,
+    ) -> Option<trames_shared::IoSubscription> {
+        let mut fabric = self.network.0.fabric.0.borrow_mut();
+        let node = fabric.nodes.get_mut(&self.network.0.key)?;
+        let state = self.state.borrow();
+        if state.connection != Connection::Connected {
+            return None;
+        }
+        let h = *state.handles.first()?;
+        let source = node.tcp_waiters.entry(h).or_insert_with(|| {
+            node.sockets.get_mut::<tcp::Socket>(h).observe_io(Some(h));
+            Arc::default()
+        });
+        let source = source.clone();
+        drop(state);
+        drop(fabric);
+        Some(source.subscribe(signal))
+    }
     pub fn subscribe_udp_readable(
         &self,
         signal: &Arc<trames_shared::IoSignal>,
@@ -540,6 +560,9 @@ impl Socket {
             udp_readable: None,
             udp_group: None,
             nodelay: state.nodelay,
+            cork: state.cork,
+            max_segment: state.max_segment,
+            quick_ack: state.quick_ack,
             congestion: state.congestion,
             fin_wait_seconds: state.fin_wait_seconds,
             linger: state.linger,
@@ -778,6 +801,7 @@ impl Socket {
             state.write_closed = true;
             if self.kind == 1 {
                 n.sockets.get_mut::<tcp::Socket>(state.handles[0]).close();
+                n.dirty = true;
             }
         }
         if how != 1 {
@@ -952,9 +976,7 @@ impl Socket {
             sent?;
             return Ok(bytes.len());
         }
-        if destination.is_some() {
-            return Err(NetError(106));
-        }
+        // Connected TCP always uses its established peer, including sendto().
         let mut i = self.network.0.fabric.0.borrow_mut();
         let can_enqueue = {
             let state = self.state.borrow();
@@ -1062,7 +1084,7 @@ impl Socket {
                 }
             }
         }
-        if self.kind == 1 && (state.read_closed || count == 0) {
+        if self.kind == 1 && count == 0 {
             return Ok(Received {
                 packet_address: None,
                 netlink_address: None,
@@ -1095,7 +1117,7 @@ impl Socket {
         if self.kind == 1 {
             let s = n.sockets.get_mut::<tcp::Socket>(state.handles[0]);
             if !s.can_recv() {
-                if s.may_recv() {
+                if s.may_recv() && !state.read_closed {
                     return Err(NetError(11));
                 }
                 return Ok(Received {
@@ -1110,17 +1132,31 @@ impl Socket {
                     truncated: false,
                 });
             }
-            let mut bytes = vec![0; count.min(s.recv_queue())];
-            let size = if flags & MSG_PEEK != 0 {
-                s.peek_slice(&mut bytes)
+            let available = count.min(s.recv_queue());
+            let (bytes, size) = if flags & MSG_TRUNC != 0 {
+                let size = if flags & MSG_PEEK == 0 {
+                    s.discard_received(available).map_err(|_| NetError(11))?
+                } else {
+                    available
+                };
+                (Vec::new(), size)
             } else {
-                s.recv_slice(&mut bytes)
-            }
-            .map_err(|_| NetError(11))?;
-            bytes.truncate(size);
-            n.dirty |= flags & MSG_PEEK == 0 && size != 0;
+                let mut bytes = vec![0; available];
+                let size = if flags & MSG_PEEK != 0 {
+                    s.peek_slice(&mut bytes)
+                } else {
+                    s.recv_slice(&mut bytes)
+                }
+                .map_err(|_| NetError(11))?;
+                bytes.truncate(size);
+                (bytes, size)
+            };
+            // Dequeuing preserves the cumulative ACK number. Only a newly
+            // advertisable window needs an extra fabric poll.
+            let advertise = flags & MSG_PEEK == 0 && size != 0 && s.window_to_update();
+            n.dirty |= advertise;
             drop(state);
-            if flags & MSG_PEEK == 0 && size != 0 {
+            if advertise {
                 i.tick();
             }
             Ok(Received {
@@ -1426,6 +1462,15 @@ impl Socket {
                 return Ok(());
             }
             (6, 1) if self.kind == 1 => state.nodelay = value != 0,
+            (6, 2) if self.kind == 1 => {
+                state.max_segment = match value {
+                    0 => None,
+                    88..=32767 => Some(value as u16),
+                    _ => return Err(NetError(22)),
+                };
+            }
+            (6, 3) if self.kind == 1 => state.cork = value != 0,
+            (6, 12) if self.kind == 1 => state.quick_ack = value != 0,
             (6, 4..=6) if self.kind == 1 => {
                 if !(1..=if name == 6 { 127 } else { 32767 }).contains(&value) {
                     return Err(NetError(22));
@@ -1452,17 +1497,29 @@ impl Socket {
             _ => return Err(NetError(92)),
         }
         if self.kind == 1 {
+            let flush = ((level, name) == (6, 1) && state.nodelay && state.cork).then(|| i.now());
             let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
             n.dirty = true;
             for h in &state.handles {
                 let s = n.sockets.get_mut::<tcp::Socket>(*h);
-                s.set_hop_limit(Some(state.hop_limit));
-                s.set_nagle_enabled(!state.nodelay);
-                s.set_keep_alive(
-                    state
-                        .keepalive
-                        .then_some(smoltcp::time::Duration::from_secs(state.keep_idle as u64)),
-                );
+                match (level, name) {
+                    (0, 2) | (41, 16) => s.set_hop_limit(Some(state.hop_limit)),
+                    (6, 1) => {
+                        s.set_nagle_enabled(!state.nodelay);
+                        if let Some(now) = flush {
+                            s.push_corked(now);
+                        }
+                    }
+                    (6, 2) => s.set_max_segment(state.max_segment),
+                    (6, 3) => s.set_cork(state.cork),
+                    (6, 12) => s.set_quick_ack(state.quick_ack),
+                    (1, 9) | (6, 4) => s.set_keep_alive(
+                        state
+                            .keepalive
+                            .then_some(smoltcp::time::Duration::from_secs(state.keep_idle as u64)),
+                    ),
+                    _ => {}
+                }
             }
         }
         if matches!(self.kind, 2 | 3) {
@@ -1557,6 +1614,24 @@ impl Socket {
             let _ = self.connect_complete();
             return Ok(self.state.borrow_mut().error.take().unwrap_or(0) as i32);
         }
+        if self.kind == 1 && level == 6 && matches!(name, 2 | 12) {
+            let fabric = self.network.0.fabric.0.borrow();
+            let state = self.state.borrow();
+            if state.connection == Connection::Connected {
+                let node = fabric.nodes.get(&self.network.0.key).ok_or(NetError(100))?;
+                let socket = node.sockets.get::<tcp::Socket>(state.handles[0]);
+                return Ok(if name == 2 {
+                    socket.send_mss() as i32
+                } else {
+                    i32::from(socket.quick_ack())
+                });
+            }
+            return Ok(if name == 2 {
+                i32::from(state.max_segment.unwrap_or(536))
+            } else {
+                i32::from(state.quick_ack)
+            });
+        }
         let state = self.state.borrow();
         if self.kind == 2 && (level == 0 || level == 41 && self.family == 10) {
             let options = state.udp_options[usize::from(level == 41)];
@@ -1617,6 +1692,7 @@ impl Socket {
             } else {
                 BUFFER
             } as i32),
+            (6, 3) if self.kind == 1 => Ok(i32::from(state.cork)),
             (6, 8) if self.kind == 1 => Ok(state.fin_wait_seconds),
             (6, 1) if self.kind == 1 => Ok(i32::from(state.nodelay)),
             (6, 4) if self.kind == 1 => Ok(state.keep_idle as i32),

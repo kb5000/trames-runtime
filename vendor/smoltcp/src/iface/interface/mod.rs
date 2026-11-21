@@ -146,6 +146,8 @@ pub struct TransportCounters {
 /// exclusively). However, it is still possible to call methods on its `inner` field.
 pub struct InterfaceInner {
     pub(crate) counters: TransportCounters,
+    #[cfg(all(feature = "socket-tcp", feature = "alloc"))]
+    pub(crate) tcp_ready: alloc::vec::Vec<crate::iface::SocketHandle>,
     #[cfg(all(feature = "socket-udp", feature = "alloc"))]
     pub(crate) udp_readable: alloc::vec::Vec<u64>,
     caps: DeviceCapabilities,
@@ -211,6 +213,12 @@ impl Config {
 }
 
 impl Interface {
+    /// Connected streams whose blocked IO can progress after receiving a segment.
+    #[cfg(all(feature = "socket-tcp", feature = "alloc"))]
+    pub fn drain_tcp_ready(&mut self) -> impl Iterator<Item = crate::iface::SocketHandle> + '_ {
+        self.inner.tcp_ready.drain(..)
+    }
+
     /// Observed UDP queues that became readable while this interface was polled.
     #[cfg(all(feature = "socket-udp", feature = "alloc"))]
     pub fn drain_udp_readable(&mut self) -> impl Iterator<Item = u64> + '_ {
@@ -277,6 +285,8 @@ impl Interface {
             fragmenter: Fragmenter::new(),
             inner: InterfaceInner {
                 counters: TransportCounters::default(),
+                #[cfg(all(feature = "socket-tcp", feature = "alloc"))]
+                tcp_ready: alloc::vec::Vec::new(),
                 #[cfg(all(feature = "socket-udp", feature = "alloc"))]
                 udp_readable: alloc::vec::Vec::new(),
                 now,

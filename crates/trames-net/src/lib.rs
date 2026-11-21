@@ -754,6 +754,25 @@ impl Socket {
             _ => None,
         }
     }
+    /// Queue transitions complement the existing protocol timers and native FDs.
+    pub fn subscribe_io_ready(
+        &self,
+        signal: &Arc<trames_shared::IoSignal>,
+        read: bool,
+    ) -> Option<trames_shared::IoSubscription> {
+        if self.kind == 1 {
+            return match &self.backend {
+                SocketBackend::Virtual(s) => s.subscribe_tcp_ready(signal),
+                SocketBackend::Hybrid(s) => s.subscribe_tcp_ready(signal),
+                _ => None,
+            };
+        }
+        if read {
+            self.subscribe_udp_readable(signal)
+        } else {
+            None
+        }
+    }
     /// Additional receive edge for the guest packet stack. Native FDs and
     /// protocol deadlines remain independent sources for the same operation.
     pub fn subscribe_udp_readable(

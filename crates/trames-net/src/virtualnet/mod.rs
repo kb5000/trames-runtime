@@ -114,6 +114,7 @@ impl DetachedTcp {
 struct Node {
     udp_bind_order: u64,
     udp_readers: BTreeMap<u64, Arc<trames_shared::Readiness>>,
+    tcp_waiters: BTreeMap<SocketHandle, Arc<trames_shared::Readiness>>,
     id: u8,
     owner: Weak<NamespaceData>,
     iface: Interface,
@@ -196,6 +197,9 @@ struct State {
     udp_readable: Option<Arc<trames_shared::Readiness>>,
     udp_group: Option<u64>,
     nodelay: bool,
+    cork: bool,
+    max_segment: Option<u16>,
+    quick_ack: bool,
     congestion: tcp::CongestionControl,
     fin_wait_seconds: i32,
     linger: Option<Duration>,
@@ -288,6 +292,9 @@ impl State {
             socket.set_congestion_control(self.congestion);
         }
         socket.set_nagle_enabled(!self.nodelay);
+        socket.set_cork(self.cork);
+        socket.set_max_segment(self.max_segment);
+        socket.set_quick_ack(self.quick_ack);
         socket.set_hop_limit(Some(self.hop_limit));
         if self.keepalive {
             socket.set_keep_alive(Some(smoltcp::time::Duration::from_secs(
@@ -363,6 +370,7 @@ fn make_node(id: u8, now: smoltcp::time::Instant) -> Result<Node> {
     Ok(Node {
         udp_bind_order: 0,
         udp_readers: BTreeMap::new(),
+        tcp_waiters: BTreeMap::new(),
         id,
         owner: Weak::new(),
         iface,
@@ -755,6 +763,11 @@ impl Inner {
                         node.sockets.remove(entry.handle);
                         false
                     });
+                }
+                for h in node.iface.drain_tcp_ready() {
+                    if let Some(source) = node.tcp_waiters.get(&h) {
+                        self.notifications.push(source.clone());
+                    }
                 }
                 for token in node.iface.drain_udp_readable() {
                     if let Some(source) = node.udp_readers.get(&token) {
@@ -1493,6 +1506,9 @@ impl Network {
                 udp_readable: None,
                 udp_group: None,
                 nodelay: false,
+                cork: false,
+                max_segment: None,
+                quick_ack: true,
                 congestion: tcp::CongestionControl::Cubic,
                 fin_wait_seconds: 60,
                 linger: None,
@@ -1557,6 +1573,9 @@ impl Drop for Socket {
             for h in state.handles.drain(..) {
                 if self.kind == 1 {
                     let s = n.sockets.get_mut::<tcp::Socket>(h);
+                    if n.tcp_waiters.remove(&h).is_some() {
+                        s.observe_io(None);
+                    }
                     if s.is_listening() || s.state() == tcp::State::Closed {
                         n.sockets.remove(h);
                     } else if abort || s.recv_queue() != 0 {
@@ -2054,6 +2073,92 @@ mod shared_lifetime_tests {
         first.set_unprivileged_port(65534).unwrap();
         assert_eq!(first.set_local_port_range(65533, 65535), Err(NetError(22)));
         assert_eq!(first.local_port_range(), [65534, 65535]);
+    }
+
+    fn tcp_io_waiter() -> (Arc<dyn trames_shared::IoWake>, Arc<trames_shared::IoSignal>) {
+        struct Reader;
+        impl trames_shared::IoWake for Reader {
+            fn wake_io(&self, _: &Arc<trames_shared::IoSignal>) {}
+        }
+        let target: Arc<dyn trames_shared::IoWake> = Arc::new(Reader);
+        let signal = trames_shared::IoSignal::new(1, Arc::downgrade(&target));
+        (target, signal)
+    }
+
+    #[test]
+    fn observed_tcp_reader_wakes_for_data_and_peer_shutdown() {
+        let (_target, signal) = tcp_io_waiter();
+        let fabric = Fabric::new().unwrap();
+        let net = fabric.environment(2, NetworkMode::Full).unwrap();
+        let listener = net.socket(2, 1, 0).unwrap();
+        let addr = "127.0.0.1:34033".parse().unwrap();
+        listener.bind(addr).unwrap();
+        listener.listen(1).unwrap();
+        let client = net.socket(2, 1, 0).unwrap();
+        assert_eq!(client.connect(addr), Err(NetError(115)));
+        assert!(client.connect_complete().unwrap());
+        let (peer, _) = listener.accept().unwrap();
+        let _subscription = peer.subscribe_tcp_ready(&signal).unwrap();
+        assert!(!signal.ready());
+        client.send(b"x", 0, None).unwrap();
+        assert!(signal.ready());
+        assert_eq!(peer.recv(1, 0).unwrap().data, b"x");
+        signal.reset();
+        client.shutdown(1).unwrap();
+        assert!(signal.ready());
+        assert_eq!(peer.recv(1, 0).unwrap().length, 0);
+    }
+
+    #[test]
+    fn draining_full_tcp_receive_window_releases_already_queued_sender_data() {
+        let fabric = Fabric::new().unwrap();
+        let net = fabric.environment(2, NetworkMode::Full).unwrap();
+        let listener = net.socket(2, 1, 0).unwrap();
+        let addr = "127.0.0.1:34032".parse().unwrap();
+        listener.bind(addr).unwrap();
+        listener.listen(1).unwrap();
+        let client = net.socket(2, 1, 0).unwrap();
+        assert_eq!(client.connect(addr), Err(NetError(115)));
+        assert!(client.connect_complete().unwrap());
+        let (peer, _) = listener.accept().unwrap();
+        client.set_option(6, 1, 1).unwrap();
+        assert_eq!(client.send(&vec![0x25; BUFFER], 0, None), Ok(BUFFER));
+        let end = Instant::now() + Duration::from_secs(3);
+        while peer.tcp_readable_bytes().unwrap() < BUFFER {
+            assert!(Instant::now() < end);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(client.send(b"tail", 0, None), Ok(4));
+        assert_eq!(peer.recv(BUFFER, MSG_TRUNC).unwrap().length, BUFFER);
+        // Inspect the queue before another guest send/receive or fabric tick.
+        let handle = peer.state.borrow().handles[0];
+        let inner = fabric.0.borrow();
+        let socket = inner.nodes[&net.0.key].sockets.get::<tcp::Socket>(handle);
+        assert_eq!(socket.recv_queue(), 4);
+
+        drop(inner);
+        let payload = vec![0x42; BUFFER];
+        while peer.tcp_readable_bytes().unwrap() < BUFFER {
+            let _ = client.send(&payload, 0, None);
+            assert!(Instant::now() < end);
+        }
+        loop {
+            match client.send(&payload, 0, None) {
+                Ok(_) => assert!(Instant::now() < end),
+                Err(NetError(11)) => break,
+                other => panic!("unexpected send result {other:?}"),
+            }
+        }
+        let (_target, signal) = tcp_io_waiter();
+        let _subscription = client.subscribe_tcp_ready(&signal).unwrap();
+        assert!(!signal.ready());
+        assert_eq!(peer.recv(BUFFER, MSG_TRUNC).unwrap().length, BUFFER);
+        while !signal.ready() {
+            fabric.tick();
+            assert!(Instant::now() < end);
+            std::thread::yield_now();
+        }
+        assert_eq!(client.send(b"x", 0, None), Ok(1));
     }
 
     #[test]

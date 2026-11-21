@@ -104,6 +104,12 @@ impl Socket {
             .update(|revision| revision.wrapping_add(1));
         Ok(s)
     }
+    pub fn subscribe_tcp_ready(
+        &self,
+        signal: &Arc<trames_shared::IoSignal>,
+    ) -> Option<trames_shared::IoSubscription> {
+        self.guest.borrow().clone()?.subscribe_tcp_ready(signal)
+    }
     pub fn subscribe_udp_readable(
         &self,
         signal: &Arc<trames_shared::IoSignal>,
@@ -529,7 +535,7 @@ impl Socket {
         }
         // These controls belong to the guest TCP engine. A wildcard socket
         // also owns a BSD listener, so reject before changing either half.
-        if self.path.get() == Path::Both && level == 6 && matches!(name, 8 | 13) {
+        if self.path.get() == Path::Both && level == 6 && matches!(name, 2 | 3 | 8 | 12 | 13) {
             return Err(NetError(92));
         }
         if matches!(self.path.get(), Path::Guest | Path::Both) {

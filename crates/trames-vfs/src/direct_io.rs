@@ -816,7 +816,7 @@ impl DirectFd {
                 // native observer. Unconnected/UDP/packet-stack sockets use
                 // their original live native set and existing fabric timer.
                 let mut subscriptions = vec![socket.subscribe_changes(signal)];
-                subscriptions.extend(socket.subscribe_udp_readable(signal));
+                subscriptions.extend(socket.subscribe_io_ready(signal, true));
                 match socket.wait_sources() {
                     Ok((fds, _)) => subscriptions.extend(
                         fds.into_iter()

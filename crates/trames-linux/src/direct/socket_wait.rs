@@ -557,11 +557,9 @@ impl DirectSyscalls {
             return Ok(false);
         };
         pending._subscriptions = vec![socket.subscribe_changes(&pending.signal)];
-        if call.events() == 1 {
-            pending
-                ._subscriptions
-                .extend(socket.subscribe_udp_readable(&pending.signal));
-        }
+        pending
+            ._subscriptions
+            .extend(socket.subscribe_io_ready(&pending.signal, call.events() == 1));
         let (fds, delay) = socket.wait_sources()?;
         let mut subscriptions = Vec::new();
         for fd in fds {
