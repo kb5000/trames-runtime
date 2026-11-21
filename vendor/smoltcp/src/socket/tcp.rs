@@ -448,6 +448,9 @@ pub struct Socket<'a> {
     /// Address passed to listen(). Listen address is set when listen() is called and
     /// used every time the socket is reset back to the LISTEN state.
     listen_endpoint: IpListenEndpoint,
+    pub(crate) ingress_device: u32,
+    pub(crate) listener_rank: u64,
+    pub(crate) specific_bind: bool,
     accept_queue_capacity: usize,
     defer_accept_secs: u32,
     deferred_until: Option<Instant>,
@@ -575,6 +578,9 @@ impl<'a> Socket<'a> {
             keep_alive: None,
             hop_limit: None,
             listen_endpoint: IpListenEndpoint::default(),
+            ingress_device: 0,
+            listener_rank: 0,
+            specific_bind: false,
             accept_queue_capacity: 0,
             defer_accept_secs: 0,
             deferred_until: None,
@@ -966,6 +972,17 @@ impl<'a> Socket<'a> {
         self.listen(endpoint)?;
         self.accept_queue_capacity = capacity;
         Ok(())
+    }
+
+    /// Every backlog slot for a Linux listener carries the same selection key.
+    pub fn set_linux_binding(&mut self, device: u32, rank: u64, specific: bool) {
+        self.ingress_device = device;
+        self.listener_rank = rank;
+        self.specific_bind = specific;
+    }
+
+    pub fn accepts_device(&self, index: u32) -> bool {
+        self.ingress_device == 0 || index == 0 || self.ingress_device == index
     }
 
     pub fn accept_ready(&self) -> bool {

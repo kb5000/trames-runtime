@@ -67,7 +67,9 @@ def run(args,output,plan,env,runner,name,store,snapshot,cache,timeout):
     rows=[];serial=0;started=time.monotonic();disk_stopped=False
     # Affinity cases narrow the test process's mask without restoring it. A
     # later case must start with the environment's full configured CPU set.
-    single={'affinity'}
+    # The isolated loopback binary reuses fixed ports across cases. TIME_WAIT
+    # from one successful test must not affect the next bind.
+    single={'affinity','socket_inet_loopback_isolated'}
     remaining_budget=lambda: not args.time_budget or time.monotonic()-started<args.time_budget
 
     def checkpoint():save(output/'results.json',rows)

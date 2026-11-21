@@ -90,6 +90,8 @@ struct Inner {
     revision: u64,
 }
 struct DetachedTcp {
+    reuse_addr: bool,
+    device: Option<u32>,
     handle: SocketHandle,
     deadline: Instant,
     fin_wait_seconds: i32,
@@ -97,9 +99,17 @@ struct DetachedTcp {
 }
 
 impl DetachedTcp {
-    fn new(handle: SocketHandle, fin_wait_seconds: i32, now: Instant) -> Self {
+    fn new(
+        handle: SocketHandle,
+        fin_wait_seconds: i32,
+        now: Instant,
+        reuse_addr: bool,
+        device: Option<u32>,
+    ) -> Self {
         Self {
             handle,
+            reuse_addr,
+            device,
             fin_wait_seconds,
             deadline: now + Duration::from_secs(30),
             in_fin_wait2: false,
@@ -123,6 +133,7 @@ impl DetachedTcp {
 struct Node {
     udp_bind_order: u64,
     udp_readers: BTreeMap<u64, Arc<trames_shared::Readiness>>,
+    next_listener: u64,
     growing_listeners: Vec<Weak<SocketMeta>>,
     tcp_waiters: BTreeMap<SocketHandle, Arc<trames_shared::Readiness>>,
     id: u8,
@@ -199,6 +210,8 @@ struct State {
     v6_only: bool,
     reuse: bool,
     reuse_port: bool,
+    listener_rank: u64,
+    shared_tcp_binding: bool,
     udp_bind_order: u64,
     // Address and port requested by bind(2), before ephemeral allocation.
     requested_bind: Option<SocketAddr>,
@@ -330,6 +343,11 @@ impl State {
 
     fn new_tcp_socket(&self) -> tcp::Socket<'static> {
         let mut socket = tcp_socket_with_buffers(self.receive_buffer, self.send_buffer);
+        socket.set_linux_binding(
+            self.device.unwrap_or(0),
+            self.listener_rank,
+            self.bound.is_some_and(|a| !a.ip().is_unspecified()),
+        );
         if socket.congestion_control() != self.congestion {
             socket.set_congestion_control(self.congestion);
         }
@@ -370,6 +388,7 @@ impl State {
         specific: bool,
     ) -> Result<()> {
         socket.enable_linux_receive();
+        socket.set_ingress_device(self.device.unwrap_or(0));
         socket.observe_errors(self.udp_errors.as_ref().unwrap().clone());
         socket.set_bind_priority(self.udp_bind_order, specific);
         if self.udp_readable.is_some() {
@@ -447,6 +466,7 @@ fn make_node(id: u8, now: smoltcp::time::Instant) -> Result<Node> {
     Ok(Node {
         udp_bind_order: 0,
         udp_readers: BTreeMap::new(),
+        next_listener: 0,
         growing_listeners: Vec::new(),
         tcp_waiters: BTreeMap::new(),
         id,
@@ -908,7 +928,7 @@ impl Inner {
                         self.stats.dropped += 1;
                         continue;
                     }
-                    let Some(complete) = rx.rx.pop_front() else {
+                    let Some((complete, _)) = rx.rx.pop_front() else {
                         continue;
                     };
                     p = complete;
@@ -949,7 +969,7 @@ impl Inner {
                             self.stats.dropped += 1;
                             continue;
                         }
-                        let Some(complete) = rx.rx.pop_front() else {
+                        let Some((complete, _)) = rx.rx.pop_front() else {
                             continue;
                         };
                         p = complete;
@@ -1124,7 +1144,12 @@ impl Inner {
                                 || matches!(ns.mode, NetworkMode::Outbound | NetworkMode::Full))
                     });
                     let size = p.len() as u64;
-                    let dropped = !permitted || !enabled || !node.port.receive_packet(p);
+                    let dropped = !permitted
+                        || !enabled
+                        || !node.port.receive_on(
+                            p,
+                            delivery.map_or(if lo { 1 } else { 2 }, |path| path.input),
+                        );
                     if let (Some(view), Some(path)) = (&dynamic, delivery) {
                         let graph = view.graph.read().unwrap();
                         graph.account(view.namespace, path.output, size as usize, true, dropped);
@@ -1206,7 +1231,7 @@ impl Inner {
 }
 impl Node {
     fn grow_accept_queue(&mut self, target: SocketAddr) {
-        for entry in &self.growing_listeners {
+        'listeners: for entry in &self.growing_listeners {
             let Some(listener) = entry.upgrade() else {
                 continue;
             };
@@ -1222,7 +1247,7 @@ impl Node {
                 let socket = self.sockets.get::<tcp::Socket>(handle);
                 if socket.listen_endpoint().addr == Some(endpoint.addr) {
                     if socket.is_listening() {
-                        return;
+                        continue 'listeners;
                     }
                     slots += 1;
                 }
@@ -1232,7 +1257,6 @@ impl Node {
                 if socket.listen_queued(endpoint, state.backlog).is_ok() {
                     state.handles.push(self.sockets.add(socket));
                 }
-                return;
             }
         }
     }
@@ -1574,6 +1598,8 @@ impl Network {
                 v6_only: family == 10 && matches!(kind, 3 | 4),
                 reuse: false,
                 reuse_port: false,
+                listener_rank: 0,
+                shared_tcp_binding: false,
                 udp_bind_order: 0,
                 requested_bind: None,
                 udp_shared: false,
@@ -1657,6 +1683,8 @@ impl Drop for Socket {
             let abort = state.connection == Connection::Listening
                 || (state.linger_enabled && state.linger_seconds == 0);
             let fin_wait_seconds = state.fin_wait_seconds;
+            let reuse_addr = state.reuse;
+            let device = state.device;
             let linger_closing = state.linger_closing;
             for h in state.handles.drain(..) {
                 if self.kind == 1 {
@@ -1673,8 +1701,13 @@ impl Drop for Socket {
                         n.sockets.remove(h);
                     } else {
                         s.close_final();
-                        n.detached
-                            .push(DetachedTcp::new(h, fin_wait_seconds, Instant::now()));
+                        n.detached.push(DetachedTcp::new(
+                            h,
+                            fin_wait_seconds,
+                            Instant::now(),
+                            reuse_addr,
+                            device,
+                        ));
                     }
                 } else {
                     n.sockets.remove(h);

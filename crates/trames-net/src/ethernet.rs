@@ -199,7 +199,9 @@ impl Switch {
         if !rx.receive_packet(p.to_vec()) {
             return None;
         }
-        rx.rx.pop_front().map(|p| (frame.with_payload(&p), true))
+        rx.rx
+            .pop_front()
+            .map(|(p, _)| (frame.with_payload(&p), true))
     }
     fn ticks(&self) -> u64 {
         self.started.elapsed().as_millis().min(u64::MAX as u128) as u64 / 10

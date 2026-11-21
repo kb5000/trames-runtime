@@ -6,6 +6,7 @@ impl InterfaceInner {
     pub(crate) fn process_tcp<'frame>(
         &mut self,
         sockets: &mut SocketSet,
+        ingress: u32,
         ip_repr: IpRepr,
         ip_payload: &'frame [u8],
     ) -> Option<Packet<'frame>> {
@@ -19,15 +20,48 @@ impl InterfaceInner {
         ));
 
         self.counters.in_segs += 1;
-        for tcp_socket in sockets
-            .items_mut()
-            .filter_map(|i| Socket::downcast_mut(&mut i.socket))
-        {
-            if tcp_socket.accepts(self, &ip_repr, &tcp_repr) {
-                return tcp_socket
-                    .process(self, &ip_repr, &tcp_repr)
-                    .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
+        let mut listener = None;
+        let mut flow = None;
+        for (handle, item) in sockets.iter_mut() {
+            let Some(socket) = Socket::downcast_mut(item) else {
+                continue;
+            };
+            if (socket.ingress_device != 0 && socket.ingress_device != ingress)
+                || !socket.accepts(self, &ip_repr, &tcp_repr)
+            {
+                continue;
             }
+            if socket.is_listening()
+                && socket.listener_rank != 0
+                && tcp_repr.control == TcpControl::Syn
+            {
+                // A matching established tuple takes precedence over a new listener.
+                // Rank logical listeners once per flow, independent of backlog size.
+                let key = *flow.get_or_insert_with(|| {
+                    socket_flow(
+                        IpEndpoint::new(src_addr, tcp_repr.src_port),
+                        IpEndpoint::new(dst_addr, tcp_repr.dst_port),
+                    )
+                });
+                let score = (
+                    socket.specific_bind,
+                    socket.ingress_device != 0,
+                    mix_flow(key ^ mix_flow(socket.listener_rank)),
+                );
+                if listener.is_none_or(|(best, _)| score > best) {
+                    listener = Some((score, handle));
+                }
+                continue;
+            }
+            return socket
+                .process(self, &ip_repr, &tcp_repr)
+                .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
+        }
+        if let Some((_, handle)) = listener {
+            return sockets
+                .get_mut::<Socket>(handle)
+                .process(self, &ip_repr, &tcp_repr)
+                .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
         }
 
         // A full accept queue drops new SYNs. An existing four-tuple has
@@ -37,7 +71,10 @@ impl InterfaceInner {
             && sockets
                 .items_mut()
                 .filter_map(|item| Socket::downcast_mut(&mut item.socket))
-                .any(|socket| socket.queues_syn_for(dst_addr, tcp_repr.dst_port))
+                .any(|socket| {
+                    (socket.ingress_device == 0 || socket.ingress_device == ingress)
+                        && socket.queues_syn_for(dst_addr, tcp_repr.dst_port)
+                })
         {
             return None;
         }

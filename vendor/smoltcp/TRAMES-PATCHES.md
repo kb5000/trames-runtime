@@ -128,3 +128,10 @@ its rings grow on demand. TCP receive growth preserves sequence offsets for
 out-of-order segments and the scale negotiated at connection setup. UDP
 growth repacks whole datagrams, including empty records, in arrival order.
 Borrowed rings used by other callers retain their fixed capacity.
+
+TCP backlog slots can carry their logical listener's stable reuse-port key
+and original bind specificity. A new SYN selects among eligible shared
+listeners by endpoint specificity, ingress device and a hash of the TCP
+four-tuple. Established connections retain their tuple match. TCP and UDP
+can both restrict delivery to a guest ingress interface. The existing UDP
+flow hash is shared with TCP listener selection.

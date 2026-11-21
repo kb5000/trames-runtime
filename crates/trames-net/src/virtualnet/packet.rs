@@ -8,13 +8,13 @@ const QUEUE: usize = 96;
 const FRAGMENT_BYTES: usize = 512 * 1024;
 #[derive(Default)]
 pub(crate) struct Port {
-    pub rx: VecDeque<Vec<u8>>,
+    pub rx: VecDeque<(Vec<u8>, u32)>,
     pub tx: VecDeque<Vec<u8>>,
     serial: u32,
     fragments: Vec<Fragments>,
 }
 struct Fragments {
-    key: (IpAddr, IpAddr, u32, u8),
+    key: (IpAddr, IpAddr, u32, u8, u32),
     header: Vec<u8>,
     data: Vec<u8>,
     covered: Vec<bool>,
@@ -31,6 +31,9 @@ impl Fragments {
 }
 impl Port {
     pub fn receive_packet(&mut self, p: Vec<u8>) -> bool {
+        self.receive_on(p, 0)
+    }
+    pub(super) fn receive_on(&mut self, p: Vec<u8>, ingress: u32) -> bool {
         self.fragments.retain(|f| f.expires > Instant::now());
         if p.len() > 65575 || self.rx.len() == QUEUE {
             return false;
@@ -76,10 +79,16 @@ impl Port {
             None
         };
         let Some((id, proto, offset, more, header_len, data_offset)) = descriptor else {
-            self.rx.push_back(p);
+            self.rx.push_back((p, ingress));
             return true;
         };
-        let key = (h.tuple.source.ip(), h.tuple.destination.ip(), id, proto);
+        let key = (
+            h.tuple.source.ip(),
+            h.tuple.destination.ip(),
+            id,
+            proto,
+            ingress,
+        );
         let n = p.len() - data_offset;
         let maximum = if version == 4 {
             65535 - header_len
@@ -176,15 +185,20 @@ impl Port {
                     f.header[4..6].copy_from_slice(&(end as u16).to_be_bytes());
                 }
                 f.header.extend_from_slice(&f.data[..end]);
-                self.rx.push_back(f.header);
+                self.rx.push_back((f.header, ingress));
             }
         }
         true
     }
 }
-pub(crate) struct Rx(Vec<u8>);
+pub(crate) struct Rx(Vec<u8>, u32);
 pub(crate) struct Tx<'a>(&'a mut Port);
 impl RxToken for Rx {
+    fn meta(&self) -> smoltcp::phy::PacketMeta {
+        let mut meta = smoltcp::phy::PacketMeta::default();
+        meta.ingress_index = self.1;
+        meta
+    }
     fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R,
@@ -230,8 +244,8 @@ impl Device for Port {
         if self.tx.len() == QUEUE {
             return None;
         }
-        let p = self.rx.pop_front()?;
-        Some((Rx(p), Tx(self)))
+        let (p, index) = self.rx.pop_front()?;
+        Some((Rx(p, index), Tx(self)))
     }
     fn transmit(&mut self, _: smoltcp::time::Instant) -> Option<Tx<'_>> {
         (self.tx.len() < QUEUE).then_some(Tx(self))
@@ -446,7 +460,7 @@ mod tests {
             for f in frames.iter().rev() {
                 assert!(port.receive_packet(f.clone()));
             }
-            assert_eq!(port.rx.pop_front().unwrap(), original);
+            assert_eq!(port.rx.pop_front().unwrap().0, original);
             assert!(port.fragments.is_empty());
             let mut port = Port::default();
             assert!(port.receive_packet(frames[0].clone()));
@@ -490,7 +504,7 @@ mod tests {
                 expected[4..6].copy_from_slice(&600u16.to_be_bytes());
                 smoltcp::wire::Ipv4Packet::new_unchecked(&mut expected).fill_checksum();
             }
-            assert_eq!(port.rx.pop_front().unwrap(), expected);
+            assert_eq!(port.rx.pop_front().unwrap().0, expected);
         }
     }
     #[test]

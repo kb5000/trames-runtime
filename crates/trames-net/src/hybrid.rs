@@ -565,6 +565,19 @@ impl Socket {
     pub fn set_option(&self, level: u32, name: u32, value: i32) -> Result<()> {
         self.set_option_bytes(level, name, &value.to_le_bytes())
     }
+    pub fn set_bound_device(&self, value: &[u8], can_rebind: bool) -> Result<()> {
+        if self.path.get() == Path::Guest {
+            return self.guest()?.bind_device(value, can_rebind);
+        }
+        Err(NetError(92))
+    }
+    pub fn bound_device_name(&self) -> Result<Vec<u8>> {
+        if self.path.get() == Path::Guest {
+            self.guest()?.bound_device_name()
+        } else {
+            Err(NetError(92))
+        }
+    }
     pub fn congestion_name(&self) -> Result<[u8; 16]> {
         if self.path.get() == Path::Guest {
             self.guest()?.congestion_name()

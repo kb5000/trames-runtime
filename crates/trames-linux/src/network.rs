@@ -92,6 +92,12 @@ pub(super) fn control(
                 return Ok(0);
             }
             write_option(memory, a, |value| {
+                if (a[1], a[2]) == (1, 25) {
+                    let can_rebind = factory
+                        .local_credentials()
+                        .has_ns_cap(socket.user_namespace(), trames_vfs::capabilities::NET_RAW);
+                    return socket.set_bound_device(value, can_rebind).map_err(net);
+                }
                 if a[1] as u32 == 1 && a[2] as u32 == 36 {
                     let credentials = factory.local_credentials();
                     if !credentials
@@ -123,6 +129,21 @@ pub(super) fn control(
             })
         }
         209 => {
+            if (a[1], a[2]) == (1, 25) {
+                let capacity = u32_at(memory, a[4])? as i32;
+                let name = socket.bound_device_name().map_err(net)?;
+                if capacity < 0 || !name.is_empty() && capacity < 16 {
+                    return Err(Errno(22));
+                }
+                Linux::check(memory, a[4], 4, Access::Write)?;
+                if !name.is_empty() {
+                    memory.write(a[3], &name).map_err(|_| Errno(14))?;
+                }
+                memory
+                    .write(a[4], &(name.len() as u32).to_le_bytes())
+                    .map_err(|_| Errno(14))?;
+                return Ok(0);
+            }
             if (a[1], a[2]) == (1, 13) {
                 return read_option(memory, a, || socket.linger().map_err(net));
             }
@@ -385,6 +406,21 @@ fn write_option(
     a: [u64; 6],
     write: impl FnOnce(&[u8]) -> Result<()>,
 ) -> Result<u64> {
+    if (a[1], a[2]) == (1, 25) {
+        let length = a[4] as u32 as i32;
+        if length < 0 {
+            return Err(Errno(22));
+        }
+        let mut name = [0; 16];
+        let count = (length as usize).min(name.len() - 1);
+        if count != 0 {
+            memory
+                .read(a[3], &mut name[..count])
+                .map_err(|_| Errno(14))?;
+        }
+        write(&name[..count])?;
+        return Ok(0);
+    }
     if (a[1], a[2]) == (6, 13) {
         let len = a[4] as u32 as i32;
         if len <= 0 {

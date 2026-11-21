@@ -93,7 +93,7 @@ impl Inner {
             if !rx.receive_packet(frame.payload().to_vec()) {
                 return;
             }
-            let Some(packet) = rx.rx.pop_front() else {
+            let Some((packet, _)) = rx.rx.pop_front() else {
                 return;
             };
             let Some(h) = packet::header(&packet) else {

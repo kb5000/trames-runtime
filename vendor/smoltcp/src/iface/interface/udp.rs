@@ -6,34 +6,6 @@ use crate::socket::dns::Socket as DnsSocket;
 #[cfg(feature = "socket-udp")]
 use crate::socket::udp::Socket as UdpSocket;
 
-// SplitMix64 finalizer. The four-tuple and logical binding identity stay
-// stable across packets and socket table slot reuse.
-#[cfg(feature = "socket-udp")]
-fn mix_flow(mut x: u64) -> u64 {
-    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
-    x ^ (x >> 31)
-}
-
-#[cfg(feature = "socket-udp")]
-fn flow_address(address: IpAddress) -> u64 {
-    match address {
-        #[cfg(feature = "proto-ipv4")]
-        IpAddress::Ipv4(v) => u64::from(v.to_bits()),
-        #[cfg(feature = "proto-ipv6")]
-        IpAddress::Ipv6(v) => {
-            let bits = v.to_bits();
-            mix_flow((bits >> 64) as u64) ^ bits as u64
-        }
-    }
-}
-
-#[cfg(feature = "socket-udp")]
-fn udp_flow(src: IpEndpoint, dst: IpEndpoint) -> u64 {
-    let ports = (u64::from(src.port) << 16) | u64::from(dst.port);
-    mix_flow(flow_address(src.addr)) ^ flow_address(dst.addr).rotate_left(23) ^ ports
-}
-
 impl InterfaceInner {
     #[cfg(all(feature = "std", feature = "socket-udp"))]
     pub(super) fn udp_unreachable(
@@ -70,7 +42,7 @@ impl InterfaceInner {
         if let Some(((connected, specific, _), mut h)) = owner {
             if let Some(group) = sockets.get::<UdpSocket>(h).reuse_port_group {
                 // Use the same return-flow affinity as an ordinary UDP reply.
-                let flow = udp_flow(peer, local);
+                let flow = socket_flow(peer, local);
                 if let Some((_, chosen)) = sockets
                     .iter_mut()
                     .filter_map(|(candidate, item)| {
@@ -122,7 +94,9 @@ impl InterfaceInner {
                 let Some(socket) = UdpSocket::downcast_mut(item) else {
                     continue;
                 };
-                if !socket.accepts(self, &ip_repr, &udp_repr) {
+                if (socket.ingress_device != 0 && socket.ingress_device != meta.ingress_index)
+                    || !socket.accepts(self, &ip_repr, &udp_repr)
+                {
                     continue;
                 }
                 let Some(rank) = socket.shared_priority() else {
@@ -135,7 +109,7 @@ impl InterfaceInner {
             }
             if let Some(((connected, specific, _), mut handle, group)) = shared {
                 if let Some(group) = group {
-                    let flow = udp_flow(
+                    let flow = socket_flow(
                         IpEndpoint::new(src_addr, udp_repr.src_port),
                         IpEndpoint::new(dst_addr, udp_repr.dst_port),
                     );
@@ -145,6 +119,8 @@ impl InterfaceInner {
                             continue;
                         };
                         if socket.reuse_port_group != Some(group)
+                            || (socket.ingress_device != 0
+                                && socket.ingress_device != meta.ingress_index)
                             || !socket.accepts(self, &ip_repr, &udp_repr)
                         {
                             continue;

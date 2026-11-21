@@ -191,6 +191,7 @@ def classify(xml, code, timed_out, expected):
 # These flags describe the named suites, not the worker or its other tests.
 SUITE_FIXTURES = {
     'host_pty_fixture': {'host_pty'},
+    'isolated_loopback_per_case': {'socket_inet_loopback_isolated'},
     'setgid_fixture': {'setgid'},
     'multiprocess_fixture': {'concurrency'},
     'memfd_tmpfs_fixture': {'memfd'},
@@ -388,6 +389,8 @@ def trames(args, output):
         plan['host_pty_fixture'] = True
     if any(s['name'] == 'setgid' for s in plan['suites']):
         plan['setgid_fixture'] = suite_flags('setgid')
+    if any(s['name'] == 'socket_inet_loopback_isolated' for s in plan['suites']):
+        plan['isolated_loopback_per_case'] = True
     if any(s['name'] == 'memfd' for s in plan['suites']):
         plan['memfd_tmpfs_fixture'] = True
     save(output/'plan.json', plan)

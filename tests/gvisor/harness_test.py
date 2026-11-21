@@ -160,6 +160,14 @@ class EvidenceTests(unittest.TestCase):
         self.assertIsNone(xml_rows(path, 0, ['T.A']))
         self.assertEqual(classify(path, 0, False, 'T.A')[0], 'invalid_result')
 
+    def test_isolated_loopback_rejects_results_from_a_shared_namespace(self):
+        suite = dict(name='socket_inet_loopback_isolated', sha256='elf', cases=['T.Bind'])
+        previous = dict(suites=[suite])
+        (self.root / 'plan.json').write_text(json.dumps(previous))
+        args = argparse.Namespace(reuse=self.root, reuse_completed=True)
+        with self.assertRaisesRegex(RuntimeError, 'isolated_loopback_per_case'):
+            reuse_rows(args, dict(previous, isolated_loopback_per_case=True))
+
     def test_repartition_and_second_reuse_keep_the_original_xml(self):
         plan = dict(suites=[dict(name='a', sha256='a', cases=['T.A']), dict(name='memfd', sha256='m', cases=['M.Test'])],
                     memfd_tmpfs_fixture=True)

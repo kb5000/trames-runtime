@@ -913,6 +913,21 @@ impl Socket {
             _ => Err(NetError(92)),
         }
     }
+    pub fn set_bound_device(&self, name: &[u8], can_rebind: bool) -> Result<()> {
+        let _operation = self.operation.write();
+        match &self.backend {
+            SocketBackend::Virtual(s) => s.bind_device(name, can_rebind),
+            SocketBackend::Hybrid(s) => s.set_bound_device(name, can_rebind),
+            _ => Err(NetError(92)),
+        }
+    }
+    pub fn bound_device_name(&self) -> Result<Vec<u8>> {
+        match &self.backend {
+            SocketBackend::Virtual(s) => s.bound_device_name(),
+            SocketBackend::Hybrid(s) => s.bound_device_name(),
+            _ => Err(NetError(92)),
+        }
+    }
     pub fn congestion_name(&self) -> Result<[u8; 16]> {
         let _operation = self.operation.read_recursive();
         match &self.backend {

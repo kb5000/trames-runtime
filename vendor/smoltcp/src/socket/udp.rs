@@ -145,6 +145,7 @@ pub struct Socket<'a> {
     bind_order: u64,
     specific_bind: bool,
     reusable: bool,
+    pub(crate) ingress_device: u32,
     pub(crate) reuse_port_group: Option<u64>,
     #[cfg(feature = "alloc")]
     readable_token: Option<u64>,
@@ -171,6 +172,7 @@ impl<'a> Socket<'a> {
             bind_order: 0,
             specific_bind: false,
             reusable: false,
+            ingress_device: 0,
             reuse_port_group: None,
             #[cfg(feature = "alloc")]
             readable_token: None,
@@ -250,6 +252,10 @@ impl<'a> Socket<'a> {
     }
 
     /// Members with the same guest owner and address family may share a flow.
+    pub fn set_ingress_device(&mut self, index: u32) {
+        self.ingress_device = index;
+    }
+
     pub fn set_reuse_port_group(&mut self, group: Option<u64>) {
         self.reusable |= group.is_some();
         self.reuse_port_group = group;

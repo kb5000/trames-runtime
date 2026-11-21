@@ -21,6 +21,34 @@ mod sixlowpan;
 pub(crate) mod multicast;
 #[cfg(feature = "socket-tcp")]
 mod tcp;
+
+// SplitMix64 finalizer. The four-tuple and logical binding identity stay
+// stable across packets and socket table slot reuse.
+#[cfg(any(feature = "socket-udp", feature = "socket-tcp"))]
+fn mix_flow(mut x: u64) -> u64 {
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+    x ^ (x >> 31)
+}
+
+#[cfg(any(feature = "socket-udp", feature = "socket-tcp"))]
+fn flow_address(address: IpAddress) -> u64 {
+    match address {
+        #[cfg(feature = "proto-ipv4")]
+        IpAddress::Ipv4(v) => u64::from(v.to_bits()),
+        #[cfg(feature = "proto-ipv6")]
+        IpAddress::Ipv6(v) => {
+            let bits = v.to_bits();
+            mix_flow((bits >> 64) as u64) ^ bits as u64
+        }
+    }
+}
+
+#[cfg(any(feature = "socket-udp", feature = "socket-tcp"))]
+fn socket_flow(src: IpEndpoint, dst: IpEndpoint) -> u64 {
+    let ports = (u64::from(src.port) << 16) | u64::from(dst.port);
+    mix_flow(flow_address(src.addr)) ^ flow_address(dst.addr).rotate_left(23) ^ ports
+}
 #[cfg(any(feature = "socket-udp", feature = "socket-dns"))]
 mod udp;
 

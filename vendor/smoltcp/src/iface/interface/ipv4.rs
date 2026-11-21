@@ -232,7 +232,7 @@ impl InterfaceInner {
             }
 
             #[cfg(feature = "socket-tcp")]
-            IpProtocol::Tcp => self.process_tcp(sockets, ip_repr, ip_payload),
+            IpProtocol::Tcp => self.process_tcp(sockets, meta.ingress_index, ip_repr, ip_payload),
 
             _ if handled_by_raw_socket => None,
 

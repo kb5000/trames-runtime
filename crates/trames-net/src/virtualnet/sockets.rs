@@ -1,5 +1,23 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PortUse {
+    Ephemeral,
+    Bind,
+    Listen,
+}
+
+fn addresses_overlap(a: SocketAddr, a_dual: bool, b: SocketAddr, b_dual: bool) -> bool {
+    a.port() == b.port()
+        && if a.is_ipv4() == b.is_ipv4() {
+            a.ip().is_unspecified() || b.ip().is_unspecified() || a.ip() == b.ip()
+        } else if a.is_ipv6() {
+            a_dual && a.ip().is_unspecified()
+        } else {
+            b_dual && b.ip().is_unspecified()
+        }
+}
+
 impl Socket {
     pub fn subscribe_tcp_ready(
         &self,
@@ -180,6 +198,13 @@ impl Socket {
         }
         Ok(a)
     }
+    fn udp_destination_address(&self, address: SocketAddr) -> Result<SocketAddr> {
+        self.normalize(if self.family == 10 && address.is_ipv4() {
+            self.presented(address)
+        } else {
+            address
+        })
+    }
     fn presented(&self, a: SocketAddr) -> SocketAddr {
         if self.family == 10 && a.is_ipv4() {
             SocketAddr::new(
@@ -292,54 +317,71 @@ impl Socket {
             .map(|ip| SocketAddr::new(ip, bound.port()))
             .collect()
     }
-    fn port_free(&self, a: SocketAddr) -> bool {
+    fn port_free(&self, address: SocketAddr, usage: PortUse) -> bool {
         let i = self.network.0.fabric.0.borrow();
         let Some(n) = i.nodes.get(&self.network.0.key) else {
             return false;
         };
-        let (dual, reuse_udp, reuse_port) = {
-            let state = self.state.borrow();
-            (
-                self.family == 10 && !state.v6_only,
-                self.kind == 2 && state.reuse,
-                self.kind == 2 && state.reuse_port,
-            )
-        };
+        let own = self.state.borrow();
+        let dual = self.family == 10 && !own.v6_only;
+        let mut udp_owner = None;
         let free = n
             .registry
             .iter()
             .filter_map(Weak::upgrade)
             .filter(|s| !std::ptr::eq(s.as_ref(), self.meta.as_ref()) && s.kind == self.kind)
             .all(|s| {
-                let state = s.state.borrow();
-                let Some(b) = state.bound else {
+                let other = s.state.borrow();
+                let Some(bound) = other.bound else {
                     return true;
                 };
-                if a.port() != b.port()
-                    || reuse_udp && state.reuse
-                    || reuse_port && state.reuse_port && self.uid.get() == s.uid.get()
+                if !addresses_overlap(address, dual, bound, s.family == 10 && !other.v6_only)
+                    || own.device.zip(other.device).is_some_and(|(a, b)| a != b)
                 {
                     return true;
                 }
-                let same_family =
-                    a.is_ipv4() == b.is_ipv4() || dual || (s.family == 10 && !state.v6_only);
-                !same_family
-                    || (!a.ip().is_unspecified() && !b.ip().is_unspecified() && a.ip() != b.ip())
+                if usage == PortUse::Listen && other.connection != Connection::Listening {
+                    return true;
+                }
+                if usage == PortUse::Ephemeral {
+                    return false;
+                }
+                let reusable_port =
+                    own.reuse_port && other.reuse_port && self.uid.get() == s.uid.get();
+                if usage == PortUse::Bind
+                    && own.reuse
+                    && other.reuse
+                    && (self.kind == 2 || other.connection != Connection::Listening)
+                {
+                    return true;
+                }
+                if self.kind == 2 && own.reuse_port {
+                    // Linux UDP walks the port chain newest binding first. The
+                    // first overlap not admitted by REUSEADDR decides REUSEPORT.
+                    if udp_owner.is_none_or(|(order, _)| other.udp_bind_order > order) {
+                        udp_owner = Some((other.udp_bind_order, reusable_port));
+                    }
+                    return true;
+                }
+                reusable_port
             });
-        if !free || self.kind != 1 {
-            return free;
+        if !free || self.kind != 1 || usage == PortUse::Listen {
+            return free && udp_owner.is_none_or(|(_, reusable)| reusable);
         }
         // Closing TCP endpoints still own their local port after guest FD
         // retirement. Reusing it here can deliver a new SYN to old TIME_WAIT
         // state. The original protocol deadline, not FD lifetime, releases it.
         n.detached.iter().all(|entry| {
+            if usage == PortUse::Bind && own.reuse && entry.reuse_addr
+                || own.device.zip(entry.device).is_some_and(|(a, b)| a != b)
+            {
+                return true;
+            }
             let socket = n.sockets.get::<tcp::Socket>(entry.handle);
             socket.state() == tcp::State::Closed
                 || socket.local_endpoint().is_none_or(|endpoint| {
-                    let b = address(endpoint);
-                    a.port() != b.port()
-                        || (a.is_ipv4() != b.is_ipv4() && !dual)
-                        || (!a.ip().is_unspecified() && a.ip() != b.ip())
+                    let b = super::address(endpoint);
+                    !addresses_overlap(address, dual, b, false)
                 })
         })
     }
@@ -360,7 +402,7 @@ impl Socket {
         };
         for n in 0..span {
             let p = low + ((first + n) % span) as u16;
-            if self.port_free(SocketAddr::new(ip, p)) {
+            if self.port_free(SocketAddr::new(ip, p), PortUse::Ephemeral) {
                 self.network
                     .0
                     .ephemeral_port
@@ -388,6 +430,9 @@ impl Socket {
     }
     fn bind_locked(&self, a: SocketAddr, explicit: bool) -> Result<()> {
         self.fabric().tick();
+        if self.family == 10 && a.is_ipv4() {
+            return Err(NetError(22));
+        }
         let requested = self.normalize(a)?;
         let mut a = requested;
         if self.network.0.finished.get() {
@@ -403,7 +448,7 @@ impl Socket {
             a.set_port(0);
         } else if a.port() == 0 {
             a.set_port(self.choose_port(a.ip())?);
-        } else if !self.port_free(a) {
+        } else if !self.port_free(a, PortUse::Bind) {
             return Err(NetError(98));
         }
         if self.kind == 3 {
@@ -481,8 +526,13 @@ impl Socket {
         if state.connection != Connection::Idle {
             return Err(NetError(22));
         }
-        state.bound.ok_or(NetError(22))?;
-        Ok(())
+        let bound = state.bound.ok_or(NetError(22))?;
+        drop(state);
+        if !self.state.borrow().shared_tcp_binding || self.port_free(bound, PortUse::Listen) {
+            Ok(())
+        } else {
+            Err(NetError(98))
+        }
     }
     pub fn listen(&self, backlog: u32) -> Result<()> {
         if self.kind != 1 {
@@ -505,6 +555,11 @@ impl Socket {
                 self.state.borrow().bound.ok_or(NetError(22))?
             }
         };
+        let shared = self.state.borrow().shared_tcp_binding;
+        let _binding = shared.then(|| self.network.0.binding.lock());
+        if shared && !self.port_free(bound, PortUse::Listen) {
+            return Err(NetError(98));
+        }
         let addresses = self.addresses(bound);
         let backlog = (backlog as usize)
             .saturating_add(1)
@@ -512,6 +567,10 @@ impl Socket {
         let mut i = self.network.0.fabric.0.borrow_mut();
         let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
         let mut state = self.state.borrow_mut();
+        if state.reuse_port {
+            n.next_listener += 1;
+            state.listener_rank = n.next_listener;
+        }
         if backlog > 1 {
             n.growing_listeners.push(Arc::downgrade(&self.meta));
         }
@@ -571,7 +630,9 @@ impl Socket {
             write_closed: false,
             v6_only: state.v6_only,
             reuse: state.reuse,
-            reuse_port: false,
+            reuse_port: state.reuse_port,
+            listener_rank: 0,
+            shared_tcp_binding: state.shared_tcp_binding,
             udp_bind_order: 0,
             requested_bind: None,
             udp_shared: false,
@@ -657,8 +718,8 @@ impl Socket {
     pub fn connect(&self, a: SocketAddr) -> Result<()> {
         // Dual-stack UDP accepts a sockaddr_in directly on connect (glibc
         // probes available address families this way).
-        let mut a = if self.kind == 2 && self.family == 10 && a.is_ipv4() {
-            self.normalize(self.presented(a))?
+        let mut a = if self.kind == 2 {
+            self.udp_destination_address(a)?
         } else {
             self.normalize(a)?
         };
@@ -774,6 +835,15 @@ impl Socket {
         let mut i = self.network.0.fabric.0.borrow_mut();
         let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
         let mut state = self.state.borrow_mut();
+        if state.shared_tcp_binding && state.requested_bind.is_some() {
+            let local = Some(endpoint(bound));
+            let remote = Some(endpoint(a));
+            if n.sockets.iter().any(|(_, socket)| matches!(socket, smoltcp::socket::Socket::Tcp(tcp)
+                if tcp.state() != tcp::State::Closed && tcp.local_endpoint() == local && tcp.remote_endpoint() == remote
+                    && tcp.accepts_device(state.device.unwrap_or(0)))) {
+                return Err(NetError(99));
+            }
+        }
         let mut s = state.new_tcp_socket();
         s.connect(n.iface.context(), endpoint(a), endpoint(bound))
             .map_err(|_| NetError(22))?;
@@ -955,7 +1025,7 @@ impl Socket {
             let initial = self.state.borrow();
             initial.udp_errors.as_ref().unwrap().check_pending()?;
             let a = if let Some(a) = destination {
-                let mut a = self.normalize(a)?;
+                let mut a = self.udp_destination_address(a)?;
                 if a.ip().is_unspecified() {
                     a.set_ip(if a.is_ipv4() {
                         Ipv4Addr::LOCALHOST.into()
@@ -1504,7 +1574,14 @@ impl Socket {
                     if s.can_send() || !s.may_send() {
                         ready |= 4 | 0x100;
                     }
-                    if s.state() == tcp::State::Closed {
+                    if matches!(
+                        s.state(),
+                        tcp::State::LastAck
+                            | tcp::State::Closing
+                            | tcp::State::TimeWait
+                            | tcp::State::Closed
+                    ) || state.read_closed && state.write_closed
+                    {
                         ready |= 16;
                         if s.failure().is_some() {
                             ready |= 8;
@@ -1597,10 +1674,12 @@ impl Socket {
             (0, 33 | 34 | 49) if self.kind == 2 => return state.multicast_scalar(name, value),
             (1, 2) => {
                 state.reuse = value != 0;
+                state.shared_tcp_binding |= self.kind == 1 && state.reuse;
                 state.udp_shared |= value != 0 && state.udp_bind_order != 0;
             }
-            (1, 15) if self.kind == 2 => {
+            (1, 15) if matches!(self.kind, 1 | 2) => {
                 state.reuse_port = value != 0;
+                state.shared_tcp_binding |= self.kind == 1 && state.reuse_port;
                 if state.udp_bind_order != 0 {
                     state.udp_shared |= state.reuse_port;
                     state.udp_group = state.reuse_port.then(|| self.reuse_port_group());
@@ -1961,7 +2040,7 @@ impl Socket {
             (0, 33 | 34) if self.kind == 1 => Ok(state.multicast_value(name)),
             (0, 32 | 33 | 34 | 49) if self.kind == 2 => Ok(state.multicast_value(name)),
             (1, 2) => Ok(i32::from(state.reuse)),
-            (1, 15) if self.kind == 2 => Ok(i32::from(state.reuse_port)),
+            (1, 15) if matches!(self.kind, 1 | 2) => Ok(i32::from(state.reuse_port)),
             (1, 29 | 35 | 63 | 64) if matches!(self.kind, 1 | 2) => {
                 Ok(i32::from(state.timestamp_option == name))
             }
@@ -2062,6 +2141,78 @@ impl Socket {
             tcp::State::FinWait1 | tcp::State::Closing | tcp::State::LastAck
         )
     }
+    pub(crate) fn bind_device(&self, value: &[u8], can_rebind: bool) -> Result<()> {
+        if value.len() > 16 {
+            return Err(NetError(22));
+        }
+        let end = value.iter().position(|b| *b == 0).unwrap_or(value.len());
+        let device = if value[..end].is_empty() {
+            None
+        } else if let Some(view) = self.network.0.routing.get() {
+            Some(view.device(&value[..end])?)
+        } else {
+            match &value[..end] {
+                b"lo" => Some(1),
+                b"eth0" if !self.network.is_isolated() => Some(2),
+                _ => return Err(NetError(19)),
+            }
+        };
+        if self.kind != 4 && self.network.0.routing.get().is_none() {
+            return Err(NetError(95));
+        }
+        let _binding = self.network.0.binding.lock();
+        let mut fabric = self.network.0.fabric.0.borrow_mut();
+        let node = fabric
+            .nodes
+            .get_mut(&self.network.0.key)
+            .ok_or(NetError(100))?;
+        let mut state = self.state.borrow_mut();
+        if state.device.is_some() && !can_rebind {
+            return Err(NetError(1));
+        }
+        state.device = device;
+        state.shared_tcp_binding |= self.kind == 1 && device.is_some();
+        let index = device.unwrap_or(0);
+        for handle in &state.handles {
+            match self.kind {
+                1 => node
+                    .sockets
+                    .get_mut::<tcp::Socket>(*handle)
+                    .set_linux_binding(
+                        index,
+                        state.listener_rank,
+                        state.bound.is_some_and(|a| !a.ip().is_unspecified()),
+                    ),
+                2 => node
+                    .sockets
+                    .get_mut::<udp::Socket>(*handle)
+                    .set_ingress_device(index),
+                _ => {}
+            }
+        }
+        self.route_device.set(device.unwrap_or(0));
+        Ok(())
+    }
+    pub(crate) fn bound_device_name(&self) -> Result<Vec<u8>> {
+        let Some(index) = self.state.borrow().device else {
+            return Ok(Vec::new());
+        };
+        let mut name = if let Some(view) = self.network.0.routing.get() {
+            view.graph
+                .read()
+                .unwrap()
+                .device(view.namespace, index)?
+                .name
+        } else {
+            match index {
+                1 => b"lo".to_vec(),
+                2 => b"eth0".to_vec(),
+                _ => return Err(NetError(19)),
+            }
+        };
+        name.push(0);
+        Ok(name)
+    }
     pub fn linger(&self) -> Result<[u8; 8]> {
         let state = self.state.borrow();
         let mut value = [0; 8];
@@ -2114,27 +2265,7 @@ impl Socket {
             return Ok(());
         }
         if (level, name) == (1, 25) {
-            if value.len() > 16 {
-                return Err(NetError(22));
-            }
-            let end = value.iter().position(|b| *b == 0).unwrap_or(value.len());
-            let device = if value[..end].is_empty() {
-                None
-            } else if let Some(view) = self.network.0.routing.get() {
-                Some(view.device(&value[..end])?)
-            } else {
-                match &value[..end] {
-                    b"lo" => Some(1),
-                    b"eth0" if !self.network.is_isolated() => Some(2),
-                    _ => return Err(NetError(19)),
-                }
-            };
-            if self.kind != 4 && self.network.0.routing.get().is_none() {
-                return Err(NetError(95));
-            }
-            self.state.borrow_mut().device = device;
-            self.route_device.set(device.unwrap_or(0));
-            return Ok(());
+            return self.bind_device(value, true);
         }
         if value.len() < 4 {
             return Err(NetError(22));

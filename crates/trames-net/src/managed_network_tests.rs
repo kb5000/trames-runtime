@@ -224,6 +224,39 @@ fn link_down_obeys_namespace_and_interface_ipv6_retention() {
 }
 
 #[test]
+fn device_binding_filters_local_delivery_and_checks_rebinding_authority() {
+    let fabric = Fabric::new().unwrap();
+    let net = Network::virtual_network(&fabric, 2, NetworkMode::Full).unwrap();
+    for kind in [1, 2] {
+        let uplink = net.socket(2, kind, 0).unwrap();
+        let local = net.socket(2, kind, 0).unwrap();
+        assert!(uplink.bound_device_name().unwrap().is_empty());
+        uplink.set_bound_device(b"eth0", false).unwrap();
+        assert_eq!(uplink.set_bound_device(b"", false), Err(NetError(1)));
+        assert_eq!(uplink.bound_device_name().unwrap(), b"eth0\0");
+        local.set_bound_device(b"lo", false).unwrap();
+        uplink.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = uplink.local_addr().unwrap();
+        local.bind(address).unwrap();
+        let sender = net.socket(2, kind, 0).unwrap();
+        if kind == 1 {
+            uplink.listen(1).unwrap();
+            local.listen(1).unwrap();
+            assert_eq!(sender.connect(address), Err(NetError(115)));
+            assert!(sender.connect_complete().unwrap());
+            let _peer = local.accept().unwrap();
+            assert!(matches!(uplink.accept(), Err(NetError(11))));
+        } else {
+            sender.send(b"local", 0, Some(address)).unwrap();
+            assert_eq!(local.recv(16, 0).unwrap().data, b"local");
+            assert_eq!(uplink.poll(1).unwrap() & 1, 0);
+        }
+        uplink.set_bound_device(b"", true).unwrap();
+        assert!(uplink.bound_device_name().unwrap().is_empty());
+    }
+}
+
+#[test]
 fn udp_destination_and_packet_info_switch_independently() {
     let fabric = Fabric::new().unwrap();
     for network in [
