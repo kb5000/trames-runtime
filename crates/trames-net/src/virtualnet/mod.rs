@@ -12,6 +12,7 @@ pub use wire::WireWait;
 mod gateway;
 pub(crate) mod packet;
 mod sockets;
+mod udp_errors;
 use super::native::{
     self, NetError, NetworkMode, Received, MAX_BUFFER, MAX_TRANSFER, MSG_DONTWAIT, MSG_NOSIGNAL,
     MSG_PEEK, MSG_TRUNC,
@@ -231,6 +232,7 @@ struct State {
     hop_limit: u8,
     receive_hops: bool,
     udp_options: [UdpOptions; 2],
+    udp_errors: Option<Arc<udp_errors::Errors>>,
     multicast: Option<Box<multicast::Options>>,
     last_hop: Option<u8>,
     broadcast: bool,
@@ -355,6 +357,7 @@ impl State {
         specific: bool,
     ) -> Result<()> {
         socket.enable_linux_receive();
+        socket.observe_errors(self.udp_errors.as_ref().unwrap().clone());
         socket.set_bind_priority(self.udp_bind_order, specific);
         if self.udp_readable.is_some() {
             socket.observe_readable(self.udp_bind_order);
@@ -1541,6 +1544,7 @@ impl Network {
                 requested_bind: None,
                 udp_shared: false,
                 udp_readable: None,
+                udp_errors: (kind == 2).then(|| Arc::new(udp_errors::Errors::default())),
                 udp_group: None,
                 nodelay: false,
                 cork: false,

@@ -28,7 +28,72 @@ fn flow_address(address: IpAddress) -> u64 {
     }
 }
 
+#[cfg(feature = "socket-udp")]
+fn udp_flow(src: IpEndpoint, dst: IpEndpoint) -> u64 {
+    let ports = (u64::from(src.port) << 16) | u64::from(dst.port);
+    mix_flow(flow_address(src.addr)) ^ flow_address(dst.addr).rotate_left(23) ^ ports
+}
+
 impl InterfaceInner {
+    #[cfg(all(feature = "std", feature = "socket-udp"))]
+    pub(super) fn udp_unreachable(
+        &mut self,
+        sockets: &mut SocketSet,
+        outer: IpRepr,
+        quoted: IpRepr,
+        code: u8,
+        data: &[u8],
+    ) {
+        if quoted.next_header() != IpProtocol::Udp
+            || quoted.src_addr() != outer.dst_addr()
+            || data.len() < 8
+        {
+            return;
+        }
+        let len = usize::from(u16::from_be_bytes([data[4], data[5]]));
+        if len < 8 || quoted.payload_len() < 8 {
+            return;
+        }
+        let local = IpEndpoint::new(quoted.src_addr(), u16::from_be_bytes([data[0], data[1]]));
+        let peer = IpEndpoint::new(quoted.dst_addr(), u16::from_be_bytes([data[2], data[3]]));
+        if local.port == 0 {
+            return;
+        }
+        let owner = sockets
+            .iter_mut()
+            .filter_map(|(h, item)| {
+                UdpSocket::downcast_mut(item)?
+                    .error_rank(local, peer)
+                    .map(|rank| (rank, h))
+            })
+            .max_by_key(|(rank, _)| *rank);
+        if let Some(((connected, specific, _), mut h)) = owner {
+            if let Some(group) = sockets.get::<UdpSocket>(h).reuse_port_group {
+                // Use the same return-flow affinity as an ordinary UDP reply.
+                let flow = udp_flow(peer, local);
+                if let Some((_, chosen)) = sockets
+                    .iter_mut()
+                    .filter_map(|(candidate, item)| {
+                        let socket = UdpSocket::downcast_mut(item)?;
+                        let (c, s, order) = socket.error_rank(local, peer)?;
+                        (socket.reuse_port_group == Some(group) && (c, s) == (connected, specific))
+                            .then(|| (mix_flow(flow ^ mix_flow(order)), candidate))
+                    })
+                    .max_by_key(|(score, _)| *score)
+                {
+                    h = chosen;
+                }
+            }
+            sockets.get::<UdpSocket>(h).unreachable(
+                self,
+                outer.src_addr(),
+                peer,
+                code,
+                &data[8..data.len().min(len).min(quoted.payload_len())],
+            );
+        }
+    }
+
     pub(super) fn process_udp<'frame>(
         &mut self,
         sockets: &mut SocketSet,
@@ -70,10 +135,10 @@ impl InterfaceInner {
             }
             if let Some(((connected, specific, _), mut handle, group)) = shared {
                 if let Some(group) = group {
-                    let ports = (u64::from(udp_repr.src_port) << 16) | u64::from(udp_repr.dst_port);
-                    let flow = mix_flow(flow_address(src_addr))
-                        ^ flow_address(dst_addr).rotate_left(23)
-                        ^ ports;
+                    let flow = udp_flow(
+                        IpEndpoint::new(src_addr, udp_repr.src_port),
+                        IpEndpoint::new(dst_addr, udp_repr.dst_port),
+                    );
                     let mut best = None;
                     for (candidate, item) in sockets.iter_mut() {
                         let Some(socket) = UdpSocket::downcast_mut(item) else {

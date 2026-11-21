@@ -120,6 +120,20 @@ impl core::fmt::Display for RecvError {
 #[cfg(feature = "std")]
 impl std::error::Error for RecvError {}
 
+/// Optional destination-unreachable delivery to the owner of this binding.
+#[cfg(feature = "std")]
+pub trait ErrorReceiver: core::fmt::Debug + Send + Sync {
+    /// Return true when this error made an error available to the application.
+    fn unreachable(
+        &self,
+        connected: bool,
+        reporter: IpAddress,
+        peer: IpEndpoint,
+        code: u8,
+        quote: &[u8],
+    ) -> bool;
+}
+
 /// A User Datagram Protocol socket.
 ///
 /// A UDP socket is bound to a specific endpoint, and owns transmit and receive
@@ -136,6 +150,8 @@ pub struct Socket<'a> {
     readable_token: Option<u64>,
     #[cfg(feature = "std")]
     linux_receive: bool,
+    #[cfg(feature = "std")]
+    error_receiver: Option<std::sync::Arc<dyn ErrorReceiver>>,
     rx_buffer: PacketBuffer<'a>,
     tx_buffer: PacketBuffer<'a>,
     /// The time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
@@ -160,6 +176,8 @@ impl<'a> Socket<'a> {
             readable_token: None,
             #[cfg(feature = "std")]
             linux_receive: false,
+            #[cfg(feature = "std")]
+            error_receiver: None,
             rx_buffer,
             tx_buffer,
             hop_limit: None,
@@ -174,6 +192,44 @@ impl<'a> Socket<'a> {
     #[cfg(feature = "std")]
     pub fn enable_linux_receive(&mut self) {
         self.linux_receive = true;
+    }
+
+    #[cfg(feature = "std")]
+    pub fn observe_errors(&mut self, receiver: std::sync::Arc<dyn ErrorReceiver>) {
+        self.error_receiver = Some(receiver);
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn error_rank(
+        &self,
+        local: IpEndpoint,
+        remote: IpEndpoint,
+    ) -> Option<(bool, bool, u64)> {
+        (self.error_receiver.is_some()
+            && self.endpoint.port == local.port
+            && self.endpoint.addr.is_none_or(|a| a == local.addr)
+            && self.peer.is_none_or(|p| p == remote))
+        .then_some((self.peer.is_some(), self.specific_bind, self.bind_order))
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn unreachable(
+        &self,
+        cx: &mut Context,
+        reporter: IpAddress,
+        peer: IpEndpoint,
+        code: u8,
+        quote: &[u8],
+    ) {
+        if self
+            .error_receiver
+            .as_ref()
+            .is_some_and(|sink| sink.unreachable(self.peer.is_some(), reporter, peer, code, quote))
+        {
+            if let Some(token) = self.readable_token {
+                cx.udp_readable.push(token);
+            }
+        }
     }
 
     /// Preserve the original guest binding across per-address receive handles.

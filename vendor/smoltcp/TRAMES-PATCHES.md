@@ -113,3 +113,11 @@ boundaries along its receive ring. Reads look up the final byte copied and
 discard consumed boundaries. Reordered segments can carry different arrival
 times. Disabling timestamps releases the index. A stream using the defaults
 does not allocate this index or read the wall clock for incoming TCP data.
+
+Under the std build, UDP sockets can observe incoming ICMP destination
+unreachable messages. The interface matches the original UDP endpoints
+from the quoted IP packet to a local binding. A connected or specifically
+bound socket takes precedence. Reuse-port groups apply their usual reply-flow
+selection. The observer receives the reporter address, code and quoted UDP
+payload and can notify the existing readable waiter. IPv4 quotations may end
+before the original packet's declared total length.

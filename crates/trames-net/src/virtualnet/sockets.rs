@@ -56,14 +56,15 @@ impl Socket {
         self.uid.set(uid);
     }
     fn route_source(&self, view: &crate::netdev::View, ip: IpAddr) -> Result<IpAddr> {
-        view.source_for(
-            ip,
-            crate::netdev::RouteContext {
-                mark: self.mark.get(),
-                uid: self.uid.get(),
-                device: (self.route_device.get() != 0).then(|| self.route_device.get()),
-            },
-        )
+        view.source_for(ip, self.route_context())
+    }
+    fn route_context(&self) -> crate::netdev::RouteContext {
+        let device = self.route_device.get();
+        crate::netdev::RouteContext {
+            mark: self.mark.get(),
+            uid: self.uid.get(),
+            device: (device != 0).then_some(device),
+        }
     }
     pub fn info(&self) -> crate::SocketInfo {
         let fabric = self.network.0.fabric.0.borrow();
@@ -567,6 +568,7 @@ impl Socket {
             requested_bind: None,
             udp_shared: false,
             udp_readable: None,
+            udp_errors: None,
             udp_group: None,
             nodelay: state.nodelay,
             cork: state.cork,
@@ -942,6 +944,8 @@ impl Socket {
             return self.send_raw(bytes, destination);
         }
         if self.kind == 2 {
+            let initial = self.state.borrow();
+            initial.udp_errors.as_ref().unwrap().check_pending()?;
             let a = if let Some(a) = destination {
                 let mut a = self.normalize(a)?;
                 if a.ip().is_unspecified() {
@@ -953,13 +957,33 @@ impl Socket {
                 }
                 a
             } else {
-                self.state.borrow().peer.ok_or(NetError(89))?
+                initial.peer.ok_or(NetError(89))?
             };
+            drop(initial);
             if multicast::group(a.ip()) {
                 return self.send_group(a, bytes, control);
             }
             self.destination(a)?;
             if bytes.len() > if a.is_ipv4() { 65507 } else { 65527 } {
+                if a.is_ipv6() {
+                    let mtu = if let Some(view) = self.network.0.routing.get() {
+                        let graph = view.graph.read().unwrap();
+                        let (_, index, _) =
+                            graph.source_for(view.namespace, a.ip(), self.route_context())?;
+                        graph.device(view.namespace, index)?.mtu
+                    } else if a.ip().is_loopback() {
+                        65536
+                    } else {
+                        self.network.0.info.mtu
+                    };
+                    let mut fabric = self.network.0.fabric.0.borrow_mut();
+                    let state = self.state.borrow();
+                    if state.udp_errors.as_ref().unwrap().too_big(a, mtu) {
+                        if let Some(source) = &state.udp_readable {
+                            fabric.notifications.push(source.clone());
+                        }
+                    }
+                }
                 return Err(NetError(90));
             }
             if self.state.borrow().bound.is_none() {
@@ -1103,6 +1127,21 @@ impl Socket {
         let wait_all = flags & 0x100 != 0;
         let ignored = MSG_NOSIGNAL | 8 | if matches!(self.kind, 1 | 2) { 0x100 } else { 0 };
         let flags = flags & !ignored;
+        if self.kind == 2 && flags & crate::MSG_ERRQUEUE != 0 {
+            if flags & !(crate::MSG_ERRQUEUE | MSG_DONTWAIT | MSG_TRUNC | MSG_PEEK) != 0 {
+                return Err(NetError(95));
+            }
+            self.fabric().tick();
+            let mut result = self
+                .state
+                .borrow()
+                .udp_errors
+                .as_ref()
+                .unwrap()
+                .receive(count, self.family == 10)?;
+            result.address = result.address.map(|a| self.presented(a));
+            return Ok(result);
+        }
         if flags & !(MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT) != 0 {
             return Err(NetError(95));
         }
@@ -1142,6 +1181,9 @@ impl Socket {
             i.tick();
         }
         let mut state = self.state.borrow_mut();
+        if let Some(errors) = &state.udp_errors {
+            errors.check_pending()?;
+        }
         if self.kind == 1 {
             if state.connection == Connection::Connecting {
                 return Err(NetError(11));
@@ -1294,6 +1336,7 @@ impl Socket {
                     let mapped = !ipv6 && self.family == 10 && state.udp_options[1].receive_info;
                     let stamp = meta.received_ns;
                     let mut headers = crate::ReceivedIp {
+                        error: None,
                         tcp_inq: None,
                         timestamp: (state.timestamp_option != 0)
                             .then_some((state.timestamp_option, stamp)),
@@ -1413,7 +1456,12 @@ impl Socket {
                 | if state.error.is_some() { 8 } else { 0 });
         }
         let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
-        let mut ready = if state.error.is_some() { 8 } else { 0 };
+        let mut ready =
+            if state.error.is_some() || state.udp_errors.as_ref().is_some_and(|e| e.ready()) {
+                8
+            } else {
+                0
+            };
         for h in &state.handles {
             if self.kind == 1 {
                 let s = n.sockets.get_mut::<tcp::Socket>(*h);
@@ -1500,6 +1548,14 @@ impl Socket {
         let mut i = self.network.0.fabric.0.borrow_mut();
         let mut state = self.state.borrow_mut();
         match (level, name) {
+            (0, 11) | (41, 25) if self.kind == 2 && (level == 0 || self.family == 10) => {
+                state
+                    .udp_errors
+                    .as_ref()
+                    .unwrap()
+                    .enable(level == 41, value != 0);
+                return Ok(());
+            }
             (0, 8 | 12 | 13 | 20) | (41, 49 | 51 | 66 | 74)
                 if self.kind == 2 && (level == 0 || self.family == 10) =>
             {
@@ -1572,6 +1628,9 @@ impl Socket {
                     let bytes = crate::socket_buffer_size(name, value);
                     if name == 8 {
                         state.receive_buffer = bytes;
+                        if let Some(errors) = &state.udp_errors {
+                            errors.set_budget(bytes);
+                        }
                     } else {
                         state.send_buffer = bytes;
                     }
@@ -1810,6 +1869,9 @@ impl Socket {
             let mut i = self.network.0.fabric.0.borrow_mut();
             i.tick();
             let mut state = self.state.borrow_mut();
+            if let Some(errors) = &state.udp_errors {
+                return Ok(errors.take_pending() as i32);
+            }
             if let Some(error) = state.error.take() {
                 return Ok(error as i32);
             }
@@ -1851,6 +1913,11 @@ impl Socket {
                     return Ok(i32::from(options.fields.traffic_class.unwrap_or(0)))
                 }
                 (0, 2) | (41, 16) => return Ok(i32::from(options.fields.hop_limit.unwrap_or(64))),
+                (0, 11) | (41, 25) => {
+                    return Ok(i32::from(
+                        state.udp_errors.as_ref().unwrap().enabled(level == 41),
+                    ))
+                }
                 (0, 8) | (41, 49) => return Ok(i32::from(options.receive_info)),
                 (0, 20) | (41, 74) => return Ok(i32::from(options.original_destination)),
                 (0, 13) | (41, 66) => return Ok(i32::from(options.receive_class)),

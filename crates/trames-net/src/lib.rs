@@ -72,8 +72,19 @@ pub struct DatagramControl {
     /// IPv4 and IPv6 overrides, selected after resolving the wire destination.
     pub fields: [IpFields; 2],
 }
-#[derive(Clone, Copy, Debug, Default)]
+pub const MSG_ERRQUEUE: u32 = 0x2000;
+#[derive(Clone, Debug)]
+pub struct ExtendedError {
+    pub errno: u32,
+    pub origin: u8,
+    pub kind: u8,
+    pub code: u8,
+    pub info: u32,
+    pub reporter: Option<std::net::IpAddr>,
+}
+#[derive(Clone, Debug, Default)]
 pub struct ReceivedIp {
+    pub error: Option<Box<ExtendedError>>,
     pub tcp_inq: Option<i32>,
     /// Linux SCM type and wall-clock packet arrival time in nanoseconds.
     pub timestamp: Option<(u32, u64)>,

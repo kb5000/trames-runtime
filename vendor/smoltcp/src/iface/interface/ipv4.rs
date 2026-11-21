@@ -339,6 +339,24 @@ impl InterfaceInner {
             }
         }
 
+        #[cfg(all(feature = "std", feature = "socket-udp"))]
+        match &icmp_repr {
+            Icmpv4Repr::DstUnreachable {
+                reason,
+                header,
+                data,
+            } if Ipv4Packet::new_unchecked(icmp_packet.data()).frag_offset() == 0 => {
+                self.udp_unreachable(
+                    _sockets,
+                    ip_repr.into(),
+                    (*header).into(),
+                    (*reason).into(),
+                    data,
+                );
+            }
+            _ => {}
+        }
+
         match icmp_repr {
             // Respond to echo requests.
             #[cfg(feature = "proto-ipv4")]

@@ -154,7 +154,7 @@ impl RetainedSocket {
                 unreachable!()
             };
             return socket.flags() & trames_vfs::O_NONBLOCK == 0
-                && socket_flags(self.number, self.args) & 0x40 == 0;
+                && socket_flags(self.number, self.args) & (0x40 | trames_net::MSG_ERRQUEUE) == 0;
         }
         match &self.socket {
             Control::Network(socket) => {

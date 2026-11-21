@@ -420,9 +420,19 @@ impl<'a> Repr<'a> {
             }),
 
             (Message::DstUnreachable, code) => {
-                let ip_packet = Ipv4Packet::new_checked(packet.data())?;
-
-                let payload = &packet.data()[ip_packet.header_len() as usize..];
+                // The returned IP header retains the original total length even
+                // when the router quotes just the first eight transport bytes.
+                let bytes = packet.data();
+                if bytes.len() < 20 {
+                    return Err(Error);
+                }
+                let ip_packet = Ipv4Packet::new_unchecked(bytes);
+                let start = usize::from(ip_packet.header_len());
+                let end = bytes.len().min(usize::from(ip_packet.total_len()));
+                if ip_packet.version() != 4 || start < 20 {
+                    return Err(Error);
+                }
+                let payload = bytes.get(start..end).ok_or(Error)?;
                 // RFC 792 requires exactly eight bytes to be returned.
                 // We allow more, since there isn't a reason not to, but require at least eight.
                 if payload.len() < 8 {

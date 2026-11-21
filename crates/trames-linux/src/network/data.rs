@@ -376,7 +376,23 @@ impl Prepared {
                     if let Some((level, kind, hop)) = socket.ancillary_hop() {
                         ancillary.push(level, kind, &(hop as u32).to_le_bytes());
                     }
-                    let ip = received.ip;
+                    let ip = &received.ip;
+                    if let Some(error) = &ip.error {
+                        let mut payload = Vec::with_capacity(44);
+                        payload.extend_from_slice(&error.errno.to_le_bytes());
+                        payload.extend_from_slice(&[error.origin, error.kind, error.code, 0]);
+                        payload.extend_from_slice(&error.info.to_le_bytes());
+                        payload.extend_from_slice(&0u32.to_le_bytes());
+                        if let Some(reporter) = error.reporter {
+                            payload.extend_from_slice(&encode_address(std::net::SocketAddr::new(
+                                reporter, 0,
+                            )));
+                        } else {
+                            payload.resize(if ip.ipv6 { 44 } else { 32 }, 0);
+                        }
+                        let (level, kind) = if ip.ipv6 { (41, 25) } else { (0, 11) };
+                        ancillary.push(level, kind, &payload);
+                    }
                     if let Some((kind, ns)) = ip.timestamp {
                         ancillary.push(
                             1,
@@ -436,12 +452,17 @@ impl Prepared {
                         .write(output.header + 40, &(count as u64).to_le_bytes())
                         .map_err(|_| Errno(14))?;
                     let flags = (if received.truncated { MSG_TRUNC } else { 0 })
+                        | if ip.error.is_some() {
+                            trames_net::MSG_ERRQUEUE
+                        } else {
+                            0
+                        }
                         | if ancillary.truncated { 8 } else { 0 };
                     memory
                         .write(output.header + 48, &flags.to_le_bytes())
                         .map_err(|_| Errno(14))?;
                 }
-                let copied = if flags & MSG_TRUNC != 0 {
+                let copied = if flags & MSG_TRUNC != 0 && received.ip.error.is_none() {
                     received.length
                 } else {
                     received.data.len()
