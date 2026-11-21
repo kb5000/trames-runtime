@@ -117,7 +117,13 @@ pub(crate) fn resource_network(
                     }
                 } else {
                     let socket = v.socket_fd(fd)?;
-                    let result = if s.opcode() == 56 {
+                    let result = if socket.is_netlink() {
+                        socket.netlink_address(
+                            request.path.as_deref().unwrap(),
+                            v.pid_namespace().local(v.local_sender_credentials()[0]),
+                            s.opcode() == 16,
+                        )
+                    } else if s.opcode() == 56 {
                         socket.bind_authorized(
                             request.path.as_deref().unwrap(),
                             v.credentials

@@ -43,6 +43,7 @@ pub(super) fn pair(root: &Network, n: &Network, name: &[u8], bridge: u32) -> u32
             Some(bridge),
             None,
             None,
+            None,
         )
         .unwrap();
     n.set_device_up(b, true).unwrap();
@@ -134,6 +135,7 @@ fn bridge_controls_real_tcp_udp_and_live_link_isolation() {
             None,
             None,
             Some(0),
+            None,
             None,
             None,
         )

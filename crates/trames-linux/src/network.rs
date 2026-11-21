@@ -34,11 +34,9 @@ pub(super) fn control(
         200 | 203 => {
             let peer = address(memory, a[1], a[2])?;
             if number == 200 {
-                socket
-                    .bind_authorized(&peer, factory.can_bind_service(socket))
-                    .map_err(net)?;
+                factory.bind_socket(socket, &peer).map_err(net)?;
             } else {
-                socket.connect_bytes(&peer).map_err(net)?;
+                factory.connect_socket(socket, &peer).map_err(net)?;
             }
             Ok(0)
         }
@@ -696,6 +694,8 @@ impl Linux {
                     | 0x8916
                     | 0x891b
                     | 0x891c
+                    | 0x8922
+                    | 0x8923
                     | 0x8921
                     | 0x8933
                     | 0x8946
@@ -708,7 +708,7 @@ impl Linux {
                 memory,
                 a[2],
                 40,
-                if matches!(request, 0x8914 | 0x8916 | 0x891c | 0x8946) {
+                if matches!(request, 0x8914 | 0x8916 | 0x891c | 0x8922 | 0x8923 | 0x8946) {
                     Access::Read
                 } else {
                     Access::Write
@@ -831,6 +831,16 @@ impl Linux {
                     };
                     entry[16..32].copy_from_slice(&encode_address(SocketAddr::new(ip, 0)));
                 }
+                0x8922 => {
+                    let mtu = u32::from_le_bytes(entry[16..20].try_into().unwrap());
+                    vfs.configure_network_device(device.index, None, None, Some(mtu))?;
+                    return Ok(0);
+                }
+                0x8923 => {
+                    let name = entry[16..32].split(|b| *b == 0).next().unwrap();
+                    vfs.configure_network_device(device.index, Some(name), None, None)?;
+                    return Ok(0);
+                }
                 0x8921 => entry[16..20].copy_from_slice(&device.mtu.to_le_bytes()),
                 0x8933 => entry[16..20].copy_from_slice(&device.index.to_le_bytes()),
                 _ => unreachable!(),
@@ -901,9 +911,16 @@ impl Linux {
             socket.address_size(),
             socket.is_stream(),
         )?
-        .progress(socket, memory, false, |bytes, flags, peer| {
-            vfs.socket_send_bytes(socket, bytes, flags, peer)
-        })
+        .progress(
+            socket,
+            memory,
+            false,
+            |credentials| {
+                vfs.descriptor_factory()
+                    .project_socket_credentials(credentials)
+            },
+            |bytes, flags, peer| vfs.socket_send_bytes(socket, bytes, flags, peer),
+        )
     }
 }
 

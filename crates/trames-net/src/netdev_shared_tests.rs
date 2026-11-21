@@ -81,7 +81,7 @@ fn packet_accounting_needs_no_topology_writer_and_survives_link_move() {
     );
     let mut graph = graph.write().unwrap();
     graph
-        .change_link(1, link, None, Some(2), None, None, None, None)
+        .change_link(1, link, None, Some(2), None, None, None, None, None)
         .unwrap();
     assert_eq!(graph.device(2, link).unwrap().stats.tx_bytes, 17);
     graph.account(2, link, 3, true, false);

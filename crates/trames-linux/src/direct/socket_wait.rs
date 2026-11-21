@@ -186,7 +186,7 @@ impl RetainedSocket {
                 let result = if let Some(address) = &self.accepted_address {
                     socket.with_tcp_publication(|| {
                         let result = if self.number == 200 {
-                            socket.bind_authorized(address, self.factory.can_bind_service(socket))
+                            self.factory.bind_socket(socket, address)
                         } else if self.connecting {
                             socket.resume_connect().and_then(|ready| {
                                 if ready {
@@ -196,7 +196,7 @@ impl RetainedSocket {
                                 }
                             })
                         } else {
-                            socket.connect_bytes(address)
+                            self.factory.connect_socket(socket, address)
                         };
                         result
                             .map(|()| 0)

@@ -54,6 +54,41 @@ fn managed_ip_link_can_roundtrip_netd_noarp_flags_on_both_dispatch_paths() {
         );
     }
 }
+#[test]
+fn loopback_rename_and_mtu_share_ioctl_state_and_permissions() {
+    for direct in [false, true] {
+        let (mut linux, mut memory, fd) = setup(1);
+        let mut ioctl = |linux: &mut Linux, cmd, name: &[u8], value: &[u8]| {
+            let mut req = [0u8; 40];
+            req[..name.len()].copy_from_slice(name);
+            req[16..16 + value.len()].copy_from_slice(value);
+            memory.write(0x1000, &req).unwrap();
+            let args = [fd as u64, cmd, 0x1000, 0, 0, 0];
+            let ret = if direct {
+                capture(linux).invoke(29, args, &mut memory).unwrap()
+            } else {
+                linux.syscall(29, args, &mut memory, &mut crate::CapturedOutput::default())
+            };
+            ret.map(|_| u32::from_le_bytes(memory.read_array(0x1010).unwrap()))
+        };
+        assert!(ioctl(&mut linux, 0x8923, b"lo", b"local0").is_ok());
+        assert_eq!(ioctl(&mut linux, 0x8921, b"lo", &[]), Err(Errno(19)));
+        assert_eq!(
+            ioctl(&mut linux, 0x8922, b"local0", &1400u32.to_le_bytes()),
+            Ok(1400)
+        );
+        assert_eq!(
+            ioctl(&mut linux, 0x8922, b"local0", &(-1i32).to_le_bytes()),
+            Err(Errno(22))
+        );
+        linux.vfs.credentials = trames_vfs::Credentials::user(1000, 1000);
+        assert_eq!(
+            ioctl(&mut linux, 0x8922, b"local0", &1200u32.to_le_bytes()),
+            Err(Errno(1))
+        );
+        assert_eq!(ioctl(&mut linux, 0x8921, b"local0", &[]), Ok(1400));
+    }
+}
 fn setup(kind: u8) -> (Linux, Memory, u32) {
     let mut linux = Linux::new(0x10000);
     linux.vfs.set_runtime_info(

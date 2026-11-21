@@ -300,6 +300,7 @@ impl Prepared {
         socket: &trames_vfs::SocketOperation,
         memory: &mut impl CpuMemory,
         retained: bool,
+        project_credentials: impl Fn([u32; 3]) -> [u32; 3],
         mut send: impl FnMut(&[u8], u32, Option<&[u8]>) -> Result<usize>,
     ) -> Result<u64> {
         match &self.transfer {
@@ -369,8 +370,10 @@ impl Prepared {
                     }
                     let mut ancillary = ControlOutput::new(output.capacity);
                     if let Some(credentials) = received.credentials {
-                        let payload: Vec<_> =
-                            credentials.into_iter().flat_map(u32::to_le_bytes).collect();
+                        let payload: Vec<_> = project_credentials(credentials)
+                            .into_iter()
+                            .flat_map(u32::to_le_bytes)
+                            .collect();
                         ancillary.push(1, 2, &payload);
                     }
                     if let Some((level, kind, hop)) = socket.ancillary_hop() {

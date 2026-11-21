@@ -48,6 +48,7 @@ fn attach(root: &Network, index: u32, master: u32) {
             Some(master),
             None,
             None,
+            None,
         )
         .unwrap();
 }
@@ -324,7 +325,7 @@ fn linux_bridge_netlink_controls_are_atomic_authorized_and_reported() {
     let monitor = crate::netlink::Socket::new(root.1.clone(), None, 3, 0).unwrap();
     let mut address = crate::netlink::address(12345);
     address[8..12].copy_from_slice(&5u32.to_le_bytes());
-    monitor.bind_bytes(&address).unwrap();
+    monitor.bind_bytes(&address, 0).unwrap();
     let call = |kind: u16, flags: u16, data: &[u8], admin, expected| {
         control
             .send_bytes_authorized(&message(kind, flags | 5, 99, 0, data), 0, None, admin)

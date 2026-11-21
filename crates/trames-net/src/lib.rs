@@ -294,6 +294,15 @@ impl Network {
         self.1.graph.read().unwrap().devices(self.namespace_id())
     }
     pub fn set_device_up(&self, index: u32, up: bool) -> Result<()> {
+        self.configure_device(index, None, Some(up), None)
+    }
+    pub fn configure_device(
+        &self,
+        index: u32,
+        name: Option<&[u8]>,
+        up: Option<bool>,
+        mtu: Option<u32>,
+    ) -> Result<()> {
         if self.1.native.get().is_some() {
             self.1.root_stack()?;
         }
@@ -301,11 +310,11 @@ impl Network {
             let ns = self.namespace_id();
             let mut graph = self.1.graph.write().unwrap();
             let before = graph.device(ns, index)?;
-            graph.change_link(ns, index, None, None, Some(up), None, None, None)?;
-            if before.up == up {
+            graph.change_link(ns, index, name, None, up, None, None, None, mtu)?;
+            let after = graph.device(ns, index)?;
+            if before.same_link_configuration(&after) {
                 return Ok(());
             }
-            let after = graph.device(ns, index)?;
             let mut changes = Vec::new();
             rtnetlink::address_changes(&before, &after, &mut changes);
             changes.push((ns, 16, 1, rtnetlink::link_data(&graph, &after)));
@@ -943,10 +952,16 @@ impl Socket {
     pub fn attach_filter(&self, instructions: &[u8]) -> Result<()> {
         match &self.backend {
             SocketBackend::Packet(s) => s.set_filter(Some(instructions)),
+            SocketBackend::Netlink(s) => s.set_filter(Some(instructions)),
             _ => Err(NetError(92)),
         }
     }
     pub fn set_option_bytes(&self, level: u32, name: u32, value: &[u8]) -> Result<()> {
+        if (level, name) == (1, 27) {
+            if let SocketBackend::Netlink(s) = &self.backend {
+                return s.set_filter(None);
+            }
+        }
         if let SocketBackend::Packet(s) = &self.backend {
             return s.set_option_bytes(level, name, value);
         }
@@ -1047,6 +1062,17 @@ impl Socket {
             None
         }
     }
+    pub fn netlink_address(&self, bytes: &[u8], process: u32, connect: bool) -> Result<()> {
+        let SocketBackend::Netlink(s) = &self.backend else {
+            return Err(NetError(97));
+        };
+        let _operation = self.operation.write();
+        if connect {
+            s.connect_bytes(bytes, process)
+        } else {
+            s.bind_bytes(bytes, process)
+        }
+    }
     pub fn netlink_memberships(&self) -> Result<Option<u32>> {
         if let SocketBackend::Netlink(s) = &self.backend {
             let _operation = self.operation.read_recursive();
@@ -1062,7 +1088,7 @@ impl Socket {
         if let SocketBackend::Netlink(s) = &self.backend {
             {
                 let _operation = self.operation.write();
-                s.bind_bytes(bytes)
+                s.bind_bytes(bytes, 0)
             }
         } else {
             self.bind(decode_address(bytes)?)
@@ -1111,7 +1137,7 @@ impl Socket {
         if let SocketBackend::Netlink(s) = &self.backend {
             {
                 let _operation = self.operation.write();
-                s.connect_bytes(bytes)
+                s.connect_bytes(bytes, 0)
             }
         } else {
             self.connect(decode_address(bytes)?)
@@ -1177,6 +1203,21 @@ impl Socket {
         net_admin: bool,
         resolve: &dyn Fn(u32) -> Result<Network>,
     ) -> Result<usize> {
+        self.send_bytes_from(bytes, flags, destination, net_admin, resolve, || {
+            (0, [0; 3])
+        })
+    }
+    /// Resolve the sender only for Netlink. The port uses the caller's local
+    /// process ID; queued SCM credentials retain global IDs until receipt.
+    pub fn send_bytes_from(
+        &self,
+        bytes: &[u8],
+        flags: u32,
+        destination: Option<&[u8]>,
+        net_admin: bool,
+        resolve: &dyn Fn(u32) -> Result<Network>,
+        sender: impl FnOnce() -> (u32, [u32; 3]),
+    ) -> Result<usize> {
         if let SocketBackend::Packet(s) = &self.backend {
             return s.send_bytes(bytes, flags, destination);
         }
@@ -1184,7 +1225,15 @@ impl Socket {
             let mut wakes = netlink::Notifications::default();
             let result = {
                 let _operation = self.operation.write();
-                s.send_deferred(bytes, flags, destination, net_admin, resolve, &mut wakes)
+                s.send_deferred(
+                    bytes,
+                    flags,
+                    destination,
+                    net_admin,
+                    resolve,
+                    sender(),
+                    &mut wakes,
+                )
             };
             wakes.flush();
             result

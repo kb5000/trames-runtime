@@ -86,6 +86,17 @@ pub struct Device {
     pub addresses: Vec<Address>,
     pub stats: LinkStats,
 }
+impl Device {
+    pub(crate) fn same_link_configuration(&self, other: &Self) -> bool {
+        self.namespace == other.namespace
+            && self.name == other.name
+            && self.up == other.up
+            && self.mtu == other.mtu
+            && self.tx_queue_len == other.tx_queue_len
+            && self.mac == other.mac
+            && self.master == other.master
+    }
+}
 // Stored links share only their actual counters. The public Device remains an
 // owned reporting snapshot, with no second mutable counter authority.
 #[derive(Default)]
@@ -748,6 +759,7 @@ impl Topology {
         master: Option<u32>,
         mac: Option<[u8; 6]>,
         tx_queue_len: Option<u32>,
+        mtu: Option<u32>,
     ) -> Result<()> {
         let old = self.device(id, index)?;
         if old.kind == DeviceKind::Direct && !self.spaces[&id].managed_uplink {
@@ -758,9 +770,34 @@ impl Topology {
         {
             return Err(NetError(95));
         }
-        if old.kind == DeviceKind::Loopback {
-            if name.is_some() || target.is_some() || master.is_some() || mac.is_some() {
+        let mtu = mtu.filter(|value| *value != old.mtu);
+        if let Some(value) = mtu {
+            if value > i32::MAX as u32 {
+                return Err(NetError(22));
+            }
+            // The guest loopback has no backing NIC. Other links keep their
+            // transport's MTU until that transport can be reconfigured.
+            if old.kind != DeviceKind::Loopback || self.spaces[&id].lo.is_none() {
                 return Err(NetError(95));
+            }
+        }
+        if old.kind == DeviceKind::Loopback {
+            let name = name.filter(|value| *value != old.name);
+            if let Some(name) = name {
+                if self.spaces[&id].lo.is_none() {
+                    return Err(NetError(95));
+                }
+                self.name_available(id, name, Some(index))?;
+            }
+            if target.is_some() || master.is_some() || mac.is_some() {
+                return Err(NetError(95));
+            }
+            if name.is_none()
+                && mtu.is_none()
+                && up.is_none_or(|value| value == old.up)
+                && tx_queue_len.is_none_or(|value| value == old.tx_queue_len)
+            {
+                return Ok(());
             }
             if let Some(up) = up {
                 match &self.spaces[&id].lo {
@@ -792,8 +829,15 @@ impl Topology {
                     None => return Err(NetError(95)),
                 }
             }
+            let dev = self.devices.get_mut(&(id, index)).unwrap();
+            if let Some(name) = name {
+                dev.name = name.to_vec();
+            }
+            if let Some(value) = mtu {
+                dev.mtu = value;
+            }
             if let Some(len) = tx_queue_len {
-                self.devices.get_mut(&(id, index)).unwrap().tx_queue_len = len;
+                dev.tx_queue_len = len;
             }
             self.changed();
             return Ok(());

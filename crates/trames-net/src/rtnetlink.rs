@@ -469,12 +469,7 @@ pub(crate) fn request(
                             }
                         }
                         3 | 10 | 18 | 28 => {}
-                        4 => {
-                            if u32v(v)? != 1500 {
-                                return Err(NetError(95));
-                            }
-                        }
-                        13 => {
+                        4 | 13 => {
                             u32v(v)?;
                         }
                         _ => return Err(NetError(95)),
@@ -482,6 +477,7 @@ pub(crate) fn request(
                 }
                 let name = get(&a, 3).map(text).transpose()?;
                 let master = get(&a, 10).map(u32v).transpose()?;
+                let mtu = get(&a, 4).map(u32v).transpose()?;
                 let tx_queue_len = get(&a, 13).map(u32v).transpose()?;
                 let mac = get(&a, 1)
                     .map(|v| v.try_into().map_err(|_| NetError(22)))
@@ -593,6 +589,7 @@ pub(crate) fn request(
                                 None,
                                 pm,
                                 get(&pa, 13).map(u32v).transpose()?,
+                                get(&pa, 4).map(u32v).transpose()?,
                             )?;
                             changes.push((
                                 peer_ns,
@@ -604,7 +601,7 @@ pub(crate) fn request(
                         }
                         _ => return Err(NetError(95)),
                     };
-                    next.change_link(ns, index, None, target, up, None, mac, tx_queue_len)?;
+                    next.change_link(ns, index, None, target, up, None, mac, tx_queue_len, mtu)?;
                     let current = target.unwrap_or(ns);
                     changes.push((
                         current,
@@ -647,6 +644,7 @@ pub(crate) fn request(
                             master,
                             mac,
                             tx_queue_len,
+                            mtu,
                         )?;
                         if target.is_some_and(|to| to != ns) {
                             changes.push((ns, 17, 1, link_data(&graph, &d)));
@@ -656,7 +654,9 @@ pub(crate) fn request(
                         if current == ns {
                             address_changes(&d, &after, &mut changes);
                         }
-                        changes.push((current, 16, 1, link_data(&graph, &after)));
+                        if !d.same_link_configuration(&after) {
+                            changes.push((current, 16, 1, link_data(&graph, &after)));
+                        }
                     }
                 }
             }

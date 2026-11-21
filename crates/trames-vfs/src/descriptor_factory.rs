@@ -260,6 +260,33 @@ impl DescriptorFactory {
             }
         }))
     }
+    pub fn bind_socket(
+        &self,
+        socket: &SocketOperation,
+        address: &[u8],
+    ) -> std::result::Result<(), trames_net::NetError> {
+        if socket.is_netlink() {
+            return socket.netlink_address(address, self.local_pid(self.local_identity[0]), false);
+        }
+        socket.bind_authorized(address, self.can_bind_service(socket))
+    }
+    pub fn connect_socket(
+        &self,
+        socket: &SocketOperation,
+        address: &[u8],
+    ) -> std::result::Result<(), trames_net::NetError> {
+        if socket.is_netlink() {
+            return socket.netlink_address(address, self.local_pid(self.local_identity[0]), true);
+        }
+        socket.connect_bytes(address)
+    }
+    pub fn project_socket_credentials(&self, [pid, uid, gid]: [u32; 3]) -> [u32; 3] {
+        [
+            self.local_pid(pid),
+            self.credentials.local_id(false, uid),
+            self.credentials.local_id(true, gid),
+        ]
+    }
     pub fn send_socket_bytes(
         &self,
         socket: &SocketOperation,
@@ -269,7 +296,7 @@ impl DescriptorFactory {
     ) -> Result<usize> {
         let retained = std::cell::RefCell::new(Vec::new());
         socket
-            .send_bytes_with_namespace(
+            .send_bytes_from(
                 bytes,
                 flags,
                 destination,
@@ -301,6 +328,7 @@ impl DescriptorFactory {
                     retained.borrow_mut().push(file);
                     Ok(network)
                 },
+                || (self.local_pid(self.local_identity[0]), self.local_identity),
             )
             .map_err(|e| Errno(e.0))
     }

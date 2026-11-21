@@ -125,9 +125,14 @@ impl Message {
         memory: &mut impl CpuMemory,
         factory: &trames_vfs::DescriptorFactory,
     ) -> Result<u64, Errno> {
-        self.progress_context(socket, number, a, memory, |bytes, flags, peer| {
-            factory.send_socket_bytes(socket, bytes, flags, peer)
-        })
+        self.progress_context(
+            socket,
+            number,
+            a,
+            memory,
+            |c| factory.project_socket_credentials(c),
+            |bytes, flags, peer| factory.send_socket_bytes(socket, bytes, flags, peer),
+        )
     }
     #[cfg(test)]
     fn progress_with(
@@ -138,7 +143,7 @@ impl Message {
         memory: &mut impl CpuMemory,
         send: impl FnMut(&[u8], u32, Option<&[u8]>) -> Result<usize, Errno>,
     ) -> Result<u64, Errno> {
-        self.progress_context(socket, number, a, memory, send)
+        self.progress_context(socket, number, a, memory, |c| c, send)
     }
     fn progress_context(
         &self,
@@ -146,6 +151,7 @@ impl Message {
         number: u32,
         a: [u64; 6],
         memory: &mut impl CpuMemory,
+        project: impl Fn([u32; 3]) -> [u32; 3],
         mut send: impl FnMut(&[u8], u32, Option<&[u8]>) -> Result<usize, Errno>,
     ) -> Result<u64, Errno> {
         let mut state = self.state.lock().unwrap();
@@ -211,7 +217,7 @@ impl Message {
                         .active
                         .as_mut()
                         .unwrap()
-                        .progress(socket, memory, true, &mut send)
+                        .progress(socket, memory, true, &project, &mut send)
                 };
                 // Preserve the existing per-message publication boundary, not
                 // a batch-wide socket lock. No Files lookup enters this guard.

@@ -202,7 +202,9 @@ pub(super) struct Socket {
     replies: SharedState<VecDeque<Datagram>>,
     read_epoch: Cell<u64>,
     readiness: Arc<trames_shared::Readiness>,
-    buffers: Cell<i32>,
+    send_buffer: Cell<i32>,
+    receive_buffer: Cell<i32>,
+    filter: std::sync::OnceLock<SharedState<Option<crate::socket_filter::Program>>>,
     ext_ack: Cell<bool>,
     cap_ack: Cell<bool>,
     strict: Cell<bool>,
@@ -212,6 +214,7 @@ pub(super) struct Socket {
 struct Datagram {
     data: Vec<u8>,
     source: [u8; 12],
+    sender: [u32; 3],
 }
 fn source(port: u32, groups: u32) -> [u8; 12] {
     let mut bytes = [0; 12];
@@ -220,15 +223,29 @@ fn source(port: u32, groups: u32) -> [u8; 12] {
     bytes[8..12].copy_from_slice(&groups.to_le_bytes());
     bytes
 }
-fn enqueue(listener: &Socket, data: &[u8], source: [u8; 12], wakes: &mut Notifications) {
+fn enqueue(
+    listener: &Socket,
+    data: &[u8],
+    source: [u8; 12],
+    sender: [u32; 3],
+    wakes: &mut Notifications,
+) {
+    let Some(len) = listener.filtered_length(data) else {
+        return;
+    };
+    let data = &data[..len];
     wakes.0.push(listener.readiness.clone());
     let mut q = listener.replies.borrow_mut();
-    if q.len() >= 128 || q.iter().map(|p| p.data.len()).sum::<usize>() + data.len() > MAX_BUFFER {
+    if q.len() >= 128
+        || q.iter().map(|p| p.data.len()).sum::<usize>() + data.len()
+            > listener.receive_buffer.get() as usize
+    {
         listener.overrun.set(true);
     } else {
         q.push_back(Datagram {
             data: data.to_vec(),
             source,
+            sender,
         });
         listener.read_epoch.update(|n| n.wrapping_add(1));
     }
@@ -332,7 +349,7 @@ fn notify_request(
                 continue;
             }
             let p = packet.get_or_insert_with(|| message(kind, flags, seq, port, &data));
-            enqueue(listener, p, source(0, group), wakes);
+            enqueue(listener, p, source(0, group), [0; 3], wakes);
         }
     }
 }
@@ -362,7 +379,9 @@ impl Socket {
             replies: SharedState::new(VecDeque::new()),
             read_epoch: Cell::new(0),
             readiness: Arc::default(),
-            buffers: Cell::new(65536),
+            send_buffer: Cell::new(65536),
+            receive_buffer: Cell::new(65536),
+            filter: Default::default(),
             ext_ack: Cell::new(false),
             cap_ack: Cell::new(false),
             strict: Cell::new(false),
@@ -375,6 +394,39 @@ impl Socket {
             .retain(|s| s.strong_count() != 0);
         namespace.listeners.borrow_mut().push(Arc::downgrade(&s));
         Ok(s)
+    }
+    pub(super) fn set_filter(&self, instructions: Option<&[u8]>) -> Result<()> {
+        if let Some(bytes) = instructions {
+            let program = crate::socket_filter::Program::new(bytes)?;
+            *self.filter.get_or_init(Default::default).borrow_mut() = Some(program);
+        } else if self
+            .filter
+            .get()
+            .and_then(|slot| slot.borrow_mut().take())
+            .is_none()
+        {
+            return Err(NetError(2));
+        }
+        Ok(())
+    }
+    fn filtered_length(&self, data: &[u8]) -> Option<usize> {
+        let Some(slot) = self.filter.get() else {
+            return Some(data.len());
+        };
+        let len = slot
+            .borrow()
+            .as_ref()
+            .map_or(data.len(), |program| program.run(data));
+        (len != 0).then_some(len.min(data.len()))
+    }
+    fn kernel_reply(&self, data: Vec<u8>) -> Option<Datagram> {
+        let mut data = self.capped_ack(data);
+        data.truncate(self.filtered_length(&data)?);
+        Some(Datagram {
+            data,
+            source: source(0, 0),
+            sender: [0; 3],
+        })
     }
     fn supported_groups(&self) -> u32 {
         match self.protocol {
@@ -389,7 +441,7 @@ impl Socket {
             _ => 0,
         }
     }
-    fn autobind(&self) -> Result<()> {
+    fn autobind(&self, process: u32) -> Result<()> {
         if self.port.get() != 0 {
             return Ok(());
         }
@@ -398,18 +450,24 @@ impl Socket {
         if self.port.get() != 0 {
             return Ok(());
         }
-        let mut next = self.namespace.next.get().max(1);
+        if process != 0 && ports.insert((self.protocol, process)) {
+            self.port.set(process);
+            return Ok(());
+        }
+        // Additional sockets use the high port-ID range, leaving ordinary
+        // process IDs available to the first socket of each process.
+        let mut next = self.namespace.next.get().max(0x8000_0000);
         while ports.contains(&(self.protocol, next)) {
-            next = next.checked_add(1).ok_or(NetError(98))?;
+            next = next.wrapping_add(1).max(0x8000_0000);
         }
         self.namespace
             .next
-            .set(next.checked_add(1).ok_or(NetError(98))?);
+            .set(next.wrapping_add(1).max(0x8000_0000));
         ports.insert((self.protocol, next));
         self.port.set(next);
         Ok(())
     }
-    pub fn bind_bytes(&self, bytes: &[u8]) -> Result<()> {
+    pub fn bind_bytes(&self, bytes: &[u8], process: u32) -> Result<()> {
         let (port, groups) = decode(bytes)?;
         if groups & !self.supported_groups() != 0 {
             return Err(NetError(95));
@@ -420,7 +478,7 @@ impl Socket {
                 return Err(NetError(22));
             }
         } else if port == 0 {
-            self.autobind()?;
+            self.autobind(process)?;
         } else {
             if !self
                 .namespace
@@ -438,11 +496,11 @@ impl Socket {
         self.groups.set(groups);
         Ok(())
     }
-    pub fn connect_bytes(&self, bytes: &[u8]) -> Result<()> {
+    pub fn connect_bytes(&self, bytes: &[u8], process: u32) -> Result<()> {
         if decode(bytes)? != (0, 0) {
             return Err(NetError(95));
         }
-        self.autobind()?;
+        self.autobind(process)?;
         self.connected.set(true);
         Ok(())
     }
@@ -484,7 +542,15 @@ impl Socket {
         resolve: &dyn Fn(u32) -> Result<Network>,
     ) -> Result<usize> {
         let mut wakes = Notifications::default();
-        let result = self.send_deferred(bytes, flags, destination, net_admin, resolve, &mut wakes);
+        let result = self.send_deferred(
+            bytes,
+            flags,
+            destination,
+            net_admin,
+            resolve,
+            (0, [0; 3]),
+            &mut wakes,
+        );
         wakes.flush();
         result
     }
@@ -516,6 +582,7 @@ impl Socket {
         reply.truncate(write);
         reply
     }
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn send_deferred(
         &self,
         bytes: &[u8],
@@ -523,6 +590,7 @@ impl Socket {
         destination: Option<&[u8]>,
         net_admin: bool,
         resolve: &dyn Fn(u32) -> Result<Network>,
+        (process, sender): (u32, [u32; 3]),
         wakes: &mut Notifications,
     ) -> Result<usize> {
         if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL) != 0 {
@@ -584,7 +652,7 @@ impl Socket {
             return Err(NetError(22));
         }
         if self.protocol == 12 {
-            self.autobind()?;
+            self.autobind(process)?;
             // Admission and commit share this reply-queue transaction. Never commit
             // a batch whose replies cannot fit, even when the reader stalls.
             let mut queue = self.replies.borrow_mut();
@@ -597,14 +665,16 @@ impl Socket {
                 128 - queue.len(),
                 available,
             )?;
-            if !generated.is_empty() {
+            let previous = queue.len();
+            queue.extend(
+                generated
+                    .into_iter()
+                    .filter_map(|data| self.kernel_reply(data)),
+            );
+            if previous != queue.len() {
                 self.read_epoch.update(|n| n.wrapping_add(1));
+                wakes.0.push(self.readiness.clone());
             }
-            wakes.0.push(self.readiness.clone());
-            queue.extend(generated.into_iter().map(|data| Datagram {
-                data: self.capped_ack(data),
-                source: source(0, 0),
-            }));
             return Ok(bytes.len());
         }
         self.namespace.refresh_native();
@@ -619,15 +689,22 @@ impl Socket {
         {
             self.namespace.root_stack()?;
         }
-        self.autobind()?;
+        self.autobind(process)?;
         if group != 0 {
             let listeners = live_listeners(&self.namespace.listeners);
             for listener in &listeners {
-                if listener.namespace.id() == self.namespace.id()
+                if listener.protocol == self.protocol
+                    && listener.namespace.id() == self.namespace.id()
                     && listener.port.get() != self.port.get()
                     && listener.groups.get() & group != 0
                 {
-                    enqueue(listener, bytes, source(self.port.get(), group), wakes);
+                    enqueue(
+                        listener,
+                        bytes,
+                        source(self.port.get(), group),
+                        sender,
+                        wakes,
+                    );
                 }
             }
         }
@@ -645,7 +722,10 @@ impl Socket {
                     .iter()
                     .map(|p| p.data.len())
                     .sum::<usize>()
-                    + replies.iter().map(Vec::len).sum::<usize>()
+                    + replies
+                        .iter()
+                        .map(|r: &Datagram| r.data.len())
+                        .sum::<usize>()
                     > MAX_BUFFER - 512)
             {
                 return Err(NetError(105));
@@ -674,24 +754,28 @@ impl Socket {
             if replies.len() + generated.len() > 128 {
                 return Err(NetError(105));
             }
-            replies.extend(generated.into_iter().map(|reply| self.capped_ack(reply)));
+            replies.extend(
+                generated
+                    .into_iter()
+                    .filter_map(|reply| self.kernel_reply(reply)),
+            );
         }
         let mut queued = self.replies.borrow_mut();
         if queued.len() + replies.len() > 128
             || queued.iter().map(|p| p.data.len()).sum::<usize>()
-                + replies.iter().map(Vec::len).sum::<usize>()
+                + replies
+                    .iter()
+                    .map(|r: &Datagram| r.data.len())
+                    .sum::<usize>()
                 > MAX_BUFFER
         {
             return Err(NetError(105));
         }
         if !replies.is_empty() {
             self.read_epoch.update(|n| n.wrapping_add(1));
+            wakes.0.push(self.readiness.clone());
         }
-        wakes.0.push(self.readiness.clone());
-        queued.extend(replies.into_iter().map(|data| Datagram {
-            data,
-            source: source(0, 0),
-        }));
+        queued.extend(replies);
         Ok(bytes.len())
     }
     pub fn subscribe(
@@ -743,7 +827,7 @@ impl Socket {
             stream_minimum: 0,
             packet_address: None,
             netlink_address: Some(packet.source),
-            credentials: self.pass_credentials.get().then_some([0, 0, 0]),
+            credentials: self.pass_credentials.get().then_some(packet.sender),
             data: bytes[..bytes.len().min(count)].to_vec(),
             length: bytes.len(),
             truncated: count < bytes.len(),
@@ -770,7 +854,10 @@ impl Socket {
         match (level, name) {
             (1, 16) => self.pass_credentials.set(value != 0),
             (1, 29 | 35 | 63 | 64) => self.timestamp.set(if value != 0 { name } else { 0 }),
-            (1, 7 | 8) if value > 0 => self.buffers.set(value.clamp(4096, MAX_BUFFER as i32)),
+            (1, 7) if value > 0 => self.send_buffer.set(value.clamp(4096, MAX_BUFFER as i32)),
+            (1, 8) if value > 0 => self
+                .receive_buffer
+                .set(value.clamp(4096, MAX_BUFFER as i32)),
             (270, 1 | 2) if (1..=32).contains(&value) => {
                 let group = 1u32 << (value - 1);
                 if group & !self.supported_groups() != 0 {
@@ -796,7 +883,8 @@ impl Socket {
             (1, 29 | 35 | 63 | 64) => Ok(i32::from(self.timestamp.get() == name)),
             (1, 3) => Ok(self.kind as i32),
             (1, 4) => Ok(if self.overrun.replace(false) { 105 } else { 0 }),
-            (1, 7 | 8) => Ok(self.buffers.get()),
+            (1, 7) => Ok(self.send_buffer.get()),
+            (1, 8) => Ok(self.receive_buffer.get()),
             (1, 39) => Ok(16),
             (1, 38) => Ok(self.protocol as i32),
             (270, 10) => Ok(i32::from(self.cap_ack.get())),
@@ -819,6 +907,56 @@ impl Drop for Socket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn socket_port_ids_and_filtered_delivery_follow_the_calling_process() {
+        let ns = Arc::new(Namespace::default());
+        let first = Socket::new(ns.clone(), None, 3, 0).unwrap();
+        let second = Socket::new(ns.clone(), None, 3, 0).unwrap();
+        let events = Socket::new(ns.clone(), None, 3, 15).unwrap();
+        for s in [&first, &second, &events] {
+            s.bind_bytes(&source(0, 1), 17).unwrap();
+        }
+        assert_eq!(first.port.get(), 17);
+        assert_eq!(events.port.get(), 17);
+        assert!(second.port.get() >= 0x8000_0000);
+        let mut wakes = Notifications::default();
+        let mut ret = [6, 0, 0, 0, 0, 0, 0, 0];
+        second.set_option(1, 16, 1).unwrap();
+        second.set_filter(Some(&ret)).unwrap();
+        let msg = message(1, 1, 3, 0, &[]);
+        let send = |wakes: &mut Notifications| {
+            first
+                .send_deferred(
+                    &msg,
+                    0,
+                    Some(&source(0, 1)),
+                    true,
+                    &|_| Err(NetError(9)),
+                    (45, [45, 78, 99]),
+                    wakes,
+                )
+                .unwrap();
+        };
+        send(&mut wakes);
+        assert_eq!(second.recv(24, 0).err(), Some(NetError(11)));
+        ret[4] = 8;
+        second.set_filter(Some(&ret)).unwrap();
+        assert_eq!(second.set_filter(Some(&[0; 8])), Err(NetError(22)));
+        send(&mut wakes);
+        let datagram = second.recv(24, 0).unwrap();
+        assert_eq!(datagram.data, msg[..8]);
+        assert_eq!(datagram.credentials, Some([45, 78, 99]));
+        assert_eq!(datagram.netlink_address, Some(source(17, 1)));
+        assert_eq!(events.recv(24, 0).err(), Some(NetError(11)));
+        second.set_filter(None).unwrap();
+        assert_eq!(second.set_filter(None), Err(NetError(2)));
+        send(&mut wakes);
+        assert_eq!(second.recv(24, 0).unwrap().data, msg);
+        drop(first);
+        let reused = Socket::new(ns, None, 3, 0).unwrap();
+        reused.connect_bytes(&source(0, 0), 17).unwrap();
+        assert_eq!(reused.port.get(), 17);
+    }
     #[test]
     fn capped_ack_preserves_every_packed_batch_record() {
         let socket = Socket::new(Arc::new(Namespace::default()), None, 3, 12).unwrap();
@@ -862,7 +1000,7 @@ mod tests {
     fn container_uevent_listener_is_quiet_and_separate_from_rtnetlink() {
         let namespace = Arc::new(Namespace::default());
         let events = Socket::new(namespace.clone(), None, 2, 15).unwrap();
-        events.bind_bytes(&source(123, u32::MAX)).unwrap();
+        events.bind_bytes(&source(123, u32::MAX), 0).unwrap();
         assert_eq!(events.local_bytes().unwrap(), source(123, u32::MAX));
         events.set_option(1, 16, 1).unwrap();
         assert_eq!(events.get_option(1, 16), Ok(1));
@@ -876,7 +1014,7 @@ mod tests {
         assert_eq!(events.send_bytes(b"injected", 0, None), Err(NetError(95)));
         // Port IDs are scoped by protocol even within the same namespace.
         let routes = Socket::new(namespace, None, 3, 0).unwrap();
-        routes.bind_bytes(&source(123, 1 | (1 << 19))).unwrap();
+        routes.bind_bytes(&source(123, 1 | (1 << 19)), 0).unwrap();
         routes.set_option(1, 16, 1).unwrap();
         routes.set_option(1, 29, 1).unwrap();
         assert_eq!(routes.get_option(1, 29), Ok(1));

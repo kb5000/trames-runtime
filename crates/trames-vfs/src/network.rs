@@ -315,6 +315,15 @@ impl Vfs {
         self.network.device_carrier(d)
     }
     pub fn set_network_device_up(&self, index: u32, up: bool) -> Result<()> {
+        self.configure_network_device(index, None, Some(up), None)
+    }
+    pub fn configure_network_device(
+        &self,
+        index: u32,
+        name: Option<&[u8]>,
+        up: Option<bool>,
+        mtu: Option<u32>,
+    ) -> Result<()> {
         if !self
             .credentials
             .has_ns_cap(&self.root_network.user_namespace, capabilities::NET_ADMIN)
@@ -322,7 +331,7 @@ impl Vfs {
             return Err(Errno(1));
         }
         self.network
-            .set_device_up(index, up)
+            .configure_device(index, name, up, mtu)
             .map_err(|e| Errno(e.0))
     }
     pub fn set_network_device_ipv4(
