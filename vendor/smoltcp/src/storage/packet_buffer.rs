@@ -84,7 +84,24 @@ impl<'a, H> PacketBuffer<'a, H> {
     /// return a reference to its payload, or return `Err(Full)`
     /// if the buffer is full.
     pub fn enqueue(&mut self, size: usize, header: H) -> Result<&mut [u8], Full> {
-        if self.payload_limit < size || self.is_full() {
+        self.enqueue_with_limit(size, header, self.payload_limit)
+    }
+
+    /// Linux UDP admits one full datagram to an empty receive queue even when
+    /// it exceeds SO_RCVBUF. Only grow storage after this packet arrives.
+    #[cfg(feature = "std")]
+    pub(crate) fn enqueue_oversized_datagram(&mut self, size: usize, header: H) -> Result<&mut [u8], Full> {
+        if !self.is_empty() || self.is_full() {
+            return Err(Full);
+        }
+        if self.payload_ring.capacity() < size {
+            self.payload_ring = RingBuffer::new(alloc::vec![0; size]);
+        }
+        self.enqueue_with_limit(size, header, size)
+    }
+
+    fn enqueue_with_limit(&mut self, size: usize, header: H, limit: usize) -> Result<&mut [u8], Full> {
+        if limit < size || self.is_full() {
             return Err(Full);
         }
 
@@ -97,7 +114,7 @@ impl<'a, H> PacketBuffer<'a, H> {
         let window = self
             .payload_ring
             .window()
-            .min(self.payload_limit.saturating_sub(self.payload_ring.len()));
+            .min(limit.saturating_sub(self.payload_ring.len()));
         let contig_window = self.payload_ring.contiguous_window();
 
         if window < size {

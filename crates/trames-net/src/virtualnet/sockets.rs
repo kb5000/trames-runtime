@@ -351,18 +351,24 @@ impl Socket {
     }
     pub fn bind(&self, a: SocketAddr) -> Result<()> {
         let _binding = self.network.0.binding.lock();
-        self.bind_locked(a)
+        self.bind_locked(a, true)
     }
     pub(super) fn ensure_bound(&self) -> Result<()> {
         let _binding = self.network.0.binding.lock();
         if self.state.borrow().bound.is_some() {
             return Ok(());
         }
-        self.bind_locked(self.wildcard())
+        let requested = self
+            .state
+            .borrow()
+            .udp_requested_bind
+            .unwrap_or_else(|| self.wildcard());
+        self.bind_locked(self.presented(requested), false)
     }
-    fn bind_locked(&self, a: SocketAddr) -> Result<()> {
+    fn bind_locked(&self, a: SocketAddr, explicit: bool) -> Result<()> {
         self.fabric().tick();
-        let mut a = self.normalize(a)?;
+        let requested = self.normalize(a)?;
+        let mut a = requested;
         if self.network.0.finished.get() {
             return Err(NetError(100));
         }
@@ -416,18 +422,28 @@ impl Socket {
             let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
             n.udp_bind_order += 1;
             let mut state = self.state.borrow_mut();
+            if explicit {
+                state.udp_requested_bind = Some(requested);
+            }
             state.udp_bind_order = n.udp_bind_order;
             if let Some(source) = &state.udp_readable {
                 n.udp_readers.insert(state.udp_bind_order, source.clone());
             }
             state.udp_shared = state.reuse || state.reuse_port;
             state.udp_group = state.reuse_port.then(|| self.reuse_port_group());
-            let mut handles = Vec::with_capacity(addresses.len());
-            for address in addresses {
-                let socket = state.bound_udp_handle(address, !a.ip().is_unspecified())?;
-                handles.push(n.sockets.add(socket));
+            let specific = !a.ip().is_unspecified();
+            for (index, address) in addresses.into_iter().enumerate() {
+                if let Some(handle) = state.handles.get(index) {
+                    state.bind_udp_handle(
+                        n.sockets.get_mut::<udp::Socket>(*handle),
+                        address,
+                        specific,
+                    )?;
+                } else {
+                    let socket = state.bound_udp_handle(address, specific)?;
+                    state.handles.push(n.sockets.add(socket));
+                }
             }
-            state.handles = handles;
         }
         self.state.borrow_mut().bound = Some(a);
         Ok(())
@@ -521,6 +537,7 @@ impl Socket {
             reuse: state.reuse,
             reuse_port: false,
             udp_bind_order: 0,
+            udp_requested_bind: None,
             udp_shared: false,
             udp_readable: None,
             udp_group: None,
@@ -556,6 +573,37 @@ impl Socket {
         socket.mark.set(self.mark.get());
         socket.route_device.set(self.route_device.get());
         Ok((socket, self.presented(peer)))
+    }
+    pub fn disconnect_udp(&self) -> Result<()> {
+        if self.kind != 2 {
+            return Err(NetError(97));
+        }
+        let _binding = self.network.0.binding.lock();
+        let mut fabric = self.network.0.fabric.0.borrow_mut();
+        let node = fabric
+            .nodes
+            .get_mut(&self.network.0.key)
+            .ok_or(NetError(100))?;
+        let mut state = self.state.borrow_mut();
+        state.peer = None;
+        state.connection = Connection::Idle;
+        state.device = None;
+        self.route_device.set(0);
+        let explicit = state.udp_requested_bind.filter(|a| a.port() != 0);
+        if explicit.is_none() {
+            node.udp_readers.remove(&state.udp_bind_order);
+            state.udp_bind_order = 0;
+        }
+        for &h in &state.handles {
+            let s = node.sockets.get_mut::<udp::Socket>(h);
+            if explicit.is_some() {
+                s.set_receive_peer(None);
+            } else {
+                s.release_binding();
+            }
+        }
+        state.bound = explicit;
+        Ok(())
     }
     pub fn connect(&self, a: SocketAddr) -> Result<()> {
         // Dual-stack UDP accepts a sockaddr_in directly on connect (glibc
@@ -605,7 +653,7 @@ impl Socket {
         if self.kind != 1 {
             let mut fabric = self.network.0.fabric.0.borrow_mut();
             let mut s = self.state.borrow_mut();
-            if self.kind == 2 && s.bound.is_some_and(|b| b.ip().is_unspecified()) {
+            if self.kind == 2 && s.udp_requested_bind.is_none_or(|b| b.ip().is_unspecified()) {
                 let source = if let Some(source) = group_source {
                     source
                 } else if let Some(view) = self.network.0.routing.get() {
@@ -703,7 +751,13 @@ impl Socket {
         r
     }
     pub fn local_addr(&self) -> Result<SocketAddr> {
-        Ok(self.presented(self.state.borrow().bound.unwrap_or(self.wildcard())))
+        let state = self.state.borrow();
+        Ok(self.presented(
+            state
+                .bound
+                .or(state.udp_requested_bind)
+                .unwrap_or_else(|| self.wildcard()),
+        ))
     }
     pub fn peer_addr(&self) -> Result<SocketAddr> {
         self.state
@@ -795,7 +849,15 @@ impl Socket {
         }
         if self.kind == 2 {
             let a = if let Some(a) = destination {
-                self.normalize(a)?
+                let mut a = self.normalize(a)?;
+                if a.ip().is_unspecified() {
+                    a.set_ip(if a.is_ipv4() {
+                        Ipv4Addr::LOCALHOST.into()
+                    } else {
+                        Ipv6Addr::LOCALHOST.into()
+                    });
+                }
+                a
             } else {
                 self.state.borrow().peer.ok_or(NetError(89))?
             };
@@ -868,6 +930,7 @@ impl Socket {
                     smoltcp::socket::udp::UdpMetadata {
                         endpoint: endpoint(a),
                         received_ns: 0,
+                        local_port: 0,
                         local_address: info
                             .filter(|i| !i.address.is_unspecified())
                             .map(|i| ip(i.address))
@@ -1102,12 +1165,8 @@ impl Socket {
                         ipv6,
                         mapped_info: mapped && options.receive_info,
                         original_destination: if options.original_destination {
-                            meta.local_address.map(|ip| {
-                                SocketAddr::new(
-                                    addr(ip),
-                                    state.bound.expect("bound UDP endpoint").port(),
-                                )
-                            })
+                            meta.local_address
+                                .map(|ip| SocketAddr::new(addr(ip), meta.local_port))
                         } else {
                             None
                         },

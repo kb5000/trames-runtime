@@ -967,20 +967,44 @@ impl Socket {
         }
     }
     pub fn bind_authorized(&self, bytes: &[u8], can_bind_service: bool) -> Result<()> {
-        if self.info().is_some_and(|s| matches!(s.protocol, 6 | 17)) {
-            let address = decode_address(bytes)?;
-            if address.port() != 0
-                && address.port() < self.namespace.unprivileged_port.get()
-                && !can_bind_service
+        let wildcard_family = bytes.starts_with(&[0, 0]);
+        // Only service-port policy and the legacy wildcard ABI need socket
+        // identification. Ordinary binds don't need a snapshot of live queues.
+        let restricted = !can_bind_service
+            && bytes.get(2..4).is_some_and(|p| {
+                let port = u16::from_be_bytes([p[0], p[1]]);
+                port != 0 && port < self.namespace.unprivileged_port.get()
+            });
+        if !restricted && !wildcard_family {
+            return self.bind_bytes(bytes);
+        }
+        if let Some(info) = self.info().filter(|s| matches!(s.protocol, 6 | 17)) {
+            let address = if wildcard_family
+                && info.family == 2
+                && bytes.len() >= 16
+                && bytes[4..8] == [0; 4]
             {
+                // Linux accepts AF_UNSPEC as AF_INET for a wildcard bind.
+                SocketAddr::from(([0; 4], u16::from_be_bytes([bytes[2], bytes[3]])))
+            } else {
+                decode_address(bytes)?
+            };
+            if restricted {
                 return Err(NetError(13));
             }
+            return self.bind(address);
         }
         self.bind_bytes(bytes)
     }
     pub fn connect_bytes(&self, bytes: &[u8]) -> Result<()> {
         if matches!(self.backend, SocketBackend::Packet(_)) {
             return Err(NetError(95));
+        }
+        if self.kind == 2 && bytes.starts_with(&[0, 0]) {
+            if let SocketBackend::Virtual(s) = &self.backend {
+                let _operation = self.operation.write();
+                return s.disconnect_udp();
+            }
         }
         if let SocketBackend::Netlink(s) = &self.backend {
             {

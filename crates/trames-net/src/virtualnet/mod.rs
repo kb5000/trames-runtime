@@ -159,6 +159,8 @@ struct State {
     reuse: bool,
     reuse_port: bool,
     udp_bind_order: u64,
+    // Address and port requested by bind(2), before ephemeral allocation.
+    udp_requested_bind: Option<SocketAddr>,
     udp_shared: bool,
     udp_readable: Option<Arc<trames_shared::Readiness>>,
     udp_group: Option<u64>,
@@ -249,7 +251,16 @@ fn udp_socket() -> udp::Socket<'static> {
 impl State {
     fn bound_udp_handle(&self, local: SocketAddr, specific: bool) -> Result<udp::Socket<'static>> {
         let mut socket = udp_socket_with_buffers(self.receive_buffer, self.send_buffer);
-        socket.capture_receive_time();
+        self.bind_udp_handle(&mut socket, local, specific)?;
+        Ok(socket)
+    }
+    fn bind_udp_handle(
+        &self,
+        socket: &mut udp::Socket,
+        local: SocketAddr,
+        specific: bool,
+    ) -> Result<()> {
+        socket.enable_linux_receive();
         socket.set_bind_priority(self.udp_bind_order, specific);
         if self.udp_readable.is_some() {
             socket.observe_readable(self.udp_bind_order);
@@ -260,8 +271,7 @@ impl State {
         socket.set_reuse_port_group(self.udp_group);
         socket.set_receive_peer(self.peer.filter(|p| p.port() != 0).map(endpoint));
         socket.set_hop_limit(Some(self.hop_limit));
-        socket.bind(endpoint(local)).map_err(|_| NetError(22))?;
-        Ok(socket)
+        socket.bind(endpoint(local)).map_err(|_| NetError(22))
     }
 }
 impl SocketMeta {
@@ -1426,6 +1436,7 @@ impl Network {
                 reuse: false,
                 reuse_port: false,
                 udp_bind_order: 0,
+                udp_requested_bind: None,
                 udp_shared: false,
                 udp_readable: None,
                 udp_group: None,
@@ -1753,6 +1764,60 @@ mod shared_lifetime_tests {
                     assert_eq!(record.ip.ipv6, v6);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn udp_disconnect_retains_queued_records_and_releases_only_automatic_ports() {
+        let fabric = Fabric::new().unwrap();
+        let net = crate::Network::virtual_network(&fabric, 2, NetworkMode::Full).unwrap();
+        for (family, addr, level, orig) in
+            [(2, "127.0.0.1:34117", 0, 20), (10, "[::1]:34117", 41, 74)]
+        {
+            let server = net.socket(family, 2, 0).unwrap();
+            let address: SocketAddr = addr.parse().unwrap();
+            server.bind(address).unwrap();
+            let client = net.socket(family, 2, 0).unwrap();
+            client.connect(address).unwrap();
+            client.set_option(level, orig, 1).unwrap();
+            let previous = client.local_addr().unwrap();
+            server.send(b"queued", 0, Some(previous)).unwrap();
+
+            client.connect_bytes(&[0, 0]).unwrap();
+            assert_eq!(client.peer_addr(), Err(NetError(107)));
+            assert_eq!(client.local_addr().unwrap().port(), 0);
+            assert_eq!(client.readable_bytes().unwrap(), Some(6));
+            let replacement = net.socket(family, 2, 0).unwrap();
+            replacement.bind(previous).unwrap();
+            server.send(b"new owner", 0, Some(previous)).unwrap();
+            assert_eq!(
+                replacement.recv(32, MSG_DONTWAIT).unwrap().data,
+                b"new owner"
+            );
+
+            client.connect(address).unwrap();
+            let current = client.local_addr().unwrap();
+            assert_ne!(previous.port(), current.port());
+            server.send(b"new", 0, Some(current)).unwrap();
+            for (bytes, dst) in [
+                (b"queued".as_slice(), previous),
+                (b"new".as_slice(), current),
+            ] {
+                for flag in [MSG_PEEK, 0] {
+                    let packet = client.recv(32, flag | MSG_DONTWAIT).unwrap();
+                    assert_eq!(packet.data, bytes);
+                    assert_eq!(packet.ip.original_destination, Some(dst));
+                }
+            }
+            let bound = net.socket(family, 2, 0).unwrap();
+            let mut specific = address;
+            specific.set_port(0);
+            bound.bind(specific).unwrap();
+            bound.connect(address).unwrap();
+            bound.connect_bytes(&[0, 0]).unwrap();
+            assert_eq!(bound.local_addr().unwrap(), specific);
+            bound.connect(address).unwrap();
+            assert_eq!(bound.local_addr().unwrap().ip(), specific.ip());
         }
     }
 

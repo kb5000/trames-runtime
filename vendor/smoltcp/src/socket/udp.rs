@@ -23,6 +23,8 @@ pub struct UdpMetadata {
     /// determined using the algorithms of RFC 6724 (candidate source address selection) or some
     /// heuristic (for IPv4).
     pub local_address: Option<IpAddress>,
+    /// Local port of this queued datagram, retained across endpoint changes.
+    pub local_port: u16,
     pub meta: PacketMeta,
     /// Wall-clock nanoseconds at ingress when capture is active.
     #[cfg(feature = "std")]
@@ -34,6 +36,7 @@ impl<T: Into<IpEndpoint>> From<T> for UdpMetadata {
         Self {
             endpoint: value.into(),
             local_address: None,
+            local_port: 0,
             meta: PacketMeta::default(),
             #[cfg(feature = "std")]
             received_ns: 0,
@@ -132,7 +135,7 @@ pub struct Socket<'a> {
     #[cfg(feature = "alloc")]
     readable_token: Option<u64>,
     #[cfg(feature = "std")]
-    capture_rx_time: bool,
+    linux_receive: bool,
     rx_buffer: PacketBuffer<'a>,
     tx_buffer: PacketBuffer<'a>,
     /// The time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
@@ -156,7 +159,7 @@ impl<'a> Socket<'a> {
             #[cfg(feature = "alloc")]
             readable_token: None,
             #[cfg(feature = "std")]
-            capture_rx_time: false,
+            linux_receive: false,
             rx_buffer,
             tx_buffer,
             hop_limit: None,
@@ -167,10 +170,10 @@ impl<'a> Socket<'a> {
         }
     }
 
-    /// Keep packet arrival time for ancillary data and last-packet ioctls.
+    /// Use Linux datagram arrival timestamps and empty-queue receive admission.
     #[cfg(feature = "std")]
-    pub fn capture_receive_time(&mut self) {
-        self.capture_rx_time = true;
+    pub fn enable_linux_receive(&mut self) {
+        self.linux_receive = true;
     }
 
     /// Preserve the original guest binding across per-address receive handles.
@@ -328,6 +331,14 @@ impl<'a> Socket<'a> {
         }
     }
 
+    /// Release the binding while preserving unread and already accepted datagrams.
+    pub fn release_binding(&mut self) {
+        self.endpoint = IpListenEndpoint::default();
+        self.peer = None;
+        self.reusable = false;
+        self.reuse_port_group = None;
+    }
+
     /// Check whether the socket is open.
     #[inline]
     pub fn is_open(&self) -> bool {
@@ -382,7 +393,9 @@ impl<'a> Socket<'a> {
         size: usize,
         meta: impl Into<UdpMetadata>,
     ) -> Result<&mut [u8], SendError> {
-        let meta = meta.into();
+        let mut meta = meta.into();
+        meta.local_port = self.endpoint.port;
+        meta.local_address = meta.local_address.or(self.endpoint.addr);
         if self.endpoint.port == 0 {
             return Err(SendError::Unaddressable);
         }
@@ -421,7 +434,9 @@ impl<'a> Socket<'a> {
     where
         F: FnOnce(&mut [u8]) -> usize,
     {
-        let meta = meta.into();
+        let mut meta = meta.into();
+        meta.local_port = self.endpoint.port;
+        meta.local_address = meta.local_address.or(self.endpoint.addr);
         if self.endpoint.port == 0 {
             return Err(SendError::Unaddressable);
         }
@@ -557,7 +572,7 @@ impl<'a> Socket<'a> {
     }
 
     pub(crate) fn accepts(&self, cx: &mut Context, ip_repr: &IpRepr, repr: &UdpRepr) -> bool {
-        if self.endpoint.port != repr.dst_port {
+        if self.endpoint.port == 0 || self.endpoint.port != repr.dst_port {
             return false;
         }
         if self
@@ -604,7 +619,7 @@ impl<'a> Socket<'a> {
 
         let metadata = UdpMetadata {
             #[cfg(feature = "std")]
-            received_ns: if self.capture_rx_time {
+            received_ns: if self.linux_receive {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -614,12 +629,21 @@ impl<'a> Socket<'a> {
             },
             endpoint: remote_endpoint,
             local_address: Some(ip_repr.dst_addr()),
+            local_port: repr.dst_port,
             meta,
         };
 
         #[cfg(feature = "alloc")]
         let edge = self.readable_token.filter(|_| self.rx_buffer.is_empty());
-        match self.rx_buffer.enqueue(size, metadata) {
+        #[cfg(feature = "std")]
+        let slot = if size > self.rx_buffer.payload_capacity() && self.linux_receive {
+            self.rx_buffer.enqueue_oversized_datagram(size, metadata)
+        } else {
+            self.rx_buffer.enqueue(size, metadata)
+        };
+        #[cfg(not(feature = "std"))]
+        let slot = self.rx_buffer.enqueue(size, metadata);
+        match slot {
             Ok(buf) => {
                 buf.copy_from_slice(payload);
                 #[cfg(feature = "alloc")]
@@ -675,7 +699,7 @@ impl<'a> Socket<'a> {
             );
 
             let repr = UdpRepr {
-                src_port: endpoint.port,
+                src_port: packet_meta.local_port,
                 dst_port: packet_meta.endpoint.port,
             };
             let ip_repr = IpRepr::new(
@@ -778,6 +802,7 @@ mod test {
         // Would be great as a const once we have const `.into()`.
         UdpMetadata {
             local_address: Some(LOCAL_ADDR.into()),
+            local_port: LOCAL_PORT,
             ..REMOTE_END.into()
         }
     }
