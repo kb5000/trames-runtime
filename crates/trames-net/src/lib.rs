@@ -613,8 +613,10 @@ impl Socket {
         Ok(())
     }
     pub fn set_owner_uid(&self, uid: u32) {
-        if let SocketBackend::Virtual(socket) = &self.backend {
-            socket.set_owner_uid(uid);
+        match &self.backend {
+            SocketBackend::Virtual(socket) => socket.set_owner_uid(uid),
+            SocketBackend::Hybrid(socket) => socket.set_owner_uid(uid),
+            _ => {}
         }
     }
     fn wrap(
@@ -746,6 +748,18 @@ impl Socket {
             SocketBackend::Packet(socket) => socket.wait_delay(),
             SocketBackend::Hybrid(socket) => socket.waiters(5).1.map(|fabric| fabric.next_wait()),
             SocketBackend::Virtual(socket) => Some(socket.fabric().next_wait()),
+            _ => None,
+        }
+    }
+    /// Additional receive edge for the guest packet stack. Native FDs and
+    /// protocol deadlines remain independent sources for the same operation.
+    pub fn subscribe_udp_readable(
+        &self,
+        signal: &Arc<trames_shared::IoSignal>,
+    ) -> Option<trames_shared::IoSubscription> {
+        match &self.backend {
+            SocketBackend::Virtual(socket) => socket.subscribe_udp_readable(signal),
+            SocketBackend::Hybrid(socket) => socket.subscribe_udp_readable(signal),
             _ => None,
         }
     }

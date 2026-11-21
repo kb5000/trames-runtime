@@ -146,6 +146,8 @@ pub struct TransportCounters {
 /// exclusively). However, it is still possible to call methods on its `inner` field.
 pub struct InterfaceInner {
     pub(crate) counters: TransportCounters,
+    #[cfg(all(feature = "socket-udp", feature = "alloc"))]
+    pub(crate) udp_readable: alloc::vec::Vec<u64>,
     caps: DeviceCapabilities,
     now: Instant,
     rand: Rand,
@@ -209,6 +211,12 @@ impl Config {
 }
 
 impl Interface {
+    /// Observed UDP queues that became readable while this interface was polled.
+    #[cfg(all(feature = "socket-udp", feature = "alloc"))]
+    pub fn drain_udp_readable(&mut self) -> impl Iterator<Item = u64> + '_ {
+        self.inner.udp_readable.drain(..)
+    }
+
     /// Create a network interface using the previously provided configuration.
     ///
     /// # Panics
@@ -269,6 +277,8 @@ impl Interface {
             fragmenter: Fragmenter::new(),
             inner: InterfaceInner {
                 counters: TransportCounters::default(),
+                #[cfg(all(feature = "socket-udp", feature = "alloc"))]
+                udp_readable: alloc::vec::Vec::new(),
                 now,
                 caps,
                 hardware_addr: config.hardware_addr,

@@ -290,6 +290,8 @@ impl StreamTransfer {
             if let Some(subscription) = socket.subscribe(signal) {
                 wait.subscriptions.push(subscription);
             } else {
+                wait.subscriptions
+                    .extend(socket.subscribe_udp_readable(signal));
                 let (fds, delay) = socket.wait_sources()?;
                 wait.native = fds.into_iter().map(|fd| (fd.into(), false)).collect();
                 if let Some(delay) = delay {

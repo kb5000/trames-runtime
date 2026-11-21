@@ -6,6 +6,28 @@ use crate::socket::dns::Socket as DnsSocket;
 #[cfg(feature = "socket-udp")]
 use crate::socket::udp::Socket as UdpSocket;
 
+// SplitMix64 finalizer. The four-tuple and logical binding identity stay
+// stable across packets and socket table slot reuse.
+#[cfg(feature = "socket-udp")]
+fn mix_flow(mut x: u64) -> u64 {
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+    x ^ (x >> 31)
+}
+
+#[cfg(feature = "socket-udp")]
+fn flow_address(address: IpAddress) -> u64 {
+    match address {
+        #[cfg(feature = "proto-ipv4")]
+        IpAddress::Ipv4(v) => u64::from(v.to_bits()),
+        #[cfg(feature = "proto-ipv6")]
+        IpAddress::Ipv6(v) => {
+            let bits = v.to_bits();
+            mix_flow((bits >> 64) as u64) ^ bits as u64
+        }
+    }
+}
+
 impl InterfaceInner {
     pub(super) fn process_udp<'frame>(
         &mut self,
@@ -31,10 +53,10 @@ impl InterfaceInner {
         #[cfg(feature = "socket-udp")]
         {
             let mut shared = None;
-            for socket in sockets
-                .items_mut()
-                .filter_map(|i| UdpSocket::downcast_mut(&mut i.socket))
-            {
+            for (handle, item) in sockets.iter_mut() {
+                let Some(socket) = UdpSocket::downcast_mut(item) else {
+                    continue;
+                };
                 if !socket.accepts(self, &ip_repr, &udp_repr) {
                     continue;
                 }
@@ -42,11 +64,37 @@ impl InterfaceInner {
                     socket.process(self, meta, &ip_repr, &udp_repr, udp_packet.payload());
                     return None;
                 };
-                if shared.as_ref().is_none_or(|(best, _)| rank > *best) {
-                    shared = Some((rank, socket));
+                if shared.as_ref().is_none_or(|(best, _, _)| rank > *best) {
+                    shared = Some((rank, handle, socket.reuse_port_group));
                 }
             }
-            if let Some((_, socket)) = shared {
+            if let Some(((connected, specific, _), mut handle, group)) = shared {
+                if let Some(group) = group {
+                    let ports = (u64::from(udp_repr.src_port) << 16) | u64::from(udp_repr.dst_port);
+                    let flow = mix_flow(flow_address(src_addr))
+                        ^ flow_address(dst_addr).rotate_left(23)
+                        ^ ports;
+                    let mut best = None;
+                    for (candidate, item) in sockets.iter_mut() {
+                        let Some(socket) = UdpSocket::downcast_mut(item) else {
+                            continue;
+                        };
+                        if socket.reuse_port_group != Some(group)
+                            || !socket.accepts(self, &ip_repr, &udp_repr)
+                        {
+                            continue;
+                        }
+                        if let Some((c, s, order)) = socket.shared_priority() {
+                            let score = mix_flow(flow ^ mix_flow(order));
+                            if (c, s) == (connected, specific) && best.is_none_or(|old| score > old)
+                            {
+                                best = Some(score);
+                                handle = candidate;
+                            }
+                        }
+                    }
+                }
+                let socket = sockets.get_mut::<UdpSocket>(handle);
                 socket.process(self, meta, &ip_repr, &udp_repr, udp_packet.payload());
                 return None;
             }

@@ -1,6 +1,37 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 impl Socket {
+    pub fn subscribe_udp_readable(
+        &self,
+        signal: &Arc<trames_shared::IoSignal>,
+    ) -> Option<trames_shared::IoSubscription> {
+        if self.kind != 2 {
+            return None;
+        }
+        if let Some(source) = self.state.borrow().udp_readable.clone() {
+            return Some(source.subscribe(signal));
+        }
+        let mut fabric = self.network.0.fabric.0.borrow_mut();
+        let node = fabric.nodes.get_mut(&self.network.0.key)?;
+        let mut state = self.state.borrow_mut();
+        let source = state
+            .udp_readable
+            .get_or_insert_with(Default::default)
+            .clone();
+        let token = state.udp_bind_order;
+        if token != 0 {
+            node.udp_readers.insert(token, source.clone());
+            for &handle in &state.handles {
+                node.sockets
+                    .get_mut::<udp::Socket>(handle)
+                    .observe_readable(token);
+            }
+        }
+        drop(state);
+        drop(fabric);
+        Some(source.subscribe(signal))
+    }
+
     pub fn set_owner_uid(&self, uid: u32) {
         self.uid.set(uid);
     }
@@ -245,11 +276,12 @@ impl Socket {
         let Some(n) = i.nodes.get(&self.network.0.key) else {
             return false;
         };
-        let (dual, reuse_udp) = {
+        let (dual, reuse_udp, reuse_port) = {
             let state = self.state.borrow();
             (
                 self.family == 10 && !state.v6_only,
                 self.kind == 2 && state.reuse,
+                self.kind == 2 && state.reuse_port,
             )
         };
         let free = n
@@ -262,7 +294,10 @@ impl Socket {
                 let Some(b) = state.bound else {
                     return true;
                 };
-                if a.port() != b.port() || reuse_udp && state.reuse {
+                if a.port() != b.port()
+                    || reuse_udp && state.reuse
+                    || reuse_port && state.reuse_port && self.uid.get() == s.uid.get()
+                {
                     return true;
                 }
                 let same_family =
@@ -380,24 +415,19 @@ impl Socket {
             let mut i = self.network.0.fabric.0.borrow_mut();
             let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
             n.udp_bind_order += 1;
-            let mut handles = Vec::new();
-            for address in addresses {
-                let state = self.state.borrow();
-                let mut s = udp_socket_with_buffers(state.receive_buffer, state.send_buffer);
-                s.set_bind_priority(n.udp_bind_order, !a.ip().is_unspecified());
-                if state.reuse {
-                    s.allow_shared_delivery();
-                }
-                drop(state);
-                s.set_hop_limit(Some(self.state.borrow().hop_limit));
-                s.bind(IpListenEndpoint {
-                    addr: Some(ip(address.ip())),
-                    port: address.port(),
-                })
-                .map_err(|_| NetError(22))?;
-                handles.push(n.sockets.add(s));
+            let mut state = self.state.borrow_mut();
+            state.udp_bind_order = n.udp_bind_order;
+            if let Some(source) = &state.udp_readable {
+                n.udp_readers.insert(state.udp_bind_order, source.clone());
             }
-            self.state.borrow_mut().handles = handles;
+            state.udp_shared = state.reuse || state.reuse_port;
+            state.udp_group = state.reuse_port.then(|| self.reuse_port_group());
+            let mut handles = Vec::with_capacity(addresses.len());
+            for address in addresses {
+                let socket = state.bound_udp_handle(address, !a.ip().is_unspecified())?;
+                handles.push(n.sockets.add(socket));
+            }
+            state.handles = handles;
         }
         self.state.borrow_mut().bound = Some(a);
         Ok(())
@@ -486,6 +516,11 @@ impl Socket {
             write_closed: false,
             v6_only: state.v6_only,
             reuse: state.reuse,
+            reuse_port: false,
+            udp_bind_order: 0,
+            udp_shared: false,
+            udp_readable: None,
+            udp_group: None,
             nodelay: state.nodelay,
             abort_on_close: state.abort_on_close,
             keepalive: state.keepalive,
@@ -673,6 +708,11 @@ impl Socket {
             state.write_closed = true;
             if self.kind == 1 {
                 n.sockets.get_mut::<tcp::Socket>(state.handles[0]).close();
+            }
+        }
+        if how != 1 {
+            if let Some(source) = &state.udp_readable {
+                i.notifications.push(source.clone());
             }
         }
         drop(state);
@@ -1214,7 +1254,17 @@ impl Socket {
                 }
                 return Ok(());
             }
-            (1, 2) => state.reuse = value != 0,
+            (1, 2) => {
+                state.reuse = value != 0;
+                state.udp_shared |= value != 0 && state.udp_bind_order != 0;
+            }
+            (1, 15) if self.kind == 2 => {
+                state.reuse_port = value != 0;
+                if state.udp_bind_order != 0 {
+                    state.udp_shared |= state.reuse_port;
+                    state.udp_group = state.reuse_port.then(|| self.reuse_port_group());
+                }
+            }
             (1, 9) => state.keepalive = value != 0,
             (1, 6) => state.broadcast = value != 0,
             (0, 2) if self.family == 2 && (1..=255).contains(&value) => {
@@ -1298,6 +1348,8 @@ impl Socket {
                     let socket = n.sockets.get_mut::<udp::Socket>(*h);
                     if (level, name) == (1, 2) && value != 0 {
                         socket.allow_shared_delivery();
+                    } else if (level, name) == (1, 15) {
+                        socket.set_reuse_port_group(state.udp_group);
                     }
                     socket.set_hop_limit(Some(state.hop_limit));
                 } else {
@@ -1418,6 +1470,7 @@ impl Socket {
             }),
             (1, 30) => Ok(i32::from(state.connection == Connection::Listening)),
             (1, 2) => Ok(i32::from(state.reuse)),
+            (1, 15) if self.kind == 2 => Ok(i32::from(state.reuse_port)),
             (1, 9) => Ok(i32::from(state.keepalive)),
             (1, 6) => Ok(i32::from(state.broadcast)),
             (0, 2) if self.family == 2 => Ok(state.hop_limit as i32),

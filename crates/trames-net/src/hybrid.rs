@@ -49,6 +49,7 @@ pub(super) struct Socket {
     protocol: u32,
     native: SharedState<Option<Arc<native::Socket>>>,
     guest: SharedState<Option<Arc<virtualnet::Socket>>>,
+    uid: Cell<u32>,
     path: Cell<Path>,
     poll_revision: Cell<u64>,
     bound: Cell<Option<SocketAddr>>,
@@ -75,6 +76,7 @@ impl Socket {
             protocol,
             native: SharedState::new(Some(native)),
             guest: SharedState::new(None),
+            uid: Cell::new(0),
             path: Cell::new(Path::Idle),
             poll_revision: Cell::new(0),
             bound: Cell::new(None),
@@ -102,6 +104,20 @@ impl Socket {
             .update(|revision| revision.wrapping_add(1));
         Ok(s)
     }
+    pub fn subscribe_udp_readable(
+        &self,
+        signal: &Arc<trames_shared::IoSignal>,
+    ) -> Option<trames_shared::IoSubscription> {
+        self.guest.borrow().clone()?.subscribe_udp_readable(signal)
+    }
+
+    pub fn set_owner_uid(&self, uid: u32) {
+        let guest = self.guest.borrow();
+        self.uid.set(uid);
+        if let Some(socket) = guest.as_ref() {
+            socket.set_owner_uid(uid);
+        }
+    }
     fn guest(&self) -> Result<Arc<virtualnet::Socket>> {
         if let Some(s) = self.guest.borrow().as_ref() {
             return Ok(s.clone());
@@ -112,6 +128,7 @@ impl Socket {
             return Ok(s.clone());
         }
         let s = stack.socket(self.family, self.kind, self.protocol)?;
+        s.set_owner_uid(self.uid.get());
         for (level, name, value) in self.options.lock().unwrap().iter() {
             s.set_option_bytes(*level, *name, value)?;
         }

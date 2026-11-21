@@ -19,7 +19,7 @@ use packet::{Port, Tuple};
 use smoltcp::{
     iface::{Config, Interface, SocketHandle, SocketSet},
     socket::{icmp, raw, tcp, udp},
-    wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint},
+    wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint},
 };
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -81,6 +81,7 @@ struct Inner {
 }
 struct Node {
     udp_bind_order: u64,
+    udp_readers: BTreeMap<u64, Arc<trames_shared::Readiness>>,
     id: u8,
     owner: Weak<NamespaceData>,
     iface: Interface,
@@ -155,6 +156,11 @@ struct State {
     write_closed: bool,
     v6_only: bool,
     reuse: bool,
+    reuse_port: bool,
+    udp_bind_order: u64,
+    udp_shared: bool,
+    udp_readable: Option<Arc<trames_shared::Readiness>>,
+    udp_group: Option<u64>,
     nodelay: bool,
     abort_on_close: bool,
     keepalive: bool,
@@ -234,6 +240,28 @@ fn packet_slots(bytes: usize) -> usize {
 fn udp_socket() -> udp::Socket<'static> {
     udp_socket_with_buffers(BUFFER, BUFFER)
 }
+impl State {
+    fn bound_udp_handle(&self, local: SocketAddr, specific: bool) -> Result<udp::Socket<'static>> {
+        let mut socket = udp_socket_with_buffers(self.receive_buffer, self.send_buffer);
+        socket.set_bind_priority(self.udp_bind_order, specific);
+        if self.udp_readable.is_some() {
+            socket.observe_readable(self.udp_bind_order);
+        }
+        if self.udp_shared {
+            socket.allow_shared_delivery();
+        }
+        socket.set_reuse_port_group(self.udp_group);
+        socket.set_receive_peer(self.peer.filter(|p| p.port() != 0).map(endpoint));
+        socket.set_hop_limit(Some(self.hop_limit));
+        socket.bind(endpoint(local)).map_err(|_| NetError(22))?;
+        Ok(socket)
+    }
+}
+impl SocketMeta {
+    fn reuse_port_group(&self) -> u64 {
+        (u64::from(self.family) << 32) | u64::from(self.uid.get())
+    }
+}
 fn udp_socket_with_buffers(receive: usize, send: usize) -> udp::Socket<'static> {
     udp::Socket::new(
         udp::PacketBuffer::new(
@@ -270,6 +298,7 @@ fn make_node(id: u8, now: smoltcp::time::Instant) -> Result<Node> {
     }
     Ok(Node {
         udp_bind_order: 0,
+        udp_readers: BTreeMap::new(),
         id,
         owner: Weak::new(),
         iface,
@@ -655,6 +684,11 @@ impl Inner {
                     #[cfg(test)]
                     {
                         node.polls += 1;
+                    }
+                }
+                for token in node.iface.drain_udp_readable() {
+                    if let Some(source) = node.udp_readers.get(&token) {
+                        self.notifications.push(source.clone());
                     }
                 }
                 while let Some(p) = node.port.tx.pop_front() {
@@ -1154,12 +1188,9 @@ impl Node {
                 for _ in count..needed {
                     let ep = SocketAddr::new(*a, bound.port());
                     let handle = if socket.kind == 2 {
-                        let mut u =
-                            udp_socket_with_buffers(state.receive_buffer, state.send_buffer);
-                        u.set_hop_limit(Some(state.hop_limit));
-                        if u.bind(endpoint(ep)).is_err() {
+                        let Ok(u) = state.bound_udp_handle(ep, false) else {
                             break;
-                        }
+                        };
                         self.sockets.add(u)
                     } else {
                         let mut t = tcp_socket();
@@ -1380,6 +1411,11 @@ impl Network {
                 write_closed: false,
                 v6_only: family == 10 && matches!(kind, 3 | 4),
                 reuse: false,
+                reuse_port: false,
+                udp_bind_order: 0,
+                udp_shared: false,
+                udp_readable: None,
+                udp_group: None,
                 nodelay: false,
                 abort_on_close: false,
                 keepalive: false,
@@ -1430,6 +1466,9 @@ impl Drop for Socket {
         if let Some(n) = i.nodes.get_mut(&self.network.0.key) {
             n.dirty = true;
             let mut state = self.state.borrow_mut();
+            if state.udp_readable.is_some() {
+                n.udp_readers.remove(&state.udp_bind_order);
+            }
             let abort = state.abort_on_close;
             for h in state.handles.drain(..) {
                 if self.kind == 1 {
@@ -1774,6 +1813,70 @@ mod shared_lifetime_tests {
         drop(last);
         assert_eq!(sender.send(b"d", 0, Some(destination)), Ok(1));
         assert_eq!(first.recv(1, 0).unwrap().data, b"d");
+    }
+
+    #[test]
+    fn reuseport_enforces_guest_owner_and_keeps_each_flow_on_one_receiver() {
+        struct Reader;
+        impl trames_shared::IoWake for Reader {
+            fn wake_io(&self, _: &Arc<trames_shared::IoSignal>) {}
+        }
+        let target: Arc<dyn trames_shared::IoWake> = Arc::new(Reader);
+        let waiter = Arc::downgrade(&target);
+        for (family, target) in [(2, "10.0.0.3:41017"), (10, "[fd00::3]:41017")] {
+            let fabric = Fabric::new().unwrap();
+            let clients = fabric.environment(2, NetworkMode::Full).unwrap();
+            let servers = fabric.environment(3, NetworkMode::Full).unwrap();
+            let destination = target.parse().unwrap();
+            let mut group = Vec::new();
+            let mut readers = Vec::new();
+            for idx in 0..3 {
+                let socket = servers.socket(family, 2, 0).unwrap();
+                socket.set_owner_uid(1000);
+                socket.set_option(1, 15, 1).unwrap();
+                let signal = trames_shared::IoSignal::new(idx, waiter.clone());
+                let subscription = if idx == 0 {
+                    let sub = socket.subscribe_udp_readable(&signal).unwrap();
+                    socket.bind(destination).unwrap();
+                    sub
+                } else {
+                    socket.bind(destination).unwrap();
+                    socket.subscribe_udp_readable(&signal).unwrap()
+                };
+                group.push(socket);
+                readers.push((signal, subscription));
+            }
+            let outsider = servers.socket(family, 2, 0).unwrap();
+            outsider.set_owner_uid(1001);
+            outsider.set_option(1, 15, 1).unwrap();
+            assert_eq!(outsider.bind(destination), Err(NetError(98)));
+            let mut hits = [0; 3];
+            for _ in 0..64 {
+                let sender = clients.socket(family, 2, 0).unwrap();
+                for data in [b"a", b"b"] {
+                    sender.send(data, 0, Some(destination)).unwrap();
+                }
+                let mut owners = 0;
+                for (idx, receiver) in group.iter().enumerate() {
+                    match receiver.recv(1, 0) {
+                        Ok(packet) => {
+                            assert!(readers[idx].0.ready());
+                            readers[idx].0.reset();
+                            assert_eq!(packet.data, b"a");
+                            assert_eq!(receiver.recv(1, 0).unwrap().data, b"b");
+                            hits[idx] += 1;
+                            owners += 1;
+                        }
+                        Err(NetError(11)) => assert!(!readers[idx].0.ready()),
+                        Err(err) => panic!("{err:?}"),
+                    }
+                }
+                assert_eq!(owners, 1);
+            }
+            assert!(hits.iter().all(|n| *n > 0), "{hits:?}");
+            assert_eq!(group[0].shutdown(0), Err(NetError(107)));
+            assert!(readers[0].0.ready());
+        }
     }
 
     #[test]

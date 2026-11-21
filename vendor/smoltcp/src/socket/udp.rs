@@ -123,6 +123,9 @@ pub struct Socket<'a> {
     bind_order: u64,
     specific_bind: bool,
     reusable: bool,
+    pub(crate) reuse_port_group: Option<u64>,
+    #[cfg(feature = "alloc")]
+    readable_token: Option<u64>,
     rx_buffer: PacketBuffer<'a>,
     tx_buffer: PacketBuffer<'a>,
     /// The time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
@@ -142,6 +145,9 @@ impl<'a> Socket<'a> {
             bind_order: 0,
             specific_bind: false,
             reusable: false,
+            reuse_port_group: None,
+            #[cfg(feature = "alloc")]
+            readable_token: None,
             rx_buffer,
             tx_buffer,
             hop_limit: None,
@@ -161,6 +167,18 @@ impl<'a> Socket<'a> {
     /// Existing shared bindings remain shared when future reuse is disabled.
     pub fn allow_shared_delivery(&mut self) {
         self.reusable = true;
+    }
+
+    /// Return this logical binding's token after ingress makes its queue readable.
+    #[cfg(feature = "alloc")]
+    pub fn observe_readable(&mut self, token: u64) {
+        self.readable_token = Some(token);
+    }
+
+    /// Members with the same guest owner and address family may share a flow.
+    pub fn set_reuse_port_group(&mut self, group: Option<u64>) {
+        self.reusable |= group.is_some();
+        self.reuse_port_group = group;
     }
 
     /// A connected datagram receiver only matches packets from its peer.
@@ -574,8 +592,16 @@ impl<'a> Socket<'a> {
             meta,
         };
 
+        #[cfg(feature = "alloc")]
+        let edge = self.readable_token.filter(|_| self.rx_buffer.is_empty());
         match self.rx_buffer.enqueue(size, metadata) {
-            Ok(buf) => buf.copy_from_slice(payload),
+            Ok(buf) => {
+                buf.copy_from_slice(payload);
+                #[cfg(feature = "alloc")]
+                if let Some(token) = edge {
+                    cx.udp_readable.push(token);
+                }
+            }
             Err(_) => {
                 #[cfg(feature = "proto-ipv4")]
                 if matches!(ip_repr, IpRepr::Ipv4(_)) {
