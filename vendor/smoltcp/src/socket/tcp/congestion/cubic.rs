@@ -39,14 +39,15 @@ impl Controller for Cubic {
     }
 
     fn on_retransmit(&mut self, now: Instant) {
-        self.w_max = self.cwnd;
-        self.ssthresh = self.cwnd >> 1;
-        self.recovery_start = Some(now);
+        self.on_duplicate_ack(now);
+        self.cwnd = self.min_cwnd;
+        self.recovery_start = None;
     }
 
     fn on_duplicate_ack(&mut self, now: Instant) {
         self.w_max = self.cwnd;
-        self.ssthresh = self.cwnd >> 1;
+        self.ssthresh = ((self.cwnd as f64 * BETA_CUBIC) as usize).max(2 * self.min_cwnd);
+        self.cwnd = self.ssthresh;
         self.recovery_start = Some(now);
     }
 
@@ -57,21 +58,23 @@ impl Controller for Cubic {
     }
 
     fn on_ack(&mut self, _now: Instant, len: usize, _rtt: &crate::socket::tcp::RttEstimator) {
-        // Slow start.
-        if self.cwnd < self.ssthresh {
-            self.cwnd = self
-                .cwnd
-                .saturating_add(len)
-                .min(self.rwnd)
-                .max(self.min_cwnd);
+        // In congestion avoidance retain the ACK-clocked TCP-friendly growth
+        // floor. The cubic curve can grow the window faster on longer paths.
+        if len > 0 {
+            let growth = if self.cwnd < self.ssthresh {
+                len
+            } else {
+                self.min_cwnd.saturating_mul(len) / self.cwnd.max(1)
+            };
+            self.cwnd = self.cwnd.saturating_add(growth).min(self.rwnd).max(self.min_cwnd);
         }
     }
 
     fn pre_transmit(&mut self, now: Instant) {
-        let Some(recovery_start) = self.recovery_start else {
-            self.recovery_start = Some(now);
+        if self.cwnd < self.ssthresh {
             return;
-        };
+        }
+        let recovery_start = *self.recovery_start.get_or_insert(now);
 
         let now_millis = now.total_millis();
 
@@ -87,7 +90,9 @@ impl Controller for Cubic {
         }
 
         // K = (w_max * (1 - beta) / C)^(1/3)
-        let k3 = ((self.w_max as f64) * (1.0 - BETA_CUBIC)) / C;
+        let segment = self.min_cwnd as f64;
+        let w_max_segments = self.w_max as f64 / segment;
+        let k3 = w_max_segments * (1.0 - BETA_CUBIC) / C;
         let k = if let Some(k) = cube_root(k3) {
             k
         } else {
@@ -97,15 +102,17 @@ impl Controller for Cubic {
         // cwnd = C(T - K)^3 + w_max
         let s = t as f64 / 1000.0 - k;
         let s = s * s * s;
-        let cwnd = C * s + self.w_max as f64;
+        let cwnd = (C * s + w_max_segments) * segment;
 
         self.last_update = now;
 
-        self.cwnd = (cwnd as usize).max(self.min_cwnd).min(self.rwnd);
+        self.cwnd = (cwnd as usize).max(self.cwnd).min(self.rwnd);
     }
 
     fn set_mss(&mut self, mss: usize) {
         self.min_cwnd = mss;
+        self.cwnd = super::initial_window(mss);
+        self.w_max = self.cwnd;
     }
 }
 
@@ -242,7 +249,8 @@ mod test {
         let t3 = Instant::from_millis(199);
         let t4 = Instant::from_millis(20000);
 
-        cubic.on_retransmit(t1);
+        cubic.set_mss(1460);
+        cubic.on_duplicate_ack(t1);
 
         cubic.pre_transmit(t2);
         let cwnd2 = cubic.window();
@@ -285,7 +293,8 @@ mod test {
 
         let cwnd = cubic.window();
         cubic.on_retransmit(t3);
-        assert_eq!(cwnd >> 1, cubic.ssthresh);
+        assert_eq!((cwnd as f64 * BETA_CUBIC) as usize, cubic.ssthresh);
+        assert_eq!(cubic.window(), cubic.min_cwnd);
     }
 
     #[test]

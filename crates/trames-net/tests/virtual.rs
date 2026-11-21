@@ -296,25 +296,28 @@ fn dns_internal_a_aaaa_and_refused_connect_error_consumption() {
 }
 #[test]
 fn tcp_survives_checksum_corruption_and_loss() {
-    let f = Fabric::new().unwrap();
-    let a = net(&f, 2);
-    let b = net(&f, 3);
-    let server = socket(&a, false, true);
-    server.bind(parse("10.0.0.2:4567")).unwrap();
-    server.listen(1).unwrap();
-    let c = socket(&b, false, true);
-    connect(&c, parse("10.0.0.2:4567"));
-    let (s, _) = until(&server, || server.accept());
-    f.set_link_faults(7, 11);
-    let data: Vec<_> = (0..32000).map(|i| (i % 251) as u8).collect();
-    c.send(&data, 0, None).unwrap();
-    let mut received = Vec::new();
-    while received.len() < data.len() {
-        received.extend_from_slice(&until(&s, || s.recv(65536, 0)).data);
+    for algorithm in [b"cubic".as_slice(), b"reno"] {
+        let f = Fabric::new().unwrap();
+        let a = net(&f, 2);
+        let b = net(&f, 3);
+        let server = socket(&a, false, true);
+        server.bind(parse("10.0.0.2:4567")).unwrap();
+        server.listen(1).unwrap();
+        let c = socket(&b, false, true);
+        connect(&c, parse("10.0.0.2:4567"));
+        let (s, _) = until(&server, || server.accept());
+        c.set_option_bytes(6, 13, algorithm).unwrap();
+        f.set_link_faults(7, 11);
+        let data: Vec<_> = (0..32000).map(|i| (i % 251) as u8).collect();
+        c.send(&data, 0, None).unwrap();
+        let mut received = Vec::new();
+        while received.len() < data.len() {
+            received.extend_from_slice(&until(&s, || s.recv(65536, 0)).data);
+        }
+        assert_eq!(received, data);
+        assert!(f.stats().dropped > 0);
+        assert!(f.stats().corrupted > 0);
     }
-    assert_eq!(received, data);
-    assert!(f.stats().dropped > 0);
-    assert!(f.stats().corrupted > 0);
 }
 #[test]
 fn icmp_echo_both_families_and_dns_over_tcp() {

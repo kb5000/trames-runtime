@@ -80,6 +80,37 @@ struct Inner {
     external: Option<wire::Wire>,
     revision: u64,
 }
+struct DetachedTcp {
+    handle: SocketHandle,
+    deadline: Instant,
+    fin_wait_seconds: i32,
+    in_fin_wait2: bool,
+}
+
+impl DetachedTcp {
+    fn new(handle: SocketHandle, fin_wait_seconds: i32, now: Instant) -> Self {
+        Self {
+            handle,
+            fin_wait_seconds,
+            deadline: now + Duration::from_secs(30),
+            in_fin_wait2: false,
+        }
+    }
+
+    fn observe(&mut self, state: tcp::State, now: Instant) {
+        let fin_wait2 = state == tcp::State::FinWait2;
+        if self.in_fin_wait2 != fin_wait2 {
+            self.in_fin_wait2 = fin_wait2;
+            let seconds = if fin_wait2 {
+                self.fin_wait_seconds.max(0) as u64
+            } else {
+                30
+            };
+            self.deadline = now + Duration::from_secs(seconds);
+        }
+    }
+}
+
 struct Node {
     udp_bind_order: u64,
     udp_readers: BTreeMap<u64, Arc<trames_shared::Readiness>>,
@@ -91,7 +122,7 @@ struct Node {
     filter_rx: Port,
     gateway_rx: Port,
     registry: Vec<Weak<SocketMeta>>,
-    detached: Vec<(SocketHandle, Instant)>,
+    detached: Vec<DetachedTcp>,
     resets: Vec<(Weak<SocketMeta>, Connection)>,
     links: [LinkStats; 2],
     configuration_revision: u64,
@@ -165,6 +196,8 @@ struct State {
     udp_readable: Option<Arc<trames_shared::Readiness>>,
     udp_group: Option<u64>,
     nodelay: bool,
+    congestion: tcp::CongestionControl,
+    fin_wait_seconds: i32,
     linger: Option<Duration>,
     udp_low_water: i32,
     udp_no_check: bool,
@@ -239,7 +272,7 @@ fn tcp_socket() -> tcp::Socket<'static> {
         tcp::SocketBuffer::new(vec![0; BUFFER]),
     );
     s.set_ack_delay(Some(smoltcp::time::Duration::from_millis(10)));
-    s.set_timeout(Some(smoltcp::time::Duration::from_secs(60)));
+    s.set_handshake_timeout(smoltcp::time::Duration::from_secs(60));
     s
 }
 fn packet_slots(bytes: usize) -> usize {
@@ -249,6 +282,20 @@ fn udp_socket() -> udp::Socket<'static> {
     udp_socket_with_buffers(BUFFER, BUFFER)
 }
 impl State {
+    fn new_tcp_socket(&self) -> tcp::Socket<'static> {
+        let mut socket = tcp_socket();
+        if socket.congestion_control() != self.congestion {
+            socket.set_congestion_control(self.congestion);
+        }
+        socket.set_nagle_enabled(!self.nodelay);
+        socket.set_hop_limit(Some(self.hop_limit));
+        if self.keepalive {
+            socket.set_keep_alive(Some(smoltcp::time::Duration::from_secs(
+                self.keep_idle as u64,
+            )));
+        }
+        socket
+    }
     fn bound_udp_handle(&self, local: SocketAddr, specific: bool) -> Result<udp::Socket<'static>> {
         let mut socket = udp_socket_with_buffers(self.receive_buffer, self.send_buffer);
         self.bind_udp_handle(&mut socket, local, specific)?;
@@ -415,6 +462,16 @@ impl Fabric {
                 .map(|d| Duration::from_millis(d.total_millis()))
                 .min()
         };
+        if let Some(deadline) = inner
+            .nodes
+            .values()
+            .flat_map(|n| &n.detached)
+            .map(|e| e.deadline)
+            .min()
+        {
+            let delay = deadline.saturating_duration_since(Instant::now());
+            next = Some(next.map_or(delay, |d| d.min(delay)));
+        }
         for view in inner
             .nodes
             .values()
@@ -658,31 +715,11 @@ impl Inner {
         for node in self.nodes.values_mut() {
             node.configure_dynamic();
             node.registry.retain(|s| s.strong_count() != 0);
-            for (_, socket) in node.sockets.iter_mut() {
-                if let smoltcp::socket::Socket::Tcp(t) = socket {
-                    if matches!(t.state(), tcp::State::Established | tcp::State::CloseWait) {
-                        t.set_timeout(None);
-                    }
-                }
-            }
-            let gone: Vec<_> = node
-                .detached
-                .iter()
-                .filter(|(h, end)| {
-                    *end <= time
-                        || node.sockets.get::<tcp::Socket>(*h).state() == tcp::State::Closed
-                })
-                .map(|(h, _)| *h)
-                .collect();
-            node.detached.retain(|(h, _)| !gone.contains(h));
-            for h in gone {
-                node.sockets.remove(h);
-            }
         }
         self.receive_external();
         self.pump_ethernet();
         // Bound work per scheduler slice even when a peer produces data continuously.
-        for _ in 0..32 {
+        for round in 0..32 {
             self.pump_ethernet();
             self.gateway.service(now, &self.nodes);
             let mut packets: Vec<_> = self
@@ -691,10 +728,10 @@ impl Inner {
                 .map(|(key, index, peer, p)| (key, Some(index), peer, p))
                 .collect();
             for (&key, node) in &mut self.nodes {
-                if node.dirty
+                let poll = node.dirty
                     || !node.port.rx.is_empty()
-                    || node.next_poll.is_some_and(|d| d <= now)
-                {
+                    || node.next_poll.is_some_and(|d| d <= now);
+                if poll {
                     node.dirty = false;
                     node.iface.poll(now, &mut node.port, &mut node.sockets);
                     node.next_poll = node.iface.poll_at(now, &node.sockets);
@@ -702,6 +739,22 @@ impl Inner {
                     {
                         node.polls += 1;
                     }
+                }
+                if (round == 0 || poll) && !node.detached.is_empty() {
+                    node.detached.retain_mut(|entry| {
+                        let socket = node.sockets.get_mut::<tcp::Socket>(entry.handle);
+                        let state = socket.state();
+                        entry.observe(state, time);
+                        if state != tcp::State::Closed && entry.deadline > time {
+                            return true;
+                        }
+                        if state == tcp::State::FinWait2 {
+                            socket.abort_with_context(node.iface.context());
+                            node.iface.poll(now, &mut node.port, &mut node.sockets);
+                        }
+                        node.sockets.remove(entry.handle);
+                        false
+                    });
                 }
                 for token in node.iface.drain_udp_readable() {
                     if let Some(source) = node.udp_readers.get(&token) {
@@ -1216,8 +1269,7 @@ impl Node {
                         };
                         self.sockets.add(u)
                     } else {
-                        let mut t = tcp_socket();
-                        t.set_hop_limit(Some(state.hop_limit));
+                        let mut t = state.new_tcp_socket();
                         if t.listen(endpoint(ep)).is_err() {
                             break;
                         }
@@ -1441,6 +1493,8 @@ impl Network {
                 udp_readable: None,
                 udp_group: None,
                 nodelay: false,
+                congestion: tcp::CongestionControl::Cubic,
+                fin_wait_seconds: 60,
                 linger: None,
                 udp_low_water: 1,
                 udp_no_check: false,
@@ -1499,6 +1553,7 @@ impl Drop for Socket {
                 n.udp_readers.remove(&state.udp_bind_order);
             }
             let abort = state.linger == Some(Duration::ZERO);
+            let fin_wait_seconds = state.fin_wait_seconds;
             for h in state.handles.drain(..) {
                 if self.kind == 1 {
                     let s = n.sockets.get_mut::<tcp::Socket>(h);
@@ -1512,7 +1567,7 @@ impl Drop for Socket {
                     } else {
                         s.close();
                         n.detached
-                            .push((h, Instant::now() + Duration::from_secs(30)));
+                            .push(DetachedTcp::new(h, fin_wait_seconds, Instant::now()));
                     }
                 } else {
                     n.sockets.remove(h);
@@ -2002,6 +2057,64 @@ mod shared_lifetime_tests {
     }
 
     #[test]
+    fn accepted_transport_inherits_congestion_and_expires_only_after_last_close() {
+        for seconds in [-1, 17] {
+            let fabric = Fabric::new().unwrap();
+            let network = fabric.environment(2, NetworkMode::Full).unwrap();
+            let listener = network.socket(2, 1, 0).unwrap();
+            let address = "127.0.0.1:35012".parse().unwrap();
+            listener.set_option_bytes(6, 13, b"reno").unwrap();
+            listener.set_option(6, 8, seconds).unwrap();
+            listener.bind(address).unwrap();
+            listener.listen(1).unwrap();
+            let client = network.socket(2, 1, 0).unwrap();
+            assert_eq!(client.connect(address), Err(NetError(115)));
+            for _ in 0..100 {
+                if client.connect_complete().unwrap() {
+                    break;
+                }
+            }
+            let (peer, _) = listener.accept().unwrap();
+            let handle = peer.state.borrow().handles[0];
+            {
+                let inner = fabric.0.borrow();
+                let tcp = inner.nodes[&network.0.key]
+                    .sockets
+                    .get::<tcp::Socket>(handle);
+                assert_eq!(tcp.congestion_control(), tcp::CongestionControl::Reno);
+                assert_eq!(tcp.timeout(), None);
+            }
+            peer.set_option_bytes(6, 13, b"cubic").unwrap();
+            assert_eq!(peer.get_option(6, 8), Ok(seconds));
+            peer.shutdown(1).unwrap();
+            fabric.tick();
+            assert_eq!(peer.tcp_info().unwrap()[0], 5);
+            assert_eq!(client.send(b"still open", 0, None), Ok(10));
+            assert_eq!(peer.recv(10, 0).unwrap().data, b"still open");
+            drop(peer);
+            fabric.tick();
+            if seconds > 0 {
+                let mut inner = fabric.0.borrow_mut();
+                let node = inner.nodes.get_mut(&network.0.key).unwrap();
+                let orphan = node
+                    .detached
+                    .iter_mut()
+                    .find(|e| e.handle == handle)
+                    .unwrap();
+                assert!(orphan.in_fin_wait2);
+                assert!(
+                    orphan.deadline.saturating_duration_since(Instant::now())
+                        > Duration::from_secs(15)
+                );
+                orphan.deadline = Instant::now();
+            }
+            fabric.tick();
+            assert!(fabric.0.borrow().nodes[&network.0.key].detached.is_empty());
+            assert_ne!(client.poll(0x18).unwrap() & 0x18, 0);
+        }
+    }
+
+    #[test]
     fn closing_tcp_ports_remain_bound_until_protocol_retirement() {
         for (family, address, local) in [
             (2, "10.0.0.3:34002", "10.0.0.2:35000"),
@@ -2033,8 +2146,8 @@ mod shared_lifetime_tests {
                 let mut inner = fabric.0.borrow_mut();
                 let node = inner.nodes.get_mut(&clients.0.key).unwrap();
                 assert!(!node.detached.is_empty());
-                for (_, deadline) in &mut node.detached {
-                    *deadline = Instant::now();
+                for entry in &mut node.detached {
+                    entry.deadline = Instant::now();
                 }
             }
             fabric.tick();

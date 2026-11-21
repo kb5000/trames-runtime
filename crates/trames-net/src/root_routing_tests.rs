@@ -109,6 +109,7 @@ fn root_wildcard_accepts_native_and_guest_and_guest_can_use_bridge_service() {
     server.bind(addr("0.0.0.0", 0)).unwrap();
     server.listen(3).unwrap();
     let port = server.local_addr().unwrap().port();
+    assert_eq!(server.set_option_bytes(6, 13, b"reno"), Err(NetError(92)));
     let br = bridge(&root, b"host-bridge");
     assign(&root, br, "172.29.0.1", 24);
     let ci = pair(&root, &child, b"host-peer", br);
@@ -145,6 +146,8 @@ fn root_reaches_private_tcp_udp_without_routing_regular_sockets_through_the_stac
     assert_eq!(client.connect_complete(), Ok(true));
     let (accepted, peer) = listener.accept().unwrap();
     assert_eq!(peer.ip(), "172.30.0.1".parse::<std::net::IpAddr>().unwrap());
+    client.set_option_bytes(6, 13, b"reno").unwrap();
+    assert_eq!(&client.congestion_name().unwrap()[..5], b"reno\0");
     client.send(b"root to guest", 0, None).unwrap();
     assert_eq!(accepted.recv(64, 0).unwrap().data, b"root to guest");
     let recv = child.socket(2, 2, 0).unwrap();

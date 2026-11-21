@@ -527,6 +527,11 @@ impl Socket {
                 return Err(NetError(105));
             }
         }
+        // These controls belong to the guest TCP engine. A wildcard socket
+        // also owns a BSD listener, so reject before changing either half.
+        if self.path.get() == Path::Both && level == 6 && matches!(name, 8 | 13) {
+            return Err(NetError(92));
+        }
         if matches!(self.path.get(), Path::Guest | Path::Both) {
             self.guest()?.set_option_bytes(level, name, value)?;
         }
@@ -540,6 +545,13 @@ impl Socket {
     }
     pub fn set_option(&self, level: u32, name: u32, value: i32) -> Result<()> {
         self.set_option_bytes(level, name, &value.to_le_bytes())
+    }
+    pub fn congestion_name(&self) -> Result<[u8; 16]> {
+        if self.path.get() == Path::Guest {
+            self.guest()?.congestion_name()
+        } else {
+            Err(NetError(92))
+        }
     }
     pub fn linger(&self) -> Result<[u8; 8]> {
         if self.path.get() == Path::Guest {

@@ -32,8 +32,7 @@ impl Controller for Reno {
             // Slow start.
             len
         } else {
-            self.ssthresh = self.cwnd;
-            self.min_cwnd
+            self.min_cwnd.saturating_mul(len) / self.cwnd.max(1)
         };
 
         self.cwnd = self
@@ -44,15 +43,18 @@ impl Controller for Reno {
     }
 
     fn on_duplicate_ack(&mut self, _now: Instant) {
-        self.ssthresh = (self.cwnd >> 1).max(self.min_cwnd);
+        self.ssthresh = (self.cwnd >> 1).max(2 * self.min_cwnd);
+        self.cwnd = self.ssthresh;
     }
 
     fn on_retransmit(&mut self, _now: Instant) {
-        self.cwnd = (self.cwnd >> 1).max(self.min_cwnd);
+        self.ssthresh = (self.cwnd >> 1).max(2 * self.min_cwnd);
+        self.cwnd = self.min_cwnd;
     }
 
     fn set_mss(&mut self, mss: usize) {
         self.min_cwnd = mss;
+        self.cwnd = super::initial_window(mss);
     }
 
     fn set_remote_window(&mut self, remote_window: usize) {

@@ -161,6 +161,7 @@ struct RttEstimator {
     timestamp: Option<(Instant, TcpSeqNumber)>,
     max_seq_sent: Option<TcpSeqNumber>,
     rto_count: u8,
+    sampled: bool,
 }
 
 impl Default for RttEstimator {
@@ -171,6 +172,7 @@ impl Default for RttEstimator {
             timestamp: None,
             max_seq_sent: None,
             rto_count: 0,
+            sampled: false,
         }
     }
 }
@@ -179,14 +181,21 @@ impl RttEstimator {
     fn retransmission_timeout(&self) -> Duration {
         let margin = RTTE_MIN_MARGIN.max(self.deviation * 4);
         let ms = (self.rtt + margin).clamp(RTTE_MIN_RTO, RTTE_MAX_RTO);
-        Duration::from_millis(ms as u64)
+        Duration::from_millis((ms << self.rto_count).min(RTTE_MAX_RTO) as u64)
     }
 
     fn sample(&mut self, new_rtt: u32) {
         // "Congestion Avoidance and Control", Van Jacobson, Michael J. Karels, 1988
-        self.rtt = (self.rtt * 7 + new_rtt + 7) / 8;
-        let diff = (self.rtt as i32 - new_rtt as i32).unsigned_abs();
-        self.deviation = (self.deviation * 3 + diff + 3) / 4;
+        if self.sampled {
+            let diff = self.rtt.abs_diff(new_rtt);
+            self.deviation = (self.deviation * 3 + diff + 3) / 4;
+            self.rtt = (self.rtt * 7 + new_rtt + 7) / 8;
+        } else {
+            // RFC 6298 initializes SRTT and RTTVAR from the first sample.
+            self.rtt = new_rtt.max(1);
+            self.deviation = self.rtt.div_ceil(2);
+            self.sampled = true;
+        }
 
         self.rto_count = 0;
 
@@ -228,24 +237,7 @@ impl RttEstimator {
             tcp_trace!("rtte: abort sampling due to retransmit");
         }
         self.timestamp = None;
-        self.rto_count = self.rto_count.saturating_add(1);
-        if self.rto_count >= 3 {
-            // This happens in 2 scenarios:
-            // - The RTT is higher than the initial estimate
-            // - The network conditions change, suddenly making the RTT much higher
-            // In these cases, the estimator can get stuck, because it can't sample because
-            // all packets sent would incur a retransmit. To avoid this, force an estimate
-            // increase if we see 3 consecutive retransmissions without any successful sample.
-            self.rto_count = 0;
-            self.rtt = RTTE_MAX_RTO.min(self.rtt * 2);
-            let rto = self.retransmission_timeout().total_millis();
-            tcp_trace!(
-                "rtte: too many retransmissions, increasing: rtt={:?} dev={:?} rto={:?}",
-                self.rtt,
-                self.deviation,
-                rto
-            );
-        }
+        self.rto_count = (self.rto_count + 1).min(10);
     }
 }
 
@@ -422,6 +414,7 @@ pub struct Socket<'a> {
     tx_buffer: SocketBuffer<'a>,
     /// Interval after which, if no inbound packets are received, the connection is aborted.
     timeout: Option<Duration>,
+    handshake_timeout_only: bool,
     /// Interval at which keep-alive packets will be sent.
     keep_alive: Option<Duration>,
     /// The time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
@@ -527,6 +520,7 @@ impl<'a> Socket<'a> {
             rx_buffer,
             rx_fin_received: false,
             timeout: None,
+            handshake_timeout_only: false,
             keep_alive: None,
             hop_limit: None,
             listen_endpoint: IpListenEndpoint::default(),
@@ -602,7 +596,20 @@ impl<'a> Socket<'a> {
 
             #[cfg(feature = "socket-tcp-cubic")]
             CongestionControl::Cubic => AnyController::Cubic(cubic::Cubic::new()),
-        }
+        };
+        self.congestion_controller
+            .inner_mut()
+            .set_mss(self.remote_mss);
+        self.congestion_controller
+            .inner_mut()
+            .set_remote_window(self.remote_win_len);
+    }
+
+    // Both the readiness decision and packet construction must use the same
+    // right edge. A per-packet cap would allow an unlimited flight of segments.
+    fn send_window(&self) -> usize {
+        self.remote_win_len
+            .min(self.congestion_controller.inner().window())
     }
 
     /// Return the current congestion control algorithm.
@@ -715,7 +722,14 @@ impl<'a> Socket<'a> {
     ///   * After enabling [keep-alive](#method.set_keep_alive), the remote endpoint exceeds
     ///     the specified duration between any two packets it sends.
     pub fn set_timeout(&mut self, duration: Option<Duration>) {
+        self.handshake_timeout_only = false;
         self.timeout = duration
+    }
+
+    /// Apply the timeout to connection establishment only.
+    pub fn set_handshake_timeout(&mut self, duration: Duration) {
+        self.handshake_timeout_only = true;
+        self.timeout = Some(duration)
     }
 
     /// Set the ACK delay duration.
@@ -1354,6 +1368,10 @@ impl<'a> Socket<'a> {
             tcp_trace!("state={}=>{}", self.state, state);
         }
 
+        if self.handshake_timeout_only && matches!(state, State::Established | State::CloseWait) {
+            self.timeout = None;
+            self.handshake_timeout_only = false;
+        }
         self.state = state;
 
         #[cfg(feature = "async")]
@@ -1745,6 +1763,11 @@ impl<'a> Socket<'a> {
                     ack_all = self.remote_last_seq == ack_number
                 }
 
+                if ack_len > 0 {
+                    // Forward progress ends this loss episode even when Karn's
+                    // rule prevents taking a new RTT measurement.
+                    self.rtte.rto_count = 0;
+                }
                 self.rtte.on_ack(cx.now(), ack_number);
                 self.congestion_controller
                     .inner_mut()
@@ -2036,11 +2059,6 @@ impl<'a> Socket<'a> {
                     // Increment duplicate ACK count
                     self.local_rx_dup_acks = self.local_rx_dup_acks.saturating_add(1);
 
-                    // Inform congestion controller of duplicate ACK
-                    self.congestion_controller
-                        .inner_mut()
-                        .on_duplicate_ack(cx.now());
-
                     net_debug!(
                         "received duplicate ACK for seq {} (duplicate nr {}{})",
                         ack_number,
@@ -2053,6 +2071,9 @@ impl<'a> Socket<'a> {
                     );
 
                     if self.local_rx_dup_acks == 3 {
+                        self.congestion_controller
+                            .inner_mut()
+                            .on_duplicate_ack(cx.now());
                         self.timer.set_for_fast_retransmit();
                         net_debug!("started fast retransmit");
                     }
@@ -2201,7 +2222,7 @@ impl<'a> Socket<'a> {
 
         // max sequence number we can send.
         let max_send_seq =
-            self.local_seq_no + core::cmp::min(self.remote_win_len, self.tx_buffer.len());
+            self.local_seq_no + core::cmp::min(self.send_window(), self.tx_buffer.len());
 
         // Max amount of octets we can send.
         let max_send = if max_send_seq >= self.remote_last_seq {
@@ -2209,9 +2230,6 @@ impl<'a> Socket<'a> {
         } else {
             0
         };
-
-        // Compare max_send with the congestion window.
-        let max_send = max_send.min(self.congestion_controller.inner().window());
 
         // Can we send at least 1 octet?
         let mut can_send = max_send != 0;
@@ -2345,15 +2363,18 @@ impl<'a> Socket<'a> {
                 // now for whatever reason (like zero window), this avoids an
                 // infinite polling loop where `poll_at` returns `Now` but `dispatch`
                 // can't actually do anything.
+                let fast = matches!(self.timer, Timer::FastRetransmit);
                 self.timer.set_for_idle(cx.now(), self.keep_alive);
-
-                // Inform RTTE, so that it can avoid bogus measurements.
-                self.rtte.on_retransmit();
-
-                // Inform the congestion controller that we're retransmitting.
-                self.congestion_controller
-                    .inner_mut()
-                    .on_retransmit(cx.now());
+                if fast {
+                    // Ambiguous RTT sample, but no timer elapsed and the
+                    // controller has already responded to the third duplicate ACK.
+                    self.rtte.timestamp = None;
+                } else {
+                    self.rtte.on_retransmit();
+                    self.congestion_controller
+                        .inner_mut()
+                        .on_retransmit(cx.now());
+                }
             }
         }
 
@@ -2453,7 +2474,7 @@ impl<'a> Socket<'a> {
                 // from the transmit buffer.
 
                 // Right edge of window, ie the max sequence number we're allowed to send.
-                let win_right_edge = self.local_seq_no + self.remote_win_len;
+                let win_right_edge = self.local_seq_no + self.send_window();
 
                 // Max amount of octets we're allowed to send according to the remote window.
                 let win_limit = if win_right_edge >= self.remote_last_seq {
@@ -2590,9 +2611,9 @@ impl<'a> Socket<'a> {
                 .post_transmit(cx.now(), repr.segment_len());
         }
 
-        if !self.seq_to_transmit(cx) && repr.segment_len() > 0 {
-            // If we've transmitted all data we could (and there was something at all,
-            // data or flag, to transmit, not just an ACK), wind up the retransmit timer.
+        if repr.segment_len() > 0 {
+            // Arm at the first unacknowledged byte. The congestion window can
+            // shrink between dispatches and prevent sending the rest of a burst.
             self.timer
                 .set_for_retransmit(cx.now(), self.rtte.retransmission_timeout());
         }
@@ -5737,7 +5758,15 @@ mod test {
             ..RECV_TEMPL
         }), exact);
 
-        recv_nothing!(s, time 1550);
+        // A 5ms first sample gives a 17ms RTO and a 34ms first backoff.
+        recv_nothing!(s, time 1533);
+        recv!(s, time 1534, Ok(TcpRepr {
+            control:    TcpControl::Psh,
+            seq_number: LOCAL_SEQ + 1 + 6,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"012345"[..],
+            ..RECV_TEMPL
+        }), exact);
     }
 
     #[test]
@@ -5777,7 +5806,15 @@ mod test {
             ..RECV_TEMPL
         }), exact);
 
-        recv_nothing!(s, time 1550);
+        // A 5ms first sample gives a 17ms RTO and a 34ms first backoff.
+        recv_nothing!(s, time 1533);
+        recv!(s, time 1534, Ok(TcpRepr {
+            control:    TcpControl::Fin,
+            seq_number: LOCAL_SEQ + 1 + 6,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"012345"[..],
+            ..RECV_TEMPL
+        }), exact);
     }
 
     #[test]
@@ -7866,14 +7903,41 @@ mod test {
     fn test_rtt_estimator() {
         let mut r = RttEstimator::default();
 
-        let rtos = &[
-            751, 766, 755, 731, 697, 656, 613, 567, 523, 484, 445, 411, 378, 350, 322, 299, 280,
-            261, 243, 229, 215, 206, 197, 188,
-        ];
+        let rtos = &[300, 252, 216, 188, 168, 152, 140, 132, 124, 120, 116, 112];
 
         for &rto in rtos {
             r.sample(100);
             assert_eq!(r.retransmission_timeout(), Duration::from_millis(rto));
+        }
+    }
+
+    #[cfg(all(feature = "socket-tcp-reno", feature = "socket-tcp-cubic"))]
+    #[test]
+    fn congestion_window_caps_the_entire_flight_until_ack() {
+        for algorithm in [CongestionControl::Reno, CongestionControl::Cubic] {
+            let mut s = socket_established();
+            s.remote_mss = 2;
+            s.remote_win_len = 64;
+            s.set_congestion_control(algorithm);
+            s.set_nagle_enabled(false);
+            s.send_slice(&[0; 23]).unwrap();
+            for _ in 0..10 {
+                recv(&mut s, Instant::from_millis(0), |p| {
+                    assert_eq!(p.unwrap().payload.len(), 2);
+                });
+            }
+            recv_nothing!(s, time 0);
+            send!(s, time 1, TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 3),
+                window_len: 64,
+                ..SEND_TEMPL
+            });
+            for size in [2, 1] {
+                recv(&mut s, Instant::from_millis(1), |p| {
+                    assert_eq!(p.unwrap().payload.len(), size);
+                });
+            }
         }
     }
 

@@ -36,3 +36,16 @@ TCP_INFO: the original RTO/RTT estimates, negotiated peer MSS, congestion window
 and available receive-buffer space. It does not copy the TCP control block,
 advance protocol work or introduce a lock. Unimplemented Linux counters remain
 zero; the existing transport state supplies tcpi_state.
+
+Guest TCP sockets can select CUBIC or Reno, including after the handshake.
+Both readiness and packet construction limit total data in flight by the
+smaller of the congestion and advertised windows. The initial flight uses
+the negotiated MSS. CUBIC tracks its growth curve in segments and resumes
+ACK-driven slow start after a timeout. The transport arms retransmission on
+the first outstanding segment and tracks timeout backoff separately from
+measured RTT. The guest connection-establishment deadline clears when the
+handshake completes, including a transition directly to CLOSE-WAIT.
+
+The TCP unit tests cover the full-flight bound, reopening the window on ACK,
+and retransmission before and after the backed-off deadline. The trames-net
+integration tests exercise both controllers under packet loss and corruption.

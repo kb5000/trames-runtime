@@ -311,8 +311,8 @@ impl Socket {
         // Closing TCP endpoints still own their local port after guest FD
         // retirement. Reusing it here can deliver a new SYN to old TIME_WAIT
         // state. The original protocol deadline, not FD lifetime, releases it.
-        n.detached.iter().all(|(handle, _)| {
-            let socket = n.sockets.get::<tcp::Socket>(*handle);
+        n.detached.iter().all(|entry| {
+            let socket = n.sockets.get::<tcp::Socket>(entry.handle);
             socket.state() == tcp::State::Closed
                 || socket.local_endpoint().is_none_or(|endpoint| {
                     let b = address(endpoint);
@@ -482,8 +482,7 @@ impl Socket {
         let mut state = self.state.borrow_mut();
         for a in addresses {
             for _ in 0..backlog {
-                let mut s = tcp_socket();
-                s.set_hop_limit(Some(state.hop_limit));
+                let mut s = state.new_tcp_socket();
                 s.listen(endpoint(a)).map_err(|_| NetError(22))?;
                 state.handles.push(n.sockets.add(s));
             }
@@ -518,8 +517,7 @@ impl Socket {
         let s = n.sockets.get::<tcp::Socket>(handle);
         let local = address(s.local_endpoint().unwrap());
         let peer = address(s.remote_endpoint().unwrap());
-        let mut replacement = tcp_socket();
-        replacement.set_hop_limit(Some(state.hop_limit));
+        let mut replacement = state.new_tcp_socket();
         replacement
             .listen(endpoint(local))
             .map_err(|_| NetError(22))?;
@@ -542,6 +540,8 @@ impl Socket {
             udp_readable: None,
             udp_group: None,
             nodelay: state.nodelay,
+            congestion: state.congestion,
+            fin_wait_seconds: state.fin_wait_seconds,
             linger: state.linger,
             udp_low_water: 1,
             udp_no_check: false,
@@ -710,17 +710,10 @@ impl Socket {
         }
         let mut i = self.network.0.fabric.0.borrow_mut();
         let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
-        let mut s = tcp_socket();
+        let mut state = self.state.borrow_mut();
+        let mut s = state.new_tcp_socket();
         s.connect(n.iface.context(), endpoint(a), endpoint(bound))
             .map_err(|_| NetError(22))?;
-        let mut state = self.state.borrow_mut();
-        s.set_hop_limit(Some(state.hop_limit));
-        s.set_nagle_enabled(!state.nodelay);
-        if state.keepalive {
-            s.set_keep_alive(Some(smoltcp::time::Duration::from_secs(
-                state.keep_idle as u64,
-            )));
-        }
         state.handles.push(n.sockets.add(s));
         state.bound = Some(bound);
         state.peer = Some(a);
@@ -1427,6 +1420,11 @@ impl Socket {
                     }
                 }
             }
+            (0, 33 | 34) if self.kind == 1 => return Err(NetError(22)),
+            (6, 8) if self.kind == 1 => {
+                state.fin_wait_seconds = if value == 0 { 60 } else { value.clamp(-1, 120) };
+                return Ok(());
+            }
             (6, 1) if self.kind == 1 => state.nodelay = value != 0,
             (6, 4..=6) if self.kind == 1 => {
                 if !(1..=if name == 6 { 127 } else { 32767 }).contains(&value) {
@@ -1595,6 +1593,7 @@ impl Socket {
                 17
             }),
             (1, 30) => Ok(i32::from(state.connection == Connection::Listening)),
+            (0, 33 | 34) if self.kind == 1 => Ok(state.multicast_value(name)),
             (0, 32 | 33 | 34 | 49) if self.kind == 2 => Ok(state.multicast_value(name)),
             (1, 2) => Ok(i32::from(state.reuse)),
             (1, 15) if self.kind == 2 => Ok(i32::from(state.reuse_port)),
@@ -1618,6 +1617,7 @@ impl Socket {
             } else {
                 BUFFER
             } as i32),
+            (6, 8) if self.kind == 1 => Ok(state.fin_wait_seconds),
             (6, 1) if self.kind == 1 => Ok(i32::from(state.nodelay)),
             (6, 4) if self.kind == 1 => Ok(state.keep_idle as i32),
             (6, 5) if self.kind == 1 => Ok(state.keep_interval as i32),
@@ -1635,10 +1635,47 @@ impl Socket {
         }
         self.state.borrow().last_packet_ns.ok_or(NetError(2))
     }
+    pub(crate) fn congestion_name(&self) -> Result<[u8; 16]> {
+        if self.kind != 1 {
+            return Err(NetError(95));
+        }
+        let name: &[u8] = match self.state.borrow().congestion {
+            tcp::CongestionControl::Cubic => b"cubic",
+            tcp::CongestionControl::Reno => b"reno",
+            tcp::CongestionControl::None => b"none",
+        };
+        let mut out = [0; 16];
+        out[..name.len()].copy_from_slice(name);
+        Ok(out)
+    }
     pub fn linger(&self) -> Result<[u8; 8]> {
         Ok(crate::linger_bytes(self.state.borrow().linger))
     }
     pub fn set_option_bytes(&self, level: u32, name: u32, value: &[u8]) -> Result<()> {
+        if (level, name) == (6, 13) && self.kind == 1 {
+            let name = value.split(|b| *b == 0).next().unwrap_or_default();
+            let selected = match name {
+                b"reno" => tcp::CongestionControl::Reno,
+                b"cubic" => tcp::CongestionControl::Cubic,
+                _ => return Err(NetError(2)),
+            };
+            let mut fabric = self.network.0.fabric.0.borrow_mut();
+            let mut state = self.state.borrow_mut();
+            if state.congestion != selected {
+                let node = fabric
+                    .nodes
+                    .get_mut(&self.network.0.key)
+                    .ok_or(NetError(100))?;
+                for &h in &state.handles {
+                    node.sockets
+                        .get_mut::<tcp::Socket>(h)
+                        .set_congestion_control(selected);
+                }
+                state.congestion = selected;
+                node.dirty = true;
+            }
+            return Ok(());
+        }
         if level == 0 && self.kind == 2 && matches!(name, 32 | 35 | 36) {
             return self.membership(name, value);
         }

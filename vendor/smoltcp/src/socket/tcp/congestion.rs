@@ -10,6 +10,12 @@ pub(super) mod cubic;
 #[cfg(feature = "socket-tcp-reno")]
 pub(super) mod reno;
 
+#[cfg(any(feature = "socket-tcp-reno", feature = "socket-tcp-cubic"))]
+fn initial_window(mss: usize) -> usize {
+    // RFC 6928 initial window, in bytes.
+    (10 * mss).min((2 * mss).max(14600))
+}
+
 #[allow(unused_variables)]
 pub(super) trait Controller {
     /// Returns the number of bytes that can be sent.

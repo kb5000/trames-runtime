@@ -129,6 +129,9 @@ pub(super) fn control(
             if (a[1], a[2]) == (6, 11) {
                 return read_option(memory, a, || socket.tcp_info().map_err(net));
             }
+            if (a[1], a[2]) == (6, 13) {
+                return read_option(memory, a, || socket.congestion_name().map_err(net));
+            }
             if a[1] == 1 && matches!(a[2], 20 | 21 | 66 | 67) {
                 return read_option(memory, a, || {
                     let timeout = socket
@@ -382,6 +385,19 @@ fn write_option(
     a: [u64; 6],
     write: impl FnOnce(&[u8]) -> Result<()>,
 ) -> Result<u64> {
+    if (a[1], a[2]) == (6, 13) {
+        let len = a[4] as u32 as i32;
+        if len <= 0 {
+            return Err(Errno(22));
+        }
+        let mut name = [0; 16];
+        let count = (len as usize).min(name.len());
+        memory
+            .read(a[3], &mut name[..count])
+            .map_err(|_| Errno(14))?;
+        write(&name[..count])?;
+        return Ok(0);
+    }
     if ipv4_header_option(a) {
         let size = a[4] as u32 as i32;
         let value = match size {

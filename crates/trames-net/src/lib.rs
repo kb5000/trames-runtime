@@ -836,6 +836,14 @@ impl Socket {
             _ => Err(NetError(92)),
         }
     }
+    pub fn congestion_name(&self) -> Result<[u8; 16]> {
+        let _operation = self.operation.read_recursive();
+        match &self.backend {
+            SocketBackend::Hybrid(s) => s.congestion_name(),
+            SocketBackend::Virtual(s) => s.congestion_name(),
+            _ => Err(NetError(92)),
+        }
+    }
     pub fn tcp_info(&self) -> Result<[u8; 104]> {
         let _operation = self.operation.read_recursive();
         match &self.backend {

@@ -555,7 +555,6 @@ impl Gateway {
             ) {
                 continue;
             }
-            t.set_timeout(None);
             if t.state() == tcp::State::Closed {
                 gone.push(index);
                 continue;
