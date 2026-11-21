@@ -579,3 +579,26 @@ fn raw_udp_shares_unicast_and_multicast_packets_with_datagram_receivers() {
     assert_eq!(raw.ancillary_hop(), Some((0, 2, 41)));
     assert_eq!(udp.recv(32, MSG_DONTWAIT).err(), Some(NetError(11)));
 }
+
+#[test]
+fn raw_transport_fanout_is_scoped_to_family_and_protocol() {
+    let network = Network::managed_uplink(NetworkMode::Full).unwrap();
+    let sockets = [(2, 6), (2, 17), (10, 6), (10, 17)]
+        .map(|(family, protocol)| network.socket(family, 3, protocol).unwrap());
+    for (sender, socket) in sockets.iter().enumerate() {
+        let destination = if sender < 2 { "127.0.0.1:0" } else { "[::1]:0" };
+        let destination = destination.parse().unwrap();
+        socket.send(b"abc", 0, Some(destination)).unwrap();
+        for (receiver, peer) in sockets.iter().enumerate() {
+            let packet = peer.recv(32, MSG_DONTWAIT);
+            if sender == receiver {
+                assert_eq!(
+                    &packet.unwrap().data[if sender < 2 { 20 } else { 0 }..],
+                    b"abc"
+                );
+            } else {
+                assert_eq!(packet.err(), Some(NetError(11)));
+            }
+        }
+    }
+}

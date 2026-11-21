@@ -21,6 +21,13 @@ pub(super) fn raw_ipv4(
     packet.extend_from_slice(payload);
     packet
 }
+pub(super) fn raw_v6_checksum(src: Ipv6Addr, dst: Ipv6Addr, protocol: u8, payload: &[u8]) -> u16 {
+    use smoltcp::wire::checksum;
+    !checksum::combine(&[
+        checksum::pseudo_header_v6(&src, &dst, protocol.into(), payload.len() as u32),
+        checksum::data(payload),
+    ])
+}
 pub(super) const MTU: usize = 1500;
 const QUEUE: usize = 96;
 // Bound retained fragment memory, rather than letting a few lost datagrams
@@ -50,6 +57,14 @@ impl Fragments {
     }
 }
 impl Port {
+    /// Queue an already formed IP datagram on the same egress path as the interface.
+    pub(super) fn send_raw(&mut self, packet: Vec<u8>) -> Result<()> {
+        if self.tx.len() >= QUEUE {
+            return Err(NetError(11));
+        }
+        self.tx.push_back(packet);
+        Ok(())
+    }
     pub fn receive_packet(&mut self, p: Vec<u8>) -> bool {
         self.receive_on(p, 0)
     }

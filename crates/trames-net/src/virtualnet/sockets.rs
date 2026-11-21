@@ -237,6 +237,18 @@ impl Socket {
         }
         self.destination_ip(a.ip())
     }
+    fn path_mtu(&self, destination: IpAddr) -> Result<u32> {
+        Ok(if let Some(view) = self.network.0.routing.get() {
+            let graph = view.graph.read().unwrap();
+            let (_, index, _) =
+                graph.source_for(view.namespace, destination, self.route_context())?;
+            graph.device(view.namespace, index)?.mtu
+        } else if destination.is_loopback() {
+            65536
+        } else {
+            self.network.0.info.mtu
+        })
+    }
     fn destination_ip(&self, v: IpAddr) -> Result<()> {
         if self.network.0.routing.get().is_none()
             && self.network.is_isolated()
@@ -423,7 +435,7 @@ impl Socket {
     pub(super) fn open_raw(&self) -> Result<()> {
         let mut i = self.network.0.fabric.0.borrow_mut();
         let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
-        let socket = raw::Socket::new(
+        let mut socket = raw::Socket::new(
             if self.family == 2 {
                 smoltcp::wire::IpVersion::Ipv4
             } else {
@@ -433,6 +445,7 @@ impl Socket {
             raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 16], vec![0; BUFFER]),
             raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 16], vec![0; BUFFER]),
         );
+        socket.set_linux_receive(self.raw_transport());
         self.state.borrow_mut().handles = vec![n.sockets.add(socket)];
         Ok(())
     }
@@ -662,6 +675,8 @@ impl Socket {
             broadcast: state.broadcast,
             multicast: None,
             icmp6_filter: state.icmp6_filter,
+            raw_ingress: 0,
+            raw_checksum: state.raw_checksum,
             hop_message: state.hop_message,
             device: state.device,
             raw_identifiers: std::collections::BTreeSet::new(),
@@ -769,7 +784,9 @@ impl Socket {
         if self.kind != 1 {
             let mut fabric = self.network.0.fabric.0.borrow_mut();
             let mut s = self.state.borrow_mut();
-            if self.kind == 2 && s.requested_bind.is_none_or(|b| b.ip().is_unspecified()) {
+            if (self.kind == 2 || self.raw_transport())
+                && s.requested_bind.is_none_or(|b| b.ip().is_unspecified())
+            {
                 let source = if let Some(source) = group_source {
                     source
                 } else if let Some(view) = self.network.0.routing.get() {
@@ -874,18 +891,22 @@ impl Socket {
     }
     pub fn local_addr(&self) -> Result<SocketAddr> {
         let state = self.state.borrow();
-        Ok(self.presented(
+        let mut addr = self.presented(
             state
                 .bound
                 .or(state.requested_bind)
                 .unwrap_or_else(|| self.wildcard()),
-        ))
+        );
+        if self.raw_transport() {
+            addr.set_port(u16::from(self.protocol));
+        }
+        Ok(addr)
     }
     pub fn peer_addr(&self) -> Result<SocketAddr> {
         self.state
             .borrow()
             .peer
-            .filter(|a| self.kind != 2 || a.port() != 0)
+            .filter(|a| !self.raw_transport() && (self.kind != 2 || a.port() != 0))
             .map(|a| self.presented(a))
             .ok_or(NetError(107))
     }
@@ -940,6 +961,9 @@ impl Socket {
             }
         }
         let connected = state.connection == Connection::Connected;
+        if self.raw_transport() && connected {
+            return Ok(());
+        }
         if !connected && self.kind != 2 {
             return Err(NetError(107));
         }
@@ -995,7 +1019,7 @@ impl Socket {
                 self.destination(peer)?;
             }
         }
-        if control != Default::default() && self.kind != 2 && !self.raw_udp() {
+        if control != Default::default() && self.kind != 2 && !self.raw_transport() {
             return Err(NetError(95));
         }
         if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL) != 0 {
@@ -1036,16 +1060,7 @@ impl Socket {
             self.destination(a)?;
             if bytes.len() > if a.is_ipv4() { 65507 } else { 65527 } {
                 if a.is_ipv6() {
-                    let mtu = if let Some(view) = self.network.0.routing.get() {
-                        let graph = view.graph.read().unwrap();
-                        let (_, index, _) =
-                            graph.source_for(view.namespace, a.ip(), self.route_context())?;
-                        graph.device(view.namespace, index)?.mtu
-                    } else if a.ip().is_loopback() {
-                        65536
-                    } else {
-                        self.network.0.info.mtu
-                    };
+                    let mtu = self.path_mtu(a.ip())?;
                     let mut fabric = self.network.0.fabric.0.borrow_mut();
                     let state = self.state.borrow();
                     if state.udp_errors.as_ref().unwrap().too_big(a, mtu) {
@@ -1700,7 +1715,38 @@ impl Socket {
                 state.receive_hops = value != 0;
                 state.hop_message = if name == 8 { 8 } else { 52 };
             }
-            (255, 7) if self.family == 10 && self.kind == 4 && value == 2 => {}
+            (0, 1 | 8 | 13) | (41, 49 | 66 | 67)
+                if self.raw_transport() && (level == 41) == (self.family == 10) =>
+            {
+                let options = &mut state.udp_options[usize::from(level == 41)];
+                match name {
+                    1 => options.fields.traffic_class = Some(value as u8),
+                    67 if (-1..=255).contains(&value) => {
+                        options.fields.traffic_class = u8::try_from(value).ok()
+                    }
+                    67 => return Err(NetError(22)),
+                    8 | 49 => options.receive_info = value != 0,
+                    _ => options.receive_class = value != 0,
+                }
+            }
+            (41 | 255, 7) if self.family == 10 && self.kind == 4 => {
+                if level == 41 && self.protocol == 58 || value >= 0 && value % 2 != 0 {
+                    return Err(NetError(22));
+                }
+                state.raw_checksum = value.max(-1);
+            }
+            (1, 7 | 8) if self.raw_transport() => {
+                let bytes = crate::socket_buffer_size(name, value);
+                let receive = name == 8;
+                if receive {
+                    state.receive_buffer = bytes;
+                } else {
+                    state.send_buffer = bytes;
+                }
+                let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
+                let socket = n.sockets.get_mut::<raw::Socket>(state.handles[0]);
+                socket.resize_owned_buffer(receive, packet_slots(bytes), bytes);
+            }
             (1, 32 | 33) if !matches!(self.kind, 1 | 2) => return Err(NetError(92)),
             (1, 7 | 8 | 32 | 33) => {
                 if !matches!(self.kind, 1 | 2) && (value <= 0 || value as usize > MAX_BUFFER) {
@@ -2038,7 +2084,18 @@ impl Socket {
             (0, 2) if self.family == 2 => Ok(state.hop_limit as i32),
             (41, 16) if self.family == 10 => Ok(state.hop_limit as i32),
             (0, 12) | (41, 51 | 8) => Ok(i32::from(state.receive_hops)),
-            (1, 7 | 8) => Ok(if matches!(self.kind, 1 | 2) {
+            (0, 1 | 8 | 13) | (41, 49 | 66 | 67)
+                if self.raw_transport() && (level == 41) == (self.family == 10) =>
+            {
+                let options = state.udp_options[usize::from(level == 41)];
+                Ok(match name {
+                    1 | 67 => options.fields.traffic_class.unwrap_or(0).into(),
+                    8 | 49 => i32::from(options.receive_info),
+                    _ => i32::from(options.receive_class),
+                })
+            }
+            (41 | 255, 7) if self.family == 10 && self.kind == 4 => Ok(state.raw_checksum),
+            (1, 7 | 8) => Ok(if matches!(self.kind, 1 | 2) || self.raw_transport() {
                 if name == 8 {
                     state.receive_buffer
                 } else {
@@ -2207,6 +2264,11 @@ impl Socket {
         Ok(value)
     }
     pub fn set_option_bytes(&self, level: u32, name: u32, value: &[u8]) -> Result<()> {
+        // SOL_SOCKET/SO_DETACH_FILTER has no argument. These raw sockets do not
+        // support attaching a classic filter, so there is no filter to remove.
+        if (level, name) == (1, 27) && self.raw_transport() {
+            return Err(NetError(2));
+        }
         if (level, name) == (6, 13) && self.kind == 1 {
             let name = value.split(|b| *b == 0).next().unwrap_or_default();
             let selected = match name {
@@ -2243,7 +2305,7 @@ impl Socket {
             }
             return Ok(());
         }
-        if (level, name) == (58, 1) && self.family == 10 && self.kind == 4 {
+        if (level, name) == (58, 1) && self.protocol == 58 && self.kind == 4 {
             if value.len() != 32 {
                 return Err(NetError(22));
             }
@@ -2281,6 +2343,9 @@ impl Socket {
         destination: Option<SocketAddr>,
         control: crate::DatagramControl,
     ) -> Result<usize> {
+        if self.family == 10 && destination.is_some_and(|a| a.is_ipv4()) {
+            return Err(NetError(22));
+        }
         let a = destination
             .map(|a| self.normalize(a))
             .transpose()?
@@ -2289,22 +2354,32 @@ impl Socket {
         if self.raw_udp() && self.udp_group(a.ip()) {
             return self.send_group(a, bytes, control);
         }
-        if control.packet_info.is_some() || control.fields[1] != Default::default() {
+        let ipv6 = self.family == 10;
+        if control.packet_info.is_some() || control.fields[usize::from(!ipv6)] != Default::default()
+        {
             return Err(NetError(95));
         }
         self.destination(a)?;
-        let maximum = if self.raw_udp() {
-            packet::MTU - 20
+        let maximum = if self.raw_transport() {
+            let mtu = self.path_mtu(a.ip())? as usize;
+            if ipv6 {
+                mtu.saturating_sub(40).min(65535)
+            } else {
+                mtu.min(65535).saturating_sub(20)
+            }
         } else {
             1400
         };
-        if bytes.len() < 8 || bytes.len() > maximum {
+        if !self.raw_transport() && bytes.len() < 8 || bytes.len() > maximum {
             return Err(NetError(90));
         }
         if self.state.borrow().bound.is_none() {
             self.ensure_bound()?;
         }
-        if !self.raw_udp() && bytes[0] == if self.family == 2 { 8 } else { 128 } && bytes[1] == 0 {
+        if !self.raw_transport()
+            && bytes[0] == if self.family == 2 { 8 } else { 128 }
+            && bytes[1] == 0
+        {
             let mut state = self.state.borrow_mut();
             let identifier = u16::from_be_bytes([bytes[4], bytes[5]]);
             if state.raw_identifiers.len() >= 32 && !state.raw_identifiers.contains(&identifier) {
@@ -2339,7 +2414,12 @@ impl Socket {
         } else {
             self.network.0.info.ipv6.into()
         };
-        let mut data = if self.family == 2 {
+        let fields = control.fields[usize::from(ipv6)];
+        let class = fields
+            .traffic_class
+            .or(state.udp_options[usize::from(ipv6)].fields.traffic_class)
+            .unwrap_or(0);
+        let data = if self.family == 2 {
             let (IpAddr::V4(source), IpAddr::V4(destination)) = (source, a.ip()) else {
                 return Err(NetError(97));
             };
@@ -2347,10 +2427,10 @@ impl Socket {
                 source,
                 destination,
                 self.protocol,
-                control.fields[0].hop_limit.unwrap_or(state.hop_limit),
+                fields.hop_limit.unwrap_or(state.hop_limit),
                 bytes,
             );
-            header[1] = control.fields[0].traffic_class.unwrap_or(0);
+            header[1] = class;
             smoltcp::wire::Ipv4Packet::new_unchecked(&mut header).fill_checksum();
             header
         } else {
@@ -2358,26 +2438,42 @@ impl Socket {
                 return Err(NetError(97));
             };
             let mut header = vec![0; 40];
-            header[0] = 0x60;
+            header[0] = 0x60 | (class >> 4);
+            header[1] = class << 4;
             header[4..6].copy_from_slice(&(bytes.len() as u16).to_be_bytes());
-            header[6] = 58;
-            header[7] = state.hop_limit;
+            header[6] = self.protocol;
+            header[7] = fields.hop_limit.unwrap_or(state.hop_limit);
             header[8..24].copy_from_slice(&source.octets());
             header[24..40].copy_from_slice(&destination.octets());
             header.extend_from_slice(bytes);
-            smoltcp::wire::Icmpv6Packet::new_unchecked(&mut header[40..])
-                .fill_checksum(&source, &destination);
+            if let Ok(offset) = usize::try_from(state.raw_checksum) {
+                let payload = &mut header[40..];
+                payload
+                    .get_mut(offset..offset + 2)
+                    .ok_or(NetError(22))?
+                    .fill(0);
+                let sum = packet::raw_v6_checksum(source, destination, self.protocol, payload);
+                let sum = if sum == 0 && self.protocol == 17 {
+                    u16::MAX
+                } else {
+                    sum
+                };
+                payload[offset..offset + 2].copy_from_slice(&sum.to_be_bytes());
+            }
             header
         };
         let n = fabric
             .nodes
             .get_mut(&self.network.0.key)
             .ok_or(NetError(100))?;
-        n.sockets
-            .get_mut::<raw::Socket>(state.handles[0])
-            .send_slice(&data)
-            .map_err(|_| NetError(11))?;
-        data.clear();
+        if self.raw_transport() {
+            n.port.send_raw(data)?;
+        } else {
+            n.sockets
+                .get_mut::<raw::Socket>(state.handles[0])
+                .send_slice(&data)
+                .map_err(|_| NetError(11))?;
+        }
         drop(fabric);
         drop(state);
         self.fabric().tick();
@@ -2388,7 +2484,7 @@ impl Socket {
         }
     }
     fn recv_raw(&self, count: usize, flags: u32) -> Result<Received> {
-        if !self.raw_udp() && self.state.borrow().bound.is_none() {
+        if !self.raw_transport() && self.state.borrow().bound.is_none() {
             self.ensure_bound()?;
         }
         let mut fabric = self.network.0.fabric.0.borrow_mut();
@@ -2416,10 +2512,10 @@ impl Socket {
                 .get_mut(&self.network.0.key)
                 .ok_or(NetError(100))?;
             for _ in 0..16 {
-                let data = n
+                let (ingress, data) = n
                     .sockets
                     .get_mut::<raw::Socket>(state.handles[0])
-                    .recv()
+                    .recv_with_interface()
                     .map_err(|_| NetError(11))?;
                 let Some(header) = packet::header(data) else {
                     continue;
@@ -2432,13 +2528,35 @@ impl Socket {
                 {
                     continue;
                 }
-                if state
-                    .device
-                    .is_some_and(|i| (i == 1) != header.tuple.destination.ip().is_loopback())
-                {
+                let ingress = if ingress == 0 {
+                    if header.tuple.destination.ip().is_loopback() {
+                        1
+                    } else {
+                        2
+                    }
+                } else {
+                    ingress
+                };
+                if state.device.is_some_and(|index| index != ingress) {
                     continue;
                 }
-                if self.family == 10 {
+                if self.raw_transport() && state.raw_checksum >= 0 {
+                    if let (IpAddr::V6(src), IpAddr::V6(dst)) =
+                        (peer, header.tuple.destination.ip())
+                    {
+                        if data.len() - header.offset < state.raw_checksum as usize + 2
+                            || packet::raw_v6_checksum(
+                                src,
+                                dst,
+                                self.protocol,
+                                &data[header.offset..],
+                            ) != 0
+                        {
+                            continue;
+                        }
+                    }
+                }
+                if self.protocol == 58 {
                     let Some(&kind) = data.get(header.offset) else {
                         continue;
                     };
@@ -2447,26 +2565,45 @@ impl Socket {
                     }
                 }
                 state.last_hop = Some(if self.family == 2 { data[8] } else { data[7] });
-                state.icmp_pending = Some((
-                    if self.family == 2 {
-                        data.to_vec()
-                    } else {
-                        data[header.offset..].to_vec()
-                    },
-                    peer,
-                ));
+                state.raw_ingress = ingress;
+                state.icmp_pending = Some((data.to_vec(), peer));
                 break;
             }
         }
-        let (data, peer) = state.icmp_pending.as_ref().ok_or(NetError(11))?;
+        let (packet, peer) = state.icmp_pending.as_ref().ok_or(NetError(11))?;
+        let header = packet::header(packet).ok_or(NetError(22))?;
+        let ipv6 = self.family == 10;
+        let data = if ipv6 {
+            &packet[header.offset..]
+        } else {
+            packet.as_slice()
+        };
         let length = data.len();
+        let options = state.udp_options[usize::from(ipv6)];
+        let destination = header.tuple.destination.ip();
         let received = Received {
             stream_minimum: 0,
             packet_address: None,
             netlink_address: None,
             credentials: None,
-            ip: Default::default(),
-            packet_info: None,
+            ip: crate::ReceivedIp {
+                ipv6,
+                fields: crate::IpFields {
+                    traffic_class: options.receive_class.then(|| {
+                        if ipv6 {
+                            (packet[0] << 4) | packet[1] >> 4
+                        } else {
+                            packet[1]
+                        }
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            packet_info: options.receive_info.then_some(crate::PacketInfo {
+                interface: state.raw_ingress,
+                address: destination,
+            }),
             data: data[..count.min(length)].to_vec(),
             address: Some(SocketAddr::new(*peer, 0)),
             length,

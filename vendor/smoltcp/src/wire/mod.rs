@@ -179,6 +179,7 @@ pub use self::ieee802154::{
 };
 
 pub use self::ip::{
+    checksum,
     Address as IpAddress, Cidr as IpCidr, Endpoint as IpEndpoint,
     ListenEndpoint as IpListenEndpoint, Protocol as IpProtocol, Repr as IpRepr,
     Version as IpVersion,

@@ -41,7 +41,7 @@ impl Default for Options {
     }
 }
 impl State {
-    pub(super) fn accepts_raw_udp(&self, tuple: packet::Tuple, index: u32) -> bool {
+    pub(super) fn accepts_raw(&self, tuple: packet::Tuple, index: u32) -> bool {
         self.bound
             .is_none_or(|a| a.ip().is_unspecified() || a.ip() == tuple.destination.ip())
             && self.peer.is_none_or(|a| a.ip() == tuple.source.ip())
@@ -405,7 +405,7 @@ impl Inner {
         {
             let state = s.state.borrow();
             if s.raw_udp() {
-                if state.accepts_raw_udp(header.tuple, index)
+                if state.accepts_raw(header.tuple, index)
                     && (!group_ip.is_multicast()
                         || state
                             .multicast
@@ -415,7 +415,7 @@ impl Inner {
                     if let Some(handle) = state.handles.first() {
                         node.sockets
                             .get_mut::<raw::Socket>(*handle)
-                            .enqueue_ip_packet(packet);
+                            .enqueue_ip_packet(packet, index);
                     }
                 }
                 continue;

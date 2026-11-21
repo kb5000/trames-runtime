@@ -76,7 +76,12 @@ pub(crate) fn rewrite(p: &mut [u8], k: Key) -> bool {
         if h.protocol == 6 {
             smoltcp::wire::TcpPacket::new_unchecked(b).fill_checksum(&s, &d);
         } else {
-            smoltcp::wire::UdpPacket::new_unchecked(b).fill_checksum(&s, &d);
+            // Raw listeners can receive an IP datagram before UDP validates its
+            // length. Translation needs a complete UDP segment to checksum.
+            let Ok(mut udp) = smoltcp::wire::UdpPacket::new_checked(b) else {
+                return false;
+            };
+            udp.fill_checksum(&s, &d);
         }
     } else if matches!(h.protocol, 1 | 58) {
         let b = &mut p[h.offset..];

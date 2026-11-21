@@ -497,9 +497,9 @@ impl Network {
             ));
         }
         let backend = match &self.0 {
-            // Raw UDP operates on the guest IP link, including on a host-backed
+            // Raw TCP and UDP operate on the guest IP link, including on a host-backed
             // environment. Ordinary host sockets keep their native transport.
-            Backend::Native(_) if (family, kind, protocol) == (2, 3, 17) => {
+            Backend::Native(_) if matches!((family, kind, protocol), (2 | 10, 3, 6 | 17)) => {
                 SocketBackend::Virtual(self.1.root_stack()?.socket(family, kind, protocol)?)
             }
             Backend::Native(n) => SocketBackend::Hybrid(hybrid::Socket::new(

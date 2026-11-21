@@ -72,11 +72,11 @@ impl core::fmt::Display for RecvError {
 #[cfg(feature = "std")]
 impl std::error::Error for RecvError {}
 
-/// A UDP packet metadata.
-pub type PacketMetadata = crate::storage::PacketMetadata<()>;
+/// Raw packet metadata holding the ingress interface index.
+pub type PacketMetadata = crate::storage::PacketMetadata<u32>;
 
-/// A UDP packet ring buffer.
-pub type PacketBuffer<'a> = crate::storage::PacketBuffer<'a, ()>;
+/// A raw IP packet ring buffer.
+pub type PacketBuffer<'a> = crate::storage::PacketBuffer<'a, u32>;
 
 /// A raw IP socket.
 ///
@@ -88,6 +88,8 @@ pub struct Socket<'a> {
     ip_protocol: IpProtocol,
     rx_buffer: PacketBuffer<'a>,
     tx_buffer: PacketBuffer<'a>,
+    #[cfg(feature = "std")]
+    linux_receive: bool,
     #[cfg(feature = "async")]
     rx_waker: WakerRegistration,
     #[cfg(feature = "async")]
@@ -108,6 +110,8 @@ impl<'a> Socket<'a> {
             ip_protocol,
             rx_buffer,
             tx_buffer,
+            #[cfg(feature = "std")]
+            linux_receive: false,
             #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
             #[cfg(feature = "async")]
@@ -212,7 +216,7 @@ impl<'a> Socket<'a> {
     pub fn send(&mut self, size: usize) -> Result<&mut [u8], SendError> {
         let packet_buf = self
             .tx_buffer
-            .enqueue(size, ())
+            .enqueue(size, 0)
             .map_err(|_| SendError::BufferFull)?;
 
         net_trace!(
@@ -234,7 +238,7 @@ impl<'a> Socket<'a> {
     {
         let size = self
             .tx_buffer
-            .enqueue_with_infallible(max_size, (), f)
+            .enqueue_with_infallible(max_size, 0, f)
             .map_err(|_| SendError::BufferFull)?;
 
         net_trace!(
@@ -262,7 +266,12 @@ impl<'a> Socket<'a> {
     /// **Note:** The IP header is parsed and re-serialized, and may not match
     /// the header actually received bit for bit.
     pub fn recv(&mut self) -> Result<&[u8], RecvError> {
-        let ((), packet_buf) = self.rx_buffer.dequeue().map_err(|_| RecvError::Exhausted)?;
+        self.recv_with_interface().map(|(_, data)| data)
+    }
+
+    /// Dequeue the complete IP packet together with its ingress interface.
+    pub fn recv_with_interface(&mut self) -> Result<(u32, &[u8]), RecvError> {
+        let (interface, packet_buf) = self.rx_buffer.dequeue().map_err(|_| RecvError::Exhausted)?;
 
         net_trace!(
             "raw:{}:{}: receive {} buffered octets",
@@ -270,7 +279,7 @@ impl<'a> Socket<'a> {
             self.ip_protocol,
             packet_buf.len()
         );
-        Ok(packet_buf)
+        Ok((interface, packet_buf))
     }
 
     /// Dequeue a packet, and copy the payload into the given slice.
@@ -296,7 +305,7 @@ impl<'a> Socket<'a> {
     ///
     /// It returns `Err(Error::Exhausted)` if the receive buffer is empty.
     pub fn peek(&mut self) -> Result<&[u8], RecvError> {
-        let ((), packet_buf) = self.rx_buffer.peek().map_err(|_| RecvError::Exhausted)?;
+        let (_, packet_buf) = self.rx_buffer.peek().map_err(|_| RecvError::Exhausted)?;
 
         net_trace!(
             "raw:{}:{}: receive {} buffered octets",
@@ -348,17 +357,53 @@ impl<'a> Socket<'a> {
         true
     }
 
+    /// Admit a single oversized datagram when a Linux receive queue is empty.
+    #[cfg(feature = "std")]
+    pub fn set_linux_receive(&mut self, enabled: bool) {
+        self.linux_receive = enabled;
+    }
+
+    /// Resize an owned raw socket queue without discarding unread packets.
+    #[cfg(feature = "alloc")]
+    pub fn resize_owned_buffer(&mut self, receive: bool, packets: usize, bytes: usize) {
+        let queue = if receive {
+            &mut self.rx_buffer
+        } else {
+            &mut self.tx_buffer
+        };
+        queue.resize_owned(packets, bytes);
+
+    }
+
+    fn receive_slot(
+        &mut self,
+        size: usize,
+        interface: u32,
+    ) -> Result<&mut [u8], crate::storage::Full> {
+        #[cfg(feature = "std")]
+        if self.linux_receive && size > self.rx_buffer.payload_capacity() {
+            return self.rx_buffer.enqueue_oversized_datagram(size, interface);
+        }
+        self.rx_buffer.enqueue(size, interface)
+    }
+
     /// Queue a complete IP packet after the enclosing interface has selected
     /// this socket. Preserve the original IP header, including its options.
-    pub fn enqueue_ip_packet(&mut self, packet: &[u8]) {
-        if let Ok(buf) = self.rx_buffer.enqueue(packet.len(), ()) {
+    pub fn enqueue_ip_packet(&mut self, packet: &[u8], interface: u32) {
+        if let Ok(buf) = self.receive_slot(packet.len(), interface) {
             buf.copy_from_slice(packet);
             #[cfg(feature = "async")]
             self.rx_waker.wake();
         }
     }
 
-    pub(crate) fn process(&mut self, cx: &mut Context, ip_repr: &IpRepr, payload: &[u8]) {
+    pub(crate) fn process(
+        &mut self,
+        cx: &mut Context,
+        ip_repr: &IpRepr,
+        payload: &[u8],
+        meta: crate::phy::PacketMeta,
+    ) {
         debug_assert!(self.accepts(ip_repr));
 
         let header_len = ip_repr.header_len();
@@ -371,9 +416,22 @@ impl<'a> Socket<'a> {
             total_len
         );
 
-        match self.rx_buffer.enqueue(total_len, ()) {
+        match self.receive_slot(total_len, meta.ingress_index) {
             Ok(buf) => {
-                ip_repr.emit(&mut buf[..header_len], &cx.checksum_caps());
+                match ip_repr {
+                    #[cfg(feature = "proto-ipv4")]
+                    IpRepr::Ipv4(ip) => ip.emit_with_class(
+                        &mut Ipv4Packet::new_unchecked(&mut buf[..header_len]),
+                        &cx.checksum_caps(),
+                        meta.traffic_class,
+                    ),
+                    #[cfg(feature = "proto-ipv6")]
+                    IpRepr::Ipv6(ip) => {
+                        let mut header = Ipv6Packet::new_unchecked(&mut buf[..header_len]);
+                        ip.emit(&mut header);
+                        header.set_traffic_class(meta.traffic_class);
+                    }
+                }
                 buf[header_len..].copy_from_slice(payload);
             }
             Err(_) => net_trace!(
@@ -394,7 +452,7 @@ impl<'a> Socket<'a> {
         let ip_protocol = self.ip_protocol;
         let ip_version = self.ip_version;
         let _checksum_caps = &cx.checksum_caps();
-        let res = self.tx_buffer.dequeue_with(|&mut (), buffer| {
+        let res = self.tx_buffer.dequeue_with(|_, buffer| {
             match IpVersion::of_packet(buffer) {
                 #[cfg(feature = "proto-ipv4")]
                 Ok(IpVersion::Ipv4) => {
@@ -629,7 +687,7 @@ mod test {
                     let mut socket = $socket(buffer(1), buffer(0));
 
                     assert!(socket.accepts(&$hdr));
-                    socket.process(&mut cx, &$hdr, &$payload);
+                    socket.process(&mut cx, &$hdr, &$payload, Default::default());
 
                     let mut slice = [0; 4];
                     assert_eq!(socket.recv_slice(&mut slice[..]), Err(RecvError::Truncated));
@@ -651,7 +709,7 @@ mod test {
                     buffer[..$packet.len()].copy_from_slice(&$packet[..]);
 
                     assert!(socket.accepts(&$hdr));
-                    socket.process(&mut cx, &$hdr, &buffer);
+                    socket.process(&mut cx, &$hdr, &buffer, Default::default());
                 }
 
                 #[rstest]
@@ -667,7 +725,7 @@ mod test {
                     let mut socket = $socket(buffer(1), buffer(0));
 
                     assert!(socket.accepts(&$hdr));
-                    socket.process(&mut cx, &$hdr, &$payload);
+                    socket.process(&mut cx, &$hdr, &$payload, Default::default());
 
                     let mut slice = [0; 4];
                     assert_eq!(socket.peek_slice(&mut slice[..]), Err(RecvError::Truncated));
@@ -761,11 +819,21 @@ mod test {
 
             assert_eq!(socket.recv(), Err(RecvError::Exhausted));
             assert!(socket.accepts(&ipv4_locals::HEADER_REPR));
-            socket.process(cx, &ipv4_locals::HEADER_REPR, &ipv4_locals::PACKET_PAYLOAD);
+            socket.process(
+                cx,
+                &ipv4_locals::HEADER_REPR,
+                &ipv4_locals::PACKET_PAYLOAD,
+                Default::default(),
+            );
             assert!(socket.can_recv());
 
             assert!(socket.accepts(&ipv4_locals::HEADER_REPR));
-            socket.process(cx, &ipv4_locals::HEADER_REPR, &ipv4_locals::PACKET_PAYLOAD);
+            socket.process(
+                cx,
+                &ipv4_locals::HEADER_REPR,
+                &ipv4_locals::PACKET_PAYLOAD,
+                Default::default(),
+            );
             assert_eq!(socket.recv(), Ok(&cksumd_packet[..]));
             assert!(!socket.can_recv());
         }
@@ -778,11 +846,21 @@ mod test {
 
             assert_eq!(socket.recv(), Err(RecvError::Exhausted));
             assert!(socket.accepts(&ipv6_locals::HEADER_REPR));
-            socket.process(cx, &ipv6_locals::HEADER_REPR, &ipv6_locals::PACKET_PAYLOAD);
+            socket.process(
+                cx,
+                &ipv6_locals::HEADER_REPR,
+                &ipv6_locals::PACKET_PAYLOAD,
+                Default::default(),
+            );
             assert!(socket.can_recv());
 
             assert!(socket.accepts(&ipv6_locals::HEADER_REPR));
-            socket.process(cx, &ipv6_locals::HEADER_REPR, &ipv6_locals::PACKET_PAYLOAD);
+            socket.process(
+                cx,
+                &ipv6_locals::HEADER_REPR,
+                &ipv6_locals::PACKET_PAYLOAD,
+                Default::default(),
+            );
             assert_eq!(socket.recv(), Ok(&ipv6_locals::PACKET_BYTES[..]));
             assert!(!socket.can_recv());
         }
@@ -806,10 +884,20 @@ mod test {
 
             assert_eq!(socket.peek(), Err(RecvError::Exhausted));
             assert!(socket.accepts(&ipv4_locals::HEADER_REPR));
-            socket.process(cx, &ipv4_locals::HEADER_REPR, &ipv4_locals::PACKET_PAYLOAD);
+            socket.process(
+                cx,
+                &ipv4_locals::HEADER_REPR,
+                &ipv4_locals::PACKET_PAYLOAD,
+                Default::default(),
+            );
 
             assert!(socket.accepts(&ipv4_locals::HEADER_REPR));
-            socket.process(cx, &ipv4_locals::HEADER_REPR, &ipv4_locals::PACKET_PAYLOAD);
+            socket.process(
+                cx,
+                &ipv4_locals::HEADER_REPR,
+                &ipv4_locals::PACKET_PAYLOAD,
+                Default::default(),
+            );
             assert_eq!(socket.peek(), Ok(&cksumd_packet[..]));
             assert_eq!(socket.recv(), Ok(&cksumd_packet[..]));
             assert_eq!(socket.peek(), Err(RecvError::Exhausted));
@@ -822,10 +910,20 @@ mod test {
 
             assert_eq!(socket.peek(), Err(RecvError::Exhausted));
             assert!(socket.accepts(&ipv6_locals::HEADER_REPR));
-            socket.process(cx, &ipv6_locals::HEADER_REPR, &ipv6_locals::PACKET_PAYLOAD);
+            socket.process(
+                cx,
+                &ipv6_locals::HEADER_REPR,
+                &ipv6_locals::PACKET_PAYLOAD,
+                Default::default(),
+            );
 
             assert!(socket.accepts(&ipv6_locals::HEADER_REPR));
-            socket.process(cx, &ipv6_locals::HEADER_REPR, &ipv6_locals::PACKET_PAYLOAD);
+            socket.process(
+                cx,
+                &ipv6_locals::HEADER_REPR,
+                &ipv6_locals::PACKET_PAYLOAD,
+                Default::default(),
+            );
             assert_eq!(socket.peek(), Ok(&ipv6_locals::PACKET_BYTES[..]));
             assert_eq!(socket.recv(), Ok(&ipv6_locals::PACKET_BYTES[..]));
             assert_eq!(socket.peek(), Err(RecvError::Exhausted));

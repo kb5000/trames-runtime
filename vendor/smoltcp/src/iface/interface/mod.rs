@@ -986,6 +986,7 @@ impl InterfaceInner {
         sockets: &mut SocketSet,
         ip_repr: &IpRepr,
         ip_payload: &[u8],
+        meta: PacketMeta,
     ) -> bool {
         let mut handled_by_raw_socket = false;
 
@@ -995,7 +996,7 @@ impl InterfaceInner {
             .filter_map(|i| raw::Socket::downcast_mut(&mut i.socket))
         {
             if raw_socket.accepts(ip_repr) {
-                raw_socket.process(self, ip_repr, ip_payload);
+                raw_socket.process(self, ip_repr, ip_payload, meta);
                 handled_by_raw_socket = true;
             }
         }

@@ -250,6 +250,8 @@ struct State {
     last_hop: Option<u8>,
     broadcast: bool,
     icmp6_filter: [u8; 32],
+    raw_checksum: i32,
+    raw_ingress: u32,
     hop_message: u32,
     device: Option<u32>,
     raw_identifiers: std::collections::BTreeSet<u16>,
@@ -278,8 +280,11 @@ pub(super) struct SocketMeta {
     connecting: std::sync::atomic::AtomicBool,
 }
 impl SocketMeta {
+    fn raw_transport(&self) -> bool {
+        self.kind == 4 && matches!(self.protocol, 6 | 17)
+    }
     fn raw_udp(&self) -> bool {
-        self.kind == 4 && self.protocol == 17
+        self.family == 2 && self.kind == 4 && self.protocol == 17
     }
 }
 fn v4(id: u8) -> Ipv4Addr {
@@ -981,14 +986,18 @@ impl Inner {
                         p = complete;
                     }
                     if !packet::valid_transport(&p) {
-                        // Raw sockets observe local IP traffic before UDP validates its
+                        // Raw sockets observe local IP traffic before TCP/UDP validate their
                         // header. Keep invalid transport data off forwarding paths and
-                        // out of UDP queues. Apply the normal local output/input hooks.
+                        // out of transport queues. Apply the normal local output/input hooks.
                         let delivered = injected.is_none()
-                            && h.protocol == 17
-                            && h.tuple.destination.is_ipv4()
+                            && matches!(h.protocol, 6 | 17)
                             && self.nodes.get_mut(&source).is_some_and(|node| {
-                                node.receive_local_raw(view, &mut p, h.tuple.destination.ip())
+                                node.receive_local_raw(
+                                    view,
+                                    &mut p,
+                                    h.tuple.destination.ip(),
+                                    h.protocol,
+                                )
                             });
                         if !delivered {
                             self.stats.dropped += 1;
@@ -1258,12 +1267,16 @@ impl Node {
         view: &crate::netdev::View,
         packet: &mut [u8],
         dest: IpAddr,
+        protocol: u8,
     ) -> bool {
+        let matches = |s: &SocketMeta| {
+            s.kind == 4 && s.protocol == protocol && (s.family == 2) == dest.is_ipv4()
+        };
         if !self
             .registry
             .iter()
             .filter_map(Weak::upgrade)
-            .any(|s| s.raw_udp())
+            .any(|s| matches(&s))
         {
             return false;
         }
@@ -1286,14 +1299,14 @@ impl Node {
             .registry
             .iter()
             .filter_map(Weak::upgrade)
-            .filter(|s| s.raw_udp())
+            .filter(|s| matches(s))
         {
             let state = socket.state.borrow();
-            if state.accepts_raw_udp(header.tuple, route.input) {
+            if state.accepts_raw(header.tuple, route.input) {
                 if let Some(handle) = state.handles.first() {
                     self.sockets
                         .get_mut::<raw::Socket>(*handle)
-                        .enqueue_ip_packet(packet);
+                        .enqueue_ip_packet(packet, route.input);
                     delivered = true;
                 }
             }
@@ -1644,9 +1657,7 @@ impl Network {
         if kind == 4 {
             return Err(NetError(94));
         }
-        if kind == 3
-            && !((family == 2 && matches!(protocol, 1 | 17)) || (family == 10 && protocol == 58))
-        {
+        if kind == 3 && !matches!((family, protocol), (_, 6 | 17) | (2, 1) | (10, 58)) {
             return Err(NetError(93));
         }
         let kind = if kind == 3 {
@@ -1658,7 +1669,7 @@ impl Network {
             kind
         };
         match (kind, protocol) {
-            (1, 0 | 6) | (2, 0 | 17) | (3 | 4, 1 | 58) | (4, 17) => {}
+            (1, 0 | 6) | (2, 0 | 17) | (3 | 4, 1 | 58) | (4, 6 | 17) => {}
             (1 | 2, _) => return Err(NetError(93)),
             _ => return Err(NetError(94)),
         };
@@ -1725,6 +1736,8 @@ impl Network {
                 broadcast: false,
                 multicast: None,
                 icmp6_filter: [0; 32],
+                raw_ingress: 0,
+                raw_checksum: if protocol == 58 { 2 } else { -1 },
                 hop_message: 52,
                 device: None,
                 raw_identifiers: std::collections::BTreeSet::new(),
@@ -1733,7 +1746,7 @@ impl Network {
             },
             reservation,
         );
-        if socket.raw_udp() {
+        if socket.raw_transport() {
             socket.open_raw()?;
         }
         Ok(socket)
