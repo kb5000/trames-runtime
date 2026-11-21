@@ -116,6 +116,7 @@ pub(super) enum FileData {
     Mapped(Box<mapped::MappedData>),
 }
 pub(super) struct DiskObject {
+    pub(super) capabilities: Option<file_caps::FileCaps>,
     pub(super) length: u64,
     pub(super) backing: Arc<DiskBacking>,
 }
@@ -134,6 +135,52 @@ pub(super) struct DiskBacking {
     pub(super) charge: std::sync::OnceLock<Arc<file_accounting::FileCharge>>,
 }
 impl DiskObject {
+    // Held under the existing byte lock. Sync revocation before admitting a
+    // mutation so reopening a store after a crash cannot restore an old grant.
+    pub(super) fn revoke_caps(&mut self) -> Result<()> {
+        if self.capabilities.is_none() {
+            return Ok(());
+        }
+        let path = self.backing.path.with_extension("cap");
+        match fs::remove_file(&path) {
+            Ok(()) => (),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+            Err(e) => return Err(host_errno(e)),
+        }
+        File::open(path.parent().unwrap())
+            .and_then(|f| f.sync_all())
+            .map_err(host_errno)?;
+        self.capabilities = None;
+        Ok(())
+    }
+    pub(super) fn set_caps(&mut self, caps: file_caps::FileCaps) -> Result<()> {
+        let bytes = caps.encode(&UserNamespace::default())?;
+        let path = self.backing.path.with_extension("cap");
+        let temp = path.with_extension("new");
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temp).map_err(host_errno)?;
+        let commit = (|| -> io::Result<()> {
+            self.backing
+                .file(false)
+                .map_err(|e| io::Error::from_raw_os_error(e.0 as i32))?
+                .sync_all()?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            fs::rename(&temp, &path)
+        })();
+        if let Err(error) = commit {
+            let _ = fs::remove_file(&temp);
+            return Err(host_errno(error));
+        }
+        self.capabilities = Some(caps);
+        File::open(path.parent().unwrap())
+            .and_then(|f| f.sync_all())
+            .map_err(host_errno)
+    }
+
     // Guest inode lifetime is independent of host descriptor lifetime. A store
     // with thousands of closed files must not consume thousands of iOS handles.
     // Orphans retain their private object path until the last guest reference dies.
@@ -587,6 +634,7 @@ impl DiskStore {
         drop(options.open(&path).map_err(host_errno)?);
         self.objects_generation.fetch_add(1, Ordering::Relaxed);
         Ok(FileData::disk(DiskObject {
+            capabilities: None,
             length: 0,
             backing: Arc::new(DiskBacking {
                 files: std::sync::Mutex::default(),
@@ -605,6 +653,7 @@ impl DiskStore {
         regular(&path)?;
         let length = fs::symlink_metadata(&path).map_err(host_errno)?.len();
         Ok(FileData::disk(DiskObject {
+            capabilities: None,
             length,
             backing: Arc::new(DiskBacking {
                 files: std::sync::Mutex::default(),
@@ -686,7 +735,7 @@ impl DiskStore {
             let e = entry.map_err(host_errno)?;
             let name = e.file_name().into_string().map_err(|_| Errno(22))?;
             if name.len() != 20
-                || !name.ends_with(".dat")
+                || !matches!(name.as_bytes().get(16..), Some(b".dat" | b".cap" | b".new"))
                 || !name[..16]
                     .bytes()
                     .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
@@ -695,11 +744,24 @@ impl DiskStore {
             }
             let ino = u64::from_str_radix(&name[..16], 16).map_err(|_| Errno(22))?;
             regular(&e.path())?;
-            if !live
+            let node = live
                 .get(&ino)
-                .is_some_and(|n| matches!(n.borrow().content, Content::File(_)))
-            {
-                garbage.push(e.path());
+                .filter(|n| matches!(n.borrow().content, Content::File(_)));
+            match (node, &name[16..]) {
+                (Some(node), ".cap") => {
+                    let mut bytes = Vec::with_capacity(25);
+                    File::open(e.path())
+                        .and_then(|f| f.take(25).read_to_end(&mut bytes))
+                        .map_err(host_errno)?;
+                    let caps = file_caps::FileCaps::parse(&bytes, &UserNamespace::default())?;
+                    let n = node.borrow();
+                    let Content::File(FileData::Plain(file)) = &n.content else {
+                        return Err(Errno(22));
+                    };
+                    file.restore_disk_caps(caps)?;
+                }
+                (Some(_), ".dat") => (),
+                _ => garbage.push(e.path()),
             }
             if garbage.len() > MAX_DISK_NODES {
                 return Err(Errno(28));
@@ -708,9 +770,13 @@ impl DiskStore {
         // Do not delete anything until the manifest and every directory entry validate.
         if !garbage.is_empty() {
             self.objects_generation.fetch_add(1, Ordering::Relaxed);
-        }
-        for path in garbage {
-            fs::remove_file(path).map_err(host_errno)?;
+            for path in garbage {
+                fs::remove_file(path).map_err(host_errno)?;
+            }
+            // Rollback may make old inode numbers available again.
+            File::open(self.root.join("objects"))
+                .and_then(|f| f.sync_all())
+                .map_err(host_errno)?;
         }
         let tmp = self.root.join("manifest.new");
         if tmp.try_exists().map_err(host_errno)? {

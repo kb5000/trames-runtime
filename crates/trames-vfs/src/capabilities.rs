@@ -50,6 +50,7 @@ pub const SYS_NICE: u32 = 23;
 pub const NET_BIND_SERVICE: u32 = 10;
 pub const SYS_RESOURCE: u32 = 24;
 pub const MKNOD: u32 = 27;
+pub const SETFCAP: u32 = 31;
 pub const SYSLOG: u32 = 34;
 pub const WAKE_ALARM: u32 = 35;
 pub const LAST: u32 = 40;
@@ -142,9 +143,9 @@ impl Capabilities {
             self.effective = self.permitted;
         }
     }
-    /// File capabilities are not yet supported. Apply ordinary/set-ID ELF rules.
+    /// Apply the ordinary/set-ID rules for an executable without file caps.
     pub fn exec(&mut self, uid: u32, euid: u32, privileged: bool) {
-        self.exec_with_nnp(uid, euid, privileged, self.no_new_privs.get());
+        self.exec_with_nnp(uid, euid, privileged, self.no_new_privs.get(), None);
     }
     pub(crate) fn exec_with_nnp(
         &mut self,
@@ -152,20 +153,25 @@ impl Capabilities {
         euid: u32,
         privileged: bool,
         no_new_privs: bool,
+        file: Option<crate::file_caps::FileCaps>,
     ) {
-        if privileged {
+        if privileged || file.is_some() {
             self.ambient = 0;
         }
-        let root = self.securebits & NOROOT == 0 && (uid == 0 || euid == 0);
+        let root = self.securebits & NOROOT == 0
+            && (uid == 0 || euid == 0)
+            && !(file.is_some() && uid != 0 && euid == 0);
         let mut permitted = self.ambient;
         if root {
             permitted |= self.inheritable | self.bounding;
+        } else if let Some(file) = file {
+            permitted |= self.bounding & file.permitted | self.inheritable & file.inheritable;
         }
         if no_new_privs {
             permitted &= self.permitted;
         }
         self.permitted = permitted;
-        self.effective = if root && euid == 0 {
+        self.effective = if root && euid == 0 || file.is_some_and(|caps| caps.effective) {
             permitted
         } else {
             self.ambient

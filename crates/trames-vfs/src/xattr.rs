@@ -64,6 +64,16 @@ impl Vfs {
         if name.len() > 255 {
             return Err(Errno(34));
         }
+        if name == file_caps::NAME {
+            if write
+                && !self
+                    .credentials
+                    .inode_cap(capabilities::SETFCAP, node.uid, node.gid)
+            {
+                return Err(Errno(1));
+            }
+            return Ok(());
+        }
         if acl::name(name) {
             if matches!(node.content, Content::Symlink(_)) {
                 return Err(Errno(95));
@@ -130,18 +140,30 @@ impl Vfs {
         let (node, _) = self.xattr_node(fd, path, follow, false)?;
         let n = node.borrow();
         self.xattr_allowed(&n, name, false)?;
+        if name == file_caps::NAME {
+            return n
+                .file_caps()
+                .ok_or(Errno(61))?
+                .encode(&self.credentials.user_namespace);
+        }
         n.xattrs.get(name).cloned().ok_or(Errno(61))
     }
     pub fn list_xattrs(&self, fd: i32, path: Option<&[u8]>, follow: bool) -> Result<Vec<u8>> {
         let (node, _) = self.xattr_node(fd, path, follow, false)?;
         let n = node.borrow();
-        Ok(n.xattrs
+        let mut names: Vec<u8> = n
+            .xattrs
             .keys()
             .filter(|name| {
                 !name.starts_with(b"trusted.") || self.credentials.has_cap(capabilities::SYS_ADMIN)
             })
             .flat_map(|k| k.iter().copied().chain([0]))
-            .collect())
+            .collect();
+        if n.file_caps().is_some() {
+            names.extend(file_caps::NAME);
+            names.push(0);
+        }
+        Ok(names)
     }
     pub fn set_xattr(
         &mut self,
@@ -174,6 +196,16 @@ impl Vfs {
         self.pseudo_immutable(&node)?;
         let mut n = node.borrow_mut();
         self.xattr_allowed(&n, name, true)?;
+        if name == file_caps::NAME {
+            let caps = value
+                .map(|bytes| file_caps::FileCaps::parse(bytes, &self.credentials.user_namespace))
+                .transpose()?;
+            n.edit_caps(caps, flags)?;
+            n.times[2] = storage::Timestamp::now();
+            drop(n);
+            inotify::notify(&node, inotify::ATTRIB, None);
+            return Ok(());
+        }
         let old = n.xattrs.get(name).cloned();
         if name == acl::ACCESS && value.is_none() && old.is_none() && lower_acl_remove {
             return Err(Errno(61));

@@ -1328,7 +1328,7 @@ impl<C: Cpu> Image<C> {
                 12 => c.euid as u64,
                 13 => c.gid as u64,
                 14 => c.egid as u64,
-                23 => u64::from(c.uid != c.euid || c.gid != c.egid),
+                23 => u64::from(c.secure_exec()),
                 _ => continue,
             };
             pair[8..].copy_from_slice(&value.to_le_bytes());
@@ -1542,7 +1542,7 @@ impl Request {
                 continue;
             }
             let mut execute_vfs = vfs;
-            let mut credentials = execute_vfs.exec_credentials(&file);
+            let mut credentials = execute_vfs.exec_credentials(&file)?;
             let exec_error = |e| match e {
                 RuntimeError::Arguments(_) => Errno(7),
                 RuntimeError::Memory(_)

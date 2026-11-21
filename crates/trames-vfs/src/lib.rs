@@ -141,6 +141,7 @@ pub use task_namespace::{
 mod pid_namespace;
 pub use pid_namespace::{PidNamespace, PidReference, CLONE_NEWPID};
 mod acl;
+mod file_caps;
 mod namespace;
 mod xattr;
 pub use linux_namespace::{

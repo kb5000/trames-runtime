@@ -348,8 +348,61 @@ impl PlainFile {
     ) -> Result<Vec<u8>> {
         self.bytes.read().unwrap().read_at(offset, count, cache)
     }
+    pub(super) fn restore_disk_caps(&self, caps: file_caps::FileCaps) -> Result<()> {
+        let mut data = self.bytes.write().unwrap();
+        let Bytes::Disk(d) = &mut *data else {
+            return Err(Errno(22));
+        };
+        d.capabilities = Some(caps);
+        Ok(())
+    }
+    pub(super) fn capabilities(&self) -> Option<file_caps::FileCaps> {
+        match &*self.bytes.read().unwrap() {
+            Bytes::Tmpfs(file) => file.capabilities,
+            Bytes::Disk(d) => d.capabilities,
+            _ => None,
+        }
+    }
+    pub(super) fn revoke_capabilities(&self) -> Result<()> {
+        match &mut *self.bytes.write().unwrap() {
+            Bytes::Disk(d) => d.revoke_caps(),
+            Bytes::Tmpfs(file) => {
+                file.capabilities = None;
+                Ok(())
+            }
+            Bytes::Memory(_) => Ok(()),
+        }
+    }
+    pub(super) fn edit_capabilities(
+        &self,
+        caps: Option<file_caps::FileCaps>,
+        flags: u32,
+    ) -> Result<()> {
+        let mut data = self.bytes.write().unwrap();
+        let old = match &*data {
+            Bytes::Tmpfs(file) => file.capabilities,
+            Bytes::Disk(d) if d.backing._store.is_some() => d.capabilities,
+            _ => return Err(Errno(95)),
+        };
+        if old.is_some() && flags & 1 != 0 {
+            return Err(Errno(17));
+        }
+        if old.is_none() && (caps.is_none() || flags & 2 != 0) {
+            return Err(Errno(61));
+        }
+        match &mut *data {
+            Bytes::Tmpfs(file) => {
+                file.capabilities = caps;
+                Ok(())
+            }
+            Bytes::Disk(d) => match caps {
+                None => d.revoke_caps(),
+                Some(c) => d.set_caps(c),
+            },
+            _ => unreachable!(),
+        }
+    }
     /// Publish the change of byte authority under the same lock as direct I/O.
-    /// Existing capabilities must defer once mapped pages can own newer bytes.
     pub fn mark_mapped(&self) {
         let _bytes = self.bytes.write().unwrap();
         self.mapped.store(true, Ordering::Relaxed);
@@ -457,7 +510,7 @@ impl PlainFile {
             Err(error) => panic!("{error}"),
         };
         if self.mapped.load(Ordering::Relaxed)
-            || matches!(&*data, Bytes::Disk(_)) && bytes.len() >= 16 * 1024
+            || matches!(&*data, Bytes::Disk(d) if d.capabilities.is_some() || bytes.len() >= 16 * 1024)
         {
             return None;
         }
@@ -531,6 +584,7 @@ impl PlainFile {
                 b.resize(n, 0);
             }
             Bytes::Disk(d) => {
+                d.revoke_caps()?;
                 d.open(true)?.set_len(length).map_err(storage::host_errno)?;
                 d.length = length;
             }
@@ -645,6 +699,9 @@ impl Bytes {
                 Ok(bytes.len())
             }
             Self::Disk(d) => {
+                if !bytes.is_empty() {
+                    d.revoke_caps()?;
+                }
                 #[cfg(unix)]
                 let n = if let Some(cache) = cache {
                     cache.file(&d.backing, true)?.write_at(bytes, offset)

@@ -6,6 +6,7 @@ use trames_memory::PAGE_SIZE;
 
 pub(super) struct SparseFile {
     pub length: u64,
+    pub(super) capabilities: Option<file_caps::FileCaps>,
     pub charge: Arc<file_accounting::FileCharge>,
     // Half-open ranges of allocated guest page numbers, including unwritten pages.
     extents: BTreeMap<u64, u64>,
@@ -15,6 +16,7 @@ impl SparseFile {
     pub fn new(quota: &Arc<file_accounting::FileQuota>) -> Result<Self> {
         Ok(Self {
             length: 0,
+            capabilities: None,
             charge: file_accounting::FileCharge::admit(quota, 0)?,
             extents: BTreeMap::new(),
             bytes: BTreeMap::new(),
@@ -58,6 +60,7 @@ impl SparseFile {
         Ok(copy)
     }
     pub fn resize(&mut self, length: u64) {
+        self.capabilities = None;
         if length < self.length {
             let limit = length.div_ceil(PAGE_SIZE);
             let mut released: u64 = self
@@ -128,6 +131,9 @@ impl SparseFile {
                     .entry(index)
                     .or_insert_with(|| Box::new([0; PAGE_SIZE as usize]))
             };
+            if written == 0 {
+                self.capabilities = None;
+            }
             page[within..within + chunk].copy_from_slice(&bytes[written..written + chunk]);
             self.length = self.length.max(end);
             written += chunk;

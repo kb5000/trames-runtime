@@ -615,6 +615,7 @@ impl HostFs {
                         Content::Symlink(target)
                     }
                     _ => Content::File(storage::FileData::disk(storage::DiskObject {
+                        capabilities: None,
                         length: meta.st_size.max(0) as u64,
                         backing: Arc::new(storage::DiskBacking {
                             files: std::sync::Mutex::default(),

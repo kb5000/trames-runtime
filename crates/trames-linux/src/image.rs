@@ -102,10 +102,7 @@ pub fn build_initial_stack(
         (12, credentials.euid as u64),
         (13, credentials.gid as u64),
         (14, credentials.egid as u64),
-        (
-            23,
-            u64::from(credentials.uid != credentials.euid || credentials.gid != credentials.egid),
-        ),
+        (23, u64::from(credentials.secure_exec())),
         (31, execfn.unwrap_or(arguments[0])),
         (25, cursor),
     ];

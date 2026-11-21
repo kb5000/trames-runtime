@@ -152,6 +152,7 @@ pub struct ExecCredentials {
     uid: u32,
     gid: u32,
     mode: u32,
+    file_caps: Option<file_caps::FileCaps>,
     nosuid: bool,
     readable: bool,
 }
@@ -184,6 +185,7 @@ impl ExecCredentials {
             c.privilege_uid(c.euid),
             c.uid != c.euid || c.gid != c.egid,
             no_new_privs || externally_shared_fs,
+            self.file_caps,
         );
         // Preserve the established pre-existing effective-ID downgrade rule.
         if (no_new_privs
@@ -193,6 +195,10 @@ impl ExecCredentials {
             c.euid = c.uid;
             c.egid = c.gid;
         }
+        c.file_secure_exec = c.privilege_uid(c.euid) != 0
+            && self.file_caps.is_some()
+            && (self.file_caps.is_some_and(|f| f.effective)
+                || c.caps.permitted & !c.caps.ambient != 0);
         view.unshare_dumpable();
         view.dumpable.set(
             self.readable
@@ -210,6 +216,7 @@ impl ExecCredentials {
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Credentials {
+    file_secure_exec: bool,
     pub user_namespace: UserNamespace,
     pub uid: u32,
     pub euid: u32,
@@ -223,6 +230,9 @@ pub struct Credentials {
     pub caps: capabilities::Capabilities,
 }
 impl Credentials {
+    pub fn secure_exec(&self) -> bool {
+        self.file_secure_exec || self.uid != self.euid || self.gid != self.egid
+    }
     pub fn fs_identity(&self) -> [u32; 4] {
         [self.euid, self.egid, self.fsuid, self.fsgid]
     }
@@ -266,6 +276,7 @@ impl Credentials {
     }
     pub fn user(uid: u32, gid: u32) -> Self {
         Self {
+            file_secure_exec: false,
             user_namespace: UserNamespace::default(),
             uid,
             euid: uid,
@@ -539,22 +550,41 @@ impl Vfs {
         let file = self.executable_file_at(AT_FDCWD, path, 0)?;
         self.apply_exec_file_credentials(&file)
     }
-    pub fn exec_credentials(&self, file: &ExecutableFile) -> ExecCredentials {
+    pub fn exec_credentials(&self, file: &ExecutableFile) -> Result<ExecCredentials> {
         let node = file.node.borrow();
-        ExecCredentials {
+        let nosuid = file
+            .mount
+            .as_ref()
+            .is_some_and(|m| m.flags.get() & mounts::MS_NOSUID != 0);
+        let file_caps = if nosuid {
+            None
+        } else {
+            node.file_caps()
+                .filter(|caps| caps.applies(&self.credentials.user_namespace))
+        };
+        if let Some(file) = file_caps {
+            let caps = &self.credentials.caps;
+            if file.effective
+                && file.permitted
+                    & capabilities::ALL
+                    & !(caps.bounding | (caps.inheritable & file.inheritable))
+                    != 0
+            {
+                return Err(Errno(1));
+            }
+        }
+        Ok(ExecCredentials {
             original: self.credentials.clone(),
             readable: self.allowed(&node, 4),
             uid: node.uid,
             gid: node.gid,
             mode: node.file_metadata().mode,
-            nosuid: file
-                .mount
-                .as_ref()
-                .is_some_and(|m| m.flags.get() & mounts::MS_NOSUID != 0),
-        }
+            file_caps,
+            nosuid,
+        })
     }
     pub fn apply_exec_file_credentials(&mut self, file: &ExecutableFile) -> Result<()> {
-        self.exec_credentials(file).apply(self);
+        self.exec_credentials(file)?.apply(self);
         Ok(())
     }
     pub fn access_at(
@@ -669,6 +699,9 @@ impl Vfs {
             return Err(Errno(1));
         }
         let old = (n.uid, n.gid, n.mode, n.times[2]);
+        if uid != u32::MAX || gid != u32::MAX {
+            n.revoke_file_caps()?;
+        }
         #[cfg(all(feature = "hostfs", unix))]
         {
             drop(n);

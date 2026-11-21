@@ -373,6 +373,12 @@ impl MappedData {
     pub(super) fn orphan(&self, value: bool) {
         self.data.borrow_mut().orphan(value);
     }
+    pub(super) fn plain_file(&self) -> Option<Arc<file_data::PlainFile>> {
+        match &**self.data.borrow() {
+            FileData::Plain(p) => Some(p.clone()),
+            _ => None,
+        }
+    }
     pub(super) fn tmpfs_file(&self) -> Option<Arc<file_data::PlainFile>> {
         self.data.borrow().tmpfs_file()
     }
@@ -659,10 +665,12 @@ impl MappingWriter {
         node: &NodeRef,
         writers: &Arc<Writers>,
         mount: Option<&MappingMount>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let inode = node.borrow();
+        inode.revoke_file_caps()?;
+        Ok(Self {
             _lease: WriteLease::new(node, writers, mount.map(MappingMount::identity), Some(open)),
-        }
+        })
     }
     #[cfg(test)]
     fn shared(&self) -> Option<WriteLease> {
@@ -720,7 +728,9 @@ impl FileMapping {
             } else {
                 return Err(Errno(19));
             };
-        let writer = writable.then(|| MappingWriter::new(&open, &node, &writers, mount.as_ref()));
+        let writer = writable
+            .then(|| MappingWriter::new(&open, &node, &writers, mount.as_ref()))
+            .transpose()?;
         Ok(Arc::new(Self {
             open,
             mount,
@@ -1116,7 +1126,9 @@ impl MappingFile {
                 .is_none_or(|m| m.identity().flags.get() & mounts::MS_NOEXEC == 0);
         let open = o.shared.clone();
         drop(o);
-        let writer = may_write.then(|| MappingWriter::new(&open, &node, &writers, mount.as_ref()));
+        let writer = may_write
+            .then(|| MappingWriter::new(&open, &node, &writers, mount.as_ref()))
+            .transpose()?;
         let mut pages: Vec<Arc<dyn PageBacking>> = Vec::new();
         for (i, page) in buffers.into_iter().enumerate() {
             pages.push(Arc::new(FileMapping {

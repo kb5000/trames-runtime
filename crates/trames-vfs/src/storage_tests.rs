@@ -7,6 +7,56 @@ use std::{
 };
 static NEXT: AtomicU64 = AtomicU64::new(0);
 #[test]
+fn private_file_capability_survives_reopen_and_revocation_precedes_bytes() {
+    let dir = Temp::new();
+    let path = b"/cap-file";
+    let name = file_caps::NAME;
+    let mut record = [0u8; 20];
+    record[..4].copy_from_slice(&0x0200_0001u32.to_le_bytes());
+    record[4] = 1 << capabilities::SETUID;
+    {
+        let mut v = dir.open();
+        v.import_reader(path, &mut &b"original"[..], true).unwrap();
+        v.set_xattr(AT_FDCWD, Some(path), true, name, Some(&record), 1)
+            .unwrap();
+        v.link_at(AT_FDCWD, path, AT_FDCWD, b"/link").unwrap();
+    }
+    {
+        let mut v = dir.open();
+        let fd = v.open_at(AT_FDCWD, b"/link", 2, 0).unwrap();
+        let set = |v: &mut Vfs| v.set_xattr(fd as i32, None, true, name, Some(&record), 0);
+        let get = |v: &Vfs| v.get_xattr(fd as i32, None, true, name);
+        assert_eq!(get(&v).unwrap(), record);
+        assert_eq!(v.pwrite(fd, &[], 0), Ok(0));
+        assert_eq!(get(&v).unwrap(), record);
+        let private = v
+            .mapping_file(fd)
+            .unwrap()
+            .pages(0, 4096, false, false)
+            .unwrap();
+        assert_eq!(get(&v).unwrap(), record);
+        drop(private);
+        let shared = v
+            .mapping_file(fd)
+            .unwrap()
+            .pages(0, 4096, true, true)
+            .unwrap();
+        assert_eq!(get(&v), Err(Errno(61)));
+        assert_eq!(set(&mut v), Err(Errno(16)));
+        drop(shared);
+        set(&mut v).unwrap();
+        v.pwrite(fd, b"changed!", 0).unwrap();
+        assert_eq!(get(&v), Err(Errno(61)));
+    }
+    let v = dir.open();
+    assert_eq!(
+        v.get_xattr(AT_FDCWD, Some(path), true, name),
+        Err(Errno(61))
+    );
+    assert_eq!(v.executable(path).unwrap(), b"changed!");
+}
+
+#[test]
 #[ignore = "emits the independent iOS File Provider manifest fixture"]
 fn emit_file_provider_manifest_fixture() {
     let dir = Temp::new();
@@ -208,7 +258,7 @@ fn inode_attributes_bound_metadata_and_reject_unimplemented_security_policy() {
             Some(&[0; 20]),
             0
         ),
-        Err(Errno(95))
+        Err(Errno(22))
     );
     v.set_xattr(AT_FDCWD, Some(b"/attrs-0"), true, b"user.key", None, 0)
         .unwrap();
