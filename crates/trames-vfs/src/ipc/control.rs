@@ -32,7 +32,7 @@ impl LocalConnection {
         let peer = self.peer.upgrade().ok_or(Errno(111))?;
         if self.client.kind == 2 {
             *self.client.datagram_peer.borrow_mut() = Arc::downgrade(&peer);
-            *self.client.peer_name.borrow_mut() = peer.name.borrow().clone();
+            *self.client.peer_name.borrow_mut() = Some(peer.name.clone());
             self.client
                 .datagram_connected
                 .store(true, Ordering::Release);
@@ -100,6 +100,19 @@ impl LocalOperation {
         })
     }
 }
+impl LocalNamespace {
+    fn bind_abstract(&mut self, name: &[u8], socket: &Arc<LocalResource>) -> bool {
+        let binding = self
+            .abstract_names
+            .entry((socket.kind, name.to_vec()))
+            .or_default();
+        if binding.strong_count() != 0 {
+            return false;
+        }
+        *binding = Arc::downgrade(socket);
+        true
+    }
+}
 impl Vfs {
     pub(crate) fn local_bind_core(
         &mut self,
@@ -110,63 +123,44 @@ impl Vfs {
         if socket.name.borrow().len() != 2 {
             return Err(Errno(22));
         }
-        let (name, abstract_) = if bytes == [1, 0] {
-            // Allocation belongs to the socket's original network namespace.
-            // Collision probing is confined to this cold bind operation.
+        let name = if bytes == [1, 0] {
             let mut ns = socket.namespace.borrow_mut();
-            let mut found = None;
-            for _ in 0..(1 << 20) {
-                let id = ns.next_autobind;
-                ns.next_autobind = (id + 1) & 0xfffff;
-                let mut name = vec![1, 0, 0];
-                name.extend_from_slice(format!("{id:05x}").as_bytes());
-                if ns
-                    .abstract_names
-                    .get(&name)
-                    .and_then(std::sync::Weak::upgrade)
-                    .is_none()
-                {
-                    ns.abstract_names
-                        .insert(name.clone(), Arc::downgrade(socket));
-                    found = Some(name);
-                    break;
+            (0..1 << 20)
+                .find_map(|_| {
+                    let id = ns.next_autobind;
+                    ns.next_autobind = (id + 1) & 0xfffff;
+                    let mut name = vec![1, 0, 0];
+                    name.extend_from_slice(format!("{id:05x}").as_bytes());
+                    ns.bind_abstract(&name, socket).then_some(name)
+                })
+                .ok_or(Errno(28))?
+        } else {
+            let (name, abstract_) = Self::local_address(bytes)?;
+            if abstract_ {
+                if !socket.namespace.borrow_mut().bind_abstract(&name, socket) {
+                    return Err(Errno(98));
                 }
+            } else {
+                let p = self.resolve_final(-100, &name[2..name.len() - 1], false)?;
+                match self.node(&p) {
+                    Ok(_) => return Err(Errno(98)),
+                    Err(Errno(2)) => {}
+                    Err(e) => return Err(e),
+                }
+                self.check_parent_write(&p)?;
+                let binding = self.path_bindings.bind(socket);
+                // Search/insert must not overwrite another concurrent binder.
+                self.insert_entry(
+                    p,
+                    Content::Socket(binding.path()),
+                    0o140000 | (socket.inode_permissions.load(Ordering::Relaxed) & !self.umask()),
+                    true,
+                )
+                .map_err(|error| if error == Errno(17) { Errno(98) } else { error })?;
+                let _ = socket.pathname_binding.set(binding);
             }
-            (found.ok_or(Errno(28))?, true)
-        } else {
-            Self::local_address(bytes)?
+            name
         };
-        if abstract_ {
-            let mut ns = socket.namespace.borrow_mut();
-            if ns
-                .abstract_names
-                .get(&name)
-                .and_then(std::sync::Weak::upgrade)
-                .is_some_and(|bound| !Arc::ptr_eq(&bound, socket))
-            {
-                return Err(Errno(98));
-            }
-            ns.abstract_names
-                .insert(name.clone(), Arc::downgrade(socket));
-        } else {
-            let p = self.resolve_final(-100, &name[2..name.len() - 1], false)?;
-            match self.node(&p) {
-                Ok(_) => return Err(Errno(98)),
-                Err(Errno(2)) => {}
-                Err(e) => return Err(e),
-            }
-            self.check_parent_write(&p)?;
-            let binding = self.path_bindings.bind(socket);
-            // Search/insert must not overwrite another concurrent binder.
-            self.insert_entry(
-                p,
-                Content::Socket(binding.path()),
-                0o140000 | (0o777 & !self.umask()),
-                true,
-            )
-            .map_err(|error| if error == Errno(17) { Errno(98) } else { error })?;
-            let _ = socket.pathname_binding.set(binding);
-        }
         *socket.name.borrow_mut() = name;
         // Packets queued before bind retain their original unbound address.
         // Future sends share a new immutable source snapshot.
@@ -184,7 +178,7 @@ impl Vfs {
                 .namespace
                 .borrow()
                 .abstract_names
-                .get(&name)
+                .get(&(socket.kind, name))
                 .and_then(std::sync::Weak::upgrade)
                 .ok_or(Errno(111))?
         } else {
@@ -260,7 +254,7 @@ impl DescriptorFactory {
         let mut listener = socket.listener.borrow_mut();
         let pending = &mut listener.as_mut().ok_or(Errno(22))?.pending;
         let front = pending.front().ok_or(Errno(11))?;
-        let name = front.peer_name.borrow().clone();
+        let name = front.peer_address();
         let prepared = prepare(context, name.len())?;
         let reserved = self.files.reserve()?;
         let accepted = pending.pop_front().expect("selected accepted endpoint");

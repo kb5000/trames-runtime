@@ -31,11 +31,6 @@ impl Linux {
             202 | 242 => accept(&vfs.descriptor_factory(), socket, number as u32, a, memory),
             204 | 205 => control(&vfs.descriptor_factory(), socket, number as u32, a, memory)
                 .expect("Unix address ABI"),
-            207 if socket.kind() == 1 => local::recv(a, memory, |count| {
-                socket
-                    .recv_message(count, a[3] as u32 | nonblocking)
-                    .map(|r| r.data)
-            }),
             63..=66 | 206 | 207 => packet_transfer(
                 number as u32,
                 a,
@@ -242,9 +237,26 @@ pub(crate) fn control(
 }
 
 pub(crate) trait MessageIo {
-    type Rights: Clone;
+    type Rights: Clone + Default;
     fn kind(&self) -> u32;
     fn connected(&self) -> bool;
+    fn peer_address(&self) -> Vec<u8>;
+
+    fn receive_address(&self, source: Vec<u8>, has_sender: bool) -> Vec<u8> {
+        if !has_sender {
+            return Vec::new();
+        }
+        let address = if self.kind() == 2 {
+            source
+        } else {
+            self.peer_address()
+        };
+        if address.len() <= 2 {
+            Vec::new()
+        } else {
+            address
+        }
+    }
     fn pid_user_namespace(&self) -> &trames_vfs::UserNamespace;
     fn send_buffer(&self) -> usize;
     fn nonblocking(&self) -> u32;
@@ -293,7 +305,10 @@ impl MessageIo for OwnerMessage<'_> {
         self.socket.kind()
     }
     fn connected(&self) -> bool {
-        self.socket.name(true).is_ok()
+        self.socket.connected()
+    }
+    fn peer_address(&self) -> Vec<u8> {
+        self.socket.peer_address()
     }
     fn send_buffer(&self) -> usize {
         self.socket.buffer_size(false)
@@ -520,7 +535,29 @@ pub(crate) fn prepare_message<I: MessageIo>(
         Some(result)
     }
 }
-impl<R: Clone> PreparedMessage<R> {
+impl<R: Clone + Default> PreparedMessage<R> {
+    pub(crate) fn send_size(&self) -> usize {
+        self.frame.vectors.size
+    }
+    pub(crate) fn send_from(
+        &self,
+        io: &mut impl MessageIo<Rights = R>,
+        offset: usize,
+    ) -> Option<Result<usize>> {
+        let (bytes, rights, identity, explicit) = self.send.as_ref().expect("prepared send");
+        let rights = if offset == 0 {
+            rights.clone()
+        } else {
+            R::default()
+        };
+        let flags = self.args[2] as u32;
+        let destination = self.frame.destination.as_deref();
+        if *explicit {
+            io.send_explicit(&bytes[offset..], flags, destination, rights, *identity)
+        } else {
+            io.send(&bytes[offset..], flags, destination, rights, *identity)
+        }
+    }
     pub(crate) fn recheck(&self, memory: &impl CpuMemory) -> Result<()> {
         if !self.receive {
             return Ok(());
@@ -623,11 +660,7 @@ impl<R: Clone> PreparedMessage<R> {
                 if let Some(output) = output {
                     output.write_bytes(
                         memory,
-                        if io.kind() == 1 {
-                            &[]
-                        } else {
-                            &received.source
-                        },
+                        &io.receive_address(received.source, received.has_sender),
                     )?;
                 } else {
                     memory
@@ -651,30 +684,12 @@ impl<R: Clone> PreparedMessage<R> {
                     received.data.len()
                 } as u64)
             } else {
-                let (bytes, rights, identity, explicit) =
-                    self.send.as_ref().expect("prepared send");
-                let sent = if *explicit {
-                    io.send_explicit(
-                        bytes,
-                        a[2] as u32,
-                        self.frame.destination.as_deref(),
-                        rights.clone(),
-                        *identity,
-                    )
-                } else {
-                    io.send(
-                        bytes,
-                        a[2] as u32,
-                        self.frame.destination.as_deref(),
-                        rights.clone(),
-                        *identity,
-                    )
-                };
-                sent.unwrap_or_else(|| {
-                    deferred.set(true);
-                    Err(Errno(11))
-                })
-                .map(|n| n as u64)
+                self.send_from(io, 0)
+                    .unwrap_or_else(|| {
+                        deferred.set(true);
+                        Err(Errno(11))
+                    })
+                    .map(|n| n as u64)
             }
         })();
         if deferred.get() {

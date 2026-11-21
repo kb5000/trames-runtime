@@ -82,6 +82,7 @@ pub(crate) struct Received {
     pub data: Vec<u8>,
     pub length: usize,
     pub truncated: bool,
+    pub has_sender: bool,
     pub(super) rights: Option<QueuedRights>,
     pub credentials: Option<[u32; 3]>,
     pub timestamp: Option<[u64; 2]>,
@@ -570,6 +571,7 @@ impl Resource {
                     timestamp = packet.timestamp;
                 }
                 return Some(Ok(Received {
+                    has_sender: true,
                     data: Vec::new(),
                     length: 0,
                     truncated: false,
@@ -591,6 +593,7 @@ impl Resource {
                 }
                 let length = packet.data.len();
                 let out = Received {
+                    has_sender: true,
                     data: packet.data[..count.min(length)].to_vec(),
                     length,
                     truncated: count < length,
@@ -683,6 +686,7 @@ impl Resource {
             }
             let length = bytes.len();
             Some(Ok(Received {
+                has_sender: true,
                 data: bytes,
                 length,
                 truncated: false,
@@ -732,6 +736,7 @@ impl Resource {
 impl Received {
     fn empty(options: [u32; 2]) -> Self {
         Self {
+            has_sender: false,
             data: Vec::new(),
             length: 0,
             truncated: false,

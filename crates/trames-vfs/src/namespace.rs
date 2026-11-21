@@ -372,6 +372,22 @@ impl Vfs {
         self.fd_writable(fd)?;
         let open_descriptor = self.descriptor(fd)?;
         let open = open_descriptor.open.borrow();
+        if let Some(socket) = &open.local {
+            let (uid, gid) = open.owner;
+            if self.credentials.fsuid != uid
+                && !self.credentials.inode_cap(capabilities::FOWNER, uid, gid)
+            {
+                return Err(Errno(1));
+            }
+            let mut mode = mode & 0o7777;
+            if !self.credentials.in_group(gid)
+                && !self.credentials.inode_cap(capabilities::FSETID, uid, gid)
+            {
+                mode &= !0o2000;
+            }
+            socket.inode_permissions.store(mode, Ordering::Relaxed);
+            return Ok(());
+        }
         let n = open.metadata_node().ok_or(Errno(22))?;
         if matches!(n.borrow().content, Content::Symlink(_)) {
             return Err(Errno(95));

@@ -960,6 +960,7 @@ impl Socket {
         result
     }
     pub fn recv(&self, count: usize, flags: u32) -> Result<Received> {
+        let flags = flags & !MSG_NOSIGNAL;
         let mut received = self.recv_inner(count, flags)?;
         let mut allowed = false;
         for attempt in 0..16 {

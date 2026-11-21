@@ -143,8 +143,10 @@ pub struct LocalResource {
     channel: LocalChannel,
     transition: std::sync::Mutex<()>,
     datagram_connected: std::sync::atomic::AtomicBool,
-    name: SharedCell<Vec<u8>>,
-    peer_name: SharedCell<Vec<u8>>,
+    // A peer retains the address cell, never the endpoint or its file rights.
+    name: Arc<SharedCell<Vec<u8>>>,
+    peer_name: SharedCell<Option<Arc<SharedCell<Vec<u8>>>>>,
+    pub(super) inode_permissions: std::sync::atomic::AtomicU32,
     credentials: SharedCell<[u32; 3]>,
     peer_credentials: SharedCell<[u32; 3]>,
     listener: SharedCell<Option<Listener>>,
@@ -192,7 +194,7 @@ struct Listener {
 }
 #[derive(Default)]
 pub(super) struct LocalNamespace {
-    abstract_names: BTreeMap<Vec<u8>, std::sync::Weak<LocalResource>>,
+    abstract_names: BTreeMap<(u32, Vec<u8>), std::sync::Weak<LocalResource>>,
     sockets: Vec<std::sync::Weak<LocalResource>>,
     next_autobind: u32,
 }
@@ -237,6 +239,7 @@ pub struct LocalReceived<R = LocalRights> {
     pub data: Vec<u8>,
     pub length: usize,
     pub truncated: bool,
+    pub has_sender: bool,
     pub rights: R,
     pub credentials: Option<[u32; 3]>,
     pub source: Vec<u8>,
@@ -244,7 +247,7 @@ pub struct LocalReceived<R = LocalRights> {
     pub timestamp: Option<(u32, [u64; 2])>,
 }
 impl LocalResource {
-    fn connected(&self) -> bool {
+    pub fn connected(&self) -> bool {
         self.channel.paired.get().is_some() || self.datagram_connected.load(Ordering::Acquire)
     }
     fn side(&self) -> usize {
@@ -297,8 +300,9 @@ impl LocalResource {
             channel: LocalChannel::new(kind),
             transition: std::sync::Mutex::new(()),
             datagram_connected: std::sync::atomic::AtomicBool::new(false),
-            name: SharedCell::new(vec![1, 0]),
-            peer_name: SharedCell::new(vec![1, 0]),
+            name: Arc::new(SharedCell::new(vec![1, 0])),
+            peer_name: Default::default(),
+            inode_permissions: 0o777.into(),
             credentials: SharedCell::new(credentials),
             peer_credentials: SharedCell::new([0, u32::MAX, u32::MAX]),
             listener: SharedCell::new(None),
@@ -340,7 +344,7 @@ impl LocalResource {
             .ends = [Arc::downgrade(a), Arc::downgrade(b)];
         let channel = Arc::new(Channel { resource });
         for (side, (end, peer)) in [(a, b), (b, a)].into_iter().enumerate() {
-            *end.peer_name.borrow_mut() = peer.name.borrow().clone();
+            *end.peer_name.borrow_mut() = Some(peer.name.clone());
             end.peer_credentials.set(peer.credentials.get());
             channel
                 .resource
@@ -356,10 +360,16 @@ impl LocalResource {
             return Err(Errno(107));
         }
         Ok(if peer {
-            self.peer_name.borrow().clone()
+            self.peer_address()
         } else {
             self.name.borrow().clone()
         })
+    }
+    pub fn peer_address(&self) -> Vec<u8> {
+        self.peer_name
+            .borrow()
+            .as_ref()
+            .map_or_else(|| vec![1, 0], |addr| addr.borrow().clone())
     }
     pub fn peer_credentials(&self) -> [u32; 3] {
         self.peer_credentials.get()
@@ -373,8 +383,7 @@ impl LocalResource {
             .pending
             .front()
             .ok_or(Errno(11))?
-            .peer_name
-            .borrow()
+            .peer_address()
             .len())
     }
     pub fn listening(&self) -> bool {
@@ -618,6 +627,7 @@ impl LocalSocket {
         Ok(LocalReceived {
             data: received.data,
             length: received.length,
+            has_sender: received.has_sender,
             truncated: received.truncated,
             rights,
             credentials: if self.passcred.load(Ordering::Relaxed) {

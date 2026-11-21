@@ -185,6 +185,7 @@ impl channel::Resource {
                     data: received.data,
                     length: received.length,
                     truncated: received.truncated,
+                    has_sender: received.has_sender,
                     rights,
                     credentials: if received.options[0] != 0 {
                         received.credentials.or(Some([0, u32::MAX, u32::MAX]))

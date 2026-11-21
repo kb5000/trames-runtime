@@ -869,6 +869,7 @@ impl Socket {
         Ok(count)
     }
     pub fn recv(&self, count: usize, flags: u32) -> Result<Received> {
+        let flags = flags & !MSG_NOSIGNAL;
         if flags & !(MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT) != 0 {
             return Err(NetError(95));
         }

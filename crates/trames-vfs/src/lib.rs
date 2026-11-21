@@ -4436,7 +4436,9 @@ impl Vfs {
                     0o100444
                 } else if o.anonymous.is_some() {
                     0o600
-                } else if o.socket.is_some() || o.local.is_some() {
+                } else if let Some(local) = &o.local {
+                    0o140000 | local.inode_permissions.load(Ordering::Relaxed)
+                } else if o.socket.is_some() {
                     0o140600
                 } else if o.pipe.is_some()
                     || matches!(o.kind, FdKind::Stdin | FdKind::Stdout | FdKind::Stderr)

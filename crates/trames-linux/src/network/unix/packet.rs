@@ -104,7 +104,7 @@ impl PreparedPacket {
             }
             (vec![(a[1], count)], count)
         };
-        let output = if number == 207 && io.kind() != 1 {
+        let output = if number == 207 {
             AddressOutput::prepare(memory, a[4], a[5], 110)?
         } else {
             None
@@ -156,7 +156,10 @@ impl PreparedPacket {
         Some((|| {
             Linux::scatter(memory, &self.parts, &received.data)?;
             if let Some(output) = self.output {
-                output.write_bytes(memory, &received.source)?;
+                output.write_bytes(
+                    memory,
+                    &io.receive_address(received.source, received.has_sender),
+                )?;
             }
             // Plain reads/recvfrom discard ancillary rights outside the queue lock.
             io.receive_rights(received.rights, 0, false);
@@ -186,7 +189,7 @@ impl PreparedPacket {
         unreachable!("accepted packet send")
     }
 }
-impl<R: Clone> PreparedTransfer<R> {
+impl<R: Clone + Default> PreparedTransfer<R> {
     pub fn recheck(&self, memory: &impl CpuMemory) -> Result<()> {
         match self {
             Self::Message(prepared) => prepared.recheck(memory),

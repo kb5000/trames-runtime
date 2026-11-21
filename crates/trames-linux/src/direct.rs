@@ -1470,7 +1470,7 @@ impl DirectSyscalls {
             206 if args[4] != 0 => Err(Errno(
                 if fd
                     .local_operation()
-                    .is_some_and(|socket| socket.name(true).is_ok())
+                    .is_some_and(|socket| socket.connected())
                 {
                     106
                 } else {
@@ -1478,13 +1478,25 @@ impl DirectSyscalls {
                 },
             )),
             206 => crate::network::local::send(args, memory, &mut self.scratch.borrow_mut(), write),
-            207 => crate::network::local::recv(args, memory, read),
+            207 => crate::network::local::recv(
+                args,
+                memory,
+                || {
+                    fd.local_operation()
+                        .map_or_else(Vec::new, |socket| socket.peer_address())
+                },
+                read,
+            ),
             210 => fd.shutdown(args[1] as u32).map(|()| 0),
             211 | 212 => crate::network::local::message(
                 number,
                 args,
                 memory,
                 &mut self.scratch.borrow_mut(),
+                || {
+                    fd.local_operation()
+                        .map_or_else(Vec::new, |socket| socket.peer_address())
+                },
                 read,
                 write,
             )?,

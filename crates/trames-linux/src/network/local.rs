@@ -35,7 +35,7 @@ impl Message {
             )?;
         }
         let output = if receive {
-            AddressOutput::prepare(memory, name, address + 8, 2)?
+            AddressOutput::prepare(memory, name, address + 8, 110)?
         } else {
             None
         };
@@ -66,15 +66,21 @@ pub(crate) fn send(
 pub(crate) fn recv(
     a: [u64; 6],
     memory: &mut impl CpuMemory,
+    peer_address: impl FnOnce() -> Vec<u8>,
     recv: impl FnOnce(usize) -> Result<Vec<u8>>,
 ) -> Result<u64> {
     let count = a[2].min(crate::MAX_WRITE as u64) as usize;
     Linux::check(memory, a[1], count, Access::Write)?;
-    let output = AddressOutput::prepare(memory, a[4], a[5], 2)?;
+    let output = AddressOutput::prepare(memory, a[4], a[5], 110)?;
     let bytes = recv(count)?;
     memory.write(a[1], &bytes).map_err(|_| Errno(14))?;
     if let Some(output) = output {
-        output.write_bytes(memory, &[])?;
+        let name = if bytes.is_empty() {
+            Vec::new()
+        } else {
+            peer_address()
+        };
+        output.write_bytes(memory, if name.len() > 2 { &name } else { &[] })?;
     }
     Ok(bytes.len() as u64)
 }
@@ -85,6 +91,7 @@ pub(crate) fn message(
     a: [u64; 6],
     memory: &mut impl CpuMemory,
     scratch: &mut Vec<u8>,
+    peer_address: impl FnOnce() -> Vec<u8>,
     recv: impl FnOnce(usize) -> Result<Vec<u8>>,
     send: impl FnOnce(&[u8]) -> Result<u64>,
 ) -> Option<Result<u64>> {
@@ -101,7 +108,12 @@ pub(crate) fn message(
             let bytes = recv(message.vectors.size)?;
             message.vectors.write(memory, &bytes)?;
             if let Some(output) = message.output {
-                output.write_bytes(memory, &[])?;
+                let name = if bytes.is_empty() {
+                    Vec::new()
+                } else {
+                    peer_address()
+                };
+                output.write_bytes(memory, if name.len() > 2 { &name } else { &[] })?;
             } else {
                 memory
                     .write_array(a[1] + 8, 0u32.to_le_bytes())
@@ -151,6 +163,7 @@ mod tests {
             args,
             &mut memory,
             &mut scratch,
+            Vec::new,
             |_| panic!("send must not receive"),
             |bytes| {
                 assert_eq!(bytes, b"abc");
@@ -163,6 +176,7 @@ mod tests {
             args,
             &mut memory,
             &mut scratch,
+            Vec::new,
             |capacity| {
                 assert_eq!(capacity, 3);
                 Ok(b"xyz".to_vec())
@@ -180,6 +194,7 @@ mod tests {
             args,
             &mut memory,
             &mut scratch,
+            Vec::new,
             |_| {
                 touched.set(true);
                 Ok(Vec::new())
@@ -196,6 +211,7 @@ mod tests {
             args,
             &mut memory,
             &mut scratch,
+            Vec::new,
             |_| panic!("send must not receive"),
             |_| {
                 touched.set(true);

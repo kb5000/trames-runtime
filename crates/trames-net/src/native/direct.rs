@@ -179,6 +179,7 @@ impl DirectTcp {
         Ok(n)
     }
     pub fn recv(&self, count: usize, flags: u32) -> Result<Vec<u8>> {
+        let flags = flags & !MSG_NOSIGNAL;
         let socket = self.socket.upgrade().ok_or(NetError(9))?;
         if socket.filtered() {
             return socket.recv(count, flags).map(|r| r.data);

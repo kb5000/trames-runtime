@@ -3,6 +3,7 @@
 use super::*;
 mod batch;
 use batch::Batch;
+use std::sync::atomic::{AtomicUsize, Ordering};
 // Keep the existing single-message records inline in their Arc allocation.
 // Boxing them would add an allocation to every normal message for a cold batch.
 #[allow(clippy::large_enum_variant)]
@@ -10,6 +11,10 @@ enum Transfer {
     Single {
         prepared: crate::network::unix::PreparedTransfer<trames_vfs::SharedRights>,
         datagram: Option<crate::network::unix::DatagramState>,
+    },
+    StreamSend {
+        message: crate::network::unix::PreparedMessage<trames_vfs::SharedRights>,
+        written: AtomicUsize,
     },
     Batch(Box<Batch>),
 }
@@ -37,7 +42,12 @@ impl crate::network::unix::MessageIo for Message<'_> {
     fn connected(&self) -> bool {
         self.fd
             .local_operation()
-            .is_some_and(|socket| socket.name(true).is_ok())
+            .is_some_and(|socket| socket.connected())
+    }
+    fn peer_address(&self) -> Vec<u8> {
+        self.fd
+            .local_operation()
+            .map_or_else(Vec::new, |socket| socket.peer_address())
     }
     fn send_buffer(&self) -> usize {
         self.fd.local_send_buffer()
@@ -146,10 +156,13 @@ impl crate::network::unix::MessageIo for Message<'_> {
 }
 impl AcceptedMessage {
     pub(super) fn interrupted(&self, memory: &mut impl CpuMemory) -> Option<Result<u64, Errno>> {
-        if let Transfer::Batch(batch) = &self.transfer {
-            batch.partial_receive(memory)
-        } else {
-            None
+        match &self.transfer {
+            Transfer::Batch(batch) => batch.partial_receive(memory),
+            Transfer::StreamSend { written, .. } => {
+                let n = written.load(Ordering::Relaxed);
+                (n != 0).then_some(Ok(n as u64))
+            }
+            Transfer::Single { .. } => None,
         }
     }
 }
@@ -165,7 +178,7 @@ impl DirectSyscalls {
         let identity = self
             .local_identity
             .unwrap_or_else(|| factory.local_sender_credentials());
-        self.prepare_local_context(fd, number, args, memory, (factory, identity))
+        self.prepare_local_context(fd, number, args, memory, (factory, identity), true)
     }
     fn prepare_local_context(
         &self,
@@ -174,6 +187,7 @@ impl DirectSyscalls {
         args: [u64; 6],
         memory: &impl CpuMemory,
         (factory, identity): (&trames_vfs::DescriptorFactory, [u32; 3]),
+        standalone: bool,
     ) -> Option<Result<RetainedByte, Errno>> {
         if matches!(number, 243 | 269) {
             return Some(Batch::new(number, args, memory).map(|batch| RetainedByte {
@@ -208,7 +222,21 @@ impl DirectSyscalls {
                 |prepared| RetainedByte {
                     fd: fd.clone(),
                     operation: ByteOperation::Message(Arc::new(AcceptedMessage {
-                        transfer: Transfer::Single { prepared, datagram },
+                        transfer: match prepared {
+                            crate::network::unix::PreparedTransfer::Message(message)
+                                if standalone
+                                    && number == 211
+                                    && fd.local_kind() == 1
+                                    && !fd.nonblocking()
+                                    && args[2] & 0x40 == 0 =>
+                            {
+                                Transfer::StreamSend {
+                                    message,
+                                    written: 0.into(),
+                                }
+                            }
+                            prepared => Transfer::Single { prepared, datagram },
+                        },
                         factory: factory.clone(),
                         identity,
                         number,
@@ -339,10 +367,7 @@ impl DirectSyscalls {
             return Some(read.check(&file.fd, memory));
         }
         if let Some(accepted) = file.message() {
-            let Transfer::Single { prepared, datagram } = &accepted.transfer else {
-                let Transfer::Batch(batch) = &accepted.transfer else {
-                    unreachable!()
-                };
+            if let Transfer::Batch(batch) = &accepted.transfer {
                 let result = batch.progress(self, accepted, &file.fd, memory, original_paths);
                 if let Some(task) = self
                     .task_signal
@@ -355,21 +380,51 @@ impl DirectSyscalls {
                 }
                 return result;
             };
-            if let Err(error) = prepared.recheck(memory) {
-                return Some(Err(error));
+            let datagram = match &accepted.transfer {
+                Transfer::Single { datagram, .. } => datagram.as_ref(),
+                _ => None,
+            };
+            let mut io = Message {
+                factory: &accepted.factory,
+                fd: &file.fd,
+                identity: accepted.identity,
+                datagram,
+                paths: self.paths.as_ref(),
+                original_paths,
+                receive_flags: socket_flags(number, args),
+            };
+            match &accepted.transfer {
+                Transfer::Single { prepared, .. } => {
+                    if let Err(error) = prepared.recheck(memory) {
+                        return Some(Err(error));
+                    }
+                    prepared.progress(memory, &mut io)
+                }
+                Transfer::StreamSend { message, written } => {
+                    // Only the executing task advances its accepted call. Interruption
+                    // reads the byte count; no queue or socket-wide lock is needed.
+                    let mut offset = written.load(Ordering::Relaxed);
+                    loop {
+                        match message.send_from(&mut io, offset)? {
+                            Ok(n) => {
+                                offset += n;
+                                if offset == message.send_size() || n == 0 || file.fd.nonblocking()
+                                {
+                                    return Some(Ok(offset as u64));
+                                }
+                                written.store(offset, Ordering::Relaxed);
+                            }
+                            Err(error)
+                                if offset != 0 && (error != Errno(11) || file.fd.nonblocking()) =>
+                            {
+                                return Some(Ok(offset as u64));
+                            }
+                            Err(error) => return Some(Err(error)),
+                        }
+                    }
+                }
+                Transfer::Batch(_) => unreachable!(),
             }
-            prepared.progress(
-                memory,
-                &mut Message {
-                    factory: &accepted.factory,
-                    fd: &file.fd,
-                    identity: accepted.identity,
-                    datagram: datagram.as_ref(),
-                    paths: self.paths.as_ref(),
-                    original_paths,
-                    receive_flags: socket_flags(number, args),
-                },
-            )
         } else {
             self.transfer_fd(&file.fd, number, args, memory)
         }
@@ -404,7 +459,7 @@ impl RetainedByte {
     pub(super) fn datagram_target(&self) -> Option<&trames_vfs::LocalDatagram> {
         match &self.message()?.transfer {
             Transfer::Single { datagram, .. } => datagram.as_ref()?.target.get(),
-            Transfer::Batch(_) => None,
+            Transfer::Batch(_) | Transfer::StreamSend { .. } => None,
         }
     }
     pub(super) fn subscribe(&self, signal: &Arc<IoSignal>) -> Vec<trames_vfs::IoSubscription> {
@@ -1591,6 +1646,47 @@ mod tests {
             assert!(matches!(attempt, IoAttempt::Complete(Ok(1))));
             assert_eq!(signals.0.load(std::sync::atomic::Ordering::Relaxed), 0);
             assert_eq!(v.read(rx, 4).unwrap(), b"abcd");
+            assert_eq!(v.read(rx, 4), Err(Errno(11)));
+        }
+    }
+    #[test]
+    fn stream_sendmsg_reports_committed_prefix_on_interrupt_and_dontwait() {
+        for flags in [0, 0x40] {
+            let mut v = Vfs::default();
+            let [tx, rx] = v.socketpair(1, 1, 0).unwrap();
+            v.local_socket(tx)
+                .unwrap()
+                .unwrap()
+                .set_reuse(7, 1024)
+                .unwrap();
+            v.write(tx, &[0x55; 2046]).unwrap();
+            let d = direct(&v);
+            let mut m = memory();
+            header(&mut m, 0);
+            let target: Arc<dyn IoWake> = Arc::new(Target);
+            let attempt = d
+                .start(
+                    211,
+                    [tx as u64, 0x1000, flags, 0, 0, 0],
+                    &mut m,
+                    1,
+                    &Arc::downgrade(&target),
+                    None,
+                )
+                .unwrap();
+            if flags == 0 {
+                let wait = blocked(attempt);
+                assert_eq!(
+                    wait.retained_byte.as_ref().unwrap().interrupted(&mut m),
+                    Some(Ok(2))
+                );
+            } else {
+                assert!(matches!(attempt, IoAttempt::Complete(Ok(2))));
+            }
+            assert_eq!(
+                v.read(rx, 2048).unwrap(),
+                [vec![0x55; 2046], b"ab".to_vec()].concat()
+            );
             assert_eq!(v.read(rx, 4), Err(Errno(11)));
         }
     }

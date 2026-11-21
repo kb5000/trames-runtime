@@ -125,6 +125,7 @@ impl Batch {
                         item_args,
                         memory,
                         (&accepted.factory, accepted.identity),
+                        false, // sendmmsg publishes a short item and completes its batch.
                     ) {
                         Some(Ok(item)) => state.active = Some(item),
                         Some(Err(error)) => return Err(error),
