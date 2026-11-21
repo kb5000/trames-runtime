@@ -562,7 +562,8 @@ impl<'a> Socket<'a> {
         true
     }
 
-    pub(crate) fn process(
+    /// Enqueue a validated IP/UDP datagram after interface demultiplexing.
+    pub fn process(
         &mut self,
         cx: &mut Context,
         meta: PacketMeta,

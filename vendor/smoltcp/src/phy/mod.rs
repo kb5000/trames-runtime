@@ -163,6 +163,8 @@ pub use self::tuntap_interface::TunTapInterface;
 pub struct PacketMeta {
     /// The eight traffic class bits (DSCP and ECN) from the wire.
     pub traffic_class: u8,
+    /// Guest ingress interface when explicitly supplied for group delivery.
+    pub ingress_index: u32,
     /// On transmit, None selects the socket default.
     pub hop_limit: Option<u8>,
     #[cfg(feature = "packetmeta-id")]

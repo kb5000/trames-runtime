@@ -170,7 +170,13 @@ impl Topology {
             .flat_map(|packet| self.ethernet_datagrams(ns, index, mac, packet))
             .collect()
     }
-    fn ethernet_datagrams(&self, ns: u64, index: u32, mac: Mac, packet: Vec<u8>) -> Vec<Action> {
+    pub(crate) fn ethernet_datagrams(
+        &self,
+        ns: u64,
+        index: u32,
+        mac: Mac,
+        packet: Vec<u8>,
+    ) -> Vec<Action> {
         self.ethernet_ip_frames(ns, index, mac, None, packet)
             .into_iter()
             .map(|f| Action::Send(ns, index, f))

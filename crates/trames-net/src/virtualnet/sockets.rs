@@ -353,7 +353,7 @@ impl Socket {
         let _binding = self.network.0.binding.lock();
         self.bind_locked(a)
     }
-    fn ensure_bound(&self) -> Result<()> {
+    pub(super) fn ensure_bound(&self) -> Result<()> {
         let _binding = self.network.0.binding.lock();
         if self.state.borrow().bound.is_some() {
             return Ok(());
@@ -369,7 +369,7 @@ impl Socket {
         if self.state.borrow().bound.is_some() {
             return Err(NetError(22));
         }
-        if !self.own(a.ip()) {
+        if !(self.own(a.ip()) || self.kind == 2 && multicast::group(a.ip())) {
             return Err(NetError(99));
         }
         if self.kind == 4 {
@@ -534,6 +534,7 @@ impl Socket {
             udp_options: state.udp_options,
             last_hop: None,
             broadcast: state.broadcast,
+            multicast: None,
             icmp6_filter: state.icmp6_filter,
             hop_message: state.hop_message,
             device: state.device,
@@ -561,10 +562,17 @@ impl Socket {
         }
         // UDP connect is also Linux's source-route probe: a zero destination
         // port selects the source without establishing a getpeername peer.
-        if self.kind == 2 {
-            self.destination_ip(a.ip())?;
+        let group_source = if self.kind == 2 && multicast::group(a.ip()) {
+            Some(IpAddr::V4(self.group_source(a, None)?.1))
         } else {
-            self.destination(a)?;
+            None
+        };
+        if group_source.is_none() {
+            if self.kind == 2 {
+                self.destination_ip(a.ip())?;
+            } else {
+                self.destination(a)?;
+            }
         }
         let state = self.state.borrow();
         if self.kind == 1 {
@@ -585,7 +593,9 @@ impl Socket {
             let mut fabric = self.network.0.fabric.0.borrow_mut();
             let mut s = self.state.borrow_mut();
             if self.kind == 2 && s.bound.is_some_and(|b| b.ip().is_unspecified()) {
-                let source = if let Some(view) = self.network.0.routing.get() {
+                let source = if let Some(source) = group_source {
+                    source
+                } else if let Some(view) = self.network.0.routing.get() {
                     self.route_source(view, a.ip())?
                 } else if a.ip().is_loopback() {
                     if a.is_ipv4() {
@@ -776,6 +786,9 @@ impl Socket {
             } else {
                 self.state.borrow().peer.ok_or(NetError(89))?
             };
+            if multicast::group(a.ip()) {
+                return self.send_group(a, bytes, control);
+            }
             self.destination(a)?;
             if bytes.len() > if a.is_ipv4() { 65507 } else { 65527 } {
                 return Err(NetError(90));
@@ -793,9 +806,10 @@ impl Socket {
             if a.is_ipv6() && state.bound.is_some_and(|b| b.is_ipv4()) {
                 return Err(NetError(97));
             }
+            let group_bound = state.bound.is_some_and(|b| multicast::group(b.ip()));
             let selected = if let Some(info) = info.filter(|i| !i.address.is_unspecified()) {
                 Some(info.address)
-            } else if state.bound.is_some_and(|b| b.ip().is_unspecified()) {
+            } else if group_bound || state.bound.is_some_and(|b| b.ip().is_unspecified()) {
                 self.network
                     .0
                     .routing
@@ -813,7 +827,7 @@ impl Socket {
                     let ep = n.sockets.get::<udp::Socket>(**h).endpoint();
                     ep.addr.is_some_and(|p| {
                         if let Some(source) = selected {
-                            addr(p) == source
+                            addr(p) == source || group_bound
                         } else {
                             addr(p).is_ipv4() == a.is_ipv4()
                                 && addr(p).is_loopback() == a.ip().is_loopback()
@@ -842,7 +856,8 @@ impl Socket {
                         endpoint: endpoint(a),
                         local_address: info
                             .filter(|i| !i.address.is_unspecified())
-                            .map(|i| ip(i.address)),
+                            .map(|i| ip(i.address))
+                            .or_else(|| selected.filter(|_| group_bound).map(ip)),
                         meta: {
                             let family = usize::from(a.is_ipv6());
                             let defaults = state.udp_options[family].fields;
@@ -1057,7 +1072,8 @@ impl Socket {
                     let ipv6 = source.is_ipv6();
                     let options = state.udp_options[usize::from(ipv6)];
                     let mapped = !ipv6 && self.family == 10 && state.udp_options[1].receive_info;
-                    let headers = crate::ReceivedIp {
+                    let mut headers = crate::ReceivedIp {
+                        spec_destination: None,
                         fields: crate::IpFields {
                             hop_limit: meta.meta.hop_limit.filter(|_| options.receive_hops),
                             traffic_class: options.receive_class.then_some(meta.meta.traffic_class),
@@ -1078,20 +1094,38 @@ impl Socket {
                     let packet_info = if options.receive_info || mapped {
                         meta.local_address.map(|a| {
                             let address = addr(a);
-                            let interface = self
-                                .network
-                                .0
-                                .routing
-                                .get()
-                                .and_then(|v| {
-                                    v.graph
-                                        .read()
-                                        .unwrap()
-                                        .devices(v.namespace)
-                                        .into_iter()
-                                        .find(|d| d.addresses.iter().any(|a| a.ip == address))
-                                })
-                                .map_or(if address.is_loopback() { 1 } else { 2 }, |d| d.index);
+                            let interface = if meta.meta.ingress_index != 0 {
+                                let idx = meta.meta.ingress_index;
+                                headers.spec_destination = self
+                                    .network
+                                    .0
+                                    .routing
+                                    .get()
+                                    .and_then(|v| {
+                                        v.graph.read().unwrap().device(v.namespace, idx).ok()
+                                    })
+                                    .and_then(|d| {
+                                        d.addresses.iter().find_map(|a| match a.ip {
+                                            IpAddr::V4(v) => Some(v),
+                                            _ => None,
+                                        })
+                                    });
+                                idx
+                            } else {
+                                self.network
+                                    .0
+                                    .routing
+                                    .get()
+                                    .and_then(|v| {
+                                        v.graph
+                                            .read()
+                                            .unwrap()
+                                            .devices(v.namespace)
+                                            .into_iter()
+                                            .find(|d| d.addresses.iter().any(|a| a.ip == address))
+                                    })
+                                    .map_or(if address.is_loopback() { 1 } else { 2 }, |d| d.index)
+                            };
                             let address = if mapped && !options.receive_info {
                                 self.presented(SocketAddr::new(address, 0)).ip()
                             } else {
@@ -1254,6 +1288,7 @@ impl Socket {
                 }
                 return Ok(());
             }
+            (0, 33 | 34 | 49) if self.kind == 2 => return state.multicast_scalar(name, value),
             (1, 2) => {
                 state.reuse = value != 0;
                 state.udp_shared |= value != 0 && state.udp_bind_order != 0;
@@ -1469,6 +1504,7 @@ impl Socket {
                 17
             }),
             (1, 30) => Ok(i32::from(state.connection == Connection::Listening)),
+            (0, 32 | 33 | 34 | 49) if self.kind == 2 => Ok(state.multicast_value(name)),
             (1, 2) => Ok(i32::from(state.reuse)),
             (1, 15) if self.kind == 2 => Ok(i32::from(state.reuse_port)),
             (1, 9) => Ok(i32::from(state.keepalive)),
@@ -1502,6 +1538,9 @@ impl Socket {
         ))
     }
     pub fn set_option_bytes(&self, level: u32, name: u32, value: &[u8]) -> Result<()> {
+        if level == 0 && self.kind == 2 && matches!(name, 32 | 35 | 36) {
+            return self.membership(name, value);
+        }
         if (level, name) == (1, 13) {
             let linger = crate::parse_linger(value)?;
             if linger.is_some_and(|d| !d.is_zero()) {

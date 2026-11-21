@@ -6,6 +6,7 @@ use crate::shared_state::{Cell, State as SharedState};
 use crate::socket_quota::{Quota, Reservation};
 use std::ops::Deref;
 mod ethernet;
+mod multicast;
 mod wire;
 pub use wire::WireWait;
 mod gateway;
@@ -172,6 +173,7 @@ struct State {
     hop_limit: u8,
     receive_hops: bool,
     udp_options: [UdpOptions; 2],
+    multicast: Option<Box<multicast::Options>>,
     last_hop: Option<u8>,
     broadcast: bool,
     icmp6_filter: [u8; 32],
@@ -792,6 +794,12 @@ impl Inner {
                     if !packet::valid_transport(&p) {
                         self.stats.dropped += 1;
                         continue;
+                    }
+                    if let Some(index) = injected {
+                        if h.protocol == 17 && multicast::group(h.tuple.destination.ip()) {
+                            self.group_input(source, view, index, &mut p);
+                            continue;
+                        }
                     }
                     let original = crate::conntrack::key(&p);
                     let incoming = injected
@@ -1429,6 +1437,7 @@ impl Network {
                 udp_options: Default::default(),
                 last_hop: None,
                 broadcast: false,
+                multicast: None,
                 icmp6_filter: [0; 32],
                 hop_message: 52,
                 device: None,

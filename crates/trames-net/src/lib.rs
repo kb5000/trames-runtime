@@ -78,6 +78,7 @@ pub struct ReceivedIp {
     /// Also deliver IPv6 packet info for an IPv4 datagram on a dual-stack socket.
     pub mapped_info: bool,
     pub original_destination: Option<SocketAddr>,
+    pub spec_destination: Option<std::net::Ipv4Addr>,
 }
 
 // Linux treats the requested int as unsigned, clamps it, then doubles it.

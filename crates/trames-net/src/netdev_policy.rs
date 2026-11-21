@@ -212,6 +212,16 @@ impl Topology {
         self.changed();
         Ok(())
     }
+    /// An explicit multicast interface still participates in policy routing.
+    pub fn check_group_output(&self, id: u64, destination: IpAddr, context: Context) -> Result<()> {
+        if self.spaces[&id].policy.active {
+            let (_, out, _) = self.source_for(id, destination, context)?;
+            if Some(out) != context.device {
+                return Err(NetError(101));
+            }
+        }
+        Ok(())
+    }
     pub fn source_for(
         &self,
         id: u64,

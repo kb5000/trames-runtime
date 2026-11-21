@@ -324,7 +324,9 @@ impl Prepared {
                         match info.address {
                             std::net::IpAddr::V4(ip) => {
                                 payload.extend_from_slice(&info.interface.to_le_bytes());
-                                payload.extend_from_slice(&ip.octets());
+                                payload.extend_from_slice(
+                                    &received.ip.spec_destination.unwrap_or(ip).octets(),
+                                );
                                 payload.extend_from_slice(&ip.octets());
                                 ancillary.push(0, 8, &payload);
                                 if received.ip.mapped_info {

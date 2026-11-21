@@ -696,3 +696,68 @@ fn tun_and_packet_injection_obey_ip_port_firewall_and_tap_precedes_input_drop() 
     assert_eq!(rx.poll(1), Ok(0));
     assert_eq!(tap.recv(100, 0).unwrap().data, allowed);
 }
+
+#[test]
+fn udp_group_traffic_uses_guest_links_memberships_and_namespace_hooks() {
+    let fabric = crate::Fabric::new().unwrap();
+    let sender_net = Network::virtual_network(&fabric, 2, NetworkMode::Outbound).unwrap();
+    let peer = Network::virtual_network(&fabric, 3, NetworkMode::Outbound).unwrap();
+    let sender = sender_net.socket(2, 2, 0).unwrap();
+    let group = [239, 8, 1, 7];
+    let dest = "239.8.1.7:18307".parse().unwrap();
+    let bind = "0.0.0.0:18307".parse().unwrap();
+    let join = |network: &Network, addr: [u8; 4]| {
+        let rx = network.socket(2, 2, 0).unwrap();
+        rx.set_option(1, 2, 1).unwrap();
+        rx.bind(bind).unwrap();
+        rx.set_option_bytes(0, 35, &[group, addr].concat()).unwrap();
+        rx.set_option(0, 8, 1).unwrap();
+        rx.set_option(0, 12, 1).unwrap();
+        rx
+    };
+    let local = join(&sender_net, [10, 0, 0, 2]);
+    let remote = join(&peer, [10, 0, 0, 3]);
+    let wrong_link = join(&peer, [127, 0, 0, 1]);
+    wrong_link.set_option(0, 49, 0).unwrap();
+    sender.set_option_bytes(0, 32, &[10, 0, 0, 2]).unwrap();
+    sender.set_option(0, 33, 7).unwrap();
+    sender.set_option(0, 34, 0).unwrap();
+    let data = vec![0x23; 6113];
+    sender.send(&data, 0, Some(dest)).unwrap();
+    let packet = remote.recv(data.len(), 0).unwrap();
+    assert_eq!(packet.data, data);
+    assert_eq!(packet.ip.fields.hop_limit, Some(7));
+    let info = packet.packet_info.unwrap();
+    assert_eq!(info.interface, 2);
+    assert_eq!(info.address, dest.ip());
+    assert_eq!(packet.ip.spec_destination, Some([10, 0, 0, 3].into()));
+    assert!(matches!(local.recv(9, 0), Err(crate::NetError(11))));
+    assert!(matches!(wrong_link.recv(9, 0), Err(crate::NetError(11))));
+
+    sender.set_option(0, 34, 1).unwrap();
+    sender.set_option(0, 33, 0).unwrap();
+    sender.send(b"local", 0, Some(dest)).unwrap();
+    assert_eq!(local.recv(9, 0).unwrap().data, b"local");
+    assert!(matches!(remote.recv(9, 0), Err(crate::NetError(11))));
+
+    sender.set_option(0, 33, 1).unwrap();
+    assert_eq!(
+        errno(&batch(
+            &peer.1,
+            &[table("filter"), chain("filter", "input", Some(1), 0, 0)]
+        )),
+        0
+    );
+    sender.send(b"input", 0, Some(dest)).unwrap();
+    assert_eq!(local.recv(9, 0).unwrap().data, b"input");
+    assert!(matches!(remote.recv(9, 0), Err(crate::NetError(11))));
+    assert_eq!(
+        errno(&batch(
+            &sender_net.1,
+            &[table("filter"), chain("filter", "out", Some(3), 0, 0)]
+        )),
+        0
+    );
+    sender.send(b"output", 0, Some(dest)).unwrap();
+    assert!(matches!(local.recv(9, 0), Err(crate::NetError(11))));
+}

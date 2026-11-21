@@ -54,6 +54,30 @@ impl Topology {
             state,
         )
     }
+    pub fn udp_group_hooks(&self, ns: u64, index: u32, incoming: bool, packet: &mut [u8]) -> bool {
+        let Some(key) = conntrack::key(packet) else {
+            return false;
+        };
+        let mut state = self.spaces[&ns].connections.lock().unwrap();
+        let (first, last, links) = if incoming {
+            (0, 1, (index, 0))
+        } else {
+            (3, 4, (0, index))
+        };
+        let mut raw = Track::untracked(key, 0);
+        if !self.hook(ns, (first, true), links, packet, &mut raw, &mut state) {
+            return false;
+        }
+        let Some(mut track) = state.begin(packet, raw.zone) else {
+            return false;
+        };
+        let allowed = self.hook(ns, (first, false), links, packet, &mut track, &mut state)
+            && self.hook(ns, (last, false), links, packet, &mut track, &mut state)
+            && conntrack::key(packet)
+                .is_some_and(|k| k.tuple.destination.ip() == key.tuple.destination.ip());
+        state.finish(track, allowed);
+        allowed
+    }
     fn route_namespace(
         &self,
         namespace: u64,
