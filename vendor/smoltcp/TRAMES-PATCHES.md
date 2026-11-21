@@ -63,3 +63,10 @@ when an incoming segment makes the receive queue readable, frees a full
 transmit queue, or changes the connection state. The interface drains those
 handles after polling. Trames notifies the socket waiters after releasing the
 fabric lock. Protocol timers still drive delayed ACKs and loss recovery.
+
+Linux listeners use protocol sockets as accept-queue slots. Only slots
+explicitly reserved by a listener participate. A SYN consumed by such a
+slot can request another one from its owner after the interface poll.
+An unmatched SYN for a full queue is dropped so the client may retry.
+Acceptance releases the queue association. An incoming RST before accept
+returns the transport to the same listener.

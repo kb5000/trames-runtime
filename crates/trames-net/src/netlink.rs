@@ -35,6 +35,14 @@ pub(super) struct Namespace {
 }
 impl Default for Namespace {
     fn default() -> Self {
+        Self::with_socket_limit(crate::MAX_SOCKETS)
+    }
+}
+impl Namespace {
+    pub(crate) fn packet_stack() -> Self {
+        Self::with_socket_limit(crate::socket_quota::GUEST_SOCKET_LIMIT)
+    }
+    fn with_socket_limit(socket_limit: usize) -> Self {
         let id = NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed);
         let graph = std::sync::Arc::new(std::sync::RwLock::new(crate::netdev::Topology::default()));
         graph.write().unwrap().add_space(id, None, None);
@@ -46,7 +54,7 @@ impl Default for Namespace {
             id,
             inet_inodes: Default::default(),
             native: std::sync::OnceLock::new(),
-            socket_count: std::sync::Arc::default(),
+            socket_count: Arc::new(crate::socket_quota::Quota::with_limit(socket_limit)),
             nft_packet_hooks: Cell::new(true),
             stack: std::sync::OnceLock::new(),
             graph,
@@ -87,7 +95,7 @@ impl Namespace {
     }
     pub fn isolated(&self, loopback: std::sync::Arc<crate::netdev::Loopback>) -> Result<Self> {
         let reservation = self.quota.reserve().map_err(|_| NetError(28))?;
-        let mut namespace = Self::default();
+        let mut namespace = Self::packet_stack();
         namespace.quota = self.quota.clone();
         namespace._reservation = reservation;
         namespace.fabric = self.fabric.clone();

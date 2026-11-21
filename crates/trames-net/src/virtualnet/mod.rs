@@ -114,6 +114,7 @@ impl DetachedTcp {
 struct Node {
     udp_bind_order: u64,
     udp_readers: BTreeMap<u64, Arc<trames_shared::Readiness>>,
+    growing_listeners: Vec<Weak<SocketMeta>>,
     tcp_waiters: BTreeMap<SocketHandle, Arc<trames_shared::Readiness>>,
     id: u8,
     owner: Weak<NamespaceData>,
@@ -184,7 +185,7 @@ struct State {
     bound: Option<SocketAddr>,
     peer: Option<SocketAddr>,
     error: Option<u32>,
-    blocking_failed: bool,
+    connect_result_pending: bool,
     read_closed: bool,
     write_closed: bool,
     v6_only: bool,
@@ -192,7 +193,7 @@ struct State {
     reuse_port: bool,
     udp_bind_order: u64,
     // Address and port requested by bind(2), before ephemeral allocation.
-    udp_requested_bind: Option<SocketAddr>,
+    requested_bind: Option<SocketAddr>,
     udp_shared: bool,
     udp_readable: Option<Arc<trames_shared::Readiness>>,
     udp_group: Option<u64>,
@@ -286,6 +287,15 @@ fn udp_socket() -> udp::Socket<'static> {
     udp_socket_with_buffers(BUFFER, BUFFER)
 }
 impl State {
+    fn fail_connect(&mut self, error: u32) {
+        self.error = Some(error);
+        self.peer = None;
+        // An explicitly chosen port remains bound. An ephemeral port is
+        // released as soon as the active open fails, even if the FD lives on.
+        self.bound = self.requested_bind.filter(|addr| addr.port() != 0);
+        self.connection = Connection::Failed(error);
+    }
+
     fn new_tcp_socket(&self) -> tcp::Socket<'static> {
         let mut socket = tcp_socket();
         if socket.congestion_control() != self.congestion {
@@ -370,6 +380,7 @@ fn make_node(id: u8, now: smoltcp::time::Instant) -> Result<Node> {
     Ok(Node {
         udp_bind_order: 0,
         udp_readers: BTreeMap::new(),
+        growing_listeners: Vec::new(),
         tcp_waiters: BTreeMap::new(),
         id,
         owner: Weak::new(),
@@ -580,7 +591,7 @@ impl Fabric {
                 key,
                 info,
                 mode,
-                live: Arc::new(Quota::default()),
+                live: Arc::new(Quota::with_limit(crate::socket_quota::GUEST_SOCKET_LIMIT)),
                 ephemeral_port: Cell::new(0),
                 port_range: Cell::new((65535 << 16) | 49152),
                 binding: parking_lot::Mutex::new(()),
@@ -623,7 +634,7 @@ impl Fabric {
                     prefix6: 0,
                 },
                 mode,
-                live: Arc::new(Quota::default()),
+                live: Arc::new(Quota::with_limit(crate::socket_quota::GUEST_SOCKET_LIMIT)),
                 ephemeral_port: Cell::new(0),
                 port_range: Cell::new((65535 << 16) | 49152),
                 binding: parking_lot::Mutex::new(()),
@@ -763,6 +774,11 @@ impl Inner {
                         node.sockets.remove(entry.handle);
                         false
                     });
+                }
+                // A verified SYN can arrive over loopback, Ethernet, or a guest link.
+                // Grow the listener only after its transport has consumed a slot.
+                while let Some(endpoint) = node.iface.pop_filled_listener() {
+                    node.grow_accept_queue(address(endpoint));
                 }
                 for h in node.iface.drain_tcp_ready() {
                     if let Some(source) = node.tcp_waiters.get(&h) {
@@ -1136,11 +1152,14 @@ impl Inner {
                     if state.connection == Connection::Connecting {
                         if let Some(&h) = state.handles.first() {
                             match node.sockets.get::<tcp::Socket>(h).state() {
-                                tcp::State::Established => state.connection = Connection::Connected,
+                                tcp::State::Established | tcp::State::CloseWait => {
+                                    state.connection = Connection::Connected
+                                }
                                 tcp::State::Closed => {
                                     let e = state.error.unwrap_or(110);
-                                    state.error = Some(e);
-                                    state.connection = Connection::Failed(e);
+                                    state.fail_connect(e);
+                                    state.handles.clear();
+                                    node.sockets.remove(h);
                                 }
                                 _ => {}
                             }
@@ -1156,6 +1175,37 @@ impl Inner {
     }
 }
 impl Node {
+    fn grow_accept_queue(&mut self, target: SocketAddr) {
+        for entry in &self.growing_listeners {
+            let Some(listener) = entry.upgrade() else {
+                continue;
+            };
+            let mut state = listener.state.borrow_mut();
+            if state.connection != Connection::Listening
+                || state.bound.is_none_or(|b| b.port() != target.port())
+            {
+                continue;
+            }
+            let endpoint = endpoint(target);
+            let mut slots = 0;
+            for &handle in &state.handles {
+                let socket = self.sockets.get::<tcp::Socket>(handle);
+                if socket.listen_endpoint().addr == Some(endpoint.addr) {
+                    if socket.is_listening() {
+                        return;
+                    }
+                    slots += 1;
+                }
+            }
+            if slots > 0 && slots < state.backlog {
+                let mut socket = state.new_tcp_socket();
+                if socket.listen_queued(endpoint, state.backlog).is_ok() {
+                    state.handles.push(self.sockets.add(socket));
+                }
+                return;
+            }
+        }
+    }
     fn configure_dynamic(&mut self) {
         let Some(owner) = self.owner.upgrade() else {
             return;
@@ -1242,10 +1292,7 @@ impl Node {
                 let endpoint = if socket.kind == 2 {
                     self.sockets.get::<udp::Socket>(h).endpoint().addr
                 } else {
-                    self.sockets
-                        .get::<tcp::Socket>(h)
-                        .local_endpoint()
-                        .map(|e| e.addr)
+                    self.sockets.get::<tcp::Socket>(h).listen_endpoint().addr
                 };
                 if endpoint.is_some_and(|a| !desired.contains(&addr(a))) {
                     if socket.kind == 1 && self.sockets.get::<tcp::Socket>(h).is_active() {
@@ -1266,25 +1313,22 @@ impl Node {
                         if socket.kind == 2 {
                             self.sockets.get::<udp::Socket>(h).endpoint().addr == Some(ip(*a))
                         } else {
-                            self.sockets
-                                .get::<tcp::Socket>(h)
-                                .local_endpoint()
-                                .is_some_and(|e| e.addr == ip(*a))
+                            self.sockets.get::<tcp::Socket>(h).listen_endpoint().addr
+                                == Some(ip(*a))
                         }
                     })
                     .count();
-                let needed = if socket.kind == 2 { 1 } else { state.backlog };
-                for _ in count..needed {
+                if count == 0 {
                     let ep = SocketAddr::new(*a, bound.port());
                     let handle = if socket.kind == 2 {
                         let Ok(u) = state.bound_udp_handle(ep, false) else {
-                            break;
+                            continue;
                         };
                         self.sockets.add(u)
                     } else {
                         let mut t = state.new_tcp_socket();
-                        if t.listen(endpoint(ep)).is_err() {
-                            break;
+                        if t.listen_queued(endpoint(ep), state.backlog).is_err() {
+                            continue;
                         }
                         self.sockets.add(t)
                     };
@@ -1494,14 +1538,14 @@ impl Network {
                 bound: None,
                 peer: None,
                 error: None,
-                blocking_failed: false,
+                connect_result_pending: false,
                 read_closed: false,
                 write_closed: false,
                 v6_only: family == 10 && matches!(kind, 3 | 4),
                 reuse: false,
                 reuse_port: false,
                 udp_bind_order: 0,
-                udp_requested_bind: None,
+                requested_bind: None,
                 udp_shared: false,
                 udp_readable: None,
                 udp_group: None,
@@ -1568,7 +1612,12 @@ impl Drop for Socket {
             if state.udp_readable.is_some() {
                 n.udp_readers.remove(&state.udp_bind_order);
             }
-            let abort = state.linger == Some(Duration::ZERO);
+            if state.connection == Connection::Listening && state.backlog > 1 {
+                n.growing_listeners
+                    .retain(|weak| weak.as_ptr() != Arc::as_ptr(&self.meta));
+            }
+            let abort =
+                state.connection == Connection::Listening || state.linger == Some(Duration::ZERO);
             let fin_wait_seconds = state.fin_wait_seconds;
             for h in state.handles.drain(..) {
                 if self.kind == 1 {
@@ -2083,6 +2132,36 @@ mod shared_lifetime_tests {
         let target: Arc<dyn trames_shared::IoWake> = Arc::new(Reader);
         let signal = trames_shared::IoSignal::new(1, Arc::downgrade(&target));
         (target, signal)
+    }
+
+    #[test]
+    fn large_listeners_allocate_slots_as_connections_arrive_and_reuse_a_reset_slot() {
+        let fabric = Fabric::new().unwrap();
+        let net = fabric.environment(2, NetworkMode::Full).unwrap();
+        let listener = net.socket(2, 1, 0).unwrap();
+        let addr = "127.0.0.1:34037".parse().unwrap();
+        listener.bind(addr).unwrap();
+        listener.listen(512).unwrap();
+        assert_eq!(listener.state.borrow().handles.len(), 1);
+        let connect = || {
+            let client = net.socket(2, 1, 0).unwrap();
+            assert_eq!(client.connect(addr), Err(NetError(115)));
+            assert_eq!(client.resume_connect(), Ok(true));
+            client
+        };
+        let mut clients = (0..12).map(|_| connect()).collect::<Vec<_>>();
+        assert_eq!(listener.state.borrow().handles.len(), clients.len() + 1);
+        let reset = clients.pop().unwrap();
+        reset
+            .set_option_bytes(1, 13, &crate::linger_bytes(Some(Duration::ZERO)))
+            .unwrap();
+        drop(reset);
+        clients.push(connect());
+        assert_eq!(listener.state.borrow().handles.len(), clients.len() + 1);
+        for _ in &clients {
+            listener.accept().unwrap();
+        }
+        assert_eq!(listener.state.borrow().handles.len(), 1);
     }
 
     #[test]

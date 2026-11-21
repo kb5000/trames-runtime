@@ -147,6 +147,8 @@ pub struct TransportCounters {
 pub struct InterfaceInner {
     pub(crate) counters: TransportCounters,
     #[cfg(all(feature = "socket-tcp", feature = "alloc"))]
+    pub(crate) filled_listeners: alloc::vec::Vec<IpEndpoint>,
+    #[cfg(all(feature = "socket-tcp", feature = "alloc"))]
     pub(crate) tcp_ready: alloc::vec::Vec<crate::iface::SocketHandle>,
     #[cfg(all(feature = "socket-udp", feature = "alloc"))]
     pub(crate) udp_readable: alloc::vec::Vec<u64>,
@@ -213,6 +215,12 @@ impl Config {
 }
 
 impl Interface {
+    /// Listener endpoint that consumed an accept-queue slot while processing a SYN.
+    #[cfg(all(feature = "socket-tcp", feature = "alloc"))]
+    pub fn pop_filled_listener(&mut self) -> Option<IpEndpoint> {
+        self.inner.filled_listeners.pop()
+    }
+
     /// Connected streams whose blocked IO can progress after receiving a segment.
     #[cfg(all(feature = "socket-tcp", feature = "alloc"))]
     pub fn drain_tcp_ready(&mut self) -> impl Iterator<Item = crate::iface::SocketHandle> + '_ {
@@ -285,6 +293,8 @@ impl Interface {
             fragmenter: Fragmenter::new(),
             inner: InterfaceInner {
                 counters: TransportCounters::default(),
+                #[cfg(all(feature = "socket-tcp", feature = "alloc"))]
+                filled_listeners: alloc::vec::Vec::new(),
                 #[cfg(all(feature = "socket-tcp", feature = "alloc"))]
                 tcp_ready: alloc::vec::Vec::new(),
                 #[cfg(all(feature = "socket-udp", feature = "alloc"))]

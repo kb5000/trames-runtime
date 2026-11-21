@@ -381,7 +381,7 @@ impl Socket {
         let requested = self
             .state
             .borrow()
-            .udp_requested_bind
+            .requested_bind
             .unwrap_or_else(|| self.wildcard());
         self.bind_locked(self.presented(requested), false)
     }
@@ -442,9 +442,6 @@ impl Socket {
             let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
             n.udp_bind_order += 1;
             let mut state = self.state.borrow_mut();
-            if explicit {
-                state.udp_requested_bind = Some(requested);
-            }
             state.udp_bind_order = n.udp_bind_order;
             if let Some(source) = &state.udp_readable {
                 n.udp_readers.insert(state.udp_bind_order, source.clone());
@@ -465,7 +462,11 @@ impl Socket {
                 }
             }
         }
-        self.state.borrow_mut().bound = Some(a);
+        let mut state = self.state.borrow_mut();
+        if explicit {
+            state.requested_bind = Some(requested);
+        }
+        state.bound = Some(a);
         Ok(())
     }
     pub(crate) fn preflight_listen(&self, _backlog: u32) -> Result<()> {
@@ -496,18 +497,25 @@ impl Socket {
             return Ok(());
         }
         let addresses = self.addresses(bound);
-        let backlog = backlog.clamp(1, 8) as usize;
+        let backlog = (backlog as usize)
+            .saturating_add(1)
+            .min(crate::socket_quota::GUEST_SOCKET_LIMIT);
         let mut i = self.network.0.fabric.0.borrow_mut();
         let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
         let mut state = self.state.borrow_mut();
+        if backlog > 1 {
+            n.growing_listeners.push(Arc::downgrade(&self.meta));
+        }
         for a in addresses {
-            for _ in 0..backlog {
-                let mut s = state.new_tcp_socket();
-                s.listen(endpoint(a)).map_err(|_| NetError(22))?;
-                state.handles.push(n.sockets.add(s));
-            }
+            let mut socket = state.new_tcp_socket();
+            socket
+                .listen_queued(endpoint(a), backlog)
+                .map_err(|_| NetError(22))?;
+            state.handles.push(n.sockets.add(socket));
         }
         state.connection = Connection::Listening;
+        state.read_closed = false;
+        state.write_closed = false;
         state.backlog = backlog;
         Ok(())
     }
@@ -534,28 +542,34 @@ impl Socket {
             })
             .ok_or(NetError(11))?;
         let handle = state.handles.swap_remove(index);
-        let s = n.sockets.get::<tcp::Socket>(handle);
+        let s = n.sockets.get_mut::<tcp::Socket>(handle);
+        s.leave_accept_queue();
         let local = address(s.local_endpoint().unwrap());
         let peer = address(s.remote_endpoint().unwrap());
-        let mut replacement = state.new_tcp_socket();
-        replacement
-            .listen(endpoint(local))
-            .map_err(|_| NetError(22))?;
-        state.handles.push(n.sockets.add(replacement));
+        if !state.handles.iter().any(|&other| {
+            let slot = n.sockets.get::<tcp::Socket>(other);
+            slot.is_listening() && slot.listen_endpoint().addr == Some(ip(local.ip()))
+        }) {
+            let mut replacement = state.new_tcp_socket();
+            replacement
+                .listen_queued(endpoint(local), state.backlog)
+                .map_err(|_| NetError(22))?;
+            state.handles.push(n.sockets.add(replacement));
+        }
         let accepted = State {
             handles: vec![handle],
             connection: Connection::Connected,
             bound: Some(local),
             peer: Some(peer),
             error: None,
-            blocking_failed: false,
+            connect_result_pending: false,
             read_closed: false,
             write_closed: false,
             v6_only: state.v6_only,
             reuse: state.reuse,
             reuse_port: false,
             udp_bind_order: 0,
-            udp_requested_bind: None,
+            requested_bind: None,
             udp_shared: false,
             udp_readable: None,
             udp_group: None,
@@ -612,7 +626,7 @@ impl Socket {
         state.connection = Connection::Idle;
         state.device = None;
         self.route_device.set(0);
-        let explicit = state.udp_requested_bind.filter(|a| a.port() != 0);
+        let explicit = state.requested_bind.filter(|a| a.port() != 0);
         if explicit.is_none() {
             node.udp_readers.remove(&state.udp_bind_order);
             state.udp_bind_order = 0;
@@ -652,21 +666,35 @@ impl Socket {
             None
         };
         if group_source.is_none() {
-            if self.kind == 2 {
+            if self.kind == 2 || self.kind == 1 && a.port() == 0 {
                 self.destination_ip(a.ip())?;
             } else {
                 self.destination(a)?;
             }
         }
-        let state = self.state.borrow();
+        let mut state = self.state.borrow_mut();
         if self.kind == 1 {
             match state.connection {
                 Connection::Connecting => return Err(NetError(114)),
-                Connection::Connected => return Err(NetError(106)),
+                Connection::Connected => {
+                    return if std::mem::take(&mut state.connect_result_pending) {
+                        Ok(())
+                    } else {
+                        Err(NetError(106))
+                    };
+                }
                 Connection::Listening => return Err(NetError(22)),
-                Connection::Failed(e) => return Err(NetError(e)),
+                Connection::Failed(_) => {
+                    state.connection = Connection::Idle;
+                    state.connect_result_pending = false;
+                    return Err(NetError(state.error.take().unwrap_or(103)));
+                }
                 Connection::Idle => {}
             }
+        }
+        if self.kind == 1 && a.port() == 0 && self.own(a.ip()) {
+            state.fail_connect(111);
+            return Err(NetError(115));
         }
         let bound = state.bound;
         drop(state);
@@ -676,7 +704,7 @@ impl Socket {
         if self.kind != 1 {
             let mut fabric = self.network.0.fabric.0.borrow_mut();
             let mut s = self.state.borrow_mut();
-            if self.kind == 2 && s.udp_requested_bind.is_none_or(|b| b.ip().is_unspecified()) {
+            if self.kind == 2 && s.requested_bind.is_none_or(|b| b.ip().is_unspecified()) {
                 let source = if let Some(source) = group_source {
                     source
                 } else if let Some(view) = self.network.0.routing.get() {
@@ -740,6 +768,7 @@ impl Socket {
         state.handles.push(n.sockets.add(s));
         state.bound = Some(bound);
         state.peer = Some(a);
+        state.connect_result_pending = true;
         state.connection = Connection::Connecting;
         self.connecting
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -760,9 +789,12 @@ impl Socket {
     pub fn resume_connect(&self) -> Result<bool> {
         let r = self.connect_complete();
         let mut s = self.state.borrow_mut();
-        if matches!(s.connection, Connection::Failed(_)) {
-            s.error = None;
-            s.blocking_failed = true;
+        if !matches!(r, Ok(false)) {
+            s.connect_result_pending = false;
+            if matches!(s.connection, Connection::Failed(_)) {
+                s.connection = Connection::Idle;
+                s.error = None;
+            }
         }
         r
     }
@@ -771,7 +803,7 @@ impl Socket {
         Ok(self.presented(
             state
                 .bound
-                .or(state.udp_requested_bind)
+                .or(state.requested_bind)
                 .unwrap_or_else(|| self.wildcard()),
         ))
     }
@@ -788,8 +820,51 @@ impl Socket {
             return Err(NetError(22));
         }
         let mut i = self.network.0.fabric.0.borrow_mut();
+        let now = i.now();
         let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
         let mut state = self.state.borrow_mut();
+        if self.kind == 1 {
+            match state.connection {
+                Connection::Listening | Connection::Connecting => {
+                    if state.connection == Connection::Listening && how == 1 {
+                        return Ok(());
+                    }
+                    if state.connection == Connection::Listening && state.backlog > 1 {
+                        n.growing_listeners
+                            .retain(|weak| weak.as_ptr() != Arc::as_ptr(&self.meta));
+                    }
+                    for &handle in &state.handles {
+                        let socket = n.sockets.get_mut::<tcp::Socket>(handle);
+                        socket.leave_accept_queue();
+                        socket.abort_with_context(n.iface.context());
+                    }
+                    n.iface.poll(now, &mut n.port, &mut n.sockets);
+                    for handle in state.handles.drain(..) {
+                        n.sockets.remove(handle);
+                    }
+                    if state.connection == Connection::Connecting {
+                        self.connecting
+                            .store(false, std::sync::atomic::Ordering::Relaxed);
+                        state.fail_connect(104);
+                    } else {
+                        state.connection = Connection::Idle;
+                    }
+                    n.dirty = true;
+                    drop(state);
+                    i.tick();
+                    return Ok(());
+                }
+                Connection::Connected
+                    if matches!(
+                        n.sockets.get::<tcp::Socket>(state.handles[0]).state(),
+                        tcp::State::Closed | tcp::State::TimeWait
+                    ) =>
+                {
+                    return Err(NetError(107))
+                }
+                _ => {}
+            }
+        }
         let connected = state.connection == Connection::Connected;
         if !connected && self.kind != 2 {
             return Err(NetError(107));
@@ -997,7 +1072,11 @@ impl Socket {
             return Err(NetError(32));
         }
         if state.connection != Connection::Connected {
-            return Err(NetError(107));
+            return Err(NetError(if self.network.0.finished.get() {
+                107
+            } else {
+                32
+            }));
         }
         if bytes.is_empty() {
             return Ok(0);
@@ -1084,7 +1163,7 @@ impl Socket {
                 }
             }
         }
-        if self.kind == 1 && count == 0 {
+        if self.kind == 1 && count == 0 && state.connection == Connection::Connected {
             return Ok(Received {
                 packet_address: None,
                 netlink_address: None,
@@ -1098,7 +1177,7 @@ impl Socket {
             });
         }
         if self.kind == 1 && state.connection != Connection::Connected {
-            if matches!(state.connection, Connection::Failed(_)) && !state.blocking_failed {
+            if matches!(state.connection, Connection::Failed(_)) {
                 return Ok(Received {
                     packet_address: None,
                     netlink_address: None,
@@ -1292,7 +1371,9 @@ impl Socket {
         let i = self.network.0.fabric.0.borrow();
         let state = self.state.borrow();
         if matches!(state.connection, Connection::Failed(_)) {
-            return Ok(events & 4 | 16 | if state.error.is_some() { 8 } else { 0 });
+            return Ok(events & (1 | 4 | 0x40 | 0x100 | 0x2000)
+                | 16
+                | if state.error.is_some() { 8 } else { 0 });
         }
         let n = i.nodes.get(&self.network.0.key).ok_or(NetError(100))?;
         let mut ready = if state.error.is_some() { 8 } else { 0 };
@@ -1301,11 +1382,11 @@ impl Socket {
                 let s = n.sockets.get::<tcp::Socket>(*h);
                 if state.connection == Connection::Listening {
                     if matches!(s.state(), tcp::State::Established | tcp::State::CloseWait) {
-                        ready |= 1;
+                        ready |= 1 | 0x40;
                     }
                 } else if state.connection == Connection::Connected {
                     if s.can_recv() || !s.may_recv() || state.read_closed {
-                        ready |= 1;
+                        ready |= 1 | 0x40;
                     }
                     if matches!(
                         s.state(),
@@ -1319,7 +1400,7 @@ impl Socket {
                         ready |= 0x2000;
                     }
                     if s.can_send() || !s.may_send() {
-                        ready |= 4;
+                        ready |= 4 | 0x100;
                     }
                     if s.state() == tcp::State::Closed {
                         ready |= 16;

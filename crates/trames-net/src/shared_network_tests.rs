@@ -76,7 +76,7 @@ fn complete_network_graph_is_shared_and_concurrent_creation_has_one_quota() {
         for _ in 0..8 {
             let (network, ready, release) = (&network, &ready, &release);
             scope.spawn(move || {
-                let sockets: Vec<_> = (0..16)
+                let sockets: Vec<_> = (0..crate::GUEST_SOCKET_LIMIT / 8 + 1)
                     .filter_map(|_| match network.socket(2, 2, 0) {
                         Ok(s) => Some(s),
                         Err(e) => {
@@ -91,9 +91,11 @@ fn complete_network_graph_is_shared_and_concurrent_creation_has_one_quota() {
             });
         }
         ready.wait();
-        assert_eq!(network.live_sockets(), MAX_SOCKETS);
-        assert!(matches!(network.socket(2, 2, 0), Err(NetError(24))));
+        let live = network.live_sockets();
+        let saturated = matches!(network.socket(2, 2, 0), Err(NetError(24)));
         release.wait();
+        assert_eq!(live, crate::GUEST_SOCKET_LIMIT);
+        assert!(saturated);
     });
     assert_eq!(network.live_sockets(), 0);
     drop(network);

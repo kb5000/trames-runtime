@@ -7,18 +7,33 @@ use std::sync::{
 };
 type Result<T> = std::result::Result<T, NetError>;
 
-#[derive(Default)]
-pub(crate) struct Quota<const LIMIT: usize = MAX_SOCKETS>(AtomicUsize);
+/// Packet-stack endpoints are allocated on demand and do not reserve BSD descriptors.
+pub const GUEST_SOCKET_LIMIT: usize = 1024;
+pub(crate) struct Quota<const LIMIT: usize = MAX_SOCKETS> {
+    live: AtomicUsize,
+    limit: usize,
+}
+impl<const LIMIT: usize> Default for Quota<LIMIT> {
+    fn default() -> Self {
+        Self::with_limit(LIMIT)
+    }
+}
 impl<const LIMIT: usize> Quota<LIMIT> {
+    pub(crate) fn with_limit(limit: usize) -> Self {
+        Self {
+            live: AtomicUsize::new(0),
+            limit,
+        }
+    }
     pub(crate) fn live(&self) -> usize {
-        self.0.load(Ordering::Relaxed)
+        self.live.load(Ordering::Relaxed)
     }
     pub(crate) fn reserve(self: &Arc<Self>) -> Result<Reservation<LIMIT>> {
         // Accounting does not publish socket data. Reserve before host creation
         // or accept, and return the slot on every failure and final close.
-        self.0
+        self.live
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                (n < LIMIT).then_some(n + 1)
+                (n < self.limit).then_some(n + 1)
             })
             .map_err(|_| NetError(24))?;
         Ok(Reservation(self.clone()))
@@ -27,7 +42,7 @@ impl<const LIMIT: usize> Quota<LIMIT> {
 pub(crate) struct Reservation<const LIMIT: usize = MAX_SOCKETS>(Arc<Quota<LIMIT>>);
 impl<const LIMIT: usize> Drop for Reservation<LIMIT> {
     fn drop(&mut self) {
-        self.0 .0.fetch_sub(1, Ordering::Relaxed);
+        self.0.live.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

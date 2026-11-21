@@ -422,6 +422,7 @@ pub struct Socket<'a> {
     /// Address passed to listen(). Listen address is set when listen() is called and
     /// used every time the socket is reset back to the LISTEN state.
     listen_endpoint: IpListenEndpoint,
+    accept_queue_capacity: usize,
     /// Current 4-tuple (local and remote endpoints).
     tuple: Option<Tuple>,
     /// The sequence number corresponding to the beginning of the transmit buffer.
@@ -530,6 +531,7 @@ impl<'a> Socket<'a> {
             keep_alive: None,
             hop_limit: None,
             listen_endpoint: IpListenEndpoint::default(),
+            accept_queue_capacity: 0,
             tuple: None,
             local_seq_no: TcpSeqNumber::default(),
             remote_seq_no: TcpSeqNumber::default(),
@@ -826,6 +828,23 @@ impl<'a> Socket<'a> {
     #[inline]
     pub fn listen_endpoint(&self) -> IpListenEndpoint {
         self.listen_endpoint
+    }
+
+    /// Reserve this socket as a slot in a Linux-style listener's accept queue.
+    pub fn listen_queued(&mut self, endpoint: IpEndpoint, capacity: usize) -> Result<(), ListenError> {
+        self.listen(endpoint)?;
+        self.accept_queue_capacity = capacity;
+        Ok(())
+    }
+
+    pub fn leave_accept_queue(&mut self) {
+        self.accept_queue_capacity = 0;
+    }
+
+    pub(crate) fn queues_syn_for(&self, address: IpAddress, port: u16) -> bool {
+        self.accept_queue_capacity != 0
+            && self.listen_endpoint.port == port
+            && self.listen_endpoint.addr.is_none_or(|a| a == address)
     }
 
     /// Return the local endpoint, or None if not connected.
@@ -1927,12 +1946,23 @@ impl<'a> Socket<'a> {
                 self.record_reset(cx);
                 self.set_state(State::Closed);
                 self.tuple = None;
+                if self.accept_queue_capacity != 0 {
+                    // The application never accepted this child. Return its
+                    // slot to the same listener, discarding the aborted stream.
+                    let endpoint = self.listen_endpoint;
+                    self.listen(endpoint).expect("valid queued listen endpoint");
+                }
                 return None;
             }
 
             // SYN packets in the LISTEN state change it to SYN-RECEIVED.
             (State::Listen, TcpControl::Syn) => {
                 cx.counters.passive_opens += 1;
+                #[cfg(feature = "alloc")]
+                if self.accept_queue_capacity > 1 {
+                    cx.filled_listeners
+                        .push(IpEndpoint::new(ip_repr.dst_addr(), repr.dst_port));
+                }
                 tcp_trace!("received SYN");
                 if let Some(max_seg_size) = repr.max_seg_size {
                     if max_seg_size == 0 {

@@ -16,6 +16,7 @@ mod rtnetlink;
 mod shared_state;
 mod socket_filter;
 mod socket_quota;
+pub use socket_quota::GUEST_SOCKET_LIMIT;
 pub mod tun;
 pub use netdev::{Address as DeviceAddress, Device, DeviceKind, Route as DeviceRoute};
 mod virtualnet;
@@ -298,8 +299,11 @@ impl Network {
         self.1.set_loopback_up(up)
     }
     pub fn new(mode: NetworkMode) -> Self {
+        Self::with_native(mode, netlink::Namespace::default())
+    }
+    fn with_native(mode: NetworkMode, namespace: netlink::Namespace) -> Self {
         let native = native::Network::new(mode);
-        let namespace = Arc::new(netlink::Namespace::default());
+        let namespace = Arc::new(namespace);
         namespace
             .graph
             .write()
@@ -316,7 +320,7 @@ impl Network {
     /// Configurable guest IP link with the existing userspace/native gateway;
     /// host interface addresses and routes remain outside guest control.
     pub fn managed_uplink(mode: NetworkMode) -> Result<Self> {
-        let network = Self::new(mode);
+        let network = Self::with_native(mode, netlink::Namespace::packet_stack());
         network.1.graph.write().unwrap().manage_uplink(
             network.namespace_id(),
             matches!(mode, NetworkMode::Full | NetworkMode::Outbound),
@@ -363,7 +367,7 @@ impl Network {
     }
     pub fn virtual_network(fabric: &Fabric, id: u8, mode: NetworkMode) -> Result<Self> {
         let stack = fabric.environment(id, mode)?;
-        let namespace = Arc::new(netlink::Namespace::default());
+        let namespace = Arc::new(netlink::Namespace::packet_stack());
         *namespace.fabric.borrow_mut() = Some(fabric.clone());
         fabric.bind_driver(&namespace.fabric.changed);
         namespace.nft_packet_hooks.set(false);

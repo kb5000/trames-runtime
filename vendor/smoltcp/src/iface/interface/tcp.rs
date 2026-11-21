@@ -30,6 +30,17 @@ impl InterfaceInner {
             }
         }
 
+        // A full accept queue drops new SYNs. An existing four-tuple has
+        // already had a chance to handle the segment above.
+        if tcp_repr.control == TcpControl::Syn
+            && tcp_repr.ack_number.is_none()
+            && sockets
+                .items_mut()
+                .filter_map(|item| Socket::downcast_mut(&mut item.socket))
+                .any(|socket| socket.queues_syn_for(dst_addr, tcp_repr.dst_port))
+        {
+            return None;
+        }
         if tcp_repr.control == TcpControl::Rst
             || ip_repr.dst_addr().is_unspecified()
             || ip_repr.src_addr().is_unspecified()

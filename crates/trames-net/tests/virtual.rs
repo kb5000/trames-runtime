@@ -169,7 +169,9 @@ fn policy_quota_teardown_and_reused_environment_id() {
     );
     let off = Network::virtual_network(&f, 4, NetworkMode::Off).unwrap();
     assert!(matches!(off.socket(2, 1, 0), Err(NetError(13))));
-    let many: Vec<_> = (0..64).map(|_| socket(&b, false, false)).collect();
+    let many: Vec<_> = (0..trames_net::GUEST_SOCKET_LIMIT)
+        .map(|_| socket(&b, false, false))
+        .collect();
     assert!(matches!(b.socket(2, 2, 0), Err(NetError(24))));
     drop(many);
     assert_eq!(b.live_sockets(), 0);
@@ -418,6 +420,15 @@ fn dual_stack_listener_backlogs_do_not_share_a_fixed_protocol_handle_ceiling() {
         s.bind(parse(&format!("[::]:{port}"))).unwrap();
         s.listen(8).unwrap();
         listeners.push(s);
+    }
+    assert!(f.stats().stack_sockets < 256);
+    let mut queued = Vec::new();
+    for port in 10000..10015 {
+        for _ in 0..8 {
+            let client = socket(&peer, false, true);
+            connect(&client, parse(&format!("10.0.0.2:{port}")));
+            queued.push(client);
+        }
     }
     assert!(f.stats().stack_sockets > 256);
     assert_eq!(n.live_sockets(), 16);
