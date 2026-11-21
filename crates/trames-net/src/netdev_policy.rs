@@ -150,6 +150,36 @@ impl Topology {
             )
             .collect()
     }
+    pub fn route_for_delete(&self, id: u64, table: u32, selector: Entry) -> Result<Entry> {
+        let space = self.spaces.get(&id).ok_or(NetError(2))?;
+        let r = selector.route;
+        space
+            .routes
+            .iter()
+            .filter(|_| table == 254)
+            .map(|route| Entry {
+                route: *route,
+                kind: 1,
+            })
+            .chain(
+                space
+                    .policy
+                    .tables
+                    .get(&table)
+                    .into_iter()
+                    .flatten()
+                    .copied(),
+            )
+            .find(|e| {
+                e.route.destination == r.destination
+                    && (selector.kind == 0 || r.destination.ip.is_ipv6() || e.kind == selector.kind)
+                    && (r.device == 0 || r.device == e.route.device)
+                    && (r.metric == 0 || r.metric == e.route.metric)
+                    && (r.protocol == 0 || r.protocol == e.route.protocol)
+                    && (r.gateway.is_none() || r.gateway == e.route.gateway)
+            })
+            .ok_or(NetError(3))
+    }
     pub fn policy_route(
         &mut self,
         id: u64,

@@ -205,6 +205,7 @@ pub(super) struct Socket {
     port: Cell<u32>,
     connected: Cell<bool>,
     groups: Cell<u32>,
+    membership_allocated: Cell<bool>,
     overrun: Cell<bool>,
     replies: SharedState<VecDeque<Datagram>>,
     read_epoch: Cell<u64>,
@@ -342,6 +343,7 @@ impl Socket {
             port: Cell::new(0),
             connected: Cell::new(false),
             groups: Cell::new(0),
+            membership_allocated: Cell::new(false),
             overrun: Cell::new(false),
             replies: SharedState::new(VecDeque::new()),
             read_epoch: Cell::new(0),
@@ -395,25 +397,31 @@ impl Socket {
     }
     pub fn bind_bytes(&self, bytes: &[u8]) -> Result<()> {
         let (port, groups) = decode(bytes)?;
-        if self.port.get() != 0 {
-            return Err(NetError(22));
-        }
         if groups & !self.supported_groups() != 0 {
             return Err(NetError(95));
         }
+        let bound = self.port.get();
+        if bound != 0 {
+            if bound != port {
+                return Err(NetError(22));
+            }
+        } else if port == 0 {
+            self.autobind()?;
+        } else {
+            if !self
+                .namespace
+                .ports
+                .borrow_mut()
+                .insert((self.protocol, port))
+            {
+                return Err(NetError(98));
+            }
+            self.port.set(port);
+        }
+        if groups != 0 {
+            self.membership_allocated.set(true);
+        }
         self.groups.set(groups);
-        if port == 0 {
-            return self.autobind();
-        }
-        if !self
-            .namespace
-            .ports
-            .borrow_mut()
-            .insert((self.protocol, port))
-        {
-            return Err(NetError(98));
-        }
-        self.port.set(port);
         Ok(())
     }
     pub fn connect_bytes(&self, bytes: &[u8]) -> Result<()> {
@@ -428,11 +436,10 @@ impl Socket {
         Ok(source(self.port.get(), self.groups.get()).to_vec())
     }
     pub fn peer_bytes(&self) -> Result<Vec<u8>> {
-        if self.connected.get() {
-            Ok(address(0))
-        } else {
-            Err(NetError(107))
-        }
+        Ok(address(0))
+    }
+    pub fn memberships(&self) -> Option<u32> {
+        self.membership_allocated.get().then(|| self.groups.get())
     }
     #[cfg(test)]
     pub fn send_bytes(
@@ -532,10 +539,16 @@ impl Socket {
         let mut offset = 0;
         while offset < bytes.len() {
             if bytes.len() - offset < 16 {
+                if self.protocol == 0 {
+                    break;
+                }
                 return Err(NetError(22));
             }
             let length = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
             if length < 16 || length > bytes.len() - offset {
+                if self.protocol == 0 {
+                    break;
+                }
                 return Err(NetError(22));
             }
             requests.push(&bytes[offset..offset + length]);
@@ -546,11 +559,14 @@ impl Socket {
                 break;
             }
             offset += (length + 3) & !3;
-            if offset > bytes.len() {
+            if offset > bytes.len() && self.protocol != 0 {
                 return Err(NetError(22));
             }
         }
-        if requests.is_empty() {
+        if bytes.is_empty() {
+            return Err(NetError(61));
+        }
+        if requests.is_empty() && self.protocol != 0 {
             return Err(NetError(22));
         }
         if self.protocol == 12 {
@@ -736,6 +752,7 @@ impl Socket {
                 if group & !self.supported_groups() != 0 {
                     return Err(NetError(95));
                 }
+                self.membership_allocated.set(true);
                 self.groups.set(if name == 1 {
                     self.groups.get() | group
                 } else {
@@ -938,15 +955,12 @@ mod tests {
         );
     }
     #[test]
-    fn malformed_multi_request_has_no_reply_and_dump_preserves_sequence_and_peek() {
+    fn route_dump_ignores_trailing_bytes_and_preserves_sequence_and_peek() {
         let s = Socket::new(Arc::new(Namespace::default()), None, 3, 0).unwrap();
         let request = message(18, 0x301, 45, 0, &[0; 16]);
         let mut malformed = request.clone();
         malformed.push(1);
-        assert_eq!(s.send_bytes(&malformed, 0, None), Err(NetError(22)));
-        assert_eq!(s.poll(1), Ok(0));
-        assert_eq!(s.port.get(), 0);
-        assert_eq!(s.send_bytes(&request, 0, None), Ok(request.len()));
+        assert_eq!(s.send_bytes(&malformed, 0, None), Ok(malformed.len()));
         let peek = s.recv(4, MSG_PEEK).unwrap();
         assert!(peek.truncated);
         let link = s.recv(65536, 0).unwrap();

@@ -129,6 +129,24 @@ pub(super) fn control(
             })
         }
         209 => {
+            if (a[1], a[2]) == (270, 9) {
+                let capacity = u32_at(memory, a[4])? as i32;
+                if capacity < 0 {
+                    return Err(Errno(22));
+                }
+                let word = socket.netlink_memberships().map_err(net)?;
+                Linux::check(memory, a[4], 4, Access::Write)?;
+                if let Some(groups) = word.filter(|_| capacity >= 4) {
+                    memory
+                        .write(a[3], &groups.to_le_bytes())
+                        .map_err(|_| Errno(14))?;
+                }
+                let size = if word.is_some() { 4u32 } else { 0 };
+                memory
+                    .write(a[4], &size.to_le_bytes())
+                    .map_err(|_| Errno(14))?;
+                return Ok(0);
+            }
             if (a[1], a[2]) == (1, 25) {
                 let capacity = u32_at(memory, a[4])? as i32;
                 let name = socket.bound_device_name().map_err(net)?;

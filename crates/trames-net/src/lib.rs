@@ -1053,6 +1053,14 @@ impl Socket {
             None
         }
     }
+    pub fn netlink_memberships(&self) -> Result<Option<u32>> {
+        if let SocketBackend::Netlink(s) = &self.backend {
+            let _operation = self.operation.read_recursive();
+            Ok(s.memberships())
+        } else {
+            Err(NetError(92))
+        }
+    }
     pub fn bind_bytes(&self, bytes: &[u8]) -> Result<()> {
         if let SocketBackend::Packet(s) = &self.backend {
             return s.bind_bytes(bytes);

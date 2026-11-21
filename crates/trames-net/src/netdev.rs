@@ -624,6 +624,15 @@ impl Topology {
             .find(|d| d.name == name)
             .ok_or(NetError(19))
     }
+    pub fn automatic_name(&self, id: u64, kind: &str, reserved: Option<&[u8]>) -> Result<Vec<u8>> {
+        for i in 0..=MAX_LINKS {
+            let name = format!("{kind}{i}").into_bytes();
+            if Some(name.as_slice()) != reserved && self.name_available(id, &name, None).is_ok() {
+                return Ok(name);
+            }
+        }
+        Err(NetError(28))
+    }
     fn name_available(&self, id: u64, name: &[u8], except: Option<u32>) -> Result<()> {
         if name == b"eth0" && except != Some(2) && self.spaces.get(&id).is_some_and(|s| s.direct) {
             return Err(NetError(17));

@@ -223,7 +223,21 @@ pub(crate) fn request(
     let kind = u16::from_le_bytes(request[4..6].try_into().unwrap());
     let flags = u16::from_le_bytes(request[6..8].try_into().unwrap());
     let seq = u32::from_le_bytes(request[8..12].try_into().unwrap());
-    let dump = flags & 0x300 == 0x300;
+    // ROOT or MATCH independently selects the dump handler on GET operations.
+    let dump = kind & 3 == 2 && flags & 0x300 != 0;
+    if flags & 1 == 0 || kind < 16 {
+        let mut messages = Vec::new();
+        if flags & 4 != 0 {
+            let mut ack = vec![0; 4];
+            ack.extend_from_slice(&request[..16]);
+            messages.push(message(2, 0, seq, port, &ack));
+        }
+        return Ok(Reply {
+            messages,
+            changes: vec![],
+            retained_namespaces: vec![],
+        });
+    }
     // BusyBox/iproute2 may request a dump using only struct rtgenmsg (one
     // family byte), while Go sends the complete per-message structure.
     let padded;
@@ -481,7 +495,6 @@ pub(crate) fn request(
                     if kind != 16 || flags & 0x400 == 0 || index != 0 || master.is_some() {
                         return Err(NetError(95));
                     }
-                    let name = name.ok_or(NetError(22))?;
                     let info = attrs(info)?;
                     if info.iter().any(|(k, _)| !matches!(k, 1 | 2)) {
                         return Err(NetError(95));
@@ -498,6 +511,13 @@ pub(crate) fn request(
                                 get(&info, 2).unwrap_or(&[]),
                                 Default::default(),
                             )?;
+                            let generated;
+                            let name = if let Some(name) = name {
+                                name
+                            } else {
+                                generated = next.automatic_name(ns, "bridge", None)?;
+                                &generated
+                            };
                             let index = next.create_bridge(ns, name)?;
                             next.configure_bridge(ns, index, config)?;
                             index
@@ -529,7 +549,29 @@ pub(crate) fn request(
                                 return Err(NetError(22));
                             }
                             let peer_ns = pn.as_ref().map_or(ns, Network::namespace_id);
-                            let peer_name = text(get(&pa, 3).ok_or(NetError(22))?)?;
+                            let peer_name = get(&pa, 3).map(text).transpose()?;
+                            let generated;
+                            let name = if let Some(name) = name {
+                                name
+                            } else {
+                                generated = next.automatic_name(
+                                    ns,
+                                    "veth",
+                                    peer_name.filter(|_| ns == peer_ns),
+                                )?;
+                                &generated
+                            };
+                            let generated_peer;
+                            let peer_name = if let Some(peer) = peer_name {
+                                peer
+                            } else {
+                                generated_peer = next.automatic_name(
+                                    peer_ns,
+                                    "veth",
+                                    (ns == peer_ns).then_some(name),
+                                )?;
+                                &generated_peer
+                            };
                             let (i, p) = next.create_veth(ns, name, peer_ns, peer_name)?;
                             let pc = u32v(&peer[12..16])?;
                             let pf = u32v(&peer[8..12])?;
@@ -631,19 +673,25 @@ pub(crate) fn request(
                     if !dump {
                         return Err(NetError(95));
                     }
-                    for d in graph.devices(ns) {
-                        if (index == 0 || index == d.index)
-                            && (d.kind != DeviceKind::Loopback || d.up)
-                        {
-                            for address in &d.addresses {
-                                if family == 0 || (family == 2) == address.ip.is_ipv4() {
-                                    out.push(message(
-                                        20,
-                                        2,
-                                        seq,
-                                        port,
-                                        &address_data(&d, *address),
-                                    ));
+                    let devices = graph.devices(ns);
+                    for af in [2, 10]
+                        .into_iter()
+                        .filter(|af| family == 0 || family == *af)
+                    {
+                        for d in &devices {
+                            if (index == 0 || index == d.index)
+                                && (d.kind != DeviceKind::Loopback || d.up)
+                            {
+                                for address in &d.addresses {
+                                    if (af == 2) == address.ip.is_ipv4() {
+                                        out.push(message(
+                                            20,
+                                            2,
+                                            seq,
+                                            port,
+                                            &address_data(d, *address),
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -723,8 +771,8 @@ pub(crate) fn request(
                     return Err(NetError(22));
                 }
                 let family = request[16];
-                if !matches!(family, 0 | 2 | 10) {
-                    return Err(NetError(97));
+                if !(matches!(family, 2 | 10) || kind == 26 && dump && family == 0) {
+                    return Err(NetError(95));
                 }
                 // Legacy iproute2 uses ifinfomsg plus IFLA_EXT_MASK for all
                 // dumps. Linux non-strict address/route dumps ignore that tail.
@@ -745,7 +793,11 @@ pub(crate) fn request(
                         {
                             return Err(NetError(95));
                         }
-                        let destination = ip(family, get(&a, 1).ok_or(NetError(22))?)?;
+                        let width = if family == 2 { 4 } else { 16 };
+                        let payload = get(&a, 1)
+                            .and_then(|v| v.get(..width))
+                            .ok_or(NetError(22))?;
+                        let destination = ip(family, payload)?;
                         let (source, device, gateway) = graph.source(ns, destination)?;
                         if get(&a, 4)
                             .map(u32v)
@@ -764,6 +816,7 @@ pub(crate) fn request(
                             metric: 0,
                             protocol: 0,
                         });
+                        data[8..12].copy_from_slice(&0x200u32.to_le_bytes()); // RTM_F_CLONED
                         if graph.own(ns, destination) {
                             data[4] = 255; // Local table / RTN_LOCAL.
                             data[6] = 254;
@@ -773,7 +826,20 @@ pub(crate) fn request(
                         out.push(message(24, 0, seq, port, &data));
                         return Ok(());
                     }
-                    for (table, r) in graph.policy_routes(ns) {
+                    let mut routes = graph.policy_routes(ns);
+                    routes.sort_by_key(|(table, entry)| {
+                        let dst = entry.route.destination;
+                        // IPv6 walks child prefixes before their containing prefix.
+                        let end = match dst.ip {
+                            IpAddr::V4(ip) => u128::from(u32::from(ip)),
+                            IpAddr::V6(ip) => {
+                                u128::from(ip)
+                                    | u128::MAX.checked_shr(dst.prefix.into()).unwrap_or(0)
+                            }
+                        };
+                        (dst.ip.is_ipv6(), *table, end, std::cmp::Reverse(dst.prefix))
+                    });
+                    for (table, r) in routes {
                         if (family == 0 || (family == 2) == r.route.destination.ip.is_ipv4())
                             && (request[20] == 0 || request[20] as u32 == table)
                         {
@@ -785,33 +851,70 @@ pub(crate) fn request(
                 if !admin {
                     return Err(NetError(1));
                 }
+                let mut route_kind = request[23];
+                if route_kind > 11 || kind == 24 && family == 2 && route_kind == 0 {
+                    return Err(NetError(22));
+                }
+                if family == 2
+                    && kind == 24
+                    && (6..=11).contains(&route_kind)
+                    && (get(&a, 4).is_some() || get(&a, 5).is_some())
+                {
+                    return Err(NetError(22));
+                }
+                if family == 10 && kind == 24 && route_kind == 0 {
+                    route_kind = 1;
+                }
                 if request[18..20] != [0; 2]
                     || !matches!(request[22], 0 | 253)
-                    || !matches!(request[23], 1 | 6 | 7 | 8 | 9)
+                    || kind == 24 && !matches!(route_kind, 1 | 6 | 7 | 8 | 9)
                     || request[24..28] != [0; 4]
                     || a.iter().any(|(k, _)| !matches!(k, 1 | 4 | 5 | 6 | 7 | 15))
                 {
                     return Err(NetError(95));
                 }
-                let destination = Address {
-                    ip: get(&a, 1)
-                        .map(|v| ip(family, v))
-                        .transpose()?
-                        .unwrap_or(if family == 2 {
-                            Ipv4Addr::UNSPECIFIED.into()
-                        } else if family == 10 {
-                            Ipv6Addr::UNSPECIFIED.into()
-                        } else {
-                            return Err(NetError(97));
-                        }),
-                    prefix: request[17],
-                };
-                if destination.prefix > if family == 2 { 32 } else { 128 } {
+                let prefix = request[17];
+                let width = if family == 2 { 4 } else { 16 };
+                if usize::from(prefix) > width * 8 {
                     return Err(NetError(22));
                 }
-                let device = get(&a, 4).map(u32v).transpose()?.unwrap_or(0);
-                if request[23] == 1 && device == 0 {
-                    return Err(NetError(22));
+                let mut address = [0; 16];
+                if let Some(value) = get(&a, 1) {
+                    if value.len()
+                        < if family == 2 {
+                            4
+                        } else {
+                            usize::from(prefix).div_ceil(8)
+                        }
+                    {
+                        return Err(NetError(22));
+                    }
+                    let n = width.min(value.len());
+                    address[..n].copy_from_slice(&value[..n]);
+                }
+                let destination = Address {
+                    ip: ip(family, &address[..width])?,
+                    prefix,
+                };
+                let gateway = get(&a, 5)
+                    .map(|v| ip(family, v.get(..width).ok_or(NetError(34))?))
+                    .transpose()?;
+                let mut device = get(&a, 4).map(u32v).transpose()?.unwrap_or(0);
+                if kind == 24 && route_kind == 1 && device == 0 {
+                    let gw = gateway.ok_or(NetError(19))?;
+                    device = graph
+                        .devices(ns)
+                        .into_iter()
+                        .filter(|d| d.up && d.master.is_none())
+                        .flat_map(|d| {
+                            d.addresses
+                                .into_iter()
+                                .filter(|a| a.contains(gw))
+                                .map(move |a| (std::cmp::Reverse(a.prefix), d.index))
+                        })
+                        .min()
+                        .ok_or(NetError(101))?
+                        .1;
                 }
                 if let Some(source) = get(&a, 7) {
                     if !graph
@@ -826,7 +929,7 @@ pub(crate) fn request(
                 let route = Route {
                     destination,
                     device,
-                    gateway: get(&a, 5).map(|v| ip(family, v)).transpose()?,
+                    gateway,
                     metric: get(&a, 6).map(u32v).transpose()?.unwrap_or(0),
                     protocol: request[21],
                 };
@@ -840,7 +943,14 @@ pub(crate) fn request(
                     });
                 let entry = crate::netdev::PolicyRoute {
                     route,
-                    kind: request[23],
+                    kind: route_kind,
+                };
+                // Missing selectors on delete are wildcards. Notify listeners with
+                // the selected installed route, including its actual output device.
+                let entry = if kind == 25 {
+                    graph.route_for_delete(ns, table, entry)?
+                } else {
+                    entry
                 };
                 graph.policy_route(
                     ns,
@@ -965,7 +1075,9 @@ fn route_data(r: Route) -> Vec<u8> {
         0,
         0,
     ];
-    attr(&mut data, 1, &octets(r.destination.ip));
+    if r.destination.prefix != 0 {
+        attr(&mut data, 1, &octets(r.destination.ip));
+    }
     if r.device != 0 {
         attr(&mut data, 4, &r.device.to_le_bytes());
     }
