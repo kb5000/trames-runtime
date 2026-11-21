@@ -29,6 +29,14 @@ use std::{
     time::{Duration, Instant},
 };
 type Result<T> = std::result::Result<T, NetError>;
+fn tcp_errno(failure: tcp::Failure) -> u32 {
+    match failure {
+        tcp::Failure::Refused => 111,
+        tcp::Failure::Reset => 104,
+        tcp::Failure::PeerAlreadyClosed => 32,
+        tcp::Failure::TimedOut => 110,
+    }
+}
 const BUFFER: usize = 65536;
 const MAX_ENVIRONMENTS: usize = 16;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,7 +133,6 @@ struct Node {
     gateway_rx: Port,
     registry: Vec<Weak<SocketMeta>>,
     detached: Vec<DetachedTcp>,
-    resets: Vec<(Weak<SocketMeta>, Connection)>,
     links: [LinkStats; 2],
     configuration_revision: u64,
     dirty: bool,
@@ -207,7 +214,10 @@ struct State {
     defer_accept_secs: u32,
     user_timeout_ms: u32,
     window_clamp: u32,
-    linger: Option<Duration>,
+    linger_enabled: bool,
+    linger_seconds: u32,
+    linger_closing: bool,
+    receive_inq: bool,
     receive_low_water: i32,
     no_check: bool,
     timestamp_option: u32,
@@ -308,6 +318,7 @@ impl State {
         if socket.congestion_control() != self.congestion {
             socket.set_congestion_control(self.congestion);
         }
+        socket.enable_receive_timestamps(self.timestamp_option != 0);
         socket.set_defer_accept(self.defer_accept_secs);
         if let Some(retries) = self.syn_retries {
             socket.set_syn_retries(retries);
@@ -410,7 +421,6 @@ fn make_node(id: u8, now: smoltcp::time::Instant) -> Result<Node> {
         gateway_rx: Port::default(),
         registry: Vec::new(),
         detached: Vec::new(),
-        resets: Vec::new(),
         links: [LinkStats::default(); 2],
         configuration_revision: u64::MAX,
         dirty: true,
@@ -1070,36 +1080,6 @@ impl Inner {
                                 matches!(ns.mode, NetworkMode::Outbound | NetworkMode::Full)
                             });
                     let node = self.nodes.get_mut(&key).unwrap();
-                    if h.protocol == 6 && h.first {
-                        if let Ok(t) = smoltcp::wire::TcpPacket::new_checked(&p[h.offset..]) {
-                            if t.rst() && t.verify_checksum(&ip(h.tuple.source.ip()), &ip(dst)) {
-                                for socket in node.registry.iter().filter_map(Weak::upgrade) {
-                                    if socket.kind == 1 {
-                                        let state = socket.state.borrow();
-                                        if state.peer == Some(h.tuple.source)
-                                            && state.bound == Some(h.tuple.destination)
-                                            && state.handles.first().is_some_and(|h| {
-                                                matches!(
-                                                    node.sockets.get::<tcp::Socket>(*h).state(),
-                                                    tcp::State::SynSent
-                                                        | tcp::State::SynReceived
-                                                        | tcp::State::Established
-                                                        | tcp::State::FinWait1
-                                                        | tcp::State::FinWait2
-                                                        | tcp::State::CloseWait
-                                                )
-                                            })
-                                            && node.resets.len() < 96
-                                        {
-                                            node.resets
-                                                .push((Arc::downgrade(&socket), state.connection));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
                     let enabled = node.owner.upgrade().is_some_and(|ns| {
                         ns.mode != NetworkMode::Off
                             && (!lo || ns.loopback_up.get())
@@ -1148,20 +1128,6 @@ impl Inner {
             }
         }
         for node in self.nodes.values_mut() {
-            for (weak, connection) in node.resets.drain(..) {
-                if let Some(socket) = weak.upgrade() {
-                    let mut state = socket.state.borrow_mut();
-                    if state.handles.first().is_some_and(|h| {
-                        node.sockets.get::<tcp::Socket>(*h).state() == tcp::State::Closed
-                    }) {
-                        state.error = Some(if connection == Connection::Connecting {
-                            111
-                        } else {
-                            104
-                        });
-                    }
-                }
-            }
             for weak in &node.registry {
                 if let Some(socket) = weak.upgrade() {
                     if !socket.connecting.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1175,7 +1141,15 @@ impl Inner {
                                     state.connection = Connection::Connected
                                 }
                                 tcp::State::Closed => {
-                                    let e = state.error.unwrap_or(110);
+                                    let e = state
+                                        .error
+                                        .or_else(|| {
+                                            node.sockets
+                                                .get_mut::<tcp::Socket>(h)
+                                                .take_failure()
+                                                .map(tcp_errno)
+                                        })
+                                        .unwrap_or(110);
                                     state.fail_connect(e);
                                     state.handles.clear();
                                     node.sockets.remove(h);
@@ -1578,7 +1552,10 @@ impl Network {
                 defer_accept_secs: 0,
                 user_timeout_ms: 0,
                 window_clamp: 0,
-                linger: None,
+                linger_enabled: false,
+                linger_seconds: 0,
+                linger_closing: false,
+                receive_inq: false,
                 receive_low_water: 1,
                 no_check: false,
                 timestamp_option: 0,
@@ -1639,9 +1616,10 @@ impl Drop for Socket {
                 n.growing_listeners
                     .retain(|weak| weak.as_ptr() != Arc::as_ptr(&self.meta));
             }
-            let abort =
-                state.connection == Connection::Listening || state.linger == Some(Duration::ZERO);
+            let abort = state.connection == Connection::Listening
+                || (state.linger_enabled && state.linger_seconds == 0);
             let fin_wait_seconds = state.fin_wait_seconds;
+            let linger_closing = state.linger_closing;
             for h in state.handles.drain(..) {
                 if self.kind == 1 {
                     let s = n.sockets.get_mut::<tcp::Socket>(h);
@@ -1650,13 +1628,13 @@ impl Drop for Socket {
                     }
                     if s.is_listening() || s.state() == tcp::State::Closed {
                         n.sockets.remove(h);
-                    } else if abort || s.recv_queue() != 0 {
+                    } else if abort || !linger_closing && s.recv_queue() != 0 {
                         // Linux aborts a stream whose final owner discards unread data.
                         s.abort_with_context(n.iface.context());
                         n.iface.poll(now, &mut n.port, &mut n.sockets);
                         n.sockets.remove(h);
                     } else {
-                        s.close();
+                        s.close_final();
                         n.detached
                             .push(DetachedTcp::new(h, fin_wait_seconds, Instant::now()));
                     }
@@ -2275,6 +2253,27 @@ mod shared_lifetime_tests {
             std::thread::yield_now();
         }
         assert_eq!(client.send(b"x", 0, None), Ok(1));
+    }
+
+    #[test]
+    fn tcp_inq_includes_peer_fin_and_preserves_zero_length_and_peek_reads() {
+        let fabric = Fabric::new().unwrap();
+        let net = fabric.environment(2, NetworkMode::Full).unwrap();
+        let listener = net.socket(2, 1, 0).unwrap();
+        let addr = "127.0.0.1:34284".parse().unwrap();
+        listener.set_option(6, 36, 1).unwrap();
+        listener.bind(addr).unwrap();
+        listener.listen(1).unwrap();
+        let client = net.socket(2, 1, 0).unwrap();
+        assert_eq!(client.connect(addr), Err(NetError(115)));
+        let (peer, _) = listener.accept().unwrap();
+        client.send(b"tail", 0, None).unwrap();
+        client.shutdown(1).unwrap();
+        fabric.tick();
+        assert_eq!(peer.recv(0, 0).unwrap().ip.tcp_inq, Some(5));
+        assert_eq!(peer.recv(2, MSG_PEEK).unwrap().ip.tcp_inq, Some(5));
+        assert_eq!(peer.recv(4, 0).unwrap().ip.tcp_inq, Some(1));
+        assert_eq!(peer.recv(1, 0).unwrap().ip.tcp_inq, Some(1));
     }
 
     #[test]

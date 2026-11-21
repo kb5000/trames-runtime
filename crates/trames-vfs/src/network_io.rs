@@ -174,6 +174,64 @@ impl Vfs {
 mod tests {
     use super::*;
     #[test]
+    fn closing_a_lingering_stream_parks_only_the_last_descriptor() {
+        let mut v = Vfs::default();
+        let fabric = trames_net::Fabric::new().unwrap();
+        v.configure_virtual_network(&fabric, 2, NetworkMode::Full)
+            .unwrap();
+        let address = "127.0.0.1:34283".parse().unwrap();
+        let server = v.socket(2, 1, 0).unwrap();
+        let listener = v.socket_fd(server).unwrap();
+        listener
+            .bind_bytes(&trames_net::encode_address(address))
+            .unwrap();
+        listener.listen(1).unwrap();
+        let client = v.socket(2, 1, 0).unwrap();
+        assert_eq!(
+            v.socket_fd(client).unwrap().connect(address),
+            Err(trames_net::NetError(115))
+        );
+        let (peer, _) = v.accept(server, 0).unwrap();
+        let files = v.shared_files();
+        let paths = v.path_queries();
+        let duplicate = files.duplicate(client, 0, false).unwrap().unwrap();
+        v.socket_fd(client)
+            .unwrap()
+            .set_option_bytes(1, 13, &[1, 0, 0, 0, 1, 0, 0, 0])
+            .unwrap();
+        assert!(paths
+            .close_file(&files, client, 1)
+            .unwrap()
+            .unwrap()
+            .is_none());
+        fabric.set_link_faults(1, 0);
+        assert_eq!(
+            v.socket_fd(duplicate).unwrap().send(b"pending", 0, None),
+            Ok(7)
+        );
+        let work = paths
+            .close_file(&files, duplicate, 1)
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(files.lookup(duplicate), Some(Err(Errno(9)))));
+        assert!(!work.ready());
+        assert!(!work.host_work());
+        let replacement = v.socket(2, 2, 0).unwrap();
+        std::thread::sleep(Duration::from_millis(1010));
+        assert!(work.ready());
+        assert!(matches!(
+            work.run(),
+            FileOutcome::Complete(FileReply {
+                result: Ok(FileValue::Count(0)),
+                ..
+            })
+        ));
+        assert!(v.socket_fd(replacement).is_ok());
+        assert!(v.socket_fd(peer).is_ok());
+    }
+
+    #[test]
     fn a_first_dns_send_rearms_an_already_subscribed_udp_reader() {
         let mut v = Vfs::default();
         v.configure_network(NetworkMode::Outbound).unwrap();

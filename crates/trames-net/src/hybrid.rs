@@ -127,6 +127,13 @@ impl Socket {
             socket.set_owner_uid(uid);
         }
     }
+    pub(super) fn guest_for_close(&self) -> Option<Arc<virtualnet::Socket>> {
+        if self.path.get() == Path::Guest {
+            self.guest.borrow().clone()
+        } else {
+            None
+        }
+    }
     fn guest(&self) -> Result<Arc<virtualnet::Socket>> {
         if let Some(s) = self.guest.borrow().as_ref() {
             return Ok(s.clone());
@@ -540,7 +547,7 @@ impl Socket {
         // also owns a BSD listener, so reject before changing either half.
         if self.path.get() == Path::Both
             && level == 6
-            && matches!(name, 2 | 3 | 7..=10 | 12 | 13 | 18)
+            && matches!(name, 2 | 3 | 7..=10 | 12 | 13 | 18 | 36)
         {
             return Err(NetError(92));
         }

@@ -74,6 +74,7 @@ pub struct DatagramControl {
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ReceivedIp {
+    pub tcp_inq: Option<i32>,
     /// Linux SCM type and wall-clock packet arrival time in nanoseconds.
     pub timestamp: Option<(u32, u64)>,
     pub fields: IpFields,
@@ -490,6 +491,26 @@ impl Network {
         Ok(Socket::wrap(backend, self.1.clone(), reservation, kind))
     }
 }
+/// Closing task's wait for acknowledgement of the original stream's FIN.
+pub struct TcpLinger {
+    socket: Arc<virtualnet::Socket>,
+    deadline: std::time::Instant,
+}
+impl TcpLinger {
+    pub fn ready(&self) -> bool {
+        std::time::Instant::now() >= self.deadline || self.socket.linger_done()
+    }
+    pub fn deadline(&self) -> std::time::Instant {
+        self.deadline
+            .min(std::time::Instant::now() + self.socket.fabric().next_wait())
+    }
+    pub fn subscribe(
+        &self,
+        signal: &Arc<trames_shared::IoSignal>,
+    ) -> Option<trames_shared::IoSubscription> {
+        self.socket.subscribe_tcp_ready(signal)
+    }
+}
 pub struct Socket {
     proc_inode: std::sync::OnceLock<(u64, usize)>,
     inode_owner: Cell<u64>,
@@ -857,6 +878,16 @@ impl Socket {
             SocketBackend::Hybrid(s) => s.last_packet_ns(),
             _ => Err(NetError(25)),
         }
+    }
+    pub fn into_linger(self) -> Option<TcpLinger> {
+        let socket = match &self.backend {
+            SocketBackend::Virtual(s) => s.clone(),
+            SocketBackend::Hybrid(s) => s.guest_for_close()?,
+            _ => return None,
+        };
+        let deadline = std::time::Instant::now() + socket.start_linger()?;
+        let wait = TcpLinger { socket, deadline };
+        (!wait.ready()).then_some(wait)
     }
     pub fn linger(&self) -> Result<[u8; 8]> {
         let _operation = self.operation.read_recursive();

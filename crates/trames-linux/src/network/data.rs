@@ -384,6 +384,9 @@ impl Prepared {
                             &super::socket_timestamp(ns, matches!(kind, 35 | 64)),
                         );
                     }
+                    if let Some(remaining) = ip.tcp_inq {
+                        ancillary.push(6, 36, &remaining.to_le_bytes());
+                    }
                     if let Some(hops) = ip.fields.hop_limit {
                         let (level, kind) = if ip.ipv6 { (41, 52) } else { (0, 2) };
                         ancillary.push(level, kind, &i32::from(hops).to_le_bytes());

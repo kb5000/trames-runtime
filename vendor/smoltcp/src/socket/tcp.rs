@@ -18,9 +18,20 @@ use crate::wire::{
 };
 
 mod congestion;
+#[cfg(feature = "std")]
+mod receive_timestamps;
 
 macro_rules! tcp_trace {
     ($($arg:expr),*) => (net_log!(trace, $($arg),*));
+}
+
+/// Cause of an accepted transport failure. The application consumes it once.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Failure {
+    Refused,
+    Reset,
+    PeerAlreadyClosed,
+    TimedOut,
 }
 
 /// Error returned by [`Socket::listen`]
@@ -417,11 +428,14 @@ pub struct Socket<'a> {
     /// Interval after which, if no inbound packets are received, the connection is aborted.
     timeout: Option<Duration>,
     handshake_timeout_only: bool,
+    #[cfg(feature = "std")]
+    receive_timestamps: Option<Box<receive_timestamps::Stamps>>,
     syn_retries: Option<u8>,
     syn_attempts: u8,
     user_timeout: Option<Duration>,
     stalled_since: Option<Instant>,
-    user_timeout_error: bool,
+    failure: Option<Failure>,
+    orphaned: bool,
     /// Interval at which keep-alive packets will be sent.
     keep_alive: Option<Duration>,
     /// The time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
@@ -542,11 +556,14 @@ impl<'a> Socket<'a> {
             rx_fin_received: false,
             timeout: None,
             handshake_timeout_only: false,
+            #[cfg(feature = "std")]
+            receive_timestamps: None,
             syn_retries: None,
             syn_attempts: 0,
             user_timeout: None,
             stalled_since: None,
-            user_timeout_error: false,
+            failure: None,
+            orphaned: false,
             keep_alive: None,
             hop_limit: None,
             listen_endpoint: IpListenEndpoint::default(),
@@ -765,6 +782,26 @@ impl<'a> Socket<'a> {
         self.rx_limit = bytes;
     }
 
+    #[cfg(feature = "std")]
+    pub fn enable_receive_timestamps(&mut self, enabled: bool) {
+        if enabled {
+            self.receive_timestamps.get_or_insert_with(Default::default);
+        } else {
+            self.receive_timestamps = None;
+        }
+    }
+
+    /// Arrival time of the last byte in a read from the head of the receive ring.
+    #[cfg(feature = "std")]
+    pub fn receive_timestamp(&self, count: usize) -> Option<u64> {
+        self.receive_timestamps.as_ref()?.last(count)
+    }
+
+    /// Linux TCP_INQ includes the FIN sequence point even after the payload drains.
+    pub fn receive_queue_hint(&self) -> i32 {
+        (self.recv_queue() + usize::from(self.rx_fin_received)).min(i32::MAX as usize) as i32
+    }
+
     pub fn set_syn_retries(&mut self, retries: u8) {
         self.syn_retries = Some(retries);
     }
@@ -776,12 +813,12 @@ impl<'a> Socket<'a> {
         }
     }
 
-    pub fn user_timeout_error(&self) -> bool {
-        self.user_timeout_error
+    pub fn failure(&self) -> Option<Failure> {
+        self.failure
     }
 
-    pub fn take_user_timeout_error(&mut self) -> bool {
-        core::mem::take(&mut self.user_timeout_error)
+    pub fn take_failure(&mut self) -> Option<Failure> {
+        self.failure.take()
     }
 
     fn synchronized(&self) -> bool {
@@ -799,6 +836,12 @@ impl<'a> Socket<'a> {
             return None;
         }
         Some(self.remote_last_ts? + self.timeout?)
+    }
+
+    /// Final owner close. A half-close through shutdown still has a reader.
+    pub fn close_final(&mut self) {
+        self.orphaned = true;
+        self.close();
     }
 
     /// Set the timeout duration.
@@ -1055,12 +1098,17 @@ impl<'a> Socket<'a> {
     }
 
     fn reset(&mut self) {
+        #[cfg(feature = "std")]
+        if let Some(stamps) = self.receive_timestamps.as_deref_mut() {
+            *stamps = Default::default();
+        }
         let rx_cap_log2 =
             mem::size_of::<usize>() * 8 - self.rx_buffer.capacity().leading_zeros() as usize;
 
         self.state = State::Closed;
         self.stalled_since = None;
-        self.user_timeout_error = false;
+        self.failure = None;
+        self.orphaned = false;
         self.syn_attempts = 0;
         self.deferred_until = None;
         self.timer = Timer::new();
@@ -1506,6 +1554,10 @@ impl<'a> Socket<'a> {
         let _old_length = self.rx_buffer.len();
         let (size, result) = f(&mut self.rx_buffer);
         self.remote_seq_no += size;
+        #[cfg(feature = "std")]
+        if let Some(stamps) = self.receive_timestamps.as_mut() {
+            stamps.consume(size);
+        }
         if size > 0 {
             #[cfg(any(test, feature = "verbose"))]
             tcp_trace!(
@@ -2083,6 +2135,11 @@ impl<'a> Socket<'a> {
             // RSTs in any other state close the socket.
             (_, TcpControl::Rst) => {
                 tcp_trace!("received RST");
+                self.failure = Some(match self.state {
+                    State::SynSent => Failure::Refused,
+                    State::CloseWait => Failure::PeerAlreadyClosed,
+                    _ => Failure::Reset,
+                });
                 self.record_reset(cx);
                 self.set_state(State::Closed);
                 self.tuple = None;
@@ -2395,6 +2452,14 @@ impl<'a> Socket<'a> {
             return None;
         }
 
+        if self.orphaned {
+            // Sequence/window validation has trimmed old retransmissions.
+            // New data can no longer be delivered after the final owner closed.
+            self.abort_with_context(cx);
+            self.tuple = None;
+            return Some(Self::rst_reply(ip_repr, repr));
+        }
+
         let assembler_was_empty = self.assembler.is_empty();
 
         // Try adding payload octets to the assembler.
@@ -2418,6 +2483,12 @@ impl<'a> Socket<'a> {
         );
         let len_written = self.rx_buffer.write_unallocated(payload_offset, payload);
         debug_assert!(len_written == payload_len);
+        #[cfg(feature = "std")]
+        if let Some(stamps) = self.receive_timestamps.as_mut() {
+            let ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_nanos() as u64;
+            stamps.record(self.rx_buffer.len() + payload_offset, len_written, ns);
+        }
 
         if contig_len != 0 {
             // Enqueue the contiguous data octets in front of the buffer.
@@ -2642,7 +2713,7 @@ impl<'a> Socket<'a> {
             && self.timer.should_retransmit(cx.now()).is_some();
         if delivery_expired || retries_exhausted || self.idle_deadline().is_some_and(|end| cx.now() >= end) {
             if delivery_expired {
-                self.user_timeout_error = true;
+                self.failure = Some(Failure::TimedOut);
                 self.stalled_since = None;
             }
             #[cfg(feature = "alloc")]
@@ -7304,8 +7375,8 @@ mod test {
         });
         recv_nothing!(s, time 579);
         recv(&mut s, Instant::from_millis(580), |p| assert_eq!(p.unwrap().control, TcpControl::Rst));
-        assert!(s.take_user_timeout_error());
-        assert!(!s.take_user_timeout_error());
+        assert_eq!(s.take_failure(), Some(Failure::TimedOut));
+        assert_eq!(s.take_failure(), None);
 
         let mut s = socket_established();
         s.remote_win_len = 0;
@@ -7314,7 +7385,7 @@ mod test {
         recv_nothing!(s, time 100);
         assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Time(Instant::from_millis(150)));
         recv(&mut s, Instant::from_millis(150), |p| assert_eq!(p.unwrap().control, TcpControl::Rst));
-        assert!(s.take_user_timeout_error());
+        assert_eq!(s.take_failure(), Some(Failure::TimedOut));
     }
 
     #[test]

@@ -578,10 +578,13 @@ impl Socket {
             defer_accept_secs: state.defer_accept_secs,
             user_timeout_ms: state.user_timeout_ms,
             window_clamp: state.window_clamp,
-            linger: state.linger,
+            linger_enabled: state.linger_enabled,
+            linger_seconds: state.linger_seconds,
+            linger_closing: false,
+            receive_inq: state.receive_inq,
             receive_low_water: state.receive_low_water,
             no_check: state.no_check,
-            timestamp_option: 0,
+            timestamp_option: state.timestamp_option,
             last_packet_ns: None,
             keepalive: state.keepalive,
             keep_idle: state.keep_idle,
@@ -1083,7 +1086,7 @@ impl Socket {
         let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
         let s = n.sockets.get_mut::<tcp::Socket>(state.handles[0]);
         if !s.may_send() {
-            return Err(NetError(if s.take_user_timeout_error() { 110 } else { 32 }));
+            return Err(NetError(s.take_failure().map_or(32, tcp_errno)));
         }
         let count = s.send_slice(bytes).map_err(|_| NetError(32))?;
         n.dirty |= count != 0;
@@ -1163,20 +1166,6 @@ impl Socket {
                 }
             }
         }
-        if self.kind == 1 && count == 0 && state.connection == Connection::Connected {
-            return Ok(Received {
-                stream_minimum: 0,
-                packet_address: None,
-                netlink_address: None,
-                credentials: None,
-                ip: Default::default(),
-                packet_info: None,
-                data: Vec::new(),
-                address: None,
-                length: 0,
-                truncated: false,
-            });
-        }
         if self.kind == 1 && state.connection != Connection::Connected {
             if matches!(state.connection, Connection::Failed(_)) {
                 return Ok(Received {
@@ -1197,19 +1186,24 @@ impl Socket {
         let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
         if self.kind == 1 {
             let s = n.sockets.get_mut::<tcp::Socket>(state.handles[0]);
-            if !s.can_recv() {
-                if s.take_user_timeout_error() {
-                    return Err(NetError(110));
-                }
-                if s.may_recv() && !state.read_closed {
-                    return Err(NetError(11));
+            if count == 0 || !s.can_recv() {
+                if count != 0 {
+                    if let Some(failure) = s.take_failure() {
+                        return Err(NetError(tcp_errno(failure)));
+                    }
+                    if s.may_recv() && !state.read_closed {
+                        return Err(NetError(11));
+                    }
                 }
                 return Ok(Received {
                     stream_minimum: 0,
                     packet_address: None,
                     netlink_address: None,
                     credentials: None,
-                    ip: Default::default(),
+                    ip: crate::ReceivedIp {
+                        tcp_inq: state.receive_inq.then(|| s.receive_queue_hint()),
+                        ..Default::default()
+                    },
                     packet_info: None,
                     data: Vec::new(),
                     address: None,
@@ -1218,6 +1212,12 @@ impl Socket {
                 });
             }
             let available = count.min(s.recv_queue());
+            let timestamp = if state.timestamp_option != 0 {
+                s.receive_timestamp(available)
+                    .map(|ns| (state.timestamp_option, ns))
+            } else {
+                None
+            };
             let (bytes, size) = if flags & MSG_TRUNC != 0 {
                 let size = if flags & MSG_PEEK == 0 {
                     s.discard_received(available).map_err(|_| NetError(11))?
@@ -1258,6 +1258,7 @@ impl Socket {
             // Dequeuing preserves the cumulative ACK number. Only a newly
             // advertisable window needs an extra fabric poll.
             let advertise = flags & MSG_PEEK == 0 && size != 0 && s.window_to_update();
+            let tcp_inq = state.receive_inq.then(|| s.receive_queue_hint());
             n.dirty |= advertise;
             drop(state);
             if advertise {
@@ -1268,7 +1269,11 @@ impl Socket {
                 packet_address: None,
                 netlink_address: None,
                 credentials: None,
-                ip: Default::default(),
+                ip: crate::ReceivedIp {
+                    tcp_inq,
+                    timestamp,
+                    ..Default::default()
+                },
                 packet_info: None,
                 data: bytes,
                 address: None,
@@ -1289,6 +1294,7 @@ impl Socket {
                     let mapped = !ipv6 && self.family == 10 && state.udp_options[1].receive_info;
                     let stamp = meta.received_ns;
                     let mut headers = crate::ReceivedIp {
+                        tcp_inq: None,
                         timestamp: (state.timestamp_option != 0)
                             .then_some((state.timestamp_option, stamp)),
                         spec_destination: None,
@@ -1398,6 +1404,9 @@ impl Socket {
         self.fabric().tick();
         let mut i = self.network.0.fabric.0.borrow_mut();
         let state = self.state.borrow();
+        if self.kind == 1 && state.connection == Connection::Idle {
+            return Ok(16 | (events & (4 | 0x100)));
+        }
         if matches!(state.connection, Connection::Failed(_)) {
             return Ok(events & (1 | 4 | 0x40 | 0x100 | 0x2000)
                 | 16
@@ -1441,7 +1450,7 @@ impl Socket {
                     }
                     if s.state() == tcp::State::Closed {
                         ready |= 16;
-                        if s.user_timeout_error() {
+                        if s.failure().is_some() {
                             ready |= 8;
                         }
                     }
@@ -1533,7 +1542,7 @@ impl Socket {
                     state.udp_group = state.reuse_port.then(|| self.reuse_port_group());
                 }
             }
-            (1, 29 | 35 | 63 | 64) if self.kind == 2 => {
+            (1, 29 | 35 | 63 | 64) if matches!(self.kind, 1 | 2) => {
                 state.timestamp_option = if value == 0 { 0 } else { name };
             }
             (1, 11) if matches!(self.kind, 1 | 2) => state.no_check = value != 0,
@@ -1620,6 +1629,14 @@ impl Socket {
                     value.max((crate::socket_buffer_size(8, 0) / 2) as i32) as u32
                 };
             }
+            (6, 36) if self.kind == 1 => {
+                state.receive_inq = match value {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(NetError(22)),
+                };
+                return Ok(());
+            }
             (6, 18) if self.kind == 1 => {
                 state.user_timeout_ms = value.try_into().map_err(|_| NetError(22))?;
             }
@@ -1675,6 +1692,9 @@ impl Socket {
                         if let Some(now) = flush {
                             s.push_corked(now);
                         }
+                    }
+                    (1, 29 | 35 | 63 | 64) => {
+                        s.enable_receive_timestamps(state.timestamp_option != 0)
                     }
                     (6, 9) => s.set_defer_accept(state.defer_accept_secs),
                     (6, 7) => s.set_syn_retries(state.syn_retries.unwrap()),
@@ -1795,12 +1815,12 @@ impl Socket {
             }
             if self.kind == 1 && state.connection == Connection::Connected {
                 let node = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
-                if node
+                if let Some(failure) = node
                     .sockets
                     .get_mut::<tcp::Socket>(state.handles[0])
-                    .take_user_timeout_error()
+                    .take_failure()
                 {
-                    return Ok(110);
+                    return Ok(tcp_errno(failure) as i32);
                 }
             }
             return Ok(0);
@@ -1863,7 +1883,7 @@ impl Socket {
             (0, 32 | 33 | 34 | 49) if self.kind == 2 => Ok(state.multicast_value(name)),
             (1, 2) => Ok(i32::from(state.reuse)),
             (1, 15) if self.kind == 2 => Ok(i32::from(state.reuse_port)),
-            (1, 29 | 35 | 63 | 64) if self.kind == 2 => {
+            (1, 29 | 35 | 63 | 64) if matches!(self.kind, 1 | 2) => {
                 Ok(i32::from(state.timestamp_option == name))
             }
             (1, 11) if matches!(self.kind, 1 | 2) => Ok(i32::from(state.no_check)),
@@ -1887,6 +1907,7 @@ impl Socket {
             (6, 7) if self.kind == 1 => Ok(state.syn_retries.unwrap_or(6).into()),
             (6, 9) if self.kind == 1 => Ok(state.defer_accept_secs as i32),
             (6, 10) if self.kind == 1 => Ok(state.window_clamp as i32),
+            (6, 36) if self.kind == 1 => Ok(i32::from(state.receive_inq)),
             (6, 18) if self.kind == 1 => Ok(state.user_timeout_ms as i32),
             (6, 8) if self.kind == 1 => Ok(state.fin_wait_seconds),
             (6, 1) if self.kind == 1 => Ok(i32::from(state.nodelay)),
@@ -1919,8 +1940,55 @@ impl Socket {
         out[..name.len()].copy_from_slice(name);
         Ok(out)
     }
+    // Called only after close has removed the last file description and socket
+    // lease. The caller can park while the original transport drains its FIN.
+    pub(crate) fn start_linger(&self) -> Option<Duration> {
+        let state = self.state.borrow_mut();
+        if self.kind != 1
+            || !state.linger_enabled
+            || state.linger_seconds == 0
+            || state.connection != Connection::Connected
+        {
+            return None;
+        }
+        let duration = Duration::from_secs(state.linger_seconds.into());
+        let handle = state.handles[0];
+        drop(state);
+        let mut fabric = self.network.0.fabric.0.borrow_mut();
+        let node = fabric.nodes.get_mut(&self.network.0.key)?;
+        let tcp = node.sockets.get_mut::<tcp::Socket>(handle);
+        if tcp.recv_queue() != 0 {
+            return None;
+        }
+        tcp.close_final();
+        if !matches!(
+            tcp.state(),
+            tcp::State::FinWait1 | tcp::State::Closing | tcp::State::LastAck
+        ) {
+            return None;
+        }
+        self.state.borrow_mut().linger_closing = true;
+        node.dirty = true;
+        Some(duration)
+    }
+    pub(crate) fn linger_done(&self) -> bool {
+        let mut fabric = self.network.0.fabric.0.borrow_mut();
+        fabric.tick();
+        let state = self.state.borrow();
+        let Some(node) = fabric.nodes.get(&self.network.0.key) else {
+            return true;
+        };
+        !matches!(
+            node.sockets.get::<tcp::Socket>(state.handles[0]).state(),
+            tcp::State::FinWait1 | tcp::State::Closing | tcp::State::LastAck
+        )
+    }
     pub fn linger(&self) -> Result<[u8; 8]> {
-        Ok(crate::linger_bytes(self.state.borrow().linger))
+        let state = self.state.borrow();
+        let mut value = [0; 8];
+        value[..4].copy_from_slice(&i32::from(state.linger_enabled).to_le_bytes());
+        value[4..].copy_from_slice(&state.linger_seconds.to_le_bytes());
+        Ok(value)
     }
     pub fn set_option_bytes(&self, level: u32, name: u32, value: &[u8]) -> Result<()> {
         if (level, name) == (6, 13) && self.kind == 1 {
@@ -1952,10 +2020,11 @@ impl Socket {
         }
         if (level, name) == (1, 13) {
             let linger = crate::parse_linger(value)?;
-            if self.kind != 2 && linger.is_some_and(|d| !d.is_zero()) {
-                return Err(NetError(95));
+            let mut state = self.state.borrow_mut();
+            state.linger_enabled = linger.is_some();
+            if let Some(duration) = linger {
+                state.linger_seconds = duration.as_secs() as u32;
             }
-            self.state.borrow_mut().linger = linger;
             return Ok(());
         }
         if (level, name) == (58, 1) && self.family == 10 && self.kind == 4 {

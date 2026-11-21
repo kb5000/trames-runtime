@@ -336,6 +336,7 @@ pub struct FileWork {
     namespace: Option<Box<namespace_work::NamespaceWork>>,
     proc_wait: Vec<trames_memory::MemoryRead>,
     fuse_stat: Option<Box<fuse::Metadata>>,
+    linger: Option<Box<trames_net::TcpLinger>>,
 }
 struct FileActive(Arc<Inode>);
 impl Drop for FileActive {
@@ -424,6 +425,9 @@ impl FileWork {
         }
     }
     pub fn waiting(&self) -> bool {
+        if let Some(wait) = &self.linger {
+            return !wait.ready();
+        }
         if let Some(p) = &self.fuse_stat {
             return !p.ready();
         }
@@ -438,6 +442,9 @@ impl FileWork {
             || matches!(&self.command, FileCommand::Transfer(t) if t.borrow().waits())
     }
     pub fn ready(&self) -> bool {
+        if let Some(wait) = &self.linger {
+            return wait.ready();
+        }
         if let Some(p) = &self.fuse_stat {
             return p.ready();
         }
@@ -460,6 +467,13 @@ impl FileWork {
         }
     }
     pub fn wait_sources(&self, signal: &Arc<IoSignal>) -> std::io::Result<TransferWait> {
+        if let Some(wait) = &self.linger {
+            return Ok(TransferWait {
+                subscriptions: wait.subscribe(signal).into_iter().collect(),
+                native: vec![],
+                deadline: Some(wait.deadline()),
+            });
+        }
         if let Some(p) = &self.fuse_stat {
             return Ok(TransferWait {
                 subscriptions: vec![p.subscribe(signal)],
@@ -585,10 +599,11 @@ impl FileWork {
             namespace: None,
             proc_wait: Vec::new(),
             fuse_stat: None,
+            linger: None,
         }
     }
     pub fn host_work(&self) -> bool {
-        if self.fuse_stat.is_some() {
+        if self.fuse_stat.is_some() || self.linger.is_some() {
             return false;
         }
         if let Some(namespace) = &self.namespace {
@@ -612,6 +627,7 @@ impl FileWork {
             namespace: None,
             proc_wait: Vec::new(),
             fuse_stat: None,
+            linger: None,
         }
     }
     pub fn from_vfs(vfs: &Vfs, target: FileTarget, command: FileCommand) -> Self {
@@ -628,10 +644,12 @@ impl FileWork {
             namespace: None,
             proc_wait: Vec::new(),
             fuse_stat: None,
+            linger: None,
         }
     }
     pub fn queued(mut self) -> Self {
         if self.fuse_stat.is_none()
+            && self.linger.is_none()
             && self.namespace.is_none()
             && self.sync_targets.is_none()
             && (matches!(self.command, FileCommand::SyncAll)
@@ -763,6 +781,17 @@ impl FileWork {
         self
     }
     pub fn run(mut self) -> FileOutcome {
+        if let Some(wait) = &self.linger {
+            return if wait.ready() {
+                FileOutcome::Complete(FileReply {
+                    result: Ok(FileValue::Count(0)),
+                    file_size_signal: false,
+                    scratch: None,
+                })
+            } else {
+                FileOutcome::Waiting(self)
+            };
+        }
         if let Some(p) = &mut self.fuse_stat {
             return match p.take() {
                 Some(result) => FileOutcome::Complete(FileReply {
@@ -898,6 +927,27 @@ impl PathQueries {
             let Some(Ok(open)) = slot.shared_open() else {
                 return Ok(None);
             };
+            if open.socket.is_some() {
+                // Consume the removed descriptor outside Files. A dup, fork or
+                // in-flight operation holding the OFD keeps the stream open.
+                let fd_table::SlotOpen::Shared(open) = slot.open else {
+                    unreachable!()
+                };
+                let Some(mut open) = Arc::into_inner(open) else {
+                    return Ok(None);
+                };
+                let Some(wait) = open
+                    .socket
+                    .take()
+                    .and_then(Arc::into_inner)
+                    .and_then(NetSocket::into_linger)
+                else {
+                    return Ok(None);
+                };
+                let mut work = FileWork::sync_all(self.retain_context());
+                work.linger = Some(Box::new(wait));
+                return Ok(Some(work));
+            }
             let Some(events::SharedControl::FuseFile(file)) = &open.control else {
                 return Ok(None);
             };

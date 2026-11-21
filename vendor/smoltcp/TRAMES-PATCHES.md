@@ -99,3 +99,17 @@ poll and accept paths consult the same readiness condition. This models
 application-visible readiness using the existing transport timers. It does
 not reproduce Linux's wire-level treatment of bare ACKs during deferred
 accept.
+
+Final TCP close marks the socket as having no remaining reader. New,
+in-window payload arriving afterward elicits a reset. A write-half shutdown
+keeps the reader. The transport records an accepted RST on its original
+socket along with the connection state at receipt. Linux I/O and SO_ERROR
+can then consume the reason once. Packet ingress no longer scans the
+environment's socket registry to attribute reset packets.
+
+TCP_INQ reads the current receive queue and FIN sequence point. On std
+builds, a socket with software receive timestamps enabled records timestamp
+boundaries along its receive ring. Reads look up the final byte copied and
+discard consumed boundaries. Reordered segments can carry different arrival
+times. Disabling timestamps releases the index. A stream using the defaults
+does not allocate this index or read the wall clock for incoming TCP data.
