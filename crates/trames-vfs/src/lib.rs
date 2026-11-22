@@ -31,6 +31,8 @@ use fs_data::{FsBorrow, FsHandle};
 mod async_io;
 mod user_namespace;
 pub use user_namespace::{UserNamespace, CLONE_NEWUSER};
+mod keyrings;
+pub use keyrings::{KeyOperation, KeyRegistry, KeyResult, SessionKeys};
 mod credentials;
 mod fd_status;
 pub use async_io::{AsyncOwner, AsyncOwners, TaskSignal};

@@ -550,6 +550,7 @@ impl<C: Cpu> Lifecycle<C> {
             let futex = crate::futex::Authority::new(self.futexes.clone(), p.vm_id);
             p.linux.vfs.retire_sem_undo(p.tgid);
             let exit = crate::worker_syscalls::ExitResources {
+                session_keys: &p.linux.session_keys,
                 task: &task,
                 files: &files,
                 context: context.as_ref(),

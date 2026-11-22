@@ -79,6 +79,7 @@ pub struct Linux {
     pub executing_file: Option<std::sync::Arc<trames_vfs::ExecutingFile>>,
     pub executable_file: Option<std::sync::Arc<trames_vfs::ExecutableFile>>,
     pub memory_policy: std::sync::Arc<crate::TaskMemoryPolicy>,
+    pub session_keys: trames_vfs::SessionKeys,
     pub personality: crate::TaskPersonality,
     pub command_name: trames_vfs::TaskName,
     pub argument_pointers: Vec<u64>,
@@ -125,6 +126,7 @@ impl Linux {
             executing_file: self.executing_file.clone(),
             executable_file: self.executable_file.clone(),
             memory_policy: std::sync::Arc::new(self.memory_policy.fork()),
+            session_keys: self.session_keys.fork(),
             personality: self.personality.fork(),
             command_name: self.command_name.fork(),
             argument_pointers: self.argument_pointers.clone(),
@@ -188,6 +190,7 @@ impl Linux {
             executing_file: None,
             executable_file: None,
             memory_policy: Default::default(),
+            session_keys: Default::default(),
             personality: Default::default(),
             command_name: Default::default(),
             argument_pointers: Vec::new(),
@@ -1618,6 +1621,7 @@ impl Linux {
             5..=17 | 33..=41 | 43 | 44 | 49..=55 | 88 | 180 | 181 | 276 | 279 | 428..=432 | 452 => {
                 crate::direct::namespace::owner(number as u32, a, memory, &mut self.vfs)
             },
+            219 => crate::keyctl(&self.session_keys, &self.vfs.key_registry(), &self.vfs.credentials, a, memory),
             92 => self.personality.call(a[0]),
             425 => self.uring_setup(a, memory),
             426 => self

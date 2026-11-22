@@ -167,6 +167,7 @@ impl<C: Cpu> Kernel<C> {
             .vfs
             .set_dumpable(dumpable)
             .expect("prepared dumpable value");
+        runtime.linux.session_keys = p.linux.session_keys.clone();
         runtime.linux.personality = p.linux.personality.clone();
         runtime.linux.memory_policy = p.linux.memory_policy.clone();
         runtime.linux.trace = p.linux.trace;

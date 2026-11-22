@@ -40,6 +40,7 @@ impl Default for UserNamespace {
     }
 }
 pub(super) struct UserSpace {
+    key_sessions: OnceLock<crate::keyrings::UserSessions>,
     overflow: Arc<OverflowIds>,
     id: u64,
     parent: UserNamespace,
@@ -136,6 +137,13 @@ impl UserNamespace {
             Namespace::Child(n) => &n.overflow,
         }
     }
+    pub(super) fn key_sessions<'a>(
+        &'a self,
+        initial: &'a crate::keyrings::UserSessions,
+    ) -> &'a crate::keyrings::UserSessions {
+        self.child()
+            .map_or(initial, |ns| ns.key_sessions.get_or_init(Default::default))
+    }
     pub fn is_initial(&self) -> bool {
         matches!(self.0, Namespace::Initial(_))
     }
@@ -183,6 +191,7 @@ impl UserNamespace {
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| Errno(28))?;
         Ok(Self(Namespace::Child(Arc::new(UserSpace {
+            key_sessions: OnceLock::new(),
             overflow: parent.overflow().clone(),
             id,
             parent,

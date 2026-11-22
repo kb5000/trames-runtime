@@ -19,6 +19,7 @@ pub(super) struct Exit {
 /// No policy/FD-kind decision or owner-local Rc enters this capability.
 pub(super) struct ExitResources<'a> {
     pub task: &'a Arc<trames_kernel::signal::IoTask>,
+    pub session_keys: &'a trames_vfs::SessionKeys,
     pub files: &'a trames_vfs::FileTableOwner,
     pub context: Option<&'a trames_vfs::FsOwner>,
     pub parents: &'a trames_kernel::task_parent::Parents,
@@ -52,6 +53,7 @@ impl ExitResources<'_> {
                 }
             }
         }
+        self.session_keys.retire();
         self.files.retire(self.task.tgid());
         if let Some(context) = self.context {
             context.retire();
@@ -85,6 +87,7 @@ impl ExitResources<'_> {
 pub(super) struct Snapshot {
     pub diagnostics: Option<trames_linux::SyscallDiagnostics>,
     pub name: trames_vfs::TaskName,
+    pub session_keys: trames_vfs::SessionKeys,
     pub personality: trames_linux::TaskPersonality,
     pub memory_policy: Arc<trames_linux::TaskMemoryPolicy>,
     pub membarrier_registered: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -840,6 +843,7 @@ impl Snapshot {
         self.direct.retire_sem_undo(self.io_signals.tgid());
         Some(
             ExitResources {
+                session_keys: &self.session_keys,
                 task: &self.io_signals,
                 files,
                 context: self.exit_context.as_ref(),
@@ -886,7 +890,7 @@ impl Snapshot {
         // futex/epoll checkpoint. Ordinary unfiltered calls keep the old path.
         if !matches!(
             cpu.x(8) as u32,
-            25 | 92 | 98..=101 | 113..=115 | 117 | 124 | 139 | 154..=157 | 163 | 164 | 261 | 166 | 168 | 169 | 172..=179 | 270 | 271 | 278
+            25 | 92 | 219 | 98..=101 | 113..=115 | 117 | 124 | 139 | 154..=157 | 163 | 164 | 261 | 166 | 168 | 169 | 172..=179 | 270 | 271 | 278
         ) && !(cpu.x(8) as u32 == 29
             && trames_vfs::DescriptorControl::status_ioctl_request(cpu.x(1) as u32))
             && !(matches!(cpu.x(8) as u32, 160..=162) && self.uts.is_some())
@@ -980,6 +984,18 @@ impl Snapshot {
                 cpu.x(1),
                 memory,
             ),
+            219 => self
+                .namespaces
+                .as_ref()?
+                .with_key_registry(|registry, credentials| {
+                    trames_linux::keyctl(
+                        &self.session_keys,
+                        registry,
+                        credentials,
+                        std::array::from_fn(|i| cpu.x(i)),
+                        memory,
+                    )
+                }),
             92 => self.personality.call(cpu.x(0)),
             96 => {
                 self.io_signals.thread_addresses()?.set_clear_tid(cpu.x(0));
@@ -1424,6 +1440,7 @@ mod tests {
         let snapshot = Snapshot {
             diagnostics: None,
             name: Default::default(),
+            session_keys: Default::default(),
             personality: Default::default(),
             memory_policy: Default::default(),
             membarrier_registered: None,
@@ -1571,6 +1588,7 @@ mod tests {
         let snapshot = Snapshot {
             diagnostics: None,
             name: Default::default(),
+            session_keys: Default::default(),
             personality: Default::default(),
             memory_policy: Default::default(),
             membarrier_registered: None,
@@ -1640,6 +1658,7 @@ mod tests {
         let mut snapshot = Snapshot {
             diagnostics: None,
             name: Default::default(),
+            session_keys: Default::default(),
             personality: Default::default(),
             memory_policy: Default::default(),
             membarrier_registered: None,
@@ -1752,6 +1771,7 @@ mod tests {
         let snapshot = Snapshot {
             diagnostics: None,
             name: Default::default(),
+            session_keys: Default::default(),
             personality: Default::default(),
             memory_policy: Default::default(),
             membarrier_registered: None,
@@ -1829,6 +1849,7 @@ mod tests {
         let snapshot = Snapshot {
             diagnostics: None,
             name: Default::default(),
+            session_keys: Default::default(),
             personality: Default::default(),
             memory_policy: Default::default(),
             membarrier_registered: None,

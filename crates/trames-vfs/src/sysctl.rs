@@ -45,6 +45,7 @@ pub(super) enum Control {
     OverflowId(bool, Arc<user_namespace::OverflowIds>),
     UtsName(bool, Arc<readiness::ProcWatch>),
     Namei(Protection, Arc<NameiPolicy>),
+    KeyLimit(bool, Arc<KeyRegistry>),
     MountMax(Arc<mounts::MountPolicy>),
     TaskIo {
         task: Arc<dyn ProcTask>,
@@ -78,7 +79,7 @@ impl Control {
             Self::UserNamespaces(owner, _) => {
                 owner.capable(credentials, capabilities::SYS_RESOURCE)
             }
-            Self::OverflowId(..) | Self::MountMax(_) | Self::Namei(..) => {
+            Self::KeyLimit(..) | Self::OverflowId(..) | Self::MountMax(_) | Self::Namei(..) => {
                 credentials.euid == 0 && credentials.user_namespace.is_initial()
             }
             Self::NrOpen(_) => {
@@ -118,6 +119,7 @@ impl Control {
             Self::UserMap(control) => return control.read(offset, count),
             Self::Network(control) => return control.read(offset, count),
             Self::Namei(kind, policy) => policy.get(*kind),
+            Self::KeyLimit(root, keys) => keys.limit(*root),
             Self::MountMax(policy) => policy.get(),
             Self::OverflowId(group, ids) => ids.get(*group),
             Self::NrOpen(limit) => limit.get(),
@@ -157,6 +159,7 @@ impl Control {
             Self::Network(control) => control.write(bytes, offset, control.authorized(credentials)),
             Self::OverflowId(..)
             | Self::Namei(..)
+            | Self::KeyLimit(..)
             | Self::MountMax(_)
             | Self::NrOpen(_)
             | Self::UserNamespaces(_, _) => {
@@ -180,6 +183,9 @@ impl Control {
                     }
                     Self::Namei(kind, policy) if value <= kind.max() => {
                         policy.0[*kind as usize].store(value, Ordering::Relaxed)
+                    }
+                    Self::KeyLimit(root, keys) if (1..=i32::MAX as u32).contains(&value) => {
+                        keys.set_limit(*root, value)
                     }
                     Self::MountMax(policy) if value > 0 => policy.set(value),
                     Self::NrOpen(limit) if (1..=MAX_FDS).contains(&value) => limit.set(value),
@@ -317,6 +323,15 @@ impl Vfs {
             ))
         } else if let Some(kind) = Protection::at(path).filter(|_| self.uses_pseudo(path)) {
             Some(Control::Namei(kind, self.namei_policy.clone()))
+        } else if matches!(
+            path.as_ref(),
+            b"/proc/sys/kernel/keys/maxkeys" | b"/proc/sys/kernel/keys/root_maxkeys"
+        ) && self.uses_pseudo(path)
+        {
+            Some(Control::KeyLimit(
+                path.ends_with(b"/root_maxkeys"),
+                self.key_registry(),
+            ))
         } else if path.as_ref() == b"/proc/sys/fs/mount-max" && self.uses_pseudo(path) {
             Some(Control::MountMax(self.pseudo.borrow().mount_policy.clone()))
         } else if self.uses_pseudo(path) && path.as_ref() == b"/proc/sys/fs/nr_open" {
