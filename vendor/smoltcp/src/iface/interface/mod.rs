@@ -55,6 +55,7 @@ mod udp;
 use super::packet::*;
 
 use core::result::Result;
+#[cfg(any(not(feature = "iface-allocated-addrs"), feature = "proto-sixlowpan"))]
 use heapless::Vec;
 
 #[cfg(feature = "_proto-fragmentation")]
@@ -66,7 +67,10 @@ use super::fragmentation::{Fragmenter, FragmentsBuffer};
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 use super::neighbor::{Answer as NeighborAnswer, Cache as NeighborCache};
 use super::socket_set::SocketSet;
-use crate::config::{IFACE_MAX_ADDR_COUNT, IFACE_MAX_SIXLOWPAN_ADDRESS_CONTEXT_COUNT};
+#[cfg(feature = "proto-sixlowpan")]
+use crate::config::IFACE_MAX_SIXLOWPAN_ADDRESS_CONTEXT_COUNT;
+#[cfg(not(feature = "iface-allocated-addrs"))]
+use crate::config::IFACE_MAX_ADDR_COUNT;
 use crate::iface::Routes;
 use crate::phy::PacketMeta;
 use crate::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -75,6 +79,37 @@ use crate::socket::*;
 use crate::time::{Duration, Instant};
 
 use crate::wire::*;
+
+/// Interface addresses. Embedded builds retain their configured fixed capacity.
+#[cfg(not(feature = "iface-allocated-addrs"))]
+pub type InterfaceAddresses = Vec<IpCidr, IFACE_MAX_ADDR_COUNT>;
+
+#[cfg(feature = "iface-allocated-addrs")]
+#[derive(Debug, Default, Clone)]
+pub struct InterfaceAddresses(alloc::vec::Vec<IpCidr>);
+
+#[cfg(feature = "iface-allocated-addrs")]
+impl InterfaceAddresses {
+    /// Keep the fallible insertion contract of the fixed-capacity address list.
+    pub fn push(&mut self, value: IpCidr) -> Result<(), IpCidr> {
+        self.0.try_reserve(1).map_err(|_| value)?;
+        self.0.push(value);
+        Ok(())
+    }
+}
+#[cfg(feature = "iface-allocated-addrs")]
+impl core::ops::Deref for InterfaceAddresses {
+    type Target = alloc::vec::Vec<IpCidr>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+#[cfg(feature = "iface-allocated-addrs")]
+impl core::ops::DerefMut for InterfaceAddresses {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 macro_rules! check {
     ($e:expr) => {
@@ -198,7 +233,7 @@ pub struct InterfaceInner {
         Vec<SixlowpanAddressContext, IFACE_MAX_SIXLOWPAN_ADDRESS_CONTEXT_COUNT>,
     #[cfg(feature = "proto-sixlowpan-fragmentation")]
     tag: u16,
-    ip_addrs: Vec<IpCidr, IFACE_MAX_ADDR_COUNT>,
+    ip_addrs: InterfaceAddresses,
     any_ip: bool,
     #[cfg(feature = "socket-tcp")]
     pub(crate) tcp_sack: bool,
@@ -330,7 +365,7 @@ impl Interface {
                 now,
                 caps,
                 hardware_addr: config.hardware_addr,
-                ip_addrs: Vec::new(),
+                ip_addrs: InterfaceAddresses::default(),
                 any_ip: false,
                 #[cfg(feature = "socket-tcp")]
                 tcp_sack: true,
@@ -445,7 +480,7 @@ impl Interface {
     ///
     /// # Panics
     /// This function panics if any of the addresses are not unicast.
-    pub fn update_ip_addrs<F: FnOnce(&mut Vec<IpCidr, IFACE_MAX_ADDR_COUNT>)>(&mut self, f: F) {
+    pub fn update_ip_addrs<F: FnOnce(&mut InterfaceAddresses)>(&mut self, f: F) {
         f(&mut self.inner.ip_addrs);
         InterfaceInner::flush_neighbor_cache(&mut self.inner);
         InterfaceInner::check_ip_addrs(&self.inner.ip_addrs);

@@ -90,38 +90,17 @@ impl Topology {
                 self.devices.get_mut(&(id, index)).unwrap().ipv6[knob] = value;
                 if knob == 2 && value == 1 {
                     let before = self.device(id, index)?;
-                    let routes = self
-                        .policy_routes(id)
-                        .into_iter()
-                        .filter(|(_, e)| {
-                            e.route.device == index && e.route.destination.ip.is_ipv6()
-                        })
-                        .collect::<Vec<_>>();
                     self.devices
                         .get_mut(&(id, index))
                         .unwrap()
                         .addresses
                         .retain(|a| a.ip.is_ipv4());
-                    let s = self.spaces.get_mut(&id).unwrap();
-                    s.routes
-                        .retain(|r| r.device != index || r.destination.ip.is_ipv4());
-                    s.policy.forget_ipv6_device(index);
-                    for address in before.addresses.iter().filter(|a| a.ip.is_ipv6()) {
-                        changes.push((
-                            id,
-                            21,
-                            0x100,
-                            crate::rtnetlink::address_data(&before, *address),
-                        ));
-                    }
-                    for (table, e) in routes {
-                        changes.push((
-                            id,
-                            25,
-                            0x400,
-                            crate::rtnetlink::policy_route_data(table, e),
-                        ));
-                    }
+                    self.flush_ipv6_routes(id, index, &mut changes);
+                    crate::rtnetlink::address_changes(
+                        &before,
+                        &self.device(id, index)?,
+                        &mut changes,
+                    );
                 }
             }
         }

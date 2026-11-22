@@ -697,3 +697,65 @@ fn an_old_netlink_fd_keeps_the_protocol_stack_alive_until_last_close() {
     drop(netlink_only);
     assert!(root.devices().iter().all(|d| d.name != b"pin-b"));
 }
+
+#[test]
+fn scoped_veth_addresses_follow_carrier_and_carry_udp() {
+    use std::net::SocketAddrV6;
+    let root = Network::new(NetworkMode::Full);
+    let left = root.isolated().unwrap();
+    let right = root.isolated().unwrap();
+    let (li, ri) = left
+        .1
+        .graph
+        .write()
+        .unwrap()
+        .create_veth(left.namespace_id(), b"left", right.namespace_id(), b"right")
+        .unwrap();
+    left.set_device_up(li, true).unwrap();
+    let changes = right
+        .1
+        .graph
+        .write()
+        .unwrap()
+        .change_link(
+            right.namespace_id(),
+            ri,
+            None,
+            None,
+            Some(true),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    let scoped = |n: &Network, index| {
+        assert!(changes
+            .iter()
+            .any(|(ns, event, group, _)| *ns == n.namespace_id()
+                && *event == 20
+                && *group == 0x100));
+        let device = n.devices().into_iter().find(|d| d.index == index).unwrap();
+        let IpAddr::V6(ip) = device.addresses[0].ip else {
+            panic!("missing IPv6 address")
+        };
+        assert!(ip.is_unicast_link_local());
+        SocketAddrV6::new(ip, 1234, 0, index)
+    };
+    let a = scoped(&left, li);
+    let b = scoped(&right, ri);
+    let sender = left.socket(10, 2, 0).unwrap();
+    let receiver = right.socket(10, 2, 0).unwrap();
+    let mut wrong = a;
+    wrong.set_scope_id(1);
+    assert_eq!(sender.bind(wrong.into()), Err(NetError(99)));
+    wrong.set_scope_id(0);
+    assert_eq!(sender.bind(wrong.into()), Err(NetError(22)));
+    sender.bind(a.into()).unwrap();
+    receiver.bind(b.into()).unwrap();
+    assert_eq!(sender.local_addr().unwrap(), SocketAddr::V6(a));
+    let mut destination = b;
+    destination.set_scope_id(li);
+    sender.send(b"scoped", 0, Some(destination.into())).unwrap();
+    assert_eq!(receiver.recv(16, 0).unwrap().data, b"scoped");
+}

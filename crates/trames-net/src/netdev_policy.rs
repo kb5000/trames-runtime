@@ -77,14 +77,6 @@ impl Policy {
             || self.rules.len() != 6
             || default_rules().any(|r| !self.rules.contains(&r));
     }
-    pub(super) fn forget_ipv6_device(&mut self, index: u32) {
-        self.tables.retain(|_, entries| {
-            entries.retain(|e| e.route.device != index || e.route.destination.ip.is_ipv4());
-            !entries.is_empty()
-        });
-        self.update_active();
-    }
-
     pub(super) fn forget_device(&mut self, index: u32) {
         self.tables.retain(|_, entries| {
             entries.retain(|e| e.route.device != index);
@@ -94,6 +86,40 @@ impl Policy {
     }
 }
 impl Topology {
+    pub(super) fn flush_ipv6_routes(
+        &mut self,
+        id: u64,
+        index: u32,
+        changes: &mut crate::rtnetlink::Changes,
+    ) {
+        let space = self.spaces.get_mut(&id).unwrap();
+        let mut keep = |table, entry: Entry| {
+            let keep = entry.route.device != index || entry.route.destination.ip.is_ipv4();
+            if !keep {
+                changes.push((
+                    id,
+                    25,
+                    0x400,
+                    crate::rtnetlink::policy_route_data(table, entry),
+                ));
+            }
+            keep
+        };
+        space.routes.retain(|route| {
+            keep(
+                254,
+                Entry {
+                    route: *route,
+                    kind: 1,
+                },
+            )
+        });
+        space.policy.tables.retain(|table, entries| {
+            entries.retain(|e| keep(*table, *e));
+            !entries.is_empty()
+        });
+        space.policy.update_active();
+    }
     pub fn policy_rules(&self, id: u64, family: u8) -> Vec<Rule> {
         self.spaces[&id]
             .policy
@@ -286,7 +312,7 @@ impl Topology {
     ) -> Result<(IpAddr, u32, Option<IpAddr>)> {
         let p = &self.spaces[&id].policy;
         if !p.active {
-            return self.source_main(id, destination);
+            return self.source_main(id, destination, context.device);
         }
         let family = if destination.is_ipv4() { 2 } else { 10 };
         for r in p.rules.iter().filter(|r| r.family == family) {
@@ -311,7 +337,7 @@ impl Topology {
                 _ => {}
             }
             if r.table == 255 && self.own(id, destination) {
-                return self.source_main(id, destination);
+                return self.source_main(id, destination, context.device);
             }
             // Main-route synthesis is needed only for that table. Normal
             // Android policy lookups borrow stored entries without allocation.
@@ -350,12 +376,8 @@ impl Topology {
                     _ => {}
                 }
                 let d = &self.devices[&(id, entry.route.device)];
-                if let Some(a) = d
-                    .addresses
-                    .iter()
-                    .find(|a| a.ip.is_ipv4() == destination.is_ipv4())
-                {
-                    return Ok((a.ip, d.index, entry.route.gateway));
+                if let Some(a) = source_address(&d.addresses, destination) {
+                    return Ok((a, d.index, entry.route.gateway));
                 }
             }
         }

@@ -273,6 +273,7 @@ version = "0.17"
 version = "2.0"
 
 [features]
+iface-allocated-addrs = ["alloc"]
 _proto-fragmentation = []
 alloc = [
     "managed/alloc",

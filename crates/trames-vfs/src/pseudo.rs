@@ -2588,9 +2588,6 @@ impl Vfs {
                             let mut data = String::new();
                             if let Some(n) = &network {
                                 for d in n.devices() {
-                                    if d.kind == trames_net::DeviceKind::Loopback && !d.up {
-                                        continue;
-                                    }
                                     for a in d.addresses {
                                         if let std::net::IpAddr::V6(ip) = a.ip {
                                             data.push_str(&format!(
@@ -2598,7 +2595,13 @@ impl Vfs {
                                                 u128::from(ip),
                                                 d.index,
                                                 a.prefix,
-                                                if ip.is_loopback() { 16 } else { 0 },
+                                                if ip.is_loopback() {
+                                                    0x10
+                                                } else if ip.is_unicast_link_local() {
+                                                    0x20
+                                                } else {
+                                                    0
+                                                },
                                                 String::from_utf8_lossy(&d.name)
                                             ));
                                         }

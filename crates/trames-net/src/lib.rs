@@ -311,13 +311,12 @@ impl Network {
             let ns = self.namespace_id();
             let mut graph = self.1.graph.write().unwrap();
             let before = graph.device(ns, index)?;
-            graph.change_link(ns, index, name, None, up, None, None, None, mtu)?;
+            let mut changes =
+                graph.change_link(ns, index, name, None, up, None, None, None, mtu)?;
             let after = graph.device(ns, index)?;
             if before.same_link_configuration(&after) {
                 return Ok(());
             }
-            let mut changes = Vec::new();
-            rtnetlink::address_changes(&before, &after, &mut changes);
             changes.push((ns, 16, 1, rtnetlink::link_data(&graph, &after)));
             changes
         };

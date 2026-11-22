@@ -675,8 +675,7 @@ impl Linux {
                     .flat_map(|d| {
                         d.addresses.iter().filter_map(move |a| {
                             if let std::net::IpAddr::V4(ip) = a.ip {
-                                (d.kind != trames_net::DeviceKind::Loopback || d.up)
-                                    .then_some((d.name.as_slice(), ip))
+                                Some((d.name.as_slice(), ip))
                             } else {
                                 None
                             }
@@ -833,7 +832,6 @@ impl Linux {
                         .addresses
                         .iter()
                         .find(|a| a.ip.is_ipv4())
-                        .filter(|_| !loopback || device.up)
                         .ok_or(Errno(99))?;
                     let ip = if request == 0x891b {
                         std::net::IpAddr::V4(std::net::Ipv4Addr::from(

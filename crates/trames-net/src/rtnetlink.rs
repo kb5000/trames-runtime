@@ -610,7 +610,7 @@ pub(crate) fn request(
                             let pm = get(&pa, 1)
                                 .map(|v| v.try_into().map_err(|_| NetError(22)))
                                 .transpose()?;
-                            next.change_link(
+                            changes.extend(next.change_link(
                                 peer_ns,
                                 p,
                                 None,
@@ -620,7 +620,7 @@ pub(crate) fn request(
                                 pm,
                                 get(&pa, 13).map(u32v).transpose()?,
                                 get(&pa, 4).map(u32v).transpose()?,
-                            )?;
+                            )?);
                             changes.push((
                                 peer_ns,
                                 16,
@@ -632,7 +632,17 @@ pub(crate) fn request(
                         _ => return Err(NetError(95)),
                     };
                     let up = requested_up(&next.device(ns, index)?, state, change)?;
-                    next.change_link(ns, index, None, target, up, None, mac, tx_queue_len, mtu)?;
+                    changes.extend(next.change_link(
+                        ns,
+                        index,
+                        None,
+                        target,
+                        up,
+                        None,
+                        mac,
+                        tx_queue_len,
+                        mtu,
+                    )?);
                     let current = target.unwrap_or(ns);
                     changes.push((
                         current,
@@ -667,7 +677,7 @@ pub(crate) fn request(
                         }
                     } else {
                         let up = requested_up(&d, state, change)?;
-                        graph.change_link(
+                        changes.extend(graph.change_link(
                             ns,
                             d.index,
                             (index != 0).then_some(name).flatten(),
@@ -677,15 +687,12 @@ pub(crate) fn request(
                             mac,
                             tx_queue_len,
                             mtu,
-                        )?;
+                        )?);
                         if target.is_some_and(|to| to != ns) {
                             changes.push((ns, 17, 1, link_data(&graph, &d)));
                         }
                         let current = target.unwrap_or(ns);
                         let after = graph.device(current, d.index)?;
-                        if current == ns {
-                            address_changes(&d, &after, &mut changes);
-                        }
                         if !d.same_link_configuration(&after) {
                             changes.push((current, 16, 1, link_data(&graph, &after)));
                         }
@@ -712,9 +719,7 @@ pub(crate) fn request(
                         .filter(|af| family == 0 || family == *af)
                     {
                         for d in &devices {
-                            if (index == 0 || index == d.index)
-                                && (d.kind != DeviceKind::Loopback || d.up)
-                            {
+                            if index == 0 || index == d.index {
                                 for address in &d.addresses {
                                     if (af == 2) == address.ip.is_ipv4() {
                                         out.push(message(
@@ -1046,6 +1051,7 @@ pub(crate) fn neighbor_data(e: crate::netdev::NeighborEntry) -> Vec<u8> {
     }
     data
 }
+pub(crate) type Changes = Vec<(u64, u16, u32, Vec<u8>)>;
 pub(crate) fn address_changes(
     before: &Device,
     after: &Device,
@@ -1095,7 +1101,13 @@ pub(crate) fn address_data(d: &Device, a: Address) -> Vec<u8> {
         if a.ip.is_ipv4() { 2 } else { 10 },
         a.prefix,
         0x80,
-        if a.ip.is_loopback() { 254 } else { 0 },
+        if a.ip.is_loopback() {
+            254
+        } else if matches!(a.ip, IpAddr::V6(ip) if ip.is_unicast_link_local()) {
+            253
+        } else {
+            0
+        },
     ];
     data.extend_from_slice(&d.index.to_le_bytes());
     attr(&mut data, 1, &octets(a.ip));

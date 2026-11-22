@@ -4,7 +4,7 @@ use heapless::{LinearMap, Vec};
 #[cfg(any(feature = "proto-ipv4", feature = "proto-ipv6"))]
 use super::{check, IpPayload, Packet};
 use super::{Interface, InterfaceInner};
-use crate::config::{IFACE_MAX_ADDR_COUNT, IFACE_MAX_MULTICAST_GROUP_COUNT};
+use crate::config::IFACE_MAX_MULTICAST_GROUP_COUNT;
 use crate::phy::{Device, PacketMeta};
 use crate::wire::*;
 
@@ -171,8 +171,8 @@ impl Interface {
             let _ = self.leave_multicast_group(removal);
         }
 
-        let cidrs: Vec<IpCidr, IFACE_MAX_ADDR_COUNT> = Vec::from_slice(self.ip_addrs()).unwrap();
-        for cidr in cidrs {
+        for i in 0..self.ip_addrs().len() {
+            let cidr = self.ip_addrs()[i];
             if let IpCidr::Ipv6(cidr) = cidr {
                 let _ = self.join_multicast_group(cidr.address().solicited_node());
             }

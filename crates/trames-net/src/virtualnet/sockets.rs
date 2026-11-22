@@ -197,7 +197,9 @@ impl Socket {
             return Err(NetError(97));
         }
         if let SocketAddr::V6(v) = a {
-            if v.scope_id() != 0 {
+            if v.scope_id() != 0
+                && !(v.ip().is_unicast_link_local() && self.route_device.get() == v.scope_id())
+            {
                 return Err(NetError(95));
             }
             if let Some(v4) = v.ip().to_ipv4_mapped() {
@@ -468,6 +470,34 @@ impl Socket {
     }
     pub fn bind(&self, a: SocketAddr) -> Result<()> {
         let _binding = self.network.0.binding.lock();
+        if let SocketAddr::V6(mut scoped) = a {
+            if scoped.ip().is_unicast_link_local() {
+                let previous = self.state.borrow().device;
+                let index = if scoped.scope_id() != 0 {
+                    scoped.scope_id()
+                } else {
+                    previous.ok_or(NetError(22))?
+                };
+                let view = self.network.0.routing.get().ok_or(NetError(19))?;
+                let device = view.graph.read().unwrap().device(view.namespace, index)?;
+                if !device
+                    .addresses
+                    .iter()
+                    .any(|address| address.ip == *scoped.ip())
+                {
+                    return Err(NetError(99));
+                }
+                scoped.set_scope_id(index);
+                self.state.borrow_mut().device = Some(index);
+                self.route_device.set(index);
+                let result = self.bind_locked(scoped.into(), true);
+                if result.is_err() {
+                    self.state.borrow_mut().device = previous;
+                    self.route_device.set(previous.unwrap_or(0));
+                }
+                return result;
+            }
+        }
         self.bind_locked(a, true)
     }
     pub(super) fn ensure_bound(&self) -> Result<()> {

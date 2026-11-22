@@ -47,7 +47,8 @@ mod ipv6;
 mod policy;
 pub(crate) use policy::{Context as RouteContext, Entry as PolicyRoute, Rule};
 const MAX_LINKS: usize = 256;
-const MAX_ADDRESSES: usize = 8; // Matches the packet stack interface address capacity.
+// Each veth additionally has one link-local address slot on its interface.
+const MAX_ADDRESSES: usize = 8;
 const MAX_ROUTES: usize = 64;
 #[path = "ethernet_neighbor.rs"]
 mod ethernet_neighbor;
@@ -211,6 +212,30 @@ pub(crate) struct View {
     pub graph: Arc<RwLock<Topology>>,
     pub namespace: u64,
 }
+const LOOPBACK_V4: Address = Address {
+    ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+    prefix: 8,
+};
+const LOOPBACK_V6: Address = Address {
+    ip: IpAddr::V6(Ipv6Addr::LOCALHOST),
+    prefix: 128,
+};
+
+fn source_address(addresses: &[Address], destination: IpAddr) -> Option<IpAddr> {
+    let link_local = |ip| matches!(ip, IpAddr::V6(v) if v.is_unicast_link_local());
+    let mut fallback = None;
+    for a in addresses
+        .iter()
+        .filter(|a| a.ip.is_ipv4() == destination.is_ipv4())
+    {
+        if link_local(a.ip) == link_local(destination) {
+            return Some(a.ip);
+        }
+        fallback.get_or_insert(a.ip);
+    }
+    fallback
+}
+
 impl Address {
     pub fn contains(self, ip: IpAddr) -> bool {
         match (self.ip, ip) {
@@ -402,6 +427,7 @@ impl Topology {
     pub fn add_space(&mut self, id: u64, lo: Option<Arc<Loopback>>, info: Option<NetworkInfo>) {
         self.changed();
         self.next = self.next.max(3);
+        let loopback_up = lo.as_ref().is_none_or(|flag| flag.get());
         self.spaces.insert(
             id,
             Space {
@@ -441,16 +467,11 @@ impl Topology {
                 tx_queue_len: 0,
                 mac: [0; 6],
                 master: None,
-                addresses: vec![
-                    Address {
-                        ip: Ipv4Addr::LOCALHOST.into(),
-                        prefix: 8,
-                    },
-                    Address {
-                        ip: Ipv6Addr::LOCALHOST.into(),
-                        prefix: 128,
-                    },
-                ],
+                addresses: if loopback_up {
+                    vec![LOOPBACK_V4, LOOPBACK_V6]
+                } else {
+                    Vec::new()
+                },
                 stats: Arc::default(),
                 ipv4_ingress: self.spaces[&id].ipv4_default,
                 ipv6: self.spaces[&id].ipv6_default,
@@ -834,7 +855,8 @@ impl Topology {
         mac: Option<[u8; 6]>,
         tx_queue_len: Option<u32>,
         mtu: Option<u32>,
-    ) -> Result<()> {
+    ) -> Result<crate::rtnetlink::Changes> {
+        let mut changes = Vec::new();
         let old = self.device(id, index)?;
         if old.kind == DeviceKind::Direct && !self.spaces[&id].managed_uplink {
             return Err(NetError(95));
@@ -880,20 +902,21 @@ impl Topology {
                 && up.is_none_or(|value| value == old.up)
                 && tx_queue_len.is_none_or(|value| value == old.tx_queue_len)
             {
-                return Ok(());
+                return Ok(changes);
             }
             if let Some(up) = up {
-                match &self.spaces[&id].lo {
+                match self.spaces[&id].lo.clone() {
                     Some(lo) => {
-                        let addr = Address {
-                            ip: Ipv6Addr::LOCALHOST.into(),
-                            prefix: 128,
-                        };
                         let dev = self.devices.get_mut(&(id, index)).unwrap();
                         if old.up != up {
                             if up {
-                                if dev.ipv6[2] == 0 && !dev.addresses.contains(&addr) {
-                                    dev.addresses.push(addr);
+                                if !dev.addresses.iter().any(|a| a.ip.is_ipv4()) {
+                                    dev.addresses.push(LOOPBACK_V4);
+                                }
+                                if dev.ipv6[2] == 0
+                                    && !dev.addresses.iter().any(|a| a.ip == LOOPBACK_V6.ip)
+                                {
+                                    dev.addresses.push(LOOPBACK_V6);
                                 }
                             } else {
                                 let all = self.spaces[&id].ipv6_all[4];
@@ -912,6 +935,9 @@ impl Topology {
                     None => return Err(NetError(95)),
                 }
             }
+            if old.up && up == Some(false) {
+                self.flush_ipv6_routes(id, index, &mut changes);
+            }
             let dev = self.devices.get_mut(&(id, index)).unwrap();
             if let Some(name) = name {
                 dev.name = name.to_vec();
@@ -922,8 +948,9 @@ impl Topology {
             if let Some(len) = tx_queue_len {
                 dev.tx_queue_len = len;
             }
+            crate::rtnetlink::address_changes(&old, &self.device(id, index)?, &mut changes);
             self.changed();
-            return Ok(());
+            return Ok(changes);
         }
         let target = target.unwrap_or(id);
         if !self.spaces.contains_key(&target) {
@@ -985,6 +1012,7 @@ impl Topology {
         }
         if let Some(up) = up {
             if d.up && !up {
+                self.flush_ipv6_routes(id, index, &mut changes);
                 // All configured addresses are permanent. Linux retains only
                 // global-scope IPv6 addresses on an ordinary link-down.
                 let all = self.spaces[&id].ipv6_all[4];
@@ -1009,9 +1037,65 @@ impl Topology {
             d.mtu = value;
         }
         self.devices.insert((target, index), d);
+        if let DeviceKind::Veth { peer } = old.kind {
+            if up == Some(true) && (!old.up || target != id) {
+                if let Some(peer) = self.peer_device(peer).filter(|link| link.up) {
+                    self.assign_veth_link_local(target, index);
+                    self.assign_veth_link_local(peer.namespace, peer.index);
+                    crate::rtnetlink::address_changes(
+                        &peer,
+                        &self.device(peer.namespace, peer.index)?,
+                        &mut changes,
+                    );
+                }
+            }
+        }
+        if id == target {
+            crate::rtnetlink::address_changes(&old, &self.device(target, index)?, &mut changes);
+        }
         self.changed();
-        Ok(())
+        Ok(changes)
     }
+    fn assign_veth_link_local(&mut self, ns: u64, index: u32) {
+        let d = &self.devices[&(ns, index)];
+        if d.ipv6[2] != 0
+            || d.ipv6[3] != 0
+            || d.mtu < 1280
+            || d.addresses
+                .iter()
+                .any(|a| matches!(a.ip, IpAddr::V6(ip) if ip.is_unicast_link_local()))
+        {
+            return;
+        }
+        let [a, b, c, d, e, f] = d.mac;
+        let ip = Ipv6Addr::from([
+            0xfe,
+            0x80,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            a ^ 2,
+            b,
+            c,
+            0xff,
+            0xfe,
+            d,
+            e,
+            f,
+        ])
+        .into();
+        if self.address_slot_available(ns, index, ip) {
+            self.devices
+                .get_mut(&(ns, index))
+                .unwrap()
+                .addresses
+                .push(Address { ip, prefix: 64 });
+        }
+    }
+
     pub fn remove_link(&mut self, id: u64, index: u32) -> Result<()> {
         if matches!(
             self.device(id, index)?.kind,
@@ -1064,11 +1148,19 @@ impl Topology {
     fn address_slot_available(&self, id: u64, index: u32, ip: IpAddr) -> bool {
         // The kernel restores ::1 on loopback-up. Reserve its slot while it
         // is absent, including when aliases arrive through SIOCSIFADDR.
+        let link_local = |ip| matches!(ip, IpAddr::V6(v) if v.is_unicast_link_local());
         let used: usize = self
             .devices
             .range((id, 0)..=(id, u32::MAX))
             .map(|(_, d)| {
-                d.addresses.len()
+                let has_link_local = matches!(d.kind, DeviceKind::Veth { .. })
+                    && d.addresses.iter().any(|a| link_local(a.ip));
+                d.addresses.len() - usize::from(has_link_local)
+                    + usize::from(
+                        d.kind == DeviceKind::Loopback
+                            && !(index == d.index && ip.is_ipv4())
+                            && !d.addresses.iter().any(|a| a.ip.is_ipv4()),
+                    )
                     + usize::from(
                         d.kind == DeviceKind::Loopback
                             && !(index == d.index && ip == Ipv6Addr::LOCALHOST)
@@ -1077,6 +1169,11 @@ impl Topology {
             })
             .sum();
         used < MAX_ADDRESSES
+            || (link_local(ip)
+                && self.devices.get(&(id, index)).is_some_and(|d| {
+                    matches!(d.kind, DeviceKind::Veth { .. })
+                        && !d.addresses.iter().any(|a| link_local(a.ip))
+                }))
     }
     pub fn address(
         &mut self,
@@ -1226,11 +1323,11 @@ impl Topology {
     }
     // Linux IPv4 local routes cover the configured loopback prefix. IPv6
     // addresses and ordinary interfaces own only their assigned addresses.
-    fn local_source(&self, id: u64, ip: IpAddr) -> Option<IpAddr> {
+    fn local_source<const REQUIRE_UP: bool>(&self, id: u64, ip: IpAddr) -> Option<IpAddr> {
         let mut subnet = None;
         for (_, d) in self.devices.range((id, 0)..=(id, u32::MAX)) {
             let lo = d.kind == DeviceKind::Loopback;
-            if lo && self.spaces[&id].lo.as_ref().is_some_and(|flag| !flag.get()) {
+            if REQUIRE_UP && lo && self.spaces[&id].lo.as_ref().is_some_and(|flag| !flag.get()) {
                 continue;
             }
             for a in &d.addresses {
@@ -1245,13 +1342,18 @@ impl Topology {
         subnet
     }
     pub fn own(&self, id: u64, ip: IpAddr) -> bool {
-        self.local_source(id, ip).is_some()
+        self.local_source::<true>(id, ip).is_some()
     }
     pub fn source(&self, id: u64, destination: IpAddr) -> Result<(IpAddr, u32, Option<IpAddr>)> {
         self.source_for(id, destination, RouteContext::default())
     }
-    fn source_main(&self, id: u64, destination: IpAddr) -> Result<(IpAddr, u32, Option<IpAddr>)> {
-        if let Some(source) = self.local_source(id, destination) {
+    fn source_main(
+        &self,
+        id: u64,
+        destination: IpAddr,
+        device: Option<u32>,
+    ) -> Result<(IpAddr, u32, Option<IpAddr>)> {
+        if let Some(source) = self.local_source::<true>(id, destination) {
             return Ok((source, 1, None));
         }
         if destination.is_loopback() {
@@ -1261,13 +1363,13 @@ impl Topology {
         routes.sort_by_key(|r| (std::cmp::Reverse(r.destination.prefix), r.metric));
         for r in routes {
             let d = self.device(id, r.device)?;
-            if d.up && d.master.is_none() && r.destination.contains(destination) {
-                if let Some(a) = d
-                    .addresses
-                    .iter()
-                    .find(|a| a.ip.is_ipv4() == destination.is_ipv4())
-                {
-                    return Ok((a.ip, d.index, r.gateway));
+            if d.up
+                && d.master.is_none()
+                && device.is_none_or(|index| index == d.index)
+                && r.destination.contains(destination)
+            {
+                if let Some(a) = source_address(&d.addresses, destination) {
+                    return Ok((a, d.index, r.gateway));
                 }
             }
         }
@@ -1360,7 +1462,12 @@ impl View {
             .map(|d| d.index)
     }
     pub fn own(&self, ip: IpAddr) -> bool {
-        self.graph.read().unwrap().own(self.namespace, ip)
+        // A down link can still own an assigned address for bind.
+        self.graph
+            .read()
+            .unwrap()
+            .local_source::<false>(self.namespace, ip)
+            .is_some()
     }
     pub fn addresses(&self, up_only: bool) -> Vec<Address> {
         self.graph
