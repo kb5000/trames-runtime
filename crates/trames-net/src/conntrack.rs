@@ -322,55 +322,63 @@ impl State {
             return false;
         }
         if let Some((low, high)) = ports {
-            if low == 0 || low > high {
+            if low > high {
                 return false;
             }
-            endpoint.set_port(low);
+            if !(low..=high).contains(&endpoint.port()) {
+                endpoint.set_port(low);
+            }
         }
+        let available = |candidate: Key| {
+            self.index
+                .get(&(t.zone, candidate.reverse()))
+                .is_none_or(|v| v.0 == t.id)
+        };
+        let mut translated = t.translated;
         if source {
-            let (low, high) = ports.unwrap_or((32768, 60999));
-            let initial = endpoint.port();
+            translated.tuple.source = endpoint;
+        } else {
+            translated.tuple.destination = endpoint;
+        }
+        if !available(translated) {
+            let (low, high) = match ports {
+                Some(range) => range,
+                None if source => (32768, 60999),
+                None => return false,
+            };
             let mut found = false;
-            for i in 0..=u32::from(high - low) + 1 {
-                if i != 0 {
-                    endpoint.set_port(low + ((i - 1) % (u32::from(high - low) + 1)) as u16);
+            for port in low..=high {
+                endpoint.set_port(port);
+                if source {
+                    translated.tuple.source = endpoint;
+                } else {
+                    translated.tuple.destination = endpoint;
                 }
-                k.tuple.source = endpoint;
-                let conflict = self
-                    .index
-                    .get(&(t.zone, k.reverse()))
-                    .is_some_and(|v| v.0 != t.id);
-                if !conflict {
+                if available(translated) {
                     found = true;
                     break;
-                }
-                if initial == 0 && i == 0 {
-                    continue;
                 }
             }
             if !found {
                 return false;
             }
-            t.translated.tuple.source = endpoint;
-            t.status |= 16;
+        }
+        if source {
+            k.tuple.source = endpoint;
         } else {
             k.tuple.destination = endpoint;
-            t.translated.tuple.destination = endpoint;
-            t.status |= 32;
-        }
-        if self
-            .index
-            .get(&(t.zone, t.translated.reverse()))
-            .is_some_and(|v| v.0 != t.id)
-        {
-            return false;
         }
         if !rewrite(p, k) {
             return false;
         }
-        self.index.retain(|_, v| v.0 != t.id || !v.1);
+        let old = (t.zone, t.translated.reverse());
+        if self.index.get(&old) == Some(&(t.id, true)) {
+            self.index.remove(&old);
+        }
+        t.translated = translated;
+        t.status |= if source { 16 } else { 32 };
         self.index
-            .insert((t.zone, t.translated.reverse()), (t.id, true));
+            .insert((t.zone, translated.reverse()), (t.id, true));
         true
     }
     pub fn finish(&mut self, t: Track, accepted: bool) {
@@ -614,6 +622,39 @@ mod tests {
         state.remove_addresses(&[s.ip()]);
         assert!(state.records().is_empty());
         assert!(state.index.is_empty());
+    }
+    #[test]
+    fn destination_port_range_preserves_ports_and_rolls_back_exhaustion() {
+        for v6 in [false, true] {
+            let (client, mut public, _, backend) = endpoints(v6);
+            let mut state = State::default();
+            for (original, selected) in [(1, Some(1)), (2000, Some(0)), (3000, None)] {
+                public.set_port(original);
+                let mut p = message(client, public, 17, 0, b"request");
+                let mut t = state.begin(&p, 0).unwrap();
+                let ok = state.nat(&mut t, &mut p, false, Some(backend), Some((0, 1)));
+                assert_eq!(ok, selected.is_some());
+                if let Some(port) = selected {
+                    let endpoint = SocketAddr::new(backend, port);
+                    assert_eq!(key(&p).unwrap().tuple.destination, endpoint);
+                    assert!(packet::valid_transport(&p));
+                    state.finish(t, true);
+                    let mut reply = message(endpoint, client, 17, 0, b"response");
+                    let mut reverse = state.begin(&reply, 0).unwrap();
+                    assert!(reverse.reply);
+                    assert!(state.existing_nat(&mut reverse, &mut reply, true));
+                    assert_eq!(key(&reply).unwrap().tuple.source, public);
+                    assert!(packet::valid_transport(&reply));
+                    state.finish(reverse, true);
+                } else {
+                    assert_eq!(key(&p), Some(t.original));
+                    assert_eq!(t.original, t.translated);
+                    assert_eq!(t.status & 32, 0);
+                    state.finish(t, false);
+                }
+            }
+            assert_eq!(state.records().len(), 2);
+        }
     }
     #[test]
     fn related_icmp_restores_truncated_udp_quote_and_checksums() {

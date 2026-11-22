@@ -257,7 +257,7 @@ enum Expr {
     },
     FixedNat {
         source: bool,
-        address: Option<std::net::IpAddr>,
+        addresses: Option<(std::net::IpAddr, std::net::IpAddr)>,
         ports: Option<(u16, u16)>,
         masquerade: bool,
     },
@@ -302,6 +302,14 @@ fn value(bytes: &[u8]) -> Result<Vec<u8>> {
         return Err(NetError(22));
     }
     Ok(v.to_vec())
+}
+fn xt_nat_revision(name: &str, family: u8, revision: u32) -> bool {
+    matches!(family, 2 | 10)
+        && match name {
+            "MASQUERADE" => revision == 0,
+            "SNAT" | "DNAT" => revision <= 2 && (revision != 0 || family == 2),
+            _ => false,
+        }
 }
 fn expressions_in(bytes: &[u8], rule_family: u8) -> Result<Vec<Expr>> {
     let mut out = vec![];
@@ -585,61 +593,73 @@ fn expressions_in(bytes: &[u8], rule_family: u8) -> Result<Vec<Expr>> {
                     }
                     Expr::Zone(u16::from_le_bytes(b[2..4].try_into().unwrap()))
                 } else {
-                    if !matches!(kind.as_str(), "MASQUERADE" | "DNAT" | "SNAT") || revision > 2 {
-                        return Err(NetError(95));
-                    }
-                    let old = b.len() == 24;
-                    if old && u32::from_le_bytes(b[..4].try_into().unwrap()) != 1
-                        || !old && !matches!(b.len(), 40 | 48)
+                    let masq = kind == "MASQUERADE";
+                    if !matches!(kind.as_str(), "MASQUERADE" | "DNAT" | "SNAT")
+                        || !xt_nat_revision(&kind, rule_family, revision)
                     {
+                        return Err(NetError(2));
+                    }
+                    let legacy = revision == 0 && rule_family == 2;
+                    let size = if legacy {
+                        20usize
+                    } else if revision == 2 {
+                        44
+                    } else {
+                        40
+                    };
+                    if b.len() != size && b.len() != size.next_multiple_of(8) {
                         return Err(NetError(22));
                     }
-                    let at = if old { 4 } else { 0 };
-                    let flags = u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+                    let word = |at| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+                    if legacy && word(0) != 1 {
+                        return Err(NetError(22));
+                    }
+                    let flags = word(if legacy { 4 } else { 0 });
+                    if masq && flags & 1 != 0 {
+                        return Err(NetError(22));
+                    }
                     if flags & !3 != 0 {
                         return Err(NetError(95));
                     }
-                    if !matches!(rule_family, 2 | 10) {
-                        return Err(NetError(95));
-                    }
-                    let address = if flags & 1 == 0 {
+                    let addresses = if flags & 1 == 0 {
                         None
-                    } else if old {
-                        Some(
-                            std::net::Ipv4Addr::from(<[u8; 4]>::try_from(&b[8..12]).unwrap())
-                                .into(),
-                        )
                     } else {
-                        // nf_nat_range uses 16-byte nf_inet_addr even for IPv4.
-                        // Rule family is checked when evaluating this expression.
-                        if rule_family == 2 {
-                            Some(
-                                std::net::Ipv4Addr::from(<[u8; 4]>::try_from(&b[4..8]).unwrap())
-                                    .into(),
-                            )
-                        } else {
-                            Some(
-                                std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&b[4..20]).unwrap())
-                                    .into(),
-                            )
+                        let address = |at: usize| -> std::net::IpAddr {
+                            if rule_family == 2 {
+                                std::net::Ipv4Addr::from(
+                                    <[u8; 4]>::try_from(&b[at..at + 4]).unwrap(),
+                                )
+                                .into()
+                            } else {
+                                std::net::Ipv6Addr::from(
+                                    <[u8; 16]>::try_from(&b[at..at + 16]).unwrap(),
+                                )
+                                .into()
+                            }
+                        };
+                        let (start, end) = if legacy { (8, 12) } else { (4, 20) };
+                        let range = (address(start), address(end));
+                        if range.0 > range.1 {
+                            return Err(NetError(22));
                         }
+                        Some(range)
                     };
-                    let p = if old { 16 } else { 36 };
-                    let ports = if flags & 2 != 0 {
-                        let low = u16::from_be_bytes(b[p..p + 2].try_into().unwrap());
-                        let high = u16::from_be_bytes(b[p + 2..p + 4].try_into().unwrap());
-                        if low == 0 || low > high {
+                    let ports = if flags & 2 == 0 {
+                        None
+                    } else {
+                        let at = if legacy { 16 } else { 36 };
+                        let low = u16::from_be_bytes(b[at..at + 2].try_into().unwrap());
+                        let high = u16::from_be_bytes(b[at + 2..at + 4].try_into().unwrap());
+                        if low > high {
                             return Err(NetError(22));
                         }
                         Some((low, high))
-                    } else {
-                        None
                     };
                     Expr::FixedNat {
                         source: kind != "DNAT",
-                        address,
+                        addresses,
                         ports,
-                        masquerade: kind == "MASQUERADE",
+                        masquerade: masq,
                     }
                 }
             }
@@ -658,6 +678,9 @@ fn expressions_in(bytes: &[u8], rule_family: u8) -> Result<Vec<Expr>> {
                     .map(u32v)
                     .transpose()?
                     .unwrap_or(0);
+                if flags & !0x7f != 0 {
+                    return Err(NetError(22));
+                }
                 if flags & !3 != 0 {
                     return Err(NetError(95));
                 }
@@ -665,7 +688,13 @@ fn expressions_in(bytes: &[u8], rule_family: u8) -> Result<Vec<Expr>> {
                     let r = get(&a, field)
                         .map(u32v)
                         .transpose()?
-                        .map(|r| reg(r, len))
+                        .map(|r| {
+                            if !matches!(r,0..=4|8..=23) {
+                                Err(NetError(34))
+                            } else {
+                                reg(r, len)
+                            }
+                        })
                         .transpose()?;
                     if r.is_some_and(|r| initialized[r..r + len].contains(&false)) {
                         return Err(NetError(22));
@@ -915,9 +944,20 @@ impl Ruleset {
                 for r in &c.rules {
                     for e in &r.expressions {
                         match e {
-                            Expr::Nat { .. } | Expr::Masquerade { .. } | Expr::FixedNat { .. }
-                                if !nat =>
+                            Expr::FixedNat {
+                                source, masquerade, ..
+                            } if !nat
+                                || if *masquerade {
+                                    hook != 4
+                                } else if *source {
+                                    !matches!(hook, 1 | 4)
+                                } else {
+                                    !matches!(hook, 0 | 3)
+                                } =>
                             {
+                                return Err(NetError(22))
+                            }
+                            Expr::Nat { .. } | Expr::Masquerade { .. } if !nat => {
                                 return Err(NetError(95))
                             }
                             Expr::AddrType { flags, .. }
@@ -941,17 +981,11 @@ impl Ruleset {
                             {
                                 return Err(NetError(95))
                             }
-                            Expr::Nat { source: true, .. }
-                            | Expr::FixedNat { source: true, .. }
-                            | Expr::Masquerade { .. }
-                                if hook != 4 =>
-                            {
+                            Expr::Nat { source: true, .. } if !matches!(hook, 1 | 4) => {
                                 return Err(NetError(95))
                             }
-                            Expr::Nat { source: false, .. }
-                            | Expr::FixedNat { source: false, .. }
-                                if !matches!(hook, 0 | 3) =>
-                            {
+                            Expr::Masquerade { .. } if hook != 4 => return Err(NetError(95)),
+                            Expr::Nat { source: false, .. } if !matches!(hook, 0 | 3) => {
                                 return Err(NetError(95))
                             }
                             Expr::Verdict(_, Some(next)) => {
@@ -1007,7 +1041,7 @@ impl Ruleset {
                 ("comment" | "tcp" | "udp" | "icmp" | "icmp6", 0) => revision == 0,
                 ("addrtype", 0) => revision == 1 || revision == 0 && r[16] == 2,
                 ("conntrack", 0) => revision <= 3,
-                ("MASQUERADE" | "SNAT" | "DNAT", 1) => revision <= 2,
+                ("MASQUERADE" | "SNAT" | "DNAT", 1) => xt_nat_revision(&n, r[16], revision),
                 ("CT", 1) => revision <= 1,
                 _ => false,
             };
@@ -1278,7 +1312,7 @@ impl Ruleset {
                 }
                 if typ.as_deref() == Some("nat")
                     && h.is_none_or(|(hook, priority)| {
-                        !matches!(hook, 0 | 3 | 4) || priority != if hook == 4 { 100 } else { -100 }
+                        !matches!(hook, 0 | 1 | 3 | 4) || priority <= -200
                     })
                 {
                     return Err(NetError(95));
@@ -1377,6 +1411,13 @@ impl Ruleset {
                 let cn = name(&a, 2)?;
                 let wire = get(&a, 4).unwrap_or_default().to_vec();
                 let expressions = expressions_in(&wire, family)?;
+                if key.1 != "nat"
+                    && expressions
+                        .iter()
+                        .any(|e| matches!(e, Expr::FixedNat { .. }))
+                {
+                    return Err(NetError(22));
+                }
                 let compatibility = get(&a, 5)
                     .map(|b| -> Result<Vec<u8>> {
                         let a = fields(b, &[1, 2])?;
@@ -1632,6 +1673,34 @@ impl Context<'_> {
         self.graph
             .address_type(self.namespace, self.address(source), device)
     }
+    fn nat_address(&self, low: std::net::IpAddr, high: std::net::IpAddr) -> std::net::IpAddr {
+        use std::{
+            hash::{DefaultHasher, Hash, Hasher},
+            net::{IpAddr, Ipv4Addr, Ipv6Addr},
+        };
+        if low == high {
+            return low;
+        }
+        // Choose on first binding only. Subsequent packets use the stored tuple.
+        let mut hasher = DefaultHasher::new();
+        self.tuple.source.hash(&mut hasher);
+        let upper = hasher.finish();
+        self.tuple.destination.hash(&mut hasher);
+        let sample = (u128::from(upper) << 64) | u128::from(hasher.finish());
+        match (low, high) {
+            (IpAddr::V4(a), IpAddr::V4(b)) => {
+                let start = u32::from(a);
+                let span = u128::from(u32::from(b) - start) + 1;
+                Ipv4Addr::from(start + (sample % span) as u32).into()
+            }
+            (IpAddr::V6(a), IpAddr::V6(b)) => {
+                let start = u128::from(a);
+                let span = (u128::from(b) - start).checked_add(1);
+                Ipv6Addr::from(start + span.map_or(sample, |n| sample % n)).into()
+            }
+            _ => unreachable!("NAT range endpoints share the rule family"),
+        }
+    }
     fn masquerade(&self) -> Option<std::net::IpAddr> {
         self.graph
             .interface_address(self.namespace, self.output, self.family() == 2)
@@ -1742,6 +1811,8 @@ impl Ruleset {
         conn: &mut crate::conntrack::State,
     ) -> bool {
         let family = if packet[0] >> 4 == 4 { 2 } else { 10 };
+        let source = matches!(meta.hook, 1 | 4);
+        let nat_priority = if source { 100 } else { -100 };
         let mut chains = vec![];
         for ((f, _), t) in &self.tables {
             if t.dormant || (*f != 1 && *f != family) {
@@ -1750,17 +1821,22 @@ impl Ruleset {
             for (n, c) in &t.chains {
                 if let Some((h, p)) = c.hook {
                     if h == meta.hook && (p < -200) == meta.raw {
-                        chains.push((p, t, n, c));
+                        // Linux registers one NAT hook per manipulation. User priorities
+                        // order binding callbacks within that hook.
+                        let stage = if c.chain_type == "nat" {
+                            nat_priority
+                        } else {
+                            p
+                        };
+                        chains.push((stage, p, t, n, c));
                     }
                 }
             }
         }
-        chains.sort_by_key(|v| v.0);
-        let source = matches!(meta.hook, 1 | 4);
-        let nat_priority = if source { 100 } else { -100 };
+        chains.sort_by_key(|v| (v.0, v.1));
         let nat_stage = matches!(meta.hook, 0 | 1 | 3 | 4) && !meta.raw;
         let mut applied = false;
-        for (priority, t, n, c) in chains {
+        for (priority, _, t, n, c) in chains {
             if nat_stage && !applied && priority >= nat_priority {
                 if !conn.existing_nat(track, packet, source) {
                     return false;
@@ -1922,7 +1998,7 @@ impl Rule {
                 Expr::Zone(zone) => effects.zone = Some(*zone),
                 Expr::FixedNat {
                     source,
-                    address,
+                    addresses,
                     ports,
                     masquerade,
                 } => {
@@ -1932,7 +2008,7 @@ impl Rule {
                     let address = if *masquerade {
                         ctx.masquerade()
                     } else {
-                        *address
+                        addresses.map(|(low, high)| ctx.nat_address(low, high))
                     };
                     if *masquerade && address.is_none() {
                         return Some((0, None));
@@ -2108,10 +2184,15 @@ impl Rule {
                             .into()
                         }
                     };
-                    let address = address.map(ip);
-                    if address_max.is_some_and(|r| address.is_some_and(|a| ip(r) < a)) {
-                        return Some((0, None));
-                    }
+                    let address = if let Some(low) = address.map(ip) {
+                        let high = address_max.map(ip).unwrap_or(low);
+                        if high < low {
+                            return Some((0, None));
+                        }
+                        Some(ctx.nat_address(low, high))
+                    } else {
+                        None
+                    };
                     let port = port.map(|r| u16::from_be_bytes(regs[r..r + 2].try_into().unwrap()));
                     let high = port_max
                         .map(|r| u16::from_be_bytes(regs[r..r + 2].try_into().unwrap()))

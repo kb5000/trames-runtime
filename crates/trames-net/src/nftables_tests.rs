@@ -972,3 +972,101 @@ fn udp_group_traffic_uses_guest_links_memberships_and_namespace_hooks() {
     sender.send(b"output", 0, Some(dest)).unwrap();
     assert!(matches!(local.recv(9, 0), Err(crate::NetError(11))));
 }
+
+#[test]
+fn first_and_established_packets_reach_filters_with_the_same_nat_binding() {
+    use crate::conntrack::{key, message, State};
+
+    let ns = Namespace::default();
+    let nat_chain = |name, priority| {
+        let mut attrs = vec![];
+        string(&mut attrs, 1, "nat");
+        string(&mut attrs, 3, name);
+        let mut hook = vec![];
+        number(&mut hook, 1, 0);
+        number(&mut hook, 2, priority);
+        attr(&mut attrs, 0x8004, &hook);
+        string(&mut attrs, 7, "nat");
+        req(3, 2, 0x400, &attrs)
+    };
+    let dnat = |name, address: [u8; 4]| {
+        let mut target = vec![];
+        string(&mut target, 1, "DNAT");
+        number(&mut target, 2, 1);
+        let mut info = [0; 40];
+        info[..4].copy_from_slice(&1u32.to_le_bytes());
+        info[4..8].copy_from_slice(&address);
+        info[20..24].copy_from_slice(&address);
+        attr(&mut target, 3, &info);
+        rule("nat", name, &expression("target", &target))
+    };
+    let backend = [192, 0, 2, 2];
+    let mut payload = vec![];
+    number(&mut payload, 1, 1);
+    number(&mut payload, 2, 1);
+    number(&mut payload, 3, 16);
+    number(&mut payload, 4, 4);
+    let mut cmp = vec![];
+    number(&mut cmp, 1, 1);
+    number(&mut cmp, 2, 0);
+    let mut value = vec![];
+    attr(&mut value, 1, &backend);
+    attr(&mut cmp, 0x8003, &value);
+    let filter = [
+        expression("payload", &payload),
+        expression("cmp", &cmp),
+        verdict(1, None),
+    ]
+    .concat();
+    assert_eq!(
+        errno(&batch(
+            &ns,
+            &[
+                table("nat"),
+                nat_chain("a_later", 40),
+                nat_chain("b_first", 20),
+                dnat("a_later", [192, 0, 2, 3]),
+                dnat("b_first", backend),
+                table("filter"),
+                chain("filter", "check_backend", Some(0), -50, 0),
+                rule("filter", "check_backend", &filter),
+            ]
+        )),
+        0
+    );
+    let from = "192.0.2.1:3000".parse().unwrap();
+    let public = "198.51.100.2:53".parse().unwrap();
+    let graph = ns.graph.read().unwrap();
+    let shared = graph.firewall(ns.id());
+    let rules = shared.read().unwrap();
+    let mut state = State::default();
+    for _ in 0..2 {
+        let mut packet = message(from, public, 17, 0, b"request");
+        let mut track = state.begin(&packet, 0).unwrap();
+        let hook = Hook {
+            graph: &graph,
+            namespace: ns.id(),
+            hook: 0,
+            input: 1,
+            output: 0,
+            raw: false,
+        };
+        assert!(rules.process(&mut packet, &hook, &mut track, &mut state));
+        let server = key(&packet).unwrap().tuple.destination;
+        assert_eq!(server.ip(), std::net::IpAddr::from(backend));
+        assert!(crate::virtualnet::packet::valid_transport(&packet));
+        state.finish(track, true);
+        let mut reply = message(server, from, 17, 0, b"reply");
+        let mut track = state.begin(&reply, 0).unwrap();
+        assert!(track.reply);
+        assert!(rules.process(
+            &mut reply,
+            &Hook { hook: 4, ..hook },
+            &mut track,
+            &mut state
+        ));
+        assert_eq!(key(&reply).unwrap().tuple.source, public);
+        assert!(crate::virtualnet::packet::valid_transport(&reply));
+        state.finish(track, true);
+    }
+}
