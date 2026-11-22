@@ -149,7 +149,8 @@ fn chain_rename_keeps_jump_target_and_dump_consistent_after_rollback() {
     let rule = &rules.tables[&(2, "filter".into())].chains["out"].rules[0];
     let dump = rule_data(2, "filter", "out", rule);
     let attrs = attrs(&dump[4..]).unwrap();
-    let decoded = expressions_in(need(&attrs, 4).unwrap(), 2).unwrap();
+    let decoded =
+        expressions_in(need(&attrs, 4).unwrap(), 2, None, &sets::BatchIds::new()).unwrap();
     assert!(matches!(decoded.as_slice(), [Expr::Verdict(-3, Some(target))] if target == "new"));
 }
 #[test]
@@ -424,7 +425,7 @@ fn packet_rule_matches(exprs: Vec<Expr>, ctx: &Context<'_>) -> bool {
         compatibility: None,
     };
     rule.expressions.push(Expr::Verdict(1, None));
-    rule.verdict(ctx, &mut Effects::default()) == Some((1, None))
+    rule.verdict(ctx, &mut Effects::default(), &sets::Sets::new()) == Some((1, None))
 }
 
 #[test]
@@ -1199,4 +1200,212 @@ fn xt_conntrack_checks_real_direction_expiry_status_and_revision_port_order() {
         b[146] = 2;
         assert!(!xt_match::conntrack_matches(&invalid, 1, &b));
     }
+}
+
+#[test]
+fn named_set_binding_uses_the_published_elements_and_transaction_scoped_id() {
+    let ns = Namespace::default();
+    let named = |name| {
+        let mut a = vec![];
+        string(&mut a, 1, "filter");
+        string(&mut a, 2, name);
+        a
+    };
+    let mut set = named("ports");
+    number(&mut set, 5, 2);
+    number(&mut set, 10, 17);
+    let edit = |op, name, port: u16| {
+        let mut a = named(name);
+        let mut v = vec![];
+        attr(&mut v, 1, &port.to_be_bytes());
+        let mut elem = vec![];
+        attr(&mut elem, 1, &v);
+        let mut list = vec![];
+        attr(&mut list, 1, &elem);
+        attr(&mut a, 3, &list);
+        number(&mut a, 4, 17);
+        req(op, 2, if op == 12 { 0x400 } else { 0 }, &a)
+    };
+    let lookup = |name, invert| {
+        let mut a = vec![];
+        string(&mut a, 1, name);
+        number(&mut a, 2, 1);
+        number(&mut a, 4, 17);
+        number(&mut a, 5, invert);
+        expression("lookup", &a)
+    };
+    let mut p = vec![];
+    number(&mut p, 1, 1);
+    number(&mut p, 2, 2);
+    number(&mut p, 3, 2);
+    number(&mut p, 4, 2);
+    let filter = [
+        expression("payload", &p),
+        lookup("transaction_alias", 1),
+        verdict(0, None),
+    ]
+    .concat();
+    assert_eq!(
+        errno(&batch(
+            &ns,
+            &[
+                table("filter"),
+                chain("filter", "out", Some(3), 0, 1),
+                req(9, 2, 0x400, &set),
+                edit(12, "transaction_alias", 19000),
+                rule("filter", "out", &filter),
+            ]
+        )),
+        0
+    );
+    assert!(allows(&ns, 3));
+    assert_eq!(
+        errno(&batch(&ns, &[edit(14, "transaction_alias", 19000)])),
+        -2
+    );
+    assert_eq!(
+        errno(&batch(
+            &ns,
+            &[edit(14, "ports", 19000), edit(14, "ports", 19001)]
+        )),
+        -2
+    );
+    assert!(allows(&ns, 3));
+    assert_eq!(errno(&batch(&ns, &[req(11, 2, 0, &named("ports"))])), -16);
+    assert_eq!(errno(&batch(&ns, &[edit(14, "ports", 19000)])), 0);
+    assert!(!allows(&ns, 3));
+    let shared = ns.graph.read().unwrap().firewall(ns.id());
+    let snapshot = shared.read().unwrap().clone();
+    let t = &snapshot.tables[&(2, "filter".into())];
+    let dumped = rule_data(2, "filter", "out", &t.chains["out"].rules[0]);
+    let fields = attrs(&dumped[4..]).unwrap();
+    let expressions = attrs(need(&fields, 4).unwrap()).unwrap();
+    let outer = attrs(expressions[1].1).unwrap();
+    let inner = attrs(need(&outer, 2).unwrap()).unwrap();
+    assert_eq!(name(&inner, 1).unwrap(), "ports");
+    assert!(get(&inner, 4).is_none());
+    assert_eq!(
+        errno(&batch(
+            &ns,
+            &[req(8, 2, 0, &named("out")), req(11, 2, 0, &named("ports"))]
+        )),
+        0
+    );
+    assert!(allows(&ns, 3));
+}
+
+#[test]
+fn set_dump_chunks_large_element_lists_without_splitting_keys() {
+    let ns = Namespace::default();
+    let mut a = vec![];
+    string(&mut a, 1, "f");
+    string(&mut a, 2, "keys");
+    let mut spec = a.clone();
+    number(&mut spec, 5, 4);
+    number(&mut spec, 10, 1);
+    let mut list = vec![];
+    for key in 0u32..1000 {
+        let mut value = vec![];
+        attr(&mut value, 1, &key.to_be_bytes());
+        let mut elem = vec![];
+        attr(&mut elem, 1, &value);
+        attr(&mut elem, 6, b"entry");
+        attr(&mut list, 1, &elem);
+    }
+    let mut elements = a.clone();
+    attr(&mut elements, 3, &list);
+    assert_eq!(
+        errno(&batch(
+            &ns,
+            &[
+                table("f"),
+                req(9, 2, 0x400, &spec),
+                req(12, 2, 0x400, &elements)
+            ]
+        )),
+        0
+    );
+    let dump = req(13, 2, 0x300, &a);
+    let packets = request(&ns, &[&dump], 1, true, 128, MAX_BYTES).unwrap();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut messages = 0;
+    for datagram in &packets {
+        let mut bytes = datagram.as_slice();
+        while !bytes.is_empty() {
+            let size = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+            if kind(bytes) == SUBSYSTEM | 12 {
+                messages += 1;
+                let msg = attrs(&bytes[20..size]).unwrap();
+                for (_, b) in attrs(need(&msg, 3).unwrap()).unwrap() {
+                    let elem = attrs(b).unwrap();
+                    let key = attrs(need(&elem, 1).unwrap()).unwrap();
+                    assert!(seen.insert(num(&key, 1).unwrap()));
+                    assert_eq!(need(&elem, 6).unwrap(), b"entry");
+                }
+            }
+            bytes = &bytes[size.next_multiple_of(4)..];
+        }
+    }
+    assert!(messages > 1);
+    assert_eq!(seen, (0..1000).collect());
+}
+
+#[test]
+fn short_map_value_clears_the_rest_of_an_overlapping_register() {
+    let ns = Namespace::default();
+    let mut a = vec![];
+    string(&mut a, 1, "filter");
+    string(&mut a, 2, "map");
+    let mut spec = a.clone();
+    number(&mut spec, 3, 8);
+    number(&mut spec, 5, 2);
+    number(&mut spec, 6, 0);
+    number(&mut spec, 7, 1);
+    number(&mut spec, 10, 1);
+    let mut key = vec![];
+    attr(&mut key, 1, &19000u16.to_be_bytes());
+    let mut data = vec![];
+    attr(&mut data, 1, &[1]);
+    let mut entry = vec![];
+    attr(&mut entry, 1, &key);
+    attr(&mut entry, 2, &data);
+    let mut list = vec![];
+    attr(&mut list, 1, &entry);
+    attr(&mut a, 3, &list);
+    let mut payload = vec![];
+    number(&mut payload, 1, 1);
+    number(&mut payload, 2, 2);
+    number(&mut payload, 3, 2);
+    number(&mut payload, 4, 2);
+    let mut lookup = vec![];
+    string(&mut lookup, 1, "map");
+    number(&mut lookup, 2, 1);
+    number(&mut lookup, 3, 1);
+    let mut cmp = vec![];
+    number(&mut cmp, 1, 1);
+    number(&mut cmp, 2, 0);
+    let mut expected = vec![];
+    attr(&mut expected, 1, &[1, 0, 0, 0]);
+    attr(&mut cmp, 3, &expected);
+    let exprs = [
+        expression("payload", &payload),
+        expression("lookup", &lookup),
+        expression("cmp", &cmp),
+        verdict(1, None),
+    ]
+    .concat();
+    assert_eq!(
+        errno(&batch(
+            &ns,
+            &[
+                table("filter"),
+                chain("filter", "in", Some(1), 0, 0),
+                req(9, 2, 0x400, &spec),
+                req(12, 2, 0x400, &a),
+                rule("filter", "in", &exprs)
+            ]
+        )),
+        0
+    );
+    assert!(allows(&ns, 1));
 }

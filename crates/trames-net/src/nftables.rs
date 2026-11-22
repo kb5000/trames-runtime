@@ -2,6 +2,8 @@
 //! Bounded guest nf_tables ABI and packet filter. Wire identifiers follow Linux
 //! UAPI nf_tables.h/nfnetlink.h (GPL-2.0 WITH Linux-syscall-note).
 //! No host firewall calls; unsupported hooks/expressions fail before publication.
+#[path = "nft_sets.rs"]
+mod sets;
 #[path = "nft_xt_match.rs"]
 mod xt_match;
 use crate::{
@@ -173,6 +175,7 @@ struct Table {
     owner: Option<u32>,
     userdata: Vec<u8>,
     chains: BTreeMap<String, Chain>,
+    sets: sets::Sets,
 }
 #[derive(Clone)]
 struct Chain {
@@ -254,6 +257,7 @@ enum Expr {
         flags: u32,
     },
     TransportMatch(xt_match::Transport),
+    Lookup(sets::Lookup),
     ConntrackMatch {
         revision: u32,
         info: Vec<u8>,
@@ -314,7 +318,12 @@ fn xt_nat_revision(name: &str, family: u8, revision: u32) -> bool {
             _ => false,
         }
 }
-fn expressions_in(bytes: &[u8], rule_family: u8) -> Result<Vec<Expr>> {
+fn expressions_in(
+    bytes: &[u8],
+    rule_family: u8,
+    table: Option<&Table>,
+    ids: &sets::BatchIds,
+) -> Result<Vec<Expr>> {
     let mut out = vec![];
     let mut initialized = [false; 64];
     for (kind, b) in attrs(bytes)? {
@@ -359,6 +368,7 @@ fn expressions_in(bytes: &[u8], rule_family: u8) -> Result<Vec<Expr>> {
                 initialized[dest..dest + len].fill(true);
                 Expr::Meta { dest, key }
             }
+            "lookup" => Expr::Lookup(sets::Lookup::parse(data, table, ids, &mut initialized)?),
             "payload" => {
                 let a = fields(data, &[1, 2, 3, 4])?;
                 let base = num(&a, 2)?;
@@ -769,7 +779,7 @@ fn table_data(family: u8, name: &str, t: &Table) -> Vec<u8> {
     if let Some(owner) = t.owner {
         number(&mut d, 7, owner);
     }
-    number(&mut d, 3, t.chains.len() as u32);
+    number(&mut d, 3, (t.chains.len() + t.sets.len()) as u32);
     integer(&mut d, 4, t.handle);
     if !t.userdata.is_empty() {
         attr(&mut d, 6, &t.userdata);
@@ -843,6 +853,11 @@ fn rule_data(family: u8, table: &str, chain: &str, r: &Rule) -> Vec<u8> {
             // nftables dumps NFTA_EXPR_DATA without NLA_F_NESTED.
             attr(&mut e, 2, &data);
             attr(&mut wire, kind, &e);
+        } else if let Expr::Lookup(lookup) = expr {
+            let mut e = vec![];
+            string(&mut e, 1, "lookup");
+            attr(&mut e, 2, &lookup.wire());
+            attr(&mut wire, kind, &e);
         } else if let Expr::Verdict(code, Some(target)) = expr {
             // The original wire names the chain at insertion time. A dump must
             // refer to the same chain after a rename.
@@ -899,6 +914,11 @@ impl Ruleset {
         let mut bytes = 0;
         for ((_, name), t) in &self.tables {
             bytes += name.len() + t.userdata.len() + 128;
+            bytes += t
+                .sets
+                .iter()
+                .map(|(name, s)| name.len() + s.bytes())
+                .sum::<usize>();
             chains += t.chains.len();
             for (name, c) in &t.chains {
                 bytes += name.len() + c.userdata.len() + 128;
@@ -1045,6 +1065,7 @@ impl Ruleset {
         r: &[u8],
         port: u32,
         batch: bool,
+        ids: &mut sets::BatchIds,
     ) -> Result<Vec<Vec<u8>>> {
         let kind = kind(r);
         let flags = flags(r);
@@ -1079,7 +1100,7 @@ impl Ruleset {
         }
         let op = kind & 255;
         let dump = flags & 0x300 == 0x300;
-        let read = matches!(op, 1 | 4 | 7 | 10 | 16);
+        let read = matches!(op, 1 | 4 | 7 | 10 | 13 | 16);
         if flags & 1 == 0 || flags & !(1 | 4 | 0x100 | 0x200 | 0x400 | 0x800) != 0 {
             return Err(NetError(95));
         }
@@ -1102,26 +1123,13 @@ impl Ruleset {
             return Ok(out);
         }
         let mutation_flags = match op {
-            0 | 3 => 0x400 | 0x200,
-            2 | 5 => 0x100,
+            0 | 3 | 9 | 12 => 0x400 | 0x200,
+            2 | 5 | 11 => 0x100,
             6 => 0xf00,
             _ => 0,
         };
         if !read && flags & !(1 | 4 | mutation_flags) != 0 {
             return Err(NetError(95));
-        }
-        if op == 10 {
-            // No sets can be created in this implementation. An empty dump is
-            // truthful and needed by iptables' rule inspection; single lookup
-            // still reports ENOENT, and NEWSET remains unsupported.
-            let a = fields(&r[20..], &[1, 2])?;
-            for (_, v) in a {
-                text(v)?;
-            }
-            if !dump {
-                return Err(NetError(2));
-            }
-            return Ok(vec![message(3, 2, seq, port, &0i32.to_le_bytes())]);
         }
         let allowed: &[u16] = match op {
             0 => &[1, 2, 6],
@@ -1133,9 +1141,17 @@ impl Ruleset {
             7 => &[1, 2, 3],
             // libnftnl echoes the selected rule when deleting by handle.
             8 => &[1, 2, 3, 4, 5, 7, 8],
+            9 => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13],
+            10 => &[1, 2],
+            11 => &[1, 2, 16],
+            12 | 14 => &[1, 2, 3, 4],
+            13 => &[1, 2, 3],
             _ => return Err(NetError(95)),
         };
         let a = fields(&r[20..], allowed)?;
+        if matches!(op, 10 | 13) {
+            return self.read_sets(op, family, &a, dump, seq, port);
+        }
         if read {
             let table = get(&a, 1).map(text).transpose()?;
             let chain = if op == 4 {
@@ -1238,7 +1254,7 @@ impl Ruleset {
                     }
                     return Err(NetError(1));
                 }
-                if flags & 0x100 != 0 && !t.chains.is_empty() {
+                if flags & 0x100 != 0 && (!t.chains.is_empty() || !t.sets.is_empty()) {
                     return Err(NetError(16));
                 }
                 remove.push(key.clone());
@@ -1290,6 +1306,7 @@ impl Ruleset {
                             owner: (options.unwrap_or(0) & 2 != 0).then_some(port),
                             userdata,
                             chains: BTreeMap::new(),
+                            sets: BTreeMap::new(),
                         },
                     );
                 }
@@ -1434,7 +1451,7 @@ impl Ruleset {
             6 => {
                 let cn = name(&a, 2)?;
                 let wire = get(&a, 4).unwrap_or_default().to_vec();
-                let expressions = expressions_in(&wire, family)?;
+                let expressions = expressions_in(&wire, family, self.tables.get(&key), ids)?;
                 if key.1 != "nat"
                     && expressions
                         .iter()
@@ -1542,6 +1559,11 @@ impl Ruleset {
                     return Err(NetError(22));
                 }
             }
+            9 | 11 | 12 | 14 => self
+                .tables
+                .get_mut(&key)
+                .ok_or(NetError(2))?
+                .mutate_set(op, flags, &a, ids)?,
             _ => return Err(NetError(95)),
         }
         self.bounds()?;
@@ -1549,7 +1571,7 @@ impl Ruleset {
     }
 }
 /// One datagram is one bounded transaction. Unsupported expressions, split
-/// batches, sets and notifications return explicit EOPNOTSUPP.
+/// batches and notifications return explicit EOPNOTSUPP.
 pub(crate) fn request(
     ns: &Namespace,
     requests: &[&[u8]],
@@ -1591,6 +1613,7 @@ fn request_rules(
     let mut out = vec![];
     let mut error = None;
     let mut mutated = false;
+    let mut ids = sets::BatchIds::new();
     for (i, r) in requests.iter().enumerate() {
         let result = (|| -> Result<Vec<Vec<u8>>> {
             if !admin {
@@ -1617,10 +1640,10 @@ fn request_rules(
                 }
                 return Ok(vec![]);
             }
-            if batch && !matches!(kind(r) & 255, 0 | 2 | 3 | 5 | 6 | 8) {
+            if batch && !matches!(kind(r) & 255, 0 | 2 | 3 | 5 | 6 | 8 | 9 | 11 | 12 | 14) {
                 return Err(NetError(95));
             }
-            let generated = staged.execute(packet_hooks, r, port, batch)?;
+            let generated = staged.execute(packet_hooks, r, port, batch, &mut ids)?;
             mutated |= batch;
             Ok(generated)
         })();
@@ -1963,7 +1986,12 @@ impl Ruleset {
     }
 }
 impl Rule {
-    fn verdict(&self, ctx: &Context<'_>, effects: &mut Effects) -> Option<(i32, Option<&str>)> {
+    fn verdict(
+        &self,
+        ctx: &Context<'_>,
+        effects: &mut Effects,
+        sets: &sets::Sets,
+    ) -> Option<(i32, Option<&str>)> {
         let mut regs = [0u8; 64];
         for expr in &self.expressions {
             match expr {
@@ -2059,6 +2087,11 @@ impl Rule {
                         ports: *ports,
                     });
                     return Some((1, None));
+                }
+                Expr::Lookup(l) => {
+                    if !l.evaluate(sets, &mut regs) {
+                        return None;
+                    }
                 }
                 Expr::TransportMatch(m) => {
                     let (offset, protocol, fragment) = ctx.transport_header()?;
@@ -2273,7 +2306,7 @@ impl Table {
                 return 0;
             }
             *budget -= 1;
-            match r.verdict(ctx, effects) {
+            match r.verdict(ctx, effects, &self.sets) {
                 Some((0, _)) => return 0,
                 Some((1, _)) => return 1,
                 Some((-5, _)) => return -5,
@@ -2346,7 +2379,7 @@ impl Ruleset {
 }
 #[cfg(test)]
 fn expressions(bytes: &[u8]) -> Result<Vec<Expr>> {
-    expressions_in(bytes, 2)
+    expressions_in(bytes, 2, None, &sets::BatchIds::new())
 }
 #[cfg(test)]
 #[path = "nftables_tests.rs"]
