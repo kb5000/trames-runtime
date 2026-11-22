@@ -10,6 +10,7 @@ pub(super) struct ProcFile {
     source: Arc<dyn ProcSource>,
     target: Option<Arc<dyn ProcTask>>,
     memory: Option<trames_memory::MemoryReport>,
+    writer: std::sync::OnceLock<trames_memory::TransferTarget>,
     saved: Option<Vec<u8>>,
     map_root: Option<trames_memory::MappingRoot>,
     payload: Option<Payload>,
@@ -97,11 +98,23 @@ impl ProcFile {
         matches!(self.payload, Some(Payload::Memory))
     }
     pub(super) fn check_memory_open(&self, credentials: &Credentials, group: u32) -> Result<()> {
-        self.target.as_ref().ok_or(Errno(3))?.check_memory_open(
-            credentials,
-            group,
-            self.memory.as_ref().ok_or(Errno(3))?,
-        )
+        let task = self.target.as_ref().ok_or(Errno(3))?;
+        let memory = self.memory.as_ref().ok_or(Errno(3))?;
+        if let Some(target) = task.open_memory(credentials, group, memory)? {
+            let _ = self.writer.set(target);
+        }
+        Ok(())
+    }
+    pub(super) fn write_target(&self) -> Option<trames_memory::TransferTarget> {
+        self.writer.get().cloned()
+    }
+    pub(super) fn local_memory(&self, caller: &impl trames_memory::CpuMemory) -> bool {
+        self.memory
+            .as_ref()
+            .is_some_and(|m| caller.proc_address_space() == Some(m.identity()))
+    }
+    pub(super) fn memory_alive(&self) -> bool {
+        self.memory.as_ref().is_some_and(|m| m.alive())
     }
     fn is_smaps(&self) -> bool {
         self.path.ends_with(b"/smaps") || self.path.ends_with(b"/smaps_rollup")
@@ -553,6 +566,7 @@ impl Vfs {
                 None
             },
             memory,
+            writer: Default::default(),
             saved,
             payload,
             smaps: Default::default(),

@@ -1711,7 +1711,19 @@ impl<C: Cpu> Kernel<C> {
             }
             return;
         };
-        if !p.signals.force_fault(fault_info) {
+        let traced = p.signals.io.is_traced();
+        if traced {
+            p.signals.io.inbox.discard(fault_info.signal);
+            let _ = p.signals.io.inbox.enqueue(
+                fault_info.signal,
+                trames_kernel::signal::Info {
+                    code: fault_info.code,
+                    fault: Some(fault_info.address),
+                    ..Default::default()
+                },
+            );
+        }
+        if !traced && !p.signals.force_fault(fault_info) {
             if pid == 1 {
                 eprintln!("trames: {fault}");
             }
@@ -1724,6 +1736,9 @@ impl<C: Cpu> Kernel<C> {
     }
     #[cfg(all(test, trames_interpreter_conformance))]
     fn deliver(&mut self, pid: u32, p: &mut Process<C>) -> Result<bool, Errno> {
+        if let Some(state) = p.signals.io.take_trace_update() {
+            p.cpu.restore_architectural_state(&state);
+        }
         let stopped = p.stopped();
         let selected = p
             .signals
@@ -2165,7 +2180,7 @@ impl<C: Cpu> Kernel<C> {
                 }
                 Ok(Some(0))
             },
-            number @ (270 | 271 | 117) if number != 117 || matches!(a[0],1|2) => {
+            number @ (270 | 271 | 117) if number != 117 || matches!(a[0],1|2|4|5) => {
                 let direct = trames_linux::DirectSyscalls::new(p.linux.vfs.direct_descriptors());
                 let attempt = if let Some(wait) = p.byte_wait.take() {
                     direct.resume(wait, &mut p.memory)

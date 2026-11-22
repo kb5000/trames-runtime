@@ -36,6 +36,7 @@ pub(super) struct Copy {
     write: bool,
     done: u64,
     inflight: Option<(Arc<TransferRequest>, u64, usize)>,
+    word: Option<[u8; 8]>,
 }
 
 fn local_bytes(address: u64, data: &mut [u8], memory: &mut impl CpuMemory, write: bool) -> usize {
@@ -79,7 +80,9 @@ impl Copy {
                 if bytes.len() != 8 {
                     return Err(Errno(5));
                 }
-                memory.write(*local, &bytes).map_err(|_| Errno(14))?;
+                if !self.write {
+                    memory.write(*local, &bytes).map_err(|_| Errno(14))?;
+                }
                 return Ok(Some(0));
             }
             let mut bytes = result.map_err(errno)?;
@@ -108,17 +111,26 @@ impl Copy {
         };
         let size = n.min(m).min(TRANSFER_WINDOW as u64) as usize;
         let mut data = vec![0; size];
-        if self.write {
+        if let Some(word) = self.word {
+            data.copy_from_slice(&word);
+        } else if self.write {
             let read = local_bytes(local, &mut data, memory, false);
             if read == 0 {
                 return Err(Errno(14));
             }
             data.truncate(read);
         }
-        let request = self
-            .target
-            .submit(remote, self.write, data, signal.clone())
-            .map_err(errno)?;
+        let request = if peek {
+            self.target.submit_ptrace(
+                remote,
+                self.write,
+                data.as_slice().try_into().unwrap(),
+                signal.clone(),
+            )
+        } else {
+            self.target.submit(remote, self.write, data, signal.clone())
+        }
+        .map_err(errno)?;
         self.inflight = Some((request, local, size));
         Ok(None)
     }
@@ -144,7 +156,7 @@ impl DirectSyscalls {
         // Linux PEEK returns one word through the fourth syscall argument.
         // Short remote reads must leave the output word untouched.
         let vectors = if number == 117 {
-            if !matches!(args[0], 1 | 2) {
+            if !matches!(args[0], 1 | 2 | 4 | 5) {
                 return IoAttempt::Complete(Err(Errno(22)));
             }
             Ok(Some((vec![(args[3], 8)], vec![(args[2], 8)])))
@@ -159,15 +171,20 @@ impl DirectSyscalls {
         let target = match admit() {
             Ok(Some(target)) => target,
             Ok(None) if number == 117 => {
-                return IoAttempt::Complete(
+                return IoAttempt::Complete(if matches!(args[0], 4 | 5) {
+                    memory
+                        .write_array(args[2], args[3].to_le_bytes())
+                        .map(|_| 0)
+                        .map_err(|_| Errno(5))
+                } else {
                     memory
                         .read_array::<8>(args[2])
                         .map_err(|_| Errno(5))
                         .and_then(|word| {
                             memory.write_array(args[3], word).map_err(|_| Errno(14))?;
                             Ok(0)
-                        }),
-                )
+                        })
+                });
             }
             Ok(None) => return IoAttempt::Complete(copy_local(number, local, remote, memory)),
             Err(error) => return IoAttempt::Complete(Err(error)),
@@ -176,7 +193,8 @@ impl DirectSyscalls {
             target,
             local: Cursor::new(local),
             remote: Cursor::new(remote),
-            write: number == 271,
+            write: number == 271 || number == 117 && matches!(args[0], 4 | 5),
+            word: (number == 117 && matches!(args[0], 4 | 5)).then(|| args[3].to_le_bytes()),
             done: 0,
             inflight: None,
         };

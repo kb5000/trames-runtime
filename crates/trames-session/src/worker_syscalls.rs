@@ -613,11 +613,26 @@ impl Snapshot {
     }
     pub fn synchronous_fault(&self, fault: &trames_engine::CpuFault) -> Option<bool> {
         let info = crate::process::fault_info(fault)?;
-        let caught = info.queue(
-            &self.actions,
-            self.io_signals.mask(),
-            &self.io_signals.inbox,
-        );
+        let caught = if self.io_signals.is_traced() {
+            self.io_signals.inbox.discard(info.signal);
+            self.io_signals
+                .inbox
+                .enqueue(
+                    info.signal,
+                    trames_kernel::signal::Info {
+                        code: info.code,
+                        fault: Some(info.address),
+                        ..Default::default()
+                    },
+                )
+                .is_ok()
+        } else {
+            info.queue(
+                &self.actions,
+                self.io_signals.mask(),
+                &self.io_signals.inbox,
+            )
+        };
         if caught {
             if let Some(diagnostics) = &self.diagnostics {
                 diagnostics.fault(self.io_signals.tgid(), fault);
@@ -874,7 +889,7 @@ impl Snapshot {
         tid: u32,
         wake: &std::sync::Weak<dyn trames_vfs::IoWake>,
     ) -> Option<trames_linux::IoAttempt> {
-        let peek = number == 117 && matches!(args[0], 1 | 2);
+        let peek = number == 117 && matches!(args[0], 1 | 2 | 4 | 5);
         (peek || matches!(number, 270 | 271) && args[0] as u32 != self.io_signals.local_tid()).then(
             || {
                 self.direct

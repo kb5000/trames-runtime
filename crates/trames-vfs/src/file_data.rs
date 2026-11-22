@@ -39,6 +39,7 @@ pub(super) struct FileMeta {
 pub(super) struct FilePosition {
     state: Mutex<PositionState>,
     committed: AtomicU64,
+    pending_ready: std::sync::OnceLock<Arc<Readiness>>,
 }
 #[derive(Default)]
 pub(super) struct PositionState {
@@ -68,6 +69,17 @@ impl Drop for PositionGuard<'_> {
     }
 }
 impl FilePosition {
+    pub fn subscribe_pending(&self, signal: &Arc<IoSignal>) -> IoSubscription {
+        self.pending_ready
+            .get_or_init(Default::default)
+            .subscribe(signal)
+    }
+    pub fn notify_pending(&self) {
+        if let Some(ready) = self.pending_ready.get() {
+            ready.notify_locked();
+        }
+    }
+
     pub fn snapshot(&self) -> u64 {
         self.committed.load(Ordering::Relaxed)
     }

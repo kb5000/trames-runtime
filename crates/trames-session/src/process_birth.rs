@@ -579,12 +579,14 @@ impl Birth {
         // Linux classifies births by the exit signal, with VFORK taking
         // precedence. CLONE_UNTRACED suppresses automatic tracing.
         let vfork = a[0] & 0x4000 != 0;
-        if a[0] & 0x800000 == 0 && (vfork || a[0] & 0xff != 17) {
-            p.signals.io.trace_birth(&child.signals.io, vfork, || {
-                let mut state = p.cpu.architectural_state();
-                state.registers[0] = u64::from(parent_tid);
-                state
-            });
+        if a[0] & 0x800000 == 0 {
+            p.signals
+                .io
+                .trace_birth(&child.signals.io, vfork, (a[0] & 0xff) as u32, || {
+                    let mut state = p.cpu.architectural_state();
+                    state.registers[0] = u64::from(parent_tid);
+                    state
+                });
         }
         Ok(Child {
             id,

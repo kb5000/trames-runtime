@@ -80,6 +80,7 @@ impl<C: Cpu> Lifecycle<C> {
                 .expect("original mapping task")
                 .clone();
             let p = &mut *original.write();
+            let batch = batch && !p.signals.io.is_traced();
             if p.signals.io.lifecycle().termination().is_some() {
                 job.checkpoint = None;
                 continue;

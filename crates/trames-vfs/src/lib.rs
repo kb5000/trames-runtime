@@ -4109,6 +4109,9 @@ impl Vfs {
         };
         drop(n);
         let mut file_position = o.file_position.lock().unwrap();
+        if file_position.pending != 0 && o.runtime_file.as_ref().is_some_and(|f| f.is_memory()) {
+            return Err(Errno(11));
+        }
         let base = match whence {
             0 => 0,
             1 => file_position.value as i64,

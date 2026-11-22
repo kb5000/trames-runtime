@@ -97,6 +97,16 @@ impl CredentialState {
         mm: &trames_memory::MemoryReport,
         require_cap: bool,
     ) -> Result<()> {
+        self.open_proc_memory(caller, same_group, mm, require_cap)
+            .map(|_| ())
+    }
+    pub fn open_proc_memory(
+        &self,
+        caller: &Credentials,
+        same_group: bool,
+        mm: &trames_memory::MemoryReport,
+        require_cap: bool,
+    ) -> Result<trames_memory::TransferTarget> {
         let target = self.current.read().unwrap();
         let binding = self.pidfd.lock().unwrap();
         let resources = binding.as_ref().ok_or(Errno(3))?;
@@ -113,7 +123,7 @@ impl CredentialState {
         {
             return Err(Errno(3));
         }
-        Ok(())
+        Ok(resources.memory.as_ref().expect("matched image").clone())
     }
     pub fn receive_pidfd_file(
         &self,

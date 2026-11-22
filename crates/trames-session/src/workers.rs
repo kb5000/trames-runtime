@@ -595,6 +595,9 @@ impl<C: Cpu> Starter<C> {
                                 break SliceOutcome::Yield { instructions: 0 };
                             }
                             if let Some(snapshot) = &work.syscalls {
+                                if let Some(state) = snapshot.io_signals.take_trace_update() {
+                                    work.cpu.restore_architectural_state(&state);
+                                }
                                 if epoch.is_some() && snapshot.io_signals.scheduling.affinity() & (1u64 << index) == 0 {
                                     yielded = true;
                                     break SliceOutcome::Yield { instructions: 0 };
@@ -647,7 +650,8 @@ impl<C: Cpu> Starter<C> {
                                 // Completion producers may hold resource locks. Publish a return
                                 // stop here, on the owning worker, before the next signal or instruction.
                                 if work.trace.take_return(|| !snapshot.io_signals.trace_stopped())
-                                    && snapshot.io_signals.trace_syscall_stop(false,||work.cpu.architectural_state()) {
+                                    && (snapshot.io_signals.trace_syscall_stop(false,||work.cpu.architectural_state())
+                                        || snapshot.io_signals.trace_single_step() && snapshot.io_signals.trace_step_stop(|| work.cpu.architectural_state())) {
                                     maintenance=true;break SliceOutcome::Yield {instructions:0};
                                 }
                                 if let Some(crate::run_queue::WaitState::Child(wait)) = &job.waiting {
@@ -662,16 +666,16 @@ impl<C: Cpu> Starter<C> {
                                 if let Some((sig, shared, action)) = snapshot.next_io_signal() {
                                     let disposition = trames_kernel::signal::disposition(sig, action);
                                     let namespace_init = snapshot.io_routes.namespace.is_nested() && snapshot.identities[0] == 1;
-                                    if action.handler == 0 && namespace_init && !matches!(sig, 9 | 19) || disposition == trames_kernel::signal::Disposition::Ignore {
-                                        snapshot.io_signals.take(sig, shared);
-                                        continue;
-                                    }
                                     let stop_held=matches!(&job.waiting,Some(crate::run_queue::WaitState::Namespace(_) | crate::run_queue::WaitState::Policy(_) | crate::run_queue::WaitState::Barrier(_))) || matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.hardware_wait.as_ref().is_some_and(|w|!w.ready())
                                         || job.gpu_pending.as_ref().is_some_and(|g|g.compile.is_some())
                                         || job.io.as_ref().is_some_and(|io|matches!(io.number,2|270|271) || io.file_pending().is_some_and(|f|!f.interruptible()))
                                         || job.retry.as_ref().is_some_and(|io|io.number==2 || io.file_checkpoint.is_some() || io.file.as_ref().is_some_and(|f|!f.interruptible()));
                                     if sig!=9 && !stop_held && snapshot.io_signals.trace_point(sig,Some(shared),||work.cpu.architectural_state()) {
                                         maintenance=true;break SliceOutcome::Yield {instructions:0};
+                                    }
+                                    if action.handler == 0 && namespace_init && !matches!(sig, 9 | 19) || disposition == trames_kernel::signal::Disposition::Ignore {
+                                        snapshot.io_signals.take(sig, shared);
+                                        continue;
                                     }
                                     if disposition == trames_kernel::signal::Disposition::Terminate {
                                         snapshot.io_signals.lifecycle().request_exit(sig as i32);
@@ -932,7 +936,9 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                 };
                                 credit = claimed;
                             }
-                            let budget = credit;
+                            let stepping = work.syscalls.as_ref().is_some_and(|s| s.io_signals.trace_single_step());
+                            let budget = if stepping && C::EXACT_INSTRUCTIONS { credit.min(1) } else { credit };
+                            work.cpu.set_single_step(stepping);
                             if !running {
                                 if profile_native_overlap {
                                     let n = active.fetch_add(1, Ordering::Relaxed) + 1;
@@ -989,6 +995,11 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                             if profile_native_overlap {
                                 if let Some(epoch) = &epoch { epoch.progress.fetch_add(retired, Ordering::Relaxed); }
                             }
+                            if stepping && (matches!(&result, SliceOutcome::Yield { instructions: 1 }) && C::EXACT_INSTRUCTIONS
+                                || matches!(&result, SliceOutcome::Fault(trames_engine::CpuFault::Trap { signal: 5, code: 2, .. })))
+                                && work.syscalls.as_ref().is_some_and(|s| s.io_signals.trace_step_stop(|| work.cpu.architectural_state())) {
+                                maintenance=true;break SliceOutcome::Yield {instructions:0};
+                            }
                             if let (SliceOutcome::Fault(fault),Some(snapshot)) = (&result,work.syscalls.as_ref()) {
                                 if let Some(caught) = snapshot.synchronous_fault(fault) {
                                     if !caught {
@@ -998,6 +1009,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                 }
                             }
                             if matches!(result, SliceOutcome::Syscall { .. }) {
+                                if stepping && fresh_entry { work.trace.observe_entry(); }
                                 if fresh_entry && work.syscalls.as_ref().is_some_and(|snapshot|snapshot.io_signals.trace_syscall_stop(true,||work.cpu.architectural_state())) {
                                     // SVC has advanced PC. Keep the decoded entry pending until CONT;
                                     // retries of this entry must not execute or account the instruction again.
@@ -1094,6 +1106,9 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                         work.cpu.set_pc(pc + 4);
                                         instructions += 1;
                                         credit -= 1;
+                                        if stepping && work.syscalls.as_ref().is_some_and(|s| s.io_signals.trace_step_stop(||work.cpu.architectural_state())) {
+                                            maintenance=true;break SliceOutcome::Yield {instructions:0};
+                                        }
                                         continue;
                                     }
                                     Err(trames_accel::native::Error::Checkpoint) => {

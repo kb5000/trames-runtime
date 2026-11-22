@@ -2,10 +2,41 @@
 //! Accepted filesystem operations. Host work owns original OFDs and owned bytes;
 //! guest pointers, source task execution and descriptor membership stay outside.
 use super::*;
+use std::sync::atomic::AtomicBool;
 
 #[derive(Clone)]
 pub struct FileTarget(pub(super) SharedFd);
 impl FileTarget {
+    fn proc_write_command(&self, command: &FileCommand) -> bool {
+        self.0
+            .open
+            .runtime_file
+            .as_ref()
+            .is_some_and(|f| f.is_memory())
+            && matches!(
+                command,
+                FileCommand::Write { .. } | FileCommand::WriteSync { .. }
+            )
+    }
+    fn proc_position_command(&self, command: &FileCommand) -> bool {
+        matches!(
+            command,
+            FileCommand::Read { offset: None, .. }
+                | FileCommand::Write { offset: None, .. }
+                | FileCommand::WriteSync { offset: None, .. }
+                | FileCommand::Seek { .. }
+        ) && self
+            .0
+            .open
+            .runtime_file
+            .as_ref()
+            .is_some_and(|f| f.is_memory())
+    }
+    fn proc_position_busy(&self, command: &FileCommand) -> bool {
+        self.proc_position_command(command)
+            && self.0.open.file_position.lock().unwrap().pending != 0
+    }
+
     pub fn read_zero_device(&self, copy: impl FnOnce() -> Result<u64>) -> Option<Result<u64>> {
         self.0.open.read_zero_device(copy)
     }
@@ -34,6 +65,9 @@ impl FileTarget {
             });
         }
         let mut position = open.file_position.lock().unwrap();
+        if position.pending != 0 {
+            return Some(proc_file::ProcRead::Waiting(Vec::new()));
+        }
         let result = file.read_payload(position.value, *count);
         if let proc_file::ProcRead::Complete(Ok(bytes)) = &result {
             position.value += bytes.len() as u64;
@@ -41,6 +75,9 @@ impl FileTarget {
         Some(result)
     }
     fn waits(&self, command: &FileCommand) -> bool {
+        if self.proc_position_command(command) {
+            return true;
+        }
         if self.0.open.console.get().is_some()
             && self.0.open.flags.get() & O_NONBLOCK == 0
             && matches!(
@@ -77,6 +114,9 @@ impl FileTarget {
             if !fd_can_write(open.flags.get()) {
                 return Some(Err(Errno(9)));
             }
+            if file.write_target().is_some() || !file.local_memory(memory) {
+                return None;
+            }
             if let Some(offset) = offset {
                 return Some(if *offset > i64::MAX as u64 {
                     Err(Errno(22))
@@ -86,6 +126,9 @@ impl FileTarget {
                 });
             }
             let mut position = open.file_position.lock().unwrap();
+            if position.pending != 0 {
+                return None;
+            }
             return Some(file.write_local(position.value, bytes, memory).map(|n| {
                 position.value += n;
                 FileValue::Count(n)
@@ -118,6 +161,9 @@ impl FileTarget {
                 .map(|r| r.map(FileValue::Bytes));
         }
         let mut position = open.file_position.lock().unwrap();
+        if position.pending != 0 {
+            return None;
+        }
         file.read_local(position.value, *count, memory).map(|r| {
             r.map(|bytes| {
                 position.value += bytes.len() as u64;
@@ -367,8 +413,32 @@ pub struct FileWork {
     sync_targets: Option<Vec<storage::FilesystemSync>>,
     namespace: Option<Box<namespace_work::NamespaceWork>>,
     proc_wait: Vec<proc_file::ProcWait>,
+    proc_write: Option<Box<ProcWrite>>,
     fuse_stat: Option<Box<fuse::Metadata>>,
     linger: Option<Box<trames_net::TcpLinger>>,
+}
+struct ProcWrite {
+    request: Arc<trames_memory::TransferRequest>,
+}
+struct ProcPosition {
+    position: Arc<file_data::FilePosition>,
+    offset: u64,
+    finished: AtomicBool,
+}
+impl ProcPosition {
+    fn finish(&self, count: Option<usize>) {
+        if self.finished.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        {
+            let mut state = self.position.lock().unwrap();
+            if let Some(n) = count {
+                state.value = self.offset + n as u64;
+            }
+            state.pending -= 1;
+        }
+        self.position.notify_pending();
+    }
 }
 struct FileActive(Arc<Inode>);
 impl Drop for FileActive {
@@ -457,6 +527,15 @@ impl FileWork {
         }
     }
     pub fn waiting(&self) -> bool {
+        if self.proc_write.is_some()
+            || self
+                .target
+                .as_ref()
+                .is_some_and(|t| t.proc_position_busy(&self.command))
+        {
+            return true;
+        }
+
         if let Some(wait) = &self.linger {
             return !wait.ready();
         }
@@ -474,6 +553,17 @@ impl FileWork {
             || matches!(&self.command, FileCommand::Transfer(t) if t.borrow().waits())
     }
     pub fn ready(&self) -> bool {
+        if let Some(write) = &self.proc_write {
+            return write.request.ready();
+        }
+        if self
+            .target
+            .as_ref()
+            .is_some_and(|t| t.proc_position_busy(&self.command))
+        {
+            return false;
+        }
+
         if let Some(wait) = &self.linger {
             return wait.ready();
         }
@@ -499,6 +589,25 @@ impl FileWork {
         }
     }
     pub fn wait_sources(&self, signal: &Arc<IoSignal>) -> std::io::Result<TransferWait> {
+        if let Some(write) = &self.proc_write {
+            return Ok(TransferWait {
+                subscriptions: vec![write.request.subscribe(signal)],
+                native: Vec::new(),
+                deadline: None,
+            });
+        }
+        if let Some(target) = self
+            .target
+            .as_ref()
+            .filter(|t| t.proc_position_busy(&self.command))
+        {
+            return Ok(TransferWait {
+                subscriptions: vec![target.0.open.file_position.subscribe_pending(signal)],
+                native: Vec::new(),
+                deadline: None,
+            });
+        }
+
         if let Some(wait) = &self.linger {
             return Ok(TransferWait {
                 subscriptions: wait.subscribe(signal).into_iter().collect(),
@@ -630,11 +739,18 @@ impl FileWork {
             sync_targets: None,
             namespace: None,
             proc_wait: Vec::new(),
+            proc_write: None,
             fuse_stat: None,
             linger: None,
         }
     }
     pub fn host_work(&self) -> bool {
+        if self.target.as_ref().is_some_and(|t| {
+            t.proc_write_command(&self.command) || t.proc_position_busy(&self.command)
+        }) {
+            return false;
+        }
+
         if self.fuse_stat.is_some() || self.linger.is_some() {
             return false;
         }
@@ -658,6 +774,7 @@ impl FileWork {
             sync_targets: None,
             namespace: None,
             proc_wait: Vec::new(),
+            proc_write: None,
             fuse_stat: None,
             linger: None,
         }
@@ -675,6 +792,7 @@ impl FileWork {
             sync_targets: None,
             namespace: None,
             proc_wait: Vec::new(),
+            proc_write: None,
             fuse_stat: None,
             linger: None,
         }
@@ -729,6 +847,10 @@ impl FileWork {
     /// Joined caller execution, with the same original VFS ownership contract.
     /// As for Vfs::truncate_fd, layout mutation requires joined execution Views.
     pub fn run_owned(vfs: &mut Vfs, target: FileTarget, mut command: FileCommand) -> FileOutcome {
+        if target.proc_write_command(&command) || target.proc_position_busy(&command) {
+            return Self::from_vfs(vfs, target, command).run();
+        }
+
         if let Some(result) = target.proc_read(&command) {
             return Self::proc_outcome(result, || Self::from_vfs(vfs, target, command));
         }
@@ -754,6 +876,9 @@ impl FileWork {
         target: FileTarget,
         mut command: FileCommand,
     ) -> FileOutcome {
+        if target.proc_write_command(&command) || target.proc_position_busy(&command) {
+            return Self::new(paths, target, command).run();
+        }
         if matches!(
             target.0.open.control,
             Some(events::SharedControl::FuseFile(_))
@@ -812,7 +937,101 @@ impl FileWork {
         self.layout_exclusive = Some(exclusive);
         self
     }
+    fn proc_write_step(&mut self) -> Option<Result<Option<u64>>> {
+        if let Some(write) = &mut self.proc_write {
+            let Some(result) = write.request.take() else {
+                return Some(Ok(None));
+            };
+            let result = match result {
+                Ok(b) => Ok(b.len() as u64),
+                Err(trames_memory::TransferError::Retired) => Ok(0),
+                Err(_) => Err(Errno(5)),
+            };
+            return Some(result.map(Some));
+        }
+        let target = self.target.as_ref()?;
+        if !target.proc_write_command(&self.command) {
+            return None;
+        }
+        let open = &target.0.open;
+        if !fd_can_write(open.flags.get()) {
+            return Some(Err(Errno(9)));
+        }
+        let file = open.runtime_file.as_ref().unwrap();
+        let (bytes, offset) = match &self.command {
+            FileCommand::Write { bytes, offset } | FileCommand::WriteSync { bytes, offset, .. } => {
+                (bytes, offset)
+            }
+            _ => unreachable!(),
+        };
+        if bytes.is_empty() || !file.memory_alive() {
+            return Some(Ok(Some(0)));
+        }
+        let Some(remote) = file.write_target() else {
+            return Some(Err(Errno(95)));
+        };
+        let mut state = open.file_position.lock().unwrap();
+        if offset.is_none() && state.pending != 0 {
+            return Some(Ok(None));
+        }
+        let address = offset.unwrap_or(state.value);
+        if offset.is_some_and(|n| n > i64::MAX as u64) {
+            return Some(Err(Errno(22)));
+        }
+        let position = if offset.is_none() {
+            state.pending += 1;
+            Some(Arc::new(ProcPosition {
+                position: open.file_position.clone(),
+                offset: address,
+                finished: AtomicBool::new(false),
+            }))
+        } else {
+            None
+        };
+        drop(state);
+        let completion = position.as_ref().map(|p| {
+            let p = p.clone();
+            Box::new(move |n| p.finish(n)) as Box<dyn Fn(Option<usize>) + Send + Sync>
+        });
+        let request = match remote.submit_forced_write(
+            address,
+            bytes[..bytes.len().min(trames_memory::TRANSFER_WINDOW)].to_vec(),
+            completion,
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                if let Some(position) = position {
+                    position.finish(None);
+                }
+                return Some(if error == trames_memory::TransferError::Retired {
+                    Ok(Some(0))
+                } else {
+                    Err(Errno(5))
+                });
+            }
+        };
+        self.proc_write = Some(Box::new(ProcWrite { request }));
+        Some(Ok(None))
+    }
     pub fn run(mut self) -> FileOutcome {
+        if let Some(result) = self.proc_write_step() {
+            return match result {
+                Ok(None) => FileOutcome::Waiting(self),
+                result => FileOutcome::Complete(FileReply {
+                    result: result.map(|n| FileValue::Count(n.unwrap())),
+                    file_size_signal: false,
+                    scratch: None,
+                }),
+            };
+        }
+        if self
+            .target
+            .as_ref()
+            .is_some_and(|t| t.proc_position_busy(&self.command))
+        {
+            return FileOutcome::Waiting(self);
+        }
+
         if let Some(wait) = &self.linger {
             return if wait.ready() {
                 FileOutcome::Complete(FileReply {

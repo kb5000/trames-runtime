@@ -1,25 +1,27 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! A guest child stops on its execution worker. Its parent consumes
-//! normal wait events and observes an immutable snapshot of that stop.
+//! Guest tasks stop on their own execution workers. Debuggers consume normal
+//! wait events; register changes return to the same worker before execution.
 use super::*;
 
 const PTRACE_TRACEME: u64 = 0;
 const PTRACE_KILL: u64 = 8;
-const PTRACE_POKETEXT: u64 = 4;
-const PTRACE_POKEDATA: u64 = 5;
 const PTRACE_GETEVENTMSG: u64 = 0x4201;
 const PTRACE_GETSIGINFO: u64 = 0x4202;
 const PTRACE_CONT: u64 = 7;
+const PTRACE_SINGLESTEP: u64 = 9;
 const PTRACE_SYSCALL: u64 = 24;
 const PTRACE_GET_SYSCALL_INFO: u64 = 0x420e;
 const PTRACE_O_TRACESYSGOOD: u64 = 1;
 const PTRACE_DETACH: u64 = 17;
 const PTRACE_SETOPTIONS: u64 = 0x4200;
 const PTRACE_GETREGSET: u64 = 0x4204;
+const PTRACE_SETREGSET: u64 = 0x4205;
+const PTRACE_SETSIGINFO: u64 = 0x4203;
 const PTRACE_INTERRUPT: u64 = 0x4207;
 const PTRACE_LISTEN: u64 = 0x4208;
 const PTRACE_GETSIGMASK: u64 = 0x420a;
 const PTRACE_SETSIGMASK: u64 = 0x420b;
+const PTRACE_O_TRACEFORK: u64 = 1 << 1;
 const PTRACE_O_TRACEEXEC: u64 = 1 << 4;
 const PTRACE_O_TRACECLONE: u64 = 1 << 3;
 const PTRACE_O_TRACEVFORK: u64 = 1 << 2;
@@ -36,7 +38,8 @@ pub(super) enum Exception {
     Task(Weak<IoTask>),
 }
 
-const SUPPORTED_OPTIONS: u64 = PTRACE_O_TRACESYSGOOD
+const SUPPORTED_OPTIONS: u64 = PTRACE_O_TRACEFORK
+    | PTRACE_O_TRACESYSGOOD
     | PTRACE_O_TRACEEXEC
     | PTRACE_O_TRACEVFORK
     | PTRACE_O_TRACECLONE
@@ -47,20 +50,16 @@ const SUPPORTED_OPTIONS: u64 = PTRACE_O_TRACESYSGOOD
 enum Mode {
     Voluntary,
     Inherited,
-    Nominated,
     Attach,
     Seize,
-}
-impl Mode {
-    fn observer(self) -> bool {
-        matches!(self, Self::Inherited | Self::Nominated)
-    }
 }
 #[derive(Clone, Copy)]
 enum StopOrigin<'a> {
     Retiring(&'a Arc<ExecPeerExit>),
     Normal,
     Control,
+    Step,
+    Fork(u32),
     Clone(u32),
     Vfork(u32),
     VforkDone(u32),
@@ -75,8 +74,11 @@ enum ControlStop {
 pub(super) struct TraceSlot {
     relationship: Option<Relationship>,
     retirement: Weak<ExecPeerExit>,
+    resume: Option<trames_execution::Aarch64State>,
 }
 struct Relationship {
+    cpu_override: Option<trames_execution::Aarch64State>,
+    signal_override: Option<RetainedInfo>,
     retiring: bool,
     mode: Mode,
     thread_source: Option<Arc<crate::children::Child>>,
@@ -158,6 +160,7 @@ impl Drop for ExecPeerExit {
 impl TraceStop {
     fn read_syscall_info(
         &self,
+        cpu: &trames_execution::Aarch64State,
         len: u64,
         output: u64,
         memory: &mut impl trames_memory::CpuMemory,
@@ -165,23 +168,20 @@ impl TraceStop {
         // ARM64 ptrace_syscall_info uses the last meaningful byte, excluding tail padding.
         let mut bytes = [0; 80];
         bytes[4..8].copy_from_slice(&0xc00000b7u32.to_le_bytes());
-        bytes[8..16].copy_from_slice(&self.cpu.pc.to_le_bytes());
-        bytes[16..24].copy_from_slice(&self.cpu.sp.to_le_bytes());
+        bytes[8..16].copy_from_slice(&cpu.pc.to_le_bytes());
+        bytes[16..24].copy_from_slice(&cpu.sp.to_le_bytes());
         let available = match self.syscall {
             Some(SyscallStop::Entry) if self.status & 0x80 != 0 => {
                 bytes[0] = 1;
-                bytes[24..32].copy_from_slice(&self.cpu.registers[8].to_le_bytes());
-                for (dst, value) in bytes[32..]
-                    .chunks_exact_mut(8)
-                    .zip(&self.cpu.registers[..6])
-                {
+                bytes[24..32].copy_from_slice(&cpu.registers[8].to_le_bytes());
+                for (dst, value) in bytes[32..].chunks_exact_mut(8).zip(&cpu.registers[..6]) {
                     dst.copy_from_slice(&value.to_le_bytes());
                 }
                 80
             }
             Some(SyscallStop::Exit) if self.status & 0x80 != 0 => {
                 bytes[0] = 2;
-                let value = self.cpu.registers[0];
+                let value = cpu.registers[0];
                 bytes[24..32].copy_from_slice(&value.to_le_bytes());
                 bytes[32] = u8::from((-4095..0).contains(&(value as i64)));
                 33
@@ -197,13 +197,15 @@ impl TraceStop {
 
     fn read_regset(
         &self,
+        cpu: &trames_execution::Aarch64State,
         kind: u64,
         iov: u64,
         memory: &mut impl trames_memory::CpuMemory,
     ) -> Result<u64, Errno> {
         let (width, size) = match kind {
-            1 => (8, 272), // NT_PRSTATUS
-            2 => (4, 528), // NT_FPREGSET, including the ABI tail padding
+            1 => (8, 272),   // NT_PRSTATUS
+            0x401 => (8, 8), // NT_ARM_TLS
+            2 => (4, 528),   // NT_FPREGSET, including the ABI tail padding
             _ => return Err(Errno(22)),
         };
         let desc = memory.read_array::<16>(iov).map_err(|_| Errno(14))?;
@@ -216,20 +218,22 @@ impl TraceStop {
         let out = iov.checked_add(8).ok_or(Errno(14))?;
         let mut bytes = [0; 528];
         if kind == 1 {
-            let words = self.cpu.registers.iter().copied().chain([
-                self.cpu.sp,
-                self.cpu.pc,
-                self.cpu.nzcv as u64,
-            ]);
+            let words = cpu
+                .registers
+                .iter()
+                .copied()
+                .chain([cpu.sp, cpu.pc, cpu.nzcv as u64]);
             for (dst, word) in bytes.chunks_exact_mut(8).zip(words) {
                 dst.copy_from_slice(&word.to_le_bytes());
             }
+        } else if kind == 0x401 {
+            bytes[..8].copy_from_slice(&cpu.tpidr_el0.to_le_bytes());
         } else {
-            for (dst, vector) in bytes.chunks_exact_mut(16).zip(self.cpu.vectors.iter()) {
+            for (dst, vector) in bytes.chunks_exact_mut(16).zip(cpu.vectors.iter()) {
                 dst.copy_from_slice(&vector.to_le_bytes());
             }
-            bytes[512..516].copy_from_slice(&self.cpu.fpsr.to_le_bytes());
-            bytes[516..520].copy_from_slice(&self.cpu.fpcr.to_le_bytes());
+            bytes[512..516].copy_from_slice(&cpu.fpsr.to_le_bytes());
+            bytes[516..520].copy_from_slice(&cpu.fpcr.to_le_bytes());
         }
         if len != 0 {
             memory.write(base, &bytes[..len]).map_err(|_| Errno(14))?;
@@ -239,6 +243,87 @@ impl TraceStop {
             .map_err(|_| Errno(14))?;
         Ok(0)
     }
+}
+
+fn write_regset(
+    cpu: &trames_execution::Aarch64State,
+    kind: u64,
+    iov: u64,
+    memory: &mut impl trames_memory::CpuMemory,
+) -> Result<trames_execution::Aarch64State, Errno> {
+    let (width, size) = match kind {
+        1 => (8, 272),
+        2 => (4, 528),
+        0x401 => (8, 8),
+        _ => return Err(Errno(22)),
+    };
+    let desc = memory.read_array::<16>(iov).map_err(|_| Errno(14))?;
+    let base = u64::from_le_bytes(desc[..8].try_into().unwrap());
+    let requested = u64::from_le_bytes(desc[8..].try_into().unwrap());
+    if requested % width != 0 {
+        return Err(Errno(22));
+    }
+    let len = requested.min(size) as usize;
+    let mut state = cpu.clone();
+    let mut bytes = [0; 528];
+    // Partial regsets preserve the bytes beyond the supplied prefix.
+    if kind == 1 {
+        for (dst, word) in bytes
+            .chunks_exact_mut(8)
+            .zip(
+                cpu.registers
+                    .iter()
+                    .copied()
+                    .chain([cpu.sp, cpu.pc, cpu.nzcv as u64]),
+            )
+        {
+            dst.copy_from_slice(&word.to_le_bytes());
+        }
+    } else if kind == 0x401 {
+        bytes[..8].copy_from_slice(&cpu.tpidr_el0.to_le_bytes());
+    } else {
+        for (dst, vector) in bytes.chunks_exact_mut(16).zip(cpu.vectors) {
+            dst.copy_from_slice(&vector.to_le_bytes());
+        }
+        bytes[512..516].copy_from_slice(&cpu.fpsr.to_le_bytes());
+        bytes[516..520].copy_from_slice(&cpu.fpcr.to_le_bytes());
+    }
+    if len != 0 {
+        memory
+            .read(base, &mut bytes[..len])
+            .map_err(|_| Errno(14))?;
+    }
+    if kind == 1 {
+        for (value, src) in state
+            .registers
+            .iter_mut()
+            .chain([&mut state.sp, &mut state.pc])
+            .zip(bytes.chunks_exact(8))
+        {
+            *value = u64::from_le_bytes(src.try_into().unwrap());
+        }
+        let pstate = u64::from_le_bytes(bytes[264..272].try_into().unwrap());
+        // Only EL0t is a valid user mode; privileged execution bits never reach a backend.
+        if pstate & 0x1f != 0 {
+            return Err(Errno(22));
+        }
+        state.nzcv = (pstate as u32) & 0xf0000000;
+    } else if kind == 0x401 {
+        state.tpidr_el0 = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+    } else {
+        for (value, src) in state.vectors.iter_mut().zip(bytes.chunks_exact(16)) {
+            *value = u128::from_le_bytes(src.try_into().unwrap());
+        }
+        state.fpsr = u32::from_le_bytes(bytes[512..516].try_into().unwrap()) & 0xf800009f;
+        state.fpcr = u32::from_le_bytes(bytes[516..520].try_into().unwrap()) & 0x07f79f00;
+    }
+    memory
+        .write_array(
+            iov.checked_add(8).ok_or(Errno(14))?,
+            (len as u64).to_le_bytes(),
+        )
+        .map_err(|_| Errno(14))?;
+    Ok(state)
 }
 
 #[derive(Default)]
@@ -276,9 +361,7 @@ impl IoTask {
             .and_then(|s| {
                 let slot = s.lock().unwrap();
                 let rel = slot.relationship.as_ref()?;
-                (!rel.mode.observer())
-                    .then(|| rel.tracer.upgrade())
-                    .flatten()
+                rel.tracer.upgrade()
             })
             .is_some_and(|t| t.live() && t.tgid() == caller_group)
         {
@@ -330,6 +413,16 @@ impl IoTask {
         self.trace_stop.load(Ordering::Acquire) != 0
     }
 
+    pub fn take_trace_update(&self) -> Option<trames_execution::Aarch64State> {
+        let slot = self.trace.get()?;
+        if !self.trace_update.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut slot = slot.lock().unwrap();
+        self.trace_update.store(false, Ordering::Relaxed);
+        slot.resume.take()
+    }
+
     pub fn tracer_tid(&self) -> u32 {
         self.trace
             .get()
@@ -339,6 +432,16 @@ impl IoTask {
     }
 
     #[inline]
+    pub fn trace_single_step(&self) -> bool {
+        self.trace.get().is_some() && self.trace_step.load(Ordering::Relaxed)
+    }
+    pub fn trace_step_stop(
+        &self,
+        registers: impl FnOnce() -> trames_execution::Aarch64State,
+    ) -> bool {
+        self.publish_trace_stop(5, None, None, None, StopOrigin::Step, registers)
+    }
+
     pub fn trace_control_pending(&self) -> bool {
         self.trace_control.load(Ordering::Acquire)
     }
@@ -486,10 +589,15 @@ impl IoTask {
             {
                 continue;
             }
-            let rel = slot.relationship.take().unwrap();
+            let mut rel = slot.relationship.take().unwrap();
+            if let Some(state) = rel.cpu_override.take() {
+                slot.resume = Some(state);
+                task.trace_update.store(true, Ordering::Release);
+            }
             let notice = rel.child.detach_trace();
             task.trace_run_generation.store(0, Ordering::Relaxed);
             task.trace_control.store(false, Ordering::Release);
+            task.trace_step.store(false, Ordering::Relaxed);
             task.trace_stop.fetch_and(!1, Ordering::Release);
             drop(slot);
             if let Some(ack) = rel.stop.as_ref().and_then(|s| s.acknowledgement.as_ref()) {
@@ -547,15 +655,18 @@ impl IoTask {
         &self,
         child: &Arc<IoTask>,
         vfork: bool,
+        exit_signal: u32,
         registers: impl FnOnce() -> trames_execution::Aarch64State,
     ) {
         let Some(slot) = self.trace.get() else { return };
         let option = if vfork {
             PTRACE_O_TRACEVFORK
+        } else if exit_signal == 17 {
+            PTRACE_O_TRACEFORK
         } else {
             PTRACE_O_TRACECLONE
         };
-        let (tracer, options) = {
+        let (tracer, options, mode, admission) = {
             let guard = slot.lock().unwrap();
             let Some(rel) = guard
                 .relationship
@@ -567,7 +678,21 @@ impl IoTask {
             let Some(tracer) = rel.tracer.upgrade() else {
                 return;
             };
-            (tracer, rel.options)
+            let admission = rel
+                .admission
+                .as_deref()
+                .cloned()
+                .unwrap_or_else(|| tracer.credentials().read().clone());
+            (
+                tracer,
+                rel.options,
+                if rel.mode == Mode::Seize {
+                    Mode::Seize
+                } else {
+                    Mode::Inherited
+                },
+                admission,
+            )
         };
         let thread_source =
             (child.tid() != child.tgid()).then(|| crate::children::Child::thread_source(child));
@@ -596,10 +721,12 @@ impl IoTask {
         list.observers.retain(|w| w.strong_count() != 0);
         list.observers.push(Arc::downgrade(&wait));
         child_slot.relationship = Some(Relationship {
+            cpu_override: None,
+            signal_override: None,
             retiring: false,
-            mode: Mode::Inherited,
+            mode,
             thread_source,
-            admission: None,
+            admission: Some(Box::new(admission)),
             pending: Some(ControlStop::Attach),
             listening: false,
             continued_while_stopped: false,
@@ -621,6 +748,8 @@ impl IoTask {
             None,
             if vfork {
                 StopOrigin::Vfork(child.tid())
+            } else if exit_signal == 17 {
+                StopOrigin::Fork(child.tid())
             } else {
                 StopOrigin::Clone(child.tid())
             },
@@ -730,15 +859,18 @@ impl IoTask {
         let TraceSlot {
             relationship,
             retirement,
+            ..
         } = &mut *lock;
         let Some(rel) = relationship.as_mut() else {
             return false;
         };
-        let vfork_child = if let StopOrigin::Clone(id)
+        let vfork_child = if let StopOrigin::Fork(id)
+        | StopOrigin::Clone(id)
         | StopOrigin::Vfork(id)
         | StopOrigin::VforkDone(id) = origin
         {
             let required = match origin {
+                StopOrigin::Fork(_) => PTRACE_O_TRACEFORK,
                 StopOrigin::Clone(_) => PTRACE_O_TRACECLONE,
                 StopOrigin::Vfork(_) => PTRACE_O_TRACEVFORK,
                 _ => PTRACE_O_TRACEVFORKDONE,
@@ -754,10 +886,6 @@ impl IoTask {
             None
         };
         let control = matches!(origin, StopOrigin::Control);
-        // Lifecycle observers never intercept the original signal delivery.
-        if rel.mode.observer() && shared.is_some() {
-            return false;
-        }
         if rel.stop.is_some() && exit_status.is_none()
             || syscall.is_some() && !rel.trace_syscalls
             || exit_status.is_some() && (rel.exit_reported || rel.options & PTRACE_O_TRACEEXIT == 0)
@@ -793,6 +921,7 @@ impl IoTask {
                 signal
             });
         }
+        let cpu = registers();
         let signal = match shared {
             Some(shared) => match (if shared { self.process() } else { &self.inbox })
                 .take_selected(|pending| pending.remove_for_trace(sig))
@@ -800,10 +929,17 @@ impl IoTask {
                 Some(info) => Some(info),
                 None => return false,
             },
+            None if matches!(origin, StopOrigin::Step) => Some(RetainedInfo::debugger(Info {
+                code: 2,
+                fault: Some(cpu.pc),
+                ..Default::default()
+            })),
             None => None,
         };
         let status = if let Some(status) = control_status {
             status
+        } else if matches!(origin, StopOrigin::Fork(_)) {
+            sig | (1 << 8)
         } else if matches!(origin, StopOrigin::Clone(_)) {
             sig | (3 << 8)
         } else if matches!(origin, StopOrigin::Vfork(_)) {
@@ -823,14 +959,19 @@ impl IoTask {
             } else {
                 sig
             }
-        } else if shared.is_none() && rel.options & PTRACE_O_TRACEEXEC != 0 {
+        } else if matches!(origin, StopOrigin::Normal)
+            && shared.is_none()
+            && rel.options & PTRACE_O_TRACEEXEC != 0
+        {
             sig | (4 << 8)
         } else {
             sig
         };
         rel.continued_while_stopped = false;
+        rel.cpu_override = None;
+        rel.signal_override = None;
         rel.stop = Some(Arc::new(TraceStop {
-            cpu: registers(),
+            cpu,
             acknowledgement: if let StopOrigin::Retiring(hold) = origin {
                 Some(hold.acknowledgement.clone())
             } else {
@@ -878,9 +1019,6 @@ impl IoTask {
 
 impl IoRoutes {
     fn trace_me(&self, task: &IoTask) -> Result<u64, Errno> {
-        if task.tgid() != task.tid() {
-            return Err(Errno(95));
-        }
         let parent = task.parentage().ok_or(Errno(3))?;
         let tracer = self
             .directory
@@ -910,7 +1048,7 @@ impl IoRoutes {
             return Err(Errno(1));
         }
         drop(own);
-        self.trace_child(&tracer, &tracee, Mode::Voluntary, 0, None)
+        self.trace_child(&tracer, &tracee, Mode::Voluntary, 0, Some(creds))
     }
 
     fn trace_child(
@@ -932,15 +1070,7 @@ impl IoRoutes {
             return Err(Errno(3));
         }
         let parent_tid = task.parentage().ok_or(Errno(3))?.parent_thread();
-        if mode != Mode::Nominated
-            && parent_tid != tracer.tid()
-            && (mode == Mode::Voluntary
-                || !self
-                    .directory
-                    .parents
-                    .original(parent_tid)
-                    .is_some_and(|p| p.live() && p.tgid() == tracer.tgid()))
-        {
+        if mode == Mode::Voluntary && parent_tid != tracer.tid() {
             return Err(Errno(3));
         }
         let mut slot = task.trace.get_or_init(Default::default).lock().unwrap();
@@ -948,27 +1078,26 @@ impl IoRoutes {
             return Err(Errno(1));
         }
         let parent_wait = tracer.lifecycle().wait_children().ok_or(Errno(3))?;
-        let (child, notice) = if mode == Mode::Nominated {
-            if !task.nominated_observer(tracer) {
-                return Err(Errno(1));
+        let (child, notice) = match child.trace_by_parent(&parent_wait) {
+            Ok(notice) => (child, Some(notice)),
+            Err(_) => {
+                let wait = child.observe(tracer, &parent_wait)?;
+                list.observers.retain(|w| w.strong_count() != 0);
+                list.observers.push(Arc::downgrade(&wait));
+                (wait, None)
             }
-            let wait = child.observe(tracer, &parent_wait)?;
-            list.observers.retain(|w| w.strong_count() != 0);
-            list.observers.push(Arc::downgrade(&wait));
-            (wait, None)
-        } else {
-            let notice = child.trace_by_parent(&parent_wait)?;
-            (child, Some(notice))
         };
         list.tasks
             .retain(|t| t.strong_count() != 0 && !Weak::ptr_eq(t, &Arc::downgrade(task)));
         list.tasks.push(Arc::downgrade(task));
         let pending = match mode {
-            Mode::Attach | Mode::Nominated => Some(ControlStop::Attach),
+            Mode::Attach => Some(ControlStop::Attach),
             Mode::Seize if task.lifecycle().stopped() => Some(ControlStop::Group),
             _ => None,
         };
         slot.relationship = Some(Relationship {
+            cpu_override: None,
+            signal_override: None,
             retiring: false,
             mode,
             thread_source,
@@ -997,8 +1126,8 @@ impl IoRoutes {
         Ok(0)
     }
 
-    /// A word read requires the original stopped child and current permission
-    /// to read its exact address space. An exec cannot redirect an accepted read.
+    /// Word access binds the original stopped task, saved attach credentials
+    /// and exact address space. Exec cannot redirect an accepted transfer.
     pub fn trace_read_target(
         &self,
         caller: &IoTask,
@@ -1013,25 +1142,19 @@ impl IoRoutes {
             .ok_or(Errno(3))?;
         let slot = task.trace.get().ok_or(Errno(3))?.lock().unwrap();
         let rel = slot.relationship.as_ref().ok_or(Errno(3))?;
-        if rel.mode.observer() || rel.stop.is_none() || !std::ptr::eq(rel.tracer.as_ptr(), caller) {
+        if rel.stop.is_none()
+            || !rel
+                .tracer
+                .upgrade()
+                .is_some_and(|t| t.tgid() == caller.tgid())
+        {
             return Err(Errno(3));
         }
         let mm = task.proc_view.memory_report().ok_or(Errno(3))?;
-        if let Some(original) = &rel.admission {
-            task.credentials()
-                .admit_process_memory(original, &mm, false)
-                .map_err(|e| if e.0 == 1 { Errno(5) } else { e })?;
-        }
-        if caller
-            .proc_view
-            .memory_report()
-            .is_some_and(|m| m.same_resource(&mm))
-        {
-            return Ok(None);
-        }
         let credentials = caller.credentials().read().clone();
+        let original = rel.admission.as_deref().unwrap_or(&credentials);
         task.credentials()
-            .admit_process_memory(&credentials, &mm, false)
+            .admit_process_memory(original, &mm, false)
             .map_err(|e| if e.0 == 1 { Errno(5) } else { e })
             .map(Some)
     }
@@ -1059,19 +1182,11 @@ impl IoRoutes {
         }
         if let Some(lock) = target.trace.get() {
             let mut slot = lock.lock().unwrap();
-            if let Some(rel) = slot
-                .relationship
-                .as_mut()
-                .filter(|r| std::ptr::eq(r.tracer.as_ptr(), caller))
-            {
-                if rel.mode.observer()
-                    && !matches!(
-                        request,
-                        PTRACE_CONT | PTRACE_DETACH | PTRACE_SYSCALL | PTRACE_GETEVENTMSG
-                    )
-                {
-                    return Err(Errno(95));
-                }
+            if let Some(rel) = slot.relationship.as_mut().filter(|r| {
+                r.tracer
+                    .upgrade()
+                    .is_some_and(|t| t.tgid() == caller.tgid())
+            }) {
                 if matches!(request, PTRACE_ATTACH | PTRACE_SEIZE) {
                     return Err(Errno(1));
                 }
@@ -1085,43 +1200,32 @@ impl IoRoutes {
                     return Ok(0);
                 }
                 let stop = rel.stop.as_ref().ok_or(Errno(3))?;
-                if let Some(original) = &rel.admission {
-                    if matches!(
-                        request,
-                        PTRACE_GETREGSET
-                            | PTRACE_GET_SYSCALL_INFO
-                            | PTRACE_GETSIGINFO
-                            | PTRACE_GETSIGMASK
-                            | PTRACE_SETSIGMASK
-                    ) {
-                        let current = caller.credentials().read().clone();
-                        target.credentials().check_trace_attach(original, false)?;
-                        target.credentials().check_trace_attach(&current, false)?;
-                    }
-                }
+                let stop = stop.clone();
                 match request {
-                    PTRACE_POKETEXT | PTRACE_POKEDATA => {
-                        // Authorize the original stopped image before reporting operation
-                        // support. Reuse the word-read checks including attach-time credentials.
-                        drop(slot);
-                        self.trace_read_target(caller, pid as u32)?;
-                        return Err(Errno(95));
-                    }
-                    PTRACE_CONT | PTRACE_SYSCALL | PTRACE_DETACH => {
+                    PTRACE_CONT | PTRACE_SINGLESTEP | PTRACE_SYSCALL | PTRACE_DETACH => {
                         if options > 64 {
                             return Err(Errno(5));
                         }
-                        if options != 0 {
-                            // Only the original selected signal can be resumed. Keep its
-                            // namespace identity alive and let normal delivery consume it.
-                            let info = stop
-                                .signal
-                                .as_ref()
-                                .filter(|_| options == u64::from(stop.status))
-                                .ok_or(Errno(95))?;
-                            target
-                                .inbox
-                                .resume_observed_quiet(stop.status, info.clone());
+                        // Linux injects the requested signal at signal-delivery stops.
+                        // Resume a retained record once, bypassing a second debugger stop.
+                        if options != 0 && (stop.signal.is_some() || stop.status == 19) {
+                            let mut info = rel
+                                .signal_override
+                                .clone()
+                                .or_else(|| stop.signal.clone())
+                                .unwrap_or_else(|| RetainedInfo::debugger(Info::default()));
+                            let info_signal = info.user.map_or(stop.status & 0xff, |b| {
+                                u32::from_le_bytes(b[..4].try_into().unwrap())
+                            });
+                            if options != u64::from(info_signal) {
+                                info = RetainedInfo::debugger(Info {
+                                    sender: caller.tgid(),
+                                    uid: caller.credentials().read().uid,
+                                    code: 0,
+                                    ..Default::default()
+                                });
+                            }
+                            target.inbox.resume_observed_quiet(options as u32, info);
                         }
                         if stop.group_stop && request != PTRACE_DETACH {
                             target
@@ -1135,8 +1239,17 @@ impl IoRoutes {
                             rel.child.trace_event(None)
                         };
                         rel.trace_syscalls = request == PTRACE_SYSCALL;
+                        target
+                            .trace_step
+                            .store(request == PTRACE_SINGLESTEP, Ordering::Relaxed);
                         rel.continued_while_stopped = false;
                         let released = rel.stop.take();
+                        let changed = rel.cpu_override.take();
+                        rel.signal_override = None;
+                        slot.resume = changed;
+                        target
+                            .trace_update
+                            .store(slot.resume.is_some(), Ordering::Release);
                         if request == PTRACE_DETACH {
                             slot.relationship = None;
                             target.trace_control.store(false, Ordering::Release);
@@ -1162,14 +1275,21 @@ impl IoRoutes {
                         return Ok(0);
                     }
                     PTRACE_GET_SYSCALL_INFO => {
+                        let cpu = rel.cpu_override.as_ref().unwrap_or(&stop.cpu).clone();
                         let stop = stop.clone();
                         drop(slot);
-                        return stop.read_syscall_info(addr, options, memory);
+                        return stop.read_syscall_info(&cpu, addr, options, memory);
+                    }
+                    PTRACE_SETREGSET => {
+                        let cpu = rel.cpu_override.as_ref().unwrap_or(&stop.cpu);
+                        rel.cpu_override = Some(write_regset(cpu, addr, options, memory)?);
+                        return Ok(0);
                     }
                     PTRACE_GETREGSET => {
+                        let cpu = rel.cpu_override.as_ref().unwrap_or(&stop.cpu).clone();
                         let stop = stop.clone();
                         drop(slot);
-                        return stop.read_regset(addr, options, memory);
+                        return stop.read_regset(&cpu, addr, options, memory);
                     }
                     PTRACE_GETEVENTMSG => {
                         let message = if let Some(status) = stop.exit_status {
@@ -1191,16 +1311,21 @@ impl IoRoutes {
                         return Err(Errno(22))
                     }
                     PTRACE_GETSIGINFO => {
-                        let mut info = stop.signal.as_deref().copied().unwrap_or_else(|| Info {
-                            sender: target.tgid(),
-                            uid: target.credentials().read().uid,
-                            code: if stop.syscall.is_none() && stop.status >> 8 == 0 {
-                                0
-                            } else {
-                                stop.status as i32
-                            },
-                            ..Default::default()
-                        });
+                        let mut info = rel
+                            .signal_override
+                            .as_ref()
+                            .or(stop.signal.as_ref())
+                            .map(|s| **s)
+                            .unwrap_or_else(|| Info {
+                                sender: target.tgid(),
+                                uid: target.credentials().read().uid,
+                                code: if stop.syscall.is_none() && stop.status >> 8 == 0 {
+                                    0
+                                } else {
+                                    stop.status as i32
+                                },
+                                ..Default::default()
+                            });
                         if info.user.is_none()
                             && info.fault.is_none()
                             && info.poll.is_none()
@@ -1225,6 +1350,19 @@ impl IoRoutes {
                         );
                         drop(slot);
                         memory.write_array(options, bytes).map_err(|_| Errno(14))?;
+                        return Ok(0);
+                    }
+                    PTRACE_SETSIGINFO => {
+                        if stop.group_stop {
+                            return Err(Errno(22));
+                        }
+                        let bytes = memory.read_array::<128>(options).map_err(|_| Errno(14))?;
+                        let user: [u8; 48] = bytes[..48].try_into().unwrap();
+                        rel.signal_override = Some(RetainedInfo::debugger(Info {
+                            code: i32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+                            user: Some(user),
+                            ..Default::default()
+                        }));
                         return Ok(0);
                     }
                     PTRACE_KILL => {
@@ -1316,36 +1454,58 @@ impl IoRoutes {
         if options & !SUPPORTED_OPTIONS != 0 && request == PTRACE_SEIZE {
             return Err(Errno(95));
         }
-        let parent_tid = target.parentage().ok_or(Errno(38))?.parent_thread();
-        let parent_group = self
-            .directory
-            .parents
-            .original(parent_tid)
-            .map(|p| p.tgid());
         let tracer = self
             .directory
             .tasks(0, caller.tid())
             .into_iter()
             .find(|t| std::ptr::eq(&**t, caller))
             .ok_or(Errno(3))?;
-        let direct = parent_tid == caller.tid() || parent_group == Some(caller.tgid());
-        let (mode, flags) = if !direct || target.tid() != target.tgid() {
-            if request != PTRACE_ATTACH || !target.nominated_observer(caller) {
-                return Err(Errno(38));
-            }
-            (Mode::Nominated, 0)
-        } else if request == PTRACE_SEIZE {
-            (Mode::Seize, options)
+        let mode = if request == PTRACE_SEIZE {
+            Mode::Seize
         } else {
-            (Mode::Attach, 0)
+            Mode::Attach
         };
-        self.trace_child(&tracer, &target, mode, flags, Some(credentials))
+        self.trace_child(
+            &tracer,
+            &target,
+            mode,
+            if request == PTRACE_SEIZE { options } else { 0 },
+            Some(credentials),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regset_prefix_preserves_tls_and_rejects_privileged_state() {
+        use trames_memory::{Memory, Permissions, PAGE_SIZE};
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        memory.write_array(0x1000, 0x1100u64.to_le_bytes()).unwrap();
+        memory.write_array(0x1008, 8u64.to_le_bytes()).unwrap();
+        memory.write_array(0x1100, 123u64.to_le_bytes()).unwrap();
+        let mut cpu = trames_execution::Aarch64State {
+            tpidr_el0: 0xabc,
+            sp: 0x2000,
+            pc: 0x3000,
+            ..Default::default()
+        };
+        cpu.registers[1] = 456;
+        let changed = write_regset(&cpu, 1, 0x1000, &mut memory).unwrap();
+        assert_eq!(changed.registers[..2], [123, 456]);
+        assert_eq!(
+            (changed.tpidr_el0, changed.pc, changed.sp),
+            (0xabc, 0x3000, 0x2000)
+        );
+        memory.write_array(0x1008, 272u64.to_le_bytes()).unwrap();
+        memory.write_array(0x1208, 5u64.to_le_bytes()).unwrap();
+        assert_eq!(write_regset(&cpu, 1, 0x1000, &mut memory), Err(Errno(22)));
+        memory.write_array(0x1008, 7u64.to_le_bytes()).unwrap();
+        assert_eq!(write_regset(&cpu, 1, 0x1000, &mut memory), Err(Errno(22)));
+    }
 
     #[test]
     fn designated_debugger_follows_the_original_task_and_its_descendants() {
@@ -1404,18 +1564,27 @@ mod tests {
         stop.cpu.registers[8] = 57;
         stop.cpu.pc = 0x1234;
         stop.cpu.sp = 0x9876;
-        assert_eq!(stop.read_syscall_info(0, u64::MAX, &mut memory), Ok(80));
         assert_eq!(
-            stop.read_syscall_info(1, u64::MAX, &mut memory),
+            stop.read_syscall_info(&stop.cpu, 0, u64::MAX, &mut memory),
+            Ok(80)
+        );
+        assert_eq!(
+            stop.read_syscall_info(&stop.cpu, 1, u64::MAX, &mut memory),
             Err(Errno(14))
         );
         memory.write_array(0x1000, [0xdd; 81]).unwrap();
-        assert_eq!(stop.read_syscall_info(7, 0x1000, &mut memory), Ok(80));
+        assert_eq!(
+            stop.read_syscall_info(&stop.cpu, 7, 0x1000, &mut memory),
+            Ok(80)
+        );
         assert_eq!(
             memory.read_array::<8>(0x1000).unwrap(),
             [1, 0, 0, 0, 0xb7, 0, 0, 0xdd]
         );
-        assert_eq!(stop.read_syscall_info(100, 0x1000, &mut memory), Ok(80));
+        assert_eq!(
+            stop.read_syscall_info(&stop.cpu, 100, 0x1000, &mut memory),
+            Ok(80)
+        );
         let bytes = memory.read_array::<81>(0x1000).unwrap();
         assert_eq!(&bytes[4..8], &0xc00000b7u32.to_le_bytes());
         let words: Vec<_> = bytes[8..80]
@@ -1427,7 +1596,10 @@ mod tests {
         stop.syscall = Some(SyscallStop::Exit);
         for (result, error) in [(0i64, 0), (-1, 1), (-4095, 1), (-4096, 0)] {
             stop.cpu.registers[0] = result as u64;
-            assert_eq!(stop.read_syscall_info(80, 0x1000, &mut memory), Ok(33));
+            assert_eq!(
+                stop.read_syscall_info(&stop.cpu, 80, 0x1000, &mut memory),
+                Ok(33)
+            );
             assert_eq!(memory.read_array::<1>(0x1000).unwrap(), [2]);
             assert_eq!(
                 memory.read_array::<8>(0x1018).unwrap(),
@@ -1436,7 +1608,10 @@ mod tests {
             assert_eq!(memory.read_array::<1>(0x1020).unwrap(), [error]);
         }
         stop.status = 5;
-        assert_eq!(stop.read_syscall_info(80, 0x1000, &mut memory), Ok(24));
+        assert_eq!(
+            stop.read_syscall_info(&stop.cpu, 80, 0x1000, &mut memory),
+            Ok(24)
+        );
         assert_eq!(memory.read_array::<1>(0x1000).unwrap(), [0]);
     }
 

@@ -16,6 +16,16 @@ impl ProcPid {
     }
 }
 impl trames_vfs::ProcTask for ProcPid {
+    fn open_memory(
+        &self,
+        credentials: &trames_vfs::Credentials,
+        group: u32,
+        memory: &trames_memory::MemoryReport,
+    ) -> Result<Option<trames_memory::TransferTarget>, Errno> {
+        self.task()
+            .ok_or(Errno(3))?
+            .open_memory(credentials, group, memory)
+    }
     fn check_memory_open(
         &self,
         credentials: &trames_vfs::Credentials,
@@ -164,20 +174,30 @@ impl trames_vfs::ProcTask for IoTask {
         credentials: &trames_vfs::Credentials,
         group: u32,
         memory: &trames_memory::MemoryReport,
-    ) -> Result<(), trames_vfs::Errno> {
-        self.credentials().check_proc_memory(
-            credentials,
-            self.tgid() == group,
-            memory,
-            self.trace_requires_cap(
-                group,
-                self.inbox
-                    .namespace
-                    .get()
-                    .map_or(1, PidNamespace::ptrace_scope),
+    ) -> Result<(), Errno> {
+        self.open_memory(credentials, group, memory).map(|_| ())
+    }
+    fn open_memory(
+        &self,
+        credentials: &trames_vfs::Credentials,
+        group: u32,
+        memory: &trames_memory::MemoryReport,
+    ) -> Result<Option<trames_memory::TransferTarget>, trames_vfs::Errno> {
+        self.credentials()
+            .open_proc_memory(
+                credentials,
+                self.tgid() == group,
+                memory,
+                self.trace_requires_cap(
+                    group,
+                    self.inbox
+                        .namespace
+                        .get()
+                        .map_or(1, PidNamespace::ptrace_scope),
+                )
+                .map_err(|_| Errno(13))?,
             )
-            .map_err(|_| Errno(13))?,
-        )
+            .map(Some)
     }
     fn present(&self) -> bool {
         self.identifies(0, self.pid.load(Ordering::Relaxed))

@@ -118,6 +118,16 @@ pub trait ProcTask: Send + Sync {
     ) -> Result<()> {
         Err(Errno(3))
     }
+    /// Admit and retain the same original image in one credential transaction.
+    fn open_memory(
+        &self,
+        credentials: &Credentials,
+        group: u32,
+        memory: &trames_memory::MemoryReport,
+    ) -> Result<Option<trames_memory::TransferTarget>> {
+        self.check_memory_open(credentials, group, memory)
+            .map(|_| None)
+    }
     /// Per-mm dump policy of the original task. A zombie has released its mm.
     fn dump_policy(&self) -> Result<Option<Dumpable>> {
         Err(Errno(3))

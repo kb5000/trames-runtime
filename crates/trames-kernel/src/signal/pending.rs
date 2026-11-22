@@ -13,6 +13,15 @@ pub struct RetainedInfo {
     info: Info,
     _sender: Option<trames_vfs::PidReference>,
 }
+impl RetainedInfo {
+    pub(super) fn debugger(info: Info) -> Self {
+        Self {
+            info,
+            observed: false,
+            _sender: None,
+        }
+    }
+}
 impl std::ops::Deref for RetainedInfo {
     type Target = Info;
     fn deref(&self) -> &Info {
