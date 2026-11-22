@@ -424,7 +424,7 @@ mod tests {
                     ));
                     assert!(matches!(
                         source.bpf_attach_device(target, program, 2, 0),
-                        Ok(()) | Err(Errno(17 | 19))
+                        Ok(()) | Err(Errno(22 | 19))
                     ));
                     assert!(matches!(
                         source.bpf_detach_device(target, program),
@@ -596,6 +596,19 @@ mod tests {
         v.bpf_detach_device(child, allow).unwrap();
         v.bpf_detach_device(parent, allow).unwrap();
         assert!(v.bpf_query_device(child, true).unwrap().1.is_empty());
+        v.bpf_attach_device(parent, allow, 1, 0).unwrap();
+        let deny = v.bpf_load_device(&constant(0)).unwrap();
+        v.bpf_attach_device(parent, deny, 1, 0).unwrap();
+        assert_eq!(authority.check(0o20666, 0x103, 2), Err(Errno(1)));
+        v.bpf_attach_device(child, allow, 0, 0).unwrap();
+        assert!(v.open_at(AT_FDCWD, b"/dev/null", 2, 0).is_ok());
+        assert_eq!(
+            v.bpf_query_device(child, true).unwrap().1,
+            v.bpf_query_device(child, false).unwrap().1
+        );
+        v.bpf_detach_device(child, allow).unwrap();
+        assert_eq!(authority.check(0o20666, 0x103, 2), Err(Errno(1)));
+        v.bpf_detach_device(parent, deny).unwrap();
         v.bpf_attach_device(parent, allow, 0, 0).unwrap();
         assert_eq!(v.bpf_attach_device(child, allow, 2, 0), Err(Errno(1)));
     }

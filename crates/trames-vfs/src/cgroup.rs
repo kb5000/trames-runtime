@@ -38,16 +38,20 @@ const FILES: &[(&str, u32)] = &[
     // advertised and no throttling request can silently succeed.
     ("io.max", 0o644),
 ];
+const ALLOW_OVERRIDE: u32 = 1;
+const ALLOW_MULTI: u32 = 2;
+const REPLACE: u32 = 4;
+const MAX_DEVICE_PROGRAMS: usize = 64;
+
 #[derive(Default)]
 struct DeviceRules {
     programs: Vec<Arc<bpf::Program>>,
     flags: u32,
 }
-/// The actual device attachment graph. Calling workers use the same hierarchy
-/// transaction for topology/attachment changes and original rules for access.
+/// A single snapshot serves device opens, mknod and effective queries.
+/// Hierarchy edits rebuild affected snapshots under the cgroup topology lock.
 pub(super) struct DeviceAccess {
-    parent: Option<Arc<DeviceAccess>>,
-    rules: SharedCell<DeviceRules>,
+    effective: SharedCell<Arc<[Arc<bpf::Program>]>>,
 }
 impl DeviceAccess {
     pub(super) fn check(&self, mode: u32, rdev: u64, access: u32) -> Result<()> {
@@ -59,18 +63,8 @@ impl DeviceAccess {
         let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & 0xfffff000);
         let minor = (rdev & 0xff) | ((rdev >> 12) & 0xffffff00);
         let context = [kind | (access << 16), major as u32, minor as u32];
-        let mut at = Some(self);
-        while let Some(group) = at {
-            if group
-                .rules
-                .borrow()
-                .programs
-                .iter()
-                .any(|p| !p.allows(context))
-            {
-                return Err(Errno(1));
-            }
-            at = group.parent.as_deref();
+        if self.effective.borrow().iter().any(|p| !p.allows(context)) {
+            return Err(Errno(1));
         }
         Ok(())
     }
@@ -82,6 +76,7 @@ struct GroupLocation {
     ancestors: Vec<u64>,
 }
 struct Group {
+    device_rules: DeviceRules,
     devices: Arc<DeviceAccess>,
     location: Arc<GroupLocation>,
     parent: Option<u64>,
@@ -590,9 +585,13 @@ impl Cgroups {
         self.groups.insert(
             id,
             Group {
+                device_rules: DeviceRules::default(),
                 devices: Arc::new(DeviceAccess {
-                    parent: parent.map(|id| self.groups[&id].devices.clone()),
-                    rules: SharedCell::default(),
+                    effective: SharedCell::new(
+                        parent
+                            .map(|id| self.groups[&id].devices.effective.borrow().clone())
+                            .unwrap_or_default(),
+                    ),
                 }),
                 location: Arc::new(GroupLocation {
                     path: path.clone(),
@@ -746,6 +745,22 @@ impl Cgroups {
     fn ancestors(&self, id: u64) -> Vec<u64> {
         self.groups[&id].location.ancestors.clone()
     }
+    fn refresh_device_filters(&self, changed: u64) {
+        for group in self
+            .groups
+            .values()
+            .filter(|g| g.location.ancestors.contains(&changed))
+        {
+            let mut effective = Vec::new();
+            for id in &group.location.ancestors {
+                let rules = &self.groups[id].device_rules;
+                if effective.is_empty() || rules.flags == ALLOW_MULTI {
+                    effective.extend(rules.programs.iter().cloned());
+                }
+            }
+            *group.devices.effective.borrow_mut() = effective.into();
+        }
+    }
     fn prune(&mut self) {
         self.dying
             .retain(|g| g.nodes.iter().any(|n| n.strong_count() != 0));
@@ -769,7 +784,7 @@ impl DescriptorFactory {
         let (id, linked) = {
             let node = open.node.as_ref().ok_or(Errno(9))?.borrow();
             if !matches!(node.content, Content::Directory) {
-                return Err(Errno(22));
+                return Err(Errno(9));
             }
             (node.inode, node.links != 0)
         };
@@ -785,8 +800,12 @@ impl DescriptorFactory {
         flags: u32,
         replace: u32,
     ) -> Result<()> {
-        self.bpf_authorized()?;
-        if flags & !6 != 0 || flags == 4 {
+        // Linux delegates attachment through the two original guest descriptors.
+        // Creating a verified program or acquiring its descriptor by ID stays privileged.
+        let mode = flags & !REPLACE;
+        if !matches!(mode, 0 | ALLOW_OVERRIDE | ALLOW_MULTI)
+            || flags & REPLACE != 0 && mode != ALLOW_MULTI
+        {
             return Err(Errno(22));
         }
         let id = self.bpf_group(target)?;
@@ -794,62 +813,70 @@ impl DescriptorFactory {
         if program.kind != 15 {
             return Err(Errno(22));
         }
-        let replace = if flags & 4 != 0 {
+        let replace = if flags & REPLACE != 0 {
             Some(self.bpf_program(replace)?)
         } else {
             None
         };
-        let cg = self.cgroups.borrow_mut();
+        let mut cg = self.cgroups.borrow_mut();
         let group = cg.groups.get(&id).ok_or(Errno(19))?;
-        // ALLOW_OVERRIDE is not supported. Preserve the original ancestor and
-        // descendant constraints; each attachment's fields share one lock.
-        if cg.ancestors(id).iter().skip(1).any(|a| {
-            let rules = cg.groups[a].devices.rules.borrow();
-            !rules.programs.is_empty() && rules.flags == 0
-        }) {
+        if group
+            .location
+            .ancestors
+            .iter()
+            .skip(1)
+            .map(|a| &cg.groups[a].device_rules)
+            .find(|r| !r.programs.is_empty())
+            .is_some_and(|r| r.flags == 0)
+        {
             return Err(Errno(1));
         }
-        if flags == 0
-            && cg.groups.iter().any(|(other, group)| {
+        if mode == 0
+            && cg.groups.iter().any(|(other, g)| {
                 *other != id
-                    && below(&group.location.path, &cg.groups[&id].location.path)
-                    && !group.devices.rules.borrow().programs.is_empty()
+                    && g.location.ancestors.contains(&id)
+                    && !g.device_rules.programs.is_empty()
             })
         {
             return Err(Errno(1));
         }
-        let mut rules = group.devices.rules.borrow_mut();
-        if !rules.programs.is_empty() && rules.flags != flags & 2 {
-            return Err(Errno(22));
+        let rules = &mut cg.groups.get_mut(&id).unwrap().device_rules;
+        if !rules.programs.is_empty() && rules.flags != mode {
+            return Err(Errno(1));
         }
-        if rules.programs.iter().any(|p| p.id == program.id) {
-            return Err(Errno(17));
-        }
-        if let Some(old) = replace {
-            let slot = rules
-                .programs
-                .iter_mut()
-                .find(|p| p.id == old.id)
-                .ok_or(Errno(2))?;
-            *slot = program;
-        } else if flags == 0 {
-            rules.programs = vec![program];
-        } else {
-            if rules.programs.len() >= 16 {
-                return Err(Errno(7));
-            }
+        if mode != ALLOW_MULTI {
+            rules.programs.clear();
             rules.programs.push(program);
+        } else {
+            if rules.programs.iter().any(|p| p.id == program.id)
+                && !replace.as_ref().is_some_and(|old| old.id == program.id)
+            {
+                return Err(Errno(22));
+            }
+            if let Some(old) = replace {
+                let slot = rules
+                    .programs
+                    .iter_mut()
+                    .find(|p| p.id == old.id)
+                    .ok_or(Errno(2))?;
+                *slot = program;
+            } else {
+                if rules.programs.len() >= MAX_DEVICE_PROGRAMS {
+                    return Err(Errno(7));
+                }
+                rules.programs.push(program);
+            }
         }
-        rules.flags = flags & 2;
+        rules.flags = mode;
+        cg.refresh_device_filters(id);
         Ok(())
     }
     pub fn bpf_detach_device(&self, target: u32, program: u32) -> Result<()> {
         self.bpf_authorized()?;
         let id = self.bpf_group(target)?;
         let program = self.bpf_program(program)?;
-        let cg = self.cgroups.borrow_mut();
-        let group = cg.groups.get(&id).ok_or(Errno(19))?;
-        let mut rules = group.devices.rules.borrow_mut();
+        let mut cg = self.cgroups.borrow_mut();
+        let rules = &mut cg.groups.get_mut(&id).ok_or(Errno(19))?.device_rules;
         let index = rules
             .programs
             .iter()
@@ -859,28 +886,41 @@ impl DescriptorFactory {
         if rules.programs.is_empty() {
             rules.flags = 0;
         }
+        cg.refresh_device_filters(id);
         Ok(())
     }
     pub fn bpf_query_device(&self, target: u32, effective: bool) -> Result<(u32, Vec<u32>)> {
+        self.bpf_query_cgroup(target, 6, effective)
+    }
+    pub fn bpf_query_cgroup(
+        &self,
+        target: u32,
+        hook: u32,
+        effective: bool,
+    ) -> Result<(u32, Vec<u32>)> {
         self.bpf_authorized()?;
         let id = self.bpf_group(target)?;
         let cg = self.cgroups.borrow();
-        cg.groups.get(&id).ok_or(Errno(19))?;
-        let groups = if effective {
-            cg.ancestors(id)
-        } else {
-            vec![id]
-        };
-        let mut ids = Vec::new();
-        let mut flags = 0;
-        for group in groups {
-            let rules = cg.groups[&group].devices.rules.borrow();
-            ids.extend(rules.programs.iter().map(|p| p.id));
-            if !effective {
-                flags = rules.flags;
-            }
+        let group = cg.groups.get(&id).ok_or(Errno(19))?;
+        match hook {
+            // The ingress/egress slots have no attached packet programs.
+            0 | 1 => Ok((0, Vec::new())),
+            6 if effective => Ok((
+                0,
+                group
+                    .devices
+                    .effective
+                    .borrow()
+                    .iter()
+                    .map(|p| p.id)
+                    .collect(),
+            )),
+            6 => Ok((
+                group.device_rules.flags,
+                group.device_rules.programs.iter().map(|p| p.id).collect(),
+            )),
+            _ => Err(Errno(22)),
         }
-        Ok((flags, ids))
     }
 }
 impl Vfs {

@@ -14,22 +14,28 @@ pub(super) fn call(
     a: [u64; 6],
     memory: &mut impl CpuMemory,
 ) -> Result<u64, Errno> {
-    factory.bpf_authorized()?;
     let command = a[0] as u32;
+    if command != 8 {
+        factory.bpf_authorized()?;
+    }
     let size = a[2] as u32 as usize;
     if size > 4096 {
         return Err(Errno(7));
     }
     Linux::check(memory, a[1], size, Access::Read)?;
-    let mut attr = vec![0; size.max(152)];
+    let mut attr = vec![0; size.max(168)];
     memory
         .read(a[1], &mut attr[..size])
         .map_err(|_| Errno(14))?;
+    // Linux first checks unknown union extensions, then fields unused by this command.
+    if attr[168..].iter().any(|&b| b != 0) {
+        return Err(Errno(7));
+    }
     let u32_at = |i| u32::from_le_bytes(attr[i..i + 4].try_into().unwrap());
     let u64_at = |i| u64::from_le_bytes(attr[i..i + 8].try_into().unwrap());
     let tail = |i| {
-        if attr[i..].iter().any(|b| *b != 0) {
-            Err(Errno(7))
+        if attr[i..168].iter().any(|b| *b != 0) {
+            Err(Errno(22))
         } else {
             Ok(())
         }
@@ -54,10 +60,7 @@ pub(super) fn call(
                 return Err(Errno(22));
             }
             let count = u32_at(4) as usize;
-            if count == 0 {
-                return Err(Errno(22));
-            }
-            if count > 4096 {
+            if !(1..=4096).contains(&count) {
                 return Err(Errno(7));
             }
             memory
@@ -94,7 +97,13 @@ pub(super) fn call(
             // BPF_PROG_ATTACH / BPF_PROG_DETACH
             tail(20)?;
             if u32_at(8) != 6 {
-                return Err(Errno(95));
+                if command == 8
+                    && matches!(u32_at(8), 0 | 1)
+                    && factory.bpf_program_identity(u32_at(4))?[..4] == 8u32.to_le_bytes()
+                {
+                    return Err(Errno(95));
+                }
+                return Err(Errno(22));
             }
             if command == 8 {
                 // Linux ignores replace_bpf_fd without BPF_F_REPLACE.
@@ -157,30 +166,30 @@ pub(super) fn call(
         16 => {
             // BPF_PROG_QUERY
             tail(28)?;
-            if u32_at(4) != 6 {
-                return Err(Errno(95));
-            }
             if u32_at(8) & !1 != 0 {
                 return Err(Errno(22));
             }
-            let (flags, ids) = factory.bpf_query_device(u32_at(0), u32_at(8) == 1)?;
+            let (flags, ids) = factory.bpf_query_cgroup(u32_at(0), u32_at(4), u32_at(8) == 1)?;
             let capacity = u32_at(24) as usize;
-            let copied = capacity.min(ids.len());
+            let count_only = capacity == 0 || u64_at(16) == 0;
             Linux::check(memory, a[1] + 12, 4, Access::Write)?;
             Linux::check(memory, a[1] + 24, 4, Access::Write)?;
-            Linux::check(memory, u64_at(16), copied * 4, Access::Write)?;
-            let bytes: Vec<_> = ids[..copied]
-                .iter()
-                .flat_map(|id| id.to_le_bytes())
-                .collect();
-            memory.write(u64_at(16), &bytes).map_err(|_| Errno(14))?;
+            if !count_only && !ids.is_empty() {
+                let copied = capacity.min(ids.len());
+                Linux::check(memory, u64_at(16), copied * 4, Access::Write)?;
+                let bytes: Vec<_> = ids[..copied]
+                    .iter()
+                    .flat_map(|id| id.to_le_bytes())
+                    .collect();
+                memory.write(u64_at(16), &bytes).map_err(|_| Errno(14))?;
+            }
             memory
                 .write(a[1] + 12, &flags.to_le_bytes())
                 .map_err(|_| Errno(14))?;
             memory
                 .write(a[1] + 24, &(ids.len() as u32).to_le_bytes())
                 .map_err(|_| Errno(14))?;
-            if capacity < ids.len() {
+            if !count_only && capacity < ids.len() {
                 Err(Errno(28))
             } else {
                 Ok(0)
