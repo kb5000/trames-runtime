@@ -177,8 +177,25 @@ struct Table {
     chains: BTreeMap<String, Chain>,
     sets: sets::Sets,
 }
+/// Netlink batch IDs are temporary. Handles keep a deleted object from being
+/// rebound to a new object with the same name.
+#[derive(Default)]
+struct BatchIds {
+    sets: sets::BatchIds,
+    chains: Vec<(u64, u32, u64)>,
+    rules: BTreeMap<(u64, u64, u32), u64>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Binding {
+    Regular,
+    Unbound,
+    Bound,
+}
+
 #[derive(Clone)]
 struct Chain {
+    binding: Binding,
     handle: u64,
     hook: Option<(u32, i32)>,
     policy: u32,
@@ -322,7 +339,7 @@ fn expressions_in(
     bytes: &[u8],
     rule_family: u8,
     table: Option<&Table>,
-    ids: &sets::BatchIds,
+    ids: &BatchIds,
 ) -> Result<Vec<Expr>> {
     let mut out = vec![];
     let mut initialized = [false; 64];
@@ -337,12 +354,18 @@ fn expressions_in(
                 let a = fields(data, &[1, 2])?;
                 if num(&a, 1)? == 0 {
                     let d = fields(need(&a, 2)?, &[2]).map_err(|_| NetError(22))?;
-                    let v = fields(need(&d, 2)?, &[1, 2])?;
+                    let v = fields(need(&d, 2)?, &[1, 2, 3])?;
                     let code = num(&v, 1)? as i32;
                     if !matches!(code, -5..=1) {
                         return Err(NetError(95));
                     }
-                    let chain = get(&v, 2).map(text).transpose()?;
+                    let chain = if let Some(n) = get(&v, 2) {
+                        Some(text(n)?)
+                    } else if let Some(id) = get(&v, 3) {
+                        Some(table.ok_or(NetError(2))?.batch_chain(ids, u32v(id)?)?)
+                    } else {
+                        None
+                    };
                     if matches!(code, -3 | -4) != chain.is_some() {
                         return Err(NetError(22));
                     }
@@ -368,7 +391,12 @@ fn expressions_in(
                 initialized[dest..dest + len].fill(true);
                 Expr::Meta { dest, key }
             }
-            "lookup" => Expr::Lookup(sets::Lookup::parse(data, table, ids, &mut initialized)?),
+            "lookup" => Expr::Lookup(sets::Lookup::parse(
+                data,
+                table,
+                &ids.sets,
+                &mut initialized,
+            )?),
             "payload" => {
                 let a = fields(data, &[1, 2, 3, 4])?;
                 let base = num(&a, 2)?;
@@ -805,7 +833,15 @@ fn chain_data(family: u8, table: &str, name: &str, c: &Chain, references: u32) -
             attr(&mut d, 8, &counters);
         }
     }
-    number(&mut d, 10, u32::from(c.hook.is_some()));
+    number(
+        &mut d,
+        10,
+        if c.binding == Binding::Bound {
+            4
+        } else {
+            u32::from(c.hook.is_some())
+        },
+    );
     number(&mut d, 6, c.rules.len() as u32 + references);
     if !c.userdata.is_empty() {
         attr(&mut d, 12, &c.userdata);
@@ -1041,6 +1077,9 @@ impl Ruleset {
                 Ok(())
             }
             for (n, c) in &t.chains {
+                if c.binding == Binding::Unbound {
+                    return Err(NetError(22));
+                }
                 if let Some((hook, priority)) = c.hook {
                     context(
                         t,
@@ -1065,7 +1104,7 @@ impl Ruleset {
         r: &[u8],
         port: u32,
         batch: bool,
-        ids: &mut sets::BatchIds,
+        ids: &mut BatchIds,
     ) -> Result<Vec<Vec<u8>>> {
         let kind = kind(r);
         let flags = flags(r);
@@ -1136,11 +1175,11 @@ impl Ruleset {
             1 | 2 => &[1, 4],
             3 => &[1, 2, 3, 4, 5, 7, 8, 10, 11, 12],
             4 => &[1, 2, 3],
-            5 => &[1, 2, 3, 6],
-            6 => &[1, 2, 3, 4, 5, 6, 7, 8],
+            5 => &[1, 2, 3, 6, 11],
+            6 => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
             7 => &[1, 2, 3],
             // libnftnl echoes the selected rule when deleting by handle.
-            8 => &[1, 2, 3, 4, 5, 7, 8],
+            8 => &[1, 2, 3, 4, 5, 7, 8, 9],
             9 => &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13],
             10 => &[1, 2],
             11 => &[1, 2, 16],
@@ -1313,12 +1352,15 @@ impl Ruleset {
             }
             3 => {
                 let table = self.tables.get_mut(&key).ok_or(NetError(2))?;
-                if let Some(id) = get(&a, 11) {
-                    u32v(id)?;
-                }
+                let id = get(&a, 11).map(u32v).transpose()?;
+                let chainflags = get(&a, 10).map(u32v).transpose()?.unwrap_or(0);
+                let binding = chainflags & 4 != 0;
                 let requested = get(&a, 3).map(text).transpose()?;
                 let cn = if let Some(handle) = get(&a, 2) {
                     let old = table.chain_name(u64v(handle)?)?;
+                    if table.chains[&old].binding != Binding::Regular {
+                        return Err(NetError(95));
+                    }
                     if flags & 0x200 != 0 {
                         return Err(NetError(17));
                     }
@@ -1329,8 +1371,18 @@ impl Ruleset {
                         }
                         _ => old,
                     }
+                } else if let Some(n) = requested {
+                    n
+                } else if binding {
+                    let mut suffix = table.next;
+                    loop {
+                        let n = format!("__chain{}", next_handle(&mut suffix)?);
+                        if !table.chains.contains_key(&n) {
+                            break n;
+                        }
+                    }
                 } else {
-                    requested.ok_or(NetError(22))?
+                    return Err(NetError(22));
                 };
                 let h = get(&a, 4)
                     .map(|b| -> Result<(u32, i32)> {
@@ -1362,11 +1414,10 @@ impl Ruleset {
                 if policy.is_some_and(|v| v > 1) {
                     return Err(NetError(22));
                 }
-                let chainflags = get(&a, 10).map(u32v).transpose()?.unwrap_or(0);
-                if chainflags & 4 != 0 || chainflags == 1 && h.is_none() {
+                if binding && (h.is_some() || chainflags != 4) || chainflags == 1 && h.is_none() {
                     return Err(NetError(22));
                 }
-                if chainflags & !1 != 0 {
+                if chainflags & !5 != 0 {
                     return Err(NetError(95));
                 }
                 let counters = get(&a, 8)
@@ -1383,6 +1434,9 @@ impl Ruleset {
                     return Err(NetError(22));
                 }
                 if let Some(c) = table.chains.get_mut(&cn) {
+                    if c.binding != Binding::Regular || binding {
+                        return Err(NetError(95));
+                    }
                     if h.is_some() && c.hook.is_none() {
                         return Err(NetError(17));
                     }
@@ -1413,9 +1467,17 @@ impl Ruleset {
                         return Err(NetError(95));
                     }
                     let handle = next_handle(&mut table.next)?;
+                    if let Some(id) = id {
+                        ids.chains.push((table.handle, id, handle));
+                    }
                     table.chains.insert(
                         cn,
                         Chain {
+                            binding: if binding {
+                                Binding::Unbound
+                            } else {
+                                Binding::Regular
+                            },
                             handle,
                             hook: h,
                             policy: policy.unwrap_or(1),
@@ -1435,6 +1497,9 @@ impl Ruleset {
                     name(&a, 3)?
                 };
                 let c = t.chains.get(&cn).ok_or(NetError(2))?;
+                if c.binding != Binding::Regular {
+                    return Err(NetError(95));
+                }
                 if (flags & 0x100 != 0 && !c.rules.is_empty())
                     || t.chains.values().any(|c| {
                         c.rules.iter().any(|r| {
@@ -1446,10 +1511,16 @@ impl Ruleset {
                 {
                     return Err(NetError(16));
                 }
-                t.chains.remove(&cn);
+                let deleted = t.chains.remove(&cn).unwrap();
+                t.release_bindings(deleted.rules);
             }
             6 => {
-                let cn = name(&a, 2)?;
+                let table = &self.tables[&key];
+                let cn = if let Some(n) = get(&a, 2) {
+                    text(n)?
+                } else {
+                    table.batch_chain(ids, num(&a, 11)?)?
+                };
                 let wire = get(&a, 4).unwrap_or_default().to_vec();
                 let expressions = expressions_in(&wire, family, self.tables.get(&key), ids)?;
                 if key.1 != "nat"
@@ -1485,7 +1556,27 @@ impl Ruleset {
                     return Err(NetError(22));
                 }
                 let table = self.tables.get_mut(&key).ok_or(NetError(2))?;
-                let c = table.chains.get_mut(&cn).ok_or(NetError(2))?;
+                let source_binding = table.chains.get(&cn).ok_or(NetError(2))?.binding;
+                if source_binding == Binding::Bound {
+                    return Err(NetError(95));
+                }
+                for expr in &expressions {
+                    if let Expr::Verdict(_, Some(n)) = expr {
+                        let target = table.chains.get_mut(n).ok_or(NetError(2))?;
+                        match target.binding {
+                            Binding::Regular => (),
+                            Binding::Bound => return Err(NetError(22)),
+                            Binding::Unbound if source_binding != Binding::Regular => {
+                                return Err(NetError(95))
+                            }
+                            Binding::Unbound => target.binding = Binding::Bound,
+                        }
+                    }
+                }
+                let c = table.chains.get_mut(&cn).unwrap();
+                let rule_id = get(&a, 9).map(u32v).transpose()?;
+                let chain_handle = c.handle;
+                let handle;
                 if let Some(old) = get(&a, 3).map(u64v).transpose()? {
                     let i = c
                         .rules
@@ -1498,19 +1589,34 @@ impl Ruleset {
                     if flags & 0x100 == 0 {
                         return Err(NetError(95));
                     }
-                    c.rules[i] = Rule {
-                        handle: old,
-                        userdata,
-                        expressions,
-                        wire,
-                        compatibility,
-                    };
+                    handle = old;
+                    let previous = std::mem::replace(
+                        &mut c.rules[i],
+                        Rule {
+                            handle: old,
+                            userdata,
+                            expressions,
+                            wire,
+                            compatibility,
+                        },
+                    );
+                    table.release_bindings([previous]);
                 } else {
                     if flags & 0x400 == 0 || flags & 0x100 != 0 {
                         return Err(NetError(22));
                     }
-                    let handle = next_handle(&mut table.next)?;
-                    let position = get(&a, 6).map(u64v).transpose()?;
+                    handle = next_handle(&mut table.next)?;
+                    let position = if let Some(raw) = get(&a, 6) {
+                        Some(u64v(raw)?)
+                    } else if let Some(raw) = get(&a, 10) {
+                        Some(
+                            *ids.rules
+                                .get(&(table.handle, chain_handle, u32v(raw)?))
+                                .ok_or(NetError(2))?,
+                        )
+                    } else {
+                        None
+                    };
                     let append = flags & 0x800 != 0;
                     let at = if let Some(position) = position {
                         c.rules
@@ -1534,6 +1640,11 @@ impl Ruleset {
                         },
                     );
                 }
+                if let Some(id) = rule_id {
+                    ids.rules
+                        .entry((table.handle, chain_handle, id))
+                        .or_insert(handle);
+                }
             }
             8 => {
                 let cn = get(&a, 2).map(text).transpose()?;
@@ -1541,17 +1652,32 @@ impl Ruleset {
                 let t = self.tables.get_mut(&key).ok_or(NetError(2))?;
                 if let Some(cn) = cn {
                     let c = t.chains.get_mut(&cn).ok_or(NetError(2))?;
-                    if let Some(handle) = handle {
+                    if c.binding != Binding::Regular {
+                        return Err(NetError(95));
+                    }
+                    let id = get(&a, 9).map(u32v).transpose()?;
+                    let selected = match (handle, id) {
+                        (None, Some(id)) => Some(
+                            *ids.rules
+                                .get(&(t.handle, c.handle, id))
+                                .ok_or(NetError(2))?,
+                        ),
+                        _ => handle,
+                    };
+                    if let Some(handle) = selected {
                         let at = c
                             .rules
                             .iter()
                             .position(|r| r.handle == handle)
                             .ok_or(NetError(2))?;
-                        c.rules.remove(at);
+                        let deleted = c.rules.remove(at);
+                        t.release_bindings([deleted]);
                     } else {
-                        c.rules.clear();
+                        let deleted = std::mem::take(&mut c.rules);
+                        t.release_bindings(deleted);
                     }
-                } else if handle.is_none() {
+                } else if handle.is_none() && get(&a, 9).is_none() {
+                    t.chains.retain(|_, c| c.binding != Binding::Bound);
                     for c in t.chains.values_mut() {
                         c.rules.clear();
                     }
@@ -1559,11 +1685,12 @@ impl Ruleset {
                     return Err(NetError(22));
                 }
             }
-            9 | 11 | 12 | 14 => self
-                .tables
-                .get_mut(&key)
-                .ok_or(NetError(2))?
-                .mutate_set(op, flags, &a, ids)?,
+            9 | 11 | 12 | 14 => self.tables.get_mut(&key).ok_or(NetError(2))?.mutate_set(
+                op,
+                flags,
+                &a,
+                &mut ids.sets,
+            )?,
             _ => return Err(NetError(95)),
         }
         self.bounds()?;
@@ -1613,7 +1740,7 @@ fn request_rules(
     let mut out = vec![];
     let mut error = None;
     let mut mutated = false;
-    let mut ids = sets::BatchIds::new();
+    let mut ids = BatchIds::default();
     for (i, r) in requests.iter().enumerate() {
         let result = (|| -> Result<Vec<Vec<u8>>> {
             if !admin {
@@ -2267,6 +2394,30 @@ impl Rule {
     }
 }
 impl Table {
+    fn release_bindings(&mut self, removed: impl IntoIterator<Item = Rule>) {
+        for rule in removed {
+            for expr in rule.expressions {
+                if let Expr::Verdict(_, Some(target)) = expr {
+                    if self
+                        .chains
+                        .get(&target)
+                        .is_some_and(|c| c.binding == Binding::Bound)
+                    {
+                        self.chains.remove(&target);
+                    }
+                }
+            }
+        }
+    }
+
+    fn batch_chain(&self, ids: &BatchIds, id: u32) -> Result<String> {
+        ids.chains
+            .iter()
+            .filter(|(table, candidate, _)| *table == self.handle && *candidate == id)
+            .find_map(|(_, _, handle)| self.chain_name(*handle).ok())
+            .ok_or(NetError(2))
+    }
+
     fn chain_name(&self, handle: u64) -> Result<String> {
         self.chains
             .iter()
@@ -2379,7 +2530,7 @@ impl Ruleset {
 }
 #[cfg(test)]
 fn expressions(bytes: &[u8]) -> Result<Vec<Expr>> {
-    expressions_in(bytes, 2, None, &sets::BatchIds::new())
+    expressions_in(bytes, 2, None, &BatchIds::default())
 }
 #[cfg(test)]
 #[path = "nftables_tests.rs"]

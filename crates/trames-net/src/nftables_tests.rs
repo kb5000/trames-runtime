@@ -149,8 +149,7 @@ fn chain_rename_keeps_jump_target_and_dump_consistent_after_rollback() {
     let rule = &rules.tables[&(2, "filter".into())].chains["out"].rules[0];
     let dump = rule_data(2, "filter", "out", rule);
     let attrs = attrs(&dump[4..]).unwrap();
-    let decoded =
-        expressions_in(need(&attrs, 4).unwrap(), 2, None, &sets::BatchIds::new()).unwrap();
+    let decoded = expressions_in(need(&attrs, 4).unwrap(), 2, None, &BatchIds::default()).unwrap();
     assert!(matches!(decoded.as_slice(), [Expr::Verdict(-3, Some(target))] if target == "new"));
 }
 #[test]
@@ -1408,4 +1407,140 @@ fn short_map_value_clears_the_rest_of_an_overlapping_register() {
         0
     );
     assert!(allows(&ns, 1));
+}
+
+#[test]
+fn batch_ids_order_rules_and_release_the_owned_chain() {
+    let fabric = crate::Fabric::new().unwrap();
+    let network = Network::virtual_network(&fabric, 2, NetworkMode::Outbound).unwrap();
+    let peer = Network::virtual_network(&fabric, 3, NetworkMode::Outbound).unwrap();
+    let ns = &network.1;
+    let sender = network.socket(2, 2, 0).unwrap();
+    let receiver = peer.socket(2, 2, 0).unwrap();
+    let dest = "10.0.0.3:14072".parse().unwrap();
+    receiver.bind(dest).unwrap();
+    let mut binding = vec![];
+    string(&mut binding, 1, "filter");
+    number(&mut binding, 10, 4);
+    number(&mut binding, 11, 7);
+    let binding = req(3, 2, 0x400, &binding);
+    let inner = |code, id, before| {
+        let mut a = vec![];
+        string(&mut a, 1, "filter");
+        number(&mut a, 11, 7);
+        number(&mut a, 9, id);
+        if let Some(position) = before {
+            number(&mut a, 10, position);
+        }
+        attr(&mut a, 4, &verdict(code, None));
+        req(6, 2, 0x400, &a)
+    };
+    let mut v = vec![];
+    number(&mut v, 1, (-3i32) as u32);
+    number(&mut v, 3, 7);
+    let mut immediate = vec![];
+    attr(&mut immediate, 2, &v);
+    let mut d = vec![];
+    number(&mut d, 1, 0);
+    attr(&mut d, 2, &immediate);
+    let jump = expression("immediate", &d);
+    let parent = rule("filter", "out", &jump);
+    let initial = [
+        table("filter"),
+        chain("filter", "out", Some(3), 0, 1),
+        binding.clone(),
+        inner(1, 40, None),
+        inner(0, 41, Some(40)),
+        parent.clone(),
+    ];
+    assert_eq!(errno(&batch(ns, &initial)), 0);
+    assert!(!allows(ns, 3));
+    sender.send(b"blocked", 0, Some(dest)).unwrap();
+    assert!(matches!(receiver.recv(16, 0), Err(NetError(11))));
+    let firewall = ns.graph.read().unwrap().firewall(ns.id());
+    let (child, handle) = {
+        let rules = firewall.read().unwrap();
+        let t = &rules.tables[&(2, "filter".into())];
+        let owner = &t.chains["out"].rules[0];
+        let Expr::Verdict(_, Some(child)) = &owner.expressions[0] else {
+            panic!("missing jump")
+        };
+        assert_eq!(t.chains[child].rules.len(), 2);
+        (child.clone(), owner.handle)
+    };
+    // A committed ID is no longer visible. The stable dump name can still
+    // identify the child but cannot acquire a second owner or modify it.
+    assert_eq!(errno(&batch(ns, &[parent])), -2);
+    assert_eq!(
+        errno(&batch(
+            ns,
+            &[rule("filter", "out", &verdict(-4, Some(&child)))]
+        )),
+        -22
+    );
+    assert_eq!(
+        errno(&batch(ns, &[rule("filter", &child, &verdict(1, None))])),
+        -95
+    );
+    let mut del = vec![];
+    string(&mut del, 1, "filter");
+    string(&mut del, 2, "out");
+    integer(&mut del, 3, handle);
+    let del = req(8, 2, 0, &del);
+    assert_eq!(errno(&batch(ns, &[del.clone(), binding])), -22);
+    assert!(!allows(ns, 3));
+    assert_eq!(errno(&batch(ns, &[del])), 0);
+    assert!(allows(ns, 3));
+    sender.send(b"allowed", 0, Some(dest)).unwrap();
+    assert_eq!(receiver.recv(16, 0).unwrap().data, b"allowed");
+    assert_eq!(
+        firewall.read().unwrap().tables[&(2, "filter".into())]
+            .chains
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn rule_batch_ids_do_not_select_other_chains_or_survive_deletion() {
+    let ns = Namespace::default();
+    let insert = |owner: &str, pos: Option<u32>| {
+        let mut a = vec![];
+        string(&mut a, 1, "filter");
+        string(&mut a, 2, owner);
+        if let Some(id) = pos {
+            number(&mut a, 10, id);
+        } else {
+            number(&mut a, 9, 42);
+        }
+        req(6, 2, 0x400, &a)
+    };
+    let mut a = vec![];
+    string(&mut a, 1, "filter");
+    string(&mut a, 2, "a");
+    number(&mut a, 9, 42);
+    let delete = req(8, 2, 0, &a);
+    assert_eq!(
+        errno(&batch(
+            &ns,
+            &[
+                table("filter"),
+                chain("filter", "a", None, 0, 1),
+                chain("filter", "b", None, 0, 1)
+            ]
+        )),
+        0
+    );
+    assert_eq!(
+        errno(&batch(&ns, &[insert("a", None), insert("b", Some(42))])),
+        -2
+    );
+    assert_eq!(
+        errno(&batch(
+            &ns,
+            &[insert("a", None), delete.clone(), insert("a", Some(42))]
+        )),
+        -2
+    );
+    assert_eq!(errno(&batch(&ns, &[insert("a", None), delete])), 0);
 }
