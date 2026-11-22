@@ -18,6 +18,7 @@ pub struct Connection {
 pub(crate) struct Port {
     pub index: u32,
     pub(crate) flags: u16,
+    location: parking_lot::RwLock<(u64, std::sync::Weak<netlink::Namespace>)>,
     queue: Mutex<Queue>,
     readiness: Arc<trames_shared::Readiness>,
 }
@@ -86,6 +87,7 @@ impl Connection {
         let port = Arc::new(Port {
             index,
             flags: flags & !0x8000,
+            location: parking_lot::RwLock::new((ns, Arc::downgrade(&self.namespace))),
             queue: Mutex::default(),
             readiness: self.readiness.clone(),
         });
@@ -101,8 +103,8 @@ impl Connection {
     }
     pub fn interface(&self) -> Result<(Vec<u8>, u16)> {
         let p = self.port.lock().clone().ok_or(NetError(77))?;
-        let ns = self.namespace.id();
         let graph = self.namespace.graph.read().unwrap();
+        let ns = p.location.read().0;
         let name = graph.device_name(ns, p.index).ok_or(NetError(77))?;
         let binding = graph.tun_binding(ns, p.index).ok_or(NetError(77))?;
         // Linux aliases the output-only IFF_NOFILTER with the input IFF_NO_PI.
@@ -113,8 +115,8 @@ impl Connection {
     }
     pub fn set_persist(&self, enabled: bool) -> Result<()> {
         let p = self.port.lock().clone().ok_or(NetError(77))?;
-        let ns = self.namespace.id();
         let mut graph = self.namespace.graph.write().unwrap();
+        let ns = p.location.read().0;
         if graph.set_tun_persist(ns, p.index, enabled)? {
             let data = crate::rtnetlink::link_data(&graph, &graph.device(ns, p.index)?);
             drop(graph);
@@ -130,8 +132,8 @@ impl Connection {
             .graph
             .read()
             .unwrap()
-            .device(self.namespace.id(), p.index)
-            .is_err()
+            .device_name(p.location.read().0, p.index)
+            .is_none()
         {
             return Err(NetError(5));
         }
@@ -165,15 +167,12 @@ impl Connection {
         {
             return Err(NetError(22));
         }
+        let namespace = p.location.read().1.upgrade().ok_or(NetError(5))?;
         if tap {
             // TAP takes the protocol from the Ethernet header. The sender supplies
             // frame bytes; packet sockets and the network stack consume them.
             let frame = crate::ethernet::Frame::from_tap(packet)?;
-            return match self
-                .namespace
-                .root_stack()?
-                .inject_frame(p.index, frame, None)
-            {
+            return match namespace.root_stack()?.inject_frame(p.index, frame, None) {
                 Err(NetError(100)) => Err(NetError(5)),
                 Err(e) => Err(e),
                 Ok(()) => Ok(bytes.len()),
@@ -186,9 +185,7 @@ impl Connection {
         } else {
             0x86dd
         };
-        self.namespace
-            .root_stack()?
-            .inject(p.index, protocol, packet)?;
+        namespace.root_stack()?.inject(p.index, protocol, packet)?;
         Ok(bytes.len())
     }
     pub fn poll(&self, events: u16) -> (u16, [u64; 2]) {
@@ -204,8 +201,8 @@ impl Connection {
             .graph
             .read()
             .unwrap()
-            .device(self.namespace.id(), p.index)
-            .is_err()
+            .device_name(p.location.read().0, p.index)
+            .is_none()
         {
             return (8, [0; 2]);
         }
@@ -231,6 +228,9 @@ impl Connection {
     }
 }
 impl Port {
+    pub(crate) fn move_to(&self, target: &Arc<netlink::Namespace>) {
+        *self.location.write() = (target.id(), Arc::downgrade(target));
+    }
     pub(crate) fn readiness(&self) -> Arc<trames_shared::Readiness> {
         self.readiness.clone()
     }
@@ -257,7 +257,7 @@ impl Drop for Connection {
             return;
         };
         let mut g = self.namespace.graph.write().unwrap();
-        let ns = self.namespace.id();
+        let ns = port.location.read().0;
         let remove = g.detach_tun(ns, port.index);
         if let Ok(d) = g.device(ns, port.index) {
             let data = crate::rtnetlink::link_data(&g, &d);

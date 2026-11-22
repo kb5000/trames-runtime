@@ -902,3 +902,102 @@ fn established_tcp_child_keeps_its_filter_when_listener_changes() {
     assert_eq!(second.connect(destination), Err(NetError(115)));
     assert!(matches!(listener.accept(), Err(NetError(11))));
 }
+
+#[test]
+fn moved_tun_queue_preserves_packets_and_delivers_udp_in_destination() {
+    let root = Network::new(NetworkMode::Full);
+    let source = root.isolated().unwrap();
+    let target = root.isolated().unwrap();
+    let tun = source.open_tun();
+    tun.attach(b"tun0", 0x1001, true).unwrap();
+    let index = source
+        .devices()
+        .iter()
+        .find(|d| d.name == b"tun0")
+        .unwrap()
+        .index;
+    assign(&source, index, "192.0.2.1", 24);
+    let sender = source.socket(2, 2, 0).unwrap();
+    sender
+        .send(b"queued before move", 0, Some(addr("192.0.2.2", 7090)))
+        .unwrap();
+    let mut data = vec![0; 16];
+    data[4..8].copy_from_slice(&index.to_le_bytes());
+    attr(&mut data, 3, b"newtun\0");
+    attr(&mut data, 28, &99u32.to_le_bytes());
+    let control = source.socket(16, 3, 0).unwrap();
+    assert_eq!(wire(&control, 16, 0, &data, false, Some(&target)), -1);
+    assert_eq!(tun.interface().unwrap().0, b"tun0");
+    assert_eq!(wire(&control, 16, 0, &data, true, Some(&target)), 0);
+    assert!(source.devices().iter().all(|d| d.name != b"tun0"));
+    assert_eq!(tun.interface().unwrap().0, b"newtun");
+    assert_ne!(tun.poll(1).0 & 1, 0);
+    assert_eq!(&tun.read(256).unwrap()[28..], b"queued before move");
+    assign(&target, index, "198.51.100.1", 24);
+    let receiver = target.socket(2, 2, 0).unwrap();
+    receiver.bind(addr("198.51.100.1", 7091)).unwrap();
+    let reply =
+        crate::packet_tests::udp4("198.51.100.2", "198.51.100.1", 7090, 7091, b"new ingress");
+    tun.write(&reply).unwrap();
+    assert_eq!(receiver.recv(32, 0).unwrap().data, b"new ingress");
+    receiver
+        .send(b"new egress", 0, Some(addr("198.51.100.2", 7090)))
+        .unwrap();
+    assert_eq!(&tun.read(256).unwrap()[28..], b"new egress");
+    tun.set_persist(true).unwrap();
+    drop(tun);
+    let reopened = target.open_tun();
+    reopened.attach(b"newtun", 0x1001, true).unwrap();
+    reopened.set_persist(false).unwrap();
+    drop(reopened);
+    assert!(target.devices().iter().all(|d| d.name != b"newtun"));
+}
+
+#[test]
+fn moved_tap_can_reopen_after_detach_and_wakes_on_namespace_teardown() {
+    let root = Network::new(NetworkMode::Full);
+    let source = root.isolated().unwrap();
+    let target = root.isolated().unwrap();
+    let device = source.open_tun();
+    device.attach(b"tap0", 0x1002, true).unwrap();
+    device.set_persist(true).unwrap();
+    let index = source
+        .devices()
+        .iter()
+        .find(|d| d.name == b"tap0")
+        .unwrap()
+        .index;
+    drop(device);
+    let mut data = vec![0; 16];
+    data[4..8].copy_from_slice(&index.to_le_bytes());
+    attr(&mut data, 28, &99u32.to_le_bytes());
+    let control = source.socket(16, 3, 0).unwrap();
+    assert_eq!(wire(&control, 16, 0, &data, true, Some(&target)), 0);
+    let tap = target.open_tun();
+    tap.attach(b"tap0", 0x1002, true).unwrap();
+    assert_ne!(tap.interface().unwrap().1 & 0x800, 0);
+    let third = root.isolated().unwrap();
+    let control = target.socket(16, 3, 0).unwrap();
+    assert_eq!(wire(&control, 16, 0, &data, true, Some(&third)), 0);
+    third.set_device_up(index, true).unwrap();
+    let capture = third.socket(17, 3, 0x88b5u16.to_be() as u32).unwrap();
+    capture
+        .bind_bytes(&crate::packet_socket::address(index, 0x88b5, 0, [0; 6]))
+        .unwrap();
+    let frame = crate::ethernet::Frame::build([2, 1, 2, 3, 4, 5], [255; 6], 0x88b5, b"moved tap");
+    tap.write(&frame.0).unwrap();
+    assert_eq!(capture.recv(128, 0).unwrap().data, frame.0.as_ref());
+    drop(capture);
+    struct Wake;
+    impl trames_shared::IoWake for Wake {
+        fn wake_io(&self, _: &Arc<trames_shared::IoSignal>) {}
+    }
+    let wake: Arc<dyn trames_shared::IoWake> = Arc::new(Wake);
+    let signal = trames_shared::IoSignal::new(1, Arc::downgrade(&wake));
+    let _sub = tap.subscribe(&signal).unwrap();
+    drop(third);
+    assert!(signal.ready());
+    assert_eq!(tap.poll(1).0, 8);
+    assert_eq!(tap.read(128), Err(NetError(5)));
+    assert_eq!(tap.write(&frame.0), Err(NetError(5)));
+}

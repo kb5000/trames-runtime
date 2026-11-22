@@ -37,13 +37,20 @@ fn topology_readers_and_other_namespace_packets_progress_independently() {
 
 #[test]
 fn packet_accounting_needs_no_topology_writer_and_survives_link_move() {
-    let loopback = Arc::new(Loopback::new(true));
-    let mut topology = Topology::default();
-    topology.add_space(1, Some(loopback.clone()), None);
-    topology.add_space(2, None, None);
-    let (link, _) = topology.create_veth(1, b"one", 2, b"two").unwrap();
-    topology.account(1, link, 17, true, false);
-    let graph = Arc::new(RwLock::new(topology));
+    let root = crate::Network::new(crate::NetworkMode::Full);
+    let source = root.isolated().unwrap();
+    let destination = root.isolated().unwrap();
+    let src = source.namespace_id();
+    let dst = destination.namespace_id();
+    let loopback = source.1.loopback.clone().unwrap();
+    loopback.set(true);
+    let graph = source.1.graph.clone();
+    let (link, _) = graph
+        .write()
+        .unwrap()
+        .create_veth(src, b"one", dst, b"two")
+        .unwrap();
+    graph.read().unwrap().account(src, link, 17, true, false);
     let reader = graph.read().unwrap();
     std::thread::scope(|scope| {
         for _ in 0..8 {
@@ -51,13 +58,13 @@ fn packet_accounting_needs_no_topology_writer_and_survives_link_move() {
             scope.spawn(move || {
                 let graph = graph.read().unwrap();
                 for _ in 0..1000 {
-                    graph.account(1, 1, 64, true, false);
-                    graph.account(1, 1, 32, false, true);
+                    graph.account(src, 1, 64, true, false);
+                    graph.account(src, 1, 32, false, true);
                 }
             });
         }
     });
-    let stats = reader.device(1, 1).unwrap().stats;
+    let stats = reader.device(src, 1).unwrap().stats;
     assert_eq!(
         (stats.tx_packets, stats.tx_bytes, stats.tx_dropped),
         (8000, 512000, 0)
@@ -67,25 +74,41 @@ fn packet_accounting_needs_no_topology_writer_and_survives_link_move() {
         (8000, 256000, 8000)
     );
     loopback.set(false);
-    assert!(!reader.device(1, 1).unwrap().up);
+    assert!(!reader.device(src, 1).unwrap().up);
     drop(reader);
     let worker = graph.clone();
     std::thread::spawn(move || {
-        worker.read().unwrap().account(1, 1, 1, true, false);
+        worker.read().unwrap().account(src, 1, 1, true, false);
     })
     .join()
     .unwrap();
     assert_eq!(
-        graph.read().unwrap().device(1, 1).unwrap().stats.tx_packets,
+        graph
+            .read()
+            .unwrap()
+            .device(src, 1)
+            .unwrap()
+            .stats
+            .tx_packets,
         8001
     );
     let mut graph = graph.write().unwrap();
     graph
-        .change_link(1, link, None, Some(2), None, None, None, None, None)
+        .change_link(
+            src,
+            link,
+            None,
+            Some(&destination),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
         .unwrap();
-    assert_eq!(graph.device(2, link).unwrap().stats.tx_bytes, 17);
-    graph.account(2, link, 3, true, false);
-    assert_eq!(graph.device(2, link).unwrap().stats.tx_bytes, 20);
+    assert_eq!(graph.device(dst, link).unwrap().stats.tx_bytes, 17);
+    graph.account(dst, link, 3, true, false);
+    assert_eq!(graph.device(dst, link).unwrap().stats.tx_bytes, 20);
 }
 
 #[test]

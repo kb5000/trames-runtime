@@ -868,7 +868,7 @@ impl Topology {
         id: u64,
         index: u32,
         name: Option<&[u8]>,
-        target: Option<u64>,
+        destination: Option<&crate::Network>,
         up: Option<bool>,
         master: Option<u32>,
         mac: Option<[u8; 6]>,
@@ -877,6 +877,7 @@ impl Topology {
     ) -> Result<crate::rtnetlink::Changes> {
         let mut changes = Vec::new();
         let old = self.device(id, index)?;
+        let target = destination.map(crate::Network::namespace_id);
         if old.kind == DeviceKind::Direct && !self.spaces[&id].managed_uplink {
             return Err(NetError(95));
         }
@@ -975,12 +976,7 @@ impl Topology {
         if !self.spaces.contains_key(&target) {
             return Err(NetError(2));
         }
-        if target != id
-            && matches!(
-                old.kind,
-                DeviceKind::Bridge | DeviceKind::Tun | DeviceKind::Tap | DeviceKind::Ethernet
-            )
-        {
+        if target != id && matches!(old.kind, DeviceKind::Bridge | DeviceKind::Ethernet) {
             return Err(NetError(22));
         }
         if target != id && master.is_some_and(|m| m != 0) {
@@ -1010,6 +1006,18 @@ impl Topology {
         d.namespace = target;
         d.name = newname.to_vec();
         if target != id {
+            if let Some(binding) = self.spaces.get_mut(&id).unwrap().tunnels.remove(&index) {
+                // A queue descriptor follows the same device across namespaces.
+                // Publish its new endpoint with the link under the topology writer.
+                if let Some(port) = binding.port.upgrade() {
+                    port.move_to(&destination.unwrap().1);
+                }
+                self.spaces
+                    .get_mut(&target)
+                    .unwrap()
+                    .tunnels
+                    .insert(index, binding);
+            }
             self.spaces
                 .get_mut(&id)
                 .unwrap()

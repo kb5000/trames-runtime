@@ -501,7 +501,8 @@ pub(crate) fn request(
                 {
                     return Err(NetError(22));
                 }
-                let target = target.as_ref().map(Network::namespace_id);
+                let destination = target.as_ref();
+                let target = destination.map(Network::namespace_id);
                 if let Some(info) = get(&a, 18) {
                     if kind != 16 || flags & 0x400 == 0 || index != 0 || master.is_some() {
                         return Err(NetError(95));
@@ -616,7 +617,7 @@ pub(crate) fn request(
                         ns,
                         index,
                         None,
-                        target,
+                        destination,
                         up,
                         None,
                         mac,
@@ -661,7 +662,7 @@ pub(crate) fn request(
                             ns,
                             d.index,
                             (index != 0).then_some(name).flatten(),
-                            target,
+                            destination,
                             up,
                             master,
                             mac,

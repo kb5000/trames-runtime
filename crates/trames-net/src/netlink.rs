@@ -175,16 +175,21 @@ impl Drop for Namespace {
         if let Some(stack) = self.stack.take() {
             stack.finish();
         }
+        let mut wakes = Notifications::default();
         let changes: Vec<_> = {
             let mut graph = self.graph.write().unwrap();
             let removed = graph.removed_with_space(self.id());
+            for d in &removed {
+                if let Some(port) = graph.tunnel(d.namespace, d.index) {
+                    wakes.0.push(port.readiness());
+                }
+            }
             graph.remove_space(self.id());
             removed
                 .into_iter()
                 .map(|d| (d.namespace, 17, 1, crate::rtnetlink::link_data(&graph, &d)))
                 .collect()
         };
-        let mut wakes = Notifications::default();
         self.link_wakes(&changes, &mut wakes);
         notify_deferred(&self.listeners, changes, &mut wakes);
         wakes.flush();
