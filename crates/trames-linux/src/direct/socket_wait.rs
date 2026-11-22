@@ -470,6 +470,7 @@ impl DirectSyscalls {
     }
     fn socket_wait(&self, call: RetainedSocket, pid: u32, target: &Weak<dyn IoWake>) -> PendingIo {
         PendingIo {
+            process_vm: None,
             binder: None,
             aio: None,
             message: None,

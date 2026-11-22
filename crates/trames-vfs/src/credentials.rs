@@ -10,6 +10,7 @@ pub struct CredentialState {
     pidfd: std::sync::Mutex<Option<PidfdResources>>,
 }
 struct PidfdResources {
+    memory: Option<trames_memory::TransferTarget>,
     namespaces: SharedNamespaceSnapshot,
     table: std::sync::Weak<fd_table::Membership>,
     dumpable: Dumpable,
@@ -36,13 +37,57 @@ impl CredentialState {
         dumpable: Dumpable,
         namespaces: SharedNamespaceSnapshot,
     ) {
+        self.publish_resources(credentials, files, dumpable, namespaces, None);
+    }
+    pub fn publish_image_resources(
+        &self,
+        credentials: &Credentials,
+        files: &SharedFiles,
+        dumpable: Dumpable,
+        namespaces: SharedNamespaceSnapshot,
+        memory: trames_memory::TransferTarget,
+    ) {
+        self.publish_resources(credentials, files, dumpable, namespaces, Some(memory));
+    }
+    fn publish_resources(
+        &self,
+        credentials: &Credentials,
+        files: &SharedFiles,
+        dumpable: Dumpable,
+        namespaces: SharedNamespaceSnapshot,
+        memory: Option<trames_memory::TransferTarget>,
+    ) {
         let mut target = self.current.write().unwrap();
         target.clone_from(credentials);
-        *self.pidfd.lock().unwrap() = Some(PidfdResources {
+        let mut binding = self.pidfd.lock().unwrap();
+        // A namespace/Files-only update retains the original mm. An image
+        // replacement publishes its memory and objective credentials together.
+        let memory = memory.or_else(|| {
+            binding
+                .as_mut()
+                .filter(|old| Arc::ptr_eq(&old.dumpable.0, &dumpable.0))
+                .and_then(|old| old.memory.take())
+        });
+        *binding = Some(PidfdResources {
+            memory,
             namespaces,
             table: Arc::downgrade(&files.0),
             dumpable,
         });
+    }
+    pub fn admit_process_memory(
+        &self,
+        caller: &Credentials,
+        observed: &trames_memory::MemoryReport,
+    ) -> Result<trames_memory::TransferTarget> {
+        self.with_pidfd_resources(caller, false, |resources| {
+            resources
+                .memory
+                .as_ref()
+                .filter(|mm| mm.matches(observed))
+                .cloned()
+                .ok_or(Errno(3))
+        })
     }
     pub fn receive_pidfd_file(
         &self,
@@ -801,5 +846,59 @@ impl Vfs {
         }
         let node = open.metadata_node().ok_or(Errno(22))?;
         self.chown_node(node, uid, gid, open.node.is_some())
+    }
+}
+
+#[cfg(test)]
+mod process_transfer_tests {
+    use super::*;
+    #[test]
+    fn accepted_target_matches_the_image_checked_with_real_credentials() {
+        let vfs = Vfs::default();
+        let creds = Credentials::user(1200, 1200);
+        let state = CredentialState::new(creds.clone());
+        let old = trames_memory::Memory::default();
+        let new = trames_memory::Memory::default();
+        let policy = Dumpable::default();
+        let publish = |mm: &trames_memory::Memory, policy: &Dumpable| {
+            state.publish_image_resources(
+                &creds,
+                &vfs.shared_files(),
+                policy.clone(),
+                vfs.pidfd_namespace_source(),
+                mm.transfer_target(),
+            );
+        };
+        publish(&old, &policy);
+        let retained = state
+            .admit_process_memory(&creds, &old.memory_report())
+            .unwrap();
+        assert!(matches!(
+            state.admit_process_memory(&Credentials::user(1300, 1300), &old.memory_report()),
+            Err(Errno(1))
+        ));
+        state.publish_pidfd_resources(
+            &creds,
+            &vfs.shared_files(),
+            policy.clone(),
+            vfs.pidfd_namespace_source(),
+        );
+        assert!(state
+            .admit_process_memory(&creds, &old.memory_report())
+            .is_ok());
+        policy.set(false);
+        assert!(matches!(
+            state.admit_process_memory(&creds, &old.memory_report()),
+            Err(Errno(1))
+        ));
+        publish(&new, &Dumpable::default());
+        assert!(matches!(
+            state.admit_process_memory(&creds, &old.memory_report()),
+            Err(Errno(3))
+        ));
+        assert!(state
+            .admit_process_memory(&creds, &new.memory_report())
+            .is_ok());
+        assert!(!retained.matches(&new.memory_report()));
     }
 }

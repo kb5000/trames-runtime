@@ -744,15 +744,15 @@ impl IoDirectory {
     }
     /// A numeric PID selects a live guest task. Only the original shared mm
     /// permits a transfer through the caller's own execution view.
-    pub fn admit_local_mm(
+    pub fn process_memory_target(
         &self,
         ns: &PidNamespace,
         caller: &IoTask,
         local: u32,
-    ) -> Result<(), Errno> {
+    ) -> Result<Option<trames_memory::TransferTarget>, Errno> {
         let global = ns.global(local).ok_or(Errno(3))?;
         if global == caller.tid() {
-            return Ok(());
+            return Ok(None);
         }
         let target = self
             .tasks(0, global)
@@ -765,11 +765,13 @@ impl IoDirectory {
             .memory_report()
             .is_some_and(|mm| mm.same_resource(&remote))
         {
-            return Ok(());
+            return Ok(None);
         }
         let credentials = caller.credentials().read().clone();
-        target.credentials().check_trace_attach(&credentials)?;
-        Err(Errno(38))
+        target
+            .credentials()
+            .admit_process_memory(&credentials, &remote)
+            .map(Some)
     }
     pub fn orphaned(&self, task: &IoTask) -> bool {
         let pgrp = task.group();

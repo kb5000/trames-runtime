@@ -49,12 +49,13 @@ impl MemoryReport {
         }
     }
     pub fn has_requested_reads(&self) -> bool {
-        self.read_ranges(0, u64::MAX).iter().any(|read| {
-            matches!(
-                *read.state.read().unwrap(),
-                ReadState::Pending { requested: true }
-            )
-        })
+        self.has_transfers()
+            || self.read_ranges(0, u64::MAX).iter().any(|read| {
+                matches!(
+                    *read.state.read().unwrap(),
+                    ReadState::Pending { requested: true }
+                )
+            })
     }
     /// Retry an already requested read when its original task becomes visible.
     /// This neither creates a new request nor retains a guest byte actor.
@@ -115,7 +116,7 @@ impl MemoryReport {
             self.wake_reads();
         }
     }
-    fn wake_reads(&self) {
+    pub(super) fn wake_reads(&self) {
         let wake = self.0.read_waker.read().unwrap().clone();
         if let Some(wake) = wake {
             wake(self.clone());
@@ -225,6 +226,7 @@ impl Memory {
             .as_ref()
             .map(|(_, r, _)| r.clone());
         let Some(report) = report else { return true };
+        report.finish_transfers(Some(self));
         for read in report.read_ranges(0, u64::MAX) {
             let mut state = read.state.write().unwrap();
             if !matches!(*state, ReadState::Pending { requested: true }) {

@@ -858,6 +858,25 @@ impl Snapshot {
     pub fn signal_send<C: Cpu>(&self, cpu: &C) -> bool {
         matches!(cpu.x(8) as u32, 129..=131 | 138 | 240 | 424)
     }
+    pub fn start_process_vm(
+        &self,
+        number: u32,
+        args: [u64; 6],
+        memory: &mut impl CpuMemory,
+        tid: u32,
+        wake: &std::sync::Weak<dyn trames_vfs::IoWake>,
+    ) -> Option<trames_linux::IoAttempt> {
+        (matches!(number, 270 | 271) && args[0] as u32 != self.io_signals.local_tid()).then(|| {
+            self.direct
+                .start_process_vm(number, args, memory, tid, wake, || {
+                    self.io_routes.directory.process_memory_target(
+                        &self.io_routes.namespace,
+                        &self.io_signals,
+                        args[0] as u32,
+                    )
+                })
+        })
+    }
     pub fn admit<C: Cpu>(&self, cpu: &C) -> bool {
         if self.seccomp.mode() == 0 {
             return true;
@@ -946,15 +965,8 @@ impl Snapshot {
             }
         }
         let result = match cpu.x(8) as u32 {
-            number @ (270 | 271) => {
-                let a = std::array::from_fn(|i| cpu.x(i));
-                trames_linux::process_vm_transfer(number, a, memory, || {
-                    self.io_routes.directory.admit_local_mm(
-                        &self.io_routes.namespace,
-                        &self.io_signals,
-                        a[0] as u32,
-                    )
-                })
+            number @ (270 | 271) if cpu.x(0) as u32 == self.io_signals.local_tid() => {
+                trames_linux::process_vm_local(number, std::array::from_fn(|i| cpu.x(i)), memory)
             }
             117 => self
                 .io_routes

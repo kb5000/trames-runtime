@@ -1,0 +1,250 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+use super::*;
+use crate::process_memory::{copy_local, import, Vectors};
+use trames_memory::{TransferError, TransferRequest, TransferTarget, PAGE_SIZE, TRANSFER_WINDOW};
+
+struct Cursor {
+    vectors: std::vec::IntoIter<(u64, u64)>,
+    offset: u64,
+}
+impl Cursor {
+    fn new(vectors: Vectors) -> Self {
+        Self {
+            vectors: vectors.into_iter(),
+            offset: 0,
+        }
+    }
+    fn span(&mut self) -> Result<Option<(u64, u64)>, Errno> {
+        while let Some(&(base, len)) = self.vectors.as_slice().first() {
+            if self.offset < len {
+                return Ok(Some((
+                    base.checked_add(self.offset).ok_or(Errno(14))?,
+                    len - self.offset,
+                )));
+            }
+            self.vectors.next();
+            self.offset = 0;
+        }
+        Ok(None)
+    }
+}
+
+pub(super) struct Copy {
+    target: TransferTarget,
+    local: Cursor,
+    remote: Cursor,
+    write: bool,
+    done: u64,
+    inflight: Option<(Arc<TransferRequest>, u64, usize)>,
+}
+
+fn local_bytes(address: u64, data: &mut [u8], memory: &mut impl CpuMemory, write: bool) -> usize {
+    let mut done = 0;
+    while done < data.len() {
+        let Some(address) = address.checked_add(done as u64) else {
+            break;
+        };
+        let end = data
+            .len()
+            .min(done + (PAGE_SIZE - address % PAGE_SIZE) as usize);
+        let result = if write {
+            memory.write(address, &data[done..end])
+        } else {
+            memory.read(address, &mut data[done..end])
+        };
+        if result.is_err() {
+            break;
+        }
+        done = end;
+    }
+    done
+}
+
+impl Copy {
+    fn step(
+        &mut self,
+        memory: &mut impl CpuMemory,
+        signal: &Arc<IoSignal>,
+    ) -> Result<Option<u64>, Errno> {
+        if let Some((request, local, requested)) = &self.inflight {
+            let Some(result) = request.take() else {
+                return Ok(None);
+            };
+            let mut bytes = result.map_err(errno)?;
+            let n = if self.write {
+                bytes.len()
+            } else {
+                local_bytes(*local, &mut bytes, memory, true)
+            };
+            self.done += n as u64;
+            if n < *requested {
+                return if self.done == 0 {
+                    Err(Errno(14))
+                } else {
+                    Ok(Some(self.done))
+                };
+            }
+            self.local.offset += n as u64;
+            self.remote.offset += n as u64;
+            self.inflight = None;
+        }
+        let Some((local, n)) = self.local.span()? else {
+            return Ok(Some(self.done));
+        };
+        let Some((remote, m)) = self.remote.span()? else {
+            return Ok(Some(self.done));
+        };
+        let size = n.min(m).min(TRANSFER_WINDOW as u64) as usize;
+        let mut data = vec![0; size];
+        if self.write {
+            let read = local_bytes(local, &mut data, memory, false);
+            if read == 0 {
+                return Err(Errno(14));
+            }
+            data.truncate(read);
+        }
+        let request = self
+            .target
+            .submit(remote, self.write, data, signal.clone())
+            .map_err(errno)?;
+        self.inflight = Some((request, local, size));
+        Ok(None)
+    }
+}
+fn errno(error: TransferError) -> Errno {
+    Errno(match error {
+        TransferError::Retired => 3,
+        TransferError::Fault => 14,
+        TransferError::Unavailable => 38,
+    })
+}
+
+impl DirectSyscalls {
+    pub fn start_process_vm(
+        &self,
+        number: u32,
+        args: [u64; 6],
+        memory: &mut impl CpuMemory,
+        tid: u32,
+        wake: &Weak<dyn IoWake>,
+        admit: impl FnOnce() -> Result<Option<TransferTarget>, Errno>,
+    ) -> IoAttempt {
+        let (local, remote) = match import(args, memory) {
+            Ok(Some(vectors)) => vectors,
+            Ok(None) => return IoAttempt::Complete(Ok(0)),
+            Err(error) => return IoAttempt::Complete(Err(error)),
+        };
+        let target = match admit() {
+            Ok(Some(target)) => target,
+            Ok(None) => return IoAttempt::Complete(copy_local(number, local, remote, memory)),
+            Err(error) => return IoAttempt::Complete(Err(error)),
+        };
+        let copy = Copy {
+            target,
+            local: Cursor::new(local),
+            remote: Cursor::new(remote),
+            write: number == 271,
+            done: 0,
+            inflight: None,
+        };
+        self.resume_process_vm(
+            PendingIo {
+                process_vm: Some(Box::new(copy)),
+                number,
+                args,
+                signal: IoSignal::new(tid, wake.clone()),
+                target: wake.clone(),
+                binder: None,
+                aio: None,
+                message: None,
+                deadline: None,
+                flock: None,
+                record: None,
+                retained_byte: None,
+                retained_socket: None,
+                native_tcp: None,
+                resource_deadline: None,
+                retained_poll: None,
+                epoll_revision: None,
+                terminal_job: false,
+                _subscriptions: Vec::new(),
+                host_subscription: None,
+                socket_subscriptions: Vec::new(),
+                uring: None,
+                poll_uring: None,
+                file: None,
+                fifo_open: None,
+            },
+            memory,
+        )
+    }
+    pub(super) fn resume_process_vm(
+        &self,
+        mut pending: PendingIo,
+        memory: &mut impl CpuMemory,
+    ) -> IoAttempt {
+        pending.signal.reset();
+        let copy = pending.process_vm.as_mut().unwrap();
+        let result = match copy.step(memory, &pending.signal) {
+            Ok(None) => return IoAttempt::Blocked(pending),
+            Ok(Some(n)) => Ok(n),
+            Err(_) if copy.done != 0 => Ok(copy.done),
+            Err(error) => Err(error),
+        };
+        IoAttempt::Complete(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use trames_memory::{Memory, Permissions};
+
+    struct Wake;
+    impl IoWake for Wake {
+        fn wake_io(&self, _: &Arc<IoSignal>) {}
+    }
+
+    #[test]
+    fn inaccessible_second_page_preserves_exact_progress_at_either_end() {
+        for write in [false, true] {
+            for fault_at_target in [false, true] {
+                let mut local = Memory::default();
+                let mut remote = Memory::default();
+                for mm in [&mut local, &mut remote] {
+                    mm.map(0x1000, 3 * PAGE_SIZE, Permissions::RW).unwrap();
+                }
+                let data = if write { &mut local } else { &mut remote };
+                data.write(0x2ffc, b"abcdefgh").unwrap();
+                let fault = if fault_at_target {
+                    &mut remote
+                } else {
+                    &mut local
+                };
+                fault.protect(0x3000, PAGE_SIZE, Permissions::NONE).unwrap();
+                local.write_array(0x1000, 0x2ffcu64.to_le_bytes()).unwrap();
+                local.write_array(0x1008, 8u64.to_le_bytes()).unwrap();
+                remote.memory_report().bind_read_waker(Arc::new(|_| {}));
+                let vfs = trames_vfs::Vfs::default();
+                let direct = DirectSyscalls::new(vfs.direct_descriptors());
+                let wake: Arc<dyn IoWake> = Arc::new(Wake);
+                let IoAttempt::Blocked(wait) = direct.start_process_vm(
+                    if write { 271 } else { 270 },
+                    [2, 0x1000, 1, 0x1000, 1, 0],
+                    &mut local,
+                    1,
+                    &Arc::downgrade(&wake),
+                    || Ok(Some(remote.transfer_target())),
+                ) else {
+                    panic!("expected target work")
+                };
+                assert!(remote.activate_proc_reads());
+                let result = direct.resume(wait, &mut local);
+                assert!(matches!(result, IoAttempt::Complete(Ok(4))));
+                let output = if write { &mut remote } else { &mut local };
+                output.protect(0x3000, PAGE_SIZE, Permissions::RW).unwrap();
+                assert_eq!(output.read_array::<8>(0x2ffc).unwrap(), *b"abcd\0\0\0\0");
+            }
+        }
+    }
+}

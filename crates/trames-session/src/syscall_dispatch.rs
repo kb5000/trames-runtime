@@ -1185,13 +1185,19 @@ pub(crate) fn execute<C: Cpu>(
                         trames_linux::IoAttempt::Checkpoint => break 'entry Some(result),
                     }
                 }
-                if let Some(attempt) = snapshot.direct.start_file_call(
-                    number,
-                    args,
-                    &mut *memory,
-                    work.pid,
-                    &epoch.io_target,
-                ) {
+                if let Some(attempt) = snapshot
+                    .direct
+                    .start_file_call(number, args, &mut *memory, work.pid, &epoch.io_target)
+                    .or_else(|| {
+                        snapshot.start_process_vm(
+                            number,
+                            args,
+                            &mut *memory,
+                            work.pid,
+                            &epoch.io_target,
+                        )
+                    })
+                {
                     if let Some(began) = began {
                         syscall_time += began.elapsed();
                     }

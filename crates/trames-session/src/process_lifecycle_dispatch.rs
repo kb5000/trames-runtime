@@ -267,6 +267,15 @@ impl<C: Cpu> Lifecycle<C> {
                         None,
                     )
                 })
+                .or_else(|| {
+                    snapshot.start_process_vm(
+                        number,
+                        args,
+                        &mut p.memory,
+                        job.work.pid,
+                        &epoch.io_target,
+                    )
+                })
         };
         let mut attempt = attempt;
         // A prepared body owns its exact original storage even at this cold

@@ -40,6 +40,7 @@ impl DirectSyscalls {
             PendingIo {
                 aio: None,
                 message: None,
+                process_vm: None,
                 binder: Some(Box::new(request)),
                 number: 29,
                 args,

@@ -2154,11 +2154,19 @@ impl<C: Cpu> Kernel<C> {
                 Ok(Some(0))
             },
             number @ (270 | 271) => {
-                trames_linux::process_vm_transfer(number, a, &mut p.memory, || {
-                    p.signals.io_directory.admit_local_mm(
-                        p.linux.vfs.pid_namespace(), &p.signals.io, a[0] as u32,
-                    )
-                }).map(Some)
+                let direct = trames_linux::DirectSyscalls::new(p.linux.vfs.direct_descriptors());
+                let attempt = if let Some(wait) = p.byte_wait.take() {
+                    direct.resume(wait, &mut p.memory)
+                } else {
+                    direct.start_process_vm(number, a, &mut p.memory, pid, &Arc::downgrade(&self.byte_target), || {
+                        p.signals.io_directory.process_memory_target(p.linux.vfs.pid_namespace(), &p.signals.io, a[0] as u32)
+                    })
+                };
+                match attempt {
+                    trames_linux::IoAttempt::Complete(result) => result.map(Some),
+                    trames_linux::IoAttempt::Blocked(wait) => { p.byte_wait = Some(wait); Ok(None) }
+                    _ => unreachable!("process memory transfer"),
+                }
             },
             172 => Ok(Some(p.linux.vfs.visible_pid(p.tgid) as u64)),
             178 => Ok(Some(p.linux.vfs.visible_pid(pid) as u64)),

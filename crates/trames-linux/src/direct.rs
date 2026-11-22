@@ -24,6 +24,7 @@ mod locks;
 mod memory_sync;
 pub(crate) mod message;
 mod posix_queue;
+mod process_vm;
 mod semaphore;
 pub use message::RetainedMessage;
 pub(crate) mod namespace;
@@ -46,6 +47,7 @@ fn tcp_wait_fd(tcp: &trames_net::DirectTcp) -> std::io::Result<trames_vfs::HostF
 /// A stopped syscall, not a re-executed SVC. Subscriptions do not retain guest
 /// FD table entries or count as additional pipe endpoints.
 pub struct PendingIo {
+    process_vm: Option<Box<process_vm::Copy>>,
     binder: Option<Box<trames_vfs::binder::Ioctl>>,
     pub aio: Option<RetainedAio>,
     pub message: Option<RetainedMessage>,
@@ -1227,6 +1229,7 @@ impl DirectSyscalls {
             };
         self.resume(
             PendingIo {
+                process_vm: None,
                 binder: None,
                 aio: None,
                 message: None,
@@ -1759,6 +1762,7 @@ impl DirectSyscalls {
         };
         Some(self.resume(
             PendingIo {
+                process_vm: None,
                 binder: None,
                 aio: None,
                 message: None,
@@ -1890,6 +1894,7 @@ impl DirectSyscalls {
         let signal = IoSignal::new(pid, target.clone());
         let subscriptions = wait.subscribe(&signal);
         PendingIo {
+            process_vm: None,
             binder: None,
             aio: None,
             message: None,
@@ -2181,6 +2186,7 @@ impl DirectSyscalls {
         };
         self.resume_inner_in(
             PendingIo {
+                process_vm: None,
                 binder: None,
                 aio: None,
                 message: None,
@@ -2229,6 +2235,7 @@ impl DirectSyscalls {
         let subscriptions = vec![request.subscribe(&signal)];
         self.resume(
             PendingIo {
+                process_vm: None,
                 binder: None,
                 aio: None,
                 message: None,
@@ -2303,6 +2310,9 @@ impl DirectSyscalls {
                 pending.signal.pid,
                 &pending.target,
             );
+        }
+        if pending.process_vm.is_some() {
+            return self.resume_process_vm(pending, memory);
         }
         if pending.binder.is_some() {
             return self.resume_binder(pending, memory);

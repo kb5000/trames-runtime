@@ -94,6 +94,7 @@ impl DirectSyscalls {
         let subscriptions = vec![request.subscribe(&signal)];
         self.resume(
             PendingIo {
+                process_vm: None,
                 binder: None,
                 aio: None,
                 message: None,

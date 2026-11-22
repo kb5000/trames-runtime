@@ -652,7 +652,7 @@ impl<C: Cpu> Starter<C> {
                                     }
                                     let stop_held=matches!(&job.waiting,Some(crate::run_queue::WaitState::Namespace(_) | crate::run_queue::WaitState::Policy(_) | crate::run_queue::WaitState::Barrier(_))) || matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.hardware_wait.as_ref().is_some_and(|w|!w.ready())
                                         || job.gpu_pending.as_ref().is_some_and(|g|g.compile.is_some())
-                                        || job.io.as_ref().is_some_and(|io|io.number==2 || io.file_pending().is_some_and(|f|!f.interruptible()))
+                                        || job.io.as_ref().is_some_and(|io|matches!(io.number,2|270|271) || io.file_pending().is_some_and(|f|!f.interruptible()))
                                         || job.retry.as_ref().is_some_and(|io|io.number==2 || io.file_checkpoint.is_some() || io.file.as_ref().is_some_and(|f|!f.interruptible()));
                                     if disposition == trames_kernel::signal::Disposition::Stop && !stop_held {
                                         if sig!=19 && snapshot.io_routes.directory.orphaned(&snapshot.io_signals) {
@@ -666,7 +666,7 @@ impl<C: Cpu> Starter<C> {
                                     if disposition == trames_kernel::signal::Disposition::Handler {
                                         if let Some(p)=job.io.as_ref().and_then(|io|io.file_pending()).or_else(||job.retry.as_ref()?.file.clone()) {p.fuse_interrupt();}
                                     }
-                                    let uninterruptible = matches!(&job.waiting,Some(crate::run_queue::WaitState::Namespace(_) | crate::run_queue::WaitState::Policy(_) | crate::run_queue::WaitState::Barrier(_))) || matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.gpu_pending.is_some() || job.io.as_ref().is_some_and(|io| io.file_pending().is_some_and(|f|!f.interruptible()) || io.number == 2)
+                                    let uninterruptible = matches!(&job.waiting,Some(crate::run_queue::WaitState::Namespace(_) | crate::run_queue::WaitState::Policy(_) | crate::run_queue::WaitState::Barrier(_))) || matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.gpu_pending.is_some() || job.io.as_ref().is_some_and(|io| io.file_pending().is_some_and(|f|!f.interruptible()) || matches!(io.number, 2 | 270 | 271))
                                         || job.retry.as_ref().is_some_and(|call| call.file.as_ref().is_some_and(|f|!f.interruptible()) || call.number == 2);
                                     if disposition == trames_kernel::signal::Disposition::Handler && !uninterruptible {
                                         if let Some(info) = snapshot.io_signals.take(sig, shared) {
@@ -737,7 +737,7 @@ impl<C: Cpu> Starter<C> {
                                 if job.hardware_wait.as_ref().is_some_and(|w|w.ready()) {job.hardware_wait=None;}
                                 let kernel_pending=job.pending_cpu.is_some()
                                     || job.gpu_pending.as_ref().is_some_and(|g|g.compile.is_some())
-                                    || job.io.as_ref().is_some_and(|io|io.number==2 || io.file_pending().is_some_and(|f|!f.interruptible()))
+                                    || job.io.as_ref().is_some_and(|io|matches!(io.number,2|270|271) || io.file_pending().is_some_and(|f|!f.interruptible()))
                                     || job.retry.as_ref().is_some_and(|io|io.number==2 || io.file_checkpoint.is_some() || io.file.as_ref().is_some_and(|f|!f.interruptible()));
                                 if !kernel_pending {maintenance=true;break SliceOutcome::Yield {instructions:0};}
                             }

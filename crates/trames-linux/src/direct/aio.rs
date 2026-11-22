@@ -638,6 +638,7 @@ impl DirectSyscalls {
             }
             Ok(IoAttempt::Blocked(PendingIo {
                 message: None,
+                process_vm: None,
                 binder: None,
                 aio: Some(RetainedAio {
                     context,

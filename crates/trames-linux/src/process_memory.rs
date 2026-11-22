@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Same-mm process_vm transfers use the executing task's original memory.
-//! Cross-mm transfers need a retained target-mm admission and remain unsupported.
+//! Linux process_vm vector import and page-bounded copies.
 use trames_memory::{CpuMemory, PAGE_SIZE};
 use trames_vfs::Errno;
 
@@ -20,6 +19,18 @@ pub fn process_vm_transfer(
     memory: &mut impl CpuMemory,
     admit_local_mm: impl FnOnce() -> Result<(), Errno>,
 ) -> Result<u64, Errno> {
+    let Some((local, remote)) = import(a, memory)? else {
+        return Ok(0);
+    };
+    admit_local_mm()?;
+    copy_local(number, local, remote, memory)
+}
+
+pub(crate) type Vectors = Vec<(u64, u64)>;
+pub(crate) fn import(
+    a: [u64; 6],
+    memory: &impl CpuMemory,
+) -> Result<Option<(Vectors, Vectors)>, Errno> {
     if a[5] != 0 {
         return Err(Errno(22));
     }
@@ -63,51 +74,56 @@ pub fn process_vm_transfer(
         remaining -= *length;
     }
     if remaining == max_rw_count {
-        return Ok(0);
+        return Ok(None);
     }
     let remote = vectors(memory, a[3], a[4])?;
     if remote.iter().all(|v| v.1 == 0) {
-        return Ok(0);
+        return Ok(None);
     }
-    admit_local_mm()?;
+    Ok(Some((local, remote)))
+}
+pub(crate) fn copy_local(
+    number: u32,
+    local: Vectors,
+    remote: Vectors,
+    memory: &mut impl CpuMemory,
+) -> Result<u64, Errno> {
     let (source, dest) = if number == 270 {
         (remote, local)
     } else {
         (local, remote)
     };
-    let (mut si, mut di, mut so, mut offset) = (0, 0, 0, 0);
+    let mut source = source.into_iter().filter(|v| v.1 != 0);
+    let mut dest = dest.into_iter().filter(|v| v.1 != 0);
+    let (mut from, mut to) = (source.next(), dest.next());
     let mut copied = 0;
     let mut buffer = [0; PAGE_SIZE as usize];
-    while si < source.len() && di < dest.len() {
-        if so == source[si].1 {
-            si += 1;
-            so = 0;
-            continue;
+    // Keep the current address and remaining length in each cursor. Long
+    // vectors advance by page without looking the vector up again.
+    while let (Some((src, src_len)), Some((dst, dst_len))) = (from, to) {
+        let n = src_len
+            .min(dst_len)
+            .min(PAGE_SIZE - src % PAGE_SIZE)
+            .min(PAGE_SIZE - dst % PAGE_SIZE) as usize;
+        if memory.read(src, &mut buffer[..n]).is_err() || memory.write(dst, &buffer[..n]).is_err() {
+            return if copied == 0 {
+                Err(Errno(14))
+            } else {
+                Ok(copied)
+            };
         }
-        if offset == dest[di].1 {
-            di += 1;
-            offset = 0;
-            continue;
-        }
-        let result = (|| {
-            let src = source[si].0.checked_add(so).ok_or(Errno(14))?;
-            let dst = dest[di].0.checked_add(offset).ok_or(Errno(14))?;
-            let n = (source[si].1 - so)
-                .min(dest[di].1 - offset)
-                .min(PAGE_SIZE - src % PAGE_SIZE)
-                .min(PAGE_SIZE - dst % PAGE_SIZE) as usize;
-            memory.read(src, &mut buffer[..n]).map_err(|_| Errno(14))?;
-            memory.write(dst, &buffer[..n]).map_err(|_| Errno(14))?;
-            Ok::<_, Errno>(n as u64)
-        })();
-        match result {
-            Ok(n) => {
-                copied += n;
-                so += n;
-                offset += n;
-            }
-            Err(error) => return if copied == 0 { Err(error) } else { Ok(copied) },
-        }
+        let n = n as u64;
+        copied += n;
+        from = if n == src_len {
+            source.next()
+        } else {
+            src.checked_add(n).map(|next| (next, src_len - n))
+        };
+        to = if n == dst_len {
+            dest.next()
+        } else {
+            dst.checked_add(n).map(|next| (next, dst_len - n))
+        };
     }
     Ok(copied)
 }

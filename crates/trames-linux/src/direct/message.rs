@@ -201,6 +201,7 @@ impl DirectSyscalls {
             signal,
             _subscriptions: subscriptions,
             target: target.clone(),
+            process_vm: None,
             binder: None,
             aio: None,
             deadline,
