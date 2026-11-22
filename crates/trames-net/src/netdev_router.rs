@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Per-namespace packet routing: raw -> tracking -> NAT/filter -> actual next hop.
 use super::*;
+use crate::ethernet::PacketType;
 use crate::{
     conntrack::{self, Track},
     nftables::Hook,
@@ -25,13 +26,13 @@ impl Topology {
         &self,
         namespace: u64,
         stage: (u32, bool),
-        devices: (u32, u32),
+        devices: (u32, u32, PacketType),
         packet: &mut [u8],
         track: &mut Track,
         state: &mut conntrack::State,
     ) -> bool {
         let (hook, raw) = stage;
-        let (input, output) = devices;
+        let (input, output, packet_type) = devices;
         let firewall = &self.spaces[&namespace].firewall;
         if !firewall.has_rules() {
             // Existing NAT attachments survive rule removal; empty policy
@@ -49,20 +50,27 @@ impl Topology {
                 input,
                 output,
                 raw,
+                packet_type,
             },
             track,
             state,
         )
     }
-    pub fn udp_group_hooks(&self, ns: u64, index: u32, incoming: bool, packet: &mut [u8]) -> bool {
+    pub fn udp_group_hooks(
+        &self,
+        ns: u64,
+        index: u32,
+        incoming: Option<PacketType>,
+        packet: &mut [u8],
+    ) -> bool {
         let Some(key) = conntrack::key(packet) else {
             return false;
         };
         let mut state = self.spaces[&ns].connections.lock().unwrap();
-        let (first, last, links) = if incoming {
-            (0, 1, (index, 0))
+        let (first, last, links) = if let Some(kind) = incoming {
+            (0, 1, (index, 0, kind))
         } else {
-            (3, 4, (0, index))
+            (3, 4, (0, index, PacketType::Host))
         };
         let mut raw = Track::untracked(key, 0);
         if !self.hook(ns, (first, true), links, packet, &mut raw, &mut state) {
@@ -81,10 +89,12 @@ impl Topology {
     fn route_namespace(
         &self,
         namespace: u64,
-        input: Option<u32>,
+        input: Option<(u32, PacketType)>,
         packet: &mut [u8],
         external_reply: bool,
     ) -> Option<(u32, Option<IpAddr>, Track)> {
+        let packet_type = input.map_or(PacketType::Host, |(_, kind)| kind);
+        let input = input.map(|(index, _)| index);
         let k = conntrack::key(packet)?;
         let connection = self.spaces[&namespace].connections.clone();
         let mut state = connection.lock().unwrap();
@@ -95,7 +105,7 @@ impl Topology {
         if !self.hook(
             namespace,
             (first, true),
-            (input.unwrap_or(0), initial_out),
+            (input.unwrap_or(0), initial_out, packet_type),
             packet,
             &mut raw,
             &mut state,
@@ -107,7 +117,7 @@ impl Topology {
             if !self.hook(
                 namespace,
                 (first, false),
-                (input.unwrap_or(0), initial_out),
+                (input.unwrap_or(0), initial_out, packet_type),
                 packet,
                 &mut track,
                 &mut state,
@@ -120,7 +130,7 @@ impl Topology {
                 if !self.hook(
                     namespace,
                     (1, false),
-                    (input, 0),
+                    (input, 0, packet_type),
                     packet,
                     &mut track,
                     &mut state,
@@ -154,7 +164,7 @@ impl Topology {
                 if !self.hook(
                     namespace,
                     (2, false),
-                    (input, out),
+                    (input, out, packet_type),
                     packet,
                     &mut track,
                     &mut state,
@@ -165,7 +175,7 @@ impl Topology {
             if !self.hook(
                 namespace,
                 (4, false),
-                (0, out),
+                (0, out, packet_type),
                 packet,
                 &mut track,
                 &mut state,
@@ -180,7 +190,7 @@ impl Topology {
     pub fn route_one(
         &self,
         ns: u64,
-        input: Option<u32>,
+        input: Option<(u32, PacketType)>,
         packet: &mut [u8],
     ) -> Option<(Delivery, Option<IpAddr>)> {
         let (out, gateway, mut track) = self.route_namespace(ns, input, packet, false)?;
@@ -188,7 +198,7 @@ impl Topology {
             return Some((
                 Delivery {
                     namespace: ns,
-                    input: input.unwrap_or(1),
+                    input: input.map_or(1, |(index, _)| index),
                     output: 0,
                     external: false,
                     tunnel: false,
@@ -200,9 +210,28 @@ impl Topology {
         if self.own(ns, destination) {
             let connections = self.spaces[&ns].connections.clone();
             let mut state = connections.lock().unwrap();
-            let accepted = self.hook(ns, (0, true), (1, 0), packet, &mut track, &mut state)
-                && self.hook(ns, (0, false), (1, 0), packet, &mut track, &mut state)
-                && self.hook(ns, (1, false), (1, 0), packet, &mut track, &mut state);
+            let accepted = self.hook(
+                ns,
+                (0, true),
+                (1, 0, PacketType::Host),
+                packet,
+                &mut track,
+                &mut state,
+            ) && self.hook(
+                ns,
+                (0, false),
+                (1, 0, PacketType::Host),
+                packet,
+                &mut track,
+                &mut state,
+            ) && self.hook(
+                ns,
+                (1, false),
+                (1, 0, PacketType::Host),
+                packet,
+                &mut track,
+                &mut state,
+            );
             state.finish(track, accepted);
             if !accepted {
                 return None;
@@ -249,7 +278,8 @@ impl Topology {
             if !visited.insert(ns) {
                 return None;
             }
-            let (out, gateway, mut track) = self.route_namespace(ns, input, packet, false)?;
+            let (out, gateway, mut track) =
+                self.route_namespace(ns, input.map(|i| (i, PacketType::Host)), packet, false)?;
             if first == 0 {
                 first = out;
             }
@@ -269,9 +299,28 @@ impl Topology {
                 // would steal the reply index and break Docker's DNS redirect.
                 let connections = self.spaces[&ns].connections.clone();
                 let mut state = connections.lock().unwrap();
-                let accepted = self.hook(ns, (0, true), (1, 0), packet, &mut track, &mut state)
-                    && self.hook(ns, (0, false), (1, 0), packet, &mut track, &mut state)
-                    && self.hook(ns, (1, false), (1, 0), packet, &mut track, &mut state);
+                let accepted = self.hook(
+                    ns,
+                    (0, true),
+                    (1, 0, PacketType::Host),
+                    packet,
+                    &mut track,
+                    &mut state,
+                ) && self.hook(
+                    ns,
+                    (0, false),
+                    (1, 0, PacketType::Host),
+                    packet,
+                    &mut track,
+                    &mut state,
+                ) && self.hook(
+                    ns,
+                    (1, false),
+                    (1, 0, PacketType::Host),
+                    packet,
+                    &mut track,
+                    &mut state,
+                );
                 state.finish(track, accepted);
                 if !accepted {
                     return None;
@@ -314,7 +363,7 @@ impl Topology {
                 bridge.filter(|(b, _)| *b != ns && *b != target)
             {
                 if self.spaces[&bridge_ns].bridge_filter[usize::from(destination.is_ipv6())] {
-                    self.bridge_packet(bridge_ns, bridge_index, packet)?;
+                    self.bridge_packet(bridge_ns, bridge_index, PacketType::Host, packet)?;
                 }
             }
             ns = target;
@@ -322,18 +371,50 @@ impl Topology {
         }
         None
     }
-    pub(super) fn bridge_packet(&self, ns: u64, bridge: u32, packet: &mut [u8]) -> Option<()> {
+    pub(super) fn bridge_packet(
+        &self,
+        ns: u64,
+        bridge: u32,
+        packet_type: PacketType,
+        packet: &mut [u8],
+    ) -> Option<()> {
         let connection = self.spaces[&ns].connections.clone();
         let mut state = connection.lock().unwrap();
         let key = conntrack::key(packet)?;
         let mut raw = Track::untracked(key, 0);
-        if !self.hook(ns, (0, true), (bridge, 0), packet, &mut raw, &mut state) {
+        if !self.hook(
+            ns,
+            (0, true),
+            (bridge, 0, packet_type),
+            packet,
+            &mut raw,
+            &mut state,
+        ) {
             return None;
         }
         let mut t = state.begin(packet, raw.zone)?;
-        let ok = self.hook(ns, (0, false), (bridge, 0), packet, &mut t, &mut state)
-            && self.hook(ns, (2, false), (bridge, bridge), packet, &mut t, &mut state)
-            && self.hook(ns, (4, false), (0, bridge), packet, &mut t, &mut state);
+        let ok = self.hook(
+            ns,
+            (0, false),
+            (bridge, 0, packet_type),
+            packet,
+            &mut t,
+            &mut state,
+        ) && self.hook(
+            ns,
+            (2, false),
+            (bridge, bridge, packet_type),
+            packet,
+            &mut t,
+            &mut state,
+        ) && self.hook(
+            ns,
+            (4, false),
+            (0, bridge, packet_type),
+            packet,
+            &mut t,
+            &mut state,
+        );
         state.finish(t, ok);
         ok.then_some(())
     }
@@ -404,7 +485,12 @@ impl Topology {
                 if !conntrack::rewrite(packet, forward.reply) {
                     return None;
                 }
-                let (out, _, _) = self.route_namespace(ns, Some(forward.input), packet, true)?;
+                let (out, _, _) = self.route_namespace(
+                    ns,
+                    Some((forward.input, PacketType::Host)),
+                    packet,
+                    true,
+                )?;
                 return (out == 2).then_some(Some(forward));
             }
             self.route_namespace(ns, None, packet, false)?;

@@ -10,6 +10,17 @@ use std::{
     },
     time::{Duration, Instant},
 };
+/// Linux ingress packet classes used by both AF_PACKET and Netfilter.
+#[derive(Clone, Copy, Default)]
+#[repr(u8)]
+pub(crate) enum PacketType {
+    #[default]
+    Host = 0,
+    Broadcast = 1,
+    Multicast = 2,
+    OtherHost = 3,
+}
+
 pub(crate) type Mac = [u8; 6];
 #[derive(Clone, Debug)]
 pub(crate) struct Frame(pub Arc<[u8]>);
@@ -64,6 +75,17 @@ impl Frame {
     }
     pub fn payload(&self) -> &[u8] {
         &self.0[if self.vlan().is_some() { 18 } else { 14 }..]
+    }
+    pub fn ingress_type(&self, local: bool) -> PacketType {
+        if self.destination() == [255; 6] {
+            PacketType::Broadcast
+        } else if self.multicast() {
+            PacketType::Multicast
+        } else if local {
+            PacketType::Host
+        } else {
+            PacketType::OtherHost
+        }
     }
     pub fn multicast(&self) -> bool {
         self.0[0] & 1 != 0

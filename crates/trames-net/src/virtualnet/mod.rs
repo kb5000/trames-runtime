@@ -17,6 +17,7 @@ use super::native::{
     self, NetError, NetworkMode, Received, MAX_BUFFER, MAX_TRANSFER, MSG_DONTWAIT, MSG_NOSIGNAL,
     MSG_PEEK, MSG_TRUNC,
 };
+use crate::ethernet::PacketType;
 use packet::{Port, Tuple};
 use smoltcp::{
     iface::{Config, Interface, SocketHandle, SocketSet},
@@ -71,13 +72,20 @@ pub struct LinkStats {
 }
 #[derive(Clone)]
 pub struct Fabric(Arc<FabricState<Inner>>);
+struct InjectedPacket {
+    node: u64,
+    interface: u32,
+    kind: PacketType,
+    source: [u8; 6],
+    bytes: Vec<u8>,
+}
 struct Inner {
     drivers: Vec<Weak<trames_shared::Readiness>>,
     driver_dirty: bool,
     driver_maintenance: bool,
     close_batch_until: Option<Instant>,
     notifications: Vec<Arc<trames_shared::Readiness>>,
-    injected: VecDeque<(u64, u32, [u8; 6], Vec<u8>)>,
+    injected: VecDeque<InjectedPacket>,
     ethernet: VecDeque<(crate::netdev::View, crate::ethernet::Action)>,
     ethernet_switch: crate::ethernet::Switch,
     started: Instant,
@@ -933,7 +941,7 @@ impl Inner {
             let mut packets: Vec<_> = self
                 .injected
                 .drain(..)
-                .map(|(key, index, peer, p)| (key, Some(index), peer, p))
+                .map(|p| (p.node, Some((p.interface, p.kind)), p.source, p.bytes))
                 .collect();
             for (&key, node) in &mut self.nodes {
                 let poll = node.dirty
@@ -994,7 +1002,9 @@ impl Inner {
             if packets.is_empty() {
                 break;
             }
-            for (source, injected, peer, mut p) in packets {
+            for (source, ingress, peer, mut p) in packets {
+                let injected = ingress.map(|(index, _)| index);
+                let packet_type = ingress.map_or(PacketType::Host, |(_, kind)| kind);
                 let lo = packet::header(&p).is_some_and(|h| h.tuple.destination.ip().is_loopback());
                 if let Some(n) = self.nodes.get_mut(&source) {
                     let s = &mut n.links[usize::from(!lo)];
@@ -1115,7 +1125,7 @@ impl Inner {
                                 h.tuple.destination.ip(),
                             )
                         {
-                            self.group_input(source, view, index, &mut p);
+                            self.group_input(source, view, index, packet_type, &mut p);
                             continue;
                         }
                     }
@@ -1144,11 +1154,11 @@ impl Inner {
                         }
                     }
 
-                    let step =
-                        view.graph
-                            .read()
-                            .unwrap()
-                            .route_one(view.namespace, incoming, &mut p);
+                    let step = view.graph.read().unwrap().route_one(
+                        view.namespace,
+                        incoming.map(|index| (index, packet_type)),
+                        &mut p,
+                    );
                     let Some((route, next_hop)) = step else {
                         self.stats.dropped += 1;
                         continue;
@@ -1674,9 +1684,13 @@ impl Network {
         ) {
             return Ok(());
         }
-        inner
-            .injected
-            .push_back((self.0.key, interface, [0; 6], packet.to_vec()));
+        inner.injected.push_back(InjectedPacket {
+            node: self.0.key,
+            interface,
+            kind: PacketType::Host,
+            source: [0; 6],
+            bytes: packet.to_vec(),
+        });
         inner.tick();
         Ok(())
     }

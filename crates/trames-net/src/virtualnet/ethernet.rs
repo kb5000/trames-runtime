@@ -62,12 +62,13 @@ impl Inner {
                     self.queue_frames(&view, actions);
                     if !consumed && self.injected.len() < 96 {
                         if let Some(key) = self.node_key(&view, ns) {
-                            self.injected.push_back((
-                                key,
-                                index,
-                                frame.source(),
-                                frame.payload().to_vec(),
-                            ));
+                            self.injected.push_back(InjectedPacket {
+                                node: key,
+                                interface: index,
+                                kind: frame.ingress_type(true),
+                                source: frame.source(),
+                                bytes: frame.payload().to_vec(),
+                            });
                         }
                     }
                 }

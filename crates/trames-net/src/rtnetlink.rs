@@ -91,14 +91,7 @@ fn requested_up(d: &Device, state: u32, change: u32) -> Result<Option<bool>> {
 
 pub(crate) fn link_data(g: &Topology, d: &Device) -> Vec<u8> {
     let mut data = vec![0; 16];
-    data[2..4].copy_from_slice(
-        &(match d.kind {
-            DeviceKind::Loopback => 772u16,
-            DeviceKind::Direct | DeviceKind::Tun => 65534,
-            _ => 1,
-        })
-        .to_le_bytes(),
-    );
+    data[2..4].copy_from_slice(&d.kind.hardware_type().to_le_bytes());
     data[4..8].copy_from_slice(&d.index.to_le_bytes());
     let carrier = g.carrier(d);
     let flags = link_flags(d, carrier);
@@ -137,22 +130,9 @@ pub(crate) fn link_data(g: &Topology, d: &Device) -> Vec<u8> {
     if let DeviceKind::Veth { peer } = d.kind {
         attr(&mut data, 5, &peer.to_le_bytes());
     }
-    if matches!(
-        d.kind,
-        DeviceKind::Bridge | DeviceKind::Veth { .. } | DeviceKind::Tun | DeviceKind::Tap
-    ) {
+    if let Some(kind) = d.kind.link_kind() {
         let mut info = vec![];
-        attr(
-            &mut info,
-            1,
-            if d.kind == DeviceKind::Bridge {
-                b"bridge\0"
-            } else if matches!(d.kind, DeviceKind::Tun | DeviceKind::Tap) {
-                b"tun\0"
-            } else {
-                b"veth\0"
-            },
-        );
+        attr(&mut info, 1, kind.to_bytes_with_nul());
         if let Ok(config) = g.bridge_config(d.namespace, d.index) {
             let mut options = vec![];
             attr(&mut options, 4, &config.ageing.to_le_bytes());

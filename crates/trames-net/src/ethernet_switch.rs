@@ -159,8 +159,11 @@ impl Topology {
             frame = whole;
             reassembled = was_fragmented;
             let mut packet = frame.payload().to_vec();
+            // Linux presents forwarded unicast as PACKET_HOST at the bridge IP hooks.
             if !crate::virtualnet::packet::valid_transport(&packet)
-                || self.bridge_packet(ns, bridge, &mut packet).is_none()
+                || self
+                    .bridge_packet(ns, bridge, frame.ingress_type(true), &mut packet)
+                    .is_none()
             {
                 return actions;
             }

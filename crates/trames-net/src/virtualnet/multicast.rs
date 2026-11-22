@@ -394,17 +394,22 @@ impl Socket {
             header.fill_checksum();
         }
         let mut fabric = self.network.0.fabric.0.borrow_mut();
-        if !view.graph.read().unwrap().udp_group_hooks(
-            view.namespace,
-            dev.index,
-            false,
-            &mut packet,
-        ) {
+        if !view
+            .graph
+            .read()
+            .unwrap()
+            .udp_group_hooks(view.namespace, dev.index, None, &mut packet)
+        {
             return Ok(bytes.len());
         }
         if loopback {
             let mut local = packet.clone();
-            fabric.group_input(self.network.0.key, view, dev.index, &mut local);
+            let packet_type = if multicast {
+                PacketType::Multicast
+            } else {
+                PacketType::Broadcast
+            };
+            fabric.group_input(self.network.0.key, view, dev.index, packet_type, &mut local);
         }
         let interface_local = matches!(dest.ip(), IpAddr::V6(a) if a.octets()[1] & 0x0f == 1);
         if dev.index != 1 && ttl != 0 && !interface_local {
@@ -438,6 +443,7 @@ impl Inner {
         key: u64,
         view: &crate::netdev::View,
         index: u32,
+        packet_type: PacketType,
         packet: &mut [u8],
     ) {
         let Some(node) = self.nodes.get_mut(&key) else {
@@ -448,12 +454,12 @@ impl Inner {
         }) {
             return;
         }
-        if !view
-            .graph
-            .read()
-            .unwrap()
-            .udp_group_hooks(view.namespace, index, true, packet)
-        {
+        if !view.graph.read().unwrap().udp_group_hooks(
+            view.namespace,
+            index,
+            Some(packet_type),
+            packet,
+        ) {
             return;
         }
         let Some(header) = packet::header(packet) else {

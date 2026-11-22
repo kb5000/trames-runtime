@@ -73,14 +73,8 @@ impl Hub {
         let protocol = frame.outer_protocol();
         let kind = if outgoing {
             4
-        } else if frame.destination() == [255; 6] {
-            1
-        } else if frame.multicast() {
-            2
-        } else if frame.destination() != device.mac {
-            3
         } else {
-            0
+            frame.ingress_type(frame.destination() == device.mac) as u8
         };
         let sockets: Vec<_> = self
             .sockets

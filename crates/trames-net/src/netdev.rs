@@ -72,6 +72,23 @@ pub enum DeviceKind {
     Tap,
     Ethernet,
 }
+impl DeviceKind {
+    pub(crate) fn hardware_type(self) -> u16 {
+        match self {
+            Self::Loopback => 772,
+            Self::Direct | Self::Tun => 65534,
+            _ => 1,
+        }
+    }
+    pub(crate) fn link_kind(self) -> Option<&'static std::ffi::CStr> {
+        match self {
+            Self::Bridge => Some(c"bridge"),
+            Self::Veth { .. } => Some(c"veth"),
+            Self::Tun | Self::Tap => Some(c"tun"),
+            _ => None,
+        }
+    }
+}
 /// Linux per-interface IPv4 ingress controls for packets arriving from a guest link.
 #[derive(Clone, Copy)]
 pub enum Ipv4Ingress {
@@ -1389,6 +1406,9 @@ impl Topology {
             .iter()
             .find(|a| a.ip.is_ipv4() == ipv4)
             .map(|a| a.ip)
+    }
+    pub(crate) fn device_kind(&self, id: u64, index: u32) -> Option<DeviceKind> {
+        self.devices.get(&(id, index)).map(|d| d.kind)
     }
     pub fn device_name(&self, id: u64, index: u32) -> Option<&[u8]> {
         self.devices.get(&(id, index)).map(|d| d.name.as_slice())

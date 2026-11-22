@@ -378,13 +378,21 @@ fn expressions_in(
                 }
             }
             "meta" => {
-                let a = fields(data, &[1, 2])?;
+                let a = fields(data, &[1, 2, 3])?;
                 let key = num(&a, 2)?;
+                if key > u8::MAX.into() {
+                    return Err(NetError(34));
+                }
+                if get(&a, 1).is_some() == get(&a, 3).is_some() {
+                    return Err(NetError(22));
+                }
+                if get(&a, 3).is_some() {
+                    return Err(NetError(95));
+                }
                 let len = match key {
-                    0 | 4 | 5 => 4,
-                    1 => 2,
-                    6 | 7 => 16,
-                    15 | 16 => 1,
+                    0 | 4 | 5 | 15 | 16 | 19 => 4,
+                    1 | 8 | 9 | 36 => 2,
+                    6 | 7 | 26 | 27 => 16,
                     _ => return Err(NetError(95)),
                 };
                 let dest = reg(num(&a, 1)?, len)?;
@@ -1830,6 +1838,7 @@ fn request_rules(
 pub(crate) struct Context<'a> {
     pub packet: &'a [u8],
     pub hook: u32,
+    pub packet_type: crate::ethernet::PacketType,
     pub input: u32,
     pub output: u32,
     pub tuple: crate::virtualnet::packet::Tuple,
@@ -1947,29 +1956,65 @@ impl Context<'_> {
         }
     }
 
-    fn meta(&self, key: u32) -> Option<Vec<u8>> {
-        Some(match key {
-            0 => (self.packet.len() as u32).to_le_bytes().to_vec(),
-            1 => (if self.family() == 2 { 0x800u16 } else { 0x86dd })
-                .to_be_bytes()
-                .to_vec(),
-            4 => self.input.to_le_bytes().to_vec(),
-            5 => self.output.to_le_bytes().to_vec(),
+    fn load_meta(&self, key: u32, register: &mut [u8]) -> Option<()> {
+        fn store_string(register: &mut [u8], bytes: &[u8]) {
+            let slot = &mut register[..16];
+            slot.fill(0);
+            let n = bytes.len().min(slot.len() - 1);
+            slot[..n].copy_from_slice(&bytes[..n]);
+        }
+        match key {
+            0 => register[..4].copy_from_slice(&(self.packet.len() as u32).to_ne_bytes()),
+            1 => {
+                let protocol = if self.family() == 2 {
+                    0x0800u16
+                } else {
+                    0x86dd
+                };
+                register[..4].fill(0);
+                register[..2].copy_from_slice(&protocol.to_be_bytes());
+            }
+            4 | 5 => {
+                let index = if key == 4 { self.input } else { self.output };
+                register[..4].copy_from_slice(&index.to_ne_bytes());
+            }
             6 | 7 => {
                 let index = if key == 6 { self.input } else { self.output };
-                let name = self
-                    .graph
-                    .device_name(self.namespace, index)
-                    .unwrap_or_default();
-                let mut b = vec![0; 16];
-                let n = name.len().min(15);
-                b[..n].copy_from_slice(&name[..n]);
-                b
+                store_string(
+                    register,
+                    self.graph
+                        .device_name(self.namespace, index)
+                        .unwrap_or_default(),
+                );
             }
-            15 => vec![self.family()],
-            16 => vec![self.transport()?.1],
+            8 | 9 | 36 => {
+                // The original IFTYPE reads the current skb device. Linux also
+                // has a distinct ingress-only key on newer UAPIs.
+                let index = match key {
+                    9 => self.output,
+                    8 if self.hook == 4 => self.output,
+                    _ => self.input,
+                };
+                let kind = self.graph.device_kind(self.namespace, index)?;
+                register[..4].fill(0);
+                register[..2].copy_from_slice(&kind.hardware_type().to_ne_bytes());
+            }
+            15 | 16 | 19 => {
+                let value = match key {
+                    15 => self.family(),
+                    16 => self.transport()?.1,
+                    _ => self.packet_type as u8,
+                };
+                register[..4].copy_from_slice(&u32::from(value).to_ne_bytes());
+            }
+            26 | 27 => {
+                let index = if key == 26 { self.input } else { self.output };
+                let kind = self.graph.device_kind(self.namespace, index)?.link_kind()?;
+                store_string(register, kind.to_bytes());
+            }
             _ => return None,
-        })
+        }
+        Some(())
     }
 }
 #[derive(Default)]
@@ -1987,6 +2032,7 @@ pub(crate) struct Hook<'a> {
     pub graph: &'a crate::netdev::Topology,
     pub namespace: u64,
     pub hook: u32,
+    pub packet_type: crate::ethernet::PacketType,
     pub input: u32,
     pub output: u32,
     pub raw: bool,
@@ -2056,6 +2102,7 @@ impl Ruleset {
             let ctx = Context {
                 packet,
                 hook: meta.hook,
+                packet_type: meta.packet_type,
                 input: meta.input,
                 output,
                 tuple: h.tuple,
@@ -2126,8 +2173,7 @@ impl Rule {
                     regs[*dest..*dest + value.len()].copy_from_slice(value)
                 }
                 Expr::Meta { dest, key } => {
-                    let b = ctx.meta(*key)?;
-                    regs[*dest..*dest + b.len()].copy_from_slice(&b);
+                    ctx.load_meta(*key, &mut regs[*dest..])?;
                 }
                 Expr::Payload {
                     dest,
