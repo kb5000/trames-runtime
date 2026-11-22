@@ -4,7 +4,14 @@ use super::*;
 use crate::ethernet::{Action, Frame, Mac, Neighbor};
 use std::time::{Duration, Instant};
 impl Topology {
-    pub fn ethernet_ip(&self, ns: u64, index: u32, target: IpAddr, packet: Vec<u8>) -> Vec<Action> {
+    pub fn ethernet_ip(
+        &self,
+        ns: u64,
+        index: u32,
+        target: IpAddr,
+        packet: Vec<u8>,
+        mark: u32,
+    ) -> Vec<Action> {
         let Ok(d) = self.device(ns, index) else {
             return vec![];
         };
@@ -17,14 +24,14 @@ impl Topology {
             IpAddr::V6(ip) if ip.is_multicast()=>{let b=ip.octets();Some([0x33,0x33,b[12],b[13],b[14],b[15]])},_=>None,
         };
         if let Some(mac) = multicast {
-            return self.ethernet_datagrams(ns, index, mac, packet);
+            return self.ethernet_datagrams(ns, index, mac, packet, mark);
         }
         if let Some(e) = self.spaces[&ns].neighbors.get(&(index, target)) {
             if e.state & (1 | 32) != 0 {
                 return vec![];
             }
             if let Some(mac) = e.mac {
-                return self.ethernet_datagrams(ns, index, mac, packet);
+                return self.ethernet_datagrams(ns, index, mac, packet, mark);
             }
         }
         let cache = &self.spaces[&ns].neighbor_cache;
@@ -33,7 +40,7 @@ impl Topology {
             if let Some(e) = entries.get(&(index, target)) {
                 if let Some(mac) = e.mac {
                     if e.updated.elapsed() < Duration::from_secs(30) {
-                        return self.ethernet_datagrams(ns, index, mac, packet);
+                        return self.ethernet_datagrams(ns, index, mac, packet, mark);
                     }
                 }
             }
@@ -43,7 +50,7 @@ impl Topology {
         let total = entries
             .values()
             .flat_map(|e| &e.pending)
-            .map(Vec::len)
+            .map(|(p, _)| p.len())
             .sum::<usize>();
         if total + packet.len() > crate::MAX_BUFFER
             || entries.values().map(|e| e.pending.len()).sum::<usize>() >= 96
@@ -66,9 +73,9 @@ impl Topology {
         }
         let mut actions = Vec::new();
         if let Some(mac) = e.mac {
-            actions.extend(self.ethernet_datagrams(ns, index, mac, packet));
+            actions.extend(self.ethernet_datagrams(ns, index, mac, packet, mark));
         } else {
-            e.pending.push(packet);
+            e.pending.push((packet, mark));
         }
         cache.probing.store(true, Relaxed);
         if e.probes == 0 {
@@ -141,7 +148,11 @@ impl Topology {
             if e.probes >= 3 {
                 e.mac = None;
                 e.state = 32;
-                actions.extend(e.pending.drain(..).map(|p| Action::NeighborFailed(ns, p)));
+                actions.extend(
+                    e.pending
+                        .drain(..)
+                        .map(|(p, _)| Action::NeighborFailed(ns, p)),
+                );
                 e.probes = 0;
                 e.updated = now;
                 continue;
@@ -167,7 +178,7 @@ impl Topology {
         let pending = space.neighbor_cache.learn(index, ip, mac);
         pending
             .into_iter()
-            .flat_map(|packet| self.ethernet_datagrams(ns, index, mac, packet))
+            .flat_map(|(packet, mark)| self.ethernet_datagrams(ns, index, mac, packet, mark))
             .collect()
     }
     pub(crate) fn ethernet_datagrams(
@@ -176,10 +187,11 @@ impl Topology {
         index: u32,
         mac: Mac,
         packet: Vec<u8>,
+        mark: u32,
     ) -> Vec<Action> {
         self.ethernet_ip_frames(ns, index, mac, None, packet)
             .into_iter()
-            .map(|f| Action::Send(ns, index, f))
+            .map(|f| Action::Send(ns, index, f.with_mark(mark)))
             .collect()
     }
     pub fn ethernet_arrival(

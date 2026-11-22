@@ -35,6 +35,7 @@ impl<'p> Packet<'p> {
         Self::Ipv4(PacketV4 {
             header: ip_repr,
             reply_class: None,
+            reply_mark: 0,
             payload,
         })
     }
@@ -44,6 +45,7 @@ impl<'p> Packet<'p> {
         Self::Ipv6(PacketV6 {
             header: ip_repr,
             reply_class: None,
+            reply_mark: 0,
             #[cfg(feature = "proto-ipv6-hbh")]
             hop_by_hop: None,
             #[cfg(feature = "proto-ipv6-fragmentation")]
@@ -52,6 +54,25 @@ impl<'p> Packet<'p> {
             routing: None,
             payload,
         })
+    }
+
+    pub(crate) fn with_reply_mark(mut self, mark: u32) -> Self {
+        match &mut self {
+            #[cfg(feature = "proto-ipv4")]
+            Self::Ipv4(p) => p.reply_mark = mark,
+            #[cfg(feature = "proto-ipv6")]
+            Self::Ipv6(p) => p.reply_mark = mark,
+        }
+        self
+    }
+
+    pub(crate) fn reply_mark(&self) -> u32 {
+        match self {
+            #[cfg(feature = "proto-ipv4")]
+            Self::Ipv4(p) => p.reply_mark,
+            #[cfg(feature = "proto-ipv6")]
+            Self::Ipv6(p) => p.reply_mark,
+        }
     }
 
     pub(crate) fn with_reply_class(mut self, value: u8) -> Self {
@@ -208,6 +229,7 @@ impl<'p> Packet<'p> {
 #[cfg(feature = "proto-ipv4")]
 pub(crate) struct PacketV4<'p> {
     pub(crate) reply_class: Option<u8>,
+    pub(crate) reply_mark: u32,
     header: Ipv4Repr,
     payload: IpPayload<'p>,
 }
@@ -217,6 +239,7 @@ pub(crate) struct PacketV4<'p> {
 #[cfg(feature = "proto-ipv6")]
 pub(crate) struct PacketV6<'p> {
     pub(crate) reply_class: Option<u8>,
+    pub(crate) reply_mark: u32,
     pub(crate) header: Ipv6Repr,
     #[cfg(feature = "proto-ipv6-hbh")]
     pub(crate) hop_by_hop: Option<Ipv6HopByHopRepr<'p>>,

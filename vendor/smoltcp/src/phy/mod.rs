@@ -161,6 +161,8 @@ pub use self::tuntap_interface::TunTapInterface;
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, Default)]
 #[non_exhaustive]
 pub struct PacketMeta {
+    /// Namespace-local packet mark, kept outside the wire header.
+    pub mark: u32,
     /// The eight traffic class bits (DSCP and ECN) from the wire.
     pub traffic_class: u8,
     /// Guest ingress interface when explicitly supplied for group delivery.

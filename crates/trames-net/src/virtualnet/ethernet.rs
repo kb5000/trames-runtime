@@ -70,6 +70,7 @@ impl Inner {
                                 interface: index,
                                 kind: frame.ingress_type(true),
                                 source: frame.source(),
+                                mark: frame.1,
                                 bytes: frame.payload().to_vec(),
                             });
                         }
@@ -129,7 +130,7 @@ impl Inner {
             if !rx.receive_packet(frame.payload().to_vec()) {
                 return;
             }
-            let Some((packet, _)) = rx.rx.pop_front() else {
+            let Some((packet, _, _)) = rx.rx.pop_front() else {
                 return;
             };
             let Some(h) = packet::header(&packet) else {
@@ -201,7 +202,7 @@ impl Inner {
                 }
                 self.ethernet.push_back((
                     target.clone(),
-                    Action::Receive(target.namespace, 2, frame.clone()),
+                    Action::Receive(target.namespace, 2, frame.clone().with_mark(0)),
                 ));
             }
         }

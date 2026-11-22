@@ -290,6 +290,7 @@ pub(crate) struct Fragmenter {
 
 #[cfg(feature = "proto-ipv4-fragmentation")]
 pub(crate) struct Ipv4Fragmenter {
+    pub meta: crate::phy::PacketMeta,
     /// The IPv4 representation.
     pub repr: Ipv4Repr,
     /// The destination hardware address.
@@ -328,6 +329,7 @@ impl Fragmenter {
 
             #[cfg(feature = "proto-ipv4-fragmentation")]
             ipv4: Ipv4Fragmenter {
+                meta: Default::default(),
                 repr: Ipv4Repr {
                     src_addr: Ipv4Address::new(0, 0, 0, 0),
                     dst_addr: Ipv4Address::new(0, 0, 0, 0),

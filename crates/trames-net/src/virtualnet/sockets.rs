@@ -541,6 +541,7 @@ impl Socket {
             raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 16], vec![0; BUFFER]),
             raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 16], vec![0; BUFFER]),
         );
+        socket.set_mark(self.mark.get());
         socket.set_linux_receive(self.raw_transport());
         self.state.borrow_mut().handles = vec![n.sockets.add(socket)];
         Ok(())
@@ -718,7 +719,7 @@ impl Socket {
             n.growing_listeners.push(Arc::downgrade(&self.meta));
         }
         for a in addresses {
-            let mut socket = state.new_tcp_socket(a.ip());
+            let mut socket = state.new_tcp_socket(a.ip(), self.mark.get());
             socket
                 .listen_queued(endpoint(a), backlog)
                 .map_err(|_| NetError(22))?;
@@ -772,7 +773,7 @@ impl Socket {
             let slot = n.sockets.get::<tcp::Socket>(other);
             slot.is_listening() && slot.listen_endpoint().addr == Some(listen_address)
         }) {
-            let mut replacement = state.new_tcp_socket(addr(listen_address));
+            let mut replacement = state.new_tcp_socket(addr(listen_address), self.mark.get());
             replacement
                 .listen_queued(IpEndpoint::new(listen_address, local.port()), state.backlog)
                 .map_err(|_| NetError(22))?;
@@ -1016,7 +1017,7 @@ impl Socket {
                 return Err(NetError(99));
             }
         }
-        let mut s = state.new_tcp_socket(bound.ip());
+        let mut s = state.new_tcp_socket(bound.ip(), self.mark.get());
         s.connect(n.iface.context(), endpoint(a), endpoint(bound))
             .map_err(|_| NetError(22))?;
         if let PortSlot::Recycle(index, sequence) = slot {
@@ -1317,6 +1318,7 @@ impl Socket {
                             let defaults = state.udp_options[family].fields;
                             let fields = control.fields[family];
                             let mut meta = smoltcp::phy::PacketMeta::default();
+                            meta.mark = self.mark.get();
                             meta.traffic_class =
                                 fields.traffic_class.or(defaults.traffic_class).unwrap_or(0);
                             meta.ipv4_clear_df = !policy.udp_df() || ip_size > mtu as usize;
@@ -1818,7 +1820,23 @@ impl Socket {
     }
     pub fn set_option(&self, level: u32, name: u32, value: i32) -> Result<()> {
         if (level, name) == (1, 36) {
+            let mut fabric = self.network.0.fabric.0.borrow_mut();
             self.mark.set(value as u32);
+            if let Some(node) = fabric.nodes.get_mut(&self.network.0.key) {
+                for &handle in &self.state.borrow().handles {
+                    match self.kind {
+                        1 => node
+                            .sockets
+                            .get_mut::<tcp::Socket>(handle)
+                            .set_mark(value as u32),
+                        4 => node
+                            .sockets
+                            .get_mut::<raw::Socket>(handle)
+                            .set_mark(value as u32),
+                        _ => break,
+                    }
+                }
+            }
             return Ok(());
         }
         if (level, name) == (41, 17) && self.kind == 2 && self.family == 10 {
@@ -2790,7 +2808,7 @@ impl Socket {
             header
         };
         if hdrincl || self.raw_transport() {
-            n.port.send_raw(data, route)?;
+            n.port.send_raw(data, route, self.mark.get())?;
         } else {
             n.sockets
                 .get_mut::<raw::Socket>(state.handles[0])
@@ -2960,6 +2978,7 @@ impl Socket {
         let fields = state.udp_options[usize::from(a.is_ipv6())].fields;
         let mut metadata = icmp::MessageMetadata::from(ip(a.ip()));
         metadata.local = Some(ip(source));
+        metadata.ip.mark = self.mark.get();
         metadata.ip.traffic_class = fields.traffic_class.unwrap_or(0);
         metadata.ip.hop_limit = fields.hop_limit;
         let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;

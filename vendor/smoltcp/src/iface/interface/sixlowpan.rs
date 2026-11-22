@@ -843,6 +843,7 @@ mod tests {
 
         let mut ip_packet = PacketV6 {
             reply_class: None,
+            reply_mark: 0,
             header: Ipv6Repr {
                 src_addr: Ipv6Address::from_bytes(&[
                     253, 0, 0, 0, 0, 0, 0, 0, 2, 3, 0, 3, 0, 3, 0, 3,
@@ -927,6 +928,7 @@ mod tests {
 
         let mut ip_packet = PacketV6 {
             reply_class: None,
+            reply_mark: 0,
             header: Ipv6Repr {
                 src_addr: addr,
                 dst_addr: parent_address,

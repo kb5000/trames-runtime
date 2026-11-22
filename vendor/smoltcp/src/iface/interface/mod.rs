@@ -825,13 +825,12 @@ impl Interface {
 
             let result = match &mut item.socket {
                 #[cfg(feature = "socket-raw")]
-                Socket::Raw(socket) => socket.dispatch(&mut self.inner, |inner, (ip, raw)| {
-                    respond(
-                        inner,
-                        PacketMeta::default(),
-                        Packet::new(ip, IpPayload::Raw(raw)),
-                    )
-                }),
+                Socket::Raw(socket) => {
+                    let meta = PacketMeta { mark: socket.mark, ..Default::default() };
+                    socket.dispatch(&mut self.inner, |inner, (ip, raw)| {
+                        respond(inner, meta, Packet::new(ip, IpPayload::Raw(raw)))
+                    })
+                }
                 #[cfg(feature = "socket-icmp")]
                 Socket::Icmp(socket) => {
                     socket.dispatch(&mut self.inner, |inner, meta, response| match response {
@@ -860,6 +859,7 @@ impl Interface {
                 #[cfg(feature = "socket-tcp")]
                 Socket::Tcp(socket) => {
                     let meta = PacketMeta {
+                        mark: socket.mark,
                         ipv4_clear_df: !socket.ipv4_dont_fragment(),
                         ..PacketMeta::default()
                     };
@@ -1278,10 +1278,14 @@ impl InterfaceInner {
         // NOTE(unused_mut): tx_token isn't always mutated, depending on
         // the feature set that is used.
         #[allow(unused_mut)] mut tx_token: Tx,
-        meta: PacketMeta,
+        mut meta: PacketMeta,
         packet: Packet,
         frag: &mut Fragmenter,
     ) -> Result<(), DispatchError> {
+        let reply_mark = packet.reply_mark();
+        if reply_mark != 0 {
+            meta.mark = reply_mark;
+        }
         let mut ip_repr = packet.ip_repr();
         let traffic_class = packet.reply_class().unwrap_or(meta.traffic_class);
         assert!(!ip_repr.dst_addr().is_unspecified());
@@ -1375,6 +1379,7 @@ impl InterfaceInner {
 
         let total_ip_len = ip_repr.buffer_len();
 
+        tx_token.set_meta(meta);
         match &mut ip_repr {
             #[cfg(feature = "proto-ipv4")]
             IpRepr::Ipv4(repr) => {
@@ -1415,6 +1420,7 @@ impl InterfaceInner {
 
                         // Save the IP header for other fragments.
                         frag.ipv4.repr = *repr;
+                        frag.ipv4.meta = meta;
 
                         // Save how much bytes we will send now.
                         frag.sent_bytes = first_frag_ip_len;
@@ -1461,8 +1467,6 @@ impl InterfaceInner {
                         Ok(())
                     }
                 } else {
-                    tx_token.set_meta(meta);
-
                     // No fragmentation is required.
                     tx_token.consume(total_len, |mut tx_buffer| {
                         #[cfg(feature = "medium-ethernet")]

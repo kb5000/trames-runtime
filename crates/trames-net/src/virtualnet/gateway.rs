@@ -336,7 +336,7 @@ impl Gateway {
             &ip(tuple.source.ip()),
             &ChecksumCapabilities::default(),
         );
-        self.node.port.tx.push_back((bytes, None));
+        self.node.port.tx.push_back((bytes, None, 0));
     }
     pub fn publish(&mut self, host: SocketAddr, guest: SocketAddr, kind: u32) -> Result<()> {
         if ![1, 2].contains(&kind) || host.is_ipv4() != guest.is_ipv4() {

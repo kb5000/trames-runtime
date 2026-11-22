@@ -189,7 +189,19 @@ impl Socket {
                 .map_or(peer, |v| SocketAddr::new(v.into(), peer.port())),
             _ => peer,
         };
-        let Ok((mut source, _, _)) = graph.source(self.namespace.id(), peer.ip()) else {
+        let mark = self
+            .native
+            .borrow()
+            .as_ref()
+            .map_or(0, |socket| socket.mark.get());
+        let Ok((mut source, _, _)) = graph.source_for(
+            self.namespace.id(),
+            peer.ip(),
+            crate::netdev::RouteContext {
+                mark,
+                ..Default::default()
+            },
+        ) else {
             return false;
         };
         let bound = self
@@ -212,7 +224,7 @@ impl Socket {
             2,
             &[],
         );
-        graph.output_redirect(self.namespace.id(), &mut p, bound.is_some())
+        graph.output_redirect(self.namespace.id(), &mut p, bound.is_some(), mark)
     }
     fn internal(&self, address: IpAddr) -> bool {
         let address = match address {

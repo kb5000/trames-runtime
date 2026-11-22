@@ -420,12 +420,14 @@ impl Socket {
             }
             header.fill_checksum();
         }
-        if !view
-            .graph
-            .read()
-            .unwrap()
-            .udp_group_hooks(view.namespace, dev.index, None, &mut packet)
-        {
+        let mut mark = self.mark.get();
+        if !view.graph.read().unwrap().udp_group_hooks(
+            view.namespace,
+            dev.index,
+            None,
+            &mut packet,
+            &mut mark,
+        ) {
             return Ok(bytes.len());
         }
         if loopback {
@@ -435,7 +437,14 @@ impl Socket {
             } else {
                 PacketType::Broadcast
             };
-            fabric.group_input(self.network.0.key, view, dev.index, packet_type, &mut local);
+            fabric.group_input(
+                self.network.0.key,
+                view,
+                dev.index,
+                packet_type,
+                &mut local,
+                mark,
+            );
         }
         let interface_local = matches!(dest.ip(), IpAddr::V6(a) if a.octets()[1] & 0x0f == 1);
         if dev.index != 1 && ttl != 0 && !interface_local {
@@ -455,6 +464,7 @@ impl Socket {
                 dev.index,
                 mac,
                 packet,
+                mark,
             );
             fabric.queue_frames(view, actions);
         }
@@ -471,6 +481,7 @@ impl Inner {
         index: u32,
         packet_type: PacketType,
         packet: &mut [u8],
+        mut mark: u32,
     ) {
         let Some(node) = self.nodes.get_mut(&key) else {
             return;
@@ -485,6 +496,7 @@ impl Inner {
             index,
             Some(packet_type),
             packet,
+            &mut mark,
         ) {
             return;
         }

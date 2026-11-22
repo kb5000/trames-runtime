@@ -23,8 +23,12 @@ pub(crate) enum PacketType {
 
 pub(crate) type Mac = [u8; 6];
 #[derive(Clone, Debug)]
-pub(crate) struct Frame(pub Arc<[u8]>);
+pub(crate) struct Frame(pub Arc<[u8]>, pub u32);
 impl Frame {
+    pub fn with_mark(mut self, mark: u32) -> Self {
+        self.1 = mark;
+        self
+    }
     pub fn new(bytes: &[u8]) -> Result<Self> {
         Self::from_link(bytes, false)
     }
@@ -39,7 +43,7 @@ impl Frame {
         if bytes.len() < 14 || bytes.len() > 65575 + 22 {
             return Err(NetError(22));
         }
-        let f = Self(Arc::from(bytes));
+        let f = Self(Arc::from(bytes), 0);
         if f.outer_protocol() == 0x8100 && bytes.len() < 18 {
             return Err(NetError(22));
         }
@@ -51,7 +55,7 @@ impl Frame {
         v.extend_from_slice(&source);
         v.extend_from_slice(&protocol.to_be_bytes());
         v.extend_from_slice(payload);
-        Self(v.into())
+        Self(v.into(), 0)
     }
     pub fn source(&self) -> Mac {
         self.0[6..12].try_into().unwrap()
@@ -108,13 +112,13 @@ impl Frame {
         }
         v.extend_from_slice(&self.protocol().to_be_bytes());
         v.extend_from_slice(self.payload());
-        Self(v.into())
+        Self(v.into(), self.1)
     }
     pub fn with_payload(&self, payload: &[u8]) -> Self {
         let n = self.0.len() - self.payload().len();
         let mut v = self.0[..n].to_vec();
         v.extend_from_slice(payload);
-        Self(v.into())
+        Self(v.into(), self.1)
     }
 }
 #[derive(Clone)]
@@ -225,12 +229,12 @@ impl Switch {
         }
         let mut fragments = self.fragments.lock();
         let rx = fragments.entry(input).or_default();
-        if !rx.receive_packet(p.to_vec()) {
+        if !rx.receive_marked(p.to_vec(), input, frame.1) {
             return None;
         }
         rx.rx
             .pop_front()
-            .map(|(p, _)| (frame.with_payload(&p), true))
+            .map(|(p, _, mark)| (frame.with_payload(&p).with_mark(mark), true))
     }
     fn ticks(&self) -> u64 {
         self.started.elapsed().as_millis().min(u64::MAX as u128) as u64 / 10
@@ -340,13 +344,13 @@ pub(crate) struct Neighbor {
     pub updated: Instant,
     pub retry: Instant,
     pub probes: u8,
-    pub pending: Vec<Vec<u8>>,
+    pub pending: Vec<(Vec<u8>, u32)>,
 }
 impl NeighborCache {
     pub fn forget(&self, index: u32) {
         self.entries.write().retain(|(i, _), _| *i != index);
     }
-    pub fn learn(&self, index: u32, ip: std::net::IpAddr, mac: Mac) -> Vec<Vec<u8>> {
+    pub fn learn(&self, index: u32, ip: std::net::IpAddr, mac: Mac) -> Vec<(Vec<u8>, u32)> {
         if ip.is_unspecified() || ip.is_multicast() || mac == [0; 6] {
             return vec![];
         }

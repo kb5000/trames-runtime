@@ -59,9 +59,10 @@ impl InterfaceInner {
                 }
                 continue;
             }
+            let mark = socket.mark;
             return socket
                 .process_wire(self, &ip_repr, &tcp_repr, ip_payload)
-                .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
+                .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)).with_reply_mark(mark));
         }
         if let Some(((priority, _), handle)) = listener {
             // Backpressure belongs to the best matching listener group. A full
@@ -69,10 +70,11 @@ impl InterfaceInner {
             if full_priority.is_some_and(|full| full > priority) {
                 return None;
             }
-            return sockets
-                .get_mut::<Socket>(handle)
+            let socket = sockets.get_mut::<Socket>(handle);
+            let mark = socket.mark;
+            return socket
                 .process_wire(self, &ip_repr, &tcp_repr, ip_payload)
-                .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
+                .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)).with_reply_mark(mark));
         }
 
         // A full accept queue drops new SYNs. An existing four-tuple has

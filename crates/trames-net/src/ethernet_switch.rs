@@ -35,12 +35,18 @@ impl Topology {
         if outgoing {
             return match d.kind {
                 DeviceKind::Loopback => vec![Action::Receive(ns, index, frame)],
-                DeviceKind::Veth { peer } => self
-                    .peer_device(peer)
-                    .filter(|d| d.up)
-                    .map_or_else(Vec::new, |p| {
-                        vec![Action::Receive(p.namespace, p.index, frame)]
-                    }),
+                DeviceKind::Veth { peer } => {
+                    self.peer_device(peer)
+                        .filter(|d| d.up)
+                        .map_or_else(Vec::new, |p| {
+                            let frame = if ns == p.namespace {
+                                frame
+                            } else {
+                                frame.with_mark(0)
+                            };
+                            vec![Action::Receive(p.namespace, p.index, frame)]
+                        })
+                }
                 DeviceKind::Tap => {
                     if let Some(p) = self.tunnel(ns, index) {
                         p.enqueue(frame.0.to_vec(), frame.outer_protocol(), wakes);
@@ -160,13 +166,15 @@ impl Topology {
             reassembled = was_fragmented;
             let mut packet = frame.payload().to_vec();
             // Linux presents forwarded unicast as PACKET_HOST at the bridge IP hooks.
+            let mut mark = frame.1;
             if !crate::virtualnet::packet::valid_transport(&packet)
                 || self
-                    .bridge_packet(ns, bridge, frame.ingress_type(true), &mut packet)
+                    .bridge_packet(ns, bridge, frame.ingress_type(true), &mut packet, &mut mark)
                     .is_none()
             {
                 return actions;
             }
+            frame.1 = mark;
             if packet != frame.payload() {
                 frame = frame.with_payload(&packet);
             }

@@ -161,6 +161,7 @@ impl PreparedSocket {
             dns_receive_errors: Cell::new(false),
             echo: SharedState::default(),
             policy: None,
+            mark: Cell::new(0),
             receive_controls: Cell::new(0),
             receive_control_update: Mutex::new(()),
             policy_forward: SharedState::default(),
@@ -375,6 +376,7 @@ pub struct Socket {
     receive_control_update: Mutex<()>,
     // Attached while this socket is unique, before any capability/publication.
     policy: Option<Policy>,
+    pub(super) mark: Cell<u32>,
     policy_forward: SharedState<
         std::collections::BTreeMap<
             (SocketAddr, SocketAddr),
@@ -480,7 +482,14 @@ impl Socket {
                     .graph
                     .read()
                     .unwrap()
-                    .source(namespace.id(), peer.ip())
+                    .source_for(
+                        namespace.id(),
+                        peer.ip(),
+                        crate::netdev::RouteContext {
+                            mark: if input { 0 } else { self.mark.get() },
+                            ..Default::default()
+                        },
+                    )
                     .map(|v| v.0)
                     .unwrap_or(local.ip())
             });
@@ -507,6 +516,7 @@ impl Socket {
             input,
             &mut packet,
             binding,
+            self.mark.get(),
         );
         if let Some(forward) = result {
             if input {
@@ -724,6 +734,7 @@ impl Socket {
         let mut accepted =
             self.network
                 .wrap(native, reservation, self.family, 1, Connection::Connected);
+        accepted.mark.set(self.mark.get());
         if let Some(policy) = &self.policy {
             accepted.attach_policy(policy.namespace.clone());
         }
@@ -1256,6 +1267,10 @@ impl Socket {
         )
     }
     pub fn set_option(&self, level: u32, name: u32, value: i32) -> Result<()> {
+        if (level, name) == (1, 36) {
+            self.mark.set(value as u32);
+            return Ok(());
+        }
         if (level, name) == (0, 11) && self.family == 2 && self.kind == 2 {
             if value != 0
                 && self.native.state.connection() != Connection::Idle
@@ -1393,6 +1408,7 @@ impl Socket {
                 n => n as i32,
             }),
             (1, 39) => Ok(self.family as i32),
+            (1, 36) => Ok(self.mark.get() as i32),
             (1, 38) => Ok(if self.kind == 1 {
                 6
             } else if matches!(self.kind, 3 | 4) {

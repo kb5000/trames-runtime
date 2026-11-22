@@ -25,7 +25,9 @@ fn topology_readers_and_other_namespace_packets_progress_independently() {
             &[],
         );
         let graph = worker.read().unwrap();
-        assert!(graph.native_policy(2, false, &mut packet, None).is_some());
+        assert!(graph
+            .native_policy(2, false, &mut packet, None, 0)
+            .is_some());
         complete.send(()).unwrap();
     });
     result

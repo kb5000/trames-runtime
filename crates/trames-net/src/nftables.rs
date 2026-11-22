@@ -280,6 +280,18 @@ enum Expr {
         dest: usize,
         flags: u32,
     },
+    MetaSetMark {
+        src: usize,
+    },
+    MarkMatch {
+        value: u32,
+        mask: u32,
+        invert: u8,
+    },
+    MarkTarget {
+        value: u32,
+        mask: u32,
+    },
     TransportMatch(xt_match::Transport),
     Lookup(sets::Lookup),
     ConntrackMatch {
@@ -362,6 +374,8 @@ impl FixedNatKind {
 /// Versions with a guest packet implementation, shared by both xtables probe ABIs.
 pub fn xt_revision(family: u8, name: &str, revision: u32, target: bool) -> Result<u32> {
     let (min, max) = match (name, target) {
+        ("mark", false) => (1, 1),
+        ("MARK", true) if matches!(family, 2 | 10) => (2, 2),
         ("comment", false) => (0, 0),
         (name, false) if xt_match::protocol(name, family).is_some() => (0, 0),
         ("addrtype", false) => (u32::from(family != 2), 1),
@@ -429,18 +443,26 @@ fn expressions_in(
                 if get(&a, 1).is_some() == get(&a, 3).is_some() {
                     return Err(NetError(22));
                 }
-                if get(&a, 3).is_some() {
-                    return Err(NetError(95));
+                if let Some(src) = get(&a, 3) {
+                    if key != 3 {
+                        return Err(NetError(95));
+                    }
+                    let src = reg(u32v(src)?, 4)?;
+                    if initialized[src..src + 4].contains(&false) {
+                        return Err(NetError(22));
+                    }
+                    Expr::MetaSetMark { src }
+                } else {
+                    let len = match key {
+                        0 | 3 | 4 | 5 | 15 | 16 | 19 => 4,
+                        1 | 8 | 9 | 36 => 2,
+                        6 | 7 | 26 | 27 => 16,
+                        _ => return Err(NetError(95)),
+                    };
+                    let dest = reg(num(&a, 1)?, len)?;
+                    initialized[dest..dest + len].fill(true);
+                    Expr::Meta { dest, key }
                 }
-                let len = match key {
-                    0 | 4 | 5 | 15 | 16 | 19 => 4,
-                    1 | 8 | 9 | 36 => 2,
-                    6 | 7 | 26 | 27 => 16,
-                    _ => return Err(NetError(95)),
-                };
-                let dest = reg(num(&a, 1)?, len)?;
-                initialized[dest..dest + len].fill(true);
-                Expr::Meta { dest, key }
             }
             "lookup" => Expr::Lookup(sets::Lookup::parse(
                 data,
@@ -578,9 +600,8 @@ fn expressions_in(
                 {
                     return Err(NetError(22));
                 }
-                // Socket marks currently select routes at socket send time.
-                // Per-packet marks are not carried through every packet hook.
-                if flags & FIB_MARK != 0 {
+                // Address-type classification currently has no policy-table result.
+                if flags & FIB_MARK != 0 && result == FIB_RESULT_ADDRTYPE {
                     return Err(NetError(95));
                 }
                 let len = if result == FIB_RESULT_OIFNAME { 16 } else { 4 };
@@ -600,7 +621,15 @@ fn expressions_in(
                 let kind = name(&a, 1)?;
                 let revision = num(&a, 2)?;
                 let b = need(&a, 3)?;
-                if kind == "comment" {
+                if kind == "mark" {
+                    xt_revision(rule_family, &kind, revision, false).map_err(|_| NetError(2))?;
+                    xt_match::check_size(b, 12)?;
+                    Expr::MarkMatch {
+                        value: u32::from_ne_bytes(b[..4].try_into().unwrap()),
+                        mask: u32::from_ne_bytes(b[4..8].try_into().unwrap()),
+                        invert: b[8],
+                    }
+                } else if kind == "comment" {
                     if revision != 0 {
                         return Err(NetError(2));
                     }
@@ -655,7 +684,14 @@ fn expressions_in(
                 let kind = name(&a, 1)?;
                 let revision = num(&a, 2)?;
                 let b = need(&a, 3)?;
-                if kind == "CT" {
+                if kind == "MARK" {
+                    xt_revision(rule_family, &kind, revision, true).map_err(|_| NetError(2))?;
+                    xt_match::check_size(b, 8)?;
+                    Expr::MarkTarget {
+                        value: u32::from_ne_bytes(b[..4].try_into().unwrap()),
+                        mask: u32::from_ne_bytes(b[4..8].try_into().unwrap()),
+                    }
+                } else if kind == "CT" {
                     if revision > 1
                         || b.len() != if revision == 0 { 40 } else { 72 }
                         || b[..2] != [0, 0]
@@ -1419,8 +1455,11 @@ impl Ruleset {
                 if h.is_some_and(|(hook, _)| packet_hooks == PacketHooks::Unavailable || hook > 4)
                     || typ
                         .as_deref()
-                        .is_some_and(|v| !matches!(v, "filter" | "nat"))
+                        .is_some_and(|v| !matches!(v, "filter" | "nat" | "route"))
                 {
+                    return Err(NetError(95));
+                }
+                if typ.as_deref() == Some("route") && h.is_none_or(|(hook, _)| hook != 3) {
                     return Err(NetError(95));
                 }
                 if typ.as_deref() == Some("nat")
@@ -1863,6 +1902,7 @@ fn request_rules(
     Ok(out)
 }
 pub(crate) struct Context<'a> {
+    pub mark: u32,
     pub packet: &'a mut [u8],
     pub hook: u32,
     pub packet_type: crate::ethernet::PacketType,
@@ -1925,7 +1965,7 @@ impl Context<'_> {
         self.graph
             .interface_address(self.namespace, self.output, self.family() == 2)
     }
-    fn fib_output(&self, source: bool, device: Option<u32>) -> u32 {
+    fn fib_output(&self, source: bool, device: Option<u32>, mark: u32) -> u32 {
         if self.input == 1 && matches!(self.hook, 0 | 1) {
             return self.input;
         }
@@ -1934,7 +1974,14 @@ impl Context<'_> {
             return 0;
         }
         self.graph
-            .source(self.namespace, addr)
+            .source_for(
+                self.namespace,
+                addr,
+                crate::netdev::RouteContext {
+                    mark,
+                    ..Default::default()
+                },
+            )
             .ok()
             .map(|(_, index, _)| index)
             .filter(|index| device.is_none_or(|d| d == *index))
@@ -2001,6 +2048,7 @@ impl Context<'_> {
                 register[..4].fill(0);
                 register[..2].copy_from_slice(&protocol.to_be_bytes());
             }
+            3 => register[..4].copy_from_slice(&self.mark.to_ne_bytes()),
             4 | 5 => {
                 let index = if key == 4 { self.input } else { self.output };
                 register[..4].copy_from_slice(&index.to_ne_bytes());
@@ -2055,6 +2103,47 @@ struct NatAction {
     address: Option<std::net::IpAddr>,
     ports: Option<(u16, u16)>,
 }
+/// Mutable state of one packet while it traverses this namespace. Nothing here is cached on the flow.
+pub(crate) struct RoutedPacket<'a> {
+    bytes: &'a mut [u8],
+    pub mark: u32,
+    pub route_mark: u32,
+}
+impl std::ops::Deref for RoutedPacket<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.bytes
+    }
+}
+impl std::ops::DerefMut for RoutedPacket<'_> {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        self.bytes
+    }
+}
+impl<'a> RoutedPacket<'a> {
+    pub fn new(bytes: &'a mut [u8], mark: u32) -> Self {
+        Self {
+            bytes,
+            mark,
+            route_mark: mark,
+        }
+    }
+}
+// Snapshot only fields that can trigger a route-chain relookup on this family.
+fn route_fields(packet: &[u8], family: u8) -> ([u8; 32], u32, u8) {
+    let mut addresses = [0; 32];
+    if family == 2 {
+        addresses[..8].copy_from_slice(&packet[12..20]);
+        (addresses, u32::from(packet[1]), 0)
+    } else {
+        addresses.copy_from_slice(&packet[8..40]);
+        (
+            addresses,
+            u32::from_ne_bytes(packet[..4].try_into().unwrap()),
+            packet[7],
+        )
+    }
+}
 pub(crate) struct Hook<'a> {
     pub graph: &'a crate::netdev::Topology,
     pub namespace: u64,
@@ -2067,11 +2156,16 @@ pub(crate) struct Hook<'a> {
 impl Ruleset {
     pub fn process(
         &self,
-        packet: &mut [u8],
+        routed: &mut RoutedPacket<'_>,
         meta: &Hook<'_>,
         track: &mut crate::conntrack::Track,
         conn: &mut crate::conntrack::State,
     ) -> bool {
+        let RoutedPacket {
+            bytes: packet,
+            mark,
+            route_mark,
+        } = routed;
         let family = if packet[0] >> 4 == 4 { 2 } else { 10 };
         let source = matches!(meta.hook, 1 | 4);
         let nat_priority = if source { 100 } else { -100 };
@@ -2120,13 +2214,21 @@ impl Ruleset {
             };
             let output = if meta.hook == 3 {
                 meta.graph
-                    .source(meta.namespace, h.tuple.destination.ip())
+                    .source_for(
+                        meta.namespace,
+                        h.tuple.destination.ip(),
+                        crate::netdev::RouteContext {
+                            mark: *route_mark,
+                            ..Default::default()
+                        },
+                    )
                     .map(|(_, i, _)| i)
                     .unwrap_or(meta.output)
             } else {
                 meta.output
             };
             let mut ctx = Context {
+                mark: *mark,
                 packet,
                 hook: meta.hook,
                 packet_type: meta.packet_type,
@@ -2138,8 +2240,13 @@ impl Ruleset {
                 graph: meta.graph,
                 namespace: meta.namespace,
             };
+            // Only a route-type OUTPUT chain requests a fresh route after a mark
+            // or routing header change. Filter-chain marks remain visible to later hooks.
+            let before_route = (c.chain_type == "route").then(|| route_fields(ctx.packet, family));
+            let chain_mark = ctx.mark;
             let mut effects = Effects::default();
             let v = t.verdict(n, &mut ctx, &mut 8192, &mut effects);
+            *mark = ctx.mark;
             if v == 0 {
                 return false;
             }
@@ -2148,6 +2255,28 @@ impl Ruleset {
                     counts.record(packet.len());
                 }
                 if c.policy == 0 {
+                    return false;
+                }
+            }
+            if before_route
+                .is_some_and(|before| chain_mark != *mark || route_fields(packet, family) != before)
+            {
+                *route_mark = *mark;
+                let Some(header) = crate::virtualnet::packet::header(packet) else {
+                    return false;
+                };
+                if meta
+                    .graph
+                    .source_for(
+                        meta.namespace,
+                        header.tuple.destination.ip(),
+                        crate::netdev::RouteContext {
+                            mark: *mark,
+                            ..Default::default()
+                        },
+                    )
+                    .is_err()
+                {
                     return false;
                 }
             }
@@ -2198,6 +2327,19 @@ impl Rule {
             match expr {
                 Expr::Immediate { dest, value } => {
                     regs[*dest..*dest + value.len()].copy_from_slice(value)
+                }
+                Expr::MetaSetMark { src } => {
+                    ctx.mark = u32::from_ne_bytes(regs[*src..*src + 4].try_into().unwrap());
+                }
+                Expr::MarkTarget { value, mask } => ctx.mark = (ctx.mark & !mask) ^ value,
+                Expr::MarkMatch {
+                    value,
+                    mask,
+                    invert,
+                } => {
+                    if (u8::from(ctx.mark & mask == *value) ^ invert) == 0 {
+                        return None;
+                    }
                 }
                 Expr::Meta { dest, key } => {
                     ctx.load_meta(*key, &mut regs[*dest..])?;
@@ -2367,7 +2509,11 @@ impl Rule {
                         regs[*dest..*dest + 4]
                             .copy_from_slice(&ctx.address_type(source, device).to_le_bytes());
                     } else {
-                        let index = ctx.fib_output(source, device);
+                        let index = ctx.fib_output(
+                            source,
+                            device,
+                            if flags & FIB_MARK != 0 { ctx.mark } else { 0 },
+                        );
                         if *result == FIB_RESULT_OIF {
                             let value = if flags & FIB_PRESENT != 0 {
                                 u32::from(index != 0)

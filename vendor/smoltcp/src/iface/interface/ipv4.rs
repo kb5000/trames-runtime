@@ -441,7 +441,8 @@ impl InterfaceInner {
     }
 
     #[cfg(feature = "proto-ipv4-fragmentation")]
-    pub(super) fn dispatch_ipv4_frag<Tx: TxToken>(&mut self, tx_token: Tx, frag: &mut Fragmenter) {
+    pub(super) fn dispatch_ipv4_frag<Tx: TxToken>(&mut self, mut tx_token: Tx, frag: &mut Fragmenter) {
+        tx_token.set_meta(frag.ipv4.meta);
         let caps = self.caps.clone();
 
         let mtu_max = self.ip_mtu();

@@ -74,6 +74,7 @@ pub struct LinkStats {
 #[derive(Clone)]
 pub struct Fabric(Arc<FabricState<Inner>>);
 struct InjectedPacket {
+    mark: u32,
     node: u64,
     interface: u32,
     kind: PacketType,
@@ -489,8 +490,9 @@ impl State {
         self.handles.push(handle);
     }
 
-    fn new_tcp_socket(&self, local: IpAddr) -> tcp::Socket<'static> {
+    fn new_tcp_socket(&self, local: IpAddr, mark: u32) -> tcp::Socket<'static> {
         let mut socket = tcp_socket_with_buffers(self.receive_buffer, self.send_buffer);
+        socket.set_mark(mark);
         if local.is_loopback() {
             socket.set_tsval_generator(Some(|| {
                 static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -1002,7 +1004,16 @@ impl Inner {
             let mut packets: Vec<_> = self
                 .injected
                 .drain(..)
-                .map(|p| (p.node, Some((p.interface, p.kind)), p.source, None, p.bytes))
+                .map(|p| {
+                    (
+                        p.node,
+                        Some((p.interface, p.kind)),
+                        p.source,
+                        None,
+                        p.mark,
+                        p.bytes,
+                    )
+                })
                 .collect();
             for (&key, node) in &mut self.nodes {
                 let poll = node.dirty
@@ -1048,8 +1059,8 @@ impl Inner {
                         self.notifications.push(source.clone());
                     }
                 }
-                while let Some((p, route)) = node.port.tx.pop_front() {
-                    packets.push((key, None, [0; 6], route, p));
+                while let Some((p, route, mark)) = node.port.tx.pop_front() {
+                    packets.push((key, None, [0; 6], route, mark, p));
                 }
             }
             self.gateway.node.iface.poll(
@@ -1057,13 +1068,13 @@ impl Inner {
                 &mut self.gateway.node.port,
                 &mut self.gateway.node.sockets,
             );
-            while let Some((p, route)) = self.gateway.node.port.tx.pop_front() {
-                packets.push((0, None, [0; 6], route, p));
+            while let Some((p, route, mark)) = self.gateway.node.port.tx.pop_front() {
+                packets.push((0, None, [0; 6], route, mark, p));
             }
             if packets.is_empty() {
                 break;
             }
-            for (source, ingress, peer, route, mut p) in packets {
+            for (source, ingress, peer, route, mut mark, mut p) in packets {
                 let injected = ingress.map(|(index, _)| index);
                 let packet_type = ingress.map_or(PacketType::Host, |(_, kind)| kind);
                 let lo = route.map_or_else(
@@ -1101,13 +1112,14 @@ impl Inner {
                 };
                 if source == 0 {
                     let rx = &mut self.gateway.node.filter_rx;
-                    if !rx.receive_packet(p) {
+                    if !rx.receive_marked(p, injected.unwrap_or(0), mark) {
                         self.stats.dropped += 1;
                         continue;
                     }
-                    let Some((complete, _)) = rx.rx.pop_front() else {
+                    let Some((complete, _, reassembled_mark)) = rx.rx.pop_front() else {
                         continue;
                     };
+                    mark = reassembled_mark;
                     p = complete;
                 }
                 let Some(h) = packet::header(&p) else {
@@ -1142,13 +1154,14 @@ impl Inner {
                     // also used for unfragmented packets without copying them.
                     if source != 0 {
                         let rx = &mut self.nodes.get_mut(&source).unwrap().filter_rx;
-                        if !rx.receive_packet(p) {
+                        if !rx.receive_marked(p, injected.unwrap_or(0), mark) {
                             self.stats.dropped += 1;
                             continue;
                         }
-                        let Some((complete, _)) = rx.rx.pop_front() else {
+                        let Some((complete, _, reassembled_mark)) = rx.rx.pop_front() else {
                             continue;
                         };
+                        mark = reassembled_mark;
                         p = complete;
                     }
                     if !packet::valid_transport(&p) {
@@ -1164,6 +1177,7 @@ impl Inner {
                                     h.tuple.destination.ip(),
                                     h.protocol,
                                     route,
+                                    mark,
                                 )
                             });
                         if !delivered {
@@ -1190,7 +1204,7 @@ impl Inner {
                                 h.tuple.destination.ip(),
                             )
                         {
-                            self.group_input(source, view, index, packet_type, &mut p);
+                            self.group_input(source, view, index, packet_type, &mut p, mark);
                             continue;
                         }
                     }
@@ -1224,6 +1238,7 @@ impl Inner {
                         incoming.map(|index| (index, packet_type)),
                         &mut p,
                         route,
+                        &mut mark,
                     );
                     let Some((route, next_hop)) = step else {
                         self.stats.dropped += 1;
@@ -1249,6 +1264,7 @@ impl Inner {
                             route.output,
                             next_hop,
                             p,
+                            mark,
                         );
                         self.queue_frames(view, actions);
                         continue;
@@ -1461,6 +1477,7 @@ impl Node {
         dest: IpAddr,
         protocol: u8,
         route_hint: Option<IpAddr>,
+        mut mark: u32,
     ) -> bool {
         let matches = |s: &SocketMeta| {
             s.kind == 4 && s.protocol == protocol && (s.family == 2) == dest.is_ipv4()
@@ -1477,7 +1494,9 @@ impl Node {
         if !graph.own(view.namespace, route_hint.unwrap_or(dest)) {
             return false;
         }
-        let Some((route, None)) = graph.route_one(view.namespace, None, packet, route_hint) else {
+        let Some((route, None)) =
+            graph.route_one(view.namespace, None, packet, route_hint, &mut mark)
+        else {
             return false;
         };
         if route.namespace != view.namespace || route.external || route.tunnel {
@@ -1540,7 +1559,8 @@ impl Node {
                 }
             }
             if slots > 0 && slots < state.backlog {
-                let mut socket = state.new_tcp_socket(addr(listen_endpoint.addr));
+                let mut socket =
+                    state.new_tcp_socket(addr(listen_endpoint.addr), listener.mark.get());
                 if socket.listen_queued(listen_endpoint, state.backlog).is_ok() {
                     state.add_listener_slot(socket, &mut self.sockets, &mut self.tcp_waiters);
                 }
@@ -1672,7 +1692,7 @@ impl Node {
                         };
                         state.handles.push(self.sockets.add(u));
                     } else {
-                        let mut t = state.new_tcp_socket(*a);
+                        let mut t = state.new_tcp_socket(*a, socket.mark.get());
                         if t.listen_queued(endpoint(ep), state.backlog).is_err() {
                             continue;
                         }
@@ -1756,6 +1776,7 @@ impl Network {
             interface,
             kind: PacketType::Host,
             source: [0; 6],
+            mark: 0,
             bytes: packet.to_vec(),
         });
         inner.tick();
@@ -2520,7 +2541,7 @@ mod shared_lifetime_tests {
                 .port
                 .tx
                 .iter()
-                .find_map(|(p, _)| {
+                .find_map(|(p, _, _)| {
                     let h = packet::header(p)?;
                     if h.protocol != 6 {
                         return None;

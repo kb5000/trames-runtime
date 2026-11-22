@@ -35,13 +35,14 @@ const QUEUE: usize = 96;
 const FRAGMENT_BYTES: usize = 512 * 1024;
 #[derive(Default)]
 pub(crate) struct Port {
-    pub rx: VecDeque<(Vec<u8>, u32)>,
-    pub tx: VecDeque<(Vec<u8>, Option<IpAddr>)>,
+    pub rx: VecDeque<(Vec<u8>, u32, u32)>,
+    pub tx: VecDeque<(Vec<u8>, Option<IpAddr>, u32)>,
     next_raw_id: u16,
     serial: u32,
     fragments: Vec<Fragments>,
 }
 struct Fragments {
+    mark: u32,
     key: (IpAddr, IpAddr, u32, u8, u32),
     header: Vec<u8>,
     data: Vec<u8>,
@@ -95,17 +96,25 @@ impl Port {
         Ok((packet, destination.into()))
     }
     /// Queue an already formed IP datagram on the same egress path as the interface.
-    pub(super) fn send_raw(&mut self, packet: Vec<u8>, route: Option<IpAddr>) -> Result<()> {
+    pub(super) fn send_raw(
+        &mut self,
+        packet: Vec<u8>,
+        route: Option<IpAddr>,
+        mark: u32,
+    ) -> Result<()> {
         if self.tx.len() >= QUEUE {
             return Err(NetError(11));
         }
-        self.tx.push_back((packet, route));
+        self.tx.push_back((packet, route, mark));
         Ok(())
     }
     pub fn receive_packet(&mut self, p: Vec<u8>) -> bool {
         self.receive_on(p, 0)
     }
     pub(super) fn receive_on(&mut self, p: Vec<u8>, ingress: u32) -> bool {
+        self.receive_marked(p, ingress, 0)
+    }
+    pub(crate) fn receive_marked(&mut self, p: Vec<u8>, ingress: u32, mark: u32) -> bool {
         self.fragments.retain(|f| f.expires > Instant::now());
         if p.len() > 65575 || self.rx.len() == QUEUE {
             return false;
@@ -151,7 +160,7 @@ impl Port {
             None
         };
         let Some((id, proto, offset, more, header_len, data_offset)) = descriptor else {
-            self.rx.push_back((p, ingress));
+            self.rx.push_back((p, ingress, mark));
             return true;
         };
         let key = (
@@ -194,6 +203,7 @@ impl Port {
             Some(i) => i,
             None => {
                 self.fragments.push(Fragments {
+                    mark,
                     key,
                     header: p[..header_len].to_vec(),
                     data: Vec::new(),
@@ -232,6 +242,7 @@ impl Port {
             }
         }
         if offset == 0 {
+            f.mark = mark;
             f.header.copy_from_slice(&p[..header_len]);
         }
         if extent > f.data.len() {
@@ -257,14 +268,14 @@ impl Port {
                     f.header[4..6].copy_from_slice(&(end as u16).to_be_bytes());
                 }
                 f.header.extend_from_slice(&f.data[..end]);
-                self.rx.push_back((f.header, ingress));
+                self.rx.push_back((f.header, ingress, f.mark));
             }
         }
         true
     }
 }
 pub(crate) struct Rx(Vec<u8>, u32);
-pub(crate) struct Tx<'a>(&'a mut Port);
+pub(crate) struct Tx<'a>(&'a mut Port, u32);
 impl RxToken for Rx {
     fn meta(&self) -> smoltcp::phy::PacketMeta {
         let mut meta = smoltcp::phy::PacketMeta::default();
@@ -279,6 +290,9 @@ impl RxToken for Rx {
     }
 }
 impl TxToken for Tx<'_> {
+    fn set_meta(&mut self, meta: smoltcp::phy::PacketMeta) {
+        self.1 = meta.mark;
+    }
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
@@ -300,13 +314,13 @@ impl TxToken for Tx<'_> {
                     fragment.extend_from_slice(&bits.to_be_bytes());
                     fragment.extend_from_slice(&id.to_be_bytes());
                     fragment.extend_from_slice(chunk);
-                    self.0.tx.push_back((fragment, None));
+                    self.0.tx.push_back((fragment, None, self.1));
                 }
             }
         } else if (len <= MTU || len <= 65535 && p.first().is_some_and(|b| b >> 4 == 4))
             && self.0.tx.len() < QUEUE
         {
-            self.0.tx.push_back((p, None));
+            self.0.tx.push_back((p, None, self.1));
         }
         r
     }
@@ -318,11 +332,11 @@ impl Device for Port {
         if self.tx.len() == QUEUE {
             return None;
         }
-        let (p, index) = self.rx.pop_front()?;
-        Some((Rx(p, index), Tx(self)))
+        let (p, index, _) = self.rx.pop_front()?;
+        Some((Rx(p, index), Tx(self, 0)))
     }
     fn transmit(&mut self, _: smoltcp::time::Instant) -> Option<Tx<'_>> {
-        (self.tx.len() < QUEUE).then_some(Tx(self))
+        (self.tx.len() < QUEUE).then_some(Tx(self, 0))
     }
     fn capabilities(&self) -> DeviceCapabilities {
         let mut c = DeviceCapabilities::default();
@@ -505,10 +519,10 @@ mod tests {
                 *b = (i % 251) as u8;
             }
             let mut port = Port::default();
-            Tx(&mut port).consume(original.len(), |b| b.copy_from_slice(&original));
+            Tx(&mut port, 0).consume(original.len(), |b| b.copy_from_slice(&original));
             (
                 original,
-                port.tx.into_iter().map(|(packet, _)| packet).collect(),
+                port.tx.into_iter().map(|(packet, _, _)| packet).collect(),
             )
         } else {
             let mut original = vec![0; 3020];

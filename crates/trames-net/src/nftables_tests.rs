@@ -235,6 +235,7 @@ fn counters_keep_parallel_packets_across_live_rule_publication() {
                 let ns = Namespace::default();
                 let graph = ns.graph.read().unwrap();
                 let mut ctx = Context {
+                    mark: 0,
                     packet_type: crate::ethernet::PacketType::Host,
                     tuple: crate::conntrack::key(&packet).unwrap().tuple,
                     packet: &mut packet,
@@ -301,6 +302,7 @@ fn allows(ns: &Namespace, hook: u32) -> bool {
         .read()
         .unwrap()
         .allows(&mut Context {
+            mark: 0,
             packet_type: crate::ethernet::PacketType::Host,
             tuple: crate::conntrack::key(&packet).unwrap().tuple,
             packet: &mut packet,
@@ -447,6 +449,7 @@ fn shifts_propagate_carries_across_overlapping_registers() {
     let graph = ns.graph.read().unwrap();
     let mut packet = packet();
     let mut ctx = Context {
+        mark: 0,
         packet_type: crate::ethernet::PacketType::Host,
         tuple: crate::conntrack::key(&packet).unwrap().tuple,
         packet: &mut packet,
@@ -505,6 +508,7 @@ fn fib_and_addrtype_use_packet_address_and_selected_guest_interface() {
     let graph = net.1.graph.read().unwrap();
     let mut packet = packet();
     let mut ctx = Context {
+        mark: 0,
         packet_type: crate::ethernet::PacketType::Host,
         tuple: crate::conntrack::key(&packet).unwrap().tuple,
         packet: &mut packet,
@@ -763,6 +767,25 @@ fn native_root_input_and_output_policy_enforces_real_socket_io() {
         peer.recv(&mut [0; 10]).unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock
     );
+    assert_eq!(
+        errno(&batch(
+            &root.1,
+            &[rule(
+                "f",
+                "output",
+                &[mark_expr(false, 17, u32::MAX, 0), verdict(1, None)].concat()
+            )]
+        )),
+        0
+    );
+    receiver.set_option(1, 36, 17).unwrap();
+    assert_eq!(receiver.get_option(1, 36), Ok(17));
+    receiver
+        .send(b"marked", 0, Some(peer.local_addr().unwrap()))
+        .unwrap();
+    let mut bytes = [0; 6];
+    assert_eq!(peer.recv(&mut bytes).unwrap(), 6);
+    assert_eq!(&bytes, b"marked");
 }
 
 #[test]
@@ -1072,7 +1095,12 @@ fn first_and_established_packets_reach_filters_with_the_same_nat_binding() {
             output: 0,
             raw: false,
         };
-        assert!(rules.process(&mut packet, &hook, &mut track, &mut state));
+        assert!(rules.process(
+            &mut RoutedPacket::new(&mut packet, 0),
+            &hook,
+            &mut track,
+            &mut state
+        ));
         let server = key(&packet).unwrap().tuple.destination;
         assert_eq!(server.ip(), std::net::IpAddr::from(backend));
         assert!(crate::virtualnet::packet::valid_transport(&packet));
@@ -1081,7 +1109,7 @@ fn first_and_established_packets_reach_filters_with_the_same_nat_binding() {
         let mut track = state.begin(&reply, 0).unwrap();
         assert!(track.reply);
         assert!(rules.process(
-            &mut reply,
+            &mut RoutedPacket::new(&mut reply, 0),
             &Hook { hook: 4, ..hook },
             &mut track,
             &mut state
@@ -1175,6 +1203,7 @@ fn xt_conntrack_checks_real_direction_expiry_status_and_revision_port_order() {
         let mut reply = message(server, client, 17, 0, b"reply");
         let track = connections.begin(&reply, 0).unwrap();
         let ctx = Context {
+            mark: 0,
             packet_type: crate::ethernet::PacketType::Host,
             packet: &mut reply,
             tuple: track.original.reverse().tuple,
@@ -1631,6 +1660,7 @@ fn metadata_register_width_link_types_and_missing_devices() {
     let graph = ns.graph.read().unwrap();
     let mut p = packet();
     let mut ctx = Context {
+        mark: 0,
         packet_type: crate::ethernet::PacketType::Broadcast,
         tuple: crate::conntrack::key(&p).unwrap().tuple,
         packet: &mut p,
@@ -1773,10 +1803,12 @@ fn payload_address_checksum_and_following_expression_observe_same_packet() {
             raw: false,
             packet_type: crate::ethernet::PacketType::Host,
         };
-        assert!(policy
-            .read()
-            .unwrap()
-            .process(&mut packet, &hook, &mut track, &mut state));
+        assert!(policy.read().unwrap().process(
+            &mut RoutedPacket::new(&mut packet, 0),
+            &hook,
+            &mut track,
+            &mut state
+        ));
         assert_eq!(
             crate::virtualnet::packet::header(&packet)
                 .unwrap()
@@ -1865,7 +1897,12 @@ fn xt_redirect_validates_hooks_and_translates_udp_in_both_directions() {
             for _ in 0..2 {
                 let mut query = message(from, public, 17, 0, b"request");
                 let mut track = state.begin(&query, 0).unwrap();
-                let accepted = rules.process(&mut query, &meta, &mut track, &mut state);
+                let accepted = rules.process(
+                    &mut RoutedPacket::new(&mut query, 0),
+                    &meta,
+                    &mut track,
+                    &mut state,
+                );
                 if input == 999 {
                     assert!(!accepted);
                     break;
@@ -1882,7 +1919,7 @@ fn xt_redirect_validates_hooks_and_translates_udp_in_both_directions() {
                 let mut track = state.begin(&reply, 0).unwrap();
                 assert!(track.reply);
                 assert!(rules.process(
-                    &mut reply,
+                    &mut RoutedPacket::new(&mut reply, 0),
                     &Hook { hook: 4, ..meta },
                     &mut track,
                     &mut state
@@ -1892,5 +1929,206 @@ fn xt_redirect_validates_hooks_and_translates_udp_in_both_directions() {
                 state.finish(track, true);
             }
         }
+    }
+}
+
+fn mark_expr(target: bool, value: u32, mask: u32, invert: u8) -> Vec<u8> {
+    let mut a = vec![];
+    string(&mut a, 1, if target { "MARK" } else { "mark" });
+    number(&mut a, 2, if target { 2 } else { 1 });
+    let mut info = [value.to_ne_bytes(), mask.to_ne_bytes()].concat();
+    if !target {
+        info.extend_from_slice(&[invert, 0, 0, 0]);
+    }
+    attr(&mut a, 3, &info);
+    expression(if target { "target" } else { "match" }, &a)
+}
+
+#[test]
+fn socket_marks_survive_local_hooks_and_fragments_and_clear_on_namespace_crossing() {
+    let fabric = crate::Fabric::new().unwrap();
+    let sender = Network::virtual_network(&fabric, 2, NetworkMode::Outbound).unwrap();
+    let peer = Network::virtual_network(&fabric, 3, NetworkMode::Outbound).unwrap();
+    let meta = |attr_number| {
+        let mut a = vec![];
+        number(&mut a, attr_number, 1);
+        number(&mut a, 2, 3);
+        expression("meta", &a)
+    };
+    for (family, local, remote) in [
+        (2, "127.0.0.1:25000", "10.0.0.3:25000"),
+        (10, "[::1]:25000", "[fd00::3]:25000"),
+    ] {
+        let install = |n: &Network, mut rules: Vec<Vec<u8>>| {
+            for r in &mut rules {
+                r[16] = family;
+            }
+            assert_eq!(errno(&batch(&n.1, &rules)), 0);
+        };
+        // Raw output sees the socket mark. Modify the low byte and copy through
+        // nft registers in the next chain. Local input must see the final mark.
+        let original = 0xa533u32;
+        let expected = 0xa547u32;
+        let mut check = vec![];
+        number(&mut check, 1, 1);
+        number(&mut check, 2, 0);
+        let mut value = vec![];
+        attr(&mut value, 1, &expected.to_ne_bytes());
+        attr(&mut check, 3, &value);
+        let mut immediate = vec![];
+        number(&mut immediate, 1, 1);
+        let mut updated = vec![];
+        attr(&mut updated, 1, &123u32.to_ne_bytes());
+        attr(&mut immediate, 2, &updated);
+        install(
+            &sender,
+            vec![
+                table("filter"),
+                chain("filter", "raw_out", Some(3), -300, 0),
+                chain("filter", "out", Some(3), 0, 0),
+                chain("filter", "in", Some(1), 0, 0),
+                rule(
+                    "filter",
+                    "raw_out",
+                    &[
+                        mark_expr(false, original, u32::MAX, 0),
+                        mark_expr(true, 0x47, 0xff, 0),
+                        verdict(1, None),
+                    ]
+                    .concat(),
+                ),
+                rule(
+                    "filter",
+                    "out",
+                    &[
+                        meta(1),
+                        expression("cmp", &check),
+                        expression("immediate", &immediate),
+                        meta(3),
+                        verdict(1, None),
+                    ]
+                    .concat(),
+                ),
+                rule(
+                    "filter",
+                    "in",
+                    &[mark_expr(false, 123, u32::MAX, 0), verdict(1, None)].concat(),
+                ),
+            ],
+        );
+        install(
+            &peer,
+            vec![
+                table("filter"),
+                chain("filter", "in", Some(1), 0, 0),
+                rule(
+                    "filter",
+                    "in",
+                    &[
+                        mark_expr(false, 123, u32::MAX, 1),
+                        mark_expr(false, 0, u32::MAX, 0),
+                        verdict(1, None),
+                    ]
+                    .concat(),
+                ),
+            ],
+        );
+        let tx = sender.socket(family.into(), 2, 0).unwrap();
+        let rx = sender.socket(family.into(), 2, 0).unwrap();
+        let remote_rx = peer.socket(family.into(), 2, 0).unwrap();
+        let local = local.parse().unwrap();
+        let remote = remote.parse().unwrap();
+        rx.bind(local).unwrap();
+        remote_rx.bind(remote).unwrap();
+        let payload = vec![0x47; 8192];
+        for &(mark, allowed) in &[(original, true), (0, false), (original, true)] {
+            tx.set_option(1, 36, mark as i32).unwrap();
+            for (dest, socket) in [(local, &rx), (remote, &remote_rx)] {
+                tx.send(&payload, 0, Some(dest)).unwrap();
+                if allowed {
+                    assert_eq!(socket.recv(payload.len(), 0).unwrap().data, payload);
+                } else {
+                    assert!(matches!(socket.recv(1, 0), Err(NetError(11))));
+                }
+            }
+        }
+
+        let server = sender.socket(family.into(), 1, 0).unwrap();
+        server.bind(local).unwrap();
+        server.listen(2).unwrap();
+        server.set_option(1, 36, original as i32).unwrap();
+        let client = sender.socket(family.into(), 1, 0).unwrap();
+        client.set_option(1, 36, original as i32).unwrap();
+        assert_eq!(client.connect(local), Err(NetError(115)));
+        assert_eq!(client.connect_complete(), Ok(true));
+        let (accepted, _) = server.accept().unwrap();
+        assert_eq!(accepted.get_option(1, 36), Ok(original as i32));
+        client.send(b"request", 0, None).unwrap();
+        assert_eq!(accepted.recv(7, 0).unwrap().data, b"request");
+        accepted.send(b"response", 0, None).unwrap();
+        assert_eq!(client.recv(8, 0).unwrap().data, b"response");
+
+        // The socket's first lookup succeeds. The OUTPUT rule rewrites its
+        // packet to 123, so the subsequent marked route must be unreachable.
+        let deny = crate::netdev::Rule {
+            family,
+            destination: None,
+            priority: 100,
+            table: 0,
+            action: 7,
+            mark: 123,
+            mask: u32::MAX,
+            input: None,
+            output: None,
+            uid: None,
+            invert: false,
+        };
+        sender
+            .1
+            .graph
+            .write()
+            .unwrap()
+            .policy_rule(sender.namespace_id(), deny.clone(), true, true, true)
+            .unwrap();
+        // A plain filter chain changes the mark without requesting a route lookup.
+        tx.send(b"filter", 0, Some(remote)).unwrap();
+        assert_eq!(remote_rx.recv(16, 0).unwrap().data, b"filter");
+        let mut route = Vec::new();
+        string(&mut route, 1, "filter");
+        string(&mut route, 3, "reroute");
+        let mut hook = Vec::new();
+        number(&mut hook, 1, 3);
+        number(&mut hook, 2, 10);
+        attr(&mut route, 0x8004, &hook);
+        string(&mut route, 7, "route");
+        install(
+            &sender,
+            vec![
+                req(3, family, 0x400, &route),
+                rule("filter", "reroute", &mark_expr(true, 123, u32::MAX, 0)),
+            ],
+        );
+        // An unchanged mark in a route chain also leaves the previous route intact.
+        tx.send(b"same", 0, Some(remote)).unwrap();
+        assert_eq!(remote_rx.recv(16, 0).unwrap().data, b"same");
+        // Change the value before the route chain. Its MARK target restores 123.
+        install(
+            &sender,
+            vec![
+                chain("filter", "change", Some(3), 5, 1),
+                rule("filter", "change", &mark_expr(true, 124, u32::MAX, 0)),
+            ],
+        );
+        tx.send(b"policy", 0, Some(remote)).unwrap();
+        assert!(matches!(remote_rx.recv(16, 0), Err(NetError(11))));
+        sender
+            .1
+            .graph
+            .write()
+            .unwrap()
+            .policy_rule(sender.namespace_id(), deny, false, false, true)
+            .unwrap();
+        tx.send(b"restored", 0, Some(remote)).unwrap();
+        assert_eq!(remote_rx.recv(16, 0).unwrap().data, b"restored");
     }
 }

@@ -4,7 +4,7 @@ use super::*;
 use crate::ethernet::PacketType;
 use crate::{
     conntrack::{self, Track},
-    nftables::Hook,
+    nftables::{Hook, RoutedPacket},
 };
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Delivery {
@@ -27,7 +27,7 @@ impl Topology {
         namespace: u64,
         stage: (u32, bool),
         devices: (u32, u32, PacketType),
-        packet: &mut [u8],
+        packet: &mut RoutedPacket<'_>,
         track: &mut Track,
         state: &mut conntrack::State,
     ) -> bool {
@@ -61,8 +61,11 @@ impl Topology {
         ns: u64,
         index: u32,
         incoming: Option<PacketType>,
-        packet: &mut [u8],
+        bytes: &mut [u8],
+        mark: &mut u32,
     ) -> bool {
+        let mut routed = RoutedPacket::new(bytes, *mark);
+        let packet = &mut routed;
         let Some(key) = conntrack::key(packet) else {
             return false;
         };
@@ -83,6 +86,7 @@ impl Topology {
             && self.hook(ns, (last, false), links, packet, &mut track, &mut state)
             && conntrack::key(packet)
                 .is_some_and(|k| k.tuple.destination.ip() == key.tuple.destination.ip());
+        *mark = packet.mark;
         state.finish(track, allowed);
         allowed
     }
@@ -90,7 +94,7 @@ impl Topology {
         &self,
         namespace: u64,
         input: Option<(u32, PacketType)>,
-        packet: &mut [u8],
+        packet: &mut RoutedPacket<'_>,
         external_reply: bool,
         route_hint: &mut Option<IpAddr>,
     ) -> Option<(u32, Option<IpAddr>, Track)> {
@@ -99,9 +103,19 @@ impl Topology {
         let k = conntrack::key(packet)?;
         let connection = self.spaces[&namespace].connections.clone();
         let mut state = connection.lock().unwrap();
-        let initial_route = self
-            .source(namespace, route_hint.unwrap_or(k.tuple.destination.ip()))
-            .ok();
+        let route = |destination, mark| {
+            self.source_for(
+                namespace,
+                destination,
+                RouteContext {
+                    mark,
+                    ..Default::default()
+                },
+            )
+        };
+        let initial_mark = packet.mark;
+        let initial_route =
+            route(route_hint.unwrap_or(k.tuple.destination.ip()), initial_mark).ok();
         let initial_out = initial_route.map_or(0, |(_, i, _)| i);
         let first = if input.is_some() { 0 } else { 3 };
         let mut raw = Track::untracked(k, 0);
@@ -148,11 +162,17 @@ impl Topology {
             let (out, gateway) = if external_reply {
                 (2, None)
             } else {
-                let (_, out, gateway) = if destination == k.tuple.destination.ip() {
-                    initial_route?
+                let routing_mark = if input.is_some() || destination != k.tuple.destination.ip() {
+                    packet.mark
                 } else {
-                    self.source(namespace, destination).ok()?
+                    packet.route_mark
                 };
+                let (_, out, gateway) =
+                    if destination == k.tuple.destination.ip() && initial_mark == routing_mark {
+                        initial_route?
+                    } else {
+                        route(route_hint.unwrap_or(destination), routing_mark).ok()?
+                    };
                 (out, gateway)
             };
             if let Some(input) = input {
@@ -165,7 +185,7 @@ impl Topology {
                 }
                 packet[ttl] -= 1;
                 if packet[0] >> 4 == 4 {
-                    smoltcp::wire::Ipv4Packet::new_unchecked(&mut *packet).fill_checksum();
+                    smoltcp::wire::Ipv4Packet::new_unchecked(&mut **packet).fill_checksum();
                 }
                 if !self.hook(
                     namespace,
@@ -199,9 +219,13 @@ impl Topology {
         input: Option<(u32, PacketType)>,
         packet: &mut [u8],
         mut route_hint: Option<IpAddr>,
+        mark: &mut u32,
     ) -> Option<(Delivery, Option<IpAddr>)> {
+        let mut routed = RoutedPacket::new(packet, *mark);
+        let packet = &mut routed;
         let (out, gateway, mut track) =
             self.route_namespace(ns, input, packet, false, &mut route_hint)?;
+        *mark = packet.mark;
         if out == 0 {
             return Some((
                 Delivery {
@@ -289,6 +313,8 @@ impl Topology {
             if !visited.insert(ns) {
                 return None;
             }
+            let mut routed = RoutedPacket::new(packet, 0);
+            let packet = &mut routed;
             let (out, gateway, mut track) = self.route_namespace(
                 ns,
                 input.map(|i| (i, PacketType::Host)),
@@ -379,7 +405,7 @@ impl Topology {
                 bridge.filter(|(b, _)| *b != ns && *b != target)
             {
                 if self.spaces[&bridge_ns].bridge_filter[usize::from(destination.is_ipv6())] {
-                    self.bridge_packet(bridge_ns, bridge_index, PacketType::Host, packet)?;
+                    self.bridge_packet(bridge_ns, bridge_index, PacketType::Host, packet, &mut 0)?;
                 }
             }
             ns = target;
@@ -393,7 +419,10 @@ impl Topology {
         bridge: u32,
         packet_type: PacketType,
         packet: &mut [u8],
+        mark: &mut u32,
     ) -> Option<()> {
+        let mut routed = RoutedPacket::new(packet, *mark);
+        let packet = &mut routed;
         let connection = self.spaces[&ns].connections.clone();
         let mut state = connection.lock().unwrap();
         let key = conntrack::key(packet)?;
@@ -431,6 +460,7 @@ impl Topology {
             &mut t,
             &mut state,
         );
+        *mark = packet.mark;
         state.finish(t, ok);
         ok.then_some(())
     }
@@ -495,6 +525,7 @@ impl Topology {
         input: bool,
         packet: &mut [u8],
         forward: Option<NativeForward>,
+        mark: u32,
     ) -> Option<Option<NativeForward>> {
         if !input {
             if let Some(forward) = forward {
@@ -504,13 +535,19 @@ impl Topology {
                 let (out, _, _) = self.route_namespace(
                     ns,
                     Some((forward.input, PacketType::Host)),
-                    packet,
+                    &mut RoutedPacket::new(packet, 0),
                     true,
                     &mut None,
                 )?;
                 return (out == 2).then_some(Some(forward));
             }
-            self.route_namespace(ns, None, packet, false, &mut None)?;
+            self.route_namespace(
+                ns,
+                None,
+                &mut RoutedPacket::new(packet, mark),
+                false,
+                &mut None,
+            )?;
             return Some(None);
         }
         let result = self.route_packet(ns, Some(2), packet)?;
@@ -527,7 +564,7 @@ impl Topology {
             reply: wire.reverse(),
         }))
     }
-    pub fn output_redirect(&self, ns: u64, packet: &mut [u8], bound: bool) -> bool {
+    pub fn output_redirect(&self, ns: u64, packet: &mut [u8], bound: bool, mark: u32) -> bool {
         // Route preview uses private copies: no counters, NAT reservations or
         // connection state change until the real SYN/datagram enters the stack.
         let mut copy = self.clone();
@@ -540,7 +577,13 @@ impl Topology {
             crate::conntrack::State::default()
         };
         space.connections = Arc::new(Mutex::new(connections));
-        let Some((_, _, t)) = copy.route_namespace(ns, None, packet, false, &mut None) else {
+        let Some((_, _, t)) = copy.route_namespace(
+            ns,
+            None,
+            &mut RoutedPacket::new(packet, mark),
+            false,
+            &mut None,
+        ) else {
             return false;
         };
         t.status & 32 != 0
