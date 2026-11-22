@@ -257,6 +257,10 @@ impl Socket {
             return Err(NetError(90));
         }
         let (dev, source) = self.group_source(dest, control.packet_info)?;
+        let policy = self.state.borrow().ipv4_pmtu;
+        if self.kind == 2 && policy.enforce_mtu() && bytes.len() + 28 > dev.mtu as usize {
+            return Err(self.udp_too_big(dest, dev.mtu));
+        }
         self.ensure_bound()?;
         let state = self.state.borrow();
         if state.write_closed {
@@ -297,7 +301,11 @@ impl Socket {
         };
         packet[1] = class;
         packet[8] = ttl;
-        smoltcp::wire::Ipv4Packet::new_unchecked(&mut packet).fill_checksum();
+        let mut header = smoltcp::wire::Ipv4Packet::new_unchecked(&mut packet);
+        if self.kind == 2 {
+            header.set_dont_frag(policy.udp_df() && bytes.len() + 28 <= dev.mtu as usize);
+        }
+        header.fill_checksum();
         let mut fabric = self.network.0.fabric.0.borrow_mut();
         if !view.graph.read().unwrap().udp_group_hooks(
             view.namespace,

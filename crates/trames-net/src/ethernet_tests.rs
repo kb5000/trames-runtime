@@ -781,3 +781,103 @@ fn full_udp_writer_advances_its_own_fragment_resource() {
     drop((tx, rx, na, nb, a, b));
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn ipv4_pmtu_policy_controls_wire_flags_fragmentation_and_size_errors() {
+    let fabric = Fabric::new().unwrap();
+    let a = Network::virtual_network(&fabric, 2, NetworkMode::Full).unwrap();
+    let b = Network::virtual_network(&fabric, 3, NetworkMode::Full).unwrap();
+    let capture = raw(&b, 2);
+    let rx = b.socket(2, 2, 0).unwrap();
+    let dest = "10.0.0.3:35003".parse().unwrap();
+    rx.bind(dest).unwrap();
+    let tx = a.socket(2, 2, 0).unwrap();
+    tx.set_option(0, 11, 1).unwrap();
+    for (mode, df, strict) in [
+        (0, false, false),
+        (1, true, false),
+        (2, true, true),
+        (3, true, true),
+        (4, false, true),
+        (5, false, false),
+    ] {
+        tx.set_option(0, 10, i32::from(mode)).unwrap();
+        let payload = [mode; 1472];
+        assert_eq!(tx.send(&payload, 0, Some(dest)), Ok(payload.len()));
+        assert_eq!(rx.recv(2000, 0).unwrap().data, payload);
+        let mut data_frames = 0;
+        while let Ok(r) = capture.recv(2048, 0) {
+            let frame = Frame::new(&r.data).unwrap();
+            if frame.protocol() == 0x800 && frame.payload()[9] == 17 {
+                let ip = smoltcp::wire::Ipv4Packet::new_checked(frame.payload()).unwrap();
+                assert_eq!(ip.dont_frag(), df);
+                assert!(ip.verify_checksum());
+                data_frames += 1;
+            }
+        }
+        assert_eq!(data_frames, 1);
+        let large = [mode; 1473];
+        let result = tx.send(&large, 0, Some(dest));
+        if strict {
+            assert_eq!(result, Err(NetError(90)));
+            let err = tx.recv(100, 0x2000).unwrap().ip.error.unwrap();
+            assert_eq!((err.errno, err.info), (90, 1500));
+            assert!(matches!(rx.recv(2000, 0), Err(NetError(11))));
+        } else {
+            assert_eq!(result, Ok(large.len()));
+            assert_eq!(rx.recv(2000, 0).unwrap().data, large);
+        }
+        while capture.recv(2048, 0).is_ok() {}
+    }
+
+    assert_eq!(tx.get_option(0, 14), Err(NetError(107)));
+    tx.connect(dest).unwrap();
+    assert_eq!(tx.get_option(0, 14), Ok(1500));
+    assert_eq!(tx.set_option(0, 10, 6), Err(NetError(22)));
+    assert_eq!(tx.get_option(0, 10), Ok(5));
+
+    let local_reader = a.socket(2, 2, 0).unwrap();
+    local_reader
+        .bind("127.0.0.1:35006".parse().unwrap())
+        .unwrap();
+    let dual = a.socket(10, 2, 0).unwrap();
+    dual.set_option(0, 10, 2).unwrap();
+    dual.connect("[::ffff:127.0.0.1]:35006".parse().unwrap())
+        .unwrap();
+    assert!(dual.get_option(0, 14).unwrap() > 4096);
+    assert_eq!(dual.send(&[5; 4096], 0, None), Ok(4096));
+    assert_eq!(local_reader.recv(4096, 0).unwrap().data, [5; 4096]);
+    let group = a.socket(2, 2, 0).unwrap();
+    group.connect("239.3.0.1:35007".parse().unwrap()).unwrap();
+    assert_eq!(group.get_option(0, 14), Ok(1500));
+    group.set_option(0, 10, 2).unwrap();
+    assert_eq!(group.send(&[0; 1473], 0, None), Err(NetError(90)));
+
+    let listener = b.socket(2, 1, 0).unwrap();
+    listener.set_option(0, 10, 0).unwrap();
+    listener.bind(dest).unwrap();
+    listener.listen(1).unwrap();
+    let client = a.socket(2, 1, 0).unwrap();
+    assert_eq!(client.connect(dest), Err(NetError(115)));
+    let (peer, _) = listener.accept().unwrap();
+    assert_eq!(peer.get_option(0, 10), Ok(0));
+    assert_eq!(client.get_option(0, 10), Ok(1));
+    for (mode, df) in [(0, false), (2, true)] {
+        peer.set_option(0, 10, mode).unwrap();
+        assert_eq!(peer.send(b"tcp", 0, None), Ok(3));
+        assert_eq!(client.recv(3, 0).unwrap().data, b"tcp");
+        let mut saw = false;
+        while let Ok(r) = capture.recv(2048, 0) {
+            let frame = Frame::new(&r.data).unwrap();
+            if frame.protocol() == 0x800
+                && frame.payload()[9] == 6
+                && frame.payload().ends_with(b"tcp")
+            {
+                let ip = smoltcp::wire::Ipv4Packet::new_checked(frame.payload()).unwrap();
+                assert_eq!(ip.dont_frag(), df);
+                saw = true;
+            }
+        }
+        assert!(saw);
+    }
+}

@@ -266,7 +266,9 @@ impl TxToken for Tx<'_> {
                     self.0.tx.push_back(fragment);
                 }
             }
-        } else if len <= MTU && self.0.tx.len() < QUEUE {
+        } else if (len <= MTU || len <= 65535 && p.first().is_some_and(|b| b >> 4 == 4))
+            && self.0.tx.len() < QUEUE
+        {
             self.0.tx.push_back(p);
         }
         r

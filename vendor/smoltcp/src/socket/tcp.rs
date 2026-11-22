@@ -511,6 +511,7 @@ pub struct Socket<'a> {
     cork_until: Option<Instant>,
     max_segment: usize,
     quick_ack: bool,
+    ipv4_dont_fragment: bool,
     #[cfg(feature = "alloc")]
     observer: Option<crate::iface::SocketHandle>,
     #[cfg(feature = "alloc")]
@@ -611,6 +612,7 @@ impl<'a> Socket<'a> {
             cork_until: None,
             max_segment: usize::MAX,
             quick_ack: false,
+            ipv4_dont_fragment: true,
             #[cfg(feature = "alloc")]
             observer: None,
             #[cfg(feature = "alloc")]
@@ -1092,6 +1094,14 @@ impl<'a> Socket<'a> {
 
     pub fn quick_ack(&self) -> bool {
         self.quick_ack
+    }
+
+    pub fn set_ipv4_dont_fragment(&mut self, enabled: bool) {
+        self.ipv4_dont_fragment = enabled;
+    }
+
+    pub(crate) fn ipv4_dont_fragment(&self) -> bool {
+        self.ipv4_dont_fragment
     }
 
     pub fn set_quick_ack(&mut self, enabled: bool) {

@@ -697,6 +697,9 @@ impl Topology {
             })
             .collect()
     }
+    pub(super) fn link_mtu(&self, id: u64, index: u32) -> Result<u32> {
+        Ok(self.devices.get(&(id, index)).ok_or(NetError(19))?.mtu)
+    }
     pub fn device(&self, id: u64, index: u32) -> Result<Device> {
         let mut d = self
             .devices

@@ -249,19 +249,24 @@ impl Socket {
         }
         self.destination_ip(a.ip())
     }
-    fn path_mtu(&self, destination: IpAddr) -> Result<u32> {
-        Ok(if let Some(view) = self.network.0.routing.get() {
-            let graph = view.graph.read().unwrap();
-            let (_, index, _) =
-                graph.source_for(view.namespace, destination, self.route_context())?;
-            graph.device(view.namespace, index)?.mtu
-        } else if destination.is_loopback() {
-            65536
-        } else {
-            self.network.0.info.mtu
-        })
+    pub(super) fn udp_too_big(&self, destination: SocketAddr, mtu: u32) -> NetError {
+        let mut fabric = self.network.0.fabric.0.borrow_mut();
+        let state = self.state.borrow();
+        if state.udp_errors.as_ref().unwrap().too_big(destination, mtu) {
+            if let Some(source) = &state.udp_readable {
+                fabric.notifications.push(source.clone());
+            }
+        }
+        NetError(90)
     }
     fn destination_ip(&self, v: IpAddr) -> Result<()> {
+        self.destination_route::<false>(v).map(|_| ())
+    }
+    fn path_mtu(&self, destination: IpAddr) -> Result<u32> {
+        self.destination_route::<true>(destination)
+    }
+    /// Validate the route once. Only MTU-aware operations read the selected link.
+    fn destination_route<const WITH_MTU: bool>(&self, v: IpAddr) -> Result<u32> {
         if self.network.0.routing.get().is_none()
             && self.network.is_isolated()
             && (!v.is_loopback() || !self.network.0.loopback_up.get())
@@ -278,8 +283,13 @@ impl Socket {
             return Err(NetError(13));
         }
         if let Some(view) = self.network.0.routing.get() {
-            self.route_source(view, v)?;
-            return Ok(());
+            let graph = view.graph.read().unwrap();
+            let (_, index, _) = graph.source_for(view.namespace, v, self.route_context())?;
+            return if WITH_MTU {
+                graph.link_mtu(view.namespace, index)
+            } else {
+                Ok(0)
+            };
         }
         if private_ip(v) && v != IpAddr::V4(v4(1)) && v != IpAddr::V6(v6(1)) {
             let i = self.network.0.fabric.0.borrow();
@@ -292,7 +302,11 @@ impl Socket {
                 return Err(NetError(113));
             }
         }
-        Ok(())
+        Ok(if v.is_loopback() {
+            65536
+        } else {
+            self.network.0.info.mtu
+        })
     }
     fn addresses(&self, bound: SocketAddr) -> Vec<SocketAddr> {
         let state = self.state.borrow();
@@ -691,6 +705,7 @@ impl Socket {
             icmp_pending: None,
             hop_limit: state.hop_limit,
             receive_hops: state.receive_hops,
+            ipv4_pmtu: state.ipv4_pmtu,
             udp_options: state.udp_options,
             last_hop: None,
             broadcast: state.broadcast,
@@ -1085,23 +1100,25 @@ impl Socket {
             } else {
                 initial.peer.ok_or(NetError(89))?
             };
+            let policy = initial.ipv4_pmtu;
             drop(initial);
             if self.udp_group(a.ip()) {
                 return self.send_group(a, bytes, control);
             }
-            self.destination(a)?;
-            if bytes.len() > if a.is_ipv4() { 65507 } else { 65527 } {
-                if a.is_ipv6() {
-                    let mtu = self.path_mtu(a.ip())?;
-                    let mut fabric = self.network.0.fabric.0.borrow_mut();
-                    let state = self.state.borrow();
-                    if state.udp_errors.as_ref().unwrap().too_big(a, mtu) {
-                        if let Some(source) = &state.udp_readable {
-                            fabric.notifications.push(source.clone());
-                        }
-                    }
+            if a.port() == 0 {
+                return Err(NetError(22));
+            }
+            let mtu = self.path_mtu(a.ip())?;
+            let ip_size = bytes.len() + if a.is_ipv4() { 28 } else { 48 };
+            if a.is_ipv4() {
+                if policy.enforce_mtu() && ip_size > mtu.min(65535) as usize {
+                    return Err(self.udp_too_big(a, mtu));
                 }
-                return Err(NetError(90));
+                if ip_size > 65535 {
+                    return Err(NetError(90));
+                }
+            } else if bytes.len() > 65527 {
+                return Err(self.udp_too_big(a, mtu));
             }
             if self.state.borrow().bound.is_none() {
                 self.ensure_bound()?;
@@ -1177,6 +1194,11 @@ impl Socket {
                             let mut meta = smoltcp::phy::PacketMeta::default();
                             meta.traffic_class =
                                 fields.traffic_class.or(defaults.traffic_class).unwrap_or(0);
+                            meta.ipv4_clear_df = !policy.udp_df() || ip_size > mtu as usize;
+                            // A software IP port may carry a full loopback or jumbo
+                            // datagram when the selected guest route admits it.
+                            meta.ipv4_route_admits_jumbo =
+                                a.is_ipv4() && ip_size > packet::MTU && ip_size <= mtu as usize;
                             meta.omit_udp_checksum = state.no_check && a.is_ipv4();
                             meta.hop_limit = fields.hop_limit.or(defaults.hop_limit);
                             meta
@@ -1672,6 +1694,19 @@ impl Socket {
         let mut i = self.network.0.fabric.0.borrow_mut();
         let mut state = self.state.borrow_mut();
         match (level, name) {
+            (0, 10) if matches!(self.kind, 1 | 2) => {
+                let policy = Ipv4Pmtu::parse(value)?;
+                if self.kind == 1 {
+                    let node = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
+                    for &handle in &state.handles {
+                        node.sockets
+                            .get_mut::<tcp::Socket>(handle)
+                            .set_ipv4_dont_fragment(policy.tcp_df());
+                    }
+                }
+                state.ipv4_pmtu = policy;
+                return Ok(());
+            }
             (0, 11) | (41, 25) if self.kind == 2 && (level == 0 || self.family == 10) => {
                 state
                     .udp_errors
@@ -2075,6 +2110,22 @@ impl Socket {
             });
         }
         let state = self.state.borrow();
+        if level == 0 && matches!(self.kind, 1 | 2) {
+            match name {
+                10 => return Ok(state.ipv4_pmtu as i32),
+                14 => {
+                    let peer = state.peer.ok_or(NetError(107))?;
+                    drop(state);
+                    let mtu = if self.kind == 2 && self.udp_group(peer.ip()) {
+                        self.group_source(peer, None)?.0.mtu
+                    } else {
+                        self.path_mtu(peer.ip())?
+                    };
+                    return Ok(mtu as i32);
+                }
+                _ => {}
+            }
+        }
         if self.kind == 2 && (level == 0 || level == 41 && self.family == 10)
             || self.kind == 3 && level == if self.family == 2 { 0 } else { 41 }
         {

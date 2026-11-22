@@ -410,7 +410,7 @@ fn query_address(
 // Linux SOL_IP accepts a byte or an int for these scalar header options.
 // Each value these options return fits in one byte (including the receive flags).
 fn ipv4_header_option(a: [u64; 6]) -> bool {
-    a[1] as u32 == 0 && matches!(a[2] as u32, 1 | 2 | 8 | 12 | 13 | 33 | 34 | 49)
+    a[1] as u32 == 0 && matches!(a[2] as u32, 1 | 2 | 8 | 10 | 12 | 13 | 33 | 34 | 49)
 }
 fn read_option<const N: usize>(
     memory: &mut impl CpuMemory,
@@ -992,7 +992,7 @@ mod tests {
         let mut memory = Memory::default();
         memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         memory.write(0x1fff, &[0xc3]).unwrap();
-        for option in [1, 2, 8, 12, 13] {
+        for option in [1, 2, 8, 10, 12, 13] {
             for width in [1, 2, 3] {
                 let args = [0, 0, option, 0x1fff, width, 0];
                 write_option(&memory, args, |value| {

@@ -605,16 +605,27 @@ impl Repr {
         checksum_caps: &ChecksumCapabilities,
         class: u8,
     ) {
+        self.emit_with_flags(packet, checksum_caps, class, true, 0);
+    }
+
+    pub(crate) fn emit_with_flags<T: AsRef<[u8]> + AsMut<[u8]>>(
+        &self,
+        packet: &mut Packet<T>,
+        checksum_caps: &ChecksumCapabilities,
+        class: u8,
+        dont_fragment: bool,
+        ident: u16,
+    ) {
         packet.set_version(4);
         packet.set_header_len(field::DST_ADDR.end as u8);
         packet.set_dscp(class >> 2);
         packet.set_ecn(class & 3);
         let total_len = packet.header_len() as u16 + self.payload_len as u16;
         packet.set_total_len(total_len);
-        packet.set_ident(0);
+        packet.set_ident(ident);
         packet.clear_flags();
         packet.set_more_frags(false);
-        packet.set_dont_frag(true);
+        packet.set_dont_frag(dont_fragment);
         packet.set_frag_offset(0);
         packet.set_hop_limit(self.hop_limit);
         packet.set_next_header(self.next_header);

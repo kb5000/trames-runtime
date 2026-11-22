@@ -823,13 +823,15 @@ impl Interface {
                     })
                 }
                 #[cfg(feature = "socket-tcp")]
-                Socket::Tcp(socket) => socket.dispatch(&mut self.inner, |inner, (ip, tcp)| {
-                    respond(
-                        inner,
-                        PacketMeta::default(),
-                        Packet::new(ip, IpPayload::Tcp(tcp)),
-                    )
-                }),
+                Socket::Tcp(socket) => {
+                    let meta = PacketMeta {
+                        ipv4_clear_df: !socket.ipv4_dont_fragment(),
+                        ..PacketMeta::default()
+                    };
+                    socket.dispatch(&mut self.inner, |inner, (ip, tcp)| {
+                        respond(inner, meta, Packet::new(ip, IpPayload::Tcp(tcp)))
+                    })
+                }
                 #[cfg(feature = "socket-dhcpv4")]
                 Socket::Dhcpv4(socket) => {
                     socket.dispatch(&mut self.inner, |inner, (ip, udp, dhcp)| {
@@ -1264,7 +1266,9 @@ impl InterfaceInner {
         }
 
         #[cfg(feature = "proto-ipv4-fragmentation")]
-        let ipv4_id = self.next_ipv4_frag_ident();
+        let ident = self.next_ipv4_frag_ident();
+        #[cfg(all(feature = "proto-ipv4", not(feature = "proto-ipv4-fragmentation")))]
+        let ident = 0;
 
         // First we calculate the total length that we will have to emit.
         let mut total_len = ip_repr.buffer_len();
@@ -1310,10 +1314,12 @@ impl InterfaceInner {
         let emit_ip = |repr: &IpRepr, tx_buffer: &mut [u8]| {
             match repr {
                 #[cfg(feature = "proto-ipv4")]
-                IpRepr::Ipv4(v4) => v4.emit_with_class(
+                IpRepr::Ipv4(v4) => v4.emit_with_flags(
                     &mut Ipv4Packet::new_unchecked(&mut *tx_buffer),
                     &caps.checksum,
                     traffic_class,
+                    !meta.ipv4_clear_df,
+                    if meta.ipv4_clear_df { ident } else { 0 },
                 ),
                 #[cfg(feature = "proto-ipv6")]
                 IpRepr::Ipv6(v6) => {
@@ -1333,7 +1339,7 @@ impl InterfaceInner {
             #[cfg(feature = "proto-ipv4")]
             IpRepr::Ipv4(repr) => {
                 // If we have an IPv4 packet, then we need to check if we need to fragment it.
-                if total_ip_len > self.caps.ip_mtu() {
+                if total_ip_len > self.caps.ip_mtu() && !meta.ipv4_route_admits_jumbo {
                     #[cfg(feature = "proto-ipv4-fragmentation")]
                     {
                         // The single fragmentation buffer belongs to the in-flight
@@ -1380,8 +1386,8 @@ impl InterfaceInner {
                         emit_ip(&ip_repr, &mut frag.buffer);
 
                         let mut ipv4_packet = Ipv4Packet::new_unchecked(&mut frag.buffer[..]);
-                        frag.ipv4.ident = ipv4_id;
-                        ipv4_packet.set_ident(ipv4_id);
+                        frag.ipv4.ident = ident;
+                        ipv4_packet.set_ident(ident);
                         ipv4_packet.set_more_frags(true);
                         ipv4_packet.set_dont_frag(false);
                         ipv4_packet.set_frag_offset(0);

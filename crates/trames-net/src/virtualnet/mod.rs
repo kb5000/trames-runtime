@@ -199,6 +199,42 @@ struct UdpOptions {
     receive_info: bool,
     original_destination: bool,
 }
+/// Linux IP_MTU_DISCOVER for IPv4 traffic, including v4-mapped peers.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[repr(i32)]
+enum Ipv4Pmtu {
+    Dont,
+    #[default]
+    Want,
+    Do,
+    Probe,
+    Interface,
+    Omit,
+}
+
+impl Ipv4Pmtu {
+    fn parse(value: i32) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Dont),
+            1 => Ok(Self::Want),
+            2 => Ok(Self::Do),
+            3 => Ok(Self::Probe),
+            4 => Ok(Self::Interface),
+            5 => Ok(Self::Omit),
+            _ => Err(NetError(22)),
+        }
+    }
+    fn enforce_mtu(self) -> bool {
+        matches!(self, Self::Do | Self::Probe | Self::Interface)
+    }
+    fn udp_df(self) -> bool {
+        matches!(self, Self::Want | Self::Do | Self::Probe)
+    }
+    fn tcp_df(self) -> bool {
+        matches!(self, Self::Want | Self::Do)
+    }
+}
+
 struct State {
     handles: Vec<SocketHandle>,
     connection: Connection,
@@ -246,6 +282,7 @@ struct State {
     icmp_pending: Option<(Vec<u8>, IpAddr)>,
     hop_limit: u8,
     receive_hops: bool,
+    ipv4_pmtu: Ipv4Pmtu,
     udp_options: [UdpOptions; 2],
     udp_errors: Option<Arc<udp_errors::Errors>>,
     multicast: Option<Box<multicast::Options>>,
@@ -372,6 +409,7 @@ impl State {
 
     fn new_tcp_socket(&self) -> tcp::Socket<'static> {
         let mut socket = tcp_socket_with_buffers(self.receive_buffer, self.send_buffer);
+        socket.set_ipv4_dont_fragment(self.ipv4_pmtu.tcp_df());
         socket.set_linux_binding(
             self.device.unwrap_or(0),
             self.listener_rank,
@@ -1816,6 +1854,7 @@ impl Network {
                 icmp_pending: None,
                 hop_limit: 64,
                 receive_hops: false,
+                ipv4_pmtu: Ipv4Pmtu::default(),
                 udp_options: Default::default(),
                 last_hop: None,
                 broadcast: false,

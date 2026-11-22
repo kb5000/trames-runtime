@@ -167,6 +167,11 @@ pub struct PacketMeta {
     pub ingress_index: u32,
     /// Emit an IPv4 UDP datagram with the optional checksum disabled.
     pub omit_udp_checksum: bool,
+    /// Clear the IPv4 DF bit on an otherwise unfragmented outgoing packet.
+    pub ipv4_clear_df: bool,
+    /// Software IP ports may accept a whole datagram larger than their default
+    /// link size when the selected route has its own larger MTU.
+    pub ipv4_route_admits_jumbo: bool,
     /// On transmit, None selects the socket default.
     pub hop_limit: Option<u8>,
     #[cfg(feature = "packetmeta-id")]
