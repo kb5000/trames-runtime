@@ -236,6 +236,20 @@ mod tests {
         assert_ne!(read(&mut next, b"/proc/sys/kernel/random/boot_id"), first);
     }
     #[test]
+    fn absent_sysfs_file_is_looked_up_before_write_checks() {
+        let mut v = Vfs::default();
+        snapshot(&mut v);
+        let path = b"/sys/kernel/debug/kcov";
+        for flags in [0, 1, 2, O_TRUNC | 2] {
+            assert_eq!(v.open_at(AT_FDCWD, path, flags, 0), Err(Errno(2)));
+        }
+        assert_eq!(
+            v.open_at(AT_FDCWD, b"/sys/missing", O_CREAT | 2, 0o600),
+            Err(Errno(30))
+        );
+    }
+
+    #[test]
     fn random_uuid_is_fresh_v4_readonly_and_discoverable() {
         let mut v = Vfs::default();
         snapshot(&mut v);

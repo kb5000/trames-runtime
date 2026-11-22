@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Guest-owned AF_PACKET receive rings. Frame ownership is published through
 //! the same physical pages that the interpreter and hardware executor map.
+mod blocks;
 use super::{NetError, Result};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -12,6 +13,7 @@ const SOCKADDR_END: usize = HEADER + 20;
 const NET_OFFSET: usize = (SOCKADDR_END + 16).next_multiple_of(16);
 
 pub(super) struct Ring {
+    blocks: Option<Box<blocks::Blocks>>,
     storage: Arc<Storage>,
     block: usize,
     frame: usize,
@@ -51,6 +53,9 @@ impl Ring {
         let [block, blocks, frame, count] = std::array::from_fn(|i| {
             u32::from_le_bytes(request[i * 4..i * 4 + 4].try_into().unwrap()) as usize
         });
+        if version == 2 && bytes.len() < 28 {
+            return Err(NetError(22));
+        }
         if blocks == 0 {
             return if count == 0 {
                 Ok(None)
@@ -62,7 +67,7 @@ impl Ring {
         if block == 0
             || !block.is_multiple_of(PAGE)
             || !frame.is_multiple_of(16)
-            || frame < SOCKADDR_END + reserve as usize
+            || frame < (if version == 2 { 68 } else { SOCKADDR_END }) + reserve as usize
             || net > u16::MAX as usize
         {
             return Err(NetError(22));
@@ -75,12 +80,20 @@ impl Ring {
             .checked_mul(blocks)
             .filter(|&v| v <= MAX_DESCRIBED_BYTES)
             .ok_or(NetError(12))?;
+        let block_layout = if version == 2 {
+            Some(Box::new(blocks::Blocks::configure(
+                bytes, block, blocks, reserve,
+            )?))
+        } else {
+            None
+        };
         let mut pages = Vec::new();
         pages
             .try_reserve_exact(size / PAGE)
             .map_err(|_| NetError(12))?;
         pages.resize_with(size / PAGE, OnceLock::new);
         Ok(Some(Self {
+            blocks: block_layout,
             storage: Arc::new(Storage {
                 id: trames_memory::new_backing_identity(),
                 pages,
@@ -111,12 +124,31 @@ impl Ring {
         }
     }
     pub fn readable(&self) -> bool {
+        if let Some(blocks) = &self.blocks {
+            return blocks.readable(&self.storage);
+        }
         let last = if self.head == 0 {
             self.count - 1
         } else {
             self.head - 1
         };
         self.owned(self.offset(last))
+    }
+    pub fn published_blocks(&self) -> Option<u64> {
+        self.blocks.as_ref().map(|b| b.published())
+    }
+    pub fn block_deadline(&self) -> Option<std::time::Instant> {
+        self.blocks.as_ref().and_then(|b| b.deadline())
+    }
+    pub fn retire_due(&mut self, now: std::time::Instant, losing: bool) -> bool {
+        self.blocks
+            .as_mut()
+            .is_some_and(|b| b.retire_due(&self.storage, now, losing))
+    }
+    pub fn take_freezes(&mut self) -> u32 {
+        self.blocks
+            .as_mut()
+            .map_or(0, |b| std::mem::take(&mut b.freezes))
     }
     pub fn mapped(&self) -> bool {
         Arc::strong_count(&self.storage) > 1
@@ -151,6 +183,9 @@ impl Ring {
         copy: bool,
         losing: bool,
     ) -> Delivery {
+        if let Some(blocks) = &mut self.blocks {
+            return blocks.receive(&self.storage, bytes, captured, link_len, address, losing);
+        }
         let start = self.offset(self.head);
         if self.owned(start) {
             return Delivery::Full;

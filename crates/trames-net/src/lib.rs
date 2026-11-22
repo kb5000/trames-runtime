@@ -1330,7 +1330,17 @@ impl Socket {
         let SocketBackend::Packet(s) = &self.backend else {
             return Err(NetError(92));
         };
-        Ok(s.statistics())
+        Ok(s.statistics(8, 8)?.0[..8].try_into().unwrap())
+    }
+    pub fn take_packet_statistics(
+        &self,
+        capacity: usize,
+        writable: usize,
+    ) -> Result<([u8; 12], usize)> {
+        let SocketBackend::Packet(s) = &self.backend else {
+            return Err(NetError(92));
+        };
+        s.statistics(capacity, writable)
     }
     pub fn packet_header_size(&self, version: u32) -> Result<u32> {
         if !matches!(self.backend, SocketBackend::Packet(_)) {

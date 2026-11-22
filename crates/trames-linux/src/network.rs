@@ -138,7 +138,30 @@ pub(super) fn control(
                 return read_option(memory, a, || socket.icmp6_filter().map_err(net));
             }
             if (a[1], a[2]) == (263, 6) {
-                return read_option(memory, a, || socket.packet_statistics().map_err(net));
+                let capacity = u32_at(memory, a[4])?;
+                if capacity > i32::MAX as u32 {
+                    return Err(Errno(22));
+                }
+                Linux::check(memory, a[4], 4, Access::Write)?;
+                // Preflight both Linux layouts before taking the reset-on-read counters.
+                // A concurrent PACKET_VERSION change selects the layout under the socket lock.
+                let max = (capacity as usize).min(12);
+                let writable = if max == 0 || Linux::check(memory, a[3], max, Access::Write).is_ok()
+                {
+                    max
+                } else if max > 8 && Linux::check(memory, a[3], 8, Access::Write).is_ok() {
+                    8
+                } else {
+                    0
+                };
+                let (bytes, n) = socket.take_packet_statistics(max, writable).map_err(net)?;
+                if n != 0 {
+                    memory.write(a[3], &bytes[..n]).map_err(|_| Errno(14))?;
+                }
+                memory
+                    .write(a[4], &(n as u32).to_le_bytes())
+                    .map_err(|_| Errno(14))?;
+                return Ok(0);
             }
             if (a[1], a[2]) == (263, 11) {
                 if (u32_at(memory, a[4])? as i32) < 4 {

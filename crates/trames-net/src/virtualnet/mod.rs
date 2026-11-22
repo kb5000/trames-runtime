@@ -753,6 +753,9 @@ impl Fabric {
             .filter_map(|o| o.routing.get().cloned())
         {
             let graph = view.graph.read().unwrap();
+            if let Some(delay) = graph.packet_block_delay(view.namespace) {
+                next = Some(next.map_or(delay, |d| d.min(delay)));
+            }
             if let Some(delay) = graph.neighbor_delay(view.namespace) {
                 next = Some(next.map_or(delay, |d| d.min(delay)));
             }

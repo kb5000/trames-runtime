@@ -12,9 +12,39 @@ use std::{
 #[derive(Default)]
 pub(crate) struct Hub {
     active: AtomicUsize,
+    block_rings: AtomicUsize,
     sockets: Mutex<Vec<Weak<Receiver>>>,
 }
 impl Hub {
+    pub fn block_delay(&self) -> Option<Duration> {
+        if self.block_rings.load(Relaxed) == 0 {
+            return None;
+        }
+        self.sockets
+            .lock()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter_map(|r| r.state.lock().ring.as_ref()?.block_deadline())
+            .min()
+            .map(|d| d.saturating_duration_since(std::time::Instant::now()))
+    }
+    pub fn retire_blocks(&self, wakes: &mut Vec<Arc<trames_shared::Readiness>>) {
+        if self.block_rings.load(Relaxed) == 0 {
+            return;
+        }
+        let now = std::time::Instant::now();
+        for r in self.sockets.lock().iter().filter_map(Weak::upgrade) {
+            let mut s = r.state.lock();
+            let losing = s.dropped != 0;
+            if s.ring
+                .as_mut()
+                .is_some_and(|ring| ring.retire_due(now, losing))
+            {
+                s.epoch = s.epoch.wrapping_add(1);
+                wakes.push(r.readiness.clone());
+            }
+        }
+    }
     pub fn link_wakes(&self, wakes: &mut Vec<Arc<trames_shared::Readiness>>) {
         wakes.extend(
             self.sockets
@@ -127,17 +157,32 @@ impl Hub {
             let queue_room = state.bytes + length <= state.buffer && state.queue.len() < 1024;
             let copy = state.copy_thresh != 0 && queue_room;
             let losing = state.dropped != 0;
+            let mut readable = true;
             let enqueue = if let Some(ring) = &mut state.ring {
-                match ring.receive(
+                let before = ring.published_blocks();
+                let previous_deadline = ring.block_deadline();
+                let delivery = ring.receive(
                     bytes,
                     length,
                     usize::from(device.kind != DeviceKind::Tun && socket.kind == 3) * 14,
                     &source,
                     copy,
                     losing,
-                ) {
+                );
+                if before.is_some() {
+                    readable = before != ring.published_blocks();
+                    if ring.block_deadline().is_some() && ring.block_deadline() != previous_deadline
+                    {
+                        wakes.push(socket.protocol_changed.clone());
+                    }
+                }
+                match delivery {
                     crate::packet_ring::Delivery::Full => {
                         state.dropped = state.dropped.wrapping_add(1);
+                        if before.is_some() && readable {
+                            state.epoch = state.epoch.wrapping_add(1);
+                            wakes.push(socket.readiness.clone());
+                        }
                         continue;
                     }
                     crate::packet_ring::Delivery::Copied => true,
@@ -150,12 +195,14 @@ impl Hub {
                 continue;
             };
             state.packets = state.packets.wrapping_add(1);
-            state.epoch = state.epoch.wrapping_add(1);
             if enqueue {
                 state.bytes += length;
                 state.queue.push_back((bytes[..length].to_vec(), source));
             }
-            wakes.push(socket.readiness.clone());
+            if readable {
+                state.epoch = state.epoch.wrapping_add(1);
+                wakes.push(socket.readiness.clone());
+            }
         }
     }
 }
@@ -183,6 +230,7 @@ pub(crate) struct Receiver {
     kind: u32,
     state: Mutex<State>,
     readiness: Arc<trames_shared::Readiness>,
+    protocol_changed: Arc<trames_shared::Readiness>,
 }
 pub(super) struct Socket {
     namespace: Arc<netlink::Namespace>,
@@ -233,6 +281,7 @@ impl Socket {
         }
         namespace.root_stack()?;
         let hub = namespace.graph.read().unwrap().packet_hub(namespace.id());
+        let protocol_changed = namespace.fabric.changed.clone();
         let socket = Arc::new(Self {
             namespace,
             kind,
@@ -260,6 +309,7 @@ impl Socket {
                     dropped: 0,
                 }),
                 readiness: Arc::default(),
+                protocol_changed,
             }),
         });
         let mut registry = hub.sockets.lock();
@@ -462,14 +512,20 @@ impl Socket {
         s.filter = filter;
         Ok(())
     }
-    pub fn statistics(&self) -> [u8; 8] {
+    pub fn statistics(&self, capacity: usize, writable: usize) -> Result<([u8; 12], usize)> {
         let mut s = self.state.lock();
-        let drops = std::mem::take(&mut s.dropped);
-        let packets = std::mem::take(&mut s.packets).wrapping_add(drops);
-        let mut out = [0; 8];
-        out[..4].copy_from_slice(&packets.to_le_bytes());
-        out[4..].copy_from_slice(&drops.to_le_bytes());
-        out
+        let size = capacity.min(if s.version == 2 { 12 } else { 8 });
+        if writable < size {
+            return Err(NetError(14));
+        }
+        let mut out = [0; 12];
+        out[..4].copy_from_slice(&s.packets.wrapping_add(s.dropped).to_le_bytes());
+        out[4..8].copy_from_slice(&s.dropped.to_le_bytes());
+        let freezes = s.ring.as_mut().map_or(0, |r| r.take_freezes());
+        out[8..].copy_from_slice(&freezes.to_le_bytes());
+        s.packets = 0;
+        s.dropped = 0;
+        Ok((out, size))
     }
     pub fn ring_pages(
         &self,
@@ -502,6 +558,17 @@ impl Socket {
                 return Err(NetError(16));
             }
             let ring = crate::packet_ring::Ring::configure(bytes, s.version, s.reserve)?;
+            if s.version == 2 {
+                match (s.ring.is_some(), ring.is_some()) {
+                    (false, true) => {
+                        self.hub.block_rings.fetch_add(1, Relaxed);
+                    }
+                    (true, false) => {
+                        self.hub.block_rings.fetch_sub(1, Relaxed);
+                    }
+                    _ => {}
+                }
+            }
             s.ring = ring;
             return Ok(());
         }
@@ -555,7 +622,7 @@ impl Socket {
             (1, 44) => return Err(NetError(1)),
             (263, 7) => s.copy_thresh = value,
             (263, 10 | 12) if s.ring.is_some() => return Err(NetError(16)),
-            (263, 10) if matches!(value, 0 | 1) => s.version = value as u32,
+            (263, 10) if (0..=2).contains(&value) => s.version = value as u32,
             (263, 12) if value >= 0 => s.reserve = value as u32,
             (263, 10 | 12) => return Err(NetError(22)),
             (263, 23) => s.ignore_outgoing = value != 0,
@@ -613,6 +680,10 @@ impl Socket {
 }
 impl Drop for Socket {
     fn drop(&mut self) {
+        let s = self.state.lock();
+        if s.version == 2 && s.ring.is_some() {
+            self.hub.block_rings.fetch_sub(1, Relaxed);
+        }
         self.hub.active.fetch_sub(1, Relaxed);
     }
 }

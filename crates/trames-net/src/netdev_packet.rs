@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 impl Topology {
+    pub fn packet_block_delay(&self, ns: u64) -> Option<std::time::Duration> {
+        self.spaces.get(&ns)?.packets.block_delay()
+    }
+    pub fn retire_packet_blocks(&self, ns: u64, wakes: &mut Vec<Arc<trames_shared::Readiness>>) {
+        if let Some(s) = self.spaces.get(&ns) {
+            s.packets.retire_blocks(wakes);
+        }
+    }
     pub fn packet_hub(&self, ns: u64) -> Arc<crate::packet_socket::Hub> {
         self.spaces[&ns].packets.clone()
     }

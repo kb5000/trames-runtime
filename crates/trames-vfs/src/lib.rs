@@ -2864,18 +2864,13 @@ impl Vfs {
             Err(Errno(2)) => false,
             Err(e) => return Err(e),
         };
-        if !existed {
-            if self.proc_directory_tree(&p) {
-                return Err(Errno(2));
-            }
-            check_write(None)?;
-        }
         #[cfg(all(feature = "hostfs", unix))]
         let mut created_host_file = None;
         if !existed {
-            if flags & O_DIRECTORY != 0 || flags & 0x40 == 0 {
+            if flags & O_CREAT == 0 || flags & O_DIRECTORY != 0 || self.proc_directory_tree(&p) {
                 return Err(Errno(2));
             }
+            check_write(None)?;
             self.check_parent_write(&p)?;
             #[cfg(all(feature = "hostfs", unix))]
             let native_created = if let Some(host) = &p.filesystem(self).host {

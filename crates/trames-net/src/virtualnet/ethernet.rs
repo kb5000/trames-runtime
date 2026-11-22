@@ -32,7 +32,10 @@ impl Inner {
             .filter_map(|o| o.routing.get().cloned())
             .collect();
         for view in views {
-            let actions = view.graph.read().unwrap().ethernet_timers(view.namespace);
+            let graph = view.graph.read().unwrap();
+            graph.retire_packet_blocks(view.namespace, &mut self.notifications);
+            let actions = graph.ethernet_timers(view.namespace);
+            drop(graph);
             self.queue_frames(&view, actions);
         }
     }
