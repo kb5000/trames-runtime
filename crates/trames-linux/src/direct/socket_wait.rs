@@ -292,7 +292,7 @@ impl RetainedSocket {
 impl DirectSyscalls {
     pub(super) fn raw_ip_socket(&self, fd: u32) -> Option<trames_vfs::SocketOperation> {
         let socket = self.resources.as_ref()?.socket_operation(fd)?.ok()?;
-        matches!(socket.address_size(), 12 | 16 | 28).then_some(socket)
+        matches!(socket.address_size(), 12 | 16 | 20 | 28).then_some(socket)
     }
     pub(super) fn start_raw_ip(
         &self,
@@ -398,7 +398,8 @@ impl DirectSyscalls {
                 return None
             }
             Ok(trames_vfs::SocketControlOperation::Network(ref socket))
-                if ip_message::number(number) && !matches!(socket.address_size(), 12 | 16 | 28) =>
+                if ip_message::number(number)
+                    && !matches!(socket.address_size(), 12 | 16 | 20 | 28) =>
             {
                 return None
             }
@@ -713,6 +714,43 @@ mod tests {
             IoAttempt::Blocked(wait) => wait,
             _ => panic!("expected retained socket wait"),
         }
+    }
+    #[test]
+    fn packet_receive_parks_until_an_incoming_frame_and_preserves_nonblocking_reads() {
+        let mut v = Vfs::default();
+        v.configure_managed_uplink(trames_net::NetworkMode::Loopback)
+            .unwrap();
+        let fd = v.socket(17, 2, 0x0800u16.to_be() as u32).unwrap();
+        let direct = DirectSyscalls::default().with_resources(v.descriptor_factory());
+        let (wake, _) = target();
+        let mut m = memory();
+        let args = [fd as u64, 0x1100, 16, 0, 0, 0];
+        let attempt = |args, m: &mut Memory| {
+            direct
+                .start_socket_control(207, args, m, 1, &Arc::downgrade(&wake))
+                .unwrap()
+        };
+        let mut nonblocking = args;
+        nonblocking[3] = 0x40;
+        assert!(matches!(
+            attempt(nonblocking, &mut m),
+            IoAttempt::Complete(Err(Errno(11)))
+        ));
+        let wait = blocked(attempt(args, &mut m));
+        let mut address = [0; 20];
+        address[..2].copy_from_slice(&17u16.to_le_bytes());
+        address[2..4].copy_from_slice(&0x0800u16.to_be_bytes());
+        address[4..8].copy_from_slice(&1u32.to_le_bytes());
+        address[11] = 6;
+        v.socket_fd(fd)
+            .unwrap()
+            .send_bytes(b"wake", 0, Some(&address))
+            .unwrap();
+        assert!(wait.signal.ready());
+        assert!(matches!(
+            direct.resume_socket(wait, &mut m),
+            IoAttempt::Complete(Ok(4))
+        ));
     }
     #[test]
     fn accept_rearms_on_a_new_target_and_keeps_original_files_after_close_reuse() {

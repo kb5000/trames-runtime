@@ -102,63 +102,86 @@ pub(crate) unsafe fn copy(mut source: *const u8, mut destination: *mut u8, len: 
     }
 }
 
-/// An aligned guest protocol word with its original acquire publication order.
-/// No Rust/LLVM reference aliases concurrent native guest accesses.
-///
-/// # Safety
-/// `source` is aligned to four, live and initialized. The caller retains its
-/// allocation and excludes overlapping Rust references. Unsupported hosts must
-/// exclude all concurrent byte actors, as for `copy`.
-#[inline]
-pub(crate) unsafe fn load_acquire_u32(source: *const u8) -> u32 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        let value: u32;
-        unsafe {
-            core::arch::asm!("ldar {value:w}, [{source}]", source=in(reg) source,
-            value=out(reg) value, options(nostack, preserves_flags));
+macro_rules! publication_word {
+    ($load:ident, $store:ident, $ty:ty, $atomic:ident, $arm_load:literal, $arm_store:literal, $x86_load:literal, $x86_store:literal) => {
+        /// An aligned guest protocol word with its original acquire publication order.
+        /// No Rust/LLVM reference aliases concurrent native guest accesses.
+        ///
+        /// # Safety
+        /// `source` is naturally aligned, live and initialized. The caller retains its
+        /// allocation and excludes overlapping Rust references. Unsupported hosts must
+        /// exclude all concurrent byte actors, as for `copy`.
+        #[inline]
+        pub(crate) unsafe fn $load(source: *const u8) -> $ty {
+            #[cfg(target_arch = "aarch64")]
+            {
+                let value: $ty;
+                unsafe {
+                    core::arch::asm!($arm_load, source=in(reg) source,
+                    value=out(reg) value, options(nostack, preserves_flags));
+                }
+                value
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                let value: $ty;
+                unsafe {
+                    core::arch::asm!($x86_load, source=in(reg) source,
+                    value=out(reg) value, options(nostack, preserves_flags));
+                }
+                value
+            }
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+            unsafe {
+                (&*source.cast::<std::sync::atomic::$atomic>()).load(std::sync::atomic::Ordering::Acquire)
+            }
         }
-        value
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        let value: u32;
-        unsafe {
-            core::arch::asm!("mov {value:e}, dword ptr [{source}]", source=in(reg) source,
-            value=out(reg) value, options(nostack, preserves_flags));
+
+        /// Release publication paired with a guest protocol's acquire load.
+        ///
+        /// # Safety
+        /// The aligned destination is live, initialized and writable, with the same
+        /// allocation/reference/exclusion conditions as the corresponding acquire load.
+        #[inline]
+        pub(crate) unsafe fn $store(destination: *mut u8, value: $ty) {
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                core::arch::asm!($arm_store, destination=in(reg) destination,
+                value=in(reg) value, options(nostack, preserves_flags));
+            }
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                core::arch::asm!($x86_store, destination=in(reg) destination,
+                value=in(reg) value, options(nostack, preserves_flags));
+            }
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+            unsafe {
+                (&*destination.cast::<std::sync::atomic::$atomic>())
+                    .store(value, std::sync::atomic::Ordering::Release);
+            }
         }
-        value
-    }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    unsafe {
-        (&*source.cast::<std::sync::atomic::AtomicU32>()).load(std::sync::atomic::Ordering::Acquire)
-    }
+    };
 }
-
-/// Release publication paired with a guest protocol's acquire load.
-///
-/// # Safety
-/// The aligned destination is live, initialized and writable, with the same
-/// allocation/reference/exclusion conditions as `load_acquire_u32`.
-#[inline]
-pub(crate) unsafe fn store_release_u32(destination: *mut u8, value: u32) {
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        core::arch::asm!("stlr {value:w}, [{destination}]", destination=in(reg) destination,
-        value=in(reg) value, options(nostack, preserves_flags));
-    }
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        core::arch::asm!("mov dword ptr [{destination}], {value:e}", destination=in(reg) destination,
-        value=in(reg) value, options(nostack, preserves_flags));
-    }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    unsafe {
-        (&*destination.cast::<std::sync::atomic::AtomicU32>())
-            .store(value, std::sync::atomic::Ordering::Release);
-    }
-}
-
+publication_word!(
+    load_acquire_u32,
+    store_release_u32,
+    u32,
+    AtomicU32,
+    "ldar {value:w}, [{source}]",
+    "stlr {value:w}, [{destination}]",
+    "mov {value:e}, dword ptr [{source}]",
+    "mov dword ptr [{destination}], {value:e}"
+);
+publication_word!(
+    load_acquire_u64,
+    store_release_u64,
+    u64,
+    AtomicU64,
+    "ldar {value}, [{source}]",
+    "stlr {value}, [{destination}]",
+    "mov {value}, qword ptr [{source}]",
+    "mov qword ptr [{destination}], {value}"
+);
 #[cfg(test)]
 mod tests {
     #[test]

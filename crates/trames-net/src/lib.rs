@@ -10,6 +10,7 @@ mod native;
 mod netdev;
 mod netlink;
 mod nftables;
+mod packet_ring;
 mod packet_socket;
 mod protocol;
 mod rtnetlink;
@@ -1281,6 +1282,34 @@ impl Socket {
     delegate!(read_recursive, local_addr() -> Result<SocketAddr>);
     delegate!(read_recursive, peer_addr() -> Result<SocketAddr>);
     delegate!(write, shutdown(how: u32) -> Result<()>);
+    pub fn packet_ring_pages(
+        &self,
+        owner: Arc<dyn Send + Sync>,
+        offset: u64,
+        len: u64,
+        shared: bool,
+    ) -> Result<Vec<Arc<dyn trames_memory::PageBacking>>> {
+        let SocketBackend::Packet(s) = &self.backend else {
+            return Err(NetError(19));
+        };
+        s.ring_pages(owner, offset, len, shared)
+    }
+    pub fn packet_statistics(&self) -> Result<[u8; 8]> {
+        let SocketBackend::Packet(s) = &self.backend else {
+            return Err(NetError(92));
+        };
+        Ok(s.statistics())
+    }
+    pub fn packet_header_size(&self, version: u32) -> Result<u32> {
+        if !matches!(self.backend, SocketBackend::Packet(_)) {
+            return Err(NetError(92));
+        }
+        match version {
+            0 | 1 => Ok(32),
+            2 => Ok(48),
+            _ => Err(NetError(22)),
+        }
+    }
     pub fn is_netlink(&self) -> bool {
         matches!(self.backend, SocketBackend::Netlink(_))
     }

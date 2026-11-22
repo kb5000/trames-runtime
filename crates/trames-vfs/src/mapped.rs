@@ -1023,6 +1023,7 @@ impl MappingFile {
     pub fn executable(&self) -> bool {
         let open = self.0.open.borrow();
         open.native_image.is_none()
+            && open.socket.is_none()
             && !matches!(open.anonymous, Some(events::Anonymous::Uring(_)))
             && !matches!(open.control, Some(events::SharedControl::Binder(_)))
             && open
@@ -1051,6 +1052,11 @@ impl MappingFile {
         }
         if shared && writable && o.flags.get() & 3 != 2 {
             return Err(Errno(13));
+        }
+        if let Some(socket) = &o.socket {
+            return socket
+                .packet_ring_pages(o.shared.clone(), offset, len, shared)
+                .map_err(|e| Errno(e.0));
         }
         if o.oom.is_some()
             || o.mount

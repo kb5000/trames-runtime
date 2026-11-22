@@ -127,6 +127,21 @@ pub(super) fn control(
             })
         }
         209 => {
+            if (a[1], a[2]) == (263, 6) {
+                return read_option(memory, a, || socket.packet_statistics().map_err(net));
+            }
+            if (a[1], a[2]) == (263, 11) {
+                if (u32_at(memory, a[4])? as i32) < 4 {
+                    return Err(Errno(22));
+                }
+                let version = u32_at(memory, a[3])?;
+                return read_option(memory, a, || {
+                    socket
+                        .packet_header_size(version)
+                        .map(u32::to_le_bytes)
+                        .map_err(net)
+                });
+            }
             if (a[1], a[2]) == (270, 9) {
                 let capacity = u32_at(memory, a[4])? as i32;
                 if capacity < 0 {

@@ -22,7 +22,7 @@ impl Frame {
             return Err(NetError(22));
         }
         let f = Self(Arc::from(bytes));
-        if f.source()[0] & 1 != 0 || (!loopback && f.source() == [0; 6]) {
+        if !loopback && (f.source()[0] & 1 != 0 || f.source() == [0; 6]) {
             return Err(NetError(22));
         }
         if f.outer_protocol() == 0x8100 && bytes.len() < 18 {

@@ -98,6 +98,53 @@ fn mask(offset: usize, len: usize) -> u64 {
     (u64::MAX >> (63 - (last - first))) << first
 }
 
+macro_rules! page_publication_word {
+    ($load:ident, $store:ident, $ty:ty, $width:literal) => {
+        /// Read a protocol publication word without exposing native guest bytes as
+        /// Rust references. Ordinary page access does not gain a memory barrier.
+        ///
+        /// # Safety
+        /// The storage address at `offset` is naturally aligned for this word and
+        /// `offset + word size <= PAGE_SIZE`. Kernel queue mappings are page-aligned.
+        pub unsafe fn $load(&self, offset: usize) -> $ty {
+            debug_assert!(offset.is_multiple_of($width) && offset <= PAGE - $width);
+            let raw = self.raw_lock(offset, $width);
+            // SAFETY: private protocol offsets satisfy the caller's contract;
+            // region ownership retains storage and excludes all Rust byte borrows.
+            unsafe {
+                crate::raw::$load(
+                    raw.ownership
+                        .page()
+                        .storage()
+                        .as_ptr()
+                        .cast::<u8>()
+                        .add(offset),
+                )
+            }
+        }
+        /// Publish one protocol word with the original release order and monitor
+        /// bookkeeping, without constructing a Rust/LLVM atomic byte reference.
+        ///
+        /// # Safety
+        /// The same alignment/range contract as the corresponding acquire load applies.
+        pub unsafe fn $store(&self, offset: usize, value: $ty) {
+            debug_assert!(offset.is_multiple_of($width) && offset <= PAGE - $width);
+            let mut raw = self.raw_lock(offset, $width);
+            self.changed(&mut raw.ownership, offset, $width);
+            let page = raw.ownership.page();
+            unsafe {
+                crate::raw::$store(
+                    page.storage().write_ptr(&page.unmaterialized).add(offset),
+                    value,
+                );
+            }
+            if let Bytes::Hardware(storage) = page.storage() {
+                storage.publish_host_write(offset, $width);
+            }
+        }
+    };
+}
+
 impl MutablePage {
     // Storage changes only under all region bits, before hardware publication;
     // ordinary access holds its regions, and hardware storage never moves again.
@@ -387,48 +434,8 @@ impl MutablePage {
         self.changed(&mut raw.ownership, offset, bytes.len());
         raw.write_from(offset, bytes);
     }
-    /// Read a protocol publication word without exposing native guest bytes as
-    /// Rust references. Ordinary page access does not gain a memory barrier.
-    ///
-    /// # Safety
-    /// The storage address at `offset` is four-byte aligned and
-    /// `offset + 4 <= PAGE_SIZE`. Kernel queue mappings are page-aligned.
-    pub unsafe fn load_acquire_u32(&self, offset: usize) -> u32 {
-        debug_assert!(offset.is_multiple_of(4) && offset <= PAGE - 4);
-        let raw = self.raw_lock(offset, 4);
-        // SAFETY: private protocol offsets satisfy the caller's contract;
-        // region ownership retains storage and excludes all Rust byte borrows.
-        unsafe {
-            crate::raw::load_acquire_u32(
-                raw.ownership
-                    .page()
-                    .storage()
-                    .as_ptr()
-                    .cast::<u8>()
-                    .add(offset),
-            )
-        }
-    }
-    /// Publish one protocol word with the original release order and monitor
-    /// bookkeeping, without constructing a Rust/LLVM atomic byte reference.
-    ///
-    /// # Safety
-    /// The same alignment/range contract as `load_acquire_u32` applies.
-    pub unsafe fn store_release_u32(&self, offset: usize, value: u32) {
-        debug_assert!(offset.is_multiple_of(4) && offset <= PAGE - 4);
-        let mut raw = self.raw_lock(offset, 4);
-        self.changed(&mut raw.ownership, offset, 4);
-        let page = raw.ownership.page();
-        unsafe {
-            crate::raw::store_release_u32(
-                page.storage().write_ptr(&page.unmaterialized).add(offset),
-                value,
-            );
-        }
-        if let Bytes::Hardware(storage) = page.storage() {
-            storage.publish_host_write(offset, 4);
-        }
-    }
+    page_publication_word!(load_acquire_u32, store_release_u32, u32, 4);
+    page_publication_word!(load_acquire_u64, store_release_u64, u64, 8);
     pub(crate) fn raw_lock(&self, offset: usize, len: usize) -> RawGuard<'_> {
         let regions = self.lock_regions(mask(offset, len));
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]

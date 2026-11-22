@@ -345,3 +345,47 @@ fn tun_ipv6_and_notification_reentry_hold_no_fabric_or_topology_lock() {
     tun.write(&reply).unwrap();
     assert_eq!(client.recv(100, 0).unwrap().data, b"IPv6");
 }
+
+#[test]
+fn packet_ring_truncation_copy_and_mapping_lifetime() {
+    for version in [0u32, 1] {
+        let net = Network::managed_uplink(NetworkMode::Loopback).unwrap();
+        let rx = net.socket(17, 2, 0x0800u16.to_be() as u32).unwrap();
+        let target = crate::packet_socket::address(1, 0x800, 0, [0; 6]);
+        let request: Vec<u8> = [4096u32, 1, 256, 16]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        rx.set_option_bytes(263, 10, &version.to_le_bytes())
+            .unwrap();
+        rx.set_option_bytes(263, 5, &request).unwrap();
+        assert!(rx.packet_ring_pages(rx.clone(), 0, 8192, true).is_err());
+        let pages = rx.packet_ring_pages(rx.clone(), 0, 4096, true).unwrap();
+        assert_eq!(rx.set_option_bytes(263, 5, &[0; 16]), Err(NetError(16)));
+        let payload = vec![0x61; 600];
+        rx.send_bytes(&payload, 0, Some(&target)).unwrap();
+        assert_eq!(rx.poll(0x40), Ok(0x40));
+        assert_eq!(rx.recv(640, MSG_DONTWAIT).err(), Some(NetError(11)));
+        rx.set_option_bytes(263, 7, &1u32.to_le_bytes()).unwrap();
+        rx.send_bytes(&payload, 0, Some(&target)).unwrap();
+        assert_eq!(rx.recv(640, MSG_DONTWAIT).unwrap().data, payload);
+        for (start, copy_flag) in [(0, 0), (256, 2)] {
+            let mut header = [0u8; 32];
+            pages[0].read(start, &mut header).unwrap();
+            let fields = if version == 0 { 8 } else { 4 };
+            assert_eq!(header[0] & 3, 1 | copy_flag);
+            assert_eq!(
+                u32::from_le_bytes(header[fields..fields + 4].try_into().unwrap()),
+                600
+            );
+            assert_eq!(
+                u32::from_le_bytes(header[fields + 4..fields + 8].try_into().unwrap()),
+                176
+            );
+        }
+        assert_eq!(rx.packet_statistics().unwrap(), [2, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(rx.packet_statistics().unwrap(), [0; 8]);
+        drop(pages);
+        rx.set_option_bytes(263, 5, &[0; 16]).unwrap();
+    }
+}

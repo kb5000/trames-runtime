@@ -119,14 +119,6 @@ impl Hub {
             if length == 0 {
                 continue;
             }
-            if state.bytes + length > state.buffer || state.queue.len() >= 1024 {
-                state.dropped = state.dropped.wrapping_add(1);
-                continue;
-            }
-            let data = bytes[..length].to_vec();
-            state.bytes += length;
-            state.packets = state.packets.wrapping_add(1);
-            state.epoch = state.epoch.wrapping_add(1);
             let mut source = address(device.index, protocol, kind, frame.source());
             if device.kind == DeviceKind::Tun {
                 source[8..10].copy_from_slice(&65534u16.to_le_bytes());
@@ -135,7 +127,37 @@ impl Hub {
             if device.kind == DeviceKind::Loopback {
                 source[8..10].copy_from_slice(&772u16.to_le_bytes());
             }
-            state.queue.push_back((data, source));
+            let queue_room = state.bytes + length <= state.buffer && state.queue.len() < 1024;
+            let copy = state.copy_thresh != 0 && queue_room;
+            let losing = state.dropped != 0;
+            let enqueue = if let Some(ring) = &mut state.ring {
+                match ring.receive(
+                    bytes,
+                    length,
+                    usize::from(device.kind != DeviceKind::Tun && socket.kind == 3) * 14,
+                    &source,
+                    copy,
+                    losing,
+                ) {
+                    crate::packet_ring::Delivery::Full => {
+                        state.dropped = state.dropped.wrapping_add(1);
+                        continue;
+                    }
+                    crate::packet_ring::Delivery::Copied => true,
+                    crate::packet_ring::Delivery::Captured => false,
+                }
+            } else if queue_room {
+                true
+            } else {
+                state.dropped = state.dropped.wrapping_add(1);
+                continue;
+            };
+            state.packets = state.packets.wrapping_add(1);
+            state.epoch = state.epoch.wrapping_add(1);
+            if enqueue {
+                state.bytes += length;
+                state.queue.push_back((bytes[..length].to_vec(), source));
+            }
             wakes.push(socket.readiness.clone());
         }
     }
@@ -153,6 +175,10 @@ struct State {
     filter: Option<crate::socket_filter::Program>,
     locked: bool,
     ignore_outgoing: bool,
+    ring: Option<crate::packet_ring::Ring>,
+    version: u32,
+    reserve: u32,
+    copy_thresh: i32,
     packets: u32,
     dropped: u32,
 }
@@ -229,6 +255,10 @@ impl Socket {
                     filter: None,
                     locked: false,
                     ignore_outgoing: false,
+                    ring: None,
+                    version: 0,
+                    reserve: 0,
+                    copy_thresh: 0,
                     packets: 0,
                     dropped: 0,
                 }),
@@ -368,7 +398,14 @@ impl Socket {
         self.namespace.root_stack()?.fabric().tick();
         let (index, ready) = {
             let s = self.state.lock();
-            (s.index, 4 | if s.queue.is_empty() { 0 } else { 1 })
+            (
+                s.index,
+                4 | if !s.queue.is_empty() || s.ring.as_ref().is_some_and(|r| r.readable()) {
+                    1 | 0x40
+                } else {
+                    0
+                },
+            )
         };
         if index != 0
             && self
@@ -407,9 +444,47 @@ impl Socket {
         s.filter = filter;
         Ok(())
     }
+    pub fn statistics(&self) -> [u8; 8] {
+        let mut s = self.state.lock();
+        let drops = std::mem::take(&mut s.dropped);
+        let packets = std::mem::take(&mut s.packets).wrapping_add(drops);
+        let mut out = [0; 8];
+        out[..4].copy_from_slice(&packets.to_le_bytes());
+        out[4..].copy_from_slice(&drops.to_le_bytes());
+        out
+    }
+    pub fn ring_pages(
+        &self,
+        owner: Arc<dyn Send + Sync>,
+        offset: u64,
+        len: u64,
+        shared: bool,
+    ) -> Result<Vec<Arc<dyn trames_memory::PageBacking>>> {
+        if offset != 0 || !shared {
+            return Err(NetError(22));
+        }
+        self.state
+            .lock()
+            .ring
+            .as_ref()
+            .ok_or(NetError(22))?
+            .pages(owner, len)
+    }
     pub fn set_option_bytes(&self, level: u32, name: u32, bytes: &[u8]) -> Result<()> {
         if (level, name) == (1, 13) {
             self.state.lock().linger = crate::parse_linger(bytes)?;
+            return Ok(());
+        }
+        if (level, name) == (263, 5) {
+            let mut s = self.state.lock();
+            if s.ring.as_ref().is_some_and(|r| r.mapped()) {
+                return Err(NetError(16));
+            }
+            if s.ring.is_some() && bytes.get(4..8).is_some_and(|n| n != [0; 4]) {
+                return Err(NetError(16));
+            }
+            let ring = crate::packet_ring::Ring::configure(bytes, s.version, s.reserve)?;
+            s.ring = ring;
             return Ok(());
         }
         if level == 263 && matches!(name, 1 | 2) {
@@ -460,6 +535,11 @@ impl Socket {
             (1, 7) => s.send_buffer = crate::socket_buffer_size(name, value),
             (1, 44) if !s.locked || value != 0 => s.locked = value != 0,
             (1, 44) => return Err(NetError(1)),
+            (263, 7) => s.copy_thresh = value,
+            (263, 10 | 12) if s.ring.is_some() => return Err(NetError(16)),
+            (263, 10) if matches!(value, 0 | 1) => s.version = value as u32,
+            (263, 12) if value >= 0 => s.reserve = value as u32,
+            (263, 10 | 12) => return Err(NetError(22)),
             (263, 23) => s.ignore_outgoing = value != 0,
             _ => return Err(NetError(92)),
         }
@@ -475,6 +555,9 @@ impl Socket {
             (1, 30) => Ok(0),
             (1, 39) => Ok(17),
             (1, 44) => Ok(i32::from(s.locked)),
+            (263, 7) => Ok(s.copy_thresh),
+            (263, 10) => Ok(s.version as i32),
+            (263, 12) => Ok(s.reserve as i32),
             (263, 23) => Ok(i32::from(s.ignore_outgoing)),
             _ => Err(NetError(92)),
         }
