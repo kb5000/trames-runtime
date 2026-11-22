@@ -195,7 +195,11 @@ def classify(xml, code, timed_out, expected):
     return ('passed' if code == 0 else 'crashed'), []
 
 # These flags describe the named suites, not the worker or its other tests.
+UDP_INTERFACE_SUITES = {'socket_ipv4_udp_unbound_external_networking',
+                       'socket_ipv6_udp_unbound_external_networking'}
+NATIVE_UDP_INTERFACES = Path(__file__).with_name('native-udp-interfaces.sh').resolve()
 SUITE_FIXTURES = {
+    'native_udp_interfaces_sha256': UDP_INTERFACE_SUITES,
     'tun_netns_per_case': {'tuntap'},
     'host_pty_fixture': {'host_pty'},
     'isolated_loopback_per_case': {'socket_inet_loopback_isolated'},
@@ -326,6 +330,8 @@ def native(args, output):
     if not any(s['cases'] for s in plan['suites']):raise RuntimeError('No cases selected')
     plan['case_execution'] = dict(timeout_base=args.timeout, suite_timeouts=args.suite_timeouts, upstream_wait_timeouts=UPSTREAM_WAIT_TIMEOUTS)
     if args.native_init:plan['native_init_sha256']=digest(args.native_init)
+    if any(s['name'] in UDP_INTERFACE_SUITES for s in plan['suites']):
+        plan['native_udp_interfaces_sha256'] = digest(NATIVE_UDP_INTERFACES)
     if any(s['name'] == 'concurrency' for s in plan['suites']):
         plan['multiprocess_fixture'] = 'MULTIPROCESS:TRUE'
     if any(s['name'] == 'tuntap' for s in plan['suites']):
@@ -358,7 +364,9 @@ def native(args, output):
                 work.mkdir()
                 xml = output / 'logs' / (str(index) + '.xml')
                 fixture = []
-                if suite['name'] == 'memfd':
+                if suite['name'] in UDP_INTERFACE_SUITES:
+                    fixture = ['/bin/sh', str(NATIVE_UDP_INTERFACES)]
+                elif suite['name'] == 'memfd':
                     # unshare creates a fresh mount namespace for this case.
                     fixture = ['/bin/sh', '-ec', 'mount -t tmpfs -o mode=1777 tmpfs "$TEST_TMPDIR"; cd "$TEST_TMPDIR"; exec "$@"', 'gvisor-memfd']
                 argv = ['unshare', '--mount', '--uts', '--ipc', '--net', '--pid', '--fork', '--kill-child=KILL', '--mount-proc',
@@ -392,7 +400,7 @@ def trames(args, output):
     if any(s['name'] in ('rename','mount') for s in plan['suites']):plan['writable_sysfs_fixture'] = True
     plan['runfiles_sha256']={str(p.relative_to(binaries)):digest(p) for p in (binaries/'runfiles').rglob('*') if p.is_file()}
 
-    plan.pop('kernel',None);plan.pop('uid',None);plan.pop('nofile',None);plan.pop('native_init_sha256',None)
+    plan.pop('kernel',None);plan.pop('uid',None);plan.pop('nofile',None);plan.pop('native_init_sha256',None);plan.pop('native_udp_interfaces_sha256',None)
     if any(s['name'] == 'concurrency' for s in plan['suites']):
         plan['multiprocess_fixture'] = 'MULTIPROCESS:TRUE'
     if any(s['name'] == 'host_pty' for s in plan['suites']):

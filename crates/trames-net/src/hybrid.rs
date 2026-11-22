@@ -543,11 +543,14 @@ impl Socket {
                 return Err(NetError(105));
             }
         }
-        // These controls belong to the guest TCP engine. A wildcard socket
+        // These controls belong to the guest network stack. A wildcard socket
         // also owns a BSD listener, so reject before changing either half.
         if self.path.get() == Path::Both
             && ((level == 6 && matches!(name, 2 | 3 | 7..=10 | 12 | 13 | 18 | 36))
-                || matches!((level, name), (0, 10 | 11) | (41, 25) | (1, 32 | 33)))
+                || matches!(
+                    (level, name),
+                    (0, 10 | 11 | 32..=36 | 49) | (41, 17..=21 | 25 | 29) | (1, 32 | 33)
+                ))
         {
             return Err(NetError(92));
         }

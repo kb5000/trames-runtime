@@ -198,6 +198,7 @@ impl Socket {
         }
         if let SocketAddr::V6(v) = a {
             if v.scope_id() != 0
+                && !(v.ip().is_multicast() && self.kind == 2)
                 && !(v.ip().is_unicast_link_local() && self.route_device.get() == v.scope_id())
             {
                 return Err(NetError(95));
@@ -471,7 +472,11 @@ impl Socket {
     pub fn bind(&self, a: SocketAddr) -> Result<()> {
         let _binding = self.network.0.binding.lock();
         if let SocketAddr::V6(mut scoped) = a {
-            if scoped.ip().is_unicast_link_local() {
+            let multicast_scope = self.family == 10
+                && self.kind == 2
+                && scoped.ip().is_multicast()
+                && matches!(scoped.ip().octets()[1] & 15, 1 | 2);
+            if scoped.ip().is_unicast_link_local() || multicast_scope {
                 let previous = self.state.borrow().device;
                 let index = if scoped.scope_id() != 0 {
                     scoped.scope_id()
@@ -480,10 +485,11 @@ impl Socket {
                 };
                 let view = self.network.0.routing.get().ok_or(NetError(19))?;
                 let device = view.graph.read().unwrap().device(view.namespace, index)?;
-                if !device
-                    .addresses
-                    .iter()
-                    .any(|address| address.ip == *scoped.ip())
+                if !multicast_scope
+                    && !device
+                        .addresses
+                        .iter()
+                        .any(|address| address.ip == *scoped.ip())
                 {
                     return Err(NetError(99));
                 }
@@ -847,7 +853,7 @@ impl Socket {
         // UDP connect is also Linux's source-route probe: a zero destination
         // port selects the source without establishing a getpeername peer.
         let group_source = if (self.kind == 2 || self.raw_udp()) && self.udp_group(a.ip()) {
-            Some(IpAddr::V4(self.group_source(a, None)?.1))
+            Some(self.group_source(a, None)?.1)
         } else {
             None
         };
@@ -1543,7 +1549,12 @@ impl Socket {
                 if let Ok((data, meta)) = s.peek() {
                     // Peer filtering occurs on ingress. Datagrams queued before
                     // connect retain their original source and delivery order.
-                    let source = address(meta.endpoint);
+                    let mut source = address(meta.endpoint);
+                    if let SocketAddr::V6(peer) = &mut source {
+                        if peer.ip().is_unicast_link_local() {
+                            peer.set_scope_id(meta.meta.ingress_index);
+                        }
+                    }
                     let size = data.len();
                     let bytes = data[..count.min(size)].to_vec();
                     let ipv6 = source.is_ipv6();
@@ -1767,6 +1778,22 @@ impl Socket {
             self.mark.set(value as u32);
             return Ok(());
         }
+        if (level, name) == (41, 17) && self.kind == 2 && self.family == 10 {
+            let index = value as u32;
+            if index != 0 {
+                let view = self.network.0.routing.get().ok_or(NetError(19))?;
+                view.graph.read().unwrap().device(view.namespace, index)?;
+            }
+            let mut state = self.state.borrow_mut();
+            if index != 0 && state.device.is_some_and(|bound| bound != index) {
+                return Err(NetError(22));
+            }
+            state
+                .multicast
+                .get_or_insert_with(Default::default)
+                .v6_interface = index;
+            return Ok(());
+        }
         let mut i = self.network.0.fabric.0.borrow_mut();
         let mut state = self.state.borrow_mut();
         match (level, name) {
@@ -1826,6 +1853,9 @@ impl Socket {
                     _ => return Err(NetError(22)),
                 }
                 return Ok(());
+            }
+            (41, 18 | 19 | 29) if self.family == 10 && self.kind == 2 => {
+                return state.multicast_scalar(name, value)
             }
             (0, 33 | 34 | 49) if self.kind == 2 || self.raw_udp() => {
                 return state.multicast_scalar(name, value)
@@ -2241,6 +2271,9 @@ impl Socket {
             (1, 39) => Ok(self.family as i32),
             (1, 38) => Ok(i32::from(self.protocol)),
             (1, 30) => Ok(i32::from(state.connection == Connection::Listening)),
+            (41, 17..=19 | 29) if self.family == 10 && self.kind == 2 => {
+                Ok(state.multicast_value(name))
+            }
             (0, 33 | 34) if self.kind == 1 => Ok(state.multicast_value(name)),
             (0, 32 | 33 | 34 | 49) if self.kind == 2 || self.raw_udp() => {
                 Ok(state.multicast_value(name))
@@ -2476,6 +2509,9 @@ impl Socket {
                 node.dirty = true;
             }
             return Ok(());
+        }
+        if level == 41 && self.family == 10 && self.kind == 2 && matches!(name, 20 | 21) {
+            return self.ipv6_membership(name == 20, value);
         }
         if level == 0 && (self.kind == 2 || self.raw_udp()) && matches!(name, 32 | 35 | 36) {
             return self.membership(name, value);

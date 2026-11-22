@@ -758,4 +758,67 @@ fn scoped_veth_addresses_follow_carrier_and_carry_udp() {
     destination.set_scope_id(li);
     sender.send(b"scoped", 0, Some(destination.into())).unwrap();
     assert_eq!(receiver.recv(16, 0).unwrap().data, b"scoped");
+
+    let group: std::net::Ipv6Addr = "ff02::1234".parse().unwrap();
+    let rx = right.socket(10, 2, 0).unwrap();
+    let mut target = SocketAddrV6::new(group, 20422, 0, 0);
+    assert_eq!(rx.bind(target.into()), Err(NetError(22)));
+    target.set_scope_id(ri);
+    rx.bind(target.into()).unwrap();
+    rx.set_option_bytes(
+        41,
+        20,
+        &[group.octets().as_slice(), &ri.to_ne_bytes()].concat(),
+    )
+    .unwrap();
+    target.set_scope_id(li);
+    sender.send(b"link group", 0, Some(target.into())).unwrap();
+    let received = rx.recv(16, 0).unwrap();
+    assert_eq!(received.data, b"link group");
+    let mut expected = a;
+    expected.set_scope_id(ri);
+    assert_eq!(received.address, Some(expected.into()));
+}
+
+#[test]
+fn ipv6_multicast_delivers_fragments_on_the_selected_guest_link() {
+    let fabric = Fabric::new().unwrap();
+    let a = Network::virtual_network(&fabric, 2, NetworkMode::Outbound).unwrap();
+    let b = Network::virtual_network(&fabric, 3, NetworkMode::Outbound).unwrap();
+    let dest = addr("ff05::1234", 13404);
+    let IpAddr::V6(group) = dest.ip() else {
+        unreachable!()
+    };
+    let request = |index: u32| [group.octets().as_slice(), &index.to_ne_bytes()].concat();
+    let receiver = |n: &Network| {
+        let s = n.socket(10, 2, 0).unwrap();
+        s.set_option(41, 26, 1).unwrap();
+        s.bind(addr("::", dest.port())).unwrap();
+        s.set_option(41, 49, 1).unwrap();
+        s.set_option(41, 51, 1).unwrap();
+        s.set_option_bytes(41, 20, &request(2)).unwrap();
+        s
+    };
+    let local = receiver(&a);
+    let remote = receiver(&b);
+    let tx = a.socket(10, 2, 0).unwrap();
+    tx.set_option(41, 17, 2).unwrap();
+    tx.set_option(41, 18, 7).unwrap();
+    tx.set_option(41, 19, 0).unwrap();
+    let data = vec![0xa6; 4097];
+    tx.send(&data, 0, Some(dest)).unwrap();
+    let packet = remote.recv(data.len(), 0).unwrap();
+    assert_eq!(packet.data, data);
+    assert_eq!(packet.packet_info.unwrap().interface, 2);
+    assert_eq!(packet.ip.fields.hop_limit, Some(7));
+    assert!(matches!(local.recv(1, 0), Err(NetError(11))));
+    assert_eq!(
+        remote.set_option_bytes(41, 20, &request(2)),
+        Err(NetError(98))
+    );
+    remote.set_option_bytes(41, 21, &request(0)).unwrap();
+    tx.set_option(41, 19, 1).unwrap();
+    tx.send(b"after leave", 0, Some(dest)).unwrap();
+    assert_eq!(local.recv(16, 0).unwrap().data, b"after leave");
+    assert!(matches!(remote.recv(1, 0), Err(NetError(11))));
 }

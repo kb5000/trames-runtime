@@ -221,14 +221,16 @@ const LOOPBACK_V6: Address = Address {
     prefix: 128,
 };
 
-fn source_address(addresses: &[Address], destination: IpAddr) -> Option<IpAddr> {
+pub(crate) fn source_address(addresses: &[Address], destination: IpAddr) -> Option<IpAddr> {
     let link_local = |ip| matches!(ip, IpAddr::V6(v) if v.is_unicast_link_local());
+    let prefer_local = link_local(destination)
+        || matches!(destination, IpAddr::V6(ip) if ip.is_multicast() && ip.octets()[1] & 15 <= 2);
     let mut fallback = None;
     for a in addresses
         .iter()
         .filter(|a| a.ip.is_ipv4() == destination.is_ipv4())
     {
-        if link_local(a.ip) == link_local(destination) {
+        if link_local(a.ip) == prefer_local {
             return Some(a.ip);
         }
         fallback.get_or_insert(a.ip);
