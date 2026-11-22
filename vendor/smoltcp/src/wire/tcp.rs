@@ -861,13 +861,6 @@ impl<'a> Repr<'a> {
     {
         packet.check_len()?;
 
-        // Source and destination ports must be present.
-        if packet.src_port() == 0 {
-            return Err(Error);
-        }
-        if packet.dst_port() == 0 {
-            return Err(Error);
-        }
         // Valid checksum is expected.
         if checksum_caps.tcp.rx() && !packet.verify_checksum(src_addr, dst_addr) {
             return Err(Error);

@@ -72,6 +72,38 @@ impl Inner {
                         }
                     }
                 }
+                Action::NeighborFailed(ns, packet) => {
+                    let Some(header) = packet::header(&packet) else {
+                        continue;
+                    };
+                    if !header.first || header.protocol != 6 {
+                        continue;
+                    }
+                    let Ok(syn) = smoltcp::wire::TcpPacket::new_checked(&packet[header.offset..])
+                    else {
+                        continue;
+                    };
+                    if !syn.syn() || syn.ack() {
+                        continue;
+                    }
+                    let Some(key) = self.node_key(&view, ns) else {
+                        continue;
+                    };
+                    let node = self.nodes.get_mut(&key).unwrap();
+                    for (_, socket) in node.sockets.iter_mut() {
+                        if let smoltcp::socket::Socket::Tcp(socket) = socket {
+                            if socket.fail_unresolved_syn(
+                                node.iface.context(),
+                                endpoint(header.tuple.source),
+                                endpoint(header.tuple.destination),
+                                syn.seq_number(),
+                            ) {
+                                node.dirty = true;
+                                break;
+                            }
+                        }
+                    }
+                }
                 Action::External(ns, index, frame) => self.external_frame(view, ns, index, frame),
             }
         }

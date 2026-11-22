@@ -141,7 +141,7 @@ impl Topology {
             if e.probes >= 3 {
                 e.mac = None;
                 e.state = 32;
-                e.pending.clear();
+                actions.extend(e.pending.drain(..).map(|p| Action::NeighborFailed(ns, p)));
                 e.probes = 0;
                 e.updated = now;
                 continue;

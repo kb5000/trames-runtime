@@ -13,7 +13,7 @@ enum PortSlot {
     Recycle(usize, smoltcp::wire::TcpSeqNumber),
 }
 
-fn addresses_overlap(a: SocketAddr, a_dual: bool, b: SocketAddr, b_dual: bool) -> bool {
+pub(super) fn addresses_overlap(a: SocketAddr, a_dual: bool, b: SocketAddr, b_dual: bool) -> bool {
     a.port() == b.port()
         && if a.is_ipv4() == b.is_ipv4() {
             a.ip().is_unspecified() || b.ip().is_unspecified() || a.ip() == b.ip()
@@ -359,6 +359,13 @@ impl Socket {
     fn port_slot(&self, n: &Node, address: SocketAddr, usage: PortUse) -> Option<PortSlot> {
         let own = self.state.borrow();
         let dual = self.family == 10 && !own.v6_only;
+        let reuse_bind = self.kind == 1
+            && usage == PortUse::Bind
+            && own.reuse_port
+            && n.tcp_binds
+                .get(&address.port())
+                .and_then(|bucket| bucket.reuse.as_ref())
+                .is_some_and(|owner| owner.admits(self.uid.get(), address, dual));
         let mut udp_owner = None;
         let free = n
             .registry
@@ -373,6 +380,9 @@ impl Socket {
                 if !addresses_overlap(address, dual, bound, s.family == 10 && !other.v6_only)
                     || own.device.zip(other.device).is_some_and(|(a, b)| a != b)
                 {
+                    return true;
+                }
+                if reuse_bind && other.tcp_bind_port != 0 {
                     return true;
                 }
                 if usage == PortUse::Listen && other.connection != Connection::Listening {
@@ -617,6 +627,30 @@ impl Socket {
                 }
             }
         }
+        if self.kind == 1 {
+            // Keep this in the same fabric transaction as publishing the binding.
+            let mut fabric = self.network.0.fabric.0.borrow_mut();
+            let n = fabric
+                .nodes
+                .get_mut(&self.network.0.key)
+                .ok_or(NetError(100))?;
+            let mut state = self.state.borrow_mut();
+            let bucket = n.tcp_binds.entry(a.port()).or_insert(TcpBindBucket {
+                owners: 0,
+                reuse: None,
+            });
+            bucket.record(
+                state.reuse_port,
+                self.uid.get(),
+                a,
+                self.family == 10 && !state.v6_only,
+            );
+            bucket.owners += 1;
+            state.tcp_bind_port = a.port();
+            state.bound = Some(a);
+            state.requested_bind = explicit.then_some(requested);
+            return Ok(());
+        }
         let mut state = self.state.borrow_mut();
         if explicit {
             state.requested_bind = Some(requested);
@@ -690,6 +724,15 @@ impl Socket {
                 .map_err(|_| NetError(22))?;
             state.add_listener_slot(socket, &mut n.sockets, &mut n.tcp_waiters);
         }
+        // listen takes the port again with the socket's current reuse options.
+        if let Some(bucket) = n.tcp_binds.get_mut(&state.tcp_bind_port) {
+            bucket.record(
+                state.reuse_port,
+                self.uid.get(),
+                bound,
+                self.family == 10 && !state.v6_only,
+            );
+        }
         state.connection = Connection::Listening;
         state.read_closed = false;
         state.write_closed = false;
@@ -749,6 +792,7 @@ impl Socket {
             reuse_port: state.reuse_port,
             listener_rank: 0,
             shared_tcp_binding: state.shared_tcp_binding,
+            tcp_bind_port: 0,
             udp_bind_order: 0,
             requested_bind: None,
             udp_shared: false,
@@ -877,10 +921,6 @@ impl Socket {
                     return Err(NetError(if a.is_ipv4() { 101 } else { 97 }));
                 }
             }
-        }
-        if self.kind == 1 && a.port() == 0 && self.own(a.ip()) {
-            state.fail_connect(111);
-            return Err(NetError(115));
         }
         let bound = state.bound;
         drop(state);
@@ -1069,7 +1109,7 @@ impl Socket {
                     if state.connection == Connection::Connecting {
                         self.connecting
                             .store(false, std::sync::atomic::Ordering::Relaxed);
-                        state.fail_connect(104);
+                        state.fail_connect(104, &mut n.tcp_binds);
                     } else {
                         state.connection = Connection::Idle;
                     }

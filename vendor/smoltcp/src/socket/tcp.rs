@@ -31,6 +31,7 @@ pub enum Failure {
     Refused,
     Reset,
     PeerAlreadyClosed,
+    HostUnreachable,
     TimedOut,
 }
 
@@ -1193,6 +1194,24 @@ impl<'a> Socket<'a> {
         self.abort();
     }
 
+    /// A queued SYN outlived neighbor discovery. Match its incarnation before
+    /// reporting failure: a new connection can already own the same four-tuple.
+    pub fn fail_unresolved_syn(&mut self, cx: &mut Context, local: IpEndpoint, remote: IpEndpoint, seq: TcpSeqNumber) -> bool {
+        if self.state != State::SynSent || self.local_seq_no != seq
+            || self.local_endpoint() != Some(local) || self.remote_endpoint() != Some(remote) {
+            return false;
+        }
+        self.record_reset(cx);
+        self.failure = Some(Failure::HostUnreachable);
+        self.set_state(State::Closed);
+        self.tuple = None;
+        #[cfg(feature = "alloc")]
+        if let Some(handle) = self.observer {
+            cx.tcp_ready.push(handle);
+        }
+        true
+    }
+
     fn initial_window_shift(&self) -> u8 {
         let initial = self.rx_buffer.capacity();
         let target = initial.max(self.rx_growth.min(self.rx_limit));
@@ -1320,7 +1339,7 @@ impl<'a> Socket<'a> {
     /// The local address may optionally be provided.
     ///
     /// This function returns an error if the socket was open; see [is_open](#method.is_open).
-    /// It also returns an error if the local or remote port is zero, or if the remote address
+    /// It also returns an error if the local port is zero, or if the remote address
     /// is unspecified.
     pub fn connect<T, U>(
         &mut self,
@@ -1338,7 +1357,7 @@ impl<'a> Socket<'a> {
         if self.is_open() {
             return Err(ConnectError::InvalidState);
         }
-        if remote_endpoint.port == 0 || remote_endpoint.addr.is_unspecified() {
+        if remote_endpoint.addr.is_unspecified() {
             return Err(ConnectError::Unaddressable);
         }
         if local_endpoint.port == 0 {

@@ -33,6 +33,7 @@ use std::{
 type Result<T> = std::result::Result<T, NetError>;
 fn tcp_errno(failure: tcp::Failure) -> u32 {
     match failure {
+        tcp::Failure::HostUnreachable => 113,
         tcp::Failure::Refused => 111,
         tcp::Failure::Reset => 104,
         tcp::Failure::PeerAlreadyClosed => 32,
@@ -139,7 +140,47 @@ impl DetachedTcp {
     }
 }
 
+// Linux TCP remembers the last admitted reuse-port owner at bind time.
+// A mixed REUSEADDR/REUSEPORT bucket uses a directional address match.
+struct TcpBindBucket {
+    owners: usize,
+    reuse: Option<TcpReuseOwner>,
+}
+
+struct TcpReuseOwner {
+    uid: u32,
+    address: Option<(SocketAddr, bool)>,
+}
+
+impl TcpReuseOwner {
+    fn admits(&self, uid: u32, address: SocketAddr, dual: bool) -> bool {
+        self.uid == uid
+            && self.address.is_none_or(|(cached, cached_dual)| {
+                (cached.ip().is_unspecified() || cached.ip() == address.ip())
+                    && sockets::addresses_overlap(cached, cached_dual, address, dual)
+            })
+    }
+}
+
+impl TcpBindBucket {
+    fn record(&mut self, reusable: bool, uid: u32, address: SocketAddr, dual: bool) {
+        if !reusable {
+            self.reuse = None;
+        } else if !self
+            .reuse
+            .as_ref()
+            .is_some_and(|owner| owner.admits(uid, address, dual))
+        {
+            self.reuse = Some(TcpReuseOwner {
+                uid,
+                address: (self.owners != 0).then_some((address, dual)),
+            });
+        }
+    }
+}
+
 struct Node {
+    tcp_binds: BTreeMap<u16, TcpBindBucket>,
     udp_bind_order: u64,
     udp_readers: BTreeMap<u64, Arc<trames_shared::Readiness>>,
     next_listener: u64,
@@ -257,6 +298,7 @@ struct State {
     reuse_port: bool,
     listener_rank: u64,
     shared_tcp_binding: bool,
+    tcp_bind_port: u16,
     udp_bind_order: u64,
     // Address and port requested by bind(2), before ephemeral allocation.
     requested_bind: Option<SocketAddr>,
@@ -408,12 +450,26 @@ impl State {
         }
     }
 
-    fn fail_connect(&mut self, error: u32) {
+    fn release_tcp_bind(&mut self, buckets: &mut BTreeMap<u16, TcpBindBucket>) {
+        let port = std::mem::take(&mut self.tcp_bind_port);
+        if port != 0 {
+            let bucket = buckets.get_mut(&port).unwrap();
+            bucket.owners -= 1;
+            if bucket.owners == 0 {
+                buckets.remove(&port);
+            }
+        }
+    }
+
+    fn fail_connect(&mut self, error: u32, buckets: &mut BTreeMap<u16, TcpBindBucket>) {
         self.error = Some(error);
         self.peer = None;
         // An explicitly chosen port remains bound. An ephemeral port is
         // released as soon as the active open fails, even if the FD lives on.
         self.bound = self.requested_bind.filter(|addr| addr.port() != 0);
+        if self.bound.is_none() {
+            self.release_tcp_bind(buckets);
+        }
         self.connection = Connection::Failed(error);
     }
 
@@ -565,6 +621,7 @@ fn make_node(id: u8, now: smoltcp::time::Instant) -> Result<Node> {
         iface.set_any_ip(true);
     }
     Ok(Node {
+        tcp_binds: BTreeMap::new(),
         udp_bind_order: 0,
         udp_readers: BTreeMap::new(),
         next_listener: 0,
@@ -1376,7 +1433,7 @@ impl Inner {
                                                 .map(tcp_errno)
                                         })
                                         .unwrap_or(110);
-                                    state.fail_connect(e);
+                                    state.fail_connect(e, &mut node.tcp_binds);
                                     state.handles.clear();
                                     node.sockets.remove(h);
                                 }
@@ -1885,6 +1942,7 @@ impl Network {
                 reuse_port: false,
                 listener_rank: 0,
                 shared_tcp_binding: false,
+                tcp_bind_port: 0,
                 udp_bind_order: 0,
                 requested_bind: None,
                 udp_shared: false,
@@ -1977,6 +2035,7 @@ impl Drop for Socket {
         if let Some(n) = i.nodes.get_mut(&self.network.0.key) {
             n.dirty = true;
             let mut state = self.state.borrow_mut();
+            state.release_tcp_bind(&mut n.tcp_binds);
             if state.udp_readable.is_some() {
                 n.udp_readers.remove(&state.udp_bind_order);
             }
@@ -2430,6 +2489,84 @@ mod shared_lifetime_tests {
         drop(last);
         assert_eq!(sender.send(b"d", 0, Some(destination)), Ok(1));
         assert_eq!(first.recv(1, 0).unwrap().data, b"d");
+    }
+
+    #[test]
+    fn failed_neighbor_probe_matches_only_the_original_syn() {
+        for (local, remote) in [
+            ("10.0.0.2:41002", "10.0.0.3:0"),
+            ("[fd00::2]:41002", "[fd00::3]:0"),
+        ] {
+            let fabric = Fabric::new().unwrap();
+            let network = fabric.environment(2, NetworkMode::Full).unwrap();
+            let mut inner = fabric.0.borrow_mut();
+            let now = inner.now();
+            let node = inner.nodes.get_mut(&network.0.key).unwrap();
+            let (local, remote) = (
+                endpoint(local.parse().unwrap()),
+                endpoint(remote.parse().unwrap()),
+            );
+            let mut socket = tcp::Socket::new(
+                tcp::SocketBuffer::new(vec![0; 1024]),
+                tcp::SocketBuffer::new(vec![0; 1024]),
+            );
+            socket.connect(node.iface.context(), remote, local).unwrap();
+            let handle = node.sockets.add(socket);
+            node.iface.poll(now, &mut node.port, &mut node.sockets);
+            let syn = node
+                .port
+                .tx
+                .iter()
+                .find_map(|(p, _)| {
+                    let h = packet::header(p)?;
+                    if h.protocol != 6 {
+                        return None;
+                    }
+                    let tcp = smoltcp::wire::TcpPacket::new_checked(&p[h.offset..]).ok()?;
+                    tcp.syn().then_some(tcp.seq_number())
+                })
+                .unwrap();
+            let tcp = node.sockets.get_mut::<tcp::Socket>(handle);
+            let cx = node.iface.context();
+            assert!(!tcp.fail_unresolved_syn(cx, local, remote, syn + 1));
+            assert!(!tcp.fail_unresolved_syn(cx, remote, local, syn));
+            assert_eq!(tcp.state(), tcp::State::SynSent);
+            assert!(tcp.fail_unresolved_syn(cx, local, remote, syn));
+            assert_eq!(tcp.take_failure(), Some(tcp::Failure::HostUnreachable));
+            assert!(!tcp.fail_unresolved_syn(cx, local, remote, syn));
+        }
+    }
+
+    #[test]
+    fn tcp_mixed_bind_bucket_tracks_owner_listener_and_last_close() {
+        for (family, local) in [(2, "127.0.0.1:42017"), (10, "[::1]:42017")] {
+            let fabric = Fabric::new().unwrap();
+            let net = fabric.environment(2, NetworkMode::Full).unwrap();
+            let address = local.parse().unwrap();
+            let socket = |uid, addr, port| {
+                let s = net.socket(family, 1, 0).unwrap();
+                s.set_owner_uid(uid);
+                s.set_option(1, 2, addr).unwrap();
+                s.set_option(1, 15, port).unwrap();
+                s
+            };
+            let first = socket(1000, 1, 0);
+            first.bind(address).unwrap();
+            let mixed = socket(1000, 1, 1);
+            mixed.bind(address).unwrap();
+            drop(mixed);
+            let outsider = socket(1001, 0, 1);
+            assert_eq!(outsider.bind(address), Err(NetError(98)));
+            let same = socket(1000, 0, 1);
+            same.bind(address).unwrap();
+            first.listen(1).unwrap();
+            assert_eq!(same.listen(1), Err(NetError(98)));
+            assert_eq!(socket(1000, 0, 1).bind(address), Err(NetError(98)));
+            drop(first);
+            drop(same);
+            outsider.bind(address).unwrap();
+            assert_eq!(socket(1000, 0, 1).bind(address), Err(NetError(98)));
+        }
     }
 
     #[test]

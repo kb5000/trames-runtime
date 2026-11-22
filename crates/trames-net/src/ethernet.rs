@@ -326,6 +326,7 @@ pub(crate) enum Action {
     Send(u64, u32, Frame),
     Receive(u64, u32, Frame),
     Local(u64, u32, Frame),
+    NeighborFailed(u64, Vec<u8>),
     External(u64, u32, Frame),
 }
 #[derive(Default)]
