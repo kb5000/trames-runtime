@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! A voluntary guest tracee stops on its execution worker. Its parent consumes
+//! A guest child stops on its execution worker. Its parent consumes
 //! normal wait events and observes an immutable snapshot of that stop.
 use super::*;
 
 const PTRACE_TRACEME: u64 = 0;
 const PTRACE_KILL: u64 = 8;
+const PTRACE_POKETEXT: u64 = 4;
+const PTRACE_POKEDATA: u64 = 5;
 const PTRACE_GETEVENTMSG: u64 = 0x4201;
 const PTRACE_GETSIGINFO: u64 = 0x4202;
 const PTRACE_CONT: u64 = 7;
@@ -19,6 +21,7 @@ const PTRACE_LISTEN: u64 = 0x4208;
 const PTRACE_GETSIGMASK: u64 = 0x420a;
 const PTRACE_SETSIGMASK: u64 = 0x420b;
 const PTRACE_O_TRACEEXEC: u64 = 1 << 4;
+const PTRACE_O_TRACEVFORKDONE: u64 = 1 << 5;
 const PTRACE_O_TRACEEXIT: u64 = 1 << 6;
 const PTRACE_O_EXITKILL: u64 = 1 << 20;
 const PTRACE_ATTACH: u64 = 16;
@@ -31,7 +34,35 @@ pub(super) enum Exception {
     Task(Weak<IoTask>),
 }
 
+const SUPPORTED_OPTIONS: u64 = PTRACE_O_TRACESYSGOOD
+    | PTRACE_O_TRACEEXEC
+    | PTRACE_O_TRACEVFORKDONE
+    | PTRACE_O_TRACEEXIT
+    | PTRACE_O_EXITKILL;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Voluntary,
+    Attach,
+    Seize,
+}
+#[derive(Clone, Copy)]
+enum StopOrigin {
+    Normal,
+    Control,
+    VforkDone(u32),
+}
+#[derive(Clone, Copy)]
+enum ControlStop {
+    Attach,
+    Group,
+    Interrupt,
+}
 pub(super) struct Relationship {
+    mode: Mode,
+    admission: Option<Box<trames_vfs::Credentials>>,
+    pending: Option<ControlStop>,
+    listening: bool,
+    continued_while_stopped: bool,
     tracer: Weak<IoTask>,
     child: Arc<crate::children::Child>,
     stop: Option<Arc<TraceStop>>,
@@ -45,6 +76,8 @@ struct TraceStop {
     signal: Option<RetainedInfo>,
     syscall: Option<SyscallStop>,
     exit_status: Option<i32>,
+    group_stop: bool,
+    vfork_child: Option<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -222,7 +255,52 @@ impl IoTask {
             .map_or(0, |t| t.tid())
     }
 
-    pub fn voluntarily_traced(&self) -> bool {
+    #[inline]
+    pub fn trace_control_pending(&self) -> bool {
+        self.trace_control.load(Ordering::Acquire)
+    }
+    pub fn trace_control_point(
+        &self,
+        registers: impl FnOnce() -> trames_execution::Aarch64State,
+    ) -> bool {
+        self.trace_control_pending()
+            && self.publish_trace_stop(5, None, None, None, StopOrigin::Control, registers)
+    }
+    pub fn job_stopped(&self) -> bool {
+        self.lifecycle().stopped()
+            && self.trace_run_generation.load(Ordering::Relaxed)
+                != self.lifecycle().stop_generation()
+    }
+
+    pub(crate) fn trace_job_event(&self, continued: bool) {
+        let Some(slot) = self.trace.get() else {
+            return;
+        };
+        let mut lock = slot.lock().unwrap();
+        let Some(rel) = lock.as_mut() else {
+            return;
+        };
+        if !continued {
+            self.trace_run_generation.store(0, Ordering::Relaxed);
+        }
+        if continued
+            && rel.mode == Mode::Seize
+            && rel.stop.as_ref().is_some_and(|s| s.status >> 8 == 128)
+        {
+            // SIGCONT may arrive after the wait event but before LISTEN.
+            rel.continued_while_stopped = true;
+        }
+        if rel.mode == Mode::Seize && rel.stop.is_none() && (!continued || rel.listening) {
+            rel.pending = Some(if continued {
+                ControlStop::Interrupt
+            } else {
+                ControlStop::Group
+            });
+            self.trace_control.store(true, Ordering::Release);
+        }
+    }
+
+    pub fn is_traced(&self) -> bool {
         self.trace
             .get()
             .is_some_and(|slot| slot.lock().unwrap().is_some())
@@ -249,6 +327,8 @@ impl IoTask {
             if rel.options & PTRACE_O_EXITKILL != 0 {
                 task.lifecycle().request_exit(9);
             }
+            task.trace_run_generation.store(0, Ordering::Relaxed);
+            task.trace_control.store(false, Ordering::Release);
             task.trace_stop.store(false, Ordering::Release);
             drop(slot);
             notice.notify();
@@ -264,7 +344,7 @@ impl IoTask {
         shared: Option<bool>,
         registers: impl FnOnce() -> trames_execution::Aarch64State,
     ) -> bool {
-        self.publish_trace_stop(sig, shared, None, None, registers)
+        self.publish_trace_stop(sig, shared, None, None, StopOrigin::Normal, registers)
     }
 
     #[inline]
@@ -285,8 +365,20 @@ impl IoTask {
                 SyscallStop::Exit
             }),
             None,
+            StopOrigin::Normal,
             registers,
         )
+    }
+
+    pub fn trace_vfork_done(
+        &self,
+        release: &crate::completion::Completion,
+        registers: impl FnOnce() -> trames_execution::Aarch64State,
+    ) -> bool {
+        self.trace.get().is_some()
+            && release.vfork_child().is_some_and(|id| {
+                self.publish_trace_stop(5, None, None, None, StopOrigin::VforkDone(id), registers)
+            })
     }
 
     pub fn trace_exit_stop(
@@ -294,7 +386,7 @@ impl IoTask {
         status: i32,
         registers: impl FnOnce() -> trames_execution::Aarch64State,
     ) -> bool {
-        self.publish_trace_stop(5, None, None, Some(status), registers)
+        self.publish_trace_stop(5, None, None, Some(status), StopOrigin::Normal, registers)
     }
 
     /// A pending group termination normally wakes every task. A tracer holding
@@ -316,6 +408,7 @@ impl IoTask {
         shared: Option<bool>,
         syscall: Option<SyscallStop>,
         exit_status: Option<i32>,
+        origin: StopOrigin,
         registers: impl FnOnce() -> trames_execution::Aarch64State,
     ) -> bool {
         let Some(slot) = self.trace.get() else {
@@ -325,11 +418,52 @@ impl IoTask {
         let Some(rel) = lock.as_mut() else {
             return false;
         };
+        let vfork_child = if let StopOrigin::VforkDone(id) = origin {
+            if rel.options & PTRACE_O_TRACEVFORKDONE == 0 {
+                return false;
+            }
+            let Some(tracer) = rel.tracer.upgrade() else {
+                return false;
+            };
+            Some(tracer.inbox.namespace.get().map_or(id, |ns| ns.local(id)))
+        } else {
+            None
+        };
+        let control = matches!(origin, StopOrigin::Control);
         if rel.stop.is_some()
             || syscall.is_some() && !rel.trace_syscalls
             || exit_status.is_some() && (rel.exit_reported || rel.options & PTRACE_O_TRACEEXIT == 0)
         {
             return false;
+        }
+        // A signal or syscall stop can win the race with INTERRUPT. The stop
+        // satisfies that request too, so a parked child has no runnable hint.
+        if !control && rel.pending.is_some() {
+            rel.pending = None;
+            self.trace_control.store(false, Ordering::Release);
+        }
+        let mut group_stop = false;
+        let mut control_status = None;
+        if control {
+            let pending = rel.pending.take();
+            self.trace_control.store(false, Ordering::Release);
+            let Some(pending) = pending else {
+                return false;
+            };
+            rel.listening = false;
+            let group_signal = self.lifecycle().stop_signal();
+            group_stop = group_signal.is_some();
+            let signal = match (pending, group_signal) {
+                (_, Some(sig)) => sig,
+                (ControlStop::Group, None) => return false,
+                (ControlStop::Interrupt, None) => 5,
+                (ControlStop::Attach, None) => 19,
+            };
+            control_status = Some(if rel.mode == Mode::Seize {
+                signal | (128 << 8)
+            } else {
+                signal
+            });
         }
         let signal = match shared {
             Some(shared) => match (if shared { self.process() } else { &self.inbox })
@@ -340,7 +474,11 @@ impl IoTask {
             },
             None => None,
         };
-        let status = if exit_status.is_some() {
+        let status = if let Some(status) = control_status {
+            status
+        } else if vfork_child.is_some() {
+            sig | (5 << 8)
+        } else if exit_status.is_some() {
             rel.exit_reported = true;
             sig | (6 << 8)
         } else if syscall.is_some() {
@@ -354,8 +492,11 @@ impl IoTask {
         } else {
             sig
         };
+        rel.continued_while_stopped = false;
         rel.stop = Some(Arc::new(TraceStop {
             cpu: registers(),
+            group_stop,
+            vfork_child,
             syscall,
             exit_status,
             status,
@@ -397,7 +538,6 @@ impl IoRoutes {
             .into_iter()
             .find(|t| std::ptr::eq(&**t, task))
             .ok_or(Errno(3))?;
-        let child = task.lifecycle().wait_child().ok_or(Errno(3))?;
         let creds = tracer.credentials().read().clone();
         let own = task.credentials().read();
         let scope = self.namespace.ptrace_scope();
@@ -414,8 +554,31 @@ impl IoRoutes {
             return Err(Errno(1));
         }
         drop(own);
+        self.trace_child(&tracer, &tracee, Mode::Voluntary, 0, None)
+    }
+
+    fn trace_child(
+        &self,
+        tracer: &Arc<IoTask>,
+        task: &Arc<IoTask>,
+        mode: Mode,
+        options: u64,
+        admission: Option<trames_vfs::Credentials>,
+    ) -> Result<u64, Errno> {
+        let child = task.lifecycle().wait_child().ok_or(Errno(3))?;
         let mut list = tracer.tracees.lock().unwrap();
-        if list.retired || !tracer.live() || parent.parent_thread() != tracer.tid() {
+        if list.retired || !tracer.live() || !task.live() {
+            return Err(Errno(3));
+        }
+        let parent_tid = task.parentage().ok_or(Errno(3))?.parent_thread();
+        if parent_tid != tracer.tid()
+            && (mode == Mode::Voluntary
+                || !self
+                    .directory
+                    .parents
+                    .original(parent_tid)
+                    .is_some_and(|p| p.live() && p.tgid() == tracer.tgid()))
+        {
             return Err(Errno(3));
         }
         let mut slot = task.trace.get_or_init(Default::default).lock().unwrap();
@@ -425,19 +588,34 @@ impl IoRoutes {
         let parent_wait = tracer.lifecycle().wait_children().ok_or(Errno(3))?;
         let notice = child.trace_by_parent(&parent_wait)?;
         list.tasks
-            .retain(|t| t.strong_count() != 0 && !Weak::ptr_eq(t, &Arc::downgrade(&tracee)));
-        list.tasks.push(Arc::downgrade(&tracee));
+            .retain(|t| t.strong_count() != 0 && !Weak::ptr_eq(t, &Arc::downgrade(task)));
+        list.tasks.push(Arc::downgrade(task));
+        let pending = match mode {
+            Mode::Attach => Some(ControlStop::Attach),
+            Mode::Seize if task.lifecycle().stopped() => Some(ControlStop::Group),
+            _ => None,
+        };
         *slot = Some(Relationship {
-            tracer: Arc::downgrade(&tracer),
+            mode,
+            admission: admission.map(Box::new),
+            listening: false,
+            continued_while_stopped: false,
+            pending,
+            tracer: Arc::downgrade(tracer),
             child,
             stop: None,
-            options: 0,
+            options,
             trace_syscalls: false,
             exit_reported: false,
         });
+        task.trace_control
+            .store(pending.is_some(), Ordering::Release);
         drop(slot);
         drop(list);
         notice.notify();
+        if pending.is_some() {
+            task.wake_control();
+        }
         Ok(0)
     }
 
@@ -461,6 +639,11 @@ impl IoRoutes {
             return Err(Errno(3));
         }
         let mm = task.proc_view.memory_report().ok_or(Errno(3))?;
+        if let Some(original) = &rel.admission {
+            task.credentials()
+                .admit_process_memory(original, &mm, false)
+                .map_err(|e| if e.0 == 1 { Errno(5) } else { e })?;
+        }
         if caller
             .proc_view
             .memory_report()
@@ -505,8 +688,38 @@ impl IoRoutes {
                 if matches!(request, PTRACE_ATTACH | PTRACE_SEIZE) {
                     return Err(Errno(1));
                 }
+                if request == PTRACE_INTERRUPT && rel.mode == Mode::Seize {
+                    if rel.stop.is_none() {
+                        rel.pending = Some(ControlStop::Interrupt);
+                        target.trace_control.store(true, Ordering::Release);
+                        drop(slot);
+                        target.wake_control();
+                    }
+                    return Ok(0);
+                }
                 let stop = rel.stop.as_ref().ok_or(Errno(3))?;
+                if let Some(original) = &rel.admission {
+                    if matches!(
+                        request,
+                        PTRACE_GETREGSET
+                            | PTRACE_GET_SYSCALL_INFO
+                            | PTRACE_GETSIGINFO
+                            | PTRACE_GETSIGMASK
+                            | PTRACE_SETSIGMASK
+                    ) {
+                        let current = caller.credentials().read().clone();
+                        target.credentials().check_trace_attach(original, false)?;
+                        target.credentials().check_trace_attach(&current, false)?;
+                    }
+                }
                 match request {
+                    PTRACE_POKETEXT | PTRACE_POKEDATA => {
+                        // Authorize the original stopped image before reporting operation
+                        // support. Reuse the word-read checks including attach-time credentials.
+                        drop(slot);
+                        self.trace_read_target(caller, pid as u32)?;
+                        return Err(Errno(95));
+                    }
                     PTRACE_CONT | PTRACE_SYSCALL | PTRACE_DETACH => {
                         if options > 64 {
                             return Err(Errno(5));
@@ -523,15 +736,23 @@ impl IoRoutes {
                                 .inbox
                                 .resume_observed_quiet(stop.status, info.clone());
                         }
+                        if stop.group_stop && request != PTRACE_DETACH {
+                            target
+                                .trace_run_generation
+                                .store(target.lifecycle().stop_generation(), Ordering::Relaxed);
+                        }
                         let notice = if request == PTRACE_DETACH {
+                            target.trace_run_generation.store(0, Ordering::Relaxed);
                             rel.child.detach_trace()
                         } else {
                             rel.child.trace_event(None)
                         };
                         rel.trace_syscalls = request == PTRACE_SYSCALL;
+                        rel.continued_while_stopped = false;
                         rel.stop = None;
                         if request == PTRACE_DETACH {
                             *slot = None;
+                            target.trace_control.store(false, Ordering::Release);
                         }
                         target.trace_stop.store(false, Ordering::Release);
                         drop(slot);
@@ -542,14 +763,7 @@ impl IoRoutes {
                         target.wake_control();
                         return Ok(0);
                     }
-                    PTRACE_SETOPTIONS
-                        if options
-                            & !(PTRACE_O_TRACESYSGOOD
-                                | PTRACE_O_TRACEEXEC
-                                | PTRACE_O_TRACEEXIT
-                                | PTRACE_O_EXITKILL)
-                            == 0 =>
-                    {
+                    PTRACE_SETOPTIONS if options & !SUPPORTED_OPTIONS == 0 => {
                         rel.options = options;
                         return Ok(0);
                     }
@@ -567,6 +781,8 @@ impl IoRoutes {
                         // Voluntary tracing currently admits leaders, so their TID survives exec.
                         let message = if let Some(status) = stop.exit_status {
                             status as u32 as u64
+                        } else if let Some(id) = stop.vfork_child {
+                            u64::from(id)
                         } else if stop.status >> 8 == 4 {
                             self.namespace.local(target.tid()) as u64
                         } else {
@@ -577,6 +793,9 @@ impl IoRoutes {
                             .write_array(options, message.to_le_bytes())
                             .map_err(|_| Errno(14))?;
                         return Ok(0);
+                    }
+                    PTRACE_GETSIGINFO if stop.group_stop && rel.mode == Mode::Attach => {
+                        return Err(Errno(22))
                     }
                     PTRACE_GETSIGINFO => {
                         let mut info = stop.signal.as_deref().copied().unwrap_or_else(|| Info {
@@ -653,6 +872,22 @@ impl IoRoutes {
                             .map_err(|_| Errno(14))?;
                         return Ok(0);
                     }
+                    PTRACE_LISTEN if rel.mode == Mode::Seize && stop.status >> 8 == 128 => {
+                        let notice = rel.child.trace_event(None);
+                        rel.listening = true;
+                        rel.stop = None;
+                        let retrap = std::mem::take(&mut rel.continued_while_stopped);
+                        if retrap {
+                            rel.pending = Some(ControlStop::Interrupt);
+                            target.trace_control.store(true, Ordering::Release);
+                        }
+                        drop(slot);
+                        notice.notify();
+                        if retrap {
+                            target.wake_control();
+                        }
+                        return Ok(0);
+                    }
                     PTRACE_INTERRUPT | PTRACE_LISTEN => return Err(Errno(5)),
                     _ => return Err(Errno(95)),
                 }
@@ -680,9 +915,32 @@ impl IoRoutes {
             &credentials,
             target.trace_requires_cap(caller.tgid(), self.namespace.ptrace_scope())?,
         )?;
-        // Keep authorized requests visibly unsupported until a live task can
-        // publish and acknowledge its own tracing stop.
-        Err(Errno(38))
+        if options & !SUPPORTED_OPTIONS != 0 && request == PTRACE_SEIZE {
+            return Err(Errno(95));
+        }
+        let parent_tid = target.parentage().ok_or(Errno(38))?.parent_thread();
+        let parent_group = self
+            .directory
+            .parents
+            .original(parent_tid)
+            .map(|p| p.tgid());
+        if target.tid() != target.tgid()
+            || (parent_tid != caller.tid() && parent_group != Some(caller.tgid()))
+        {
+            return Err(Errno(38));
+        }
+        let tracer = self
+            .directory
+            .tasks(0, caller.tid())
+            .into_iter()
+            .find(|t| std::ptr::eq(&**t, caller))
+            .ok_or(Errno(3))?;
+        let (mode, flags) = if request == PTRACE_SEIZE {
+            (Mode::Seize, options)
+        } else {
+            (Mode::Attach, 0)
+        };
+        self.trace_child(&tracer, &target, mode, flags, Some(credentials))
     }
 }
 
@@ -739,6 +997,8 @@ mod tests {
             signal: None,
             syscall: Some(SyscallStop::Entry),
             exit_status: None,
+            group_stop: false,
+            vfork_child: None,
         };
         stop.cpu.registers[..6].copy_from_slice(&[10, 11, 12, 13, 14, 15]);
         stop.cpu.registers[8] = 57;

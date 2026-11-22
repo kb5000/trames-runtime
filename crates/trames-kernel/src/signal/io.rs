@@ -210,6 +210,8 @@ pub struct IoTask {
     trace: std::sync::OnceLock<Mutex<Option<ptrace::Relationship>>>,
     tracees: Mutex<ptrace::Tracees>,
     trace_stop: AtomicBool,
+    trace_control: AtomicBool,
+    trace_run_generation: AtomicU64,
     ptracer: std::sync::OnceLock<Mutex<Option<ptrace::Exception>>>,
     parents: std::sync::OnceLock<Weak<crate::task_parent::Parents>>,
     pub io: crate::usage::TaskIo,
@@ -245,6 +247,8 @@ impl Default for IoTask {
             trace: Default::default(),
             tracees: Default::default(),
             trace_stop: Default::default(),
+            trace_control: Default::default(),
+            trace_run_generation: Default::default(),
             ptracer: Default::default(),
             parents: Default::default(),
             io: Default::default(),
@@ -379,7 +383,7 @@ impl IoTask {
     pub fn eligible_mask(&self, mask: u64) -> u64 {
         if self.trace_stopped() {
             mask & (1 << 8)
-        } else if self.lifecycle().stopped() {
+        } else if self.job_stopped() {
             mask & ((1 << 8) | (1 << 17))
         } else {
             mask

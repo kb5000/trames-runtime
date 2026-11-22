@@ -642,6 +642,14 @@ impl<C: Cpu> Job<C> {
         .min()
     }
     fn ring_ready(&self) -> bool {
+        if self
+            .work
+            .syscalls
+            .as_ref()
+            .is_some_and(|s| s.io_signals.trace_control_pending())
+        {
+            return true;
+        }
         if matches!(&self.waiting, Some(WaitState::Custody(wait)) if wait.signal.ready()) {
             return true;
         }
@@ -668,7 +676,7 @@ impl<C: Cpu> Job<C> {
                 || (matches!(&self.waiting, Some(WaitState::Namespace(wait)) if wait.ready())
                     || matches!(&self.waiting, Some(WaitState::Policy(wait)) if wait.ready())
                     || matches!(&self.waiting, Some(WaitState::Barrier(wait)) if wait.ready()))
-                || matches!(&self.waiting, Some(WaitState::Completion(wait)) if wait.release.finished())
+                || matches!(&self.waiting, Some(WaitState::Completion(wait)) if wait.release.finished() && !self.work.syscalls.as_ref().is_some_and(|s| s.io_signals.trace_stopped()))
                 || self.io.as_ref().is_some_and(|io| {
                     (io.number == 2 || io.file_pending().is_some_and(|f| !f.interruptible()))
                         && io.signal.ready()

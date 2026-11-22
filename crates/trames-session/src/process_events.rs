@@ -189,10 +189,18 @@ impl<C: Cpu> Kernel<C> {
             return false;
         }
 
-        if matches!(&p.state, State::Completion(release) if release.finished()) {
-            p.state = State::Ready;
-            p.trace.record(p.cpu.x(0));
-            return true;
+        if let State::Completion(release) = &p.state {
+            if release.finished() && !p.signals.io.trace_stopped() {
+                if p.signals
+                    .io
+                    .trace_vfork_done(release, || p.cpu.architectural_state())
+                {
+                    p.trace.observe_entry();
+                }
+                p.state = State::Ready;
+                p.trace.record(p.cpu.x(0));
+                return true;
+            }
         }
         if p.stopped() {
             return false;

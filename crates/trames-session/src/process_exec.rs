@@ -145,10 +145,7 @@ impl<C: Cpu> Kernel<C> {
         // slot. Serialize the final credentials/auxv image with TSYNC publication.
         let policy = p.seccomp.birth_group();
         let _permit = policy.write_owned().into_admission();
-        runtime.refresh_credentials(
-            runtime.externally_shared_fs,
-            p.signals.io.voluntarily_traced(),
-        );
+        runtime.refresh_credentials(runtime.externally_shared_fs, p.signals.io.is_traced());
         let task = p.linux.vfs.process_context();
         {
             let body = &mut *p;

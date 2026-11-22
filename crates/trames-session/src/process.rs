@@ -178,7 +178,7 @@ pub(crate) struct Process<C: Cpu> {
 }
 impl<C: Cpu> Process<C> {
     fn stopped(&self) -> bool {
-        self.signals.io.trace_stopped() || self.signals.io.lifecycle().stopped()
+        self.signals.io.trace_stopped() || self.signals.io.job_stopped()
     }
     fn runnable(&self) -> bool {
         matches!(self.state, State::Ready) && !self.stopped()

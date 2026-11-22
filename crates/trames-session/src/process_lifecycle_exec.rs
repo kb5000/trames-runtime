@@ -263,7 +263,7 @@ impl<C: Cpu> Lifecycle<C> {
             let trace = p
                 .signals
                 .io
-                .voluntarily_traced()
+                .is_traced()
                 .then(|| (p.signals.io.clone(), p.cpu.architectural_state()));
             self.tasks.restore(pid, actual, &custody);
             if let Some(previous) = old_presence {

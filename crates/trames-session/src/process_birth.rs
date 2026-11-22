@@ -565,7 +565,10 @@ impl Birth {
             let _ = child.memory.write(a[4], &child_tid.to_le_bytes());
         }
         let value = if a[0] & 0x4000 != 0 {
-            let release = Arc::new(trames_kernel::vfork::Release::default());
+            let release = Arc::new(trames_kernel::vfork::Release::for_vfork(
+                id,
+                child.linux.vfs.pid_namespace(),
+            ));
             child.vfork = Some(release.clone());
             p.state = State::Completion(release);
             p.cpu.set_x(0, parent_tid as u64);

@@ -594,7 +594,7 @@ impl Snapshot {
                 .is_some_and(trames_vfs::CgroupTask::frozen)
     }
     pub fn quiesced(&self) -> bool {
-        self.io_signals.trace_stopped() || self.io_signals.lifecycle().stopped() || self.frozen()
+        self.io_signals.trace_stopped() || self.io_signals.job_stopped() || self.frozen()
     }
     pub fn next_io_signal(&self) -> Option<(u32, bool, trames_kernel::signal::Action)> {
         if self.io_signals.trace_stopped() {

@@ -610,14 +610,26 @@ impl<C: Cpu> Starter<C> {
                                     thread_exit = snapshot.exit_thread(work.pid, status, work.memory.as_deref_mut().expect("exit View"));
                                     break SliceOutcome::Yield { instructions: 0 };
                                 }
+                                if snapshot.io_signals.trace_control_point(|| work.cpu.architectural_state()) {
+                                    maintenance=true;break SliceOutcome::Yield { instructions: 0 };
+                                }
                                 if let Some(wake) = snapshot.io_wake.as_ref().filter(|s| s.ready()) { wake.reset(); }
                                 if !snapshot.quiesced() && matches!(&job.waiting,Some(crate::run_queue::WaitState::ClockSleep(w)) if w.ready()) {
                                     job.waiting=None;
                                     work.trace.finish(&mut work.cpu,0);
                                     continue;
                                 }
-                                if matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if wait.release.finished()) {
-                                    job.waiting=None;continue;
+                                if let Some(crate::run_queue::WaitState::Completion(wait)) = &job.waiting {
+                                    if wait.release.finished() && !snapshot.io_signals.trace_stopped() {
+                                        let stopped = snapshot.io_signals.trace_vfork_done(&wait.release, || work.cpu.architectural_state());
+                                        // The tracer can switch to SYSCALL at VFORK_DONE even
+                                        // when it ran through the clone entry with CONT.
+                                        if stopped { work.trace.observe_entry(); }
+                                        if wait.release.vfork_child().is_some() { work.trace.record(work.cpu.x(0)); }
+                                        job.waiting = None;
+                                        if stopped { maintenance = true; break SliceOutcome::Yield { instructions: 0 }; }
+                                        continue;
+                                    }
                                 }
                                 if let Some(crate::run_queue::WaitState::Custody(wait)) = &job.waiting {
                                     if wait.signal.ready() { job.waiting=None; }

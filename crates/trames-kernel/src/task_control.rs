@@ -367,6 +367,9 @@ impl Group {
     pub fn stop_generation(&self) -> u64 {
         self.stop_generation.load(Ordering::Relaxed)
     }
+    pub(crate) fn stop_signal(&self) -> Option<u32> {
+        self.state.lock().unwrap().stop.map(|(sig, _)| sig)
+    }
     pub fn stopped(&self) -> bool {
         self.stopped.load(Ordering::Relaxed)
     }
@@ -511,6 +514,7 @@ impl Group {
             notice.publish();
         }
         for task in tasks {
+            task.trace_job_event(false);
             task.wake_control();
         }
         true
@@ -568,6 +572,7 @@ impl Group {
         }
         if signal == 18 {
             for task in tasks {
+                task.trace_job_event(true);
                 task.wake_control();
             }
         }
@@ -681,7 +686,7 @@ impl Lease {
     pub fn bind_interrupt(&self, interrupt: Arc<dyn trames_execution::ExecutionInterrupt>) -> bool {
         let mut state = self.group.state.lock().unwrap();
         state.members.get_mut(&self.pid).unwrap().interrupt = Some(interrupt);
-        !self.group.stopped()
+        !self.group.stopped() || self.task.upgrade().is_some_and(|t| !t.job_stopped())
     }
     pub fn finish(mut self, held: Option<bool>) {
         self.held = held;
