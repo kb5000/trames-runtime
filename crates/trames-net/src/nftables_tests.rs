@@ -70,6 +70,89 @@ fn shared_batch(shared: &Firewall, r: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
     request_rules(shared, true, &requests, 1, true, 128, MAX_BYTES)
 }
 #[test]
+fn dormant_and_socket_owned_tables_follow_hook_and_socket_lifetimes() {
+    use crate::netlink::Socket;
+    let ns = std::sync::Arc::new(Namespace::default());
+    let owned_table = |flags| {
+        let mut attrs = vec![];
+        string(&mut attrs, 1, "owned");
+        number(&mut attrs, 2, flags);
+        req(0, 2, 0, &attrs)
+    };
+    let mut address = [0; 12];
+    address[..2].copy_from_slice(&16u16.to_le_bytes());
+    address[4..8].copy_from_slice(&1u32.to_le_bytes());
+    let owner = Socket::new(ns.clone(), None, 3, 12).unwrap();
+    owner.bind_bytes(&address, 1).unwrap();
+    let shared = ns.graph.read().unwrap().firewall(ns.id());
+    assert_eq!(
+        errno(&batch(
+            &ns,
+            &[owned_table(3), chain("owned", "drop", Some(3), 0, 0)]
+        )),
+        0
+    );
+    assert!(!shared.has_rules());
+    assert_eq!(
+        errno(&batch(
+            &ns,
+            &[table("keep"), chain("keep", "accept", Some(3), 1, 1)]
+        )),
+        0
+    );
+    assert!(shared.has_rules() && allows(&ns, 3));
+    assert_eq!(errno(&batch(&ns, &[owned_table(2)])), 0);
+    let unrelated = Socket::new(ns.clone(), None, 3, 0).unwrap();
+    unrelated.bind_bytes(&address, 1).unwrap();
+    drop(unrelated);
+    assert!(!allows(&ns, 3));
+    drop(owner);
+    let replacement = Socket::new(ns.clone(), None, 3, 12).unwrap();
+    replacement.bind_bytes(&address, 1).unwrap();
+    assert!(shared.has_rules() && allows(&ns, 3));
+    let rules = shared.read().unwrap();
+    assert_eq!(rules.tables.len(), 1);
+    assert!(rules.tables.contains_key(&(2, "keep".into())));
+}
+#[test]
+fn chain_rename_keeps_jump_target_and_dump_consistent_after_rollback() {
+    let ns = Namespace::default();
+    let shared = ns.graph.read().unwrap().firewall(ns.id());
+    assert_eq!(
+        errno(&batch(
+            &ns,
+            &[
+                table("filter"),
+                chain("filter", "out", Some(3), 0, 1),
+                chain("filter", "old", None, 0, 1),
+                rule("filter", "old", &verdict(0, None)),
+                rule("filter", "out", &verdict(-3, Some("old"))),
+            ]
+        )),
+        0
+    );
+    let handle = shared.read().unwrap().tables[&(2, "filter".into())].chains["old"].handle;
+    let rename = |new| {
+        let mut a = vec![];
+        string(&mut a, 1, "filter");
+        integer(&mut a, 2, handle);
+        string(&mut a, 3, new);
+        req(3, 2, 0, &a)
+    };
+    assert_eq!(errno(&batch(&ns, &[rename("new"), rename("out")])), -17);
+    assert!(shared.read().unwrap().tables[&(2, "filter".into())]
+        .chains
+        .contains_key("old"));
+    assert_eq!(errno(&batch(&ns, &[rename("new")])), 0);
+    assert!(!allows(&ns, 3));
+    let rules = shared.read().unwrap();
+    let rule = &rules.tables[&(2, "filter".into())].chains["out"].rules[0];
+    let dump = rule_data(2, "filter", "out", rule);
+    let attrs = attrs(&dump[4..]).unwrap();
+    let decoded = expressions_in(need(&attrs, 4).unwrap(), 2).unwrap();
+    assert!(matches!(decoded.as_slice(), [Expr::Verdict(-3, Some(target))] if target == "new"));
+}
+#[test]
 fn resource_id_and_unspecified_flush_use_one_original_rules_transaction() {
     let ns = Namespace::default();
     assert_eq!(errno(&batch(&ns, &[table("first"), table("second")])), 0);
@@ -95,7 +178,7 @@ fn concurrent_rule_batches_preserve_every_commit_and_generation() {
         start.wait();
     });
     let current = rules.read().unwrap();
-    assert_eq!(current.generation, 8);
+    assert_eq!(current.generation, 9);
     assert_eq!(current.tables.len(), 8);
     for index in 0..8 {
         assert!(current.tables.contains_key(&(2, format!("worker-{index}"))));
@@ -111,7 +194,7 @@ fn concurrent_rule_batches_preserve_every_commit_and_generation() {
         ),
         -95
     );
-    assert_eq!(rules.read().unwrap().generation, 8);
+    assert_eq!(rules.read().unwrap().generation, 9);
     assert!(!rules
         .read()
         .unwrap()
@@ -178,7 +261,7 @@ fn counters_keep_parallel_packets_across_live_rule_publication() {
     };
     assert_eq!(packets.get(), 8000);
     assert_eq!(bytes.get(), 8000 * packet().len() as u64);
-    assert_eq!(current.generation, 5);
+    assert_eq!(current.generation, 6);
 }
 fn errno(r: &[Vec<u8>]) -> i32 {
     if r.is_empty() {
@@ -234,7 +317,7 @@ fn batch_rollback_generation_authority_capacity_and_namespace_are_real() {
     );
     assert!(!allows(&n, 3));
     assert!(allows(&other, 3));
-    assert_eq!(before.read().unwrap().generation, 1);
+    assert_eq!(before.read().unwrap().generation, 2);
     assert_eq!(
         errno(&batch(
             &n,
@@ -245,10 +328,10 @@ fn batch_rollback_generation_authority_capacity_and_namespace_are_real() {
         )),
         -95
     );
-    assert_eq!(before.read().unwrap().generation, 1);
+    assert_eq!(before.read().unwrap().generation, 2);
     assert_eq!(before.read().unwrap().tables.len(), 1);
     let mut gen = vec![];
-    number(&mut gen, 1, 0);
+    number(&mut gen, 1, 1);
     let mut begin = vec![0, 0, 0, 10];
     begin.extend(gen);
     let r = message(16, 1, 1, 0, &begin);
@@ -270,8 +353,17 @@ fn batch_rollback_generation_authority_capacity_and_namespace_are_real() {
         request(&n, &[&begin, &create, &end], 1, true, 0, 0),
         Err(NetError(105))
     );
-    assert_eq!(before.read().unwrap().generation, 1);
+    assert_eq!(before.read().unwrap().generation, 2);
     assert_eq!(before.read().unwrap().tables.len(), 1);
+    // Explicit zero admits the batch regardless of the current generation.
+    let mut any = vec![0, 0, 0, 10];
+    number(&mut any, 1, 0);
+    let begin = message(16, 1, 1, 0, &any);
+    assert_eq!(
+        errno(&request(&n, &[&begin, &create, &end], 1, true, 128, MAX_BYTES).unwrap()),
+        0
+    );
+    assert_eq!(before.read().unwrap().generation, 3);
 }
 #[test]
 fn jumps_priorities_live_counters_and_payload_match() {

@@ -21,9 +21,6 @@ impl Counter {
     fn get(&self) -> u64 {
         self.0.load(Relaxed)
     }
-    fn set(&self, value: u64) {
-        self.0.store(value, Relaxed);
-    }
     fn add(&self, value: u64) {
         self.0.fetch_add(value, Relaxed);
     }
@@ -106,12 +103,22 @@ fn number(out: &mut Vec<u8>, k: u16, v: u32) {
 fn integer(out: &mut Vec<u8>, k: u16, v: u64) {
     attr(out, k, &v.to_be_bytes());
 }
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct Ruleset {
     generation: u32,
     next: u64,
     active_hooks: u8,
     tables: BTreeMap<(u8, String), Table>,
+}
+impl Default for Ruleset {
+    fn default() -> Self {
+        Self {
+            generation: 1,
+            next: 0,
+            active_hooks: 0,
+            tables: BTreeMap::new(),
+        }
+    }
 }
 /// The published rules and their empty-policy selector are one resource. The
 /// selector only skips evaluation when no hook exists; actual filtering still
@@ -130,6 +137,16 @@ impl From<Ruleset> for Firewall {
     }
 }
 impl Firewall {
+    pub(super) fn release_port(&self, port: u32) {
+        let mut rules = self.rules.write().unwrap();
+        let before = rules.tables.len();
+        rules.tables.retain(|_, t| t.owner != Some(port));
+        if rules.tables.len() != before {
+            rules.refresh_hooks();
+            rules.generation = rules.generation.wrapping_add(1).max(1);
+            self.active.store(rules.has_rules(), Relaxed);
+        }
+    }
     pub fn has_rules(&self) -> bool {
         self.active.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -140,6 +157,9 @@ impl Firewall {
 #[derive(Clone)]
 struct Table {
     handle: u64,
+    next: u64,
+    dormant: bool,
+    owner: Option<u32>,
     userdata: Vec<u8>,
     chains: BTreeMap<String, Chain>,
 }
@@ -151,8 +171,18 @@ struct Chain {
     chain_type: String,
     userdata: Vec<u8>,
     rules: Vec<Rule>,
-    packets: Counter,
+    counters: Option<ChainCounters>,
+}
+#[derive(Clone)]
+struct ChainCounters {
     bytes: Counter,
+    packets: Counter,
+}
+impl ChainCounters {
+    fn record(&self, length: usize) {
+        self.bytes.add(length as u64);
+        self.packets.add(1);
+    }
 }
 #[derive(Clone)]
 struct Rule {
@@ -164,6 +194,7 @@ struct Rule {
 }
 #[derive(Clone)]
 enum Expr {
+    Comment,
     Immediate {
         dest: usize,
         value: Vec<u8>,
@@ -248,7 +279,7 @@ fn reg(n: u32, len: usize) -> Result<usize> {
     Ok(index)
 }
 fn value(bytes: &[u8]) -> Result<Vec<u8>> {
-    let a = fields(bytes, &[1])?;
+    let a = fields(bytes, &[1]).map_err(|_| NetError(22))?;
     let v = need(&a, 1)?;
     if v.is_empty() || v.len() > 16 {
         return Err(NetError(22));
@@ -259,8 +290,8 @@ fn expressions_in(bytes: &[u8], rule_family: u8) -> Result<Vec<Expr>> {
     let mut out = vec![];
     let mut initialized = [false; 64];
     for (kind, b) in attrs(bytes)? {
-        if kind != 1 || out.len() >= 32 {
-            return Err(NetError(95));
+        if kind != 1 || out.len() >= 128 {
+            return Err(NetError(22));
         }
         let a = fields(b, &[1, 2])?;
         let data = need(&a, 2)?;
@@ -268,7 +299,7 @@ fn expressions_in(bytes: &[u8], rule_family: u8) -> Result<Vec<Expr>> {
             "immediate" => {
                 let a = fields(data, &[1, 2])?;
                 if num(&a, 1)? == 0 {
-                    let d = fields(need(&a, 2)?, &[2])?;
+                    let d = fields(need(&a, 2)?, &[2]).map_err(|_| NetError(22))?;
                     let v = fields(need(&d, 2)?, &[1, 2])?;
                     let code = num(&v, 1)? as i32;
                     if !matches!(code, -5..=1) {
@@ -281,7 +312,7 @@ fn expressions_in(bytes: &[u8], rule_family: u8) -> Result<Vec<Expr>> {
                     Expr::Verdict(code, chain)
                 } else {
                     let v = value(need(&a, 2)?)?;
-                    let dest = reg(num(&a, 1)?, v.len())?;
+                    let dest = reg(num(&a, 1)?, v.len()).map_err(|_| NetError(34))?;
                     initialized[dest..dest + v.len()].fill(true);
                     Expr::Immediate { dest, value: v }
                 }
@@ -418,7 +449,15 @@ fn expressions_in(bytes: &[u8], rule_family: u8) -> Result<Vec<Expr>> {
                 let kind = name(&a, 1)?;
                 let revision = num(&a, 2)?;
                 let b = need(&a, 3)?;
-                if kind == "conntrack" {
+                if kind == "comment" {
+                    if revision != 0 {
+                        return Err(NetError(2));
+                    }
+                    if b.len() != 256 {
+                        return Err(NetError(22));
+                    }
+                    Expr::Comment
+                } else if kind == "conntrack" {
                     if revision > 3 || b.len() != if revision == 3 { 168 } else { 160 } {
                         return Err(NetError(95));
                     }
@@ -611,7 +650,14 @@ fn data(family: u8) -> Vec<u8> {
 fn table_data(family: u8, name: &str, t: &Table) -> Vec<u8> {
     let mut d = data(family);
     string(&mut d, 1, name);
-    number(&mut d, 2, 0);
+    number(
+        &mut d,
+        2,
+        u32::from(t.dormant) | (u32::from(t.owner.is_some()) << 1),
+    );
+    if let Some(owner) = t.owner {
+        number(&mut d, 7, owner);
+    }
     number(&mut d, 3, t.chains.len() as u32);
     integer(&mut d, 4, t.handle);
     if !t.userdata.is_empty() {
@@ -628,15 +674,17 @@ fn chain_data(family: u8, table: &str, name: &str, c: &Chain, references: u32) -
         let mut h = vec![];
         number(&mut h, 1, hook);
         number(&mut h, 2, priority as u32);
-        attr(&mut d, 4 | 0x8000, &h);
+        attr(&mut d, 4, &h);
         number(&mut d, 5, c.policy);
         string(&mut d, 7, &c.chain_type);
-        let mut counters = vec![];
-        integer(&mut counters, 1, c.bytes.get());
-        integer(&mut counters, 2, c.packets.get());
-        attr(&mut d, 8 | 0x8000, &counters);
-        number(&mut d, 10, 1);
+        if let Some(counts) = &c.counters {
+            let mut counters = vec![];
+            integer(&mut counters, 1, counts.bytes.get());
+            integer(&mut counters, 2, counts.packets.get());
+            attr(&mut d, 8, &counters);
+        }
     }
+    number(&mut d, 10, u32::from(c.hook.is_some()));
     number(&mut d, 6, c.rules.len() as u32 + references);
     if !c.userdata.is_empty() {
         attr(&mut d, 12, &c.userdata);
@@ -661,13 +709,28 @@ fn rule_data(family: u8, table: &str, chain: &str, r: &Rule) -> Vec<u8> {
             let mut c = vec![];
             integer(&mut c, 1, bytes.get());
             integer(&mut c, 2, packets.get());
-            attr(&mut e, 2 | 0x8000, &c);
-            attr(&mut wire, kind | 0x8000, &e);
+            attr(&mut e, 2, &c);
+            attr(&mut wire, kind, &e);
+        } else if let Expr::Verdict(code, Some(target)) = expr {
+            // The original wire names the chain at insertion time. A dump must
+            // refer to the same chain after a rename.
+            let mut verdict = vec![];
+            number(&mut verdict, 1, *code as u32);
+            string(&mut verdict, 2, target);
+            let mut value = vec![];
+            attr(&mut value, 2, &verdict);
+            let mut immediate = vec![];
+            number(&mut immediate, 1, 0);
+            attr(&mut immediate, 2, &value);
+            let mut e = vec![];
+            string(&mut e, 1, "immediate");
+            attr(&mut e, 2, &immediate);
+            attr(&mut wire, kind, &e);
         } else {
-            attr(&mut wire, kind | 0x8000, b);
+            attr(&mut wire, kind, b);
         }
     }
-    attr(&mut d, 4 | 0x8000, &wire);
+    attr(&mut d, 4, &wire);
     if let Some(compat) = &r.compatibility {
         attr(&mut d, 5 | 0x8000, compat);
     }
@@ -693,11 +756,11 @@ fn kind(r: &[u8]) -> u16 {
 fn flags(r: &[u8]) -> u16 {
     u16::from_le_bytes(r[6..8].try_into().unwrap())
 }
+fn next_handle(last: &mut u64) -> Result<u64> {
+    *last = last.checked_add(1).ok_or(NetError(28))?;
+    Ok(*last)
+}
 impl Ruleset {
-    fn handle(&mut self) -> Result<u64> {
-        self.next = self.next.checked_add(1).ok_or(NetError(28))?;
-        Ok(self.next)
-    }
     fn bounds(&self) -> Result<()> {
         let mut chains = 0;
         let mut rules = 0;
@@ -844,7 +907,8 @@ impl Ruleset {
             let revision = num(&a, 2)?;
             let target = num(&a, 3)?;
             let supported = match (n.as_str(), target) {
-                ("tcp" | "udp" | "icmp" | "icmp6", 0) => revision == 0,
+                ("comment", 0) if revision != 0 => return Err(NetError(93)),
+                ("comment" | "tcp" | "udp" | "icmp" | "icmp6", 0) => revision == 0,
                 ("addrtype", 0) => revision == 1,
                 ("conntrack", 0) => revision <= 3,
                 ("MASQUERADE" | "SNAT" | "DNAT", 1) => revision <= 2,
@@ -873,7 +937,7 @@ impl Ruleset {
         }
         let family = r[16];
         if !matches!(family, 0 | 1 | 2 | 10) || (!read && family == 0 && op != 2) {
-            return Err(NetError(97));
+            return Err(NetError(95));
         }
         let mut out = vec![];
         if op == 16 {
@@ -907,10 +971,10 @@ impl Ruleset {
         }
         let allowed: &[u16] = match op {
             0 => &[1, 2, 6],
-            1 | 2 => &[1],
-            3 => &[1, 3, 4, 5, 7, 8, 10, 12],
+            1 | 2 => &[1, 4],
+            3 => &[1, 2, 3, 4, 5, 7, 8, 10, 11, 12],
             4 => &[1, 2, 3],
-            5 => &[1, 3, 6],
+            5 => &[1, 2, 3, 6],
             6 => &[1, 2, 3, 4, 5, 6, 7, 8],
             7 => &[1, 2, 3],
             // libnftnl echoes the selected rule when deleting by handle.
@@ -929,13 +993,30 @@ impl Ruleset {
             }
             .map(text)
             .transpose()?;
-            let handle = get(&a, if op == 4 { 2 } else { 3 }).map(u64v).transpose()?;
+            let handle_attr = match op {
+                1 => 4,
+                4 => 2,
+                _ => 3,
+            };
+            let handle = get(&a, handle_attr).map(u64v).transpose()?;
+            if !dump
+                && match op {
+                    1 => table.is_none() && handle.is_none(),
+                    4 => table.is_none() || (chain.is_none() && handle.is_none()),
+                    _ => table.is_none() || chain.is_none() || handle.is_none(),
+                }
+            {
+                return Err(NetError(22));
+            }
             let mut found = false;
             for ((f, n), t) in &self.tables {
                 if family != 0 && family != *f || table.as_ref().is_some_and(|v| v != n) {
                     continue;
                 }
                 if op == 1 {
+                    if handle.is_some_and(|h| h != t.handle) {
+                        continue;
+                    }
                     out.push(message(
                         SUBSYSTEM,
                         if dump { 2 } else { 0 },
@@ -985,37 +1066,63 @@ impl Ruleset {
             }
             return Ok(out);
         }
-        if op == 2 && get(&a, 1).is_none() {
-            // An unnamed DELTABLE flushes the selected family, or the complete
-            // original namespace ruleset for NFPROTO_UNSPEC, in this transaction.
-            if flags & 0x100 != 0
-                && self.tables.iter().any(|((f, _), table)| {
-                    (family == 0 || family == *f) && !table.chains.is_empty()
-                })
-            {
-                return Err(NetError(16));
+        if op == 2 {
+            let table = get(&a, 1).map(text).transpose()?;
+            let handle = get(&a, 4).map(u64v).transpose()?;
+            let flush = family == 0 || (table.is_none() && handle.is_none());
+            let mut remove = Vec::new();
+            for (key, t) in &self.tables {
+                if (family != 0 && family != key.0)
+                    || table.as_ref().is_some_and(|n| *n != key.1)
+                    || handle.is_some_and(|h| h != t.handle)
+                {
+                    continue;
+                }
+                if t.owner.is_some_and(|owner| owner != port) {
+                    if flush {
+                        continue;
+                    }
+                    return Err(NetError(1));
+                }
+                if flags & 0x100 != 0 && !t.chains.is_empty() {
+                    return Err(NetError(16));
+                }
+                remove.push(key.clone());
             }
-            self.tables.retain(|(f, _), _| family != 0 && family != *f);
+            if remove.is_empty() && !flush {
+                return Err(NetError(2));
+            }
+            for key in remove {
+                self.tables.remove(&key);
+            }
             return Ok(out);
         }
         let key = (family, name(&a, 1)?);
+        if let Some(t) = self.tables.get(&key) {
+            if t.owner.is_some_and(|owner| owner != port) {
+                return Err(NetError(1));
+            }
+        } else if op != 0 {
+            return Err(NetError(2));
+        }
         match op {
             0 => {
-                if get(&a, 2).map(u32v).transpose()?.unwrap_or(0) != 0 {
+                let options = get(&a, 2).map(u32v).transpose()?;
+                if options.is_some_and(|f| f & !3 != 0) {
                     return Err(NetError(95));
                 }
-                if self.tables.contains_key(&key) {
-                    if get(&a, 6).is_some() {
-                        return Err(NetError(95));
-                    }
+                if let Some(t) = self.tables.get_mut(&key) {
                     if flags & 0x200 != 0 {
                         return Err(NetError(17));
                     }
-                } else {
-                    if flags & 0x400 == 0 {
-                        return Err(NetError(2));
+                    if let Some(f) = options {
+                        if (f & 2 != 0) != t.owner.is_some() {
+                            return Err(NetError(95));
+                        }
+                        t.dormant = f & 1 != 0;
                     }
-                    let handle = self.handle()?;
+                } else {
+                    let handle = next_handle(&mut self.next)?;
                     let userdata = get(&a, 6).unwrap_or_default().to_vec();
                     if userdata.len() > 256 {
                         return Err(NetError(22));
@@ -1024,27 +1131,43 @@ impl Ruleset {
                         key,
                         Table {
                             handle,
+                            next: 0,
+                            dormant: options.unwrap_or(0) & 1 != 0,
+                            owner: (options.unwrap_or(0) & 2 != 0).then_some(port),
                             userdata,
                             chains: BTreeMap::new(),
                         },
                     );
                 }
             }
-            2 => {
-                if flags & 0x100 != 0 && self.tables.get(&key).is_some_and(|t| !t.chains.is_empty())
-                {
-                    return Err(NetError(16));
-                }
-                if self.tables.remove(&key).is_none() {
-                    return Err(NetError(2));
-                }
-            }
             3 => {
-                let cn = name(&a, 3)?;
+                let table = self.tables.get_mut(&key).ok_or(NetError(2))?;
+                if let Some(id) = get(&a, 11) {
+                    u32v(id)?;
+                }
+                let requested = get(&a, 3).map(text).transpose()?;
+                let cn = if let Some(handle) = get(&a, 2) {
+                    let old = table.chain_name(u64v(handle)?)?;
+                    if flags & 0x200 != 0 {
+                        return Err(NetError(17));
+                    }
+                    match requested {
+                        Some(new) if new != old => {
+                            table.rename_chain(&old, &new)?;
+                            new
+                        }
+                        _ => old,
+                    }
+                } else {
+                    requested.ok_or(NetError(22))?
+                };
                 let h = get(&a, 4)
                     .map(|b| -> Result<(u32, i32)> {
                         let a = fields(b, &[1, 2])?;
-                        Ok((num(&a, 1)?, num(&a, 2)? as i32))
+                        Ok((
+                            u32v(get(&a, 1).ok_or(NetError(2))?)?,
+                            u32v(get(&a, 2).ok_or(NetError(2))?)? as i32,
+                        ))
                     })
                     .transpose()?;
                 let typ = get(&a, 7).map(text).transpose()?;
@@ -1066,28 +1189,32 @@ impl Ruleset {
                 }
                 let policy = get(&a, 5).map(u32v).transpose()?;
                 if policy.is_some_and(|v| v > 1) {
-                    return Err(NetError(95));
+                    return Err(NetError(22));
                 }
                 let chainflags = get(&a, 10).map(u32v).transpose()?.unwrap_or(0);
-                if chainflags & !1 != 0 || chainflags == 1 && h.is_none() {
+                if chainflags & 4 != 0 || chainflags == 1 && h.is_none() {
+                    return Err(NetError(22));
+                }
+                if chainflags & !1 != 0 {
                     return Err(NetError(95));
                 }
                 let counters = get(&a, 8)
-                    .map(|b| -> Result<(u64, u64)> {
+                    .map(|b| -> Result<ChainCounters> {
                         let a = fields(b, &[1, 2, 3])?;
-                        Ok((
-                            get(&a, 1).map(u64v).transpose()?.unwrap_or(0),
-                            get(&a, 2).map(u64v).transpose()?.unwrap_or(0),
-                        ))
+                        Ok(ChainCounters {
+                            bytes: Counter::new(u64v(need(&a, 1)?)?),
+                            packets: Counter::new(u64v(need(&a, 2)?)?),
+                        })
                     })
                     .transpose()?;
                 let userdata = get(&a, 12).map(<[u8]>::to_vec);
                 if userdata.as_ref().is_some_and(|v| v.len() > 256) {
                     return Err(NetError(22));
                 }
-                let handle = self.handle()?;
-                let table = self.tables.get_mut(&key).ok_or(NetError(2))?;
                 if let Some(c) = table.chains.get_mut(&cn) {
+                    if h.is_some() && c.hook.is_none() {
+                        return Err(NetError(17));
+                    }
                     if flags & 0x200 != 0 {
                         return Err(NetError(17));
                     }
@@ -1098,7 +1225,7 @@ impl Ruleset {
                     {
                         return Err(NetError(95));
                     }
-                    if policy.is_some() && c.hook.is_none() {
+                    if (policy.is_some() || counters.is_some()) && c.hook.is_none() {
                         return Err(NetError(95));
                     }
                     if let Some(v) = policy {
@@ -1107,15 +1234,14 @@ impl Ruleset {
                     if let Some(v) = userdata {
                         c.userdata = v;
                     }
-                    if let Some((bytes, packets)) = counters {
-                        c.bytes.set(bytes);
-                        c.packets.set(packets);
+                    if counters.is_some() {
+                        c.counters = counters;
                     }
                 } else {
                     if h.is_none() && (policy.is_some() || typ.is_some()) {
                         return Err(NetError(95));
                     }
-                    let (bytes, packets) = counters.unwrap_or_default();
+                    let handle = next_handle(&mut table.next)?;
                     table.chains.insert(
                         cn,
                         Chain {
@@ -1125,15 +1251,18 @@ impl Ruleset {
                             chain_type: typ.unwrap_or_else(|| "filter".to_owned()),
                             userdata: userdata.unwrap_or_default(),
                             rules: vec![],
-                            packets: Counter::new(packets),
-                            bytes: Counter::new(bytes),
+                            counters: if h.is_some() { counters } else { None },
                         },
                     );
                 }
             }
             5 => {
-                let cn = name(&a, 3)?;
                 let t = self.tables.get_mut(&key).ok_or(NetError(2))?;
+                let cn = if let Some(raw) = get(&a, 2) {
+                    t.chain_name(u64v(raw)?)?
+                } else {
+                    name(&a, 3)?
+                };
                 let c = t.chains.get(&cn).ok_or(NetError(2))?;
                 if (flags & 0x100 != 0 && !c.rules.is_empty())
                     || t.chains.values().any(|c| {
@@ -1150,7 +1279,7 @@ impl Ruleset {
             }
             6 => {
                 let cn = name(&a, 2)?;
-                let wire = need(&a, 4)?.to_vec();
+                let wire = get(&a, 4).unwrap_or_default().to_vec();
                 let expressions = expressions_in(&wire, family)?;
                 let compatibility = get(&a, 5)
                     .map(|b| -> Result<Vec<u8>> {
@@ -1168,19 +1297,20 @@ impl Ruleset {
                 if userdata.len() > 256 {
                     return Err(NetError(22));
                 }
-                let handle = self.handle()?;
-                let c = self
-                    .tables
-                    .get_mut(&key)
-                    .and_then(|t| t.chains.get_mut(&cn))
-                    .ok_or(NetError(2))?;
-                if flags & 0x100 != 0 {
-                    let old = u64v(need(&a, 3)?)?;
+                let table = self.tables.get_mut(&key).ok_or(NetError(2))?;
+                let c = table.chains.get_mut(&cn).ok_or(NetError(2))?;
+                if let Some(old) = get(&a, 3).map(u64v).transpose()? {
                     let i = c
                         .rules
                         .iter()
                         .position(|r| r.handle == old)
                         .ok_or(NetError(2))?;
+                    if flags & 0x200 != 0 {
+                        return Err(NetError(17));
+                    }
+                    if flags & 0x100 == 0 {
+                        return Err(NetError(95));
+                    }
                     c.rules[i] = Rule {
                         handle: old,
                         userdata,
@@ -1189,9 +1319,10 @@ impl Ruleset {
                         compatibility,
                     };
                 } else {
-                    if get(&a, 3).is_some() {
-                        return Err(NetError(95));
+                    if flags & 0x400 == 0 || flags & 0x100 != 0 {
+                        return Err(NetError(22));
                     }
+                    let handle = next_handle(&mut table.next)?;
                     let position = get(&a, 6).map(u64v).transpose()?;
                     let append = flags & 0x800 != 0;
                     let at = if let Some(position) = position {
@@ -1307,7 +1438,7 @@ fn request_rules(
                 if get(&a, 1)
                     .map(u32v)
                     .transpose()?
-                    .is_some_and(|v| v != staged.generation)
+                    .is_some_and(|v| v != 0 && v != staged.generation)
                 {
                     return Err(NetError(85));
                 }
@@ -1363,13 +1494,8 @@ fn request_rules(
         return Err(NetError(105));
     }
     if mutated {
-        staged.generation = staged.generation.wrapping_add(1);
-        staged.active_hooks = staged
-            .tables
-            .values()
-            .flat_map(|t| t.chains.values())
-            .filter_map(|c| c.hook)
-            .fold(0, |mask, (h, _)| mask | (1 << h));
+        staged.generation = staged.generation.wrapping_add(1).max(1);
+        staged.refresh_hooks();
         **publication.as_mut().unwrap() = staged;
         // Keep this inside the real publication transaction. A concurrent fast
         // call observing the previous empty selector overlaps this commit;
@@ -1494,7 +1620,7 @@ impl Ruleset {
         let family = if packet[0] >> 4 == 4 { 2 } else { 10 };
         let mut chains = vec![];
         for ((f, _), t) in &self.tables {
-            if *f != 1 && *f != family {
+            if t.dormant || (*f != 1 && *f != family) {
                 continue;
             }
             for (n, c) in &t.chains {
@@ -1576,8 +1702,9 @@ impl Ruleset {
                 return false;
             }
             if v < 0 {
-                c.packets.add(1);
-                c.bytes.add(packet.len() as u64);
+                if let Some(counts) = &c.counters {
+                    counts.record(packet.len());
+                }
                 if c.policy == 0 {
                     return false;
                 }
@@ -1850,7 +1977,7 @@ impl Rule {
                     packets.add(1);
                     bytes.add(ctx.packet.len() as u64);
                 }
-                Expr::Verdict(-1, _) => {}
+                Expr::Comment | Expr::Verdict(-1, _) => {}
                 Expr::Verdict(code, chain) => return Some((*code, chain.as_deref())),
             }
         }
@@ -1858,6 +1985,32 @@ impl Rule {
     }
 }
 impl Table {
+    fn chain_name(&self, handle: u64) -> Result<String> {
+        self.chains
+            .iter()
+            .find(|(_, c)| c.handle == handle)
+            .map(|(n, _)| n.clone())
+            .ok_or(NetError(2))
+    }
+    fn rename_chain(&mut self, old: &str, new: &str) -> Result<()> {
+        if self.chains.contains_key(new) {
+            return Err(NetError(17));
+        }
+        let chain = self.chains.remove(old).ok_or(NetError(2))?;
+        self.chains.insert(new.to_owned(), chain);
+        for chain in self.chains.values_mut() {
+            for rule in &mut chain.rules {
+                for expr in &mut rule.expressions {
+                    if let Expr::Verdict(_, Some(target)) = expr {
+                        if target == old {
+                            new.clone_into(target);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
     fn verdict(
         &self,
         chain: &str,
@@ -1891,6 +2044,15 @@ impl Table {
     }
 }
 impl Ruleset {
+    fn refresh_hooks(&mut self) {
+        self.active_hooks = self
+            .tables
+            .values()
+            .filter(|t| !t.dormant)
+            .flat_map(|t| t.chains.values())
+            .filter_map(|c| c.hook)
+            .fold(0, |mask, (h, _)| mask | (1 << h));
+    }
     pub fn has_rules(&self) -> bool {
         self.active_hooks != 0
     }
@@ -1904,7 +2066,7 @@ impl Ruleset {
         }
         let mut hooks = vec![];
         for ((family, _), t) in &self.tables {
-            if *family != 1 && *family != ctx.family() {
+            if t.dormant || (*family != 1 && *family != ctx.family()) {
                 continue;
             }
             for (n, c) in &t.chains {
@@ -1922,8 +2084,9 @@ impl Ruleset {
                 return false;
             }
             if v < 0 {
-                c.packets.add(1);
-                c.bytes.add(ctx.packet.len() as u64);
+                if let Some(counts) = &c.counters {
+                    counts.record(ctx.packet.len());
+                }
                 if c.policy == 0 {
                     return false;
                 }

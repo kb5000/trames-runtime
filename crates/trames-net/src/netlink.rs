@@ -897,6 +897,16 @@ impl Socket {
 impl Drop for Socket {
     fn drop(&mut self) {
         self.namespace.live.update(|n| n - 1);
+        if self.protocol == 12 && self.port.get() != 0 {
+            // Release owned nftables before this port ID can be reused.
+            let firewall = self
+                .namespace
+                .graph
+                .read()
+                .unwrap()
+                .firewall(self.namespace.id());
+            firewall.release_port(self.port.get());
+        }
         self.namespace
             .ports
             .borrow_mut()
