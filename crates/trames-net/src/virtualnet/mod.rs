@@ -1005,6 +1005,17 @@ impl Inner {
                         continue;
                     }
                     if let Some(index) = injected {
+                        if h.tuple.source.is_ipv4()
+                            && !view.graph.read().unwrap().accepts_ipv4_ingress(
+                                view.namespace,
+                                index,
+                                h.tuple.source.ip(),
+                                h.tuple.destination.ip(),
+                            )
+                        {
+                            self.stats.dropped += 1;
+                            continue;
+                        }
                         if h.protocol == 17
                             && multicast::group_on(
                                 Some(view),
@@ -1060,6 +1071,19 @@ impl Inner {
                         self.stats.dropped += 1;
                         continue;
                     };
+                    // A frame written to lo in loopback-only mode must remain local
+                    // even if a guest route or NAT rule points at another device.
+                    if injected == Some(1)
+                        && next_hop.is_some()
+                        && self
+                            .nodes
+                            .get(&source)
+                            .and_then(|n| n.owner.upgrade())
+                            .is_some_and(|n| n.mode == NetworkMode::Loopback)
+                    {
+                        self.stats.dropped += 1;
+                        continue;
+                    }
                     delivery = Some(route);
                     if let Some(next_hop) = next_hop.filter(|_| !route.tunnel && !route.external) {
                         let actions = view.graph.read().unwrap().ethernet_ip(
@@ -1071,7 +1095,13 @@ impl Inner {
                         self.queue_frames(view, actions);
                         continue;
                     }
-                    if route.input == 1 {
+                    if route.input == 1 && incoming.is_none() {
+                        view.graph.read().unwrap().observe_local_loopback(
+                            view.namespace,
+                            &p,
+                            &mut self.notifications,
+                        );
+                    } else if route.input == 1 && injected.is_none() {
                         view.graph.read().unwrap().observe(
                             view.namespace,
                             1,
@@ -1543,9 +1573,9 @@ impl Network {
         &self,
         index: u32,
         frame: crate::ethernet::Frame,
-        outgoing: bool,
+        sender: Option<&crate::packet_socket::Receiver>,
     ) -> Result<()> {
-        if matches!(self.0.mode, NetworkMode::Off | NetworkMode::Loopback) {
+        if self.0.mode == NetworkMode::Off || self.0.mode == NetworkMode::Loopback && index != 1 {
             return Err(NetError(13));
         }
         let view = self.0.routing.get().ok_or(NetError(95))?;
@@ -1555,7 +1585,8 @@ impl Network {
         }
         if !matches!(
             d.kind,
-            crate::DeviceKind::Veth { .. }
+            crate::DeviceKind::Loopback
+                | crate::DeviceKind::Veth { .. }
                 | crate::DeviceKind::Bridge
                 | crate::DeviceKind::Tap
                 | crate::DeviceKind::Ethernet
@@ -1569,7 +1600,18 @@ impl Network {
         if inner.ethernet.len() >= 96 {
             return Err(NetError(11));
         }
-        let action = if outgoing {
+        let action = if d.kind == crate::DeviceKind::Loopback {
+            let graph = view.graph.read().unwrap();
+            graph.packet_hub(view.namespace).observe_wire_except(
+                &d,
+                &frame,
+                true,
+                sender,
+                &mut inner.notifications,
+            );
+            graph.account(view.namespace, index, frame.0.len(), true, false);
+            crate::ethernet::Action::Receive(view.namespace, index, frame)
+        } else if sender.is_some() {
             crate::ethernet::Action::Send(view.namespace, index, frame)
         } else {
             crate::ethernet::Action::Receive(view.namespace, index, frame)

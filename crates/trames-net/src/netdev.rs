@@ -71,6 +71,12 @@ pub enum DeviceKind {
     Tap,
     Ethernet,
 }
+/// Linux per-interface IPv4 ingress controls for packets arriving from a guest link.
+#[derive(Clone, Copy)]
+pub enum Ipv4Ingress {
+    AcceptLocal = 1,
+    RouteLocalnet = 2,
+}
 #[derive(Clone, Debug)]
 pub struct Device {
     pub index: u32,
@@ -136,6 +142,7 @@ struct Link {
     master: Option<u32>,
     addresses: Vec<Address>,
     stats: Arc<Counters>,
+    ipv4_ingress: u8,
     ipv6: [i32; 5],
     stable_secret: Option<std::net::Ipv6Addr>,
 }
@@ -182,6 +189,8 @@ struct Space {
     direct: bool,
     managed_uplink: bool,
     policy: policy::Policy,
+    ipv4_all: u8,
+    ipv4_default: u8,
     ipv6_all: [i32; 5],
     ipv6_default: [i32; 5],
     stable_secret: Option<std::net::Ipv6Addr>,
@@ -262,6 +271,7 @@ impl Topology {
                 master: None,
                 addresses: Vec::new(),
                 stats: Arc::default(),
+                ipv4_ingress: self.spaces[&id].ipv4_default,
                 ipv6: self.spaces[&id].ipv6_default,
                 stable_secret: None,
             },
@@ -405,6 +415,8 @@ impl Topology {
                 direct: false,
                 managed_uplink: false,
                 policy: policy::Policy::default(),
+                ipv4_all: 0,
+                ipv4_default: 0,
                 ipv6_all: [1, 0, 0, 0, 0],
                 ipv6_default: [1, 0, 0, 0, 0],
                 stable_secret: None,
@@ -440,6 +452,7 @@ impl Topology {
                     },
                 ],
                 stats: Arc::default(),
+                ipv4_ingress: self.spaces[&id].ipv4_default,
                 ipv6: self.spaces[&id].ipv6_default,
                 stable_secret: None,
             },
@@ -492,6 +505,7 @@ impl Topology {
                     master: None,
                     addresses,
                     stats: Arc::default(),
+                    ipv4_ingress: self.spaces[&id].ipv4_default,
                     ipv6: self.spaces[&id].ipv6_default,
                     stable_secret: None,
                 },
@@ -548,6 +562,7 @@ impl Topology {
                 master: None,
                 addresses: addresses.clone(),
                 stats: Arc::default(),
+                ipv4_ingress: self.spaces[&id].ipv4_default,
                 ipv6: self.spaces[&id].ipv6_default,
                 stable_secret: None,
             },
@@ -572,6 +587,61 @@ impl Topology {
             });
         }
         self.changed();
+    }
+    pub fn ipv4_ingress(&self, ns: u64, index: u32, flag: Ipv4Ingress) -> Result<bool> {
+        let space = self.spaces.get(&ns).ok_or(NetError(19))?;
+        let bits = match index {
+            0 => space.ipv4_all,
+            u32::MAX => space.ipv4_default,
+            _ => {
+                self.devices
+                    .get(&(ns, index))
+                    .ok_or(NetError(19))?
+                    .ipv4_ingress
+            }
+        };
+        Ok(bits & flag as u8 != 0)
+    }
+    pub fn set_ipv4_ingress(
+        &mut self,
+        ns: u64,
+        index: u32,
+        flag: Ipv4Ingress,
+        enabled: bool,
+    ) -> Result<()> {
+        let space = self.spaces.get_mut(&ns).ok_or(NetError(19))?;
+        let bits = match index {
+            0 => &mut space.ipv4_all,
+            u32::MAX => &mut space.ipv4_default,
+            _ => {
+                &mut self
+                    .devices
+                    .get_mut(&(ns, index))
+                    .ok_or(NetError(19))?
+                    .ipv4_ingress
+            }
+        };
+        if enabled {
+            *bits |= flag as u8;
+        } else {
+            *bits &= !(flag as u8);
+        }
+        Ok(())
+    }
+    pub(super) fn accepts_ipv4_ingress(
+        &self,
+        ns: u64,
+        index: u32,
+        source: IpAddr,
+        dest: IpAddr,
+    ) -> bool {
+        let Some(link) = self.devices.get(&(ns, index)) else {
+            return false;
+        };
+        let flags = self.spaces[&ns].ipv4_all | link.ipv4_ingress;
+        (!(source.is_loopback() || dest.is_loopback())
+            || flags & Ipv4Ingress::RouteLocalnet as u8 != 0)
+            && (flags & Ipv4Ingress::AcceptLocal as u8 != 0 || !self.own(ns, source))
     }
     pub fn forwarding(&self, id: u64, ipv6: bool) -> bool {
         self.spaces
@@ -715,6 +785,7 @@ impl Topology {
                 master: None,
                 addresses: vec![],
                 stats: Arc::default(),
+                ipv4_ingress: self.spaces[&id].ipv4_default,
                 ipv6: self.spaces[&id].ipv6_default,
                 stable_secret: None,
             },

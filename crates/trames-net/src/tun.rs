@@ -139,7 +139,7 @@ impl Connection {
             }
             self.namespace
                 .root_stack()?
-                .inject_frame(p.index, frame, false)?;
+                .inject_frame(p.index, frame, None)?;
             return Ok(bytes.len());
         }
         let packet = if p.flags & 0x1000 != 0 {

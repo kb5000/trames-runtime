@@ -18,7 +18,7 @@ mod socket_filter;
 mod socket_quota;
 pub use socket_quota::GUEST_SOCKET_LIMIT;
 pub mod tun;
-pub use netdev::{Address as DeviceAddress, Device, DeviceKind, Route as DeviceRoute};
+pub use netdev::{Address as DeviceAddress, Device, DeviceKind, Ipv4Ingress, Route as DeviceRoute};
 mod virtualnet;
 use crate::shared_state::Cell;
 pub use native::{
@@ -407,6 +407,20 @@ impl Network {
         namespace.nft_packet_hooks.set(true);
         Ok(Self(Backend::Virtual(stack), namespace))
     }
+    pub fn ipv4_ingress(&self, scope: u32, flag: Ipv4Ingress) -> Result<bool> {
+        self.1
+            .graph
+            .read()
+            .unwrap()
+            .ipv4_ingress(self.namespace_id(), scope, flag)
+    }
+    pub fn set_ipv4_ingress(&self, scope: u32, flag: Ipv4Ingress, enabled: bool) -> Result<()> {
+        self.1
+            .graph
+            .write()
+            .unwrap()
+            .set_ipv4_ingress(self.namespace_id(), scope, flag, enabled)
+    }
     pub fn forwarding(&self, ipv6: bool) -> bool {
         self.1
             .graph
@@ -696,6 +710,14 @@ impl Socket {
                 _ => false,
             }
     }
+    /// The pipe splice write path submits the reserved pipe prefix as one message.
+    pub fn is_inet_message(&self) -> bool {
+        matches!(self.kind, 2 | 3)
+            && !matches!(
+                self.backend,
+                SocketBackend::Netlink(_) | SocketBackend::Packet(_)
+            )
+    }
     pub fn is_stream(&self) -> bool {
         self.kind == 1
     }
@@ -918,6 +940,7 @@ impl Socket {
             SocketBackend::Native(s) => s.linger(),
             SocketBackend::Hybrid(s) => s.linger(),
             SocketBackend::Virtual(s) => s.linger(),
+            SocketBackend::Packet(s) => Ok(s.linger()),
             _ => Err(NetError(92)),
         }
     }

@@ -57,6 +57,16 @@ impl Hub {
         outgoing: bool,
         wakes: &mut Vec<Arc<trames_shared::Readiness>>,
     ) {
+        self.observe_wire_except(device, frame, outgoing, None, wakes);
+    }
+    pub(crate) fn observe_wire_except(
+        &self,
+        device: &Device,
+        frame: &crate::ethernet::Frame,
+        outgoing: bool,
+        sender: Option<&Receiver>,
+        wakes: &mut Vec<Arc<trames_shared::Readiness>>,
+    ) {
         if !self.active() {
             return;
         }
@@ -79,11 +89,16 @@ impl Hub {
             .filter_map(Weak::upgrade)
             .collect();
         for socket in sockets {
+            if sender.is_some_and(|r| std::ptr::eq(r, Arc::as_ptr(&socket))) {
+                continue;
+            }
             let mut state = socket.state.lock();
             if state.protocol == 0
                 || state.protocol != 3 && state.protocol != protocol
                 || state.index != 0 && state.index != device.index
-                || outgoing && state.ignore_outgoing
+                || outgoing
+                    && (state.ignore_outgoing
+                        || device.kind == DeviceKind::Loopback && state.protocol != 3)
                 || kind == 3
                     && !state
                         .memberships
@@ -132,6 +147,8 @@ struct State {
     queue: VecDeque<(Vec<u8>, [u8; 20])>,
     bytes: usize,
     buffer: usize,
+    send_buffer: usize,
+    linger: Option<Duration>,
     epoch: u64,
     filter: Option<crate::socket_filter::Program>,
     locked: bool,
@@ -206,6 +223,8 @@ impl Socket {
                     queue: VecDeque::new(),
                     bytes: 0,
                     buffer: MAX_BUFFER,
+                    send_buffer: MAX_BUFFER,
+                    linger: None,
                     epoch: 0,
                     filter: None,
                     locked: false,
@@ -238,7 +257,9 @@ impl Socket {
         }
         let mut s = self.state.lock();
         s.index = index;
-        s.protocol = protocol;
+        if protocol != 0 {
+            s.protocol = protocol;
+        }
         Ok(())
     }
     pub fn local_bytes(&self) -> Result<Vec<u8>> {
@@ -254,11 +275,17 @@ impl Socket {
             .device(self.namespace.id(), index)
             .ok();
         let mut a = address(index, protocol, 0, d.as_ref().map_or([0; 6], |d| d.mac));
-        if let Some(d) = d {
-            if d.kind == DeviceKind::Tun {
+        match d.map(|d| d.kind) {
+            Some(DeviceKind::Loopback) => a[8..10].copy_from_slice(&772u16.to_le_bytes()),
+            Some(DeviceKind::Tun) => {
                 a[8..10].copy_from_slice(&65534u16.to_le_bytes());
                 a[11] = 0;
             }
+            None => {
+                a[8..10].fill(0);
+                a[11] = 0;
+            }
+            _ => {}
         }
         Ok(a.to_vec())
     }
@@ -277,20 +304,20 @@ impl Socket {
             let s = self.state.lock();
             (s.index, s.protocol)
         };
+        if index == 0 {
+            return Err(NetError(6));
+        }
         let device = self
             .namespace
             .graph
             .read()
             .unwrap()
             .device(self.namespace.id(), index)?;
-        if matches!(
-            device.kind,
-            DeviceKind::Direct | DeviceKind::Tun | DeviceKind::Loopback
-        ) {
+        if matches!(device.kind, DeviceKind::Direct | DeviceKind::Tun) {
             return Err(NetError(95));
         }
         let frame = if self.kind == 3 {
-            crate::ethernet::Frame::new(bytes)?
+            crate::ethernet::Frame::from_link(bytes, device.kind == DeviceKind::Loopback)?
         } else {
             let a = destination.ok_or(NetError(89))?;
             if a[11] != 6 {
@@ -305,7 +332,7 @@ impl Socket {
         };
         self.namespace
             .root_stack()?
-            .inject_frame(index, frame, true)?;
+            .inject_frame(index, frame, Some(&self.receiver))?;
         Ok(bytes.len())
     }
     pub fn recv(&self, count: usize, flags: u32) -> Result<Received> {
@@ -381,6 +408,10 @@ impl Socket {
         Ok(())
     }
     pub fn set_option_bytes(&self, level: u32, name: u32, bytes: &[u8]) -> Result<()> {
+        if (level, name) == (1, 13) {
+            self.state.lock().linger = crate::parse_linger(bytes)?;
+            return Ok(());
+        }
         if level == 263 && matches!(name, 1 | 2) {
             if bytes.len() < 16 {
                 return Err(NetError(22));
@@ -425,7 +456,8 @@ impl Socket {
     pub fn set_option(&self, level: u32, name: u32, value: i32) -> Result<()> {
         let mut s = self.state.lock();
         match (level, name) {
-            (1, 8) => s.buffer = (value.max(128) as usize).saturating_mul(2).min(MAX_BUFFER),
+            (1, 8) => s.buffer = crate::socket_buffer_size(name, value),
+            (1, 7) => s.send_buffer = crate::socket_buffer_size(name, value),
             (1, 44) if !s.locked || value != 0 => s.locked = value != 0,
             (1, 44) => return Err(NetError(1)),
             (263, 23) => s.ignore_outgoing = value != 0,
@@ -439,11 +471,16 @@ impl Socket {
             (1, 3) => Ok(self.kind as i32),
             (1, 4) => Ok(0),
             (1, 8) => Ok(s.buffer as i32),
+            (1, 7) => Ok(s.send_buffer as i32),
+            (1, 30) => Ok(0),
             (1, 39) => Ok(17),
             (1, 44) => Ok(i32::from(s.locked)),
             (263, 23) => Ok(i32::from(s.ignore_outgoing)),
             _ => Err(NetError(92)),
         }
+    }
+    pub fn linger(&self) -> [u8; 8] {
+        crate::linger_bytes(self.state.lock().linger)
     }
     pub fn address_size(&self) -> usize {
         20

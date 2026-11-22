@@ -113,16 +113,22 @@ pub struct TransferWait {
 }
 impl StreamTransfer {
     pub fn admitted(input: &SharedFd, output: &SharedFd) -> bool {
+        if input.open.pipe.is_some()
+            && output
+                .open
+                .socket
+                .as_ref()
+                .is_some_and(|s| s.is_inet_message())
+        {
+            return input.open.control.is_none() && output.open.control.is_none();
+        }
         [input, output].iter().all(|file| {
             let open = &file.open;
             open.control.is_none()
                 && (open.node.as_ref().is_some_and(|n| n.regular_file)
                     || open.pipe.is_some()
                     || open.local.as_ref().is_some_and(|s| s.kind() == 1)
-                    || open
-                        .socket
-                        .as_ref()
-                        .is_some_and(|s| s.info().is_some_and(|i| i.kind == 1)))
+                    || open.socket.as_ref().is_some_and(|s| s.is_stream()))
         })
     }
     pub fn new(

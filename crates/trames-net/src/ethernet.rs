@@ -15,11 +15,14 @@ pub(crate) type Mac = [u8; 6];
 pub(crate) struct Frame(pub Arc<[u8]>);
 impl Frame {
     pub fn new(bytes: &[u8]) -> Result<Self> {
+        Self::from_link(bytes, false)
+    }
+    pub fn from_link(bytes: &[u8], loopback: bool) -> Result<Self> {
         if bytes.len() < 14 || bytes.len() > 65575 + 22 {
             return Err(NetError(22));
         }
         let f = Self(Arc::from(bytes));
-        if f.source()[0] & 1 != 0 || f.source() == [0; 6] {
+        if f.source()[0] & 1 != 0 || (!loopback && f.source() == [0; 6]) {
             return Err(NetError(22));
         }
         if f.outer_protocol() == 0x8100 && bytes.len() < 18 {

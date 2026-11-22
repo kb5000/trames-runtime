@@ -3393,12 +3393,12 @@ impl Vfs {
             }
             o.pipe.as_ref().map(|p| (p.pipe.clone(), p.write))
         };
-        for open in [source, dest] {
+        for (open, write) in [(source, false), (dest, true)] {
             let o = open.borrow();
-            if o.socket
-                .as_ref()
-                .is_some_and(|s| s.info().is_some_and(|i| i.kind != 1))
-                || o.local.as_ref().is_some_and(|s| s.kind() != 1)
+            if o.socket.as_ref().is_some_and(|s| {
+                s.info().is_some_and(|i| i.kind != 1)
+                    && !(write && source_pipe.is_some() && s.is_inet_message())
+            }) || o.local.as_ref().is_some_and(|s| s.kind() != 1)
             {
                 return Err(Errno(22));
             }

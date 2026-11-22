@@ -90,12 +90,13 @@ pub(super) enum Sysctl {
     LocalPortRange,
     TcpSack,
     Forwarding(bool),
+    Ipv4Ingress(u32, trames_net::Ipv4Ingress),
     BridgeFilter(bool),
     Ipv6(u32, usize),
     StableSecret(u32),
 }
 impl Sysctl {
-    pub(super) fn ipv6_scope(name: &[u8], net: &trames_net::Network) -> Option<u32> {
+    pub(super) fn interface_scope(name: &[u8], net: &trames_net::Network) -> Option<u32> {
         match name {
             b"all" => Some(0),
             b"default" => Some(u32::MAX),
@@ -106,10 +107,23 @@ impl Sysctl {
                 .map(|d| d.index),
         }
     }
+    pub(super) fn ipv4_path(path: &[u8], net: &trames_net::Network) -> Option<Self> {
+        let tail = path.strip_prefix(b"/proc/sys/net/ipv4/conf/")?;
+        let cut = tail.iter().position(|b| *b == b'/')?;
+        let flag = match &tail[cut + 1..] {
+            b"accept_local" => trames_net::Ipv4Ingress::AcceptLocal,
+            b"route_localnet" => trames_net::Ipv4Ingress::RouteLocalnet,
+            _ => return None,
+        };
+        Some(Self::Ipv4Ingress(
+            Self::interface_scope(&tail[..cut], net)?,
+            flag,
+        ))
+    }
     pub(super) fn ipv6_path(path: &[u8], net: &trames_net::Network) -> Option<Self> {
         let tail = path.strip_prefix(b"/proc/sys/net/ipv6/conf/")?;
         let cut = tail.iter().position(|b| *b == b'/')?;
-        let scope = Self::ipv6_scope(&tail[..cut], net)?;
+        let scope = Self::interface_scope(&tail[..cut], net)?;
         if &tail[cut + 1..] == b"keep_addr_on_down" {
             return Some(Self::Ipv6(scope, 4));
         }
@@ -140,7 +154,7 @@ impl Sysctl {
             b"/proc/sys/net/ipv6/conf/all/forwarding" => Some(Self::Forwarding(true)),
             b"/proc/sys/net/bridge/bridge-nf-call-iptables" => Some(Self::BridgeFilter(false)),
             b"/proc/sys/net/bridge/bridge-nf-call-ip6tables" => Some(Self::BridgeFilter(true)),
-            _ => Self::ipv6_path(path, net),
+            _ => Self::ipv4_path(path, net).or_else(|| Self::ipv6_path(path, net)),
         }
     }
 }
@@ -168,6 +182,10 @@ impl Control {
             Sysctl::TcpSack => format!("{}\n", u8::from(n.tcp_sack().map_err(|e| Errno(e.0))?)),
             Sysctl::UnprivilegedPort => format!("{}\n", n.unprivileged_port()),
             Sysctl::BridgeFilter(ipv6) => format!("{}\n", u8::from(n.bridge_filter(ipv6))),
+            Sysctl::Ipv4Ingress(scope, flag) => format!(
+                "{}\n",
+                u8::from(n.ipv4_ingress(scope, flag).map_err(|e| Errno(e.0))?)
+            ),
             Sysctl::Forwarding(ipv6) => format!("{}\n", u8::from(n.forwarding(ipv6))),
             Sysctl::StableSecret(scope) => {
                 format!("{}\n", n.stable_secret(scope).map_err(|e| Errno(e.0))?)
@@ -232,6 +250,9 @@ impl Control {
             (Sysctl::BridgeFilter(ipv6), [enabled]) if *enabled <= 1 => {
                 n.set_bridge_filter(ipv6, *enabled != 0)
             }
+            (Sysctl::Ipv4Ingress(scope, flag), [enabled]) if *enabled <= 1 => n
+                .set_ipv4_ingress(scope, flag, *enabled != 0)
+                .map_err(|e| Errno(e.0))?,
             (Sysctl::Forwarding(ipv6), [enabled]) if *enabled <= 1 => {
                 n.set_forwarding(ipv6, *enabled != 0)
             }
@@ -695,6 +716,39 @@ mod tests {
         assert_eq!(v.write(fd, b"2"), Err(Errno(22)));
         v.credentials = Credentials::user(1000, 1000);
         assert_eq!(v.write(fd, b"0"), Err(Errno(13)));
+    }
+    #[test]
+    fn ipv4_ingress_sysctls_follow_the_open_namespace_and_link() {
+        let mut v = Vfs::default();
+        v.configure_network(NetworkMode::Loopback).unwrap();
+        v.set_runtime_info(1, RuntimeInfo::default());
+        let path = b"/proc/sys/net/ipv4/conf/lo/accept_local";
+        let old = v.open_at(AT_FDCWD, path, 2, 0).unwrap();
+        v.unshare_net().unwrap();
+        let new = v.open_at(AT_FDCWD, path, 2, 0).unwrap();
+        v.write(old, b"1").unwrap();
+        assert_eq!(v.read(new, 8).unwrap(), b"0\n");
+        v.seek(old, 0, 0).unwrap();
+        assert_eq!(v.read(old, 8).unwrap(), b"1\n");
+    }
+    #[test]
+    fn splice_to_datagram_commits_pipe_bytes_only_after_delivery() {
+        let mut v = Vfs::default();
+        v.configure_managed_uplink(NetworkMode::Loopback).unwrap();
+        let [r, w] = v.pipe(O_NONBLOCK).unwrap();
+        let src = v.socket(2, 2 | O_NONBLOCK, 0).unwrap();
+        let dst = v.socket(2, 2 | O_NONBLOCK, 0).unwrap();
+        let receiver = v.socket_fd(dst).unwrap();
+        receiver.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        v.write(w, b"one message").unwrap();
+        assert!(v.splice(r, src, 11, None, None).is_err());
+        v.socket_fd(src)
+            .unwrap()
+            .connect(receiver.local_addr().unwrap())
+            .unwrap();
+        assert_eq!(v.splice(r, src, 11, None, None), Ok(11));
+        assert_eq!(receiver.recv(32, 0).unwrap().data, b"one message");
+        assert_eq!(v.read(r, 1), Err(Errno(11)));
     }
     #[test]
     fn splice_preserves_bytes_under_backpressure_and_stream_half_close() {

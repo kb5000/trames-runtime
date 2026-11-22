@@ -79,6 +79,26 @@ impl Topology {
             wakes,
         );
     }
+    pub fn observe_local_loopback(
+        &self,
+        ns: u64,
+        packet: &[u8],
+        wakes: &mut Vec<Arc<trames_shared::Readiness>>,
+    ) {
+        let hub = &self.spaces[&ns].packets;
+        if !hub.active() {
+            return;
+        }
+        let protocol = match packet.first().map(|b| b >> 4) {
+            Some(4) => 0x0800,
+            Some(6) => 0x86dd,
+            _ => return,
+        };
+        let device = self.devices[&(ns, 1)].snapshot();
+        let frame = crate::ethernet::Frame::build(device.mac, device.mac, protocol, packet);
+        hub.observe_wire(&device, &frame, true, wakes);
+        hub.observe_wire(&device, &frame, false, wakes);
+    }
     pub fn link_wakes(&self, ns: u64, index: u32, wakes: &mut Vec<Arc<trames_shared::Readiness>>) {
         if let Some(space) = self.spaces.get(&ns) {
             space.packets.link_wakes(wakes);

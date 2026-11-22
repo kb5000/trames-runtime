@@ -2114,9 +2114,13 @@ impl Vfs {
             b"/proc/sys/net/ipv4/ip_local_port_range" => return Ok(regular(b"49152\t65535\n".to_vec())),
             b"/proc/sys/net/ipv4/ip_default_ttl" => return Ok(regular(b"64\n".to_vec())),
             b"/proc/sys/net/ipv4/ping_group_range" | b"/proc/sys/net/ipv4/ip_unprivileged_port_start" => return Ok(Some((file(Vec::new()),0o100644))),
+            p if p.starts_with(b"/proc/sys/net/ipv4/conf/") => {
+                if super::network::Sysctl::ipv4_path(p, &self.network).is_some() {return Ok(Some((file(Vec::new()),0o100644)));}
+                if super::network::Sysctl::interface_scope(&p[b"/proc/sys/net/ipv4/conf/".len()..], &self.network).is_some() {return Ok(directory());}
+            },
             p if p.starts_with(b"/proc/sys/net/ipv6/conf/") => {
                 if super::network::Sysctl::ipv6_path(p, &self.network).is_some() {return Ok(Some((file(Vec::new()),0o100644)));}
-                if super::network::Sysctl::ipv6_scope(&p[b"/proc/sys/net/ipv6/conf/".len()..], &self.network).is_some() {return Ok(directory());}
+                if super::network::Sysctl::interface_scope(&p[b"/proc/sys/net/ipv6/conf/".len()..], &self.network).is_some() {return Ok(directory());}
             },
             _ => {},
         }
@@ -2885,13 +2889,18 @@ impl Vfs {
                 b"bridge-nf-call-iptables".to_vec(),
                 b"bridge-nf-call-ip6tables".to_vec(),
             ],
-            b"/proc/sys/net/ipv6/conf" => {
+            b"/proc/sys/net/ipv4/conf" | b"/proc/sys/net/ipv6/conf" => {
                 let mut names = vec![b"all".to_vec(), b"default".to_vec()];
                 names.extend(self.network.devices().into_iter().map(|d| d.name));
                 names
             }
-            b"/proc/sys/net/ipv4/conf" => vec![b"all".to_vec()],
-            b"/proc/sys/net/ipv4/conf/all" => vec![b"forwarding".to_vec()],
+            p if p.starts_with(b"/proc/sys/net/ipv4/conf/") => {
+                let mut names = vec![b"accept_local".to_vec(), b"route_localnet".to_vec()];
+                if p.ends_with(b"/all") {
+                    names.push(b"forwarding".to_vec());
+                }
+                names
+            }
             p if p.starts_with(b"/proc/sys/net/ipv6/conf/") => {
                 let mut names = vec![b"keep_addr_on_down".to_vec()];
                 if p.ends_with(b"/all") {

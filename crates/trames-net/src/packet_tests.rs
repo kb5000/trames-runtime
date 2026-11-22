@@ -189,6 +189,52 @@ fn packet_capture_filter_injection_and_namespace_isolation() {
     assert_eq!(tap.set_option_bytes(1, 27, &[]), Err(NetError(1)));
 }
 #[test]
+fn loopback_injection_and_capture_respect_protocol_direction_and_ingress_policy() {
+    let net = Network::managed_uplink(NetworkMode::Loopback).unwrap();
+    let sender = net.socket(17, 3, 3u16.to_be() as u32).unwrap();
+    let observer = net.socket(17, 2, 3u16.to_be() as u32).unwrap();
+    let receiver = net.socket(2, 2, 0).unwrap();
+    receiver.bind(addr("127.0.0.1", 7102)).unwrap();
+    let target = crate::packet_socket::address(1, 0x800, 0, [0; 6]);
+    let ip = udp4("127.0.0.1", "127.0.0.1", 7101, 7102, b"guest only");
+    let frame = crate::ethernet::Frame::build([0; 6], [0; 6], 0x800, &ip);
+    assert!(crate::ethernet::Frame::new(&frame.0).is_err());
+    for step in 0..3 {
+        if step == 1 {
+            net.set_ipv4_ingress(0, Ipv4Ingress::RouteLocalnet, true)
+                .unwrap();
+        }
+        if step == 2 {
+            net.set_ipv4_ingress(1, Ipv4Ingress::AcceptLocal, true)
+                .unwrap();
+        }
+        sender.send_bytes(&frame.0, 0, Some(&target)).unwrap();
+        for direction in [4, 0] {
+            let message = observer.recv(512, MSG_DONTWAIT).unwrap();
+            assert_eq!(message.packet_address.unwrap()[10], direction);
+            assert_eq!(message.data, ip);
+        }
+        assert_eq!(observer.poll(1), Ok(0));
+        assert_eq!(
+            sender
+                .recv(512, MSG_DONTWAIT)
+                .unwrap()
+                .packet_address
+                .unwrap()[10],
+            0
+        );
+        assert_eq!(sender.poll(1), Ok(0));
+        if step < 2 {
+            assert_eq!(receiver.poll(1), Ok(0));
+        } else {
+            assert_eq!(
+                receiver.recv(512, MSG_DONTWAIT).unwrap().data,
+                b"guest only"
+            );
+        }
+    }
+}
+#[test]
 fn neighbors_netlink_override_real_delivery_and_dump() {
     let root = Network::new(NetworkMode::Full);
     let a = root.isolated().unwrap();

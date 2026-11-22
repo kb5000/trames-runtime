@@ -16,7 +16,11 @@ impl Topology {
         };
         if !matches!(
             d.kind,
-            DeviceKind::Veth { .. } | DeviceKind::Bridge | DeviceKind::Tap | DeviceKind::Ethernet
+            DeviceKind::Loopback
+                | DeviceKind::Veth { .. }
+                | DeviceKind::Bridge
+                | DeviceKind::Tap
+                | DeviceKind::Ethernet
         ) {
             return vec![];
         }
@@ -30,6 +34,7 @@ impl Topology {
         self.account(ns, index, frame.0.len(), outgoing, false);
         if outgoing {
             return match d.kind {
+                DeviceKind::Loopback => vec![Action::Receive(ns, index, frame)],
                 DeviceKind::Veth { peer } => self
                     .peer_device(peer)
                     .filter(|d| d.up)
