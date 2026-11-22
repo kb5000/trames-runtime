@@ -57,6 +57,7 @@ fn rule(
             n.namespace_id(),
             Rule {
                 family: 2,
+                destination: None,
                 priority,
                 table,
                 action,
@@ -600,5 +601,62 @@ fn raw_transport_fanout_is_scoped_to_family_and_protocol() {
                 assert_eq!(packet.err(), Some(NetError(11)));
             }
         }
+    }
+}
+
+#[test]
+fn destination_rules_control_guest_delivery_and_deletion_restores_the_route() {
+    let fabric = Fabric::new().unwrap();
+    let a = Network::virtual_network(&fabric, 2, NetworkMode::Full).unwrap();
+    let b = Network::virtual_network(&fabric, 3, NetworkMode::Full).unwrap();
+    let c = Network::virtual_network(&fabric, 4, NetworkMode::Full).unwrap();
+    for (family, denied, allowed, prefix) in [
+        (
+            2,
+            IpAddr::V4(b.info().unwrap().ipv4),
+            IpAddr::V4(c.info().unwrap().ipv4),
+            32,
+        ),
+        (
+            10,
+            IpAddr::V6(b.info().unwrap().ipv6),
+            IpAddr::V6(c.info().unwrap().ipv6),
+            128,
+        ),
+    ] {
+        let dst = SocketAddr::new(denied, 34003);
+        let other = SocketAddr::new(allowed, 34003);
+        let rx = b.socket(family, 2, 0).unwrap();
+        rx.bind(dst).unwrap();
+        let control = c.socket(family, 2, 0).unwrap();
+        control.bind(other).unwrap();
+        let tx = a.socket(family, 2, 0).unwrap();
+        let rule = Rule {
+            family: family as u8,
+            priority: 100,
+            table: 0,
+            action: 8,
+            destination: Some(Address { ip: denied, prefix }),
+            mark: 0,
+            mask: 0,
+            input: None,
+            output: None,
+            uid: None,
+            invert: false,
+        };
+        let apply = |add| {
+            a.1.graph
+                .write()
+                .unwrap()
+                .policy_rule(a.namespace_id(), rule.clone(), add, true, true)
+        };
+        apply(true).unwrap();
+        assert_eq!(tx.send(b"denied", 0, Some(dst)), Err(NetError(13)));
+        assert!(matches!(rx.recv(32, 0), Err(NetError(11))));
+        tx.send(b"allowed", 0, Some(other)).unwrap();
+        assert_eq!(control.recv(32, 0).unwrap().data, b"allowed");
+        apply(false).unwrap();
+        tx.send(b"restored", 0, Some(dst)).unwrap();
+        assert_eq!(rx.recv(32, 0).unwrap().data, b"restored");
     }
 }

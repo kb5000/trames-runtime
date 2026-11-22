@@ -6,6 +6,7 @@ use super::*;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Rule {
     pub family: u8,
+    pub destination: Option<Address>,
     pub priority: u32,
     pub table: u32,
     pub action: u8,
@@ -20,6 +21,7 @@ impl Rule {
     fn lookup(family: u8, priority: u32, table: u32) -> Self {
         Self {
             family,
+            destination: None,
             priority,
             table,
             action: 1,
@@ -49,33 +51,46 @@ pub(super) struct Policy {
     rules: Vec<Rule>,
     tables: BTreeMap<u32, Vec<Entry>>,
 }
+fn default_rules() -> impl Iterator<Item = Rule> {
+    [2, 10].into_iter().flat_map(|family| {
+        [(0, 255), (32766, 254), (32767, 253)]
+            .into_iter()
+            .map(move |(priority, table)| Rule::lookup(family, priority, table))
+    })
+}
 impl Default for Policy {
     fn default() -> Self {
         Self {
             active: false,
-            rules: [2, 10]
-                .into_iter()
-                .flat_map(|family| {
-                    [(0, 255), (32766, 254), (32767, 253)]
-                        .into_iter()
-                        .map(move |(p, t)| Rule::lookup(family, p, t))
-                })
-                .collect(),
+            rules: default_rules().collect(),
             tables: BTreeMap::new(),
         }
     }
 }
 impl Policy {
+    // Recompute only on configuration changes, so removing custom policy
+    // restores the ordinary route lookup and its allocation profile.
+    fn update_active(&mut self) {
+        self.active = [253, 254, 255]
+            .into_iter()
+            .any(|table| self.tables.contains_key(&table))
+            || self.rules.len() != 6
+            || default_rules().any(|r| !self.rules.contains(&r));
+    }
     pub(super) fn forget_ipv6_device(&mut self, index: u32) {
-        for entries in self.tables.values_mut() {
+        self.tables.retain(|_, entries| {
             entries.retain(|e| e.route.device != index || e.route.destination.ip.is_ipv4());
-        }
+            !entries.is_empty()
+        });
+        self.update_active();
     }
 
     pub(super) fn forget_device(&mut self, index: u32) {
-        for entries in self.tables.values_mut() {
+        self.tables.retain(|_, entries| {
             entries.retain(|e| e.route.device != index);
-        }
+            !entries.is_empty()
+        });
+        self.update_active();
     }
 }
 impl Topology {
@@ -97,7 +112,7 @@ impl Topology {
         priority: bool,
     ) -> Result<()> {
         let space = self.spaces.get_mut(&id).ok_or(NetError(2))?;
-        if !space.managed_uplink {
+        if space.lo.is_none() {
             return Err(NetError(95));
         }
         let rules = &mut space.policy.rules;
@@ -115,6 +130,7 @@ impl Topology {
                 .iter()
                 .position(|r| {
                     r.family == rule.family
+                        && rule.destination.is_none_or(|a| r.destination == Some(a))
                         && (!priority || r.priority == rule.priority)
                         && (rule.table == 0 || r.table == rule.table)
                         && (rule.action == 0 || r.action == rule.action)
@@ -133,7 +149,7 @@ impl Topology {
                 .ok_or(NetError(2))?;
             rules.remove(i);
         }
-        space.policy.active = true;
+        space.policy.update_active();
         self.changed();
         Ok(())
     }
@@ -192,7 +208,7 @@ impl Topology {
         if table == 254 && entry.kind == 1 {
             return self.route(id, entry.route, add, replace, exclusive);
         }
-        if !self.spaces[&id].managed_uplink {
+        if self.spaces[&id].lo.is_none() {
             return Err(NetError(95));
         }
         let route = entry.route;
@@ -212,7 +228,8 @@ impl Topology {
                 }
             }
         }
-        let tables = &mut self.spaces.get_mut(&id).unwrap().policy.tables;
+        let policy = &mut self.spaces.get_mut(&id).unwrap().policy;
+        let tables = &mut policy.tables;
         if !add && !tables.contains_key(&table) {
             return Err(NetError(3));
         }
@@ -244,6 +261,10 @@ impl Topology {
                 .ok_or(NetError(3))?;
             routes.remove(i);
         }
+        if routes.is_empty() {
+            tables.remove(&table);
+        }
+        policy.update_active();
         self.changed();
         Ok(())
     }
@@ -269,7 +290,8 @@ impl Topology {
         }
         let family = if destination.is_ipv4() { 2 } else { 10 };
         for r in p.rules.iter().filter(|r| r.family == family) {
-            let matches = context.mark & r.mask == r.mark & r.mask
+            let matches = r.destination.is_none_or(|a| a.contains(destination))
+                && context.mark & r.mask == r.mark & r.mask
                 && r.uid
                     .is_none_or(|range| (range[0]..=range[1]).contains(&context.uid))
                 && r.input.as_ref().is_none_or(|n| n == b"lo")
@@ -288,11 +310,8 @@ impl Topology {
                 8 => return Err(NetError(13)),
                 _ => {}
             }
-            if r.table == 255 {
-                if self.own(id, destination) {
-                    return self.source_main(id, destination);
-                }
-                continue;
+            if r.table == 255 && self.own(id, destination) {
+                return self.source_main(id, destination);
             }
             // Main-route synthesis is needed only for that table. Normal
             // Android policy lookups borrow stored entries without allocation.
@@ -301,26 +320,27 @@ impl Topology {
             } else {
                 Vec::new()
             };
-            let selected =
-                main.iter()
-                    .map(|route| Entry {
-                        route: *route,
-                        kind: 1,
-                    })
-                    .chain(p.tables.get(&r.table).into_iter().flatten().copied())
-                    .filter(|e| e.route.destination.contains(destination))
-                    .filter(|e| {
-                        e.kind != 1
-                            || self.devices.get(&(id, e.route.device)).is_some_and(|d| {
-                                d.up && context.device.is_none_or(|i| i == d.index)
-                            })
-                    })
-                    .min_by_key(|e| {
-                        (
-                            std::cmp::Reverse(e.route.destination.prefix),
-                            e.route.metric,
-                        )
-                    });
+            let selected = main
+                .iter()
+                .map(|route| Entry {
+                    route: *route,
+                    kind: 1,
+                })
+                .chain(p.tables.get(&r.table).into_iter().flatten().copied())
+                .filter(|e| e.route.destination.contains(destination))
+                .filter(|e| {
+                    e.kind != 1
+                        || self.devices.get(&(id, e.route.device)).is_some_and(|d| {
+                            d.up && d.master.is_none()
+                                && context.device.is_none_or(|i| i == d.index)
+                        })
+                })
+                .min_by_key(|e| {
+                    (
+                        std::cmp::Reverse(e.route.destination.prefix),
+                        e.route.metric,
+                    )
+                });
             if let Some(entry) = selected {
                 match entry.kind {
                     6 => return Err(NetError(22)),

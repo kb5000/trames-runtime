@@ -130,7 +130,11 @@ impl Topology {
             |e| e.local,
         );
         let mut actions = Vec::new();
-        if input != 0 && (local_mac || frame.multicast()) {
+        // A bridge port's own destination is PACKET_HOST only on ingress
+        // through that port. Another port's local MAC terminates forwarding
+        // but remains PACKET_OTHERHOST for the bridge IP stack.
+        let host_destination = frame.destination() == br.mac || frame.destination() == port.mac;
+        if input != 0 && (local_mac && host_destination || frame.multicast()) {
             let local = if br.bridge_config.vlan_filtering {
                 br.l2.egress(&frame, vid)
             } else {

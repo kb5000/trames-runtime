@@ -527,7 +527,7 @@ fn fdb_ages_moves_and_link_deletion_removes_entries_and_neighbors() {
 }
 
 #[test]
-fn packet_promiscuity_and_bpf_filter_real_opaque_ethernet_bytes() {
+fn veth_captures_otherhost_frames_and_filters_real_opaque_ethernet_bytes() {
     let root = Network::new(NetworkMode::Full);
     let n = root.isolated().unwrap();
     let br = bridge(&root, b"filter-br");
@@ -541,7 +541,9 @@ fn packet_promiscuity_and_bpf_filter_real_opaque_ethernet_bytes() {
         b"opaque",
     );
     tap.write(&frame.0).unwrap();
-    assert_eq!(capture.poll(1), Ok(0));
+    let incoming = capture.recv(2048, 0).unwrap();
+    assert_eq!(incoming.packet_address.unwrap()[10], 3);
+    assert_eq!(incoming.data, &*frame.0);
     let mut membership = ni.to_le_bytes().to_vec();
     membership.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     capture.set_option_bytes(263, 1, &membership).unwrap();
@@ -566,7 +568,7 @@ fn packet_promiscuity_and_bpf_filter_real_opaque_ethernet_bytes() {
     assert_eq!(capture.poll(1), Ok(0));
     capture.set_option_bytes(263, 2, &membership).unwrap();
     tap.write(&frame.0).unwrap();
-    assert_eq!(capture.poll(1), Ok(0));
+    assert_eq!(capture.recv(2048, 0).unwrap().data, &*frame.0);
 }
 
 #[test]

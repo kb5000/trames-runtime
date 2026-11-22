@@ -64,6 +64,31 @@ fn octets(ip: IpAddr) -> Vec<u8> {
         IpAddr::V6(a) => a.octets().to_vec(),
     }
 }
+fn link_flags(d: &Device, carrier: bool) -> u32 {
+    match d.kind {
+        DeviceKind::Loopback => 8 | if d.up { 0x41 } else { 0 },
+        DeviceKind::Tun => 0x1090 | u32::from(d.up) | if carrier { 0x10040 } else { 0 },
+        DeviceKind::Direct => 0x90 | if d.up { 0x41 } else { 0 },
+        _ => 0x1002 | u32::from(d.up) | if carrier { 0x10040 } else { 0 },
+    }
+}
+
+fn requested_up(d: &Device, state: u32, change: u32) -> Result<Option<bool>> {
+    if state == 0 && change == 0 {
+        return Ok(None);
+    }
+    let mask = if change == 0 { u32::MAX } else { change };
+    // Volatile flags (RUNNING, LOWER_UP, etc.) are reports from the device.
+    // Reject actual edits to configurable flags we do not implement, while
+    // accepting a full-mask read/modify/write of UP.
+    const OTHER_CONFIGURABLE: u32 =
+        0x4 | 0x20 | 0x80 | 0x100 | 0x200 | 0x1000 | 0x2000 | 0x4000 | 0x8000;
+    if (state ^ link_flags(d, false)) & mask & OTHER_CONFIGURABLE != 0 {
+        return Err(NetError(95));
+    }
+    Ok((mask & 1 != 0).then_some(state & 1 != 0))
+}
+
 pub(crate) fn link_data(g: &Topology, d: &Device) -> Vec<u8> {
     let mut data = vec![0; 16];
     data[2..4].copy_from_slice(
@@ -76,12 +101,7 @@ pub(crate) fn link_data(g: &Topology, d: &Device) -> Vec<u8> {
     );
     data[4..8].copy_from_slice(&d.index.to_le_bytes());
     let carrier = g.carrier(d);
-    let flags = match d.kind {
-        DeviceKind::Loopback => 8 | if d.up { 0x41 } else { 0 },
-        DeviceKind::Tun => 0x1090 | u32::from(d.up) | if carrier { 0x10040 } else { 0 },
-        DeviceKind::Direct => 0x90 | if d.up { 0x41 } else { 0 },
-        _ => 0x1002 | u32::from(d.up) | if carrier { 0x10040 } else { 0 },
-    };
+    let flags = link_flags(d, carrier);
     data[8..12].copy_from_slice(&flags.to_le_bytes());
     data[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
     let mut name = d.name.clone();
@@ -372,12 +392,12 @@ pub(crate) fn request(
                 }
                 let a = attrs(&request[28..])?;
                 if !matches!(family, 2 | 10)
-                    || request[17..20] != [0; 3]
+                    || request[18..20] != [0; 2]
                     || request[21..23] != [0; 2]
                     || !matches!(request[23], 0 | 1 | 6 | 7 | 8)
                     || u32v(&request[24..28])? & !2 != 0
                     || a.iter()
-                        .any(|(k, _)| !matches!(k, 3 | 6 | 10 | 15 | 16 | 17 | 20))
+                        .any(|(k, _)| !matches!(k, 1 | 3 | 6 | 10 | 15 | 16 | 17 | 20))
                 {
                     return Err(NetError(95));
                 }
@@ -392,8 +412,19 @@ pub(crate) fn request(
                 if uid.is_some_and(|v| v[0] > v[1]) {
                     return Err(NetError(22));
                 }
+                let prefix = request[17];
+                if prefix > if family == 2 { 32 } else { 128 } {
+                    return Err(NetError(22));
+                }
+                let dst = get(&a, 1).map(|b| ip(family, b)).transpose()?;
+                if prefix != 0 && dst.is_none() {
+                    return Err(NetError(22));
+                }
                 let rule = crate::netdev::Rule {
                     family,
+                    destination: dst
+                        .filter(|_| prefix != 0)
+                        .map(|ip| Address { ip, prefix }.network()),
                     priority: get(&a, 6).map(u32v).transpose()?.unwrap_or(32765),
                     table: get(&a, 15)
                         .map(u32v)
@@ -462,10 +493,6 @@ pub(crate) fn request(
                 }
                 let change = u32v(&request[28..32])?;
                 let state = u32v(&request[24..28])?;
-                if change & !1 != 0 || state & change & !1 != 0 {
-                    return Err(NetError(95));
-                }
-                let up = (change & 1 != 0).then_some(state & 1 != 0);
                 for &(k, v) in &a {
                     match k {
                         1 => {
@@ -579,9 +606,7 @@ pub(crate) fn request(
                             let (i, p) = next.create_veth(ns, name, peer_ns, peer_name)?;
                             let pc = u32v(&peer[12..16])?;
                             let pf = u32v(&peer[8..12])?;
-                            if pc & !1 != 0 {
-                                return Err(NetError(95));
-                            }
+                            let peer_up = requested_up(&next.device(peer_ns, p)?, pf, pc)?;
                             let pm = get(&pa, 1)
                                 .map(|v| v.try_into().map_err(|_| NetError(22)))
                                 .transpose()?;
@@ -590,7 +615,7 @@ pub(crate) fn request(
                                 p,
                                 None,
                                 None,
-                                (pc & 1 != 0).then_some(pf & 1 != 0),
+                                peer_up,
                                 None,
                                 pm,
                                 get(&pa, 13).map(u32v).transpose()?,
@@ -606,6 +631,7 @@ pub(crate) fn request(
                         }
                         _ => return Err(NetError(95)),
                     };
+                    let up = requested_up(&next.device(ns, index)?, state, change)?;
                     next.change_link(ns, index, None, target, up, None, mac, tx_queue_len, mtu)?;
                     let current = target.unwrap_or(ns);
                     changes.push((
@@ -640,6 +666,7 @@ pub(crate) fn request(
                             }
                         }
                     } else {
+                        let up = requested_up(&d, state, change)?;
                         graph.change_link(
                             ns,
                             d.index,
@@ -1089,6 +1116,11 @@ pub(crate) fn policy_route_data(table: u32, entry: crate::netdev::PolicyRoute) -
 fn rule_data(rule: &crate::netdev::Rule) -> Vec<u8> {
     let mut bytes = vec![0; 12];
     bytes[0] = rule.family;
+    bytes[4] = u8::try_from(rule.table).unwrap_or(0);
+    if let Some(destination) = rule.destination {
+        bytes[1] = destination.prefix;
+        attr(&mut bytes, 1, &octets(destination.ip));
+    }
     bytes[7] = rule.action;
     bytes[8..12].copy_from_slice(&(if rule.invert { 2u32 } else { 0 }).to_le_bytes());
     attr(&mut bytes, 6, &rule.priority.to_le_bytes());

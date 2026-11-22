@@ -100,6 +100,9 @@ impl Hub {
                     && (state.ignore_outgoing
                         || device.kind == DeviceKind::Loopback && state.protocol != 3)
                 || kind == 3
+                    // A veth peer receives every frame transmitted to it, including
+                    // OTHERHOST. Only local IP delivery filters on the destination.
+                    && !matches!(device.kind, DeviceKind::Veth { .. })
                     && !state
                         .memberships
                         .keys()
