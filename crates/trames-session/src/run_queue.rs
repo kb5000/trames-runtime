@@ -654,18 +654,17 @@ impl<C: Cpu> Job<C> {
             return true;
         }
         if self.stopped() {
-            return self
-                .work
-                .syscalls
-                .as_ref()
-                .is_some_and(|s| s.next_io_signal().is_some_and(|(sig, _)| sig == 9))
-                || self.uring.as_ref().is_some_and(|r| {
-                    r.signal.ready() || r.deadline().is_some_and(|d| d <= Instant::now())
+            return self.work.syscalls.as_ref().is_some_and(|s| {
+                s.next_io_signal().is_some_and(|(sig, _, action)| {
+                    trames_kernel::signal::disposition(sig, action)
+                        == trames_kernel::signal::Disposition::Terminate
                 })
-                || self
-                    .gpu_pending
-                    .as_ref()
-                    .is_some_and(|g| g.compile.is_some() && !g.waiting())
+            }) || self.uring.as_ref().is_some_and(|r| {
+                r.signal.ready() || r.deadline().is_some_and(|d| d <= Instant::now())
+            }) || self
+                .gpu_pending
+                .as_ref()
+                .is_some_and(|g| g.compile.is_some() && !g.waiting())
                 || (matches!(&self.waiting, Some(WaitState::Namespace(wait)) if wait.ready())
                     || matches!(&self.waiting, Some(WaitState::Policy(wait)) if wait.ready())
                     || matches!(&self.waiting, Some(WaitState::Barrier(wait)) if wait.ready()))
@@ -708,12 +707,12 @@ impl<C: Cpu> Job<C> {
             }
         }
         self.work.syscalls.as_ref().is_some_and(|s| {
-            s.next_io_signal().is_some_and(|(sig, _)| {
-                if s.actions.get(sig as usize).handler > 1 &&
+            s.next_io_signal().is_some_and(|(sig, _, action)| {
+                if action.handler > 1 &&
                     self.io.as_ref().and_then(|io|io.file_pending()).or_else(||self.retry.as_ref()?.file.clone()).is_some_and(|p|p.fuse_interrupt_needed()) {return true;}
-                (s.actions.get(sig as usize).handler <= 1
+                (action.handler <= 1
                     && !(matches!(sig, 19..=22) && self.stop_hold() == Some(true)))
-                    || s.actions.get(sig as usize).handler > 1
+                    || action.handler > 1
                         && !(matches!(&self.waiting, Some(WaitState::Namespace(_) | WaitState::Policy(_) | WaitState::Barrier(_)))
                             || matches!(&self.waiting, Some(WaitState::Completion(wait)) if !wait.release.finished())
                             || self.gpu_pending.is_some()

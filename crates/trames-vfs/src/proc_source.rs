@@ -122,6 +122,9 @@ pub trait ProcTask: Send + Sync {
     ) -> Result<Vec<u8>> {
         Err(Errno(3))
     }
+    fn exited_cgroup(&self) -> Option<CgroupTask> {
+        None
+    }
     fn present(&self) -> bool {
         self.observe(ProcRefresh::Metadata, None).is_some()
     }

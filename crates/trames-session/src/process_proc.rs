@@ -220,6 +220,7 @@ impl<C: Cpu> Process<C> {
                 .map(|id| self.linux.vfs.pid_namespace().hierarchy(id)),
             command: self.linux.command_name.get(),
             cgroup: self.linux.vfs.cgroup_path(pid),
+            cgroup_deleted: false,
             nondumpable: self.linux.vfs.dumpable() != 1,
             seccomp: self.seccomp.mode(),
             seccomp_filters: self.seccomp.count(),

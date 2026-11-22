@@ -585,6 +585,28 @@ impl IoTask {
             .map(|s| (s, false))
             .or_else(|| self.process().next(mask).map(|s| (s, true)))
     }
+    /// A frozen task can exit on an unblocked default-fatal signal. Signals
+    /// whose default action dumps core need the task to thaw first.
+    pub fn next_frozen_signal(&self, actions: &Actions) -> Option<(u32, bool, Action)> {
+        let pending = self.inbox.bits() | self.process().bits();
+        if pending & (1 << 8) != 0 {
+            return self
+                .next(1 << 8)
+                .map(|(sig, shared)| (sig, shared, Action::default()));
+        }
+        let mut eligible = pending & !self.mask();
+        while let Some((sig, shared)) = self.next(eligible) {
+            eligible &= !(1u64 << (sig - 1));
+            if matches!(sig, 3..=8 | 11 | 24 | 25 | 31) {
+                continue;
+            }
+            let action = actions.get(sig as usize);
+            if disposition(sig, action) == Disposition::Terminate {
+                return Some((sig, shared, action));
+            }
+        }
+        None
+    }
     /// Delivery gives KILL, then a precise thread fault, priority over ordinary
     /// pending signals. The idle path reads only the same two pending bitsets.
     pub fn next_delivery(&self, mask: u64) -> Option<(u32, bool)> {
@@ -1169,6 +1191,29 @@ impl IoRoutes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn frozen_delivery_selects_default_fatal_among_deferred_signals() {
+        let signals = Signals::default();
+        let task = &signals.io;
+        signals.actions.set_handler(1, 0x2000);
+        signals.actions.set_handler(2, 1);
+        for sig in [1, 2, 3, 10] {
+            task.inbox.enqueue(sig, Info::default()).unwrap();
+        }
+        task.process().enqueue(15, Info::default()).unwrap();
+        task.publish_mask(1 << 9);
+        let select = || {
+            task.next_frozen_signal(&signals.actions)
+                .map(|(sig, shared, _)| (sig, shared))
+        };
+        assert_eq!(select(), Some((15, true)));
+        task.take(15, true).unwrap();
+        assert_eq!(select(), None);
+        task.publish_mask(0);
+        assert_eq!(select(), Some((10, false)));
+        task.inbox.enqueue(9, Info::default()).unwrap();
+        assert_eq!(select(), Some((9, false)));
+    }
     #[test]
     fn timer_job_control_clears_opposing_queues_and_resumes_ignored_or_masked_cont() {
         for thread in [false, true] {

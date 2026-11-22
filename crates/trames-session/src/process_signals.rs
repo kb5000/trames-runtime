@@ -3,6 +3,7 @@
 use super::*;
 
 impl<C: Cpu> Process<C> {
+    #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn pending_bits(&self) -> u64 {
         self.signals.pending_bits()
     }

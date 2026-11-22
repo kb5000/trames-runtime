@@ -638,8 +638,7 @@ impl<C: Cpu> Starter<C> {
                                     }
                                 }
                                     }
-                                if let Some((sig, shared)) = snapshot.next_io_signal() {
-                                    let action = snapshot.actions.get(sig as usize);
+                                if let Some((sig, shared, action)) = snapshot.next_io_signal() {
                                     let disposition = trames_kernel::signal::disposition(sig, action);
                                     let namespace_init = snapshot.io_routes.namespace.is_nested() && snapshot.identities[0] == 1;
                                     if action.handler == 0 && namespace_init && !matches!(sig, 9 | 19) || disposition == trames_kernel::signal::Disposition::Ignore {

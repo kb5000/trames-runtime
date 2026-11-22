@@ -596,11 +596,13 @@ impl Snapshot {
     pub fn quiesced(&self) -> bool {
         self.io_signals.lifecycle().stopped() || self.frozen()
     }
-    pub fn next_io_signal(&self) -> Option<(u32, bool)> {
+    pub fn next_io_signal(&self) -> Option<(u32, bool, trames_kernel::signal::Action)> {
         if self.frozen() {
-            self.io_signals.next(1 << 8)
+            self.io_signals.next_frozen_signal(&self.actions)
         } else {
-            self.io_signals.next_delivery(!self.io_signals.mask())
+            self.io_signals
+                .next_delivery(!self.io_signals.mask())
+                .map(|(sig, shared)| (sig, shared, self.actions.get(sig as usize)))
         }
     }
     pub fn synchronous_fault(&self, fault: &trames_engine::CpuFault) -> Option<bool> {

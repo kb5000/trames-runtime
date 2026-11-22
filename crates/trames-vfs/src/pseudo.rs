@@ -854,6 +854,7 @@ pub struct ProcessInfo {
     pub namespace_ids: [Vec<u32>; 4],
     pub command: Vec<u8>,
     pub cgroup: Vec<u8>,
+    pub cgroup_deleted: bool,
     pub nondumpable: bool,
     pub seccomp: u32,
     pub seccomp_filters: usize,
@@ -2296,9 +2297,16 @@ impl Vfs {
                         }
                         b"children" if i == 3 => return Ok(regular(Vec::new())),
                         b"comm" => return Ok(Some((file(comm(p)), 0o100644))),
-                        b"cgroup" => {
-                            [b"0::".as_slice(), &self.cgroup_view_path(&p.cgroup), b"\n"].concat()
-                        }
+                        b"cgroup" => [
+                            b"0::".as_slice(),
+                            &self.cgroup_view_path(&p.cgroup),
+                            if p.cgroup_deleted {
+                                b" (deleted)\n"
+                            } else {
+                                b"\n"
+                            },
+                        ]
+                        .concat(),
                         b"cmdline" => p
                             .arguments_bytes
                             .clone()

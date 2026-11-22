@@ -517,7 +517,11 @@ impl<C: Cpu> Process<C> {
             || self.signals.io.cgroup().map_or_else(
                 || self.linux.vfs.cgroup_frozen(pid),
                 trames_vfs::CgroupTask::frozen,
-            ) && self.pending_bits() & (1 << 8) == 0
+            ) && self
+                .signals
+                .io
+                .next_frozen_signal(&self.signals.actions)
+                .is_none()
     }
     #[cfg(all(test, trames_interpreter_conformance))]
     fn fork(&self) -> Box<Self> {

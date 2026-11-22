@@ -75,9 +75,15 @@ impl DeviceAccess {
         Ok(())
     }
 }
+// Immutable original ancestry survives rmdir while an unreaped task still
+// describes its last group. Inode numbers distinguish same-name replacements.
+struct GroupLocation {
+    path: Vec<u8>,
+    ancestors: Vec<u64>,
+}
 struct Group {
     devices: Arc<DeviceAccess>,
-    path: Vec<u8>,
+    location: Arc<GroupLocation>,
     parent: Option<u64>,
     freeze: bool,
     subtree_pids: bool,
@@ -112,6 +118,7 @@ struct Member {
     pid: AtomicU32,
     tgid: AtomicU32,
     group: AtomicU64,
+    exited: std::sync::OnceLock<Arc<GroupLocation>>,
     frozen: AtomicBool,
     acknowledged: AtomicBool,
     kill_pending: AtomicBool,
@@ -123,6 +130,7 @@ impl Member {
             pid: AtomicU32::new(pid),
             tgid: AtomicU32::new(tgid),
             group: AtomicU64::new(group),
+            exited: Default::default(),
             frozen: AtomicBool::new(frozen),
             acknowledged: AtomicBool::new(frozen),
             kill_pending: AtomicBool::new(false),
@@ -163,16 +171,16 @@ pub struct CgroupTask {
     member: Arc<Member>,
 }
 impl CgroupTask {
-    pub fn path(&self) -> Vec<u8> {
+    pub fn path_status(&self) -> (Vec<u8>, bool) {
         let cg = self.groups.borrow();
-        let id = cg
-            .tasks
-            .get(&self.pid())
-            .filter(|m| Arc::ptr_eq(m, &self.member))
-            .map_or(ROOT, |m| m.group());
-        cg.groups
-            .get(&id)
-            .map_or_else(|| b"/".to_vec(), |g| g.path.clone())
+        let id = self.member.group();
+        if let Some(group) = cg.groups.get(&id) {
+            return (group.location.path.clone(), false);
+        }
+        self.member
+            .exited
+            .get()
+            .map_or_else(|| (b"/".to_vec(), false), |last| (last.path.clone(), true))
     }
     pub fn pid(&self) -> u32 {
         self.member.pid.load(Ordering::Relaxed)
@@ -233,6 +241,9 @@ impl CgroupTask {
             }
             let id = self.member.group();
             let before = cg.event_states(cg.ancestors(id));
+            self.member
+                .exited
+                .get_or_init(|| cg.groups[&id].location.clone());
             cg.tasks.remove(&pid);
             cg.kill.remove(&pid);
             cg.adjust(
@@ -284,6 +295,7 @@ impl CgroupTask {
 /// Migration additionally checks the opener's credentials and cgroup namespace.
 #[derive(Clone)]
 pub(super) struct CgroupAccess {
+    owner: (u32, u32),
     namespace: PidNamespace,
     pid: u32,
     admin: bool,
@@ -324,6 +336,7 @@ fn notify_events(events: Vec<Arc<ControlEvents>>) {
 pub(super) struct CgroupFile {
     namespace: Arc<linux_namespace::CgroupNamespace>,
     migration_credentials: Option<Credentials>,
+    task_source: Option<Weak<dyn ProcSource>>,
     groups: Arc<SharedCell<Cgroups>>,
     node: NodeRef,
     id: u64,
@@ -384,7 +397,7 @@ impl Default for Cgroups {
             dying: Vec::new(),
             kill: BTreeSet::new(),
         };
-        out.add_group(b"/".to_vec(), None, 0o755);
+        out.add_group(b"/".to_vec(), None, 0o755, (0, 0));
         out
     }
 }
@@ -404,7 +417,7 @@ impl Cgroups {
         let fs = self.fs.borrow();
         if !fs
             .paths
-            .get(&dest.path)
+            .get(&dest.location.path)
             .is_some_and(|n| Arc::ptr_eq(n, &target.node))
         {
             return Err(Errno(2));
@@ -436,7 +449,10 @@ impl Cgroups {
         namespace: &linux_namespace::CgroupNamespace,
     ) -> Result<()> {
         let mut common = source;
-        while !below(&self.groups[&dest].path, &self.groups[&common].path) {
+        while !below(
+            &self.groups[&dest].location.path,
+            &self.groups[&common].location.path,
+        ) {
             common = self.groups[&common]
                 .parent
                 .expect("root contains every cgroup");
@@ -447,7 +463,7 @@ impl Cgroups {
         if let Some(root) = &namespace.root {
             if self.nsdelegate.load(Ordering::Relaxed) {
                 let boundary = self.groups.get(&root.borrow().inode).ok_or(Errno(2))?;
-                if !below(&self.groups[&common].path, &boundary.path) {
+                if !below(&self.groups[&common].location.path, &boundary.location.path) {
                     return Err(Errno(2));
                 }
             }
@@ -513,7 +529,7 @@ impl Cgroups {
         self.changed_events(before)
     }
 
-    fn add_node(&self, path: Vec<u8>, directory: bool, mode: u32) -> u64 {
+    fn add_node(&self, path: Vec<u8>, directory: bool, mode: u32, owner: (u32, u32)) -> u64 {
         let mut fs = self.fs.borrow_mut();
         let inode = fs.next_inode;
         fs.next_inode += 1;
@@ -530,8 +546,8 @@ impl Cgroups {
                 Content::File(storage::FileData::memory(Vec::new()))
             },
             mode: mode | if directory { 0o40000 } else { 0o100000 },
-            uid: 0,
-            gid: 0,
+            uid: owner.0,
+            gid: owner.1,
             volatile: true,
             inode,
             links: 1,
@@ -544,8 +560,12 @@ impl Cgroups {
         fs.paths.insert(path, node);
         inode
     }
-    fn add_group(&mut self, path: Vec<u8>, parent: Option<u64>, mode: u32) {
-        let id = self.add_node(path.clone(), true, mode);
+    fn add_group(&mut self, path: Vec<u8>, parent: Option<u64>, mode: u32, owner: (u32, u32)) {
+        let id = self.add_node(path.clone(), true, mode, owner);
+        let mut ancestors = vec![id];
+        if let Some(parent) = parent {
+            ancestors.extend_from_slice(&self.groups[&parent].location.ancestors);
+        }
         let mut files = BTreeMap::new();
         for (name, mode) in FILES {
             // These controls apply only below the root cgroup.
@@ -557,7 +577,7 @@ impl Cgroups {
             {
                 continue;
             }
-            self.add_node(child_path(&path, name.as_bytes()), false, *mode);
+            self.add_node(child_path(&path, name.as_bytes()), false, *mode, owner);
             files.insert(
                 name.as_bytes().to_vec(),
                 self.file_events(&path, name.as_bytes()),
@@ -574,7 +594,10 @@ impl Cgroups {
                     parent: parent.map(|id| self.groups[&id].devices.clone()),
                     rules: SharedCell::default(),
                 }),
-                path: path.clone(),
+                location: Arc::new(GroupLocation {
+                    path: path.clone(),
+                    ancestors,
+                }),
                 parent,
                 freeze: false,
                 subtree_pids: false,
@@ -594,7 +617,7 @@ impl Cgroups {
             },
         );
         if self.pids_enabled(id) {
-            let _ = self.install_pids(id, true);
+            let _ = self.install_pids(id, true, owner);
         }
     }
     fn pids_enabled(&self, id: u64) -> bool {
@@ -653,14 +676,19 @@ impl Cgroups {
             }
         }
     }
-    fn install_pids(&mut self, id: u64, enable: bool) -> (Vec<Arc<ControlEvents>>, Vec<NodeRef>) {
+    fn install_pids(
+        &mut self,
+        id: u64,
+        enable: bool,
+        owner: (u32, u32),
+    ) -> (Vec<Arc<ControlEvents>>, Vec<NodeRef>) {
         let mut events = Vec::new();
         let mut nodes = Vec::new();
         for (name, mode) in PIDS_FILES {
-            let path = child_path(&self.groups[&id].path, name.as_bytes());
+            let path = child_path(&self.groups[&id].location.path, name.as_bytes());
             if enable {
-                self.add_node(path, false, *mode);
-                let event = self.file_events(&self.groups[&id].path, name.as_bytes());
+                self.add_node(path, false, *mode, owner);
+                let event = self.file_events(&self.groups[&id].location.path, name.as_bytes());
                 self.groups
                     .get_mut(&id)
                     .unwrap()
@@ -682,7 +710,7 @@ impl Cgroups {
                 }
             }
         }
-        let path = self.groups[&id].path.clone();
+        let path = self.groups[&id].location.path.clone();
         let signal = self.groups[&id]
             .files
             .get(b"pids.events".as_slice())
@@ -715,13 +743,8 @@ impl Cgroups {
             id = parent;
         }
     }
-    fn ancestors(&self, mut id: u64) -> Vec<u64> {
-        let mut out = vec![id];
-        while let Some(parent) = self.groups[&id].parent {
-            out.push(parent);
-            id = parent;
-        }
-        out
+    fn ancestors(&self, id: u64) -> Vec<u64> {
+        self.groups[&id].location.ancestors.clone()
     }
     fn prune(&mut self) {
         self.dying
@@ -789,7 +812,7 @@ impl DescriptorFactory {
         if flags == 0
             && cg.groups.iter().any(|(other, group)| {
                 *other != id
-                    && below(&group.path, &cg.groups[&id].path)
+                    && below(&group.location.path, &cg.groups[&id].location.path)
                     && !group.devices.rules.borrow().programs.is_empty()
             })
         {
@@ -948,9 +971,6 @@ impl Vfs {
     }
     pub(super) fn cgroup_mkdir(&self, path: &ResolvedPath, mode: u32) -> Result<()> {
         path.writable()?;
-        if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
-            return Err(Errno(1));
-        }
         let parent = self.node(&path.parent())?;
         if !self.allowed(&parent.borrow(), 3) {
             return Err(Errno(13));
@@ -983,7 +1003,12 @@ impl Vfs {
         if cg.groups.len() + cg.dying.len() >= MAX_GROUPS || ancestors.len() > MAX_DEPTH {
             return Err(Errno(28));
         }
-        cg.add_group(path.key.clone(), Some(id), mode & 0o777 & !self.umask());
+        cg.add_group(
+            path.key.clone(),
+            Some(id),
+            mode & 0o777 & !self.umask(),
+            (self.credentials.fsuid, self.credentials.fsgid),
+        );
         for ancestor in ancestors {
             cg.groups.get_mut(&ancestor).unwrap().descendants += 1;
         }
@@ -991,8 +1016,8 @@ impl Vfs {
     }
     pub(super) fn cgroup_rmdir(&self, path: &ResolvedPath) -> Result<()> {
         path.writable()?;
-        if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
-            return Err(Errno(1));
+        if !self.allowed(&self.node(&path.parent())?.borrow(), 3) {
+            return Err(Errno(13));
         }
         let node = self.node(path)?;
         let id = node.borrow().inode;
@@ -1074,7 +1099,7 @@ impl Vfs {
             || cg.member_group(self.pid),
             |target| target.node.borrow().inode,
         );
-        let path = cg.groups.get(&id).ok_or(Errno(2))?.path.clone();
+        let path = cg.groups.get(&id).ok_or(Errno(2))?.location.path.clone();
         let root = cg.fs.borrow().paths[&path].clone();
         if target.is_some_and(|t| !Arc::ptr_eq(&t.node, &root)) {
             return Err(Errno(2));
@@ -1161,12 +1186,13 @@ impl Vfs {
         let id = cg.tasks.get(&pid).map_or(ROOT, |task| task.group());
         cg.groups
             .get(&id)
-            .map_or_else(|| b"/".to_vec(), |g| g.path.clone())
+            .map_or_else(|| b"/".to_vec(), |g| g.location.path.clone())
     }
     // Open descriptions retain inode identity: deletion/recreation at the same
     // path must never redirect an old control FD to a new group.
     pub(super) fn cgroup_access(&self) -> CgroupAccess {
         CgroupAccess {
+            owner: (self.credentials.fsuid, self.credentials.fsgid),
             namespace: self.pid_ns.clone(),
             pid: self.pid,
             admin: self.credentials.has_cap(capabilities::SYS_ADMIN),
@@ -1190,6 +1216,9 @@ impl Vfs {
         }
         Ok(Some(Arc::new(CgroupFile {
             namespace: self.cgroup_namespace.clone(),
+            task_source: (path.key[split + 1..] == *b"cgroup.procs")
+                .then(|| self.pseudo.borrow().source.as_ref().map(Arc::downgrade))
+                .flatten(),
             migration_credentials: (path.key[split + 1..] == *b"cgroup.procs")
                 .then(|| self.credentials.clone()),
             groups: self.cgroups.clone(),
@@ -1352,7 +1381,7 @@ impl CgroupFile {
         // pids.max FD mutate the replacement control's state.
         let mut cg = self.groups.borrow_mut();
         self.check_live(&cg)?;
-        if !caller.admin {
+        if !caller.admin && name != b"cgroup.subtree_control" {
             return Err(Errno(1));
         }
         if self
@@ -1423,11 +1452,11 @@ impl CgroupFile {
                 if sysctl::parse_kernel_i32(text)? != 1 {
                     return Err(Errno(34));
                 }
-                let path = &cg.groups.get(&id).ok_or(Errno(19))?.path;
+                let path = &cg.groups.get(&id).ok_or(Errno(19))?.location.path;
                 let targets: Vec<_> = cg
                     .tasks
                     .iter()
-                    .filter(|(_, task)| below(&cg.groups[&task.group()].path, path))
+                    .filter(|(_, task)| below(&cg.groups[&task.group()].location.path, path))
                     .map(|(pid, task)| (*pid, task.clone()))
                     .collect();
                 let groups: BTreeSet<_> = targets.iter().map(|(_, task)| task.tgid()).collect();
@@ -1482,7 +1511,7 @@ impl CgroupFile {
                 let mut events = Vec::new();
                 let mut nodes = Vec::new();
                 for child in children {
-                    let (changed, removed) = cg.install_pids(child, enable);
+                    let (changed, removed) = cg.install_pids(child, enable, caller.owner);
                     events.extend(changed);
                     nodes.extend(removed);
                 }
@@ -1526,7 +1555,41 @@ impl CgroupFile {
                 } else {
                     caller.global_pid(local)?
                 };
-                let member = cg.tasks.get(&target).ok_or(Errno(3))?;
+                let Some(member) = cg.tasks.get(&target) else {
+                    // The task directory owns wait/reap visibility. Query it only on a
+                    // live-membership miss, outside the hierarchy lock.
+                    drop(cg);
+                    let retired = self
+                        .task_source
+                        .as_ref()
+                        .and_then(Weak::upgrade)
+                        .and_then(|source| source.task(target))
+                        .and_then(|task| task.exited_cgroup())
+                        .ok_or(Errno(3))?;
+                    let last = retired.member.exited.get().ok_or(Errno(3))?;
+                    let cg = self.groups.borrow();
+                    self.check_live(&cg)?;
+                    if !Arc::ptr_eq(&self.groups, &retired.groups) || cg.tasks.contains_key(&target)
+                    {
+                        return Err(Errno(3));
+                    }
+                    let source = last
+                        .ancestors
+                        .iter()
+                        .copied()
+                        .find(|id| cg.groups.contains_key(id))
+                        .ok_or(Errno(3))?;
+                    cg.check_migration(
+                        source,
+                        id,
+                        self.migration_credentials.as_ref().expect("procs opener"),
+                        &self.namespace,
+                    )?;
+                    if id != ROOT && cg.groups[&id].subtree_pids {
+                        return Err(Errno(16));
+                    }
+                    return Ok(Some(bytes.len()));
+                };
                 let tgid = member.tgid();
                 cg.check_migration(
                     member.group(),
@@ -1818,6 +1881,30 @@ mod tests {
         assert!(v.cgroup_task(2).is_some());
         std::thread::spawn(move || current.exit()).join().unwrap();
         assert!(v.cgroup_task(2).is_none());
+    }
+    #[test]
+    fn removed_group_and_reused_pid_preserve_original_zombie_location() {
+        let mut v = setup();
+        v.mkdir_at(AT_FDCWD, b"/sys/fs/cgroup/child", 0o755)
+            .unwrap();
+        v.cgroup_fork(1, 2, 2);
+        let procs = v
+            .open_at(AT_FDCWD, b"/sys/fs/cgroup/child/cgroup.procs", 1, 0)
+            .unwrap();
+        v.write(procs, b"2").unwrap();
+        let original = v.cgroup_task(2).unwrap();
+        original.exit();
+        assert_eq!(original.path_status(), (b"/child".to_vec(), false));
+        v.unlink_at(AT_FDCWD, b"/sys/fs/cgroup/child", true)
+            .unwrap();
+        v.mkdir_at(AT_FDCWD, b"/sys/fs/cgroup/child", 0o755)
+            .unwrap();
+        v.cgroup_fork(1, 2, 2);
+        assert_eq!(original.path_status(), (b"/child".to_vec(), true));
+        assert_eq!(
+            v.cgroup_task(2).unwrap().path_status(),
+            (b"/".to_vec(), false)
+        );
     }
     struct Wake(AtomicU32);
     impl IoWake for Wake {

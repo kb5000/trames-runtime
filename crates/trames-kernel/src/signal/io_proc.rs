@@ -16,6 +16,13 @@ impl ProcPid {
     }
 }
 impl trames_vfs::ProcTask for ProcPid {
+    fn exited_cgroup(&self) -> Option<trames_vfs::CgroupTask> {
+        let task = self.task()?;
+        if task.live() {
+            return None;
+        }
+        task.cgroup().cloned()
+    }
     fn present(&self) -> bool {
         self.task().is_some()
     }
@@ -283,7 +290,7 @@ impl trames_vfs::ProcTask for IoTask {
                 info.mutable_limits = Some(limits.snapshot());
             }
             if let Some(cgroup) = self.cgroup() {
-                info.cgroup = cgroup.path();
+                (info.cgroup, info.cgroup_deleted) = cgroup.path_status();
             }
         }
         Some(info)
