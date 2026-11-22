@@ -31,8 +31,16 @@ impl Message {
         number: u32,
         args: [u64; 6],
         memory: &impl CpuMemory,
-        flags: u32,
+        socket: &trames_vfs::SocketOperation,
     ) -> Result<Self, Errno> {
+        if number == 64
+            && socket
+                .datagram_limit()
+                .is_some_and(|limit| args[2] > limit as u64)
+        {
+            return Err(Errno(90));
+        }
+        let flags = socket.flags();
         Ok(Self {
             pipe: AtomicBool::new(false),
             receive: if number == 243 {
@@ -51,12 +59,18 @@ impl Message {
         args: [u64; 6],
         memory: &impl CpuMemory,
         address_size: usize,
-        stream: bool,
+        datagram_limit: Option<usize>,
     ) -> Result<Self, Errno> {
         let active = if matches!(number, 243 | 269) {
             None
         } else {
-            Some(Prepared::new(number, args, memory, address_size, stream)?)
+            Some(Prepared::new(
+                number,
+                args,
+                memory,
+                address_size,
+                datagram_limit,
+            )?)
         };
         Ok(Self {
             pipe: AtomicBool::new(false),
@@ -205,7 +219,7 @@ impl Message {
                         [a[0], header, flags as u64, 0, 0, 0],
                         memory,
                         socket.address_size(),
-                        socket.is_stream(),
+                        socket.datagram_limit(),
                     )?);
                 }
                 if state.recheck {
@@ -350,7 +364,7 @@ mod tests {
             } else {
                 [peer as u64, 0x1000, flags, 0, 0, 0]
             };
-            let call = Message::new(number, args, &m, 16, true).unwrap();
+            let call = Message::new(number, args, &m, 16, None).unwrap();
             let progress =
                 |m: &mut Memory| call.progress_with(&rx, number, args, m, |_, _, _| unreachable!());
             assert_eq!(tx.send(b"abcd", 0, None).unwrap(), 4);
@@ -660,7 +674,7 @@ mod tests {
         m.write_array(0x1308, (limit as u64 * 3).to_le_bytes())
             .unwrap();
         let a = [fd as u64, 0x1000, 2, 0, 0, 0];
-        let batch = Message::new(269, a, &m, 16, true).unwrap();
+        let batch = Message::new(269, a, &m, 16, None).unwrap();
         assert_eq!(
             batch.progress_with(&socket, 269, a, &mut m, |bytes, _, _| {
                 assert_eq!(bytes.len(), limit);
@@ -692,7 +706,7 @@ mod tests {
         let (_v, fd, socket) = socket();
         let mut m = memory();
         let args = [fd as u64, 0x1000, 2, 0, 0, 0];
-        let batch = Message::new(269, args, &m, 16, false).unwrap();
+        let batch = Message::new(269, args, &m, 16, Some(trames_net::MAX_TRANSFER)).unwrap();
         assert_eq!(
             batch.progress_with(&socket, 269, args, &mut m, |bytes, _, _| {
                 assert_eq!(bytes, b"abc");
@@ -727,7 +741,7 @@ mod tests {
             for flags in [0, 0x4000] {
                 let mut m = memory();
                 let a = [fd as u64, 0x1000, 2, flags, 0, 0];
-                let batch = Message::new(269, a, &m, 16, false).unwrap();
+                let batch = Message::new(269, a, &m, 16, Some(trames_net::MAX_TRANSFER)).unwrap();
                 let mut calls = 0;
                 assert_eq!(
                     batch.progress_with(&socket, 269, a, &mut m, |bytes, _, _| {
@@ -751,7 +765,7 @@ mod tests {
         }
         let mut m = memory();
         let a = [fd as u64, 0x1000, 2, 0, 0, 0];
-        let batch = Message::new(269, a, &m, 16, false).unwrap();
+        let batch = Message::new(269, a, &m, 16, Some(trames_net::MAX_TRANSFER)).unwrap();
         assert_eq!(
             batch.progress_with(&socket, 269, a, &mut m, |_, _, _| Ok(1)),
             Ok(1)
@@ -759,7 +773,7 @@ mod tests {
         assert_eq!(m.read_array::<4>(0x1038).unwrap(), 1u32.to_le_bytes());
         let mut m = memory();
         m.protect(0x1000, PAGE_SIZE, Permissions::R).unwrap();
-        let batch = Message::new(269, a, &m, 16, false).unwrap();
+        let batch = Message::new(269, a, &m, 16, Some(trames_net::MAX_TRANSFER)).unwrap();
         let mut effects = 0;
         assert_eq!(
             batch.progress_with(&socket, 269, a, &mut m, |_, _, _| {
@@ -775,7 +789,7 @@ mod tests {
         );
         let mut m = memory();
         m.write_array(0x1050, u64::MAX.to_le_bytes()).unwrap();
-        let batch = Message::new(269, a, &m, 16, false).unwrap();
+        let batch = Message::new(269, a, &m, 16, Some(trames_net::MAX_TRANSFER)).unwrap();
         let mut effects = 0;
         assert_eq!(
             batch.progress_with(&socket, 269, a, &mut m, |_, _, _| {
@@ -789,7 +803,7 @@ mod tests {
             let a = [fd as u64, 0x1000, count, 0, 0, 0];
             let mut m = Memory::default();
             m.map(0x1000, PAGE_SIZE * 17, Permissions::RW).unwrap();
-            let batch = Message::new(269, a, &m, 16, false).unwrap();
+            let batch = Message::new(269, a, &m, 16, Some(trames_net::MAX_TRANSFER)).unwrap();
             let mut calls = 0;
             assert_eq!(
                 batch.progress_with(&socket, 269, a, &mut m, |bytes, _, _| {

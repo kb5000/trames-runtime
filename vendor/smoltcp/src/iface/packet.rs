@@ -34,6 +34,7 @@ impl<'p> Packet<'p> {
     pub(crate) fn new_ipv4(ip_repr: Ipv4Repr, payload: IpPayload<'p>) -> Self {
         Self::Ipv4(PacketV4 {
             header: ip_repr,
+            reply_class: None,
             payload,
         })
     }
@@ -42,6 +43,7 @@ impl<'p> Packet<'p> {
     pub(crate) fn new_ipv6(ip_repr: Ipv6Repr, payload: IpPayload<'p>) -> Self {
         Self::Ipv6(PacketV6 {
             header: ip_repr,
+            reply_class: None,
             #[cfg(feature = "proto-ipv6-hbh")]
             hop_by_hop: None,
             #[cfg(feature = "proto-ipv6-fragmentation")]
@@ -50,6 +52,27 @@ impl<'p> Packet<'p> {
             routing: None,
             payload,
         })
+    }
+
+    pub(crate) fn with_reply_class(mut self, value: u8) -> Self {
+        // Interface-generated replies already default to class zero.
+        let class = (value != 0).then_some(value);
+        match &mut self {
+            #[cfg(feature = "proto-ipv4")]
+            Self::Ipv4(p) => p.reply_class = class,
+            #[cfg(feature = "proto-ipv6")]
+            Self::Ipv6(p) => p.reply_class = class,
+        }
+        self
+    }
+
+    pub(crate) fn reply_class(&self) -> Option<u8> {
+        match self {
+            #[cfg(feature = "proto-ipv4")]
+            Self::Ipv4(p) => p.reply_class,
+            #[cfg(feature = "proto-ipv6")]
+            Self::Ipv6(p) => p.reply_class,
+        }
     }
 
     pub(crate) fn ip_repr(&self) -> IpRepr {
@@ -184,6 +207,7 @@ impl<'p> Packet<'p> {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[cfg(feature = "proto-ipv4")]
 pub(crate) struct PacketV4<'p> {
+    pub(crate) reply_class: Option<u8>,
     header: Ipv4Repr,
     payload: IpPayload<'p>,
 }
@@ -192,6 +216,7 @@ pub(crate) struct PacketV4<'p> {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[cfg(feature = "proto-ipv6")]
 pub(crate) struct PacketV6<'p> {
+    pub(crate) reply_class: Option<u8>,
     pub(crate) header: Ipv6Repr,
     #[cfg(feature = "proto-ipv6-hbh")]
     pub(crate) hop_by_hop: Option<Ipv6HopByHopRepr<'p>>,

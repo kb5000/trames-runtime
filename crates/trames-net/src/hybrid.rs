@@ -621,6 +621,13 @@ impl Socket {
             self.native()?.tcp_readable_bytes()
         }
     }
+    pub fn icmp6_filter(&self) -> Result<[u8; 32]> {
+        if self.path.get() == Path::Guest {
+            self.guest()?.icmp6_filter()
+        } else {
+            self.native()?.icmp6_filter()
+        }
+    }
     pub fn tcp_info(&self) -> Result<[u8; 104]> {
         if self.path.get() == Path::Guest {
             self.guest()?.tcp_info()

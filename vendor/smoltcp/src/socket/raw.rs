@@ -90,6 +90,7 @@ pub struct Socket<'a> {
     tx_buffer: PacketBuffer<'a>,
     #[cfg(feature = "std")]
     linux_receive: bool,
+    icmp6_filter: [u8; 32],
     #[cfg(feature = "async")]
     rx_waker: WakerRegistration,
     #[cfg(feature = "async")]
@@ -112,6 +113,7 @@ impl<'a> Socket<'a> {
             tx_buffer,
             #[cfg(feature = "std")]
             linux_receive: false,
+            icmp6_filter: [0; 32],
             #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
             #[cfg(feature = "async")]
@@ -346,6 +348,10 @@ impl<'a> Socket<'a> {
         self.rx_buffer.payload_bytes_count()
     }
 
+    pub fn set_icmp6_filter(&mut self, filter: [u8; 32]) {
+        self.icmp6_filter = filter;
+    }
+
     pub(crate) fn accepts(&self, ip_repr: &IpRepr) -> bool {
         if ip_repr.version() != self.ip_version {
             return false;
@@ -405,6 +411,14 @@ impl<'a> Socket<'a> {
         meta: crate::phy::PacketMeta,
     ) {
         debug_assert!(self.accepts(ip_repr));
+        if self.ip_protocol == IpProtocol::Icmpv6
+            && payload
+                .first()
+                .is_none_or(|kind| self.icmp6_filter[*kind as usize / 8] & (1 << (*kind % 8)) != 0)
+        {
+            return;
+        }
+
 
         let header_len = ip_repr.header_len();
         let total_len = header_len + payload.len();

@@ -986,11 +986,11 @@ impl Inner {
                         p = complete;
                     }
                     if !packet::valid_transport(&p) {
-                        // Raw sockets observe local IP traffic before TCP/UDP validate their
+                        // Raw sockets observe local IP traffic before the protocol validates its
                         // header. Keep invalid transport data off forwarding paths and
                         // out of transport queues. Apply the normal local output/input hooks.
                         let delivered = injected.is_none()
-                            && matches!(h.protocol, 6 | 17)
+                            && matches!(h.protocol, 1 | 6 | 17)
                             && self.nodes.get_mut(&source).is_some_and(|node| {
                                 node.receive_local_raw(
                                     view,
@@ -1332,6 +1332,13 @@ impl Node {
             .filter(|s| matches(s))
         {
             let state = socket.state.borrow();
+            if protocol == 58
+                && packet.get(header.offset).is_none_or(|kind| {
+                    state.icmp6_filter[*kind as usize / 8] & (1 << (*kind % 8)) != 0
+                })
+            {
+                continue;
+            }
             if state.accepts_raw(header.tuple, route.input) {
                 if let Some(handle) = state.handles.first() {
                     self.sockets
@@ -1788,7 +1795,7 @@ impl Network {
             },
             reservation,
         );
-        if socket.raw_transport() {
+        if socket.kind == 4 {
             socket.open_raw()?;
         }
         Ok(socket)

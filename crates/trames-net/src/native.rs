@@ -1219,6 +1219,16 @@ impl Socket {
             .map(crate::linger_bytes)
             .map_err(from_io)
     }
+    pub fn icmp6_filter(&self) -> Result<[u8; 32]> {
+        if self.kind == 4 && self.family == 2 {
+            return Err(NetError(95));
+        }
+        if self.family != 10 || self.kind != 4 {
+            return Err(NetError(92));
+        }
+        let words = self.echo.borrow().filter;
+        Ok(std::array::from_fn(|i| words[i / 4].to_le_bytes()[i % 4]))
+    }
     pub fn set_option_bytes(&self, level: u32, name: u32, value: &[u8]) -> Result<()> {
         if (level, name) == (1, 13) {
             return self
@@ -1228,13 +1238,12 @@ impl Socket {
                 .map_err(from_io);
         }
         if (level, name) == (58, 1) && self.family == 10 && self.kind == 4 {
-            if value.len() != 32 {
-                return Err(NetError(22));
-            }
-            let mut e = self.echo.borrow_mut();
-            for (out, bytes) in e.filter.iter_mut().zip(value.chunks_exact(4)) {
-                *out = u32::from_le_bytes(bytes.try_into().unwrap());
-            }
+            let length = value.len().min(32);
+            let mut bytes = self.icmp6_filter()?;
+            bytes[..length].copy_from_slice(&value[..length]);
+            self.echo.borrow_mut().filter = std::array::from_fn(|i| {
+                u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
+            });
             return Ok(());
         }
         if value.len() < 4 {

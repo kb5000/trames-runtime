@@ -462,6 +462,15 @@ impl Socket {
         if self.state.borrow().bound.is_some() {
             return Err(NetError(22));
         }
+        if self.kind == 3 {
+            match a.ip() {
+                IpAddr::V6(ip) if ip.is_multicast() || ip.to_ipv4_mapped().is_some() => {
+                    return Err(NetError(22))
+                }
+                IpAddr::V4(ip) if self.udp_group(ip.into()) => return Err(NetError(99)),
+                _ => {}
+            }
+        }
         if !(self.own(a.ip()) || (self.kind == 2 || self.raw_udp()) && self.udp_group(a.ip())) {
             return Err(NetError(99));
         }
@@ -1649,7 +1658,10 @@ impl Socket {
                 return Ok(());
             }
             (0, 8 | 12 | 13 | 20) | (41, 49 | 51 | 66 | 74)
-                if self.kind == 2 && (level == 0 || self.family == 10) =>
+                if self.kind == 2 && (level == 0 || self.family == 10)
+                    || self.kind == 3
+                        && (level == 0) == (self.family == 2)
+                        && !matches!(name, 20 | 74) =>
             {
                 let options = &mut state.udp_options[usize::from(level == 41)];
                 match name {
@@ -1660,7 +1672,10 @@ impl Socket {
                 }
                 return Ok(());
             }
-            (0, 1 | 2) | (41, 16 | 67) if self.kind == 2 && (level == 0 || self.family == 10) => {
+            (0, 1 | 2) | (41, 16 | 67)
+                if self.kind == 2 && (level == 0 || self.family == 10)
+                    || self.kind == 3 && (level == 0) == (self.family == 2) =>
+            {
                 let fields = &mut state.udp_options[usize::from(level == 41)].fields;
                 match (level, name) {
                     (0, 1) => fields.traffic_class = Some(value as u8),
@@ -2037,20 +2052,24 @@ impl Socket {
             });
         }
         let state = self.state.borrow();
-        if self.kind == 2 && (level == 0 || level == 41 && self.family == 10) {
+        if self.kind == 2 && (level == 0 || level == 41 && self.family == 10)
+            || self.kind == 3 && level == if self.family == 2 { 0 } else { 41 }
+        {
             let options = state.udp_options[usize::from(level == 41)];
             match (level, name) {
                 (0, 1) | (41, 67) => {
                     return Ok(i32::from(options.fields.traffic_class.unwrap_or(0)))
                 }
                 (0, 2) | (41, 16) => return Ok(i32::from(options.fields.hop_limit.unwrap_or(64))),
-                (0, 11) | (41, 25) => {
+                (0, 11) | (41, 25) if self.kind == 2 => {
                     return Ok(i32::from(
                         state.udp_errors.as_ref().unwrap().enabled(level == 41),
                     ))
                 }
                 (0, 8) | (41, 49) => return Ok(i32::from(options.receive_info)),
-                (0, 20) | (41, 74) => return Ok(i32::from(options.original_destination)),
+                (0, 20) | (41, 74) if self.kind == 2 => {
+                    return Ok(i32::from(options.original_destination))
+                }
                 (0, 13) | (41, 66) => return Ok(i32::from(options.receive_class)),
                 (0, 12) | (41, 51) => return Ok(i32::from(options.receive_hops)),
                 _ => {}
@@ -2094,6 +2113,7 @@ impl Socket {
                     _ => i32::from(options.receive_class),
                 })
             }
+            (41, 7) if self.family == 2 && self.kind == 4 => Err(NetError(95)),
             (41 | 255, 7) if self.family == 10 && self.kind == 4 => Ok(state.raw_checksum),
             (1, 7 | 8) => Ok(if matches!(self.kind, 1 | 2) || self.raw_transport() {
                 if name == 8 {
@@ -2263,6 +2283,15 @@ impl Socket {
         value[4..].copy_from_slice(&state.linger_seconds.to_le_bytes());
         Ok(value)
     }
+    pub fn icmp6_filter(&self) -> Result<[u8; 32]> {
+        if self.kind == 4 && self.family == 2 {
+            return Err(NetError(95));
+        }
+        if self.kind != 4 || self.protocol != 58 {
+            return Err(NetError(92));
+        }
+        Ok(self.state.borrow().icmp6_filter)
+    }
     pub fn set_option_bytes(&self, level: u32, name: u32, value: &[u8]) -> Result<()> {
         // SOL_SOCKET/SO_DETACH_FILTER has no argument. These raw sockets do not
         // support attaching a classic filter, so there is no filter to remove.
@@ -2306,10 +2335,17 @@ impl Socket {
             return Ok(());
         }
         if (level, name) == (58, 1) && self.protocol == 58 && self.kind == 4 {
-            if value.len() != 32 {
-                return Err(NetError(22));
-            }
-            self.state.borrow_mut().icmp6_filter.copy_from_slice(value);
+            let length = value.len().min(32);
+            let mut fabric = self.network.0.fabric.0.borrow_mut();
+            let mut state = self.state.borrow_mut();
+            state.icmp6_filter[..length].copy_from_slice(&value[..length]);
+            let node = fabric
+                .nodes
+                .get_mut(&self.network.0.key)
+                .ok_or(NetError(100))?;
+            node.sockets
+                .get_mut::<raw::Socket>(state.handles[0])
+                .set_icmp6_filter(state.icmp6_filter);
             return Ok(());
         }
         if (level, name) == (1, 25) {
@@ -2335,6 +2371,23 @@ impl Socket {
             } else {
                 (41, state.hop_message, hop)
             }
+        })
+    }
+    fn icmp_or_raw_source(&self, bound: IpAddr, a: SocketAddr) -> Result<IpAddr> {
+        Ok(if !bound.is_unspecified() {
+            bound
+        } else if let Some(view) = self.network.0.routing.get() {
+            self.route_source(view, a.ip())?
+        } else if a.ip().is_loopback() {
+            if self.family == 2 {
+                Ipv4Addr::LOCALHOST.into()
+            } else {
+                Ipv6Addr::LOCALHOST.into()
+            }
+        } else if self.family == 2 {
+            self.network.0.info.ipv4.into()
+        } else {
+            self.network.0.info.ipv6.into()
         })
     }
     fn send_raw(
@@ -2370,13 +2423,14 @@ impl Socket {
         } else {
             1400
         };
-        if !self.raw_transport() && bytes.len() < 8 || bytes.len() > maximum {
+        if bytes.len() > maximum {
             return Err(NetError(90));
         }
         if self.state.borrow().bound.is_none() {
             self.ensure_bound()?;
         }
         if !self.raw_transport()
+            && bytes.len() >= 8
             && bytes[0] == if self.family == 2 { 8 } else { 128 }
             && bytes[1] == 0
         {
@@ -2398,22 +2452,7 @@ impl Socket {
         {
             return Err(NetError(101));
         }
-        let bound = state.bound.unwrap().ip();
-        let source = if !bound.is_unspecified() {
-            bound
-        } else if let Some(view) = self.network.0.routing.get() {
-            self.route_source(view, a.ip())?
-        } else if a.ip().is_loopback() {
-            if self.family == 2 {
-                Ipv4Addr::LOCALHOST.into()
-            } else {
-                Ipv6Addr::LOCALHOST.into()
-            }
-        } else if self.family == 2 {
-            self.network.0.info.ipv4.into()
-        } else {
-            self.network.0.info.ipv6.into()
-        };
+        let source = self.icmp_or_raw_source(state.bound.unwrap().ip(), a)?;
         let fields = control.fields[usize::from(ipv6)];
         let class = fields
             .traffic_class
@@ -2556,14 +2595,6 @@ impl Socket {
                         }
                     }
                 }
-                if self.protocol == 58 {
-                    let Some(&kind) = data.get(header.offset) else {
-                        continue;
-                    };
-                    if state.icmp6_filter[kind as usize / 8] & (1 << (kind % 8)) != 0 {
-                        continue;
-                    }
-                }
                 state.last_hop = Some(if self.family == 2 { data[8] } else { data[7] });
                 state.raw_ingress = ingress;
                 state.icmp_pending = Some((data.to_vec(), peer));
@@ -2621,11 +2652,10 @@ impl Socket {
             self.state.borrow().peer.ok_or(NetError(89))?
         };
         self.destination(a)?;
-        if bytes.len() < 8
-            || bytes.len() > 1400
-            || bytes[0] != if a.is_ipv4() { 8 } else { 128 }
-            || bytes[1] != 0
-        {
+        if bytes.len() > if a.is_ipv4() { 65535 - 20 } else { 65535 } {
+            return Err(NetError(90));
+        }
+        if bytes.len() < 8 || bytes[0] != if a.is_ipv4() { 8 } else { 128 } || bytes[1] != 0 {
             return Err(NetError(22));
         }
         if self.state.borrow().bound.is_none() {
@@ -2636,31 +2666,31 @@ impl Socket {
         if state.write_closed {
             return Err(NetError(32));
         }
-        let mut data = bytes.to_vec();
-        data[4..6].copy_from_slice(&state.bound.unwrap().port().to_be_bytes());
-        if a.is_ipv4() {
-            smoltcp::wire::Icmpv4Packet::new_unchecked(&mut data).fill_checksum();
-        } else {
-            let source = if let Some(view) = self.network.0.routing.get() {
-                let IpAddr::V6(source) = self.route_source(view, a.ip())? else {
-                    return Err(NetError(97));
-                };
-                source
-            } else if a.ip().is_loopback() {
-                Ipv6Addr::LOCALHOST
-            } else {
-                self.network.0.info.ipv6
-            };
-            let IpAddr::V6(dest) = a.ip() else {
-                return Err(NetError(97));
-            };
-            smoltcp::wire::Icmpv6Packet::new_unchecked(&mut data).fill_checksum(&source, &dest);
-        }
+        let bound = state.bound.unwrap();
+        let source = self.icmp_or_raw_source(bound.ip(), a)?;
+        let v6 = match (source, a.ip()) {
+            (IpAddr::V4(_), IpAddr::V4(_)) => None,
+            (IpAddr::V6(src), IpAddr::V6(dst)) => Some((src, dst)),
+            _ => return Err(NetError(97)),
+        };
+        let fields = state.udp_options[usize::from(a.is_ipv6())].fields;
+        let mut metadata = icmp::MessageMetadata::from(ip(a.ip()));
+        metadata.local = Some(ip(source));
+        metadata.ip.traffic_class = fields.traffic_class.unwrap_or(0);
+        metadata.ip.hop_limit = fields.hop_limit;
         let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
-        n.sockets
+        let data = n
+            .sockets
             .get_mut::<icmp::Socket>(state.handles[0])
-            .send_slice(&data, ip(a.ip()))
+            .send_with_metadata(bytes.len(), metadata)
             .map_err(|_| NetError(11))?;
+        data.copy_from_slice(bytes);
+        data[4..6].copy_from_slice(&bound.port().to_be_bytes());
+        if let Some((src, dst)) = v6 {
+            smoltcp::wire::Icmpv6Packet::new_unchecked(data).fill_checksum(&src, &dst);
+        } else {
+            smoltcp::wire::Icmpv4Packet::new_unchecked(data).fill_checksum();
+        }
         drop(i);
         drop(state);
         self.fabric().tick();
@@ -2690,49 +2720,62 @@ impl Socket {
                 truncated: false,
             });
         }
-        if state.icmp_pending.is_none() {
-            let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
-            let h = *state.handles.first().ok_or(NetError(11))?;
-            for _ in 0..16 {
-                let (data, peer) = n
-                    .sockets
-                    .get_mut::<icmp::Socket>(h)
-                    .recv()
-                    .map_err(|_| NetError(11))?;
-                let peer = addr(peer);
-                if data.first() != Some(&if self.family == 2 { 0 } else { 129 })
-                    || state.peer.is_some_and(|a| a.ip() != peer)
-                {
-                    continue;
-                }
-                state.icmp_pending = Some((data.to_vec(), peer));
-                break;
+        let node = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
+        let handle = *state.handles.first().ok_or(NetError(11))?;
+        let socket = node.sockets.get_mut::<icmp::Socket>(handle);
+        let ipv6 = self.family == 10;
+        let options = state.udp_options[usize::from(ipv6)];
+        loop {
+            let (data, meta) = socket.peek_with_metadata().map_err(|_| NetError(11))?;
+            let peer = addr(meta.peer);
+            let destination = addr(meta.local.expect("received ICMP destination"));
+            if data.first() != Some(&if ipv6 { 129 } else { 0 })
+                || state.peer.is_some_and(|a| a.ip() != peer)
+                || state
+                    .bound
+                    .is_some_and(|a| !a.ip().is_unspecified() && a.ip() != destination)
+            {
+                socket.recv().map_err(|_| NetError(11))?;
+                continue;
             }
-            if state.icmp_pending.is_none() {
-                return Err(NetError(11));
+            let length = data.len();
+            let received = Received {
+                stream_minimum: 0,
+                packet_address: None,
+                netlink_address: None,
+                credentials: None,
+                ip: crate::ReceivedIp {
+                    ipv6,
+                    spec_destination: Some(Ipv4Addr::UNSPECIFIED),
+                    fields: crate::IpFields {
+                        traffic_class: options.receive_class.then_some(meta.ip.traffic_class),
+                        hop_limit: meta.ip.hop_limit.filter(|_| options.receive_hops),
+                    },
+                    ..Default::default()
+                },
+                packet_info: options.receive_info.then(|| crate::PacketInfo {
+                    interface: if meta.ip.ingress_index != 0 {
+                        meta.ip.ingress_index
+                    } else if destination.is_loopback() {
+                        1
+                    } else {
+                        2
+                    },
+                    address: destination,
+                }),
+                data: data[..count.min(length)].to_vec(),
+                address: Some(SocketAddr::new(peer, 0)),
+                length: if flags & MSG_TRUNC != 0 {
+                    length
+                } else {
+                    count.min(length)
+                },
+                truncated: count < length,
+            };
+            if flags & MSG_PEEK == 0 {
+                socket.recv().map_err(|_| NetError(11))?;
             }
+            return Ok(received);
         }
-        let (data, peer) = state.icmp_pending.as_ref().unwrap();
-        let length = data.len();
-        let received = Received {
-            stream_minimum: 0,
-            packet_address: None,
-            netlink_address: None,
-            credentials: None,
-            ip: Default::default(),
-            packet_info: None,
-            data: data[..count.min(length)].to_vec(),
-            address: Some(SocketAddr::new(*peer, 0)),
-            length: if flags & MSG_TRUNC != 0 {
-                length
-            } else {
-                count.min(length)
-            },
-            truncated: count < length,
-        };
-        if flags & MSG_PEEK == 0 {
-            state.icmp_pending = None;
-        }
-        Ok(received)
     }
 }

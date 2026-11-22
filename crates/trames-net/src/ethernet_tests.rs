@@ -292,12 +292,24 @@ fn named_ethernet_ports_echo_both_ip_families() {
     for (family, protocol, target, kind) in [(2, 1, "10.0.0.3:0", 8), (10, 58, "[fd00::3]:0", 128)]
     {
         let ping = a.socket(family, 2, protocol).unwrap();
+        let (level, class, recv_class, recv_info) = if family == 2 {
+            (0, 1, 13, 8)
+        } else {
+            (41, 67, 66, 49)
+        };
+        ping.set_option(level, class, 42).unwrap();
         ping.send(
             &[kind, 0, 0, 0, 0, 0, 0, 1],
             0,
             Some(target.parse().unwrap()),
         )
         .unwrap();
+        ping.set_option(level, class, 10).unwrap();
+        ping.set_option(level, recv_class, 1).unwrap();
+        ping.set_option(level, recv_info, 1).unwrap();
+        let peek = ping.recv(4, MSG_PEEK).unwrap();
+        assert_eq!(peek.ip.fields.traffic_class, Some(42));
+        assert_eq!(peek.packet_info.unwrap().interface, 2);
         let received = ping.recv(100, 0);
         let mut trace = vec![];
         for socket in [&trace_a, &trace_b] {

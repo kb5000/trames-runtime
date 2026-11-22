@@ -221,7 +221,7 @@ impl InterfaceInner {
         }
 
         match ipv4_repr.next_header {
-            IpProtocol::Icmp => self.process_icmpv4(sockets, ipv4_repr, ip_payload),
+            IpProtocol::Icmp => self.process_icmpv4(sockets, ipv4_repr, ip_payload, meta),
 
             #[cfg(feature = "multicast")]
             IpProtocol::Igmp => self.process_igmp(ipv4_repr, ip_payload),
@@ -321,6 +321,7 @@ impl InterfaceInner {
         _sockets: &mut SocketSet,
         ip_repr: Ipv4Repr,
         ip_payload: &'frame [u8],
+        meta: PacketMeta,
     ) -> Option<Packet<'frame>> {
         let icmp_packet = check!(Icmpv4Packet::new_checked(ip_payload));
         let icmp_repr = check!(Icmpv4Repr::parse(&icmp_packet, &self.caps.checksum));
@@ -334,7 +335,7 @@ impl InterfaceInner {
             .filter_map(|i| icmp::Socket::downcast_mut(&mut i.socket))
         {
             if icmp_socket.accepts_v4(self, &ip_repr, &icmp_repr) {
-                icmp_socket.process_v4(self, &ip_repr, &icmp_repr);
+                icmp_socket.process_v4(self, &ip_repr, &icmp_repr, meta);
                 handled_by_icmp_socket = true;
             }
         }
@@ -370,7 +371,7 @@ impl InterfaceInner {
                     seq_no,
                     data,
                 };
-                self.icmpv4_reply(ip_repr, icmp_reply_repr)
+                self.icmpv4_reply(ip_repr, icmp_reply_repr).map(|reply| reply.with_reply_class(meta.traffic_class))
             }
 
             // Ignore any echo replies.

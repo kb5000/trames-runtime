@@ -650,7 +650,7 @@ fn test_icmpv4_socket(#[case] medium: Medium) {
     assert_eq!(
         iface
             .inner
-            .process_icmpv4(&mut sockets, ipv4_repr, icmp_data),
+            .process_icmpv4(&mut sockets, ipv4_repr, icmp_data, Default::default()),
         Some(Packet::new_ipv4(ipv4_reply, IpPayload::Icmpv4(echo_reply)))
     );
 

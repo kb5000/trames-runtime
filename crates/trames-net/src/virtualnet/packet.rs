@@ -386,7 +386,7 @@ pub(crate) fn valid_transport(p: &[u8]) -> bool {
         58 => {
             if let (IpAddr::V6(s), IpAddr::V6(d)) = (h.tuple.source.ip(), h.tuple.destination.ip())
             {
-                smoltcp::wire::Icmpv6Packet::new_checked(b).is_ok_and(|p| p.verify_checksum(&s, &d))
+                b.len() >= 4 && raw_v6_checksum(s, d, 58, b) == 0
             } else {
                 false
             }

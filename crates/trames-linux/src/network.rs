@@ -127,6 +127,9 @@ pub(super) fn control(
             })
         }
         209 => {
+            if (a[1], a[2]) == (58, 1) {
+                return read_option(memory, a, || socket.icmp6_filter().map_err(net));
+            }
             if (a[1], a[2]) == (263, 6) {
                 return read_option(memory, a, || socket.packet_statistics().map_err(net));
             }
@@ -924,7 +927,7 @@ impl Linux {
             a,
             memory,
             socket.address_size(),
-            socket.is_stream(),
+            socket.datagram_limit(),
         )?
         .progress(
             socket,

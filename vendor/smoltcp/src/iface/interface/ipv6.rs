@@ -335,7 +335,7 @@ impl InterfaceInner {
         ip_payload: &'frame [u8],
     ) -> Option<Packet<'frame>> {
         match nxt_hdr {
-            IpProtocol::Icmpv6 => self.process_icmpv6(sockets, ipv6_repr, ip_payload),
+            IpProtocol::Icmpv6 => self.process_icmpv6(sockets, ipv6_repr, ip_payload, meta),
 
             #[cfg(any(feature = "socket-udp", feature = "socket-dns"))]
             IpProtocol::Udp => self.process_udp(
@@ -375,6 +375,7 @@ impl InterfaceInner {
         _sockets: &mut SocketSet,
         ip_repr: Ipv6Repr,
         ip_payload: &'frame [u8],
+        meta: PacketMeta,
     ) -> Option<Packet<'frame>> {
         let icmp_packet = check!(Icmpv6Packet::new_checked(ip_payload));
         let icmp_repr = check!(Icmpv6Repr::parse(
@@ -395,7 +396,7 @@ impl InterfaceInner {
                 .filter_map(|i| IcmpSocket::downcast_mut(&mut i.socket))
             {
                 if icmp_socket.accepts_v6(self, &ip_repr, &icmp_repr) {
-                    icmp_socket.process_v6(self, &ip_repr, &icmp_repr);
+                    icmp_socket.process_v6(self, &ip_repr, &icmp_repr, meta);
                     handled_by_icmp_socket = true;
                 }
             }
@@ -431,7 +432,7 @@ impl InterfaceInner {
                     seq_no,
                     data,
                 };
-                self.icmpv6_reply(ip_repr, icmp_reply_repr)
+                self.icmpv6_reply(ip_repr, icmp_reply_repr).map(|reply| reply.with_reply_class(meta.traffic_class))
             }
 
             // Ignore any echo replies.

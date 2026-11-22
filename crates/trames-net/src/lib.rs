@@ -496,6 +496,7 @@ impl Network {
                 self.1.clone(),
                 reservation,
                 kind,
+                false,
             ));
         }
         if family == 16 {
@@ -509,6 +510,7 @@ impl Network {
                 self.1.clone(),
                 reservation,
                 kind,
+                false,
             ));
         }
         let backend = match &self.0 {
@@ -526,7 +528,13 @@ impl Network {
             )?),
             Backend::Virtual(n) => SocketBackend::Virtual(n.socket(family, kind, protocol)?),
         };
-        Ok(Socket::wrap(backend, self.1.clone(), reservation, kind))
+        Ok(Socket::wrap(
+            backend,
+            self.1.clone(),
+            reservation,
+            kind,
+            kind & 0xf == 2 && matches!((family, protocol), (2, 1) | (10, 58)),
+        ))
     }
 }
 /// Closing task's wait for acknowledgement of the original stream's FIN.
@@ -554,6 +562,7 @@ pub struct Socket {
     inode_owner: Cell<u64>,
     // Immutable ABI type, retained across native/virtual endpoint transitions.
     kind: u32,
+    ping: bool,
     // Serializes endpoint/control transitions, while ordinary data operations
     // can run concurrently. Cached native byte capabilities bypass this gate.
     operation: parking_lot::RwLock<()>,
@@ -690,11 +699,13 @@ impl Socket {
         namespace: Arc<netlink::Namespace>,
         reservation: socket_quota::Reservation,
         kind: u32,
+        ping: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
             proc_inode: Default::default(),
             inode_owner: Cell::new(0),
             kind: kind & 0xf,
+            ping,
             operation: parking_lot::RwLock::new(()),
             backend,
             namespace,
@@ -718,6 +729,15 @@ impl Socket {
                 self.backend,
                 SocketBackend::Netlink(_) | SocketBackend::Packet(_)
             )
+    }
+    pub fn datagram_limit(&self) -> Option<usize> {
+        if self.is_stream() {
+            None
+        } else if self.ping {
+            Some(u16::MAX as usize)
+        } else {
+            Some(MAX_TRANSFER)
+        }
     }
     pub fn is_stream(&self) -> bool {
         self.kind == 1
@@ -966,6 +986,15 @@ impl Socket {
             SocketBackend::Hybrid(s) => s.congestion_name(),
             SocketBackend::Virtual(s) => s.congestion_name(),
             _ => Err(NetError(92)),
+        }
+    }
+    pub fn icmp6_filter(&self) -> Result<[u8; 32]> {
+        let _operation = self.operation.read_recursive();
+        match &self.backend {
+            SocketBackend::Native(socket) => socket.icmp6_filter(),
+            SocketBackend::Virtual(socket) => socket.icmp6_filter(),
+            SocketBackend::Hybrid(socket) => socket.icmp6_filter(),
+            _ => Err(NetError(95)),
         }
     }
     pub fn tcp_info(&self) -> Result<[u8; 104]> {
@@ -1366,7 +1395,13 @@ impl Socket {
                 (SocketBackend::Virtual(s), peer)
             }
         };
-        let accepted = Self::wrap(backend, self.namespace.clone(), reservation, self.kind);
+        let accepted = Self::wrap(
+            backend,
+            self.namespace.clone(),
+            reservation,
+            self.kind,
+            self.ping,
+        );
         for receive in [false, true] {
             accepted.set_io_timeout(receive, self.io_timeout(receive));
         }

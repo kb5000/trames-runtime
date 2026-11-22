@@ -25,26 +25,37 @@ impl Key {
     }
 }
 pub(crate) fn key(p: &[u8]) -> Option<Key> {
+    flow_key(p).map(|(key, _)| key)
+}
+
+// IP routing still needs the addresses of ICMP messages without a tracked
+// request/reply tuple. Only echo messages use the identifier as a port.
+fn flow_key(p: &[u8]) -> Option<(Key, bool)> {
     let h = packet::header(p)?;
     if !h.first {
         return None;
     }
     let mut tuple = h.tuple;
+    let mut trackable = true;
     if matches!(h.protocol, 1 | 58) {
-        let b = p.get(h.offset..h.offset + 8)?;
-        let id = u16::from_be_bytes([b[4], b[5]]);
-        match b[0] {
-            8 | 128 => tuple.source.set_port(id),
-            0 | 129 => tuple.destination.set_port(id),
-            _ if h.protocol == 1 && matches!(b[0], 3 | 11 | 12)
-                || h.protocol == 58 && matches!(b[0], 1..=4) => {}
-            _ => return None,
+        let b = p.get(h.offset..)?;
+        match (h.protocol, *b.first()?) {
+            (1, 8) | (58, 128) if b.len() >= 8 => {
+                tuple.source.set_port(u16::from_be_bytes([b[4], b[5]]))
+            }
+            (1, 0) | (58, 129) if b.len() >= 8 => {
+                tuple.destination.set_port(u16::from_be_bytes([b[4], b[5]]))
+            }
+            _ => trackable = false,
         }
     }
-    Some(Key {
-        protocol: h.protocol,
-        tuple,
-    })
+    Some((
+        Key {
+            protocol: h.protocol,
+            tuple,
+        },
+        trackable,
+    ))
 }
 pub(crate) fn rewrite(p: &mut [u8], k: Key) -> bool {
     let Some(h) = packet::header(p) else {
@@ -189,7 +200,7 @@ impl State {
         self.index.retain(|_, v| v.0 != id);
     }
     pub fn begin(&mut self, p: &[u8], zone: u16) -> Option<Track> {
-        let k = key(p)?;
+        let (k, trackable) = flow_key(p)?;
         let now = Instant::now();
         if self.next_sweep.is_none_or(|deadline| now >= deadline) {
             let expired: Vec<_> = self
@@ -217,6 +228,8 @@ impl State {
                 t.fresh = false;
                 return Some(t);
             }
+        }
+        if !trackable {
             let mut invalid = Track::untracked(k, zone);
             invalid.state = 1;
             return Some(invalid);

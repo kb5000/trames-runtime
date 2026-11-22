@@ -201,11 +201,11 @@ impl Prepared {
         a: [u64; 6],
         memory: &impl CpuMemory,
         address_size: usize,
-        stream: bool,
+        datagram_limit: Option<usize>,
     ) -> Result<Self> {
         let transfer = match number {
             206 => {
-                if !stream && a[2] > trames_net::MAX_TRANSFER as u64 {
+                if datagram_limit.is_some_and(|limit| a[2] > limit as u64) {
                     return Err(Errno(90));
                 }
                 let count = a[2].min(trames_net::MAX_TRANSFER as u64) as usize;
@@ -257,8 +257,12 @@ impl Prepared {
                     u64_at(memory, a[1] + 16)?,
                     u64_at(memory, a[1] + 24)?,
                     access,
-                    receive || stream,
-                    trames_net::MAX_TRANSFER,
+                    receive || datagram_limit.is_none(),
+                    if receive {
+                        trames_net::MAX_TRANSFER
+                    } else {
+                        datagram_limit.unwrap_or(trames_net::MAX_TRANSFER)
+                    },
                 )?;
                 if receive {
                     Transfer::Receive {

@@ -591,6 +591,16 @@ impl Linux {
             return Ok(self.vfs.write(a[0] as u32, bytes)? as u64);
         }
         if self.vfs.fd_kind(a[0] as u32)? == FdKind::Socket {
+            if a[2] > u16::MAX as u64
+                && self
+                    .vfs
+                    .socket_fd(a[0] as u32)
+                    .ok()
+                    .and_then(|socket| socket.datagram_limit())
+                    .is_some_and(|limit| a[2] > limit as u64)
+            {
+                return Err(Errno(90));
+            }
             if let Some(socket) = self
                 .vfs
                 .local_socket(a[0] as u32)?

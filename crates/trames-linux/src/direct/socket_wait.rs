@@ -62,7 +62,7 @@ impl RetainedSocket {
                         args,
                         memory,
                         socket.address_size(),
-                        socket.is_stream(),
+                        socket.datagram_limit(),
                     )?))
                 }
                 _ => None,
@@ -306,7 +306,7 @@ impl DirectSyscalls {
             return None;
         }
         let socket = self.raw_ip_socket(args[0] as u32)?;
-        let message = match ip_message::Message::raw(number, args, memory, socket.flags()) {
+        let message = match ip_message::Message::raw(number, args, memory, &socket) {
             Ok(message) => Arc::new(message),
             Err(error) => return Some(self.complete_socket(Err(error))),
         };
@@ -340,8 +340,7 @@ impl DirectSyscalls {
         let socket = file.socket_operation()?;
         let factory = self.resources.as_ref()?;
         Some((|| {
-            let message =
-                ip_message::Message::raw(byte_number(number), args, memory, socket.flags())?;
+            let message = ip_message::Message::raw(byte_number(number), args, memory, &socket)?;
             let deadline = socket
                 .io_timeout(number == 286)
                 .and_then(|duration| Instant::now().checked_add(duration));
@@ -433,7 +432,7 @@ impl DirectSyscalls {
                         args,
                         memory,
                         socket.address_size(),
-                        socket.is_stream(),
+                        socket.datagram_limit(),
                     )?))
                 }
                 _ => None,

@@ -799,17 +799,17 @@ impl Interface {
                 }),
                 #[cfg(feature = "socket-icmp")]
                 Socket::Icmp(socket) => {
-                    socket.dispatch(&mut self.inner, |inner, response| match response {
+                    socket.dispatch(&mut self.inner, |inner, meta, response| match response {
                         #[cfg(feature = "proto-ipv4")]
                         (IpRepr::Ipv4(ipv4_repr), IcmpRepr::Ipv4(icmpv4_repr)) => respond(
                             inner,
-                            PacketMeta::default(),
+                            meta,
                             Packet::new_ipv4(ipv4_repr, IpPayload::Icmpv4(icmpv4_repr)),
                         ),
                         #[cfg(feature = "proto-ipv6")]
                         (IpRepr::Ipv6(ipv6_repr), IcmpRepr::Ipv6(icmpv6_repr)) => respond(
                             inner,
-                            PacketMeta::default(),
+                            meta,
                             Packet::new_ipv6(ipv6_repr, IpPayload::Icmpv6(icmpv6_repr)),
                         ),
                         #[allow(unreachable_patterns)]
@@ -1241,6 +1241,7 @@ impl InterfaceInner {
         frag: &mut Fragmenter,
     ) -> Result<(), DispatchError> {
         let mut ip_repr = packet.ip_repr();
+        let traffic_class = packet.reply_class().unwrap_or(meta.traffic_class);
         assert!(!ip_repr.dst_addr().is_unspecified());
 
         // Dispatch IEEE802.15.4:
@@ -1312,13 +1313,13 @@ impl InterfaceInner {
                 IpRepr::Ipv4(v4) => v4.emit_with_class(
                     &mut Ipv4Packet::new_unchecked(&mut *tx_buffer),
                     &caps.checksum,
-                    meta.traffic_class,
+                    traffic_class,
                 ),
                 #[cfg(feature = "proto-ipv6")]
                 IpRepr::Ipv6(v6) => {
                     let mut header = Ipv6Packet::new_unchecked(&mut *tx_buffer);
                     v6.emit(&mut header);
-                    header.set_traffic_class(meta.traffic_class);
+                    header.set_traffic_class(traffic_class);
                 }
             }
 

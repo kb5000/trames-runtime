@@ -135,3 +135,9 @@ listeners by endpoint specificity, ingress device and a hash of the TCP
 four-tuple. Established connections retain their tuple match. TCP and UDP
 can both restrict delivery to a guest ingress interface. The existing UDP
 flow hash is shared with TCP listener selection.
+
+ICMP datagram queues retain the source, destination, ingress interface, hop
+limit and traffic class with each message. A peek exposes the same metadata
+as the subsequent receive. Transmit records can select the local address
+and IP options, and generated echo replies reflect the request's traffic
+class. Raw ICMPv6 sockets filter on message type before queue admission.
