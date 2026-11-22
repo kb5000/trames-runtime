@@ -193,7 +193,11 @@ impl Vfs {
                 .as_ref()
                 .is_some_and(|overlay| overlay.uncopied_inode(&node));
         let _metadata = node.metadata.lock().unwrap();
-        self.pseudo_immutable(&node)?;
+        if name.starts_with(b"user.") || trusted_attribute(name) {
+            self.pseudo_metadata_mutable(&node)?;
+        } else {
+            self.pseudo_immutable(&node)?;
+        }
         let mut n = node.borrow_mut();
         self.xattr_allowed(&n, name, true)?;
         if name == file_caps::NAME {

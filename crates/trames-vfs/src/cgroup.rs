@@ -11,6 +11,7 @@ use std::{
 };
 
 const ROOT: u64 = 5 << 32;
+const UNLIMITED: u32 = i32::MAX as u32;
 const MAX_GROUPS: usize = 128;
 const MAX_DEPTH: usize = 32;
 const PIDS_FILES: &[(&str, u32)] = &[
@@ -27,6 +28,8 @@ const FILES: &[(&str, u32)] = &[
     ("cgroup.subtree_control", 0o644),
     ("cgroup.type", 0o444),
     ("cgroup.events", 0o444),
+    ("cgroup.max.depth", 0o644),
+    ("cgroup.max.descendants", 0o644),
     ("cgroup.stat", 0o444),
     ("cgroup.freeze", 0o644),
     ("cgroup.kill", 0o200),
@@ -78,6 +81,9 @@ struct Group {
     parent: Option<u64>,
     freeze: bool,
     subtree_pids: bool,
+    max_depth: u32,
+    max_descendants: u32,
+    descendants: u32,
     pids_max: Option<u64>,
     pids_peak: u64,
     pids_events: u64,
@@ -466,6 +472,7 @@ impl Cgroups {
     }
     fn add_group(&mut self, path: Vec<u8>, parent: Option<u64>, mode: u32) {
         let id = self.add_node(path.clone(), true, mode);
+        let mut files = BTreeMap::new();
         for (name, mode) in FILES {
             // These controls apply only below the root cgroup.
             if parent.is_none()
@@ -477,22 +484,11 @@ impl Cgroups {
                 continue;
             }
             self.add_node(child_path(&path, name.as_bytes()), false, *mode);
+            files.insert(
+                name.as_bytes().to_vec(),
+                self.file_events(&path, name.as_bytes()),
+            );
         }
-        let files: BTreeMap<_, _> = FILES
-            .iter()
-            .filter(|(name, _)| {
-                self.fs
-                    .borrow()
-                    .paths
-                    .contains_key(&child_path(&path, name.as_bytes()))
-            })
-            .map(|(name, _)| {
-                (
-                    name.as_bytes().to_vec(),
-                    self.file_events(&path, name.as_bytes()),
-                )
-            })
-            .collect();
         let events = files
             .get(b"cgroup.events".as_slice())
             .cloned()
@@ -508,6 +504,9 @@ impl Cgroups {
                 parent,
                 freeze: false,
                 subtree_pids: false,
+                max_depth: UNLIMITED,
+                max_descendants: UNLIMITED,
+                descendants: 0,
                 pids_max: None,
                 pids_peak: 0,
                 pids_events: 0,
@@ -887,10 +886,29 @@ impl Vfs {
         if !cg.groups.contains_key(&id) {
             return Err(Errno(19));
         }
-        if cg.groups.len() + cg.dying.len() >= MAX_GROUPS || cg.ancestors(id).len() > MAX_DEPTH {
+        if path
+            .key
+            .rsplit(|&b| b == b'/')
+            .next()
+            .unwrap_or_default()
+            .contains(&b'\n')
+        {
+            return Err(Errno(22));
+        }
+        let ancestors = cg.ancestors(id);
+        if ancestors.iter().enumerate().any(|(depth, ancestor)| {
+            let group = &cg.groups[ancestor];
+            depth >= group.max_depth as usize || group.descendants >= group.max_descendants
+        }) {
+            return Err(Errno(11));
+        }
+        if cg.groups.len() + cg.dying.len() >= MAX_GROUPS || ancestors.len() > MAX_DEPTH {
             return Err(Errno(28));
         }
         cg.add_group(path.key.clone(), Some(id), mode & 0o777 & !self.umask());
+        for ancestor in ancestors {
+            cg.groups.get_mut(&ancestor).unwrap().descendants += 1;
+        }
         Ok(())
     }
     pub(super) fn cgroup_rmdir(&self, path: &ResolvedPath) -> Result<()> {
@@ -907,21 +925,25 @@ impl Vfs {
         if id == ROOT {
             return Err(Errno(16));
         }
-        if cg.groups.values().any(|g| g.parent == Some(id)) {
-            return Err(Errno(39));
+        if cg.groups[&id].descendants != 0 {
+            return Err(Errno(16));
         }
         if cg.tasks.values().any(|task| task.group() == id) {
             return Err(Errno(16));
         }
         let ancestors = cg.ancestors(id)[1..].to_vec();
-        let removed: Vec<_> = cg
-            .fs
-            .borrow()
-            .paths
-            .keys()
-            .filter(|key| below(key, &path.key))
-            .cloned()
-            .collect();
+        // A leaf and its control files are the only directory entries to retire.
+        // Start at the slash so similarly named siblings do not enter the range.
+        let prefix = child_path(&path.key, b"");
+        let mut removed = vec![path.key.clone()];
+        removed.extend(
+            cg.fs
+                .borrow()
+                .paths
+                .range(prefix.clone()..)
+                .take_while(|(key, _)| key.starts_with(&prefix))
+                .map(|(key, _)| key.clone()),
+        );
         let mut nodes = Vec::new();
         let events = cg.groups[&id].files.values().cloned().collect();
         let mut removed_nodes = Vec::new();
@@ -932,6 +954,9 @@ impl Vfs {
             removed_nodes.push(node);
         }
         cg.groups.remove(&id);
+        for ancestor in &ancestors {
+            cg.groups.get_mut(ancestor).unwrap().descendants -= 1;
+        }
         cg.dying.push(Dying { nodes, ancestors });
         cg.prune();
         drop(cg);
@@ -1093,7 +1118,7 @@ impl CgroupFile {
                 Ordering::Relaxed,
             );
         }
-        let path = &cg.groups.get(&id).ok_or(Errno(19))?.path;
+        let group = cg.groups.get(&id).ok_or(Errno(19))?;
         let text = match name.as_slice() {
             b"io.max" => String::new(),
             b"cgroup.procs" | b"cgroup.threads" => {
@@ -1115,15 +1140,27 @@ impl CgroupFile {
             b"cgroup.controllers" => if id == ROOT || cg.pids_enabled(id) {
                 "pids\n"
             } else {
-                "\n"
+                ""
             }
             .to_owned(),
             b"cgroup.subtree_control" => if cg.groups.get(&id).ok_or(Errno(19))?.subtree_pids {
                 "pids\n"
             } else {
-                "\n"
+                ""
             }
             .to_owned(),
+            b"cgroup.max.depth" | b"cgroup.max.descendants" => {
+                let limit = if name == b"cgroup.max.depth" {
+                    group.max_depth
+                } else {
+                    group.max_descendants
+                };
+                if limit == UNLIMITED {
+                    "max\n".to_owned()
+                } else {
+                    format!("{limit}\n")
+                }
+            }
             b"pids.current" => format!("{}\n", cg.current(id)),
             b"pids.peak" => format!("{}\n", cg.groups.get(&id).ok_or(Errno(19))?.pids_peak),
             b"pids.max" => cg
@@ -1151,11 +1188,7 @@ impl CgroupFile {
                 u8::from(cg.groups.get(&id).ok_or(Errno(19))?.freeze)
             ),
             b"cgroup.stat" => {
-                let descendants = cg
-                    .groups
-                    .iter()
-                    .filter(|(g, entry)| **g != id && below(&entry.path, path))
-                    .count();
+                let descendants = group.descendants;
                 let dying = cg
                     .dying
                     .iter()
@@ -1194,12 +1227,26 @@ impl CgroupFile {
         }
         let text = std::str::from_utf8(bytes).map_err(|_| Errno(22))?.trim();
         match name.as_slice() {
+            b"cgroup.controllers" => return Err(Errno(22)),
+            b"cgroup.max.depth" | b"cgroup.max.descendants" => {
+                let limit = if text == "max" {
+                    UNLIMITED
+                } else {
+                    u32::try_from(sysctl::parse_kernel_i32(text)?).map_err(|_| Errno(34))?
+                };
+                let group = cg.groups.get_mut(&id).ok_or(Errno(19))?;
+                if name == b"cgroup.max.depth" {
+                    group.max_depth = limit;
+                } else {
+                    group.max_descendants = limit;
+                }
+            }
             b"io.max" => return Err(Errno(95)),
             b"cgroup.freeze" => {
-                let freeze = match text {
-                    "0" => false,
-                    "1" => true,
-                    _ => return Err(Errno(22)),
+                let freeze = match sysctl::parse_kernel_i32(text)? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(Errno(34)),
                 };
                 let before = cg.event_states(cg.groups.keys().copied());
                 cg.groups.get_mut(&id).ok_or(Errno(19))?.freeze = freeze;
@@ -1224,8 +1271,8 @@ impl CgroupFile {
                 notify_events(events);
             }
             b"cgroup.kill" => {
-                if text != "1" {
-                    return Err(Errno(22));
+                if sysctl::parse_kernel_i32(text)? != 1 {
+                    return Err(Errno(34));
                 }
                 let path = &cg.groups.get(&id).ok_or(Errno(19))?.path;
                 let targets: Vec<_> = cg
@@ -1262,7 +1309,7 @@ impl CgroupFile {
                     enable = match token {
                         "+pids" => true,
                         "-pids" => false,
-                        _ => return Err(Errno(95)),
+                        _ => return Err(Errno(22)),
                     };
                 }
                 if enable == cg.groups.get(&id).ok_or(Errno(19))?.subtree_pids {
@@ -1324,7 +1371,7 @@ impl CgroupFile {
                 if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
                     return Err(Errno(22));
                 }
-                let local = text.parse::<u32>().map_err(|_| Errno(22))?;
+                let local = text.parse::<i32>().map_err(|_| Errno(22))? as u32;
                 let target = if local == 0 {
                     caller.pid
                 } else {
@@ -1696,6 +1743,54 @@ mod tests {
         assert_eq!(v.read(new_max, 128).unwrap(), b"max\n");
         v.cgroup_task(2).unwrap().exit();
         assert_eq!(fd.device_pread(128, 0).unwrap(), b"populated 0\nfrozen 0\n");
+    }
+    #[test]
+    fn ancestor_limits_apply_across_siblings_and_release_on_unlink() {
+        let mut v = setup();
+        let create = |v: &mut Vfs, suffix: &str| {
+            v.mkdir_at(
+                AT_FDCWD,
+                format!("/sys/fs/cgroup/{suffix}").as_bytes(),
+                0o755,
+            )
+        };
+        let limit = v
+            .open_at(AT_FDCWD, b"/sys/fs/cgroup/cgroup.max.descendants", 2, 0)
+            .unwrap();
+        v.write(limit, b"0x2").unwrap();
+        create(&mut v, "a").unwrap();
+        create(&mut v, "a/b").unwrap();
+        let held = v
+            .open_at(AT_FDCWD, b"/sys/fs/cgroup/a/b/cgroup.procs", 0, 0)
+            .unwrap();
+        assert_eq!(create(&mut v, "sibling"), Err(Errno(11)));
+        v.write(limit, b"0").unwrap();
+        assert_eq!(
+            v.unlink_at(AT_FDCWD, b"/sys/fs/cgroup/a", true),
+            Err(Errno(16))
+        );
+        v.unlink_at(AT_FDCWD, b"/sys/fs/cgroup/a/b", true).unwrap();
+        assert_eq!(create(&mut v, "sibling"), Err(Errno(11)));
+        v.write(limit, b"+02").unwrap();
+        assert_eq!(v.write(limit, b"-1"), Err(Errno(34)));
+        assert_eq!(v.write(limit, b"2147483648"), Err(Errno(34)));
+        assert_eq!(v.write(limit, b"--1"), Err(Errno(22)));
+        create(&mut v, "sibling").unwrap();
+        assert_eq!(create(&mut v, "a/b"), Err(Errno(11)));
+        v.close(held).unwrap();
+        v.write(limit, b"2147483647").unwrap();
+        let copy = v
+            .open_at(AT_FDCWD, b"/sys/fs/cgroup/cgroup.max.descendants", 0, 0)
+            .unwrap();
+        assert_eq!(v.read(copy, 32).unwrap(), b"max\n");
+        let depth = v
+            .open_at(AT_FDCWD, b"/sys/fs/cgroup/a/cgroup.max.depth", 2, 0)
+            .unwrap();
+        v.write(depth, b"1").unwrap();
+        create(&mut v, "a/b").unwrap();
+        assert_eq!(create(&mut v, "a/b/c"), Err(Errno(11)));
+        assert_eq!(create(&mut v, "sibling/bad\nname"), Err(Errno(22)));
+        create(&mut v, "sibling/c").unwrap();
     }
     #[test]
     fn quotas_count_live_deleted_objects_and_release_them() {

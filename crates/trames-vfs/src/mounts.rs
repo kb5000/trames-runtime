@@ -1475,6 +1475,9 @@ impl Vfs {
                     } else {
                         (fs.borrow().paths[b"/".as_slice()].clone(), b"/".to_vec())
                     };
+                    if parent.kind == Kind::Cgroup && Arc::ptr_eq(&target_node, &root) {
+                        return Err(Errno(16));
+                    }
                     (fs, root, key, Kind::Cgroup, flags & ATTRS)
                 }
                 b"devpts" => {

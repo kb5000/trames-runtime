@@ -193,6 +193,29 @@ impl Control {
         Ok(n)
     }
 }
+/// Linux kstrtoint with base zero, after the caller handles its input buffer.
+pub(super) fn parse_kernel_i32(input: &str) -> Result<i32> {
+    let (negative, digits) = if let Some(s) = input.strip_prefix('-') {
+        (true, s)
+    } else {
+        (false, input.strip_prefix('+').unwrap_or(input))
+    };
+    let (radix, digits) = if let Some(s) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        (16, s)
+    } else if digits.starts_with('0') && digits.len() > 1 {
+        (8, digits)
+    } else {
+        (10, digits)
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| (b as char).is_digit(radix)) {
+        return Err(Errno(22));
+    }
+    let magnitude = i64::from_str_radix(digits, radix).map_err(|_| Errno(34))?;
+    i32::try_from(if negative { -magnitude } else { magnitude }).map_err(|_| Errno(34))
+}
 fn parse_dump_filter(bytes: &[u8]) -> Result<u32> {
     // kstrtouint_from_user, base 0. The input buffer fits a binary u32,
     // one leading sign and a final newline.
