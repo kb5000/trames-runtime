@@ -337,13 +337,34 @@ impl Socket {
         if index == 0 {
             return Err(NetError(6));
         }
-        let device = self
-            .namespace
-            .graph
-            .read()
-            .unwrap()
-            .device(self.namespace.id(), index)?;
-        if matches!(device.kind, DeviceKind::Direct | DeviceKind::Tun) {
+        let graph = self.namespace.graph.read().unwrap();
+        let ns = self.namespace.id();
+        let device = graph.device(ns, index)?;
+        if device.kind == DeviceKind::Tun {
+            if bytes.len() > device.mtu as usize {
+                return Err(NetError(90));
+            }
+            let mut wakes = Vec::new();
+            if !device.up {
+                return Err(NetError(100));
+            }
+            let hub = graph.packet_hub(ns);
+            if hub.active() {
+                let frame = crate::ethernet::Frame::build([0; 6], [0; 6], protocol, bytes);
+                hub.observe_wire_except(&device, &frame, true, Some(&self.receiver), &mut wakes);
+            }
+            let queued = graph
+                .tunnel(ns, index)
+                .is_some_and(|port| port.enqueue(bytes.to_vec(), protocol, &mut wakes));
+            graph.account(ns, index, bytes.len(), true, !queued);
+            drop(graph);
+            for source in wakes {
+                source.notify_locked();
+            }
+            return Ok(bytes.len());
+        }
+        drop(graph);
+        if device.kind == DeviceKind::Direct {
             return Err(NetError(95));
         }
         let frame = if self.kind == 3 {

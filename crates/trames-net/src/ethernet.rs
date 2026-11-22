@@ -18,13 +18,17 @@ impl Frame {
         Self::from_link(bytes, false)
     }
     pub fn from_link(bytes: &[u8], loopback: bool) -> Result<Self> {
+        let frame = Self::from_tap(bytes)?;
+        if !loopback && (frame.source()[0] & 1 != 0 || frame.source() == [0; 6]) {
+            return Err(NetError(22));
+        }
+        Ok(frame)
+    }
+    pub fn from_tap(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < 14 || bytes.len() > 65575 + 22 {
             return Err(NetError(22));
         }
         let f = Self(Arc::from(bytes));
-        if !loopback && (f.source()[0] & 1 != 0 || f.source() == [0; 6]) {
-            return Err(NetError(22));
-        }
         if f.outer_protocol() == 0x8100 && bytes.len() < 18 {
             return Err(NetError(22));
         }
@@ -320,11 +324,21 @@ impl NeighborCache {
         self.entries.write().retain(|(i, _), _| *i != index);
     }
     pub fn learn(&self, index: u32, ip: std::net::IpAddr, mac: Mac) -> Vec<Vec<u8>> {
-        if ip.is_unspecified() || ip.is_multicast() || mac[0] & 1 != 0 || mac == [0; 6] {
+        if ip.is_unspecified() || ip.is_multicast() || mac == [0; 6] {
             return vec![];
         }
         let now = Instant::now();
         let mut entries = self.entries.write();
+        // An IPv4 ARP reply can resolve an outstanding probe to a group MAC.
+        // Keep unsolicited group addresses and invalid IPv6 neighbors out.
+        if mac[0] & 1 != 0
+            && !(ip.is_ipv4()
+                && entries
+                    .get(&(index, ip))
+                    .is_some_and(|e| e.probes != 0 || e.mac == Some(mac)))
+        {
+            return vec![];
+        }
         let pending = entries
             .remove(&(index, ip))
             .map_or_else(Vec::new, |e| e.pending);

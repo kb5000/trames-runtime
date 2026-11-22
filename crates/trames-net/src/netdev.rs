@@ -181,7 +181,7 @@ pub struct Route {
 struct Space {
     lo: Option<Arc<Loopback>>,
     packets: Arc<crate::packet_socket::Hub>,
-    tunnels: BTreeMap<u32, std::sync::Weak<crate::tun::Port>>,
+    tunnels: BTreeMap<u32, crate::tun::Binding>,
     neighbors: BTreeMap<(u32, IpAddr), NeighborEntry>,
     neighbor_cache: Arc<crate::ethernet::NeighborCache>,
     ip_serial: Arc<AtomicU64>,
@@ -849,10 +849,19 @@ impl Topology {
             if value > i32::MAX as u32 {
                 return Err(NetError(22));
             }
-            // The guest loopback has no backing NIC. Other links keep their
-            // transport's MTU until that transport can be reconfigured.
-            if old.kind != DeviceKind::Loopback || self.spaces[&id].lo.is_none() {
-                return Err(NetError(95));
+            match old.kind {
+                DeviceKind::Loopback if self.spaces[&id].lo.is_some() => {}
+                DeviceKind::Tun | DeviceKind::Tap => {
+                    let max = if old.kind == DeviceKind::Tap {
+                        65535 - 14
+                    } else {
+                        65535
+                    };
+                    if !(68..=max).contains(&value) {
+                        return Err(NetError(22));
+                    }
+                }
+                _ => return Err(NetError(95)),
             }
         }
         if old.kind == DeviceKind::Loopback {
@@ -996,6 +1005,9 @@ impl Topology {
         if let Some(len) = tx_queue_len {
             d.tx_queue_len = len;
         }
+        if let Some(value) = mtu {
+            d.mtu = value;
+        }
         self.devices.insert((target, index), d);
         self.changed();
         Ok(())
@@ -1032,6 +1044,13 @@ impl Topology {
             }
         }
         if let Some(s) = self.spaces.get_mut(&id) {
+            // Attached queues remain reachable for the link-deletion wake.
+            if s.tunnels
+                .get(&index)
+                .is_some_and(|b| b.port.strong_count() == 0)
+            {
+                s.tunnels.remove(&index);
+            }
             s.neighbors.retain(|(i, _), _| *i != index);
             s.routes.retain(|r| r.device != index);
             s.policy.forget_device(index);
@@ -1310,6 +1329,7 @@ impl Topology {
             return false;
         }
         match d.kind {
+            DeviceKind::Tun | DeviceKind::Tap => self.tunnel(d.namespace, d.index).is_some(),
             DeviceKind::Veth { peer } => self.devices.values().any(|p| p.index == peer && p.up),
             _ => true,
         }

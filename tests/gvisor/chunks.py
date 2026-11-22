@@ -11,7 +11,7 @@ import subprocess
 import time
 import xml.etree.ElementTree as ET
 
-from run import executed_case, TRACEE_WAIT, classify, execute, guest_terminal, guest_test_work, save, suite_flags, child_check_failure
+from run import executed_case, TRACEE_WAIT, classify, execute, guest_terminal, guest_binary, guest_test_work, save, suite_flags, child_check_failure
 
 
 class Progress:
@@ -69,7 +69,7 @@ def run(args,output,plan,env,runner,name,store,snapshot,cache,timeout):
     # later case must start with the environment's full configured CPU set.
     # The isolated loopback binary reuses fixed ports across cases. TIME_WAIT
     # from one successful test must not affect the next bind.
-    single={'affinity','socket_inet_loopback_isolated'}
+    single={'affinity','socket_inet_loopback_isolated','tuntap'}
     remaining_budget=lambda: not args.time_budget or time.monotonic()-started<args.time_budget
 
     def checkpoint():save(output/'results.json',rows)
@@ -104,7 +104,7 @@ def run(args,output,plan,env,runner,name,store,snapshot,cache,timeout):
             # original binary or treating an unexercised ACL as a passing case.
             wrapper='mkdir -p /dev/shm; mount -t tmpfs -o mode=1777 tmpfs /dev/shm; '+wrapper
         terminal, wrapper = guest_terminal(suite, wrapper)
-        argv=[runner,'debug','env-run',name,'--no-windows',terminal,'--','/bin/sh','-ec',wrapper,'trames-gvisor',work,'/opt/gvisor/'+suite+'_test',*suite_flags(suite),'--gtest_color=no','--gtest_filter='+':'.join(selected),'--gtest_output=xml:'+guest_xml]
+        argv=[runner,'debug','env-run',name,'--no-windows',terminal,'--','/bin/sh','-ec',wrapper,'trames-gvisor',work,*guest_binary(suite),*suite_flags(suite),'--gtest_color=no','--gtest_filter='+':'.join(selected),'--gtest_output=xml:'+guest_xml]
         stdout=output/'logs'/(stem+'.stdout');stderr=output/'logs'/(stem+'.stderr')
         budget=lambda case:timeout(suite,case) if case else 30
         progress=Progress(stdout,selected,budget)

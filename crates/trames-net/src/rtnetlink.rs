@@ -78,7 +78,8 @@ pub(crate) fn link_data(g: &Topology, d: &Device) -> Vec<u8> {
     let carrier = g.carrier(d);
     let flags = match d.kind {
         DeviceKind::Loopback => 8 | if d.up { 0x41 } else { 0 },
-        DeviceKind::Direct | DeviceKind::Tun => 0x90 | if d.up { 0x41 } else { 0 },
+        DeviceKind::Tun => 0x1090 | u32::from(d.up) | if carrier { 0x10040 } else { 0 },
+        DeviceKind::Direct => 0x90 | if d.up { 0x41 } else { 0 },
         _ => 0x1002 | u32::from(d.up) | if carrier { 0x10040 } else { 0 },
     };
     data[8..12].copy_from_slice(&flags.to_le_bytes());
@@ -141,18 +142,22 @@ pub(crate) fn link_data(g: &Topology, d: &Device) -> Vec<u8> {
             attr(&mut options, 23, &[0]);
             attr(&mut info, 2 | 0x8000, &options);
         }
-        if let Some(tun) = g.tunnel(d.namespace, d.index) {
+        if let Some(tun) = g.tun_binding(d.namespace, d.index) {
             let mut options = vec![];
             for (kind, value) in [
                 (3, if d.kind == DeviceKind::Tap { 2 } else { 1 }),
-                (4, u8::from(tun.flags & 0x1000 == 0)),
+                (4, u8::from(tun.packet_info)),
                 (5, 0),
-                (6, 0),
+                (6, u8::from(tun.persistent)),
                 (7, 0),
             ] {
                 attr(&mut options, kind, &[value]);
             }
-            attr(&mut options, 8, &1u32.to_le_bytes());
+            attr(
+                &mut options,
+                8,
+                &u32::from(tun.port.strong_count() != 0).to_le_bytes(),
+            );
             attr(&mut options, 9, &0u32.to_le_bytes());
             attr(&mut info, 2 | 0x8000, &options);
         }

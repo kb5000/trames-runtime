@@ -24,7 +24,7 @@ impl Topology {
         ) {
             return vec![];
         }
-        if frame.0.len() > d.mtu as usize + 22 {
+        if (d.kind != DeviceKind::Tap || outgoing) && frame.0.len() > d.mtu as usize + 22 {
             self.account(ns, index, frame.0.len(), outgoing, true);
             return vec![];
         }
@@ -43,7 +43,7 @@ impl Topology {
                     }),
                 DeviceKind::Tap => {
                     if let Some(p) = self.tunnel(ns, index) {
-                        p.enqueue(&frame.0, wakes);
+                        p.enqueue(frame.0.to_vec(), frame.outer_protocol(), wakes);
                     }
                     vec![]
                 }
@@ -53,6 +53,9 @@ impl Topology {
             };
         }
         if let Some(master) = d.master {
+            if frame.source()[0] & 1 != 0 || frame.source() == [0; 6] {
+                return vec![];
+            }
             return self.ethernet_bridge(ns, master, index, frame, wakes);
         }
         if frame.destination() == d.mac || frame.multicast() {

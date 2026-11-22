@@ -389,3 +389,55 @@ fn packet_ring_truncation_copy_and_mapping_lifetime() {
         rx.set_option_bytes(263, 5, &[0; 16]).unwrap();
     }
 }
+
+#[test]
+fn persistent_tun_reopens_without_stale_packets_and_uses_live_mtu() {
+    let network = Network::new(NetworkMode::Full).isolated().unwrap();
+    let tun = network.open_tun();
+    tun.attach(b"testtun", 1, true).unwrap();
+    let index = network
+        .devices()
+        .into_iter()
+        .find(|d| d.name == b"testtun")
+        .unwrap()
+        .index;
+    assign(&network, index, "192.0.2.1", 24);
+    tun.set_persist(true).unwrap();
+    assert_eq!(tun.interface().unwrap().1, 0x1801);
+    let other = network.open_tun();
+    assert_eq!(other.attach(b"testtun", 1, true), Err(NetError(16)));
+    assert_eq!(other.attach(b"testtun", 0x8001, true), Err(NetError(16)));
+    assert_eq!(other.attach(b"testtun", 2, true), Err(NetError(22)));
+    let sender = network.socket(2, 2, 0).unwrap();
+    sender.set_option(0, 10, 0).unwrap();
+    let peer = addr("192.0.2.2", 4321);
+    sender.send(b"discard on detach", 0, Some(peer)).unwrap();
+    assert_eq!(tun.poll(1).0, 1);
+    drop(tun);
+    let ns = network.namespace_id();
+    {
+        let g = network.1.graph.read().unwrap();
+        let d = g.device(ns, index).unwrap();
+        assert!(d.up && !g.carrier(&d));
+        assert!(g.tun_binding(ns, index).unwrap().packet_info);
+    }
+    other.attach(b"testtun", 0x1001, true).unwrap();
+    assert_eq!(other.read(256), Err(NetError(11)));
+    network
+        .configure_device(index, None, None, Some(100))
+        .unwrap();
+    let payload = [0x5a; 200];
+    sender.send(&payload, 0, Some(peer)).unwrap();
+    let mut datagram = Vec::new();
+    while let Ok(packet) = other.read(256) {
+        assert!(packet.len() <= 100);
+        let ip = smoltcp::wire::Ipv4Packet::new_checked(packet.as_slice()).unwrap();
+        assert!(ip.verify_checksum());
+        assert_eq!(usize::from(ip.frag_offset()), datagram.len());
+        datagram.extend_from_slice(ip.payload());
+    }
+    assert_eq!(datagram.get(8..), Some(payload.as_slice()));
+    other.set_persist(false).unwrap();
+    drop(other);
+    assert!(network.devices().iter().all(|d| d.index != index));
+}

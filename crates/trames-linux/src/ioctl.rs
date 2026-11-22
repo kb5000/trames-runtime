@@ -115,6 +115,7 @@ fn tun_ioctl(
             ifreq[..name.len()].copy_from_slice(&name);
             memory.write(argument, &ifreq).map_err(|_| Errno(14))?;
         }
+        0x400454cb => file.set_persist(argument != 0).map_err(net)?,
         0x800454d2 => {
             let (name, flags) = file.interface().map_err(net)?;
             let mut ifreq = [0; 40];

@@ -4,6 +4,12 @@ use crate::*;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 pub const FEATURES: u32 = 1 | 2 | 0x1000; // IFF_TUN | IFF_TAP | IFF_NO_PI
+#[derive(Clone, Default)]
+pub(crate) struct Binding {
+    pub port: std::sync::Weak<Port>,
+    pub persistent: bool,
+    pub packet_info: bool,
+}
 pub struct Connection {
     namespace: Arc<netlink::Namespace>,
     port: Mutex<Option<Arc<Port>>>,
@@ -17,7 +23,7 @@ pub(crate) struct Port {
 }
 #[derive(Default)]
 struct Queue {
-    packets: VecDeque<Vec<u8>>,
+    packets: VecDeque<(Vec<u8>, u16)>,
     bytes: usize,
     epoch: u64,
 }
@@ -41,30 +47,49 @@ impl Connection {
         self.namespace.root_stack()?;
         let mut attached = self.port.lock();
         if attached.is_some() {
-            return Err(NetError(22));
+            return Err(NetError(17));
         }
         let mut graph = self.namespace.graph.write().unwrap();
         let name = if name.is_empty() || name == b"tun%d" || name == b"tap%d" {
-            (0..256)
-                .map(|n| format!("{}{n}", if flags & 2 != 0 { "tap" } else { "tun" }).into_bytes())
-                .find(|name| {
-                    graph
-                        .devices(self.namespace.id())
-                        .iter()
-                        .all(|d| d.name != *name)
-                })
-                .ok_or(NetError(23))?
+            let prefix = match name {
+                b"tun%d" => "tun",
+                b"tap%d" => "tap",
+                _ if flags & 2 != 0 => "tap",
+                _ => "tun",
+            };
+            graph.automatic_name(self.namespace.id(), prefix, None)?
         } else {
             name.to_vec()
         };
-        let index = graph.create_tun(self.namespace.id(), &name, flags & 2 != 0)?;
+        let ns = self.namespace.id();
+        let tap = flags & 2 != 0;
+        let index = if let Ok(existing) = graph.named(ns, &name) {
+            if flags & 0x8000 != 0 {
+                return Err(NetError(16));
+            }
+            if existing.kind
+                != if tap {
+                    DeviceKind::Tap
+                } else {
+                    DeviceKind::Tun
+                }
+            {
+                return Err(NetError(22));
+            }
+            if graph.tunnel(ns, existing.index).is_some() {
+                return Err(NetError(16));
+            }
+            existing.index
+        } else {
+            graph.create_tun(ns, &name, tap)?
+        };
         let port = Arc::new(Port {
             index,
             flags: flags & !0x8000,
             queue: Mutex::default(),
             readiness: self.readiness.clone(),
         });
-        graph.attach_tun(self.namespace.id(), index, Arc::downgrade(&port));
+        graph.attach_tun(self.namespace.id(), index, &port);
         let d = graph.device(self.namespace.id(), index)?;
         let data = crate::rtnetlink::link_data(&graph, &d);
         drop(graph);
@@ -76,13 +101,26 @@ impl Connection {
     }
     pub fn interface(&self) -> Result<(Vec<u8>, u16)> {
         let p = self.port.lock().clone().ok_or(NetError(77))?;
-        let d = self
-            .namespace
-            .graph
-            .read()
-            .unwrap()
-            .device(self.namespace.id(), p.index)?;
-        Ok((d.name, p.flags))
+        let ns = self.namespace.id();
+        let graph = self.namespace.graph.read().unwrap();
+        let name = graph.device_name(ns, p.index).ok_or(NetError(77))?;
+        let binding = graph.tun_binding(ns, p.index).ok_or(NetError(77))?;
+        // Linux aliases the output-only IFF_NOFILTER with the input IFF_NO_PI.
+        Ok((
+            name.to_vec(),
+            p.flags | 0x1000 | if binding.persistent { 0x0800 } else { 0 },
+        ))
+    }
+    pub fn set_persist(&self, enabled: bool) -> Result<()> {
+        let p = self.port.lock().clone().ok_or(NetError(77))?;
+        let ns = self.namespace.id();
+        let mut graph = self.namespace.graph.write().unwrap();
+        if graph.set_tun_persist(ns, p.index, enabled)? {
+            let data = crate::rtnetlink::link_data(&graph, &graph.device(ns, p.index)?);
+            drop(graph);
+            self.namespace.notify(vec![(ns, 16, 1, data)]);
+        }
+        Ok(())
     }
     pub fn read(&self, count: usize) -> Result<Vec<u8>> {
         let p = self.port.lock().clone().ok_or(NetError(77))?;
@@ -98,7 +136,7 @@ impl Connection {
             return Err(NetError(5));
         }
         let mut q = p.queue.lock();
-        let packet = q.packets.front().ok_or(NetError(11))?;
+        let (packet, protocol) = q.packets.front().ok_or(NetError(11))?;
         let header = usize::from(p.flags & 0x1000 == 0) * 4;
         if count < header {
             return Err(NetError(22));
@@ -107,66 +145,50 @@ impl Connection {
         let mut out = Vec::with_capacity(n + header);
         if header != 0 {
             out.extend_from_slice(&(u16::from(n < packet.len())).to_le_bytes());
-            out.extend_from_slice(
-                &(if p.flags & 2 != 0 {
-                    u16::from_be_bytes([packet[12], packet[13]])
-                } else if packet[0] >> 4 == 4 {
-                    0x0800u16
-                } else {
-                    0x86dd
-                })
-                .to_be_bytes(),
-            );
+            out.extend_from_slice(&protocol.to_be_bytes());
         }
         out.extend_from_slice(&packet[..n]);
-        q.bytes -= q.packets.pop_front().unwrap().len();
+        q.bytes -= q.packets.pop_front().unwrap().0.len();
         Ok(out)
     }
     pub fn write(&self, bytes: &[u8]) -> Result<usize> {
         let p = self.port.lock().clone().ok_or(NetError(77))?;
-        if p.flags & 2 != 0 {
-            let frame = if p.flags & 0x1000 != 0 {
-                bytes
-            } else {
-                if bytes.len() < 4 {
-                    return Err(NetError(22));
-                }
-                &bytes[4..]
-            };
-            let frame = crate::ethernet::Frame::new(frame)?;
-            if p.flags & 0x1000 == 0 && bytes[2..4] != frame.outer_protocol().to_be_bytes() {
-                return Err(NetError(22));
-            }
-            self.namespace
-                .root_stack()?
-                .inject_frame(p.index, frame, None)?;
-            return Ok(bytes.len());
-        }
-        let packet = if p.flags & 0x1000 != 0 {
-            bytes
+        let has_pi = p.flags & 0x1000 == 0;
+        let packet = if has_pi {
+            bytes.get(4..).ok_or(NetError(22))?
         } else {
-            if bytes.len() < 4 {
-                return Err(NetError(22));
-            }
-            let proto = u16::from_be_bytes([bytes[2], bytes[3]]);
-            if !matches!(
-                (proto, bytes.get(4).map(|b| b >> 4)),
-                (0x0800, Some(4)) | (0x86dd, Some(6))
-            ) {
-                return Err(NetError(22));
-            }
-            &bytes[4..]
+            bytes
         };
-        let d = self
-            .namespace
-            .graph
-            .read()
-            .unwrap()
-            .device(self.namespace.id(), p.index)?;
-        if !d.up {
-            return Err(NetError(5));
+        let tap = p.flags & 2 != 0;
+        if tap && packet.len() < 14
+            || !tap && !has_pi && !matches!(packet.first().map(|b| b >> 4), Some(4 | 6))
+        {
+            return Err(NetError(22));
         }
-        self.namespace.root_stack()?.inject(p.index, packet)?;
+        if tap {
+            // TAP takes the protocol from the Ethernet header. The sender supplies
+            // frame bytes; packet sockets and the network stack consume them.
+            let frame = crate::ethernet::Frame::from_tap(packet)?;
+            return match self
+                .namespace
+                .root_stack()?
+                .inject_frame(p.index, frame, None)
+            {
+                Err(NetError(100)) => Err(NetError(5)),
+                Err(e) => Err(e),
+                Ok(()) => Ok(bytes.len()),
+            };
+        }
+        let protocol = if has_pi {
+            u16::from_be_bytes([bytes[2], bytes[3]])
+        } else if packet[0] >> 4 == 4 {
+            0x0800
+        } else {
+            0x86dd
+        };
+        self.namespace
+            .root_stack()?
+            .inject(p.index, protocol, packet)?;
         Ok(bytes.len())
     }
     pub fn poll(&self, events: u16) -> (u16, [u64; 2]) {
@@ -214,7 +236,8 @@ impl Port {
     }
     pub(crate) fn enqueue(
         &self,
-        packet: &[u8],
+        packet: Vec<u8>,
+        protocol: u16,
         wakes: &mut Vec<Arc<trames_shared::Readiness>>,
     ) -> bool {
         let mut q = self.queue.lock();
@@ -222,7 +245,7 @@ impl Port {
             return false;
         }
         q.bytes += packet.len();
-        q.packets.push_back(packet.to_vec());
+        q.packets.push_back((packet, protocol));
         q.epoch = q.epoch.wrapping_add(1);
         wakes.push(self.readiness.clone());
         true
@@ -234,12 +257,16 @@ impl Drop for Connection {
             return;
         };
         let mut g = self.namespace.graph.write().unwrap();
-        if let Ok(d) = g.device(self.namespace.id(), port.index) {
+        let ns = self.namespace.id();
+        let remove = g.detach_tun(ns, port.index);
+        if let Ok(d) = g.device(ns, port.index) {
             let data = crate::rtnetlink::link_data(&g, &d);
-            let _ = g.remove_link(self.namespace.id(), port.index);
+            if remove {
+                let _ = g.remove_link(ns, port.index);
+            }
             drop(g);
             self.namespace
-                .notify(vec![(self.namespace.id(), 17, 1, data)]);
+                .notify(vec![(ns, if remove { 17 } else { 16 }, 1, data)]);
         }
     }
 }

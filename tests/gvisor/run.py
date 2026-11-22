@@ -78,6 +78,12 @@ def suite_flags(suite):
     # fixture otherwise skips all setgid cases on a single-group rootfs.
     return ['--groups=0,1'] if suite == 'setgid' else []
 
+def guest_binary(suite):
+    # The TUN/TAP fixtures own 10.0.0.1/24 and use .2 as the remote peer.
+    # Run in an empty netns, matching the native harness, to avoid eth0's subnet.
+    prefix = ['/usr/bin/unshare', '-n'] if suite == 'tuntap' else []
+    return [*prefix, '/opt/gvisor/' + suite + '_test']
+
 def guest_test_work(suite):
     if suite == 'memfd':
         # Keep the original XML on persistent storage for the later export.
@@ -190,6 +196,7 @@ def classify(xml, code, timed_out, expected):
 
 # These flags describe the named suites, not the worker or its other tests.
 SUITE_FIXTURES = {
+    'tun_netns_per_case': {'tuntap'},
     'host_pty_fixture': {'host_pty'},
     'isolated_loopback_per_case': {'socket_inet_loopback_isolated'},
     'setgid_fixture': {'setgid'},
@@ -321,6 +328,8 @@ def native(args, output):
     if args.native_init:plan['native_init_sha256']=digest(args.native_init)
     if any(s['name'] == 'concurrency' for s in plan['suites']):
         plan['multiprocess_fixture'] = 'MULTIPROCESS:TRUE'
+    if any(s['name'] == 'tuntap' for s in plan['suites']):
+        plan['tun_netns_per_case'] = True
     if any(s['name'] == 'host_pty' for s in plan['suites']):
         plan['host_pty_fixture'] = True
     if any(s['name'] == 'setgid' for s in plan['suites']):
@@ -378,6 +387,7 @@ def trames(args, output):
     plan['network']=args.network
     plan['cpus']=args.cpus
     plan['rootfs_sha256']=digest(args.rootfs.resolve())
+    if any(s['name'] == 'tuntap' for s in plan['suites']):plan['tun_netns_per_case'] = True
     if args.custom_rootfs:plan['custom_rootfs'] = True
     if any(s['name'] in ('rename','mount') for s in plan['suites']):plan['writable_sysfs_fixture'] = True
     plan['runfiles_sha256']={str(p.relative_to(binaries)):digest(p) for p in (binaries/'runfiles').rglob('*') if p.is_file()}
@@ -469,7 +479,7 @@ def trames(args, output):
                 wrapper=wrapper.replace('exec "$@"', '"$@" & child=$!; wait "$child"')
             terminal, wrapper = guest_terminal(suite['name'], wrapper)
             argv = [runner,'debug','env-run',name,'--no-windows',terminal,'--','/bin/sh','-ec',wrapper,'trames-gvisor',work,
-                    '/opt/gvisor/'+suite['name']+'_test',*suite_flags(suite['name']),'--gtest_color=no','--gtest_filter='+case,'--gtest_output=xml:'+guest_xml]
+                    *guest_binary(suite['name']),*suite_flags(suite['name']),'--gtest_color=no','--gtest_filter='+case,'--gtest_output=xml:'+guest_xml]
             code, timed, seconds = execute(argv,output/'logs'/(str(index)+'.stdout'),output/'logs'/(str(index)+'.stderr'),case_timeout(suite['name'],case),env=env,min_free=int(args.min_free_gib*1024**3))
             if not timed:
                 exported = subprocess.run([runner,'debug','env-run',name,'--fs','get',guest_xml,str(xml)],env=env,capture_output=True,timeout=20)

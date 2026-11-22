@@ -815,15 +815,12 @@ impl Linux {
                 0x8913 => {
                     let flags: u16 = if loopback {
                         8 | if device.up { 0x41 } else { 0 }
-                    } else if matches!(
-                        device.kind,
-                        trames_net::DeviceKind::Direct | trames_net::DeviceKind::Tun
-                    ) {
-                        (if device.kind == trames_net::DeviceKind::Tun {
-                            0x90
-                        } else {
-                            0x80
-                        }) | if device.up { 0x41 } else { 0 }
+                    } else if device.kind == trames_net::DeviceKind::Tun {
+                        0x1090
+                            | u16::from(device.up)
+                            | if vfs.network_carrier(device) { 0x40 } else { 0 }
+                    } else if device.kind == trames_net::DeviceKind::Direct {
+                        0x80 | if device.up { 0x41 } else { 0 }
                     } else {
                         0x1002
                             | u16::from(device.up)

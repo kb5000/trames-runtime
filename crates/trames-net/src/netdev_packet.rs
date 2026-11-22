@@ -5,11 +5,6 @@ impl Topology {
         self.spaces[&ns].packets.clone()
     }
     pub fn create_tun(&mut self, ns: u64, name: &[u8], tap: bool) -> Result<u32> {
-        self.spaces
-            .get_mut(&ns)
-            .unwrap()
-            .tunnels
-            .retain(|_, p| p.strong_count() != 0);
         let index = self.new_device(
             ns,
             name,
@@ -24,15 +19,73 @@ impl Topology {
         }
         Ok(index)
     }
-    pub fn attach_tun(&mut self, ns: u64, index: u32, port: std::sync::Weak<crate::tun::Port>) {
-        self.spaces
+    pub fn attach_tun(&mut self, ns: u64, index: u32, port: &Arc<crate::tun::Port>) {
+        let binding = self
+            .spaces
             .get_mut(&ns)
             .unwrap()
             .tunnels
-            .insert(index, port);
+            .entry(index)
+            .or_default();
+        binding.port = Arc::downgrade(port);
+        binding.packet_info = port.flags & 0x1000 == 0;
+    }
+    pub fn tun_binding(&self, ns: u64, index: u32) -> Option<&crate::tun::Binding> {
+        self.spaces.get(&ns)?.tunnels.get(&index)
+    }
+    pub fn set_tun_persist(&mut self, ns: u64, index: u32, enabled: bool) -> Result<bool> {
+        if !self.devices.contains_key(&(ns, index)) {
+            return Err(NetError(77));
+        }
+        let binding = self
+            .spaces
+            .get_mut(&ns)
+            .and_then(|s| s.tunnels.get_mut(&index))
+            .ok_or(NetError(77))?;
+        Ok(std::mem::replace(&mut binding.persistent, enabled) != enabled)
+    }
+    pub fn detach_tun(&mut self, ns: u64, index: u32) -> bool {
+        let exists = self.devices.contains_key(&(ns, index));
+        let Some(space) = self.spaces.get_mut(&ns) else {
+            return false;
+        };
+        if let Some(binding) = space.tunnels.get_mut(&index) {
+            if exists && binding.persistent {
+                binding.port = Default::default();
+                return false;
+            }
+        }
+        space.tunnels.remove(&index);
+        exists
     }
     pub fn tunnel(&self, ns: u64, index: u32) -> Option<Arc<crate::tun::Port>> {
-        self.spaces.get(&ns)?.tunnels.get(&index)?.upgrade()
+        self.tun_binding(ns, index)?.port.upgrade()
+    }
+    pub fn transmit_tun(
+        &self,
+        ns: u64,
+        index: u32,
+        packet: Vec<u8>,
+        wakes: &mut Vec<Arc<trames_shared::Readiness>>,
+    ) -> bool {
+        let Some(port) = self.tunnel(ns, index) else {
+            return false;
+        };
+        let Ok(mtu) = self.link_mtu(ns, index) else {
+            return false;
+        };
+        let protocol = if packet[0] >> 4 == 4 { 0x0800 } else { 0x86dd };
+        if packet.len() <= mtu as usize {
+            return port.enqueue(packet, protocol, wakes);
+        }
+        let serial = self.spaces[&ns].ip_serial.fetch_add(1, Relaxed) as u32;
+        crate::virtualnet::packet::fragment_link(packet, mtu as usize, serial).is_some_and(
+            |fragments| {
+                fragments
+                    .into_iter()
+                    .all(|p| port.enqueue(p, protocol, wakes))
+            },
+        )
     }
     pub fn observe(
         &self,
@@ -102,7 +155,7 @@ impl Topology {
     pub fn link_wakes(&self, ns: u64, index: u32, wakes: &mut Vec<Arc<trames_shared::Readiness>>) {
         if let Some(space) = self.spaces.get(&ns) {
             space.packets.link_wakes(wakes);
-            if let Some(port) = space.tunnels.get(&index).and_then(std::sync::Weak::upgrade) {
+            if let Some(port) = self.tunnel(ns, index) {
                 wakes.push(port.readiness());
             }
         }

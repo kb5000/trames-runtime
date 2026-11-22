@@ -1116,16 +1116,6 @@ impl Inner {
                                 self.queue_frames(view, actions);
                                 continue;
                             }
-                            if d.kind == crate::DeviceKind::Tun {
-                                view.graph.read().unwrap().observe(
-                                    view.namespace,
-                                    index,
-                                    peer,
-                                    &p,
-                                    false,
-                                    &mut self.notifications,
-                                );
-                            }
                         }
                     }
 
@@ -1188,10 +1178,14 @@ impl Inner {
                             &mut self.notifications,
                         );
                         let graph = view.graph.read().unwrap();
-                        let delivered = graph
-                            .tunnel(route.namespace, route.input)
-                            .is_some_and(|port| port.enqueue(&p, &mut self.notifications));
-                        graph.account(route.namespace, route.input, p.len(), true, !delivered);
+                        let len = p.len();
+                        let delivered = graph.transmit_tun(
+                            route.namespace,
+                            route.input,
+                            p,
+                            &mut self.notifications,
+                        );
+                        graph.account(route.namespace, route.input, len, true, !delivered);
                         if !delivered {
                             self.stats.dropped += 1;
                         }
@@ -1622,16 +1616,38 @@ impl Network {
     pub(super) fn fabric(&self) -> Fabric {
         self.0.fabric.clone()
     }
-    pub(crate) fn inject(&self, interface: u32, packet: &[u8]) -> Result<()> {
+    pub(crate) fn inject(&self, interface: u32, protocol: u16, packet: &[u8]) -> Result<()> {
         if self.0.mode == NetworkMode::Off {
             return Err(NetError(13));
         }
-        if packet.len() > 65535 || packet::header(packet).is_none() {
-            return Err(NetError(22));
-        }
+        let view = self.0.routing.get().ok_or(NetError(95))?;
         let mut inner = self.0.fabric.0.borrow_mut();
         if inner.injected.len() >= 96 {
             return Err(NetError(11));
+        }
+        if packet.len() > 65575 {
+            return Err(NetError(90));
+        }
+        {
+            let graph = view.graph.read().unwrap();
+            let device = graph
+                .device(view.namespace, interface)
+                .map_err(|_| NetError(77))?;
+            if !device.up {
+                return Err(NetError(5));
+            }
+            let hub = graph.packet_hub(view.namespace);
+            if hub.active() {
+                let frame = crate::ethernet::Frame::build([0; 6], [0; 6], protocol, packet);
+                hub.observe_wire(&device, &frame, false, &mut inner.notifications);
+            }
+        }
+        // Packet sockets tap ingress before IP validates its header or checksum.
+        if !matches!(
+            (protocol, packet.first().map(|b| b >> 4)),
+            (0x0800, Some(4)) | (0x86dd, Some(6))
+        ) {
+            return Ok(());
         }
         inner
             .injected
@@ -1673,7 +1689,9 @@ impl Network {
         ) {
             return Err(NetError(95));
         }
-        if frame.0.len() > d.mtu as usize + 22 {
+        if (d.kind != crate::DeviceKind::Tap || sender.is_some())
+            && frame.0.len() > d.mtu as usize + 22
+        {
             return Err(NetError(90));
         }
         let mut inner = self.0.fabric.0.borrow_mut();
