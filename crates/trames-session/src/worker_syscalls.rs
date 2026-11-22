@@ -946,15 +946,16 @@ impl Snapshot {
             }
         }
         let result = match cpu.x(8) as u32 {
-            number @ (270 | 271)
-                if cpu.x(0) as u32 as u64 == self.identities[0]
-                    || cpu.x(0) as u32 as u64 == self.identities[6] =>
-            {
-                trames_linux::process_vm_local(number, std::array::from_fn(|i| cpu.x(i)), memory)
+            number @ (270 | 271) => {
+                let a = std::array::from_fn(|i| cpu.x(i));
+                trames_linux::process_vm_transfer(number, a, memory, || {
+                    self.io_routes.directory.admit_local_mm(
+                        &self.io_routes.namespace,
+                        &self.io_signals,
+                        a[0] as u32,
+                    )
+                })
             }
-            // Cross-mm access has no retained target-mm admission yet. Keep
-            // its unsupported result terminal on this source, without fallback.
-            270 | 271 => Err(Errno(38)),
             117 => self
                 .io_routes
                 .ptrace(&self.io_signals, std::array::from_fn(|i| cpu.x(i))),

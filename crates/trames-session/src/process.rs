@@ -2154,10 +2154,11 @@ impl<C: Cpu> Kernel<C> {
                 Ok(Some(0))
             },
             number @ (270 | 271) => {
-                if a[0] as u32 == p.linux.vfs.visible_pid(p.tgid)
-                    || a[0] as u32 == p.linux.vfs.visible_pid(pid) {
-                    trames_linux::process_vm_local(number, a, &mut p.memory).map(Some)
-                } else { Err(Errno(38)) }
+                trames_linux::process_vm_transfer(number, a, &mut p.memory, || {
+                    p.signals.io_directory.admit_local_mm(
+                        p.linux.vfs.pid_namespace(), &p.signals.io, a[0] as u32,
+                    )
+                }).map(Some)
             },
             172 => Ok(Some(p.linux.vfs.visible_pid(p.tgid) as u64)),
             178 => Ok(Some(p.linux.vfs.visible_pid(pid) as u64)),

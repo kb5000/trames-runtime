@@ -46,7 +46,7 @@ pub use mempolicy::TaskMemoryPolicy;
 mod memory_sync;
 mod process_memory;
 pub use memory_queries::{memory_query, memory_query_entry};
-pub use process_memory::process_vm_local;
+pub use process_memory::{process_vm_local, process_vm_transfer};
 mod path_queries;
 mod render;
 pub use heap::ProgramBreak;
