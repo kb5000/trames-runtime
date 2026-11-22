@@ -236,6 +236,9 @@ impl Gateway {
                 let Ok(native) = self.native.socket(family, 1, 6) else {
                     return false;
                 };
+                if native.set_option(1, 10, 1).is_err() {
+                    return false;
+                }
                 match native.connect(actual) {
                     Ok(()) | Err(NetError(115)) => {}
                     Err(e) => {
@@ -304,6 +307,7 @@ impl Gateway {
             window_scale: None,
             max_seg_size: None,
             sack_permitted: false,
+            urgent_pointer: None,
             sack_ranges: [None; 3],
             timestamp: None,
             payload: &[],
@@ -387,6 +391,9 @@ impl Gateway {
                         Ok(pair) => pair,
                         Err(_) => break,
                     };
+                    if native.set_option(1, 10, 1).is_err() {
+                        continue;
+                    }
                     let local = SocketAddr::new(
                         if port.guest.is_ipv4() {
                             v4(1).into()
@@ -560,8 +567,17 @@ impl Gateway {
                 continue;
             }
             if t.can_recv() {
-                let data = t.peek(t.recv_queue().min(BUFFER)).unwrap();
-                match flow.native.send(data, 0, None) {
+                let mark = t.urgent_offset();
+                let limit = match mark {
+                    Some(0) => 1,
+                    Some(n) => n,
+                    None => BUFFER,
+                };
+                let data = t.peek(t.recv_queue().min(BUFFER).min(limit)).unwrap();
+                match flow
+                    .native
+                    .send(data, if mark == Some(0) { MSG_OOB } else { 0 }, None)
+                {
                     Ok(n) => {
                         let _ = t.recv(|_| (n, ()));
                         flow.last = Instant::now();
@@ -580,7 +596,15 @@ impl Gateway {
             }
             let room = t.send_capacity() - t.send_queue();
             if !flow.native_eof && t.may_send() && room > 0 {
-                match flow.native.recv(room.min(BUFFER), 0) {
+                // The native endpoint reads urgent bytes inline. A normal read
+                // before a pending mark stops at it; relay the marked byte alone.
+                let events = flow.native.poll(1).unwrap_or(8);
+                if events == 0 {
+                    continue;
+                }
+                let at_mark = flow.native.at_mark().unwrap_or(false);
+                let count = if at_mark { 1 } else { room.min(BUFFER) };
+                match flow.native.recv(count, 0) {
                     Ok(r) => {
                         if r.data.is_empty() {
                             flow.native_eof = true;
@@ -588,6 +612,9 @@ impl Gateway {
                         } else {
                             let n = t.send_slice(&r.data).unwrap_or(0);
                             debug_assert_eq!(n, r.data.len());
+                            if at_mark && n != 0 {
+                                t.mark_last_sent_urgent();
+                            }
                             flow.last = Instant::now();
                         }
                     }
@@ -769,8 +796,11 @@ impl Gateway {
         for f in &self.tcp {
             let events = if let Some(h) = f.handle {
                 let t = self.node.sockets.get::<tcp::Socket>(h);
-                u16::from(!f.native_eof && t.may_send() && t.send_queue() < t.send_capacity())
-                    | if t.can_recv() { 4 } else { 0 }
+                (if !f.native_eof && t.may_send() && t.send_queue() < t.send_capacity() {
+                    1
+                } else {
+                    0
+                }) | if t.can_recv() { 4 } else { 0 }
             } else {
                 4
             };

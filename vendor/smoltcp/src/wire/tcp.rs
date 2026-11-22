@@ -818,6 +818,7 @@ pub struct Repr<'a> {
     pub window_scale: Option<u8>,
     pub max_seg_size: Option<u16>,
     pub sack_permitted: bool,
+    pub urgent_pointer: Option<u16>,
     pub sack_ranges: [Option<(u32, u32)>; 3],
     pub timestamp: Option<TcpTimestampRepr>,
     pub payload: &'a [u8],
@@ -879,10 +880,6 @@ impl<'a> Repr<'a> {
             false => None,
         };
         // The PSH flag is ignored.
-        // The URG flag and the urgent field is ignored. This behavior is standards-compliant,
-        // however, most deployed systems (e.g. Linux) are *not* standards-compliant, and would
-        // cut the byte at the urgent pointer from the stream.
-
         let mut max_seg_size = None;
         let mut window_scale = None;
         let mut options = packet.options();
@@ -933,6 +930,7 @@ impl<'a> Repr<'a> {
             window_scale: window_scale,
             max_seg_size: max_seg_size,
             sack_permitted: sack_permitted,
+            urgent_pointer: packet.urg().then(|| packet.urgent_at()),
             sack_ranges: sack_ranges,
             timestamp: timestamp,
             payload: packet.payload(),
@@ -1031,7 +1029,8 @@ impl<'a> Repr<'a> {
                 TcpOption::EndOfList.emit(options);
             }
         }
-        packet.set_urgent_at(0);
+        packet.set_urg(self.urgent_pointer.is_some());
+        packet.set_urgent_at(self.urgent_pointer.unwrap_or(0));
         packet.payload_mut()[..self.payload.len()].copy_from_slice(self.payload);
 
         if checksum_caps.tcp.tx() {
@@ -1283,6 +1282,7 @@ mod test {
             control: Control::Syn,
             max_seg_size: None,
             sack_permitted: false,
+            urgent_pointer: None,
             sack_ranges: [None, None, None],
             timestamp: None,
             payload: &PAYLOAD_BYTES,

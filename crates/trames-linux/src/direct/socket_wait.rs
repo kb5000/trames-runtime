@@ -144,6 +144,10 @@ impl RetainedSocket {
     pub fn events(&self) -> u16 {
         if matches!(self.number, 64 | 66 | 203 | 206 | 211 | 269 | 287) {
             4
+        } else if matches!(self.number, 207 | 212 | 243)
+            && socket_flags(self.number, self.args) & trames_net::MSG_OOB != 0
+        {
+            2
         } else {
             1
         }
@@ -560,7 +564,7 @@ impl DirectSyscalls {
         pending._subscriptions = vec![socket.subscribe_changes(&pending.signal)];
         pending
             ._subscriptions
-            .extend(socket.subscribe_io_ready(&pending.signal, call.events() == 1));
+            .extend(socket.subscribe_io_ready(&pending.signal, call.events() != 4));
         let (fds, delay) = socket.wait_sources()?;
         let mut subscriptions = Vec::new();
         for fd in fds {

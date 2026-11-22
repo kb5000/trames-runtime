@@ -716,6 +716,13 @@ impl Linux {
         let request = a[1] as u32;
         if vfs.local_socket(a[0] as u32)?.is_none() {
             let socket = vfs.socket_fd(a[0] as u32)?;
+            if request == 0x8905 {
+                let marked = socket.at_mark().map_err(net)?;
+                memory
+                    .write_array(a[2], i32::from(marked).to_le_bytes())
+                    .map_err(|_| Errno(14))?;
+                return Ok(0);
+            }
             if matches!(request, 0x8906 | 0x8907 | 0x80108906 | 0x80108907) {
                 let ns = socket.last_packet_ns().map_err(net)?;
                 memory

@@ -783,6 +783,9 @@ fn native_root_input_and_output_policy_enforces_real_socket_io() {
     receiver
         .send(b"marked", 0, Some(peer.local_addr().unwrap()))
         .unwrap();
+    peer.set_nonblocking(false).unwrap();
+    peer.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
     let mut bytes = [0; 6];
     assert_eq!(peer.recv(&mut bytes).unwrap(), 6);
     assert_eq!(&bytes, b"marked");

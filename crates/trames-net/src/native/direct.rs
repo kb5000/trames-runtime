@@ -62,7 +62,50 @@ pub(super) fn send_connected(socket: &NativeSocket, bytes: &[u8]) -> Result<usiz
         .send_with_flags(bytes, send_flags())
         .map_err(from_io)
 }
-pub(super) fn read_tcp(socket: &TcpStream, data: &mut [u8], flags: u32) -> Result<usize> {
+pub(super) fn read_tcp(
+    endpoint: &Endpoint,
+    socket: &TcpStream,
+    data: &mut [u8],
+    flags: u32,
+) -> Result<usize> {
+    #[cfg(target_vendor = "apple")]
+    {
+        let cursor = if flags & MSG_OOB != 0 {
+            Some(endpoint.urgent_cursor.get_or_init(Default::default))
+        } else {
+            endpoint.urgent_cursor.get()
+        };
+        if let Some(cursor) = cursor {
+            return cursor.lock().unwrap().read(endpoint, socket, data, flags);
+        }
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    let _ = endpoint;
+    host_read(socket, data, flags)
+}
+pub(super) fn host_read(socket: &TcpStream, data: &mut [u8], flags: u32) -> Result<usize> {
+    if flags & MSG_OOB != 0 {
+        let native_flags = libc::MSG_OOB
+            | if flags & MSG_PEEK != 0 {
+                libc::MSG_PEEK
+            } else {
+                0
+            };
+        // SAFETY: recv only fills the supplied mutable slice and retains no pointer.
+        let n = unsafe {
+            libc::recv(
+                socket.as_raw_fd(),
+                data.as_mut_ptr().cast(),
+                data.len(),
+                native_flags,
+            )
+        };
+        return if n < 0 {
+            Err(from_io(std::io::Error::last_os_error()))
+        } else {
+            Ok(n as usize)
+        };
+    }
     if flags & MSG_PEEK != 0 {
         socket.peek(data)
     } else {
@@ -163,7 +206,7 @@ impl DirectTcp {
     }
     pub fn send(&self, bytes: &[u8], flags: u32) -> Result<usize> {
         let socket = self.socket.upgrade().ok_or(NetError(9))?;
-        if socket.filtered() {
+        if flags & MSG_OOB != 0 || socket.filtered() {
             return socket.send(bytes, flags, None);
         }
         if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL) != 0 {
@@ -181,7 +224,7 @@ impl DirectTcp {
     pub fn recv(&self, count: usize, flags: u32) -> Result<Vec<u8>> {
         let flags = flags & !MSG_NOSIGNAL;
         let socket = self.socket.upgrade().ok_or(NetError(9))?;
-        if socket.filtered() {
+        if flags & MSG_OOB != 0 || socket.filtered() {
             return socket.recv(count, flags).map(|r| r.data);
         }
         if flags & !(MSG_PEEK | MSG_DONTWAIT) != 0 {
@@ -197,7 +240,7 @@ impl DirectTcp {
             return Ok(Vec::new());
         }
         let mut data = vec![0; count];
-        let n = read_tcp(tcp, &mut data, flags)?;
+        let n = read_tcp(&socket.native, tcp, &mut data, flags)?;
         data.truncate(n);
         if flags & MSG_PEEK == 0 && n != 0 {
             self.links.account(Some(self.peer.ip()), n, false);
@@ -225,6 +268,25 @@ mod tests {
             Connection::Connected,
         );
         (network, socket, peer)
+    }
+    #[test]
+    fn native_priority_is_level_triggered_until_the_urgent_byte_is_read() {
+        let (_network, receiver, mut sender) = pair();
+        sender.write_all(b"pre").unwrap();
+        assert_eq!(receiver.poll(2).unwrap(), 0);
+        assert_eq!(SockRef::from(&sender).send_out_of_band(b"!").unwrap(), 1);
+        let end = Instant::now() + Duration::from_secs(2);
+        while receiver.poll(2).unwrap() == 0 {
+            assert!(Instant::now() < end);
+            std::thread::yield_now();
+        }
+        assert_eq!(receiver.poll(2).unwrap(), 2);
+        assert_eq!(receiver.recv(8, 0).unwrap().data, b"pre");
+        assert!(receiver.at_mark().unwrap());
+        assert_eq!(receiver.recv(1, MSG_PEEK | MSG_OOB).unwrap().data, b"!");
+        assert_eq!(receiver.poll(2).unwrap(), 2);
+        assert_eq!(receiver.recv(1, MSG_OOB).unwrap().data, b"!");
+        assert_eq!(receiver.poll(2).unwrap(), 0);
     }
     #[test]
     fn event_queue_lease_preserves_edges_without_retaining_socket_or_quota() {

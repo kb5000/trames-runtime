@@ -629,6 +629,13 @@ impl Socket {
         }
         self.native()?.datagram_readable_bytes()
     }
+    pub fn at_mark(&self) -> Result<bool> {
+        if self.path.get() == Path::Guest {
+            self.guest()?.at_mark()
+        } else {
+            self.native()?.at_mark()
+        }
+    }
     pub fn tcp_readable_bytes(&self) -> Result<usize> {
         if self.path.get() == Path::Guest {
             self.guest()?.tcp_readable_bytes()

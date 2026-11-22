@@ -8,6 +8,10 @@ pub(super) struct Endpoint {
     // Drop the observer before the watched descriptor, then return its quota.
     // This entire lifetime can end on the executing worker.
     events: Mutex<Option<edge::Events>>,
+    #[cfg(target_vendor = "apple")]
+    urgent: std::sync::OnceLock<std::os::fd::OwnedFd>,
+    #[cfg(target_vendor = "apple")]
+    pub(super) urgent_cursor: std::sync::OnceLock<Mutex<urgent::Cursor>>,
     pub(super) socket: NativeSocket,
     pub(super) state: state::State,
     pub(super) completion: Mutex<()>,
@@ -15,6 +19,14 @@ pub(super) struct Endpoint {
     _reservation: Reservation,
 }
 impl Endpoint {
+    #[cfg(target_vendor = "apple")]
+    pub(super) fn urgent_fd(&self) -> io::Result<std::os::fd::BorrowedFd<'_>> {
+        if let Some(fd) = self.urgent.get() {
+            return Ok(fd.as_fd());
+        }
+        let fd = edge::urgent_queue(self.as_fd())?;
+        Ok(self.urgent.get_or_init(|| fd).as_fd())
+    }
     pub(super) fn poll_event_fd(&self) -> io::Result<std::os::fd::OwnedFd> {
         let mut events = self.events.lock().unwrap();
         if events.is_none() {
@@ -25,6 +37,16 @@ impl Endpoint {
         }
         events.as_ref().unwrap().duplicate()
     }
+    pub(super) fn host_at_mark(&self) -> Result<bool> {
+        unsafe extern "C" {
+            fn sockatmark(fd: libc::c_int) -> libc::c_int;
+        }
+        // SAFETY: POSIX sockatmark queries our live socket.
+        match unsafe { sockatmark(self.as_fd().as_raw_fd()) } {
+            -1 => Err(from_io(io::Error::last_os_error())),
+            n => Ok(n != 0),
+        }
+    }
     pub(super) fn new(
         native: RawNativeSocket,
         kind: u32,
@@ -33,6 +55,10 @@ impl Endpoint {
     ) -> Arc<Self> {
         Arc::new(Self {
             events: Mutex::default(),
+            #[cfg(target_vendor = "apple")]
+            urgent: Default::default(),
+            #[cfg(target_vendor = "apple")]
+            urgent_cursor: Default::default(),
             state: state::State::new(connection),
             completion: Mutex::default(),
             keepalive: Mutex::default(),

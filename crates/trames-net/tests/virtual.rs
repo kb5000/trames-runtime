@@ -464,3 +464,71 @@ fn system_resolver_worker_returns_bounded_dns_wire_answer() {
     assert_eq!(r.data[7], 1);
     assert!(r.data.ends_with(&[127, 0, 0, 1]));
 }
+
+#[test]
+fn tcp_gateway_preserves_urgent_data_in_both_directions() {
+    use std::io::{Read, Write};
+    use trames_net::MSG_OOB;
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let host = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.set_nodelay(true).unwrap();
+        let mut prefix = [0; 3];
+        stream.read_exact(&mut prefix).unwrap();
+        assert_eq!(&prefix, b"req");
+
+        let mut byte = [std::mem::MaybeUninit::<u8>::uninit()];
+        // The urgent indication may follow the prefix in a separate segment.
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            match socket2::SockRef::from(&stream).recv_out_of_band(&mut byte) {
+                Ok(1) => break,
+                Err(err)
+                    if matches!(
+                        err.raw_os_error(),
+                        Some(nix::libc::EINVAL) | Some(nix::libc::EWOULDBLOCK)
+                    ) && Instant::now() < end =>
+                {
+                    std::thread::yield_now()
+                }
+                result => panic!("urgent byte: {result:?}"),
+            }
+        }
+        // SAFETY: recv_out_of_band initialized exactly one byte.
+        assert_eq!(unsafe { byte[0].assume_init() }, b'!');
+        stream.read_exact(&mut prefix[..1]).unwrap();
+        assert_eq!(prefix[0], b'.');
+        stream.write_all(b"rep").unwrap();
+        assert_eq!(
+            socket2::SockRef::from(&stream)
+                .send_out_of_band(b"?")
+                .unwrap(),
+            1
+        );
+        stream.write_all(b".").unwrap();
+    });
+
+    let fabric = Fabric::new().unwrap();
+    let n = net(&fabric, 2);
+    let vip = "198.18.0.1".parse().unwrap();
+    fabric
+        .map_host_ip(vip, "127.0.0.1".parse().unwrap())
+        .unwrap();
+    let client = socket(&n, false, true);
+    connect(&client, SocketAddr::new(vip, port));
+    client.set_option(6, 1, 1).unwrap();
+    assert_eq!(client.send(b"req!", MSG_OOB, None), Ok(4));
+    assert_eq!(client.send(b".", 0, None), Ok(1));
+    until(&client, || match client.poll(2)? & 2 {
+        0 => Err(NetError(11)),
+        _ => Ok(()),
+    });
+    assert_eq!(client.recv(1, MSG_OOB).unwrap().data, b"?");
+    assert_eq!(client.recv(16, 0).unwrap().data, b"rep");
+    assert_eq!(until(&client, || client.recv(16, 0)).data, b".");
+    host.join().unwrap();
+}

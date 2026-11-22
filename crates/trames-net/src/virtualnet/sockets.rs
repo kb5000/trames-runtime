@@ -817,6 +817,7 @@ impl Socket {
             linger_closing: false,
             receive_inq: state.receive_inq,
             receive_low_water: state.receive_low_water,
+            oob_inline: state.oob_inline,
             no_check: state.no_check,
             timestamp_option: state.timestamp_option,
             last_packet_ns: None,
@@ -1195,7 +1196,9 @@ impl Socket {
         if control != Default::default() && self.kind != 2 && !self.raw_transport() {
             return Err(NetError(95));
         }
-        if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL) != 0 {
+        if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL | MSG_OOB) != 0
+            || flags & MSG_OOB != 0 && self.kind != 1
+        {
             return Err(NetError(95));
         }
         if bytes.len() > MAX_TRANSFER {
@@ -1379,6 +1382,9 @@ impl Socket {
             return Err(NetError(s.take_failure().map_or(32, tcp_errno)));
         }
         let count = s.send_slice(bytes).map_err(|_| NetError(32))?;
+        if flags & MSG_OOB != 0 && count != 0 {
+            s.mark_last_sent_urgent();
+        }
         n.dirty |= count != 0;
         drop(state);
         i.tick();
@@ -1408,7 +1414,9 @@ impl Socket {
             result.address = result.address.map(|a| self.presented(a));
             return Ok(result);
         }
-        if flags & !(MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT) != 0 {
+        if flags & !(MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT | MSG_OOB) != 0
+            || flags & MSG_OOB != 0 && self.kind != 1
+        {
             return Err(NetError(95));
         }
         if count > MAX_TRANSFER {
@@ -1494,7 +1502,40 @@ impl Socket {
         let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
         if self.kind == 1 {
             let s = n.sockets.get_mut::<tcp::Socket>(state.handles[0]);
-            if count == 0 || !s.can_recv() {
+            let mark = s.urgent_offset();
+            let peek = flags & MSG_PEEK != 0;
+            if flags & MSG_OOB != 0 {
+                if state.oob_inline || mark.is_none() || s.urgent_consumed() {
+                    return Err(NetError(22));
+                }
+                let byte = s.urgent_byte(peek).ok_or(NetError(11))?;
+                let length = count.min(1);
+                return Ok(Received {
+                    stream_minimum: 0,
+                    packet_address: None,
+                    netlink_address: None,
+                    credentials: None,
+                    ip: Default::default(),
+                    packet_info: None,
+                    data: if length != 0 && flags & MSG_TRUNC == 0 {
+                        vec![byte]
+                    } else {
+                        Vec::new()
+                    },
+                    address: None,
+                    length,
+                    truncated: false,
+                });
+            }
+            // A normal read stops before the mark. Starting at it includes
+            // the byte inline or skips it, without advancing a peeking reader.
+            let skip = mark == Some(0) && !state.oob_inline && s.can_recv();
+            if skip && !peek && count != 0 {
+                s.discard_received(1).map_err(|_| NetError(11))?;
+            }
+            let skip_peek = skip && peek;
+            let readable = s.recv_queue().saturating_sub(usize::from(skip_peek));
+            if count == 0 || readable == 0 {
                 if count != 0 {
                     if let Some(failure) = s.take_failure() {
                         return Err(NetError(tcp_errno(failure)));
@@ -1519,7 +1560,9 @@ impl Socket {
                     truncated: false,
                 });
             }
-            let available = count.min(s.recv_queue());
+            let available = count
+                .min(readable)
+                .min(mark.filter(|offset| *offset != 0).unwrap_or(usize::MAX));
             let timestamp = if state.timestamp_option != 0 {
                 s.receive_timestamp(available)
                     .map(|ns| (state.timestamp_option, ns))
@@ -1535,7 +1578,9 @@ impl Socket {
                 (Vec::new(), size)
             } else {
                 let mut bytes = vec![0; available];
-                let size = if flags & MSG_PEEK != 0 {
+                let size = if skip_peek {
+                    Ok(s.peek_after_urgent(&mut bytes))
+                } else if peek {
                     s.peek_slice(&mut bytes)
                 } else {
                     s.recv_slice(&mut bytes)
@@ -1544,7 +1589,8 @@ impl Socket {
                 bytes.truncate(size);
                 (bytes, size)
             };
-            let stream_minimum = if state.read_closed
+            let stream_minimum = if mark == Some(available)
+                || state.read_closed
                 || !matches!(
                     s.state(),
                     tcp::State::Established | tcp::State::FinWait1 | tcp::State::FinWait2
@@ -1742,7 +1788,13 @@ impl Socket {
                     }
                 } else if state.connection == Connection::Connected {
                     let threshold = (state.receive_low_water as usize).min(state.receive_buffer);
-                    if s.recv_queue() >= threshold
+                    if s.urgent_pending() {
+                        ready |= 2;
+                    }
+                    let normal_bytes = s.recv_queue().saturating_sub(usize::from(
+                        !state.oob_inline && s.urgent_offset() == Some(0),
+                    ));
+                    if normal_bytes >= threshold
                         || !matches!(
                             s.state(),
                             tcp::State::Established | tcp::State::FinWait1 | tcp::State::FinWait2
@@ -1937,6 +1989,7 @@ impl Socket {
             (1, 29 | 35 | 63 | 64) if matches!(self.kind, 1 | 2) => {
                 state.timestamp_option = if value == 0 { 0 } else { name };
             }
+            (1, 10) => state.oob_inline = value != 0,
             (1, 11) if matches!(self.kind, 1 | 2) => state.no_check = value != 0,
             (1, 16) => return Err(NetError(95)),
             (1, 18) if matches!(self.kind, 1 | 2) => {
@@ -2139,7 +2192,11 @@ impl Socket {
                     (6, 18) => s.set_user_timeout((state.user_timeout_ms != 0).then(|| {
                         smoltcp::time::Duration::from_millis(state.user_timeout_ms.into())
                     })),
-                    (6, 2) => s.set_max_segment(state.max_segment),
+                    // TCP_MAXSEG configures the next handshake. An established
+                    // socket keeps the negotiated MSS, including its option allowance.
+                    (6, 2) if matches!(s.state(), tcp::State::Closed | tcp::State::Listen) => {
+                        s.set_max_segment(state.max_segment)
+                    }
                     (6, 3) => s.set_cork(state.cork),
                     (6, 12) => s.set_quick_ack(state.quick_ack),
                     (1, 9) | (6, 4) => s.set_keep_alive(
@@ -2188,6 +2245,16 @@ impl Socket {
             .iter()
             .find_map(|h| node.sockets.get::<udp::Socket>(*h).next_datagram_len(peer)))
     }
+    pub fn at_mark(&self) -> Result<bool> {
+        let mut fabric = self.network.0.fabric.0.borrow_mut();
+        fabric.tick();
+        let state = self.state.borrow();
+        let node = fabric.nodes.get(&self.network.0.key).ok_or(NetError(100))?;
+        Ok(state
+            .handles
+            .first()
+            .is_some_and(|h| node.sockets.get::<tcp::Socket>(*h).urgent_offset() == Some(0)))
+    }
     pub fn tcp_readable_bytes(&self) -> Result<usize> {
         let mut fabric = self.network.0.fabric.0.borrow_mut();
         fabric.tick();
@@ -2196,10 +2263,15 @@ impl Socket {
             return Err(NetError(22));
         }
         let node = fabric.nodes.get(&self.network.0.key).ok_or(NetError(100))?;
-        Ok(state
-            .handles
-            .first()
-            .map_or(0, |h| node.sockets.get::<tcp::Socket>(*h).recv_queue()))
+        Ok(state.handles.first().map_or(0, |h| {
+            let s = node.sockets.get::<tcp::Socket>(*h);
+            let len = s.recv_queue();
+            match s.urgent_offset() {
+                Some(0) if !state.oob_inline => len.saturating_sub(1),
+                Some(offset) if offset != 0 => len.min(offset),
+                _ => len,
+            }
+        }))
     }
     pub fn tcp_info(&self) -> Result<[u8; 104]> {
         if self.kind != 1 {
@@ -2352,6 +2424,7 @@ impl Socket {
             }
             (1, 11) if matches!(self.kind, 1 | 2) => Ok(i32::from(state.no_check)),
             (1, 16) => Err(NetError(95)),
+            (1, 10) => Ok(i32::from(state.oob_inline)),
             (1, 18) if matches!(self.kind, 1 | 2) => Ok(state.receive_low_water),
             (1, 9) => Ok(i32::from(state.keepalive)),
             (1, 6) => Ok(i32::from(state.broadcast)),

@@ -15,7 +15,7 @@ mod sockets;
 mod udp_errors;
 use super::native::{
     self, NetError, NetworkMode, Received, MAX_BUFFER, MAX_TRANSFER, MSG_DONTWAIT, MSG_NOSIGNAL,
-    MSG_PEEK, MSG_TRUNC,
+    MSG_OOB, MSG_PEEK, MSG_TRUNC,
 };
 use crate::ethernet::PacketType;
 use packet::{Port, Tuple};
@@ -322,6 +322,7 @@ struct State {
     linger_closing: bool,
     receive_inq: bool,
     receive_low_water: i32,
+    oob_inline: bool,
     no_check: bool,
     timestamp_option: u32,
     last_packet_ns: Option<u64>,
@@ -1990,6 +1991,7 @@ impl Network {
                 linger_closing: false,
                 receive_inq: false,
                 receive_low_water: 1,
+                oob_inline: false,
                 no_check: false,
                 timestamp_option: 0,
                 last_packet_ns: None,
@@ -2901,6 +2903,48 @@ mod shared_lifetime_tests {
             std::thread::yield_now();
         }
         assert_eq!(client.send(b"x", 0, None), Ok(1));
+    }
+
+    #[test]
+    fn tcp_urgent_byte_survives_wire_and_preserves_read_boundaries() {
+        for addr in ["127.0.0.1:34285", "[::1]:34285"] {
+            for inline in [false, true] {
+                let fabric = Fabric::new().unwrap();
+                let net = fabric.environment(2, NetworkMode::Full).unwrap();
+                let addr: SocketAddr = addr.parse().unwrap();
+                let family = if addr.is_ipv4() { 2 } else { 10 };
+                let listener = net.socket(family, 1, 0).unwrap();
+                listener.set_option(1, 10, i32::from(inline)).unwrap();
+                listener.bind(addr).unwrap();
+                listener.listen(1).unwrap();
+                let client = net.socket(family, 1, 0).unwrap();
+                assert_eq!(client.connect(addr), Err(NetError(115)));
+                let (peer, _) = listener.accept().unwrap();
+                assert_eq!(peer.get_option(1, 10), Ok(i32::from(inline)));
+                client.set_option(6, 1, 1).unwrap();
+                client.send(b"ab", MSG_OOB, None).unwrap();
+                client.send(b"cd!", MSG_OOB, None).unwrap();
+                client.send(b"tail", 0, None).unwrap();
+                assert_eq!(peer.poll(2).unwrap(), 2);
+                assert_eq!(peer.recv(64, MSG_PEEK).unwrap().data, b"abcd");
+                assert_eq!(peer.tcp_readable_bytes(), Ok(4));
+                assert_eq!(peer.recv(64, 0).unwrap().data, b"abcd");
+                assert!(peer.at_mark().unwrap());
+                if inline {
+                    assert!(matches!(peer.recv(1, MSG_OOB), Err(NetError(22))));
+                    assert_eq!(peer.recv(1, 0).unwrap().data, b"!");
+                } else {
+                    assert_eq!(peer.recv(1, MSG_OOB | MSG_PEEK).unwrap().data, b"!");
+                    assert_eq!(peer.recv(1, MSG_OOB).unwrap().data, b"!");
+                    assert_eq!(peer.poll(2).unwrap(), 0);
+                    assert!(matches!(peer.recv(1, MSG_OOB), Err(NetError(22))));
+                }
+                assert_eq!(peer.recv(8, MSG_PEEK).unwrap().data, b"tail");
+                assert_eq!(peer.recv(8, 0).unwrap().data, b"tail");
+                assert!(!peer.at_mark().unwrap());
+                assert_eq!(peer.poll(2).unwrap(), 0);
+            }
+        }
     }
 
     #[test]

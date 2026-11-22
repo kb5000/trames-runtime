@@ -458,7 +458,8 @@ impl Prepared {
                     memory
                         .write(output.header + 40, &(count as u64).to_le_bytes())
                         .map_err(|_| Errno(14))?;
-                    let flags = (if received.truncated { MSG_TRUNC } else { 0 })
+                    let flags = (flags & trames_net::MSG_OOB)
+                        | (if received.truncated { MSG_TRUNC } else { 0 })
                         | if ip.error.is_some() {
                             trames_net::MSG_ERRQUEUE
                         } else {

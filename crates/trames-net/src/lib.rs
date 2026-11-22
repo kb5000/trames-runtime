@@ -25,8 +25,8 @@ mod virtualnet;
 use crate::shared_state::Cell;
 pub use native::{
     decode_address, encode_address, DirectControl, DirectTcp, NetError, NetworkMode, Received,
-    TcpLease, TcpPoll, MAX_BUFFER, MAX_SOCKETS, MAX_TRANSFER, MSG_DONTWAIT, MSG_NOSIGNAL, MSG_PEEK,
-    MSG_TRUNC,
+    TcpLease, TcpPoll, MAX_BUFFER, MAX_SOCKETS, MAX_TRANSFER, MSG_DONTWAIT, MSG_NOSIGNAL, MSG_OOB,
+    MSG_PEEK, MSG_TRUNC,
 };
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 pub use virtualnet::{Fabric, LinkStats, NetworkInfo, NetworkStats, WireWait};
@@ -913,6 +913,17 @@ impl Socket {
         }?;
         info.namespace_id = self.namespace.id();
         Some(info)
+    }
+    pub fn at_mark(&self) -> Result<bool> {
+        if self.kind != 1 {
+            return Err(NetError(25));
+        }
+        match &self.backend {
+            SocketBackend::Native(s) => s.at_mark(),
+            SocketBackend::Virtual(s) => s.at_mark(),
+            SocketBackend::Hybrid(s) => s.at_mark(),
+            _ => Err(NetError(25)),
+        }
     }
     pub fn tcp_readable_bytes(&self) -> Result<Option<usize>> {
         if self.kind == 1 {

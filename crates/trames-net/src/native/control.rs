@@ -163,6 +163,7 @@ impl Endpoint {
             (41, 16) if family == 10 && (1..=255).contains(&value) => {
                 self.control().set_unicast_hops_v6(value as u32)
             }
+            (1, 10) => self.control().set_out_of_band_inline(value != 0),
             (1, 9) => {
                 let _keepalive = self.keepalive.lock().unwrap();
                 self.control().set_keepalive(value != 0)
@@ -220,6 +221,9 @@ impl Endpoint {
     pub(super) fn get_option(&self, family: u32, kind: u32, level: u32, name: u32) -> Result<i32> {
         match (level, name) {
             (1, 2) => Ok(i32::from(self.control().reuse_address().map_err(from_io)?)),
+            (1, 10) => Ok(i32::from(
+                self.control().out_of_band_inline().map_err(from_io)?,
+            )),
             (1, 9) => Ok(i32::from(self.control().keepalive().map_err(from_io)?)),
             (1, 7) => Ok(self.control().send_buffer_size().map_err(from_io)? as i32),
             (1, 8) => Ok(self.control().recv_buffer_size().map_err(from_io)? as i32),

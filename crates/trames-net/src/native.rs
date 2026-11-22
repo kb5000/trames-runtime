@@ -7,6 +7,8 @@ use nix::libc;
 mod control;
 mod direct;
 mod state;
+#[cfg(target_vendor = "apple")]
+mod urgent;
 pub use control::DirectControl;
 pub(crate) use control::SavedOptions;
 mod endpoint;
@@ -38,6 +40,7 @@ use std::{
 pub const MAX_SOCKETS: usize = 64;
 pub const MAX_BUFFER: usize = 256 * 1024;
 pub const MAX_TRANSFER: usize = 1024 * 1024;
+pub const MSG_OOB: u32 = 1;
 pub const MSG_PEEK: u32 = 2;
 pub const MSG_TRUNC: u32 = 0x20;
 pub const MSG_DONTWAIT: u32 = 0x40;
@@ -109,6 +112,15 @@ pub fn wait_with_fds(
             PollFd::new(socket.native.as_fd(), flags)
         })
         .collect();
+    #[cfg(target_vendor = "apple")]
+    for (socket, events) in &unique {
+        if events & 2 != 0 && socket.kind == 1 {
+            fds.push(PollFd::new(
+                socket.native.urgent_fd().map_err(from_io)?,
+                PollFlags::POLLIN,
+            ));
+        }
+    }
     fds.extend(extra.iter().map(|fd| PollFd::new(*fd, PollFlags::POLLIN)));
     fds.extend(
         notifications
@@ -626,6 +638,15 @@ impl Socket {
         }
         Ok(bytes.max(0) as usize)
     }
+    pub fn at_mark(&self) -> Result<bool> {
+        #[cfg(target_vendor = "apple")]
+        if let Some(cursor) = self.native.urgent_cursor.get() {
+            if cursor.lock().unwrap().marked() && !self.native.native_urgent_pending()? {
+                return Ok(true);
+            }
+        }
+        self.native.host_at_mark()
+    }
     pub fn tcp_readable_bytes(&self) -> Result<usize> {
         if self.native.state.connection() == Connection::Listening {
             return Err(NetError(22));
@@ -931,7 +952,9 @@ impl Socket {
         Ok(sent)
     }
     fn send_inner(&self, bytes: &[u8], flags: u32, address: Option<SocketAddr>) -> Result<usize> {
-        if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL) != 0 {
+        if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL | MSG_OOB) != 0
+            || flags & MSG_OOB != 0 && self.kind != 1
+        {
             return Err(NetError(95));
         }
         if bytes.len() > MAX_TRANSFER {
@@ -958,7 +981,12 @@ impl Socket {
         } else {
             None
         };
-        let result = if let Some(address) = address {
+        let result = if flags & MSG_OOB != 0 {
+            self.native
+                .control()
+                .send_with_flags(bytes, libc::MSG_OOB | direct::send_flags())
+                .map_err(from_io)
+        } else if let Some(address) = address {
             let address_native = self.address(address)?;
             self.network.destination(address)?;
             self.native
@@ -1042,7 +1070,9 @@ impl Socket {
             return Err(NetError(95));
         }
 
-        if flags & !(MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT) != 0 {
+        if flags & !(MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT | MSG_OOB) != 0
+            || flags & MSG_OOB != 0 && self.kind != 1
+        {
             return Err(NetError(95));
         }
         if self.kind == 1 && flags & MSG_TRUNC != 0 {
@@ -1121,7 +1151,7 @@ impl Socket {
         let mut original_destination = None;
         let (length, address) = match &self.native.socket {
             NativeSocket::Tcp(socket) => {
-                let length = direct::read_tcp(socket, &mut data, flags)?;
+                let length = direct::read_tcp(&self.native, socket, &mut data, flags)?;
                 (length, None)
             }
             NativeSocket::Udp(socket) => {

@@ -90,6 +90,17 @@ impl Endpoint {
             fds[0].revents().unwrap_or(PollFlags::empty())
         };
         let mut result = 0;
+        #[cfg(target_vendor = "apple")]
+        if events & 2 != 0
+            && matches!(self.socket, NativeSocket::Tcp(_))
+            && (self.native_urgent_pending()?
+                || self
+                    .urgent_cursor
+                    .get()
+                    .is_some_and(|c| c.lock().unwrap().pending()))
+        {
+            result |= 2;
+        }
         for (native, guest) in [
             (PollFlags::POLLIN, 1),
             (PollFlags::POLLPRI, 2),

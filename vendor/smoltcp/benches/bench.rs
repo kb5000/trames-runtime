@@ -36,6 +36,7 @@ mod wire {
             window_scale: None,
             max_seg_size: None,
             sack_permitted: false,
+            urgent_pointer: None,
             sack_ranges: [None, None, None],
             payload: &PAYLOAD_BYTES,
             timestamp: None,

@@ -1,6 +1,36 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Lazy host edge notifications for guest epoll. No guest FD enters the host API.
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+// Darwin poll does not return POLLPRI for TCP urgent data. Keep a level
+// exception filter only for endpoints with priority interest. The kqueue
+// itself can participate in the same wait as other descriptors.
+#[cfg(target_vendor = "apple")]
+pub(super) fn urgent_queue(socket: std::os::fd::BorrowedFd<'_>) -> std::io::Result<OwnedFd> {
+    use nix::libc;
+    let raw = unsafe { libc::kqueue() };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: kqueue returned a new descriptor; the watched socket is live.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    // SAFETY: F_SETFD sets descriptor flags on our owned queue.
+    if unsafe { libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let event = libc::kevent {
+        ident: socket.as_raw_fd() as usize,
+        filter: libc::EVFILT_EXCEPT,
+        flags: libc::EV_ADD,
+        fflags: libc::NOTE_OOB,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    // SAFETY: one change record and no output records.
+    if unsafe { libc::kevent(raw, &event, 1, std::ptr::null_mut(), 0, std::ptr::null()) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(fd)
+}
 pub(super) struct Events {
     fd: OwnedFd,
     epoch: [u64; 2],
@@ -22,6 +52,7 @@ impl Events {
             let fd = unsafe { OwnedFd::from_raw_fd(raw) };
             let mut event = nix::libc::epoll_event {
                 events: (nix::libc::EPOLLIN
+                    | nix::libc::EPOLLPRI
                     | nix::libc::EPOLLOUT
                     | nix::libc::EPOLLRDHUP
                     | nix::libc::EPOLLET) as u32,
@@ -46,7 +77,7 @@ impl Events {
                 nix::libc::kevent {
                     ident: socket as usize,
                     filter: nix::libc::EVFILT_READ,
-                    flags: nix::libc::EV_ADD | nix::libc::EV_CLEAR,
+                    flags: nix::libc::EV_ADD | nix::libc::EV_CLEAR | nix::libc::EV_OOBAND,
                     fflags: 0,
                     data: 0,
                     udata: std::ptr::null_mut(),
@@ -84,6 +115,7 @@ impl Events {
                 let flags = event.events;
                 if flags
                     & (nix::libc::EPOLLIN
+                        | nix::libc::EPOLLPRI
                         | nix::libc::EPOLLRDHUP
                         | nix::libc::EPOLLHUP
                         | nix::libc::EPOLLERR) as u32
