@@ -168,14 +168,18 @@ impl Track {
             11 => k.tuple.source.port().to_be_bytes().to_vec(),
             12 => k.tuple.destination.port().to_be_bytes().to_vec(),
             17 => self.zone.to_le_bytes().to_vec(),
-            8 | 19 | 21 => match k.tuple.source.ip() {
-                IpAddr::V4(v) => v.octets().to_vec(),
-                IpAddr::V6(v) => v.octets().to_vec(),
-            },
-            9 | 20 | 22 => match k.tuple.destination.ip() {
-                IpAddr::V4(v) => v.octets().to_vec(),
-                IpAddr::V6(v) => v.octets().to_vec(),
-            },
+            8 | 9 | 19..=22 => {
+                let ip = if matches!(key, 8 | 19 | 21) {
+                    k.tuple.source.ip()
+                } else {
+                    k.tuple.destination.ip()
+                };
+                match ip {
+                    IpAddr::V4(v) if !matches!(key, 21 | 22) => v.octets().to_vec(),
+                    IpAddr::V6(v) if !matches!(key, 19 | 20) => v.octets().to_vec(),
+                    _ => return None,
+                }
+            }
             23 => (self.id as u32).to_le_bytes().to_vec(),
             _ => return None,
         })

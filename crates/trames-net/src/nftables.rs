@@ -34,6 +34,15 @@ type Result<T> = std::result::Result<T, NetError>;
 #[path = "nft_conntrack.rs"]
 mod ctnetlink;
 const SUBSYSTEM: u16 = 10 << 8;
+const FIB_SADDR: u32 = 1;
+const FIB_DADDR: u32 = 2;
+const FIB_MARK: u32 = 4;
+const FIB_IIF: u32 = 8;
+const FIB_OIF: u32 = 16;
+const FIB_PRESENT: u32 = 32;
+const FIB_RESULT_OIF: u32 = 1;
+const FIB_RESULT_OIFNAME: u32 = 2;
+const FIB_RESULT_ADDRTYPE: u32 = 3;
 const MAX_BYTES: usize = 256 * 1024;
 type Attrs<'a> = Vec<(u16, &'a [u8])>;
 fn attrs(mut bytes: &[u8]) -> Result<Attrs<'_>> {
@@ -221,6 +230,13 @@ enum Expr {
         mask: Vec<u8>,
         xor: Vec<u8>,
     },
+    Shift {
+        src: usize,
+        dest: usize,
+        len: usize,
+        left: bool,
+        bits: u32,
+    },
     CtGet {
         dest: usize,
         key: u32,
@@ -231,6 +247,7 @@ enum Expr {
         key: u32,
     },
     Fib {
+        result: u32,
         dest: usize,
         flags: u32,
     },
@@ -355,7 +372,7 @@ fn expressions_in(bytes: &[u8], rule_family: u8) -> Result<Vec<Expr>> {
                 let a = fields(data, &[1, 2, 3])?;
                 let op = num(&a, 2)?;
                 if op > 5 {
-                    return Err(NetError(95));
+                    return Err(NetError(22));
                 }
                 let v = value(need(&a, 3)?)?;
                 let src = reg(num(&a, 1)?, v.len())?;
@@ -365,32 +382,63 @@ fn expressions_in(bytes: &[u8], rule_family: u8) -> Result<Vec<Expr>> {
                 Expr::Compare { src, op, value: v }
             }
             "bitwise" => {
-                let a = fields(data, &[1, 2, 3, 4, 5, 6])?;
-                if get(&a, 6).map(u32v).transpose()?.unwrap_or(0) != 0 {
-                    return Err(NetError(95));
-                }
+                let a = fields(data, &[1, 2, 3, 4, 5, 6, 7])?;
                 let len = num(&a, 3)? as usize;
                 let src = reg(num(&a, 1)?, len)?;
                 let dest = reg(num(&a, 2)?, len)?;
-                let mask = value(need(&a, 4)?)?;
-                let xor = value(need(&a, 5)?)?;
-                if mask.len() != len
-                    || xor.len() != len
-                    || initialized[src..src + len].contains(&false)
-                {
+                if initialized[src..src + len].contains(&false) {
                     return Err(NetError(22));
                 }
                 initialized[dest..dest + len].fill(true);
-                Expr::Bitwise {
-                    src,
-                    dest,
-                    mask,
-                    xor,
+                match get(&a, 6).map(u32v).transpose()?.unwrap_or(0) {
+                    0 => {
+                        let mask = value(need(&a, 4)?)?;
+                        let xor = value(need(&a, 5)?)?;
+                        if mask.len() != len || xor.len() != len || get(&a, 7).is_some() {
+                            return Err(NetError(22));
+                        }
+                        Expr::Bitwise {
+                            src,
+                            dest,
+                            mask,
+                            xor,
+                        }
+                    }
+                    op @ (1 | 2) => {
+                        if get(&a, 4).is_some() || get(&a, 5).is_some() {
+                            return Err(NetError(22));
+                        }
+                        let bytes = value(need(&a, 7)?)?;
+                        let bits = u32::from_le_bytes(bytes.try_into().map_err(|_| NetError(22))?);
+                        if bits >= 32 {
+                            return Err(NetError(22));
+                        }
+                        Expr::Shift {
+                            src,
+                            dest,
+                            len,
+                            left: op == 1,
+                            bits,
+                        }
+                    }
+                    _ => return Err(NetError(95)),
                 }
             }
             "ct" => {
                 let a = fields(data, &[1, 2, 3, 4])?;
                 let key = num(&a, 2)?;
+                if key > u8::MAX.into() {
+                    return Err(NetError(34));
+                }
+                if get(&a, 1).is_some() == get(&a, 4).is_some() {
+                    return Err(NetError(22));
+                }
+                let directed = get(&a, 3).is_some();
+                if matches!(key, 8 | 9 | 11 | 12 | 19..=22) && !directed
+                    || matches!(key, 0..=3 | 23) && directed
+                {
+                    return Err(NetError(22));
+                }
                 let len = match key {
                     0 | 2 | 3 | 19 | 20 | 23 => 4,
                     1 | 7 | 10 => 1,
@@ -406,7 +454,7 @@ fn expressions_in(bytes: &[u8], rule_family: u8) -> Result<Vec<Expr>> {
                     _ => return Err(NetError(95)),
                 };
                 if let Some(src) = get(&a, 4) {
-                    if get(&a, 1).is_some() || !matches!(key, 3 | 17) {
+                    if directed || !matches!(key, 3 | 17) {
                         return Err(NetError(95));
                     }
                     let src = reg(u32v(src)?, len)?;
@@ -436,13 +484,35 @@ fn expressions_in(bytes: &[u8], rule_family: u8) -> Result<Vec<Expr>> {
             }
             "fib" => {
                 let a = fields(data, &[1, 2, 3])?;
+                let register = num(&a, 1)?;
+                let result = num(&a, 2)?;
                 let flags = num(&a, 3)?;
-                if num(&a, 2)? != 3 || !matches!(flags, 1 | 2) {
+                if !matches!(result, 1..=3)
+                    || !matches!(flags & (FIB_SADDR | FIB_DADDR), FIB_SADDR | FIB_DADDR)
+                    || flags & !(FIB_SADDR | FIB_DADDR | FIB_IIF | FIB_OIF | FIB_MARK | FIB_PRESENT)
+                        != 0
+                    || flags & FIB_IIF != 0 && flags & FIB_OIF != 0
+                    || (result != FIB_RESULT_ADDRTYPE && flags & FIB_OIF != 0)
+                    || (result != FIB_RESULT_OIF && flags & FIB_PRESENT != 0)
+                {
+                    return Err(NetError(22));
+                }
+                // Socket marks currently select routes at socket send time.
+                // Per-packet marks are not carried through every packet hook.
+                if flags & FIB_MARK != 0 {
                     return Err(NetError(95));
                 }
-                let dest = reg(num(&a, 1)?, 4)?;
-                initialized[dest..dest + 4].fill(true);
-                Expr::Fib { dest, flags }
+                let len = if result == FIB_RESULT_OIFNAME { 16 } else { 4 };
+                if register == 0 {
+                    return Err(NetError(22));
+                }
+                let dest = reg(register, len).map_err(|_| NetError(34))?;
+                initialized[dest..dest + len].fill(true);
+                Expr::Fib {
+                    dest,
+                    result,
+                    flags,
+                }
             }
             "match" => {
                 let a = fields(data, &[1, 2, 3])?;
@@ -471,16 +541,26 @@ fn expressions_in(bytes: &[u8], rule_family: u8) -> Result<Vec<Expr>> {
                         info: b.to_vec(),
                     }
                 } else {
-                    if kind != "addrtype" || revision != 1 {
-                        return Err(NetError(95));
+                    if kind != "addrtype" || revision > 1 || revision == 0 && rule_family != 2 {
+                        return Err(NetError(2));
                     }
-                    if b.len() != 8 {
+                    if (revision == 0 && !matches!(b.len(), 12 | 16))
+                        || (revision == 1 && b.len() != 8)
+                    {
                         return Err(NetError(22));
                     }
                     let source = u16::from_le_bytes(b[..2].try_into().unwrap());
                     let destination = u16::from_le_bytes(b[2..4].try_into().unwrap());
-                    let flags = u32::from_le_bytes(b[4..].try_into().unwrap());
-                    if flags & !3 != 0 || (source | destination) & !0x2e != 0 {
+                    let word = u32::from_le_bytes(b[4..8].try_into().unwrap());
+                    let flags = if revision == 0 {
+                        u32::from(word != 0) | (u32::from(b[8..12] != [0; 4]) << 1)
+                    } else {
+                        word
+                    };
+                    if flags & 12 == 12 {
+                        return Err(NetError(22));
+                    }
+                    if flags & !15 != 0 || (source | destination) & !0x2e != 0 {
                         return Err(NetError(95));
                     }
                     Expr::AddrType {
@@ -840,6 +920,22 @@ impl Ruleset {
                             {
                                 return Err(NetError(95))
                             }
+                            Expr::AddrType { flags, .. }
+                                if (flags & 4 != 0 && hook >= 3)
+                                    || (flags & 8 != 0 && hook <= 1) =>
+                            {
+                                return Err(NetError(22))
+                            }
+                            Expr::Fib { result, flags, .. }
+                                if (*result != FIB_RESULT_ADDRTYPE
+                                    && hook != 0
+                                    && !(flags & FIB_IIF != 0 && matches!(hook, 1 | 2)))
+                                    || (*result == FIB_RESULT_ADDRTYPE
+                                        && ((flags & FIB_IIF != 0 && hook >= 3)
+                                            || (flags & FIB_OIF != 0 && hook < 2))) =>
+                            {
+                                return Err(NetError(95))
+                            }
                             Expr::Zone(_) | Expr::CtSet { key: 17, .. }
                                 if priority >= -200 || !matches!(hook, 0 | 3) =>
                             {
@@ -909,7 +1005,7 @@ impl Ruleset {
             let supported = match (n.as_str(), target) {
                 ("comment", 0) if revision != 0 => return Err(NetError(93)),
                 ("comment" | "tcp" | "udp" | "icmp" | "icmp6", 0) => revision == 0,
-                ("addrtype", 0) => revision == 1,
+                ("addrtype", 0) => revision == 1 || revision == 0 && r[16] == 2,
                 ("conntrack", 0) => revision <= 3,
                 ("MASQUERADE" | "SNAT" | "DNAT", 1) => revision <= 2,
                 ("CT", 1) => revision <= 1,
@@ -1512,12 +1608,10 @@ pub(crate) struct Context<'a> {
     pub hook: u32,
     pub input: u32,
     pub output: u32,
-    pub input_name: &'a [u8],
-    pub output_name: &'a [u8],
+    pub tuple: crate::virtualnet::packet::Tuple,
     pub track: Option<crate::conntrack::Track>,
-    pub source_type: u32,
-    pub destination_type: u32,
-    pub masquerade: Option<std::net::IpAddr>,
+    pub graph: &'a crate::netdev::Topology,
+    pub namespace: u64,
 }
 impl Context<'_> {
     fn family(&self) -> u8 {
@@ -1526,6 +1620,36 @@ impl Context<'_> {
         } else {
             10
         }
+    }
+    fn address(&self, source: bool) -> std::net::IpAddr {
+        if source {
+            self.tuple.source.ip()
+        } else {
+            self.tuple.destination.ip()
+        }
+    }
+    fn address_type(&self, source: bool, device: Option<u32>) -> u32 {
+        self.graph
+            .address_type(self.namespace, self.address(source), device)
+    }
+    fn masquerade(&self) -> Option<std::net::IpAddr> {
+        self.graph
+            .interface_address(self.namespace, self.output, self.family() == 2)
+    }
+    fn fib_output(&self, source: bool, device: Option<u32>) -> u32 {
+        if self.input == 1 && matches!(self.hook, 0 | 1) {
+            return self.input;
+        }
+        let addr = self.address(source);
+        if addr.is_ipv4() && self.graph.own(self.namespace, addr) {
+            return 0;
+        }
+        self.graph
+            .source(self.namespace, addr)
+            .ok()
+            .map(|(_, index, _)| index)
+            .filter(|index| device.is_none_or(|d| d == *index))
+            .unwrap_or(0)
     }
     fn transport(&self) -> Option<(usize, u8)> {
         let p = self.packet;
@@ -1574,11 +1698,11 @@ impl Context<'_> {
             4 => self.input.to_le_bytes().to_vec(),
             5 => self.output.to_le_bytes().to_vec(),
             6 | 7 => {
-                let name = if key == 6 {
-                    self.input_name
-                } else {
-                    self.output_name
-                };
+                let index = if key == 6 { self.input } else { self.output };
+                let name = self
+                    .graph
+                    .device_name(self.namespace, index)
+                    .unwrap_or_default();
                 let mut b = vec![0; 16];
                 let n = name.len().min(15);
                 b[..n].copy_from_slice(&name[..n]);
@@ -1664,37 +1788,15 @@ impl Ruleset {
             } else {
                 meta.output
             };
-            let name = |i| {
-                meta.graph
-                    .device(meta.namespace, i)
-                    .map(|d| d.name)
-                    .unwrap_or_default()
-            };
-            let src_type = meta.graph.address_type(meta.namespace, h.tuple.source.ip());
-            let dst_type = meta
-                .graph
-                .address_type(meta.namespace, h.tuple.destination.ip());
-            let masquerade = meta
-                .graph
-                .device(meta.namespace, output)
-                .ok()
-                .and_then(|d| {
-                    d.addresses
-                        .into_iter()
-                        .find(|a| a.ip.is_ipv4() == (family == 2))
-                })
-                .map(|a| a.ip);
             let ctx = Context {
                 packet,
                 hook: meta.hook,
                 input: meta.input,
                 output,
-                input_name: &name(meta.input),
-                output_name: &name(output),
+                tuple: h.tuple,
                 track: Some(*track),
-                source_type: src_type,
-                destination_type: dst_type,
-                masquerade,
+                graph: meta.graph,
+                namespace: meta.namespace,
             };
             let mut effects = Effects::default();
             let v = t.verdict(n, &ctx, &mut 8192, &mut effects);
@@ -1791,6 +1893,32 @@ impl Rule {
                         regs[*dest + i] = (saved[*src + i] & mask[i]) ^ xor[i];
                     }
                 }
+                Expr::Shift {
+                    src,
+                    dest,
+                    len,
+                    left,
+                    bits,
+                } => {
+                    // Each register word is native endian. Left shifts consume the
+                    // least significant word first, right shifts the most significant.
+                    let count = len.div_ceil(4);
+                    let mut carry = 0;
+                    for step in 0..count {
+                        let offset = 4 * if *left { count - 1 - step } else { step };
+                        let from = src + offset;
+                        let to = dest + offset;
+                        let word = u32::from_le_bytes(regs[from..from + 4].try_into().unwrap());
+                        let shifted = if *left { word << bits } else { word >> bits };
+                        regs[to..to + 4].copy_from_slice(&(shifted | carry).to_le_bytes());
+                        carry = if *left {
+                            word.checked_shr(32 - bits)
+                        } else {
+                            word.checked_shl(32 - bits)
+                        }
+                        .unwrap_or(0);
+                    }
+                }
                 Expr::Zone(zone) => effects.zone = Some(*zone),
                 Expr::FixedNat {
                     source,
@@ -1802,7 +1930,7 @@ impl Rule {
                         return Some((0, None));
                     }
                     let address = if *masquerade {
-                        ctx.masquerade
+                        ctx.masquerade()
                     } else {
                         *address
                     };
@@ -1897,26 +2025,63 @@ impl Rule {
                             Some(u32::from_le_bytes(regs[*src..*src + 4].try_into().unwrap()));
                     }
                 }
-                Expr::Fib { dest, flags } => {
-                    regs[*dest..*dest + 4].copy_from_slice(
-                        &(if *flags == 1 {
-                            ctx.source_type
+                Expr::Fib {
+                    dest,
+                    flags,
+                    result,
+                } => {
+                    let source = flags & FIB_SADDR != 0;
+                    let device = if flags & FIB_IIF != 0 {
+                        Some(ctx.input)
+                    } else if flags & FIB_OIF != 0 {
+                        Some(ctx.output)
+                    } else {
+                        None
+                    };
+                    if *result == FIB_RESULT_ADDRTYPE {
+                        regs[*dest..*dest + 4]
+                            .copy_from_slice(&ctx.address_type(source, device).to_le_bytes());
+                    } else {
+                        let index = ctx.fib_output(source, device);
+                        if *result == FIB_RESULT_OIF {
+                            let value = if flags & FIB_PRESENT != 0 {
+                                u32::from(index != 0)
+                            } else {
+                                index
+                            };
+                            regs[*dest..*dest + 4].copy_from_slice(&value.to_le_bytes());
                         } else {
-                            ctx.destination_type
-                        })
-                        .to_le_bytes(),
-                    );
+                            let output = &mut regs[*dest..*dest + 16];
+                            output.fill(0);
+                            if let Some(name) = ctx.graph.device_name(ctx.namespace, index) {
+                                let n = name.len().min(15);
+                                output[..n].copy_from_slice(&name[..n]);
+                            }
+                        }
+                    }
                 }
                 Expr::AddrType {
                     source,
                     destination,
                     flags,
                 } => {
-                    let test = |mask: u16, kind: u32, invert: bool| {
-                        mask == 0 || ((mask & (1 << kind) != 0) ^ invert)
+                    let test =
+                        |mask: u16, kind: u32, invert: bool| (mask & (1 << kind) != 0) ^ invert;
+                    let device = if flags & 4 != 0 {
+                        Some(ctx.input)
+                    } else if flags & 8 != 0 {
+                        Some(ctx.output)
+                    } else {
+                        None
                     };
-                    if !test(*source, ctx.source_type, *flags & 1 != 0)
-                        || !test(*destination, ctx.destination_type, *flags & 2 != 0)
+                    if (*source != 0
+                        && !test(*source, ctx.address_type(true, device), *flags & 1 != 0))
+                        || (*destination != 0
+                            && !test(
+                                *destination,
+                                ctx.address_type(false, device),
+                                *flags & 2 != 0,
+                            ))
                     {
                         return None;
                     }
@@ -1959,7 +2124,7 @@ impl Rule {
                     return Some((1, None));
                 }
                 Expr::Masquerade { port, port_max } => {
-                    let Some(address) = ctx.masquerade else {
+                    let Some(address) = ctx.masquerade() else {
                         return Some((0, None));
                     };
                     let port = port.map(|r| u16::from_be_bytes(regs[r..r + 2].try_into().unwrap()));

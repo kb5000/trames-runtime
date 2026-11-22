@@ -1256,13 +1256,36 @@ impl Topology {
         self.devices.range(range).any(|(_,d)| d.addresses.iter().any(|a|
             matches!(a.ip, IpAddr::V4(local) if a.prefix<=30 && u32::from(local) | u32::MAX.checked_shr(a.prefix.into()).unwrap_or(0)==u32::from(ip))))
     }
-    pub fn address_type(&self, id: u64, ip: IpAddr) -> u32 {
-        if self.own(id, ip) || ip.is_loopback() {
+    pub fn interface_address(&self, id: u64, index: u32, ipv4: bool) -> Option<IpAddr> {
+        self.devices
+            .get(&(id, index))?
+            .addresses
+            .iter()
+            .find(|a| a.ip.is_ipv4() == ipv4)
+            .map(|a| a.ip)
+    }
+    pub fn device_name(&self, id: u64, index: u32) -> Option<&[u8]> {
+        self.devices.get(&(id, index)).map(|d| d.name.as_slice())
+    }
+    pub fn address_type(&self, id: u64, ip: IpAddr, interface: Option<u32>) -> u32 {
+        if ip.is_multicast() {
+            return 5;
+        }
+        if let IpAddr::V4(v) = ip {
+            if v.is_broadcast() || self.directed_broadcast(id, interface, v) {
+                return 3;
+            }
+        }
+        let local = match interface {
+            Some(index) => self.devices.get(&(id, index)).is_some_and(|d| {
+                d.addresses.iter().any(|a| {
+                    a.ip == ip || (d.kind == DeviceKind::Loopback && ip.is_ipv4() && a.contains(ip))
+                })
+            }),
+            None => self.own(id, ip) || ip.is_loopback(),
+        };
+        if local {
             2
-        } else if ip.is_multicast() {
-            5
-        } else if matches!(ip,IpAddr::V4(v) if v.is_broadcast()) {
-            3
         } else {
             1
         }
