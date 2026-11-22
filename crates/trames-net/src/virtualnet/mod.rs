@@ -382,6 +382,22 @@ fn udp_socket() -> udp::Socket<'static> {
     udp_socket_with_buffers(BUFFER, BUFFER)
 }
 impl State {
+    /// A pending nonblocking result is consumed once by a repeated connect.
+    fn existing_tcp_connect(&mut self) -> Result<bool> {
+        match self.connection {
+            Connection::Connecting => Err(NetError(114)),
+            Connection::Connected if std::mem::take(&mut self.connect_result_pending) => Ok(true),
+            Connection::Connected => Err(NetError(106)),
+            Connection::Listening => Err(NetError(22)),
+            Connection::Failed(_) => {
+                self.connection = Connection::Idle;
+                self.connect_result_pending = false;
+                Err(NetError(self.error.take().unwrap_or(103)))
+            }
+            Connection::Idle => Ok(false),
+        }
+    }
+
     fn fail_connect(&mut self, error: u32) {
         self.error = Some(error);
         self.peer = None;
@@ -407,8 +423,14 @@ impl State {
         self.handles.push(handle);
     }
 
-    fn new_tcp_socket(&self) -> tcp::Socket<'static> {
+    fn new_tcp_socket(&self, local: IpAddr) -> tcp::Socket<'static> {
         let mut socket = tcp_socket_with_buffers(self.receive_buffer, self.send_buffer);
+        if local.is_loopback() {
+            socket.set_tsval_generator(Some(|| {
+                static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+                EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u32
+            }));
+        }
         socket.set_ipv4_dont_fragment(self.ipv4_pmtu.tcp_df());
         socket.set_linux_binding(
             self.device.unwrap_or(0),
@@ -1438,7 +1460,7 @@ impl Node {
                 }
             }
             if slots > 0 && slots < state.backlog {
-                let mut socket = state.new_tcp_socket();
+                let mut socket = state.new_tcp_socket(addr(listen_endpoint.addr));
                 if socket.listen_queued(listen_endpoint, state.backlog).is_ok() {
                     state.add_listener_slot(socket, &mut self.sockets, &mut self.tcp_waiters);
                 }
@@ -1570,7 +1592,7 @@ impl Node {
                         };
                         state.handles.push(self.sockets.add(u));
                     } else {
-                        let mut t = state.new_tcp_socket();
+                        let mut t = state.new_tcp_socket(*a);
                         if t.listen_queued(endpoint(ep), state.backlog).is_err() {
                             continue;
                         }
@@ -2798,6 +2820,53 @@ mod shared_lifetime_tests {
             fabric.tick();
             assert!(fabric.0.borrow().nodes[&network.0.key].detached.is_empty());
             assert_ne!(client.poll(0x18).unwrap() & 0x18, 0);
+        }
+    }
+
+    #[test]
+    fn active_opens_share_only_distinct_tuples_and_recycle_quiet_loopback() {
+        for (family, local) in [(2, "127.0.0.1"), (10, "::1")] {
+            let fabric = Fabric::new().unwrap();
+            let net = fabric.environment(2, NetworkMode::Full).unwrap();
+            net.set_port_range(38000, 38000);
+            let local: IpAddr = local.parse().unwrap();
+            let listen = |port| {
+                let socket = net.socket(family, 1, 0).unwrap();
+                socket.bind(SocketAddr::new(local, port)).unwrap();
+                socket.listen(2).unwrap();
+                socket
+            };
+            let first = listen(34041);
+            let second = listen(34042);
+            let client = || net.socket(family, 1, 0).unwrap();
+            let a = client();
+            let b = client();
+            let dst = first.local_addr().unwrap();
+            assert_eq!(a.connect(dst), Err(NetError(115)));
+            assert_eq!(b.connect(second.local_addr().unwrap()), Err(NetError(115)));
+            assert_eq!(a.local_addr().unwrap(), b.local_addr().unwrap());
+            let (a_peer, _) = first.accept().unwrap();
+            let (b_peer, _) = second.accept().unwrap();
+            assert_ne!(a.tcp_info().unwrap()[5] & 1, 0);
+            let retry = client();
+            assert_eq!(retry.connect(dst), Err(NetError(99)));
+            assert_eq!(retry.local_addr().unwrap().port(), 0);
+            let bind = client();
+            assert_eq!(bind.bind(SocketAddr::new(local, 0)), Err(NetError(98)));
+
+            a.shutdown(2).unwrap();
+            a_peer.shutdown(2).unwrap();
+            drop(a);
+            drop(a_peer);
+            fabric.tick();
+            assert_eq!(retry.connect(dst), Err(NetError(99)));
+            fabric.0.borrow_mut().started -= Duration::from_millis(1100);
+            assert_eq!(retry.connect(dst), Err(NetError(115)));
+            let (new_peer, _) = first.accept().unwrap();
+            retry.send(b"new", 0, None).unwrap();
+            b.send(b"other", 0, None).unwrap();
+            assert_eq!(new_peer.recv(8, 0).unwrap().data, b"new");
+            assert_eq!(b_peer.recv(8, 0).unwrap().data, b"other");
         }
     }
 

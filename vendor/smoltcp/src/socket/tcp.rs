@@ -638,6 +638,28 @@ impl<'a> Socket<'a> {
         self.tsval_generator.is_some()
     }
 
+    /// Sequence space for recycling a detached, timestamped loopback tuple.
+    /// A retransmitted closing segment restarts the quiet interval.
+    pub fn loopback_reuse_sequence(&self, now: Instant) -> Option<TcpSeqNumber> {
+        let Timer::Close { expires_at } = self.timer else {
+            return None;
+        };
+        if self.state != State::TimeWait
+            || !self.timestamp_enabled()
+            || now < expires_at - (CLOSE_DELAY - Duration::from_secs(1))
+        {
+            return None;
+        }
+        Some(self.remote_last_seq + 65537)
+    }
+
+    /// Apply the preceding incarnation's sequence floor before sending the SYN.
+    pub fn inherit_time_wait_sequence(&mut self, sequence: TcpSeqNumber) {
+        debug_assert_eq!(self.state, State::SynSent);
+        self.local_seq_no = sequence;
+        self.remote_last_seq = sequence;
+    }
+
     /// Set an algorithm for congestion control.
     ///
     /// `CongestionControl::None` indicates that no congestion control is applied.
@@ -1045,6 +1067,13 @@ impl<'a> Socket<'a> {
 
     pub fn send_mss(&self) -> usize {
         self.remote_mss.min(self.max_segment)
+    }
+
+    fn payload_mss(&self, local_mss: usize) -> usize {
+        // The SYN advertises MSS without options (RFC 6691). Data segments
+        // carry a padded 12-byte option when timestamps were negotiated.
+        let options = if self.timestamp_enabled() { 12 } else { 0 };
+        local_mss.min(self.send_mss()).saturating_sub(options).max(1)
     }
 
     pub fn set_cork(&mut self, enabled: bool) {
@@ -2659,7 +2688,7 @@ impl<'a> Socket<'a> {
         let local_mss = cx.ip_mtu() - ip_header_len - TCP_HEADER_LEN;
 
         // The effective max segment size, taking into account our and remote's limits.
-        let effective_mss = local_mss.min(self.send_mss());
+        let effective_mss = self.payload_mss(local_mss);
 
         // Have we sent data that hasn't been ACKed yet?
         let data_in_flight = self.remote_last_seq != self.local_seq_no;
@@ -2965,7 +2994,7 @@ impl<'a> Socket<'a> {
                 // 1. remote window
                 // 2. MSS the remote is willing to accept, probably determined by their MTU
                 // 3. MSS we can send, determined by our MTU.
-                let mss = self.send_mss().min(cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN);
+                let mss = self.payload_mss(cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN);
                 let size = win_limit.min(mss);
                 let offset = self.remote_last_seq - self.local_seq_no;
                 // An independent ACK may be due while a short tail is corked.

@@ -3,8 +3,14 @@ use super::*;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PortUse {
     Ephemeral,
+    Connect(SocketAddr, smoltcp::time::Instant),
     Bind,
     Listen,
+}
+
+enum PortSlot {
+    Free,
+    Recycle(usize, smoltcp::wire::TcpSeqNumber),
 }
 
 fn addresses_overlap(a: SocketAddr, a_dual: bool, b: SocketAddr, b_dual: bool) -> bool {
@@ -345,6 +351,9 @@ impl Socket {
         let Some(n) = i.nodes.get(&self.network.0.key) else {
             return false;
         };
+        self.port_slot(n, address, usage).is_some()
+    }
+    fn port_slot(&self, n: &Node, address: SocketAddr, usage: PortUse) -> Option<PortSlot> {
         let own = self.state.borrow();
         let dual = self.family == 10 && !own.v6_only;
         let mut udp_owner = None;
@@ -365,6 +374,12 @@ impl Socket {
                 }
                 if usage == PortUse::Listen && other.connection != Connection::Listening {
                     return true;
+                }
+                if let PortUse::Connect(peer, _) = usage {
+                    // An implicit active open reserves its four-tuple. An
+                    // explicitly bound port or listener still owns its bind.
+                    return other.requested_bind.is_none()
+                        && other.peer.is_some_and(|remote| remote != peer);
                 }
                 if usage == PortUse::Ephemeral {
                     return false;
@@ -389,26 +404,38 @@ impl Socket {
                 reusable_port
             });
         if !free || self.kind != 1 || usage == PortUse::Listen {
-            return free && udp_owner.is_none_or(|(_, reusable)| reusable);
+            return (free && udp_owner.is_none_or(|(_, reusable)| reusable))
+                .then_some(PortSlot::Free);
         }
-        // Closing TCP endpoints still own their local port after guest FD
-        // retirement. Reusing it here can deliver a new SYN to old TIME_WAIT
-        // state. The original protocol deadline, not FD lifetime, releases it.
-        n.detached.iter().all(|entry| {
+        let mut slot = PortSlot::Free;
+        for (index, entry) in n.detached.iter().enumerate() {
             if usage == PortUse::Bind && own.reuse && entry.reuse_addr
                 || own.device.zip(entry.device).is_some_and(|(a, b)| a != b)
             {
-                return true;
+                continue;
             }
             let socket = n.sockets.get::<tcp::Socket>(entry.handle);
-            socket.state() == tcp::State::Closed
-                || socket.local_endpoint().is_none_or(|endpoint| {
-                    let b = super::address(endpoint);
-                    !addresses_overlap(address, dual, b, false)
-                })
-        })
+            if socket.state() == tcp::State::Closed
+                || socket
+                    .local_endpoint()
+                    .is_none_or(|ep| !addresses_overlap(address, dual, super::address(ep), false))
+            {
+                continue;
+            }
+            if let PortUse::Connect(peer, now) = usage {
+                if socket.remote_endpoint() != Some(endpoint(peer)) {
+                    continue;
+                }
+                if address.ip().is_loopback() && peer.ip().is_loopback() {
+                    slot = PortSlot::Recycle(index, socket.loopback_reuse_sequence(now)?);
+                    continue;
+                }
+            }
+            return None;
+        }
+        Some(slot)
     }
-    fn choose_port(&self, ip: IpAddr) -> Result<u16> {
+    fn choose_port(&self, n: &Node, ip: IpAddr, usage: PortUse) -> Result<(u16, PortSlot)> {
         // Randomize once per original namespace, then visit the range before
         // reuse. A fresh random choice per connection collides with a remote
         // peer's TIME_WAIT even after our local endpoint has fully closed.
@@ -423,17 +450,21 @@ impl Socket {
             getrandom::fill(&mut seed).map_err(|_| NetError(5))?;
             u32::from(u16::from_ne_bytes(seed)) % span
         };
-        for n in 0..span {
-            let p = low + ((first + n) % span) as u16;
-            if self.port_free(SocketAddr::new(ip, p), PortUse::Ephemeral) {
+        for offset in 0..span {
+            let p = low + ((first + offset) % span) as u16;
+            if let Some(slot) = self.port_slot(n, SocketAddr::new(ip, p), usage) {
                 self.network
                     .0
                     .ephemeral_port
                     .set(if p == high { low } else { p + 1 });
-                return Ok(p);
+                return Ok((p, slot));
             }
         }
-        Err(NetError(98))
+        Err(NetError(if matches!(usage, PortUse::Connect(..)) {
+            99
+        } else {
+            98
+        }))
     }
     pub fn bind(&self, a: SocketAddr) -> Result<()> {
         let _binding = self.network.0.binding.lock();
@@ -496,7 +527,16 @@ impl Socket {
         if self.kind == 4 {
             a.set_port(0);
         } else if a.port() == 0 {
-            a.set_port(self.choose_port(a.ip())?);
+            let fabric = self.network.0.fabric.0.borrow();
+            let node = fabric.nodes.get(&self.network.0.key).ok_or(NetError(100))?;
+            // UDP bind(0) uses the ordinary overlap and reuse rules while
+            // scanning the range. TCP bind(0) reserves an unused port.
+            let usage = if self.kind == 2 {
+                PortUse::Bind
+            } else {
+                PortUse::Ephemeral
+            };
+            a.set_port(self.choose_port(node, a.ip(), usage)?.0);
         } else if !self.port_free(a, PortUse::Bind) {
             return Err(NetError(98));
         }
@@ -608,7 +648,7 @@ impl Socket {
             n.growing_listeners.push(Arc::downgrade(&self.meta));
         }
         for a in addresses {
-            let mut socket = state.new_tcp_socket();
+            let mut socket = state.new_tcp_socket(a.ip());
             socket
                 .listen_queued(endpoint(a), backlog)
                 .map_err(|_| NetError(22))?;
@@ -652,7 +692,7 @@ impl Socket {
             let slot = n.sockets.get::<tcp::Socket>(other);
             slot.is_listening() && slot.listen_endpoint().addr == Some(listen_address)
         }) {
-            let mut replacement = state.new_tcp_socket();
+            let mut replacement = state.new_tcp_socket(addr(listen_address));
             replacement
                 .listen_queued(IpEndpoint::new(listen_address, local.port()), state.backlog)
                 .map_err(|_| NetError(22))?;
@@ -789,24 +829,8 @@ impl Socket {
             }
         }
         let mut state = self.state.borrow_mut();
-        if self.kind == 1 {
-            match state.connection {
-                Connection::Connecting => return Err(NetError(114)),
-                Connection::Connected => {
-                    return if std::mem::take(&mut state.connect_result_pending) {
-                        Ok(())
-                    } else {
-                        Err(NetError(106))
-                    };
-                }
-                Connection::Listening => return Err(NetError(22)),
-                Connection::Failed(_) => {
-                    state.connection = Connection::Idle;
-                    state.connect_result_pending = false;
-                    return Err(NetError(state.error.take().unwrap_or(103)));
-                }
-                Connection::Idle => {}
-            }
+        if self.kind == 1 && state.existing_tcp_connect()? {
+            return Ok(());
         }
         if self.family == 10 && matches!(self.kind, 1 | 2) {
             if let Some(local) = state.requested_bind.filter(|b| !b.ip().is_unspecified()) {
@@ -821,7 +845,7 @@ impl Socket {
         }
         let bound = state.bound;
         drop(state);
-        if bound.is_none() {
+        if self.kind != 1 && bound.is_none() {
             self.ensure_bound()?;
         }
         if self.kind != 1 {
@@ -862,7 +886,11 @@ impl Socket {
             s.connection = Connection::Connected;
             return Ok(());
         }
-        let mut bound = self.state.borrow().bound.unwrap();
+        let binding = bound.is_none().then(|| self.network.0.binding.lock());
+        if binding.is_some() {
+            self.fabric().tick();
+        }
+        let mut bound = self.state.borrow().bound.unwrap_or_else(|| self.wildcard());
         if bound.ip().is_unspecified() {
             bound.set_ip(if let Some(view) = self.network.0.routing.get() {
                 self.route_source(view, a.ip())?
@@ -885,7 +913,20 @@ impl Socket {
             return Err(NetError(99));
         }
         let mut i = self.network.0.fabric.0.borrow_mut();
+        let now = i.now();
         let n = i.nodes.get_mut(&self.network.0.key).ok_or(NetError(100))?;
+        // Recheck after entering the fabric transaction if another opener
+        // raced the route lookup on this descriptor.
+        if self.state.borrow_mut().existing_tcp_connect()? {
+            return Ok(());
+        }
+        let slot = if bound.port() == 0 {
+            let (port, slot) = self.choose_port(n, bound.ip(), PortUse::Connect(a, now))?;
+            bound.set_port(port);
+            slot
+        } else {
+            PortSlot::Free
+        };
         let mut state = self.state.borrow_mut();
         if state.shared_tcp_binding && state.requested_bind.is_some() {
             let local = Some(endpoint(bound));
@@ -896,9 +937,13 @@ impl Socket {
                 return Err(NetError(99));
             }
         }
-        let mut s = state.new_tcp_socket();
+        let mut s = state.new_tcp_socket(bound.ip());
         s.connect(n.iface.context(), endpoint(a), endpoint(bound))
             .map_err(|_| NetError(22))?;
+        if let PortSlot::Recycle(index, sequence) = slot {
+            s.inherit_time_wait_sequence(sequence);
+            n.sockets.remove(n.detached.swap_remove(index).handle);
+        }
         state.handles.push(n.sockets.add(s));
         state.bound = Some(bound);
         state.peer = Some(a);
@@ -908,6 +953,7 @@ impl Socket {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         drop(state);
         drop(i);
+        drop(binding);
         self.fabric().tick();
         Err(NetError(115))
     }
@@ -2047,7 +2093,12 @@ impl Socket {
         let mut out = [0; 104];
         out[0] = state_code;
         if let Some(socket) = socket {
-            out[5] = u8::from(socket.sack_negotiated()) << 1;
+            out[5] = u8::from(socket.sack_negotiated()) << 1
+                | u8::from(
+                    socket.remote_endpoint().is_some()
+                        && socket.state() != tcp::State::SynSent
+                        && socket.timestamp_enabled(),
+                );
             let [rto, rtt, variance, mss, cwnd, window] = socket.transport_info();
             for (offset, value) in [
                 (8, rto),

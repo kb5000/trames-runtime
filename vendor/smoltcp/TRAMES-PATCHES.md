@@ -146,3 +146,10 @@ limit and traffic class with each message. A peek exposes the same metadata
 as the subsequent receive. Transmit records can select the local address
 and IP options, and generated echo replies reflect the request's traffic
 class. Raw ICMPv6 sockets filter on message type before queue admission.
+
+Guest TCP active opens can reuse a detached loopback four-tuple after one
+quiet second in TIME_WAIT when the peers negotiated timestamps. The TCP
+socket derives eligibility from its close timer and supplies the preceding
+send sequence for the next SYN. The runtime transfers the tuple while it
+owns the fabric transaction. Timestamped data segments account for the
+padded option length in both send readiness and packet construction.
