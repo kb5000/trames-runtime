@@ -816,9 +816,89 @@ fn ipv6_multicast_delivers_fragments_on_the_selected_guest_link() {
         remote.set_option_bytes(41, 20, &request(2)),
         Err(NetError(98))
     );
+    remote
+        .attach_filter(&filter_instruction(6, 0, 0, 10))
+        .unwrap();
+    tx.send(b"filtered multicast", 0, Some(dest)).unwrap();
+    assert_eq!(remote.recv(30, 0).unwrap().data, b"fi");
     remote.set_option_bytes(41, 21, &request(0)).unwrap();
     tx.set_option(41, 19, 1).unwrap();
     tx.send(b"after leave", 0, Some(dest)).unwrap();
     assert_eq!(local.recv(16, 0).unwrap().data, b"after leave");
     assert!(matches!(remote.recv(1, 0), Err(NetError(11))));
+}
+
+fn filter_instruction(op: u16, yes: u8, no: u8, operand: u32) -> [u8; 8] {
+    let mut bytes = [0; 8];
+    bytes[..2].copy_from_slice(&op.to_le_bytes());
+    bytes[2] = yes;
+    bytes[3] = no;
+    bytes[4..].copy_from_slice(&operand.to_le_bytes());
+    bytes
+}
+
+#[test]
+fn udp_receive_filter_runs_on_the_wire_header_before_queueing() {
+    let fabric = Fabric::new().unwrap();
+    let network = Network::virtual_network(&fabric, 2, NetworkMode::Outbound).unwrap();
+    for (family, local) in [(2, "127.0.0.1"), (10, "::1")] {
+        let destination = addr(local, 14012);
+        let rx = network.socket(family, 2, 0).unwrap();
+        let tx = network.socket(family, 2, 0).unwrap();
+        let select = [
+            filter_instruction(0x28, 0, 0, 2), // UDP destination port
+            filter_instruction(0x15, 0, 1, 14012),
+            filter_instruction(0x06, 0, 0, 11), // header + 3 bytes
+            filter_instruction(0x06, 0, 0, 0),
+        ]
+        .concat();
+        rx.attach_filter(&select).unwrap();
+        rx.bind(destination).unwrap();
+        tx.send(b"abcdef", 0, Some(destination)).unwrap();
+        rx.attach_filter(&filter_instruction(6, 0, 0, 0)).unwrap();
+        assert_eq!(rx.recv(10, 0).unwrap().data, b"abc");
+        assert_eq!(rx.attach_filter(&[0; 8]), Err(NetError(22)));
+        tx.send(b"drop", 0, Some(destination)).unwrap();
+        assert!(matches!(rx.recv(10, 0), Err(NetError(11))));
+        rx.attach_filter(&filter_instruction(6, 0, 0, 1)).unwrap();
+        tx.send(b"empty", 0, Some(destination)).unwrap();
+        assert!(rx.recv(10, 0).unwrap().data.is_empty());
+        rx.set_option_bytes(1, 27, &[]).unwrap();
+        assert_eq!(rx.set_option_bytes(1, 27, &[]), Err(NetError(2)));
+        tx.send(b"complete", 0, Some(destination)).unwrap();
+        assert_eq!(rx.recv(10, 0).unwrap().data, b"complete");
+    }
+}
+
+#[test]
+fn established_tcp_child_keeps_its_filter_when_listener_changes() {
+    let fabric = Fabric::new().unwrap();
+    let network = Network::virtual_network(&fabric, 2, NetworkMode::Outbound).unwrap();
+    let destination = addr("127.0.0.1", 14013);
+    let listener = network.socket(2, 1, 0).unwrap();
+    // Read the data offset from the actual TCP header, then keep two payload bytes.
+    let keep_two = [
+        filter_instruction(0x30, 0, 0, 12),
+        filter_instruction(0x74, 0, 0, 4),
+        filter_instruction(0x64, 0, 0, 2),
+        filter_instruction(0x04, 0, 0, 2),
+        filter_instruction(0x16, 0, 0, 0),
+    ]
+    .concat();
+    listener.attach_filter(&keep_two).unwrap();
+    listener.bind(destination).unwrap();
+    listener.listen(4).unwrap();
+    let client = network.socket(2, 1, 0).unwrap();
+    assert_eq!(client.connect(destination), Err(NetError(115)));
+    assert_eq!(client.connect_complete(), Ok(true));
+    listener
+        .attach_filter(&filter_instruction(6, 0, 0, 0))
+        .unwrap();
+    let (child, _) = listener.accept().unwrap();
+    client.send(b"abcdef", 0, None).unwrap();
+    assert_eq!(child.recv(10, 0).unwrap().data, b"ab");
+    child.set_option_bytes(1, 27, &[]).unwrap();
+    let second = network.socket(2, 1, 0).unwrap();
+    assert_eq!(second.connect(destination), Err(NetError(115)));
+    assert!(matches!(listener.accept(), Err(NetError(11))));
 }

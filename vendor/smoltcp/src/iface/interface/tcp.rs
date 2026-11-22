@@ -60,7 +60,7 @@ impl InterfaceInner {
                 continue;
             }
             return socket
-                .process(self, &ip_repr, &tcp_repr)
+                .process_wire(self, &ip_repr, &tcp_repr, ip_payload)
                 .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
         }
         if let Some(((priority, _), handle)) = listener {
@@ -71,7 +71,7 @@ impl InterfaceInner {
             }
             return sockets
                 .get_mut::<Socket>(handle)
-                .process(self, &ip_repr, &tcp_repr)
+                .process_wire(self, &ip_repr, &tcp_repr, ip_payload)
                 .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
         }
 

@@ -555,12 +555,12 @@ impl Inner {
                     .addr
                     .is_some_and(|a| addr(a).is_ipv6() == v6)
             }) {
-                node.sockets.get_mut::<udp::Socket>(h).process(
+                node.sockets.get_mut::<udp::Socket>(h).process_wire(
                     node.iface.context(),
                     meta,
                     &ip_repr,
                     &udp_repr,
-                    udp.payload(),
+                    &udp,
                 );
             }
         }

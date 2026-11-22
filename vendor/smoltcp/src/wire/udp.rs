@@ -131,6 +131,12 @@ impl<T: AsRef<[u8]>> Packet<T> {
 }
 
 impl<'a, T: AsRef<[u8]> + ?Sized> Packet<&'a T> {
+    /// Return the complete checked datagram without IP padding.
+    #[inline]
+    pub fn datagram(&self) -> &'a [u8] {
+        &self.buffer.as_ref()[..usize::from(self.len())]
+    }
+
     /// Return a pointer to the payload.
     #[inline]
     pub fn payload(&self) -> &'a [u8] {

@@ -33,6 +33,13 @@ mod waker;
 #[cfg(feature = "async")]
 pub(crate) use self::waker::WakerRegistration;
 
+/// Socket-local ingress policy. The input begins with the transport header.
+#[cfg(feature = "std")]
+pub trait ReceiveFilter: core::fmt::Debug + Send + Sync {
+    /// Return the number of wire bytes to keep, or zero to drop the packet.
+    fn keep(&self, packet: &[u8]) -> usize;
+}
+
 /// Gives an indication on the next time the socket should be polled.
 #[derive(Debug, PartialOrd, Ord, PartialEq, Eq, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]

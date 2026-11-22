@@ -1008,6 +1008,10 @@ impl Socket {
     /// Imported classic BPF only, never a guest sock_fprog pointer.
     pub fn attach_filter(&self, instructions: &[u8]) -> Result<()> {
         match &self.backend {
+            SocketBackend::Virtual(s) => {
+                let _operation = self.operation.write();
+                s.set_filter(Some(instructions))
+            }
             SocketBackend::Packet(s) => s.set_filter(Some(instructions)),
             SocketBackend::Netlink(s) => s.set_filter(Some(instructions)),
             _ => Err(NetError(92)),

@@ -70,6 +70,13 @@ pub(super) fn control(
                 return Ok(0);
             }
             if a[1] as u32 == 1 && a[2] as u32 == 26 {
+                if socket.is_stream()
+                    && !factory
+                        .local_credentials()
+                        .has_ns_cap(socket.user_namespace(), trames_vfs::capabilities::NET_ADMIN)
+                {
+                    return Err(Errno(1));
+                }
                 if a[4] as u32 != 16 {
                     return Err(Errno(22));
                 }

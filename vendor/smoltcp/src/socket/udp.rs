@@ -145,6 +145,8 @@ pub struct Socket<'a> {
     bind_order: u64,
     specific_bind: bool,
     reusable: bool,
+    #[cfg(feature = "std")]
+    receive_filter: Option<std::sync::Arc<dyn super::ReceiveFilter>>,
     pub(crate) ingress_device: u32,
     pub(crate) reuse_port_group: Option<u64>,
     #[cfg(feature = "alloc")]
@@ -172,6 +174,8 @@ impl<'a> Socket<'a> {
             bind_order: 0,
             specific_bind: false,
             reusable: false,
+            #[cfg(feature = "std")]
+            receive_filter: None,
             ingress_device: 0,
             reuse_port_group: None,
             #[cfg(feature = "alloc")]
@@ -249,6 +253,12 @@ impl<'a> Socket<'a> {
     #[cfg(feature = "alloc")]
     pub fn observe_readable(&mut self, token: u64) {
         self.readable_token = Some(token);
+    }
+
+    /// Set the policy applied to this socket after transport demultiplexing.
+    #[cfg(feature = "std")]
+    pub fn set_receive_filter(&mut self, filter: Option<std::sync::Arc<dyn super::ReceiveFilter>>) {
+        self.receive_filter = filter;
     }
 
     /// Members with the same guest owner and address family may share a flow.
@@ -671,7 +681,30 @@ impl<'a> Socket<'a> {
     }
 
     /// Enqueue a validated IP/UDP datagram after interface demultiplexing.
-    pub fn process(
+    pub fn process_wire(
+        &mut self,
+        cx: &mut Context,
+        meta: PacketMeta,
+        ip_repr: &IpRepr,
+        repr: &UdpRepr,
+        packet: &crate::wire::UdpPacket<&[u8]>,
+    ) {
+        let payload = packet.payload();
+        #[cfg(feature = "std")]
+        let payload = if let Some(filter) = &self.receive_filter {
+            let wire = packet.datagram();
+            let keep = filter.keep(wire);
+            if keep == 0 {
+                return;
+            }
+            &payload[..keep.min(wire.len()).saturating_sub(wire.len() - payload.len())]
+        } else {
+            payload
+        };
+        self.process(cx, meta, ip_repr, repr, payload);
+    }
+
+    fn process(
         &mut self,
         cx: &mut Context,
         meta: PacketMeta,

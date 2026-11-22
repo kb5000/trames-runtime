@@ -719,6 +719,7 @@ impl Socket {
         let (local, peer) = (address(local), address(peer));
         let connected = s.state() != tcp::State::Closed;
         let listen_address = s.listen_endpoint().addr.expect("per-address listener");
+        let receive_filter = s.receive_filter();
         s.leave_accept_queue();
         if state.listener_ready.is_some() {
             s.observe_io(None);
@@ -753,6 +754,7 @@ impl Socket {
             udp_shared: false,
             udp_readable: None,
             listener_ready: None,
+            receive_filter,
             udp_errors: None,
             udp_group: None,
             nodelay: state.nodelay,
@@ -2480,11 +2482,46 @@ impl Socket {
         }
         Ok(self.state.borrow().icmp6_filter)
     }
-    pub fn set_option_bytes(&self, level: u32, name: u32, value: &[u8]) -> Result<()> {
-        // SOL_SOCKET/SO_DETACH_FILTER has no argument. These raw sockets do not
-        // support attaching a classic filter, so there is no filter to remove.
-        if (level, name) == (1, 27) && self.raw_transport() {
+    pub fn set_filter(&self, instructions: Option<&[u8]>) -> Result<()> {
+        if !matches!(self.kind, 1 | 2) {
+            return Err(NetError(if instructions.is_none() { 2 } else { 92 }));
+        }
+        let filter = instructions
+            .map(crate::socket_filter::Program::new)
+            .transpose()?
+            .map(|program| Arc::new(program) as Arc<dyn smoltcp::socket::ReceiveFilter>);
+        let mut fabric = self.network.0.fabric.0.borrow_mut();
+        let mut state = self.state.borrow_mut();
+        if filter.is_none() && state.receive_filter.is_none() {
             return Err(NetError(2));
+        }
+        let node = fabric
+            .nodes
+            .get_mut(&self.network.0.key)
+            .ok_or(NetError(100))?;
+        for &handle in &state.handles {
+            if self.kind == 1 {
+                let socket = node.sockets.get_mut::<tcp::Socket>(handle);
+                // Half-open slots still use the listener policy. Established children
+                // have their own snapshot even before accept().
+                if state.connection != Connection::Listening
+                    || matches!(socket.state(), tcp::State::Listen | tcp::State::SynReceived)
+                {
+                    socket.set_receive_filter(filter.clone());
+                }
+            } else {
+                node.sockets
+                    .get_mut::<udp::Socket>(handle)
+                    .set_receive_filter(filter.clone());
+            }
+        }
+        state.receive_filter = filter;
+        Ok(())
+    }
+
+    pub fn set_option_bytes(&self, level: u32, name: u32, value: &[u8]) -> Result<()> {
+        if (level, name) == (1, 27) {
+            return self.set_filter(None);
         }
         if (level, name) == (6, 13) && self.kind == 1 {
             let name = value.split(|b| *b == 0).next().unwrap_or_default();

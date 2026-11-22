@@ -448,6 +448,8 @@ pub struct Socket<'a> {
     /// Address passed to listen(). Listen address is set when listen() is called and
     /// used every time the socket is reset back to the LISTEN state.
     listen_endpoint: IpListenEndpoint,
+    #[cfg(feature = "std")]
+    receive_filter: Option<std::sync::Arc<dyn super::ReceiveFilter>>,
     pub(crate) ingress_device: u32,
     pub(crate) listener_rank: u64,
     pub(crate) specific_bind: bool,
@@ -580,6 +582,8 @@ impl<'a> Socket<'a> {
             keep_alive: None,
             hop_limit: None,
             listen_endpoint: IpListenEndpoint::default(),
+            #[cfg(feature = "std")]
+            receive_filter: None,
             ingress_device: 0,
             listener_rank: 0,
             specific_bind: false,
@@ -998,6 +1002,18 @@ impl<'a> Socket<'a> {
         self.listen(endpoint)?;
         self.accept_queue_capacity = capacity;
         Ok(())
+    }
+
+    /// Set the policy applied to this socket after transport demultiplexing.
+    #[cfg(feature = "std")]
+    pub fn set_receive_filter(&mut self, filter: Option<std::sync::Arc<dyn super::ReceiveFilter>>) {
+        self.receive_filter = filter;
+    }
+
+    /// Snapshot the policy inherited by this passive connection during its handshake.
+    #[cfg(feature = "std")]
+    pub fn receive_filter(&self) -> Option<std::sync::Arc<dyn super::ReceiveFilter>> {
+        self.receive_filter.clone()
     }
 
     /// Every backlog slot for a Linux listener carries the same selection key.
@@ -1932,6 +1948,29 @@ impl<'a> Socket<'a> {
             let addr_ok = self.listens_on_address(ip_repr.dst_addr());
             addr_ok && repr.dst_port != 0 && repr.dst_port == self.listen_endpoint.port
         }
+    }
+
+    pub(crate) fn process_wire(
+        &mut self,
+        cx: &mut Context,
+        ip_repr: &IpRepr,
+        repr: &TcpRepr,
+        _wire: &[u8],
+    ) -> Option<(IpRepr, TcpRepr<'static>)> {
+        #[cfg(feature = "std")]
+        if let Some(filter) = &self.receive_filter {
+            let keep = filter.keep(_wire);
+            if keep == 0 {
+                return None;
+            }
+            if keep < _wire.len() {
+                let header = _wire.len() - repr.payload.len();
+                let mut trimmed = *repr;
+                trimmed.payload = &repr.payload[..keep.saturating_sub(header)];
+                return self.process(cx, ip_repr, &trimmed);
+            }
+        }
+        self.process(cx, ip_repr, repr)
     }
 
     pub(crate) fn process(

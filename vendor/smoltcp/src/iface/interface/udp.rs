@@ -100,7 +100,7 @@ impl InterfaceInner {
                     continue;
                 }
                 let Some(rank) = socket.shared_priority() else {
-                    socket.process(self, meta, &ip_repr, &udp_repr, udp_packet.payload());
+                    socket.process_wire(self, meta, &ip_repr, &udp_repr, &udp_packet);
                     return None;
                 };
                 if shared.as_ref().is_none_or(|(best, _, _)| rank > *best) {
@@ -136,7 +136,7 @@ impl InterfaceInner {
                     }
                 }
                 let socket = sockets.get_mut::<UdpSocket>(handle);
-                socket.process(self, meta, &ip_repr, &udp_repr, udp_packet.payload());
+                socket.process_wire(self, meta, &ip_repr, &udp_repr, &udp_packet);
                 return None;
             }
         }

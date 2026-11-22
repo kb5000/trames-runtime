@@ -284,6 +284,7 @@ struct State {
     receive_hops: bool,
     ipv4_pmtu: Ipv4Pmtu,
     udp_options: [UdpOptions; 2],
+    receive_filter: Option<Arc<dyn smoltcp::socket::ReceiveFilter>>,
     udp_errors: Option<Arc<udp_errors::Errors>>,
     multicast: Option<Box<multicast::Options>>,
     last_hop: Option<u8>,
@@ -431,6 +432,7 @@ impl State {
                 EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u32
             }));
         }
+        socket.set_receive_filter(self.receive_filter.clone());
         socket.set_ipv4_dont_fragment(self.ipv4_pmtu.tcp_df());
         socket.set_linux_binding(
             self.device.unwrap_or(0),
@@ -476,6 +478,7 @@ impl State {
         local: SocketAddr,
         specific: bool,
     ) -> Result<()> {
+        socket.set_receive_filter(self.receive_filter.clone());
         socket.enable_linux_receive();
         socket.set_ingress_device(self.device.unwrap_or(0));
         socket.observe_errors(self.udp_errors.as_ref().unwrap().clone());
@@ -1866,6 +1869,7 @@ impl Network {
                 udp_shared: false,
                 udp_readable: None,
                 listener_ready: None,
+                receive_filter: None,
                 udp_errors: (kind == 2).then(|| Arc::new(udp_errors::Errors::default())),
                 udp_group: None,
                 nodelay: false,

@@ -1,14 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Verified classic socket BPF. Guest pointers are imported by the Linux ABI.
 use crate::{NetError, Result};
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct Instruction {
     code: u16,
     jt: u8,
     jf: u8,
     k: u32,
 }
+#[derive(Debug)]
 pub(crate) struct Program(Vec<Instruction>);
+impl smoltcp::socket::ReceiveFilter for Program {
+    fn keep(&self, packet: &[u8]) -> usize {
+        self.run(packet)
+    }
+}
 impl Program {
     pub fn new(bytes: &[u8]) -> Result<Self> {
         if bytes.is_empty() || bytes.len() % 8 != 0 || bytes.len() > 4096 * 8 {
