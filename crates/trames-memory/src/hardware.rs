@@ -141,7 +141,7 @@ impl Memory {
         }
         if write {
             if let Some(backing) = &mut page.backing {
-                backing.private_copy = true;
+                backing.detached_copy(&page.charge);
             }
         }
         page.bytes = Arc::new(PageBytes::Concurrent(storage));

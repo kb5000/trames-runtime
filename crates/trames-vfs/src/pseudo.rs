@@ -1228,7 +1228,8 @@ impl PseudoFs {
                 | b"/proc/bootconfig"
                 | b"/proc/filesystems"
                 | b"/proc/loadavg"
-        );
+        ) || path.ends_with(b"/smaps")
+            || path.ends_with(b"/smaps_rollup");
         let node = Arc::new(inode);
         nodes.entries.insert((ns, path.to_vec()), node.clone());
         Ok(CachedNode {
@@ -2331,6 +2332,9 @@ impl Vfs {
                             .unwrap_or_else(|| nul_list(&p.environment)),
                         b"auxv" => p.auxiliary.clone(),
                         b"maps" => p.maps.clone(),
+                        b"smaps" | b"smaps_rollup" if self.pseudo.borrow().source.is_some() => {
+                            Vec::new()
+                        }
                         b"mounts" => {
                             mounts::table_text(&p.namespaces, false, &self.cgroup_namespace.path)
                         }
@@ -3161,6 +3165,8 @@ impl Vfs {
                             "environ",
                             "comm",
                             "maps",
+                            "smaps",
+                            "smaps_rollup",
                             "auxv",
                             "cwd",
                             "root",

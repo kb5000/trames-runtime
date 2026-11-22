@@ -224,10 +224,15 @@ fn complete_task_proc_memory_family_and_uring_use_original_resources_without_hos
         imm(&mut code, 0, 0x2800);
         imm(&mut code, 1, 1);
         code.push(0xb9000001);
-        let sleep = [
-            0xd2860000, 0xd2801001, 0xd2800002, 0xd2800003, 0xd2800c48, 0xd4000001, 0x14000000,
-        ];
-        code.extend(sleep);
+        // Keep the idle peer asleep even with one execution slot. The iovec at
+        // 0x3000 starts with a nonzero pointer and would make FUTEX_WAIT return
+        // EAGAIN, leaving a busy loop to spend the whole epoch's budget.
+        let mut sleep = Vec::new();
+        imm(&mut sleep, 0, 0x3100);
+        sleep.extend([
+            0xd2801001, 0xd2800002, 0xd2800003, 0xd2800c48, 0xd4000001, 0x14000000,
+        ]);
+        code.extend_from_slice(&sleep);
         for (address, words) in [(0x4000, code.as_slice()), (0x6000, sleep.as_slice())] {
             root.memory
                 .write(
@@ -272,26 +277,6 @@ fn complete_task_proc_memory_family_and_uring_use_original_resources_without_hos
         );
         for (i, path) in paths.iter().enumerate() {
             let row = 0x2000 + i as u64 * 64;
-            if matches!(*path, b"/proc/1/smaps" | b"/proc/1/smaps_rollup") {
-                // These files are not implemented. Preserve canonical ENOENT,
-                // EBADF and CQ results without a capability/cohort fallback.
-                assert_eq!(root.memory.read_u64(row).unwrap(), 0u64.wrapping_sub(2));
-                for offset in [8, 16, 24, 32, 48] {
-                    assert_eq!(
-                        root.memory.read_u64(row + offset).unwrap(),
-                        0u64.wrapping_sub(9)
-                    );
-                }
-                assert_eq!(
-                    root.memory.read_u64(row + 40).unwrap(),
-                    0u64.wrapping_sub(2)
-                );
-                assert_eq!(
-                    i32::from_le_bytes(ring.read_queue::<4>(trames_vfs::URING_CQES + i * 16 + 8)),
-                    -9
-                );
-                continue;
-            }
             assert!(
                 (3..64).contains(&root.memory.read_u64(row).unwrap()),
                 "{path:?}"

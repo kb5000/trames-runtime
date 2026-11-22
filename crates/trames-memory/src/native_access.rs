@@ -383,7 +383,7 @@ impl Memory {
                     .read(0, &mut bytes)
                     .map_err(|e| e.at_access(address))?;
                 page.bytes = Arc::new(PageBytes::new(bytes));
-                b.private_copy = true;
+                b.detached_copy(&page.charge);
             }
         }
         self.mark_native_write(frame);

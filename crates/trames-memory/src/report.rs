@@ -38,6 +38,7 @@ pub(super) struct Report {
     retired: std::sync::atomic::AtomicBool,
     image: RwLock<Option<ImageRanges>>,
     state: RwLock<Arc<Layout>>,
+    pub(super) smaps: OnceLock<smaps::Requests>,
     pub(super) transfers: OnceLock<process_transfer::Transfers>,
     pub(super) reads: OnceLock<read_export::Reads>,
     pub(super) read_waker: RwLock<Option<read_export::ReadWaker>>,
@@ -210,6 +211,7 @@ impl Memory {
                 retired: std::sync::atomic::AtomicBool::new(false),
                 image: RwLock::new(self.image_ranges),
                 state: RwLock::new(layout),
+                smaps: OnceLock::new(),
                 transfers: OnceLock::new(),
                 reads: OnceLock::new(),
                 read_waker: RwLock::new(None),
@@ -244,6 +246,7 @@ impl MemoryReport {
     pub(super) fn retire(&self) {
         self.0.retired.store(true, Ordering::Relaxed);
         self.retire_reads();
+        self.finish_smaps(None);
         self.finish_transfers(None);
     }
     pub fn image_ranges(&self) -> Option<ImageRanges> {

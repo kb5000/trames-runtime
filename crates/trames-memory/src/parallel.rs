@@ -1354,6 +1354,15 @@ impl CpuMemory for View {
     }
 }
 impl Memory {
+    /// Workers journal mapped writes before the next original-mm commit. Aliases
+    /// of the same file page share the physical frame's dirty fragments.
+    pub(super) fn worker_dirty_backing(&self, base: u64) -> Option<bool> {
+        let snapshot = &self.parallel_cache.as_ref()?.snapshot;
+        let frame = &snapshot.frames[*snapshot.pages.get(&base)?];
+        (frame.bytes.dirty.load(Ordering::Relaxed) != 0).then_some(frame.bytes.private_source)
+    }
+}
+impl Memory {
     /// A layout checkpoint must account for retained Views from every mapping
     /// generation, not just the scheduler's current job list.
     /// Reborrow this frozen generation after the caller has quiesced every

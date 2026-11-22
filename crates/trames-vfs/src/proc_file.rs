@@ -13,6 +13,7 @@ pub(super) struct ProcFile {
     saved: Option<Vec<u8>>,
     payload: Option<Payload>,
     readers: Mutex<Readers>,
+    smaps: Mutex<SmapsStream>,
     renderer: Mutex<PathQueries>,
 }
 
@@ -41,13 +42,67 @@ struct Readers {
     memory: Option<trames_memory::MemoryReport>,
     pages: BTreeMap<u64, trames_memory::MemoryRead>,
 }
+#[derive(Default)]
+struct SmapsStream {
+    pending: Option<Arc<trames_memory::SmapsRead>>,
+    bytes: Option<Arc<[u8]>>,
+}
 pub(super) enum ProcRead {
     Complete(Result<Vec<u8>>),
-    Waiting(Vec<trames_memory::MemoryRead>),
+    Waiting(Vec<ProcWait>),
+}
+#[derive(Clone)]
+pub(super) enum ProcWait {
+    Page(trames_memory::MemoryRead),
+    Smaps(Arc<trames_memory::SmapsRead>),
+}
+impl ProcWait {
+    pub fn ready(&self) -> bool {
+        match self {
+            Self::Page(p) => p.ready(),
+            Self::Smaps(r) => r.result().is_some(),
+        }
+    }
+    pub fn subscribe(&self, s: &Arc<IoSignal>) -> IoSubscription {
+        match self {
+            Self::Page(p) => p.subscribe(s),
+            Self::Smaps(r) => r.subscribe(s),
+        }
+    }
 }
 impl ProcFile {
     pub fn live_payload(&self) -> bool {
-        self.payload.is_some()
+        self.payload.is_some() || self.is_smaps()
+    }
+    fn is_smaps(&self) -> bool {
+        self.path.ends_with(b"/smaps") || self.path.ends_with(b"/smaps_rollup")
+    }
+    fn read_smaps(&self, offset: u64, count: usize) -> ProcRead {
+        let Some(mm) = self.memory.as_ref().filter(|m| m.alive()) else {
+            return ProcRead::Complete(Ok(Vec::new()));
+        };
+        if count == 0 {
+            return ProcRead::Complete(Ok(Vec::new()));
+        }
+        let mut stream = self.smaps.lock().unwrap();
+        if offset == 0 || stream.bytes.is_none() {
+            let read = stream
+                .pending
+                .get_or_insert_with(|| mm.request_smaps(self.path.ends_with(b"/smaps_rollup")));
+            let Some(result) = read.result().cloned() else {
+                return ProcRead::Waiting(vec![ProcWait::Smaps(read.clone())]);
+            };
+            stream.pending = None;
+            match result {
+                Ok(data) => stream.bytes = Some(data),
+                Err(_) => return ProcRead::Complete(Err(Errno(5))),
+            }
+        }
+        let data = stream.bytes.as_ref().expect("completed mapping statistics");
+        let start = offset.min(data.len() as u64) as usize;
+        ProcRead::Complete(Ok(
+            data[start..data.len().min(start.saturating_add(count))].to_vec()
+        ))
     }
     fn payload_memory(&self) -> Result<Option<trames_memory::MemoryReport>> {
         match self.payload {
@@ -99,6 +154,9 @@ impl ProcFile {
         .map(Ok)
     }
     pub fn read_payload(&self, offset: u64, count: usize) -> ProcRead {
+        if self.is_smaps() {
+            return self.read_smaps(offset, count);
+        }
         let memory = match self.payload_memory() {
             Ok(memory) => memory,
             Err(error) => return ProcRead::Complete(Err(error)),
@@ -142,7 +200,7 @@ impl ProcFile {
         });
         if !missing.is_empty() {
             memory.request_reads(&missing);
-            return ProcRead::Waiting(missing);
+            return ProcRead::Waiting(missing.into_iter().map(ProcWait::Page).collect());
         }
         ProcRead::Complete(Ok(bytes.expect("admitted original mm reader")))
     }
@@ -150,7 +208,7 @@ impl ProcFile {
         if count == 0 {
             return Ok(Vec::new());
         }
-        if self.payload.is_some() {
+        if self.live_payload() {
             return match self.read_payload(offset, count) {
                 ProcRead::Complete(result) => result,
                 ProcRead::Waiting(_) => Err(Errno(11)),
@@ -310,7 +368,8 @@ impl Vfs {
         } else {
             None
         };
-        let memory = if demand.mappings() || payload.is_some() {
+        let smaps = path.ends_with(b"/smaps") || path.ends_with(b"/smaps_rollup");
+        let memory = if smaps || demand.mappings() || payload.is_some() {
             let memory = target.as_ref()?.memory_report();
             if payload.is_some()
                 && memory
@@ -319,7 +378,10 @@ impl Vfs {
             {
                 return None; // legacy synthetic fixtures without an actual image
             }
-            if demand.mappings() {
+            if smaps && !memory.as_ref().is_some_and(|m| m.supports_reads()) {
+                return None;
+            }
+            if smaps || demand.mappings() {
                 Some(memory?)
             } else {
                 memory
@@ -385,6 +447,7 @@ impl Vfs {
             memory,
             saved,
             payload,
+            smaps: Default::default(),
             readers: Default::default(),
             renderer: Mutex::new(PathQueries {
                 view: RefCell::new(view),

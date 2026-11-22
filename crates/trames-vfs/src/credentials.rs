@@ -528,7 +528,10 @@ impl Vfs {
         let protected = if link {
             matches!(key, b"cwd" | b"root" | b"exe" | b"fd" | b"ns")
         } else {
-            matches!(key, b"maps" | b"environ" | b"auxv" | b"fdinfo")
+            matches!(
+                key,
+                b"maps" | b"smaps" | b"smaps_rollup" | b"environ" | b"auxv" | b"fdinfo"
+            )
         };
         if protected {
             let pseudo = self.pseudo.borrow();

@@ -152,6 +152,53 @@ impl Store {
         }
         Ok(())
     }
+    /// Enumerate only present descriptors and admitted hardware extents. Virtual
+    /// reservations can span terabytes, so do not build a mincore vector for the VMA.
+    pub(super) fn visit_resident(
+        &self,
+        start: u64,
+        end: u64,
+        mut visit: impl FnMut(u64),
+    ) -> Result<(), MemoryError> {
+        let native = self.native.as_ref().map(|n| n.lock().unwrap());
+        for shard in &self.pages {
+            for (&base, page) in shard.lock().unwrap().range(start..end) {
+                if page.charge.resident()
+                    && !native.as_ref().is_some_and(|n| {
+                        n.ranges
+                            .range(..=base)
+                            .next_back()
+                            .is_some_and(|(&at, r)| base - at < r.len() as u64)
+                    })
+                {
+                    visit(base);
+                }
+            }
+        }
+        if let Some(n) = native {
+            let first = n
+                .ranges
+                .range(..=start)
+                .next_back()
+                .map_or(start, |(&at, _)| at);
+            let mut flags = [0u8; (HARDWARE_MAPPING_CHUNK_SIZE / PAGE_SIZE) as usize];
+            for (&at, r) in n.ranges.range(first..end) {
+                let mut lo = at.max(start);
+                let hi = end.min(at + r.len() as u64);
+                while lo < hi {
+                    let count = flags.len().min(((hi - lo) / PAGE_SIZE) as usize);
+                    r.residency((lo - at) as usize, &mut flags[..count])?;
+                    for (i, &bit) in flags[..count].iter().enumerate() {
+                        if bit & 1 != 0 {
+                            visit(lo + i as u64 * PAGE_SIZE);
+                        }
+                    }
+                    lo += count as u64 * PAGE_SIZE;
+                }
+            }
+        }
+        Ok(())
+    }
     pub fn native_contains(&self, address: u64) -> bool {
         self.native.as_ref().is_some_and(|n| {
             n.lock()

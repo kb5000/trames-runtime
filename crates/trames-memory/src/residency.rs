@@ -324,7 +324,11 @@ impl Memory {
             charges.push(charge);
         }
         for (page, charge) in self.frames.iter_mut().flatten().zip(charges) {
+            if let Some(b) = &page.backing {
+                b.detach(&page.charge);
+            }
             page.charge = charge;
+            page.register_backing();
         }
         self.anonymous = self.anonymous.fork(&account);
         self.sparse_pages.get_mut().clear();

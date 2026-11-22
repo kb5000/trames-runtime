@@ -38,6 +38,14 @@ impl<C: Cpu> Kernel<C> {
             else {
                 continue;
             };
+            if self
+                .processes
+                .read(&pid)
+                .memory
+                .serve_mapping_statistics(&report)
+            {
+                continue;
+            }
             if epoch.is_some_and(|epoch| epoch.request_proc_reads(pid)) {
                 continue;
             }

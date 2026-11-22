@@ -334,7 +334,7 @@ pub struct FileWork {
     open: Option<Box<PreparedOpen>>,
     sync_targets: Option<Vec<storage::FilesystemSync>>,
     namespace: Option<Box<namespace_work::NamespaceWork>>,
-    proc_wait: Vec<trames_memory::MemoryRead>,
+    proc_wait: Vec<proc_file::ProcWait>,
     fuse_stat: Option<Box<fuse::Metadata>>,
     linger: Option<Box<trames_net::TcpLinger>>,
 }

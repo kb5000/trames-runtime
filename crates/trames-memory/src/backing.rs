@@ -59,6 +59,13 @@ impl SyncRange {
 /// Implementations synchronize their own metadata and physical byte owners;
 /// Send + Sync does not authorize concurrent structural changes to a Memory.
 pub trait PageBacking: Send + Sync {
+    /// Physical file or shmem page membership used only at mapping transitions and by smaps.
+    fn mapped_residents(&self) -> Option<&MappedResidents> {
+        None
+    }
+    fn proc_dirty(&self) -> bool {
+        false
+    }
     fn proc_file(&self) -> Option<MappingFileInfo> {
         None
     }
@@ -230,13 +237,86 @@ pub trait PageBacking: Send + Sync {
     }
     fn next_page(&self, pages: u64) -> Result<Arc<dyn PageBacking>, MemoryError>;
 }
+/// A physical backing page may appear in several guest page tables. Execution
+/// pins and file-cache references do not constitute additional mappings.
+#[derive(Default)]
+pub struct MappedResidents(parking_lot::Mutex<Members>);
+#[derive(Default)]
+enum Members {
+    #[default]
+    Empty,
+    One(std::sync::Weak<Charge>),
+    Several(Vec<std::sync::Weak<Charge>>),
+}
+impl MappedResidents {
+    fn attach(&self, charge: &Arc<Charge>) {
+        let mut owners = self.0.lock();
+        let next = Arc::downgrade(charge);
+        match &mut *owners {
+            Members::Empty => *owners = Members::One(next),
+            Members::One(first) if first.strong_count() == 0 => *first = next,
+            Members::One(first) => *owners = Members::Several(vec![first.clone(), next]),
+            Members::Several(items) => {
+                items.retain(|w| w.strong_count() != 0);
+                items.push(next);
+            }
+        }
+    }
+    fn detach(&self, charge: &Arc<Charge>) {
+        let mut owners = self.0.lock();
+        match &mut *owners {
+            Members::One(w) if w.as_ptr() == Arc::as_ptr(charge) => *owners = Members::Empty,
+            Members::Several(items) => {
+                items.retain(|w| w.as_ptr() != Arc::as_ptr(charge) && w.strong_count() != 0);
+                if items.len() <= 1 {
+                    *owners = items.pop().map_or(Members::Empty, Members::One);
+                }
+            }
+            _ => {}
+        }
+    }
+    pub(super) fn resident_count(&self) -> usize {
+        let resident = |w: &std::sync::Weak<Charge>| w.upgrade().is_some_and(|c| c.resident());
+        match &*self.0.lock() {
+            Members::Empty => 0,
+            Members::One(w) => usize::from(resident(w)),
+            Members::Several(items) => items.iter().filter(|w| resident(w)).count(),
+        }
+    }
+}
 #[derive(Clone)]
 pub(super) struct Backed {
     pub object: Arc<dyn PageBacking>,
     pub shared: bool,
     pub private_copy: bool,
 }
+impl Backed {
+    fn attach(&self, charge: &Arc<Charge>) {
+        if !self.private_copy {
+            if let Some(owners) = self.object.mapped_residents() {
+                owners.attach(charge);
+            }
+        }
+    }
+    pub(super) fn detach(&self, charge: &Arc<Charge>) {
+        if self.private_copy {
+            return;
+        }
+        if let Some(owners) = self.object.mapped_residents() {
+            owners.detach(charge);
+        }
+    }
+    pub(super) fn detached_copy(&mut self, charge: &Arc<Charge>) {
+        self.detach(charge);
+        self.private_copy = true;
+    }
+}
 impl Page {
+    pub(super) fn register_backing(&self) {
+        if let Some(b) = &self.backing {
+            b.attach(&self.charge);
+        }
+    }
     pub(super) fn parallel_changes_since(
         &self,
         generation: u64,
@@ -293,7 +373,7 @@ impl Page {
             let mut page = [0; PAGE_SIZE as usize];
             b.object.read(0, &mut page)?;
             self.bytes = Arc::new(PageBytes::new(page));
-            b.private_copy = true;
+            b.detached_copy(&self.charge);
         }
         Ok(())
     }
@@ -387,6 +467,12 @@ impl Memory {
                 origin,
                 shared: shared_mapping,
                 write_only: false,
+                may_write: if shared_mapping {
+                    source.writable()
+                } else {
+                    source.private_writable()
+                },
+                may_execute: source.executable(),
                 name: None,
             },
         );
@@ -401,6 +487,7 @@ impl Memory {
                 shared: shared_mapping,
                 private_copy: false,
             });
+            page.register_backing();
         }
         self.refresh_mapping_mmu(address, len);
         self.invalidate_translations();
@@ -495,8 +582,9 @@ impl Memory {
             if page.backing.is_none() {
                 page.charge = Charge::new(&self.account);
             }
-            if let Some(b) = &mut page.backing {
+            if let Some(b) = page.backing.as_mut().filter(|b| b.private_copy) {
                 b.private_copy = false;
+                b.attach(&page.charge);
             }
             page.instruction_revision = self.code_revision;
         }
@@ -763,6 +851,7 @@ impl Memory {
                 .is_none_or(|b| b.object.cpu_borrow_safe())
         });
         for (i, mut page) in pages.into_iter().take(count).enumerate() {
+            page.register_backing();
             page.instruction_revision = self.code_revision;
             let frame = self.pages[&(new + i as u64 * PAGE_SIZE)];
             self.frames[frame] = Some(page);
@@ -774,6 +863,7 @@ impl Memory {
 }
 
 struct AnonymousData {
+    owners: MappedResidents,
     bytes: Arc<SharedPage>,
     revision: AtomicU64,
     identity: u64,
@@ -781,6 +871,7 @@ struct AnonymousData {
 impl AnonymousData {
     fn zero() -> Self {
         Self {
+            owners: Default::default(),
             bytes: Arc::new(SharedPage::zero()),
             revision: AtomicU64::new(0),
             identity: new_backing_identity(),
@@ -902,6 +993,12 @@ impl PageSource for RetainedPageSource {
     }
 }
 impl PageBacking for AnonymousPage {
+    fn mapped_residents(&self) -> Option<&MappedResidents> {
+        Some(&self.owners)
+    }
+    fn proc_dirty(&self) -> bool {
+        !self.bytes.unmaterialized_zero()
+    }
     fn proc_shmem_inode(&self) -> Option<u64> {
         Some(self.extent[0].identity)
     }

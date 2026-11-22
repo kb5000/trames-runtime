@@ -29,7 +29,10 @@ pub use process_transfer::{TransferError, TransferRequest, TransferTarget, TRANS
 mod read_export;
 pub use read_export::MemoryRead;
 mod proc_maps;
+mod smaps;
+pub use backing::MappedResidents;
 pub use proc_maps::MappingFileInfo;
+pub use smaps::{SmapsRead, SmapsResult};
 mod report;
 mod reservations;
 mod residency;
@@ -375,6 +378,7 @@ impl Memory {
                 });
             }
             page.charge = Charge::fork(&account, resident)?;
+            page.register_backing();
             page.parallel_dirty = false;
             frames.push(Some(page));
         }
@@ -975,8 +979,11 @@ impl Memory {
                 self.parallel_mappings.insert(base);
             }
             let frame = self.pages.remove(&base).expect("mapped frame");
-            if let Some(backing) = self.frames[frame].as_ref().and_then(|p| p.backing.as_ref()) {
-                backing.object.unmapped();
+            if let Some(p) = self.frames[frame].as_ref() {
+                if let Some(backing) = &p.backing {
+                    backing.detach(&p.charge);
+                    backing.object.unmapped();
+                }
             }
             self.frames[frame] = None;
             self.free_frames.push(frame);

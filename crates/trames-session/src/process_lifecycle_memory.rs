@@ -36,6 +36,9 @@ impl<C: Cpu> Lifecycle<C> {
                 if !p.memory.has_memory_report(&report) {
                     continue;
                 }
+                if p.memory.serve_mapping_statistics(&report) {
+                    break;
+                }
                 if epoch.request_proc_reads(pid) {
                     break;
                 }

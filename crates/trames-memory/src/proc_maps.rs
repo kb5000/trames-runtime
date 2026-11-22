@@ -25,6 +25,8 @@ pub(super) struct Mapping {
     pub origin: Origin,
     pub shared: bool,
     pub write_only: bool,
+    pub may_write: bool,
+    pub may_execute: bool,
     pub name: Option<Arc<[u8]>>,
 }
 impl Mapping {
@@ -35,6 +37,8 @@ impl Mapping {
             origin: Origin::Private,
             shared: false,
             write_only: false,
+            may_write: true,
+            may_execute: true,
             name: None,
         }
     }
@@ -47,6 +51,8 @@ impl Mapping {
             && self.name == next.name
             && self.shared == next.shared
             && self.write_only == next.write_only
+            && self.may_write == next.may_write
+            && self.may_execute == next.may_execute
             && (matches!(self.origin, Origin::Private)
                 || self.offset.checked_add(self.end - base) == Some(next.offset))
     }
@@ -303,22 +309,31 @@ impl super::report::RegionLayout {
         sizes
     }
     pub(super) fn maps(&self, stack: Option<u64>) -> Arc<[u8]> {
+        self.describe_maps(stack, true, |_, _, _, _, _| {})
+    }
+    pub(super) fn describe_maps(
+        &self,
+        stack: Option<u64>,
+        headers: bool,
+        mut visit: impl FnMut(&mut Vec<u8>, u64, u64, Permissions, Option<&Mapping>),
+    ) -> Arc<[u8]> {
         let mut text = Vec::new();
         for &(a, b, perm) in &self.ranges {
             self.origins.pieces(a, b, |start, end, entry| {
                 let m = entry.map(|(_, m)| m);
-                let (dev, inode, offset) = match entry {
-                    Some((base, m)) => match &m.origin {
-                        Origin::File(f) => (f.device, f.inode, m.offset + (start - base)),
-                        Origin::SharedAnon(id) => (1, *id, m.offset + (start - base)),
-                        _ => (0, 0, 0),
-                    },
-                    None => (0, 0, 0),
-                };
-                let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & 0xfffff000);
-                let minor = (dev & 0xff) | ((dev >> 12) & 0xffffff00);
-                let line = text.len();
-                write!(
+                if headers {
+                    let (dev, inode, offset) = match entry {
+                        Some((base, m)) => match &m.origin {
+                            Origin::File(f) => (f.device, f.inode, m.offset + (start - base)),
+                            Origin::SharedAnon(id) => (1, *id, m.offset + (start - base)),
+                            _ => (0, 0, 0),
+                        },
+                        None => (0, 0, 0),
+                    };
+                    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & 0xfffff000);
+                    let minor = (dev & 0xff) | ((dev >> 12) & 0xffffff00);
+                    let line = text.len();
+                    write!(
                     text,
                     "{start:08x}-{end:08x} {}{}{}{} {offset:08x} {major:02x}:{minor:02x} {inode} ",
                     if perm.read && !m.is_some_and(|m| m.write_only) {
@@ -334,41 +349,43 @@ impl super::report::RegionLayout {
                         'p'
                     }
                 )
-                .unwrap();
-                let label: &[u8] = match m {
-                    Some(Mapping {
-                        origin: Origin::File(f),
-                        ..
-                    }) => &f.path,
-                    Some(Mapping {
-                        origin: Origin::SharedAnon(_),
-                        name: None,
-                        ..
-                    }) => b"/dev/zero (deleted)",
-                    Some(Mapping {
-                        origin: Origin::SharedAnon(_),
-                        name: Some(_),
-                        ..
-                    }) => b"[anon_shmem:",
-                    Some(Mapping { name: Some(_), .. }) => b"[anon:",
-                    _ if stack.is_some_and(|sp| start <= sp && sp < end) => b"[stack]",
-                    _ => b"",
-                };
-                if !label.is_empty() {
-                    text.resize(text.len().max(line + 73), b' ');
-                    for &byte in label {
-                        if byte == b'\n' {
-                            text.extend_from_slice(b"\\012");
-                        } else {
-                            text.push(byte);
+                    .unwrap();
+                    let label: &[u8] = match m {
+                        Some(Mapping {
+                            origin: Origin::File(f),
+                            ..
+                        }) => &f.path,
+                        Some(Mapping {
+                            origin: Origin::SharedAnon(_),
+                            name: None,
+                            ..
+                        }) => b"/dev/zero (deleted)",
+                        Some(Mapping {
+                            origin: Origin::SharedAnon(_),
+                            name: Some(_),
+                            ..
+                        }) => b"[anon_shmem:",
+                        Some(Mapping { name: Some(_), .. }) => b"[anon:",
+                        _ if stack.is_some_and(|sp| start <= sp && sp < end) => b"[stack]",
+                        _ => b"",
+                    };
+                    if !label.is_empty() {
+                        text.resize(text.len().max(line + 73), b' ');
+                        for &byte in label {
+                            if byte == b'\n' {
+                                text.extend_from_slice(b"\\012");
+                            } else {
+                                text.push(byte);
+                            }
+                        }
+                        if let Some(name) = m.and_then(|m| m.name.as_ref()) {
+                            text.extend_from_slice(name);
+                            text.push(b']');
                         }
                     }
-                    if let Some(name) = m.and_then(|m| m.name.as_ref()) {
-                        text.extend_from_slice(name);
-                        text.push(b']');
-                    }
+                    text.push(b'\n');
                 }
-                text.push(b'\n');
+                visit(&mut text, start, end, perm, m);
             });
         }
         text.into()

@@ -14,6 +14,7 @@ use trames_memory::{MemoryError, PageBacking, SharedPage, PAGE_SIZE};
 use writers::WriteLease;
 pub(super) use writers::Writers;
 pub(super) struct FilePage {
+    owners: trames_memory::MappedResidents,
     identity: u64,
     bytes: RwLock<PageStorage>,
     writeback: std::sync::Mutex<()>,
@@ -100,6 +101,7 @@ impl PageStorage {
 impl FilePage {
     fn new(bytes: PageStorage) -> Arc<Self> {
         Arc::new(Self {
+            owners: Default::default(),
             identity: trames_memory::new_backing_identity(),
             bytes: RwLock::new(bytes),
             writeback: std::sync::Mutex::new(()),
@@ -745,6 +747,12 @@ impl FileMapping {
     }
 }
 impl PageBacking for FileMapping {
+    fn mapped_residents(&self) -> Option<&trames_memory::MappedResidents> {
+        Some(&self.page.owners)
+    }
+    fn proc_dirty(&self) -> bool {
+        self.page.dirty.load(Ordering::Relaxed)
+    }
     fn proc_file(&self) -> Option<trames_memory::MappingFileInfo> {
         let FdKind::Node(path) = &self.open.kind else {
             return None;
@@ -2252,6 +2260,29 @@ mod tests {
         );
         assert!(m.fill_with(0x1fff, 2, |b| b.fill(0)).is_err());
         assert_eq!(m.read_array::<1>(0x1fff).unwrap(), [91]);
+    }
+
+    #[test]
+    fn smaps_accounts_for_live_file_alias_writes_before_worker_commit() {
+        use trames_memory::{parallel::Registry, CpuMemory};
+        let mut v = Vfs::default();
+        let fd = v.open_at(-100, b"/accounted", 0x42, 0o600).unwrap();
+        v.truncate_fd(fd, PAGE_SIZE).unwrap();
+        let mut mm = Memory::default();
+        mapped(&v, &mut mm, fd, 0x1000, PAGE_SIZE, true, Permissions::RW);
+        mapped(&v, &mut mm, fd, 0x5000, PAGE_SIZE, true, Permissions::R);
+        let mut view = mm.parallel_view(&mut Registry::default()).unwrap();
+        view.write(0x1000, b"x").unwrap();
+        let mut value = [0];
+        view.read(0x5000, &mut value).unwrap();
+        assert_eq!(value, [b'x']);
+        let body = mm.smaps(false).unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert_eq!(text.lines().filter(|l| *l == "Pss: 2 kB").count(), 2);
+        assert_eq!(
+            text.lines().filter(|l| *l == "Shared_Dirty: 4 kB").count(),
+            2
+        );
     }
 
     #[test]
