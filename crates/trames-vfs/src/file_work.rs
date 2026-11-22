@@ -61,6 +61,38 @@ impl FileTarget {
     }
     /// Finish through the caller's existing mm before FileOutput can overwrite
     /// its source. None leaves both guest output and the original f_pos intact.
+    pub fn proc_io_local(
+        &self,
+        command: &FileCommand,
+        memory: &mut impl trames_memory::CpuMemory,
+    ) -> Option<Result<FileValue>> {
+        let open = &self.0.open;
+        let file = open.runtime_file.as_ref()?;
+        if let FileCommand::Write { bytes, offset } | FileCommand::WriteSync { bytes, offset, .. } =
+            command
+        {
+            if !file.is_memory() {
+                return None;
+            }
+            if !fd_can_write(open.flags.get()) {
+                return Some(Err(Errno(9)));
+            }
+            if let Some(offset) = offset {
+                return Some(if *offset > i64::MAX as u64 {
+                    Err(Errno(22))
+                } else {
+                    file.write_local(*offset, bytes, memory)
+                        .map(FileValue::Count)
+                });
+            }
+            let mut position = open.file_position.lock().unwrap();
+            return Some(file.write_local(position.value, bytes, memory).map(|n| {
+                position.value += n;
+                FileValue::Count(n)
+            }));
+        }
+        self.proc_read_local(command, memory)
+    }
     pub fn proc_read_local(
         &self,
         command: &FileCommand,

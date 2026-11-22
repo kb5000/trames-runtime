@@ -73,7 +73,7 @@ impl ProcImage {
             .map(|result| if result.is_ok() { out.len() } else { 0 })
     }
 }
-fn read_range(
+pub(super) fn read_range(
     mut address: u64,
     mut count: usize,
     mut read: impl FnMut(u64, &mut [u8]) -> Option<usize>,

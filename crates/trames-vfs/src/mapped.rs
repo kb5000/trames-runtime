@@ -771,6 +771,7 @@ impl PageBacking for FileMapping {
             device,
             inode: node.inode,
             path: path.into(),
+            path_mount: self.mount.as_ref().map(|m| m.identity().id),
         })
     }
     fn layout(&self) -> Option<Arc<trames_memory::layout::Layout>> {

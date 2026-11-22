@@ -11,6 +11,7 @@ pub(super) struct ProcFile {
     target: Option<Arc<dyn ProcTask>>,
     memory: Option<trames_memory::MemoryReport>,
     saved: Option<Vec<u8>>,
+    map_root: Option<trames_memory::MappingRoot>,
     payload: Option<Payload>,
     readers: Mutex<Readers>,
     smaps: Mutex<SmapsStream>,
@@ -34,6 +35,7 @@ impl ProcSource for PublishedGlobal {
 }
 #[derive(Clone, Copy)]
 enum Payload {
+    Memory,
     CommandLine,
     Environment,
 }
@@ -70,9 +72,36 @@ impl ProcWait {
         }
     }
 }
+pub(super) fn memory_path(path: &[u8]) -> bool {
+    let Some(prefix) = path
+        .strip_suffix(b"/mem")
+        .and_then(|p| p.strip_prefix(b"/proc/"))
+    else {
+        return false;
+    };
+    let mut parts = prefix.split(|b| *b == b'/');
+    parts.next().and_then(proc_task_id).is_some()
+        && match parts.next() {
+            None => true,
+            Some(b"task") => {
+                parts.next().and_then(proc_task_id).is_some() && parts.next().is_none()
+            }
+            _ => false,
+        }
+}
 impl ProcFile {
     pub fn live_payload(&self) -> bool {
         self.payload.is_some() || self.is_smaps()
+    }
+    pub(super) fn is_memory(&self) -> bool {
+        matches!(self.payload, Some(Payload::Memory))
+    }
+    pub(super) fn check_memory_open(&self, credentials: &Credentials, group: u32) -> Result<()> {
+        self.target.as_ref().ok_or(Errno(3))?.check_memory_open(
+            credentials,
+            group,
+            self.memory.as_ref().ok_or(Errno(3))?,
+        )
     }
     fn is_smaps(&self) -> bool {
         self.path.ends_with(b"/smaps") || self.path.ends_with(b"/smaps_rollup")
@@ -86,9 +115,12 @@ impl ProcFile {
         }
         let mut stream = self.smaps.lock().unwrap();
         if offset == 0 || stream.bytes.is_none() {
-            let read = stream
-                .pending
-                .get_or_insert_with(|| mm.request_smaps(self.path.ends_with(b"/smaps_rollup")));
+            let read = stream.pending.get_or_insert_with(|| {
+                mm.request_smaps_at_root(
+                    self.path.ends_with(b"/smaps_rollup"),
+                    self.map_root.clone(),
+                )
+            });
             let Some(result) = read.result().cloned() else {
                 return ProcRead::Waiting(vec![ProcWait::Smaps(read.clone())]);
             };
@@ -104,9 +136,39 @@ impl ProcFile {
             data[start..data.len().min(start.saturating_add(count))].to_vec()
         ))
     }
+    pub(super) fn write_local(
+        &self,
+        address: u64,
+        bytes: &[u8],
+        caller: &mut impl trames_memory::CpuMemory,
+    ) -> Result<u64> {
+        let mm = self.memory.as_ref().ok_or(Errno(3))?;
+        if !mm.alive() || bytes.is_empty() {
+            return Ok(0);
+        }
+        if caller.proc_address_space() != Some(mm.identity()) {
+            return Err(Errno(95));
+        }
+        let mut done = 0;
+        while done < bytes.len() {
+            let at = address + done as u64;
+            let end = bytes
+                .len()
+                .min(done + (trames_memory::PAGE_SIZE - at % trames_memory::PAGE_SIZE) as usize);
+            if at >= 1 << 56 || caller.write(at, &bytes[done..end]).is_err() {
+                return if done == 0 {
+                    Err(Errno(5))
+                } else {
+                    Ok(done as u64)
+                };
+            }
+            done = end;
+        }
+        Ok(done as u64)
+    }
     fn payload_memory(&self) -> Result<Option<trames_memory::MemoryReport>> {
         match self.payload {
-            Some(Payload::Environment) => Ok(self.memory.clone()),
+            Some(Payload::Environment | Payload::Memory) => Ok(self.memory.clone()),
             Some(Payload::CommandLine) => {
                 let target = self.target.as_ref().unwrap();
                 if !target.present() {
@@ -119,16 +181,39 @@ impl ProcFile {
     }
     fn image_read(
         &self,
-        ranges: trames_memory::ImageRanges,
+        memory: &trames_memory::MemoryReport,
         offset: u64,
         count: usize,
         read: impl FnMut(u64, &mut [u8]) -> Option<usize>,
     ) -> Option<Vec<u8>> {
-        let image = crate::ProcImage(ranges);
+        let image = || memory.image_ranges().map(crate::ProcImage);
         match self.payload.unwrap() {
-            Payload::CommandLine => image.command_line(offset, count, read),
-            Payload::Environment => image.environment(offset, count, read),
+            Payload::Memory => {
+                // File offsets are untagged guest addresses. Bound work and page pins per read.
+                if offset >= 1 << 56 {
+                    Some(Vec::new())
+                } else {
+                    let remaining = (1u64 << 56) - offset;
+                    crate::proc_image::read_range(
+                        offset,
+                        count.min(64 * 1024).min(remaining as usize),
+                        read,
+                    )
+                }
+            }
+            Payload::CommandLine => image()?.command_line(offset, count, read),
+            Payload::Environment => image()?.environment(offset, count, read),
         }
+    }
+    fn read_result(&self, bytes: Vec<u8>, count: usize) -> Result<Vec<u8>> {
+        if self.is_memory()
+            && count != 0
+            && bytes.is_empty()
+            && self.memory.as_ref().is_some_and(|mm| mm.alive())
+        {
+            return Err(Errno(5));
+        }
+        Ok(bytes)
     }
     pub fn read_local(
         &self,
@@ -147,11 +232,10 @@ impl ProcFile {
         if caller.proc_address_space() != Some(memory.identity()) {
             return None;
         }
-        let ranges = memory.image_ranges()?;
-        self.image_read(ranges, offset, count, |a, out| {
+        self.image_read(&memory, offset, count, |a, out| {
             crate::ProcImage::local_reader(caller, a, out)
         })
-        .map(Ok)
+        .map(|bytes| self.read_result(bytes, count))
     }
     pub fn read_payload(&self, offset: u64, count: usize) -> ProcRead {
         if self.is_smaps() {
@@ -164,9 +248,6 @@ impl ProcFile {
         let Some(memory) = memory.filter(|m| m.alive()) else {
             return ProcRead::Complete(Ok(Vec::new()));
         };
-        let Some(ranges) = memory.image_ranges() else {
-            return ProcRead::Complete(Ok(Vec::new()));
-        };
         let mut readers = self.readers.lock().unwrap();
         if readers
             .memory
@@ -176,8 +257,15 @@ impl ProcFile {
             readers.pages.clear();
             readers.memory = Some(memory.clone());
         }
+        if self.is_memory() {
+            // Keep outstanding leases across a retry, without pinning every page ever visited.
+            readers.pages.retain(|base, _| {
+                *base >= offset & !(trames_memory::PAGE_SIZE - 1)
+                    && *base < offset.saturating_add(count.min(64 * 1024) as u64)
+            });
+        }
         let mut missing = Vec::new();
-        let bytes = self.image_read(ranges, offset, count, |address, out| {
+        let bytes = self.image_read(&memory, offset, count, |address, out| {
             let base = address & !(trames_memory::PAGE_SIZE - 1);
             let page = match readers.pages.entry(base) {
                 std::collections::btree_map::Entry::Occupied(page) => page.into_mut(),
@@ -202,7 +290,7 @@ impl ProcFile {
             memory.request_reads(&missing);
             return ProcRead::Waiting(missing.into_iter().map(ProcWait::Page).collect());
         }
-        ProcRead::Complete(Ok(bytes.expect("admitted original mm reader")))
+        ProcRead::Complete(self.read_result(bytes.unwrap_or_default(), count))
     }
     pub fn read(&self, offset: u64, count: usize, caller: &Vfs) -> Result<Vec<u8>> {
         if count == 0 {
@@ -278,7 +366,7 @@ impl ProcFile {
                     .as_ref()
                     .is_some_and(|target| target.identity() == task.identity)
                 {
-                    task.maps = memory.maps().to_vec();
+                    task.maps = memory.maps_at_root(self.map_root.as_ref()).to_vec();
                 }
             }
         }
@@ -361,7 +449,9 @@ impl Vfs {
         {
             return None;
         }
-        let payload = if demand.arguments() {
+        let payload = if memory_path(path) {
+            Some(Payload::Memory)
+        } else if demand.arguments() {
             Some(Payload::CommandLine)
         } else if demand.environment() {
             Some(Payload::Environment)
@@ -372,9 +462,10 @@ impl Vfs {
         let memory = if smaps || demand.mappings() || payload.is_some() {
             let memory = target.as_ref()?.memory_report();
             if payload.is_some()
-                && memory
-                    .as_ref()
-                    .is_some_and(|m| m.image_ranges().is_none() || !m.supports_reads())
+                && memory.as_ref().is_some_and(|m| {
+                    (!matches!(payload, Some(Payload::Memory)) && m.image_ranges().is_none())
+                        || !m.supports_reads()
+                })
             {
                 return None; // legacy synthetic fixtures without an actual image
             }
@@ -444,6 +535,23 @@ impl Vfs {
                 ))
             }),
             target,
+            // The proc directory can predate chroot. Capture the filesystem
+            // view when opening the maps file through that directory.
+            map_root: if (smaps || demand.mappings())
+                && self.context.paths.borrow().root_node.is_some()
+            {
+                self.root_location()
+                    .ok()
+                    .filter(|root| root.key != b"/")
+                    .and_then(|root| {
+                        Some(trames_memory::MappingRoot {
+                            mount: root.mount?.id,
+                            path: root.key.into(),
+                        })
+                    })
+            } else {
+                None
+            },
             memory,
             saved,
             payload,

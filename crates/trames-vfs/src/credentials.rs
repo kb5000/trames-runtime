@@ -89,6 +89,27 @@ impl CredentialState {
                 .ok_or(Errno(3))
         })
     }
+    pub fn check_proc_memory(
+        &self,
+        caller: &Credentials,
+        same_group: bool,
+        mm: &trames_memory::MemoryReport,
+    ) -> Result<()> {
+        let target = self.current.read().unwrap();
+        let binding = self.pidfd.lock().unwrap();
+        let resources = binding.as_ref().ok_or(Errno(3))?;
+        if !caller.can_inspect_credentials(same_group, &target, resources.dumpable.get()) {
+            return Err(Errno(13));
+        }
+        if !resources
+            .memory
+            .as_ref()
+            .is_some_and(|image| image.matches(mm))
+        {
+            return Err(Errno(3));
+        }
+        Ok(())
+    }
     pub fn receive_pidfd_file(
         &self,
         caller: &Credentials,
@@ -217,7 +238,15 @@ impl ExecCredentials {
         self.apply_for_exec(view, false)
     }
     pub fn apply_for_exec(&self, view: &mut Vfs, externally_shared_fs: bool) -> bool {
-        let no_new_privs = self.no_new_privs();
+        self.apply_observed_exec(view, externally_shared_fs, false)
+    }
+    pub fn apply_observed_exec(
+        &self,
+        view: &mut Vfs,
+        externally_shared_fs: bool,
+        traced: bool,
+    ) -> bool {
+        let no_new_privs = self.no_new_privs() || traced;
         let old_permitted = self.original.caps.permitted;
         let mut c = self.original.clone();
         if !self.nosuid && !no_new_privs {
@@ -315,10 +344,12 @@ impl Credentials {
                 && (bits & 1 == 0 || matches!(node.content, Content::Directory))
     }
     pub fn can_read_proc_task(&self, same_group: bool, target: &ProcessInfo) -> bool {
-        let t = &target.credentials;
+        self.can_inspect_credentials(same_group, &target.credentials, !target.nondumpable)
+    }
+    fn can_inspect_credentials(&self, same_group: bool, t: &Credentials, dumpable: bool) -> bool {
         same_group
             || self.has_ns_cap(&t.user_namespace, capabilities::SYS_PTRACE)
-            || !target.nondumpable
+            || dumpable
                 && [t.uid, t.euid, t.suid].iter().all(|id| *id == self.fsuid)
                 && [t.gid, t.egid, t.sgid].iter().all(|id| *id == self.fsgid)
                 && self.user_namespace == t.user_namespace
@@ -881,6 +912,18 @@ mod process_transfer_tests {
             );
         };
         publish(&old, &policy);
+        let mut fs_caller = Credentials::user(1300, 1300);
+        fs_caller.fsuid = creds.uid;
+        fs_caller.fsgid = creds.gid;
+        assert_eq!(
+            state.check_proc_memory(&fs_caller, false, &old.memory_report()),
+            Ok(())
+        );
+        fs_caller.fsuid = 1300;
+        assert_eq!(
+            state.check_proc_memory(&fs_caller, false, &old.memory_report()),
+            Err(Errno(13))
+        );
         let retained = state
             .admit_process_memory(&creds, &old.memory_report())
             .unwrap();
@@ -910,6 +953,10 @@ mod process_transfer_tests {
         assert!(state
             .admit_process_memory(&creds, &new.memory_report())
             .is_ok());
+        assert_eq!(
+            state.check_proc_memory(&creds, false, &old.memory_report()),
+            Err(Errno(3))
+        );
         assert!(!retained.matches(&new.memory_report()));
     }
 }

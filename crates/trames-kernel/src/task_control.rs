@@ -315,6 +315,9 @@ impl Group {
         let state = self.state.lock().unwrap();
         state.completed.then_some(state.exit_status).flatten()
     }
+    pub(crate) fn wait_child(&self) -> Option<Arc<Child>> {
+        self.state.lock().unwrap().child.upgrade()
+    }
     pub fn has_live_members(&self) -> bool {
         self.state.lock().unwrap().live != 0
     }

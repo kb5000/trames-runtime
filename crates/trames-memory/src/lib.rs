@@ -31,7 +31,7 @@ pub use read_export::MemoryRead;
 mod proc_maps;
 mod smaps;
 pub use backing::MappedResidents;
-pub use proc_maps::MappingFileInfo;
+pub use proc_maps::{MappingFileInfo, MappingRoot};
 pub use smaps::{SmapsRead, SmapsResult};
 mod report;
 mod reservations;

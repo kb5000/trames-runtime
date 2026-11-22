@@ -260,11 +260,19 @@ impl<C: Cpu> Lifecycle<C> {
             self.birth.bind_task_cgroup(actual, p);
             p.publish_stop_hold(actual);
             control.finish(Some(p.stop_held()));
+            let trace = p
+                .signals
+                .io
+                .voluntarily_traced()
+                .then(|| (p.signals.io.clone(), p.cpu.architectural_state()));
             self.tasks.restore(pid, actual, &custody);
             if let Some(previous) = old_presence {
                 previous.visibility().reap();
             }
             self.memory.retire(old_memory)?;
+            if let Some((task, state)) = trace {
+                task.trace_point(5, None, || state);
+            }
             epoch.forget_checkpoint_member(pid);
             let elapsed = began.elapsed();
             if job.work.syscalls.as_ref().is_some_and(|s| s.profile) {

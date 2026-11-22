@@ -147,6 +147,7 @@ impl Parents {
         choose: impl FnOnce() -> Option<(u32, Arc<IoTask>)>,
         info: Info,
     ) {
+        task.release_tracees();
         let (notifications, wait_notice) = {
             let mut state = self.0.lock().unwrap();
             let id = key(task);

@@ -8,6 +8,26 @@ pub struct MappingFileInfo {
     pub device: u64,
     pub inode: u64,
     pub path: Arc<[u8]>,
+    /// Original mount for a filesystem-relative path. Executable image labels
+    /// may already have been rendered relative to the executing task.
+    pub path_mount: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MappingRoot {
+    pub mount: u64,
+    pub path: Arc<[u8]>,
+}
+impl MappingRoot {
+    fn visible<'a>(&self, file: &'a MappingFileInfo) -> &'a [u8] {
+        if file.path_mount != Some(self.mount) || self.path.as_ref() == b"/" {
+            return &file.path;
+        }
+        file.path
+            .strip_prefix(self.path.as_ref())
+            .filter(|relative| relative.starts_with(b"/"))
+            .unwrap_or(&file.path)
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -309,12 +329,13 @@ impl super::report::RegionLayout {
         sizes
     }
     pub(super) fn maps(&self, stack: Option<u64>) -> Arc<[u8]> {
-        self.describe_maps(stack, true, |_, _, _, _, _| {})
+        self.describe_maps(stack, true, None, |_, _, _, _, _| {})
     }
     pub(super) fn describe_maps(
         &self,
         stack: Option<u64>,
         headers: bool,
+        root: Option<&MappingRoot>,
         mut visit: impl FnMut(&mut Vec<u8>, u64, u64, Permissions, Option<&Mapping>),
     ) -> Arc<[u8]> {
         let mut text = Vec::new();
@@ -354,7 +375,7 @@ impl super::report::RegionLayout {
                         Some(Mapping {
                             origin: Origin::File(f),
                             ..
-                        }) => &f.path,
+                        }) => root.map_or(f.path.as_ref(), |r| r.visible(f)),
                         Some(Mapping {
                             origin: Origin::SharedAnon(_),
                             name: None,

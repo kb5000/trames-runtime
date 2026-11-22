@@ -594,9 +594,15 @@ impl Snapshot {
                 .is_some_and(trames_vfs::CgroupTask::frozen)
     }
     pub fn quiesced(&self) -> bool {
-        self.io_signals.lifecycle().stopped() || self.frozen()
+        self.io_signals.trace_stopped() || self.io_signals.lifecycle().stopped() || self.frozen()
     }
     pub fn next_io_signal(&self) -> Option<(u32, bool, trames_kernel::signal::Action)> {
+        if self.io_signals.trace_stopped() {
+            return self
+                .io_signals
+                .next(1 << 8)
+                .map(|(sig, shared)| (sig, shared, Default::default()));
+        }
         if self.frozen() {
             self.io_signals.next_frozen_signal(&self.actions)
         } else {
@@ -970,9 +976,10 @@ impl Snapshot {
             number @ (270 | 271) if cpu.x(0) as u32 == self.io_signals.local_tid() => {
                 trames_linux::process_vm_local(number, std::array::from_fn(|i| cpu.x(i)), memory)
             }
-            117 => self
-                .io_routes
-                .ptrace(&self.io_signals, std::array::from_fn(|i| cpu.x(i))),
+            117 => {
+                self.io_routes
+                    .ptrace(&self.io_signals, std::array::from_fn(|i| cpu.x(i)), memory)
+            }
             number @ 154..=157 => self.io_routes.job_call(
                 &self.io_signals,
                 number,

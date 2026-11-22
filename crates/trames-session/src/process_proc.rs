@@ -210,9 +210,12 @@ impl<C: Cpu> Process<C> {
             pid,
             tgid: self.tgid,
             parent: self.family.parent(),
+            tracer: self.signals.io.tracer_tid(),
             group: self.group(),
             session: self.session(),
-            state: if self.stopped() && !matches!(self.state, State::Zombie(_)) {
+            state: if self.signals.io.trace_stopped() && !matches!(self.state, State::Zombie(_)) {
+                't'
+            } else if self.stopped() && !matches!(self.state, State::Zombie(_)) {
                 'T'
             } else {
                 match self.state {

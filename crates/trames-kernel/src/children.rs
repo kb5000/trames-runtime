@@ -87,6 +87,8 @@ struct State {
     parent: Weak<Children>,
     parent_group: Weak<crate::task_control::Group>,
     event: Option<i32>,
+    trap: Option<i32>,
+    traced_by_parent: bool,
     stopped: bool,
     exited: bool,
     reaped: bool,
@@ -228,6 +230,8 @@ impl Child {
                 }
                 return notices;
             }
+            state.traced_by_parent = false;
+            state.trap = None;
             (std::mem::replace(&mut state.parent, next), previous_id)
         };
         if let Some(old) = previous.upgrade() {
@@ -259,6 +263,9 @@ impl Child {
             if status.is_some() && !exited && state.stopped == stopped {
                 return Notice(None, Weak::new(), Vec::new());
             }
+            if exited {
+                state.trap = None;
+            }
             state.stopped = stopped;
             state.event = status;
             state.exited = exited;
@@ -276,6 +283,32 @@ impl Child {
     }
     fn publish(&self, status: Option<i32>, exited: bool) {
         self.publish_quiet(status, exited).notify();
+    }
+    pub(crate) fn trace_by_parent(&self, parent: &Arc<Children>) -> Result<Notice, Errno> {
+        let mut state = self.0.lock().unwrap();
+        if state.reaped || state.exited || state.parent.as_ptr() != Arc::as_ptr(parent) {
+            return Err(Errno(3));
+        }
+        state.traced_by_parent = true;
+        Ok(Notice(Some(parent.clone()), Weak::new(), Vec::new()))
+    }
+    pub(crate) fn detach_trace(&self) -> Notice {
+        let mut state = self.0.lock().unwrap();
+        state.trap = None;
+        state.traced_by_parent = false;
+        Notice(state.parent.upgrade(), Weak::new(), Vec::new())
+    }
+    pub(crate) fn trace_event(&self, signal: Option<i32>) -> Notice {
+        let mut state = self.0.lock().unwrap();
+        if !state.traced_by_parent || state.exited || state.reaped {
+            return Notice(None, Weak::new(), Vec::new());
+        }
+        state.trap = signal.map(|s| (s << 8) | 0x7f);
+        Notice(
+            state.parent.upgrade(),
+            state.parent_group.clone(),
+            Vec::new(),
+        )
     }
     pub(crate) fn stopped_quiet(&self, signal: u32) -> Notice {
         self.publish_quiet(Some(((signal as i32) << 8) | 0x7f), false)
@@ -311,10 +344,12 @@ impl Child {
         state.exited = true;
         state.stopped = false;
         state.event = Some(status);
+        state.trap = None;
         let signo = parent.map_or(state.exit_signal.signo, |(_, image)| {
             state.exit_signal.delivered(image)
         });
-        let auto_reap = signo == 17 && parent.is_some_and(|(auto, _)| auto);
+        let auto_reap =
+            !state.traced_by_parent && signo == 17 && parent.is_some_and(|(auto, _)| auto);
         let parent = state.parent.upgrade();
         if auto_reap {
             state.reaped = true;
@@ -425,6 +460,9 @@ impl Wait {
         }
     }
     fn event_code(&self, state: &State) -> Option<i32> {
+        if state.trap.is_some() && (self.number == 260 || self.options() & 2 != 0) {
+            return Some(4); // CLD_TRAPPED
+        }
         let status = state.event?;
         let options = self.options();
         if state.exited && options & 4 != 0 {
@@ -446,7 +484,9 @@ impl Wait {
                     .owner
                     .as_ref()
                     .is_some_and(|owner| owner.parent_thread() == self.caller)
-            || options & WALL == 0 && (options & WCLONE != 0) != (child.exit_signal.signo != 17)
+            || !child.traced_by_parent
+                && options & WALL == 0
+                && (options & WCLONE != 0) != (child.exit_signal.signo != 17)
         {
             return false;
         }
@@ -585,10 +625,11 @@ impl Children {
                 continue;
             }
             found = true;
-            let Some(status) = state.event else { continue };
             let Some(code) = request.event_code(&state) else {
                 continue;
             };
+            let status =
+                if code == 4 { state.trap } else { state.event }.expect("selected wait event");
             let local = namespace.local(state.id);
             // Only waitid with a siginfo destination observes the UID.
             let siginfo = (request.number == 95 && request.args[2] != 0)
@@ -604,7 +645,11 @@ impl Children {
             let mut cleanup = None;
             if options & 0x01000000 == 0 {
                 state.reaped = state.exited;
-                state.event = None;
+                if code == 4 {
+                    state.trap = None;
+                } else {
+                    state.event = None;
+                }
                 if state.reaped {
                     self.collected.lock().unwrap().include(usage);
                     self.reaped.store(true, Ordering::Relaxed);
@@ -660,7 +705,7 @@ impl Children {
                     bytes[16..20].copy_from_slice(&local.to_le_bytes());
                     bytes[20..24].copy_from_slice(&uid.to_le_bytes());
                     let value = match code {
-                        1 | 5 => status >> 8,
+                        1 | 4 | 5 => status >> 8,
                         6 => 18,
                         _ => status & 127,
                     };

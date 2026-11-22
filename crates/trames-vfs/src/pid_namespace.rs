@@ -380,6 +380,7 @@ impl Vfs {
             p.pid = ns.local(p.pid);
             p.tgid = ns.local(p.tgid);
             p.parent = ns.local(p.parent);
+            p.tracer = ns.local(p.tracer);
             p.group = ns.local(p.group);
             p.session = ns.local(p.session);
             if let Some((_, foreground)) = &mut p.terminal_stat {

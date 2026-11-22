@@ -2753,6 +2753,7 @@ impl Vfs {
         let mount_file = (flags & O_PATH == 0)
             .then(|| self.proc_mount_file(&p))
             .flatten();
+        let proc_mem = proc_file::memory_path(&p) && self.uses_pseudo(&p);
         let check_write = |node: Option<&NodeRef>| -> Result<()> {
             if flags & O_PATH == 0 && (flags & 3 != 0 || flags & 0x200 != 0) {
                 if let Some(mount) = &p.mount {
@@ -2774,6 +2775,7 @@ impl Vfs {
                 && network_control.is_none()
                 && self.uses_pseudo(&p)
                 && self.pseudo_readonly(&p)
+                && !proc_mem
                 && !node.is_some_and(|n| n.seq_file)
                 && (flags & 3 != 0
                     || flags & O_TRUNC != 0
@@ -2807,13 +2809,17 @@ impl Vfs {
                     n.volatile && matches!(n.content, Content::File(_))
                 };
                 if flags & O_PATH == 0
-                    && (flags & 3 == 0 || node.seq_file)
+                    && (flags & 3 == 0 || node.seq_file || proc_mem)
                     && oom.is_none()
                     && network_control.is_none()
                     && mount_file.is_none()
                     && proc_regular
                 {
                     runtime_file = self.proc_runtime_file(&p);
+                    if proc_mem {
+                        let file = runtime_file.as_ref().ok_or(Errno(3))?;
+                        file.check_memory_open(&self.credentials, self.lock_owner)?;
+                    }
                 }
                 if let Some(query) = &self.query {
                     let n = node.borrow();
@@ -2989,6 +2995,7 @@ impl Vfs {
         let truncate = existed
             && flags & 0x200 != 0
             && !node.seq_file
+            && !proc_mem
             && !Self::cgroup_mount(&p)
             && oom.is_none()
             && network_control.is_none();
@@ -3769,6 +3776,10 @@ impl Vfs {
             }
             return Ok(count);
         }
+        if o.runtime_file.as_ref().is_some_and(|file| file.is_memory()) {
+            // Mutable guest memory is available on its own executing worker.
+            return Err(Errno(95));
+        }
         if let Some(count) = self.oom_write(&o, bytes)? {
             // proc oom_score_adj_write ignores and does not advance f_pos.
             return Ok(count);
@@ -4075,7 +4086,10 @@ impl Vfs {
         if let Some(log) = &o.kernel_log {
             return log.seek(offset, whence);
         }
-        if whence == 2 && (node.seq_file || !n.volatile && matches!(n.content, Content::Directory))
+        if whence == 2
+            && (o.runtime_file.as_ref().is_some_and(|file| file.is_memory())
+                || node.seq_file
+                || !n.volatile && matches!(n.content, Content::Directory))
         {
             return Err(Errno(22));
         }

@@ -145,7 +145,10 @@ impl<C: Cpu> Kernel<C> {
         // slot. Serialize the final credentials/auxv image with TSYNC publication.
         let policy = p.seccomp.birth_group();
         let _permit = policy.write_owned().into_admission();
-        runtime.refresh_credentials(runtime.externally_shared_fs);
+        runtime.refresh_credentials(
+            runtime.externally_shared_fs,
+            p.signals.io.voluntarily_traced(),
+        );
         let task = p.linux.vfs.process_context();
         {
             let body = &mut *p;
@@ -188,6 +191,7 @@ impl<C: Cpu> Kernel<C> {
         p.family.mark_exec();
         p.wait_event.exec();
         p.signals.exec();
+
         p.membarrier_registered = Arc::new(std::sync::atomic::AtomicBool::new(false));
         p.state = State::Ready;
         old_memory
@@ -283,6 +287,9 @@ impl<C: Cpu> Kernel<C> {
             previous.visibility().reap();
         }
         self.retire_detached_memory(old_memory)?;
+        p.signals
+            .io
+            .trace_point(5, None, || p.cpu.architectural_state());
         Ok(())
     }
     #[cfg(all(test, trames_interpreter_conformance))]
@@ -1343,13 +1350,14 @@ impl<C: Cpu> Image<C> {
             self.externally_shared_fs = true;
         }
     }
-    fn refresh_credentials(&mut self, externally_shared_fs: bool) {
-        if !externally_shared_fs && self.credentials.no_new_privs() == self.no_new_privs {
+    fn refresh_credentials(&mut self, externally_shared_fs: bool, traced: bool) {
+        if !traced && !externally_shared_fs && self.credentials.no_new_privs() == self.no_new_privs
+        {
             return;
         }
-        self.no_new_privs = self
-            .credentials
-            .apply_for_exec(&mut self.linux.vfs, externally_shared_fs);
+        self.no_new_privs =
+            self.credentials
+                .apply_observed_exec(&mut self.linux.vfs, externally_shared_fs, traced);
         let c = &self.linux.vfs.credentials;
         let base = self.cpu.sp()
             + 8 * (3 + self.linux.arguments.len() + self.linux.environment.len()) as u64;

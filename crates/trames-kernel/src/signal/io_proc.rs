@@ -16,6 +16,16 @@ impl ProcPid {
     }
 }
 impl trames_vfs::ProcTask for ProcPid {
+    fn check_memory_open(
+        &self,
+        credentials: &trames_vfs::Credentials,
+        group: u32,
+        memory: &trames_memory::MemoryReport,
+    ) -> Result<(), trames_vfs::Errno> {
+        self.task()
+            .ok_or(trames_vfs::Errno(3))?
+            .check_memory_open(credentials, group, memory)
+    }
     fn exited_cgroup(&self) -> Option<trames_vfs::CgroupTask> {
         let task = self.task()?;
         if task.live() {
@@ -148,6 +158,15 @@ impl IoTask {
     }
 }
 impl trames_vfs::ProcTask for IoTask {
+    fn check_memory_open(
+        &self,
+        credentials: &trames_vfs::Credentials,
+        group: u32,
+        memory: &trames_memory::MemoryReport,
+    ) -> Result<(), trames_vfs::Errno> {
+        self.credentials()
+            .check_proc_memory(credentials, self.tgid() == group, memory)
+    }
     fn present(&self) -> bool {
         self.identifies(0, self.pid.load(Ordering::Relaxed))
     }
@@ -252,6 +271,7 @@ impl trames_vfs::ProcTask for IoTask {
             return None;
         }
         info.tgid = self.tgid();
+        info.tracer = self.tracer_tid();
         info.group = self.group();
         info.session = self.session();
         if demand.terminal_stat() {
@@ -282,6 +302,8 @@ impl trames_vfs::ProcTask for IoTask {
             info.executable_file = None;
             info.cwd_directory = None;
             info.root_directory = None;
+        } else if self.trace_stopped() {
+            info.state = 't';
         } else if self.lifecycle().stopped() {
             info.state = 'T';
         }

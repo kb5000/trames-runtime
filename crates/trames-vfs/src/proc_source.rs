@@ -110,6 +110,14 @@ pub trait ProcTask: Send + Sync {
     fn pid(&self) -> u32;
     fn observe(&self, demand: ProcRefresh, residency: Option<usize>) -> Option<ProcessInfo>;
     fn memory_report(&self) -> Option<trames_memory::MemoryReport>;
+    fn check_memory_open(
+        &self,
+        _credentials: &Credentials,
+        _group: u32,
+        _memory: &trames_memory::MemoryReport,
+    ) -> Result<()> {
+        Err(Errno(3))
+    }
     /// Per-mm dump policy of the original task. A zombie has released its mm.
     fn dump_policy(&self) -> Result<Option<Dumpable>> {
         Err(Errno(3))

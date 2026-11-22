@@ -348,6 +348,7 @@ fn map_image(
         if phdr.is_some_and(|p| (s.base..s.base + s.size).contains(&p)) {
             phdr = None;
         }
+        let mut file_pages = 0;
         if s.filesz != 0 {
             // mmap exposes the prefix of the first file page and the last
             // page up to EOF. BSS starts exactly at p_filesz when present.
@@ -359,9 +360,9 @@ fn map_image(
                 file_end
             }
             .min(bytes.len());
+            file_pages = (file_end.next_multiple_of(PAGE_SIZE as usize) - start) as u64;
             if let Some(file) = file {
-                let file_pages = file_end.next_multiple_of(PAGE_SIZE as usize) - start;
-                memory.record_image_file(s.base, file_pages as u64, start as u64, file.clone());
+                memory.record_image_file(s.base, file_pages, start as u64, file.clone());
             }
             if start < end {
                 memory.write(s.base, &bytes[start..end])?;
@@ -370,7 +371,20 @@ fn map_image(
                 }
             }
         }
-        memory.protect(s.base, s.size, s.permissions)?;
+        // Linux allocates complete anonymous BSS pages with brk semantics.
+        // The partial BSS tail inside a file page keeps the segment protection.
+        let anonymous = Permissions {
+            execute: s.permissions.execute,
+            ..Permissions::RW
+        };
+        if file_pages == s.size || anonymous == s.permissions {
+            memory.protect(s.base, s.size, s.permissions)?;
+        } else {
+            if file_pages != 0 {
+                memory.protect(s.base, file_pages, s.permissions)?;
+            }
+            memory.protect(s.base + file_pages, s.size - file_pages, anonymous)?;
+        }
     }
     Ok(Image {
         entry,
@@ -427,6 +441,7 @@ mod tests {
             device: 1,
             inode: 7,
             path: b"/image".as_slice().into(),
+            path_mount: None,
         };
         let e =
             load_with_files(&b, 4 * PAGE_SIZE as usize, Some(&file), |_| unreachable!()).unwrap();

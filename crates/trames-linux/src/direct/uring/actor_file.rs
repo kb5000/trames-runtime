@@ -248,7 +248,7 @@ pub(super) fn execute(
         buffer: request.buffer.clone(),
         address: request.sqe.address(),
     };
-    if let Some(result) = file.proc_read_local(&command, memory) {
+    if let Some(result) = file.proc_io_local(&command, memory) {
         return Some(io.finish(
             FileOutcome::Complete(trames_vfs::FileReply {
                 result,

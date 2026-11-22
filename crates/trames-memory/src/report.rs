@@ -281,6 +281,18 @@ impl MemoryReport {
         let layout = self.0.state.read().unwrap().clone();
         *layout.vm_sizes.get_or_init(|| layout.regions.vm_sizes())
     }
+    pub fn maps_at_root(&self, root: Option<&MappingRoot>) -> Arc<[u8]> {
+        let Some(root) = root else {
+            return self.maps();
+        };
+        let layout = self.0.state.read().unwrap().clone();
+        layout.regions.describe_maps(
+            self.image_ranges().map(|r| r.start_stack),
+            true,
+            Some(root),
+            |_, _, _, _, _| {},
+        )
+    }
     pub fn maps(&self) -> Arc<[u8]> {
         let layout = self.0.state.read().unwrap().clone();
         layout

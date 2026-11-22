@@ -194,6 +194,9 @@ pub struct IoContext {
 }
 pub struct IoTask {
     pub(crate) posix_timers: std::sync::OnceLock<Arc<crate::timers::CpuSchedule>>,
+    trace: std::sync::OnceLock<Mutex<Option<ptrace::Relationship>>>,
+    tracees: Mutex<ptrace::Tracees>,
+    trace_stop: AtomicBool,
     pub io: crate::usage::TaskIo,
     pub proc_view: trames_vfs::ProcessView,
     proc_pid: RwLock<Option<Arc<proc_views::ProcPid>>>,
@@ -224,6 +227,9 @@ impl Default for IoTask {
     fn default() -> Self {
         Self {
             posix_timers: Default::default(),
+            trace: Default::default(),
+            tracees: Default::default(),
+            trace_stop: Default::default(),
             io: Default::default(),
             proc_view: Default::default(),
             proc_pid: Default::default(),
@@ -354,7 +360,9 @@ impl IoTask {
         self.live.load(Ordering::Relaxed) && self.presence.get().is_none_or(|p| p.present())
     }
     pub fn eligible_mask(&self, mask: u64) -> u64 {
-        if self.lifecycle().stopped() {
+        if self.trace_stopped() {
+            mask & (1 << 8)
+        } else if self.lifecycle().stopped() {
             mask & ((1 << 8) | (1 << 17))
         } else {
             mask

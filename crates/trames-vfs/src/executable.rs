@@ -204,6 +204,7 @@ impl Vfs {
             .filter(|m| m.kind == mounts::Kind::Overlay)
             .map_or(node.device, |m| m.device);
         trames_memory::MappingFileInfo {
+            path_mount: None,
             path,
             device,
             inode: node.inode,

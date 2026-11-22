@@ -545,7 +545,7 @@ impl DirectSyscalls {
         memory: &mut impl CpuMemory,
     ) -> Option<Result<u64, Errno>> {
         let paths = self.paths.as_ref()?;
-        if let Some(result) = target.proc_read_local(&command, memory) {
+        if let Some(result) = target.proc_io_local(&command, memory) {
             return Some(self.finish_file_reply(
                 trames_vfs::FileReply {
                     result,
@@ -904,7 +904,7 @@ impl DirectSyscalls {
             };
             (file, command, output)
         };
-        if let Some(result) = file.proc_read_local(&command, memory) {
+        if let Some(result) = file.proc_io_local(&command, memory) {
             return Some(self.complete_file_attempt(
                 trames_vfs::FileReply {
                     result,

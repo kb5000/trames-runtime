@@ -859,6 +859,7 @@ pub struct ProcessInfo {
     pub affinity: u64,
     pub tgid: u32,
     pub parent: u32,
+    pub tracer: u32,
     pub group: u32,
     pub session: u32,
     pub state: char,
@@ -2331,6 +2332,9 @@ impl Vfs {
                             .clone()
                             .unwrap_or_else(|| nul_list(&p.environment)),
                         b"auxv" => p.auxiliary.clone(),
+                        b"mem" if pseudo.source.is_some() => {
+                            return Ok(Some((file(Vec::new()), 0o100600)))
+                        }
                         b"maps" => p.maps.clone(),
                         b"smaps" | b"smaps_rollup" if self.pseudo.borrow().source.is_some() => {
                             Vec::new()
@@ -2471,7 +2475,7 @@ impl Vfs {
                                 .unwrap_or(0)
                                 .max(64)
                                 .next_power_of_two();
-                            format!("Name:\t{name}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t{fd_size}\nGroups:\t{}\nVmSize:\t{} kB\nVmData:\t{} kB\nVmStk:\t{} kB\nVmExe:\t{text} kB\nVmLib:\t{library} kB\nVmHWM:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{threads}\nSigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\n", p.state, state_description(p.state), p.tgid, p.pid, p.parent,
+                            format!("Name:\t{name}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t{fd_size}\nGroups:\t{}\nVmSize:\t{} kB\nVmData:\t{} kB\nVmStk:\t{} kB\nVmExe:\t{text} kB\nVmLib:\t{library} kB\nVmHWM:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{threads}\nSigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\n", p.state, state_description(p.state), p.tgid, p.pid, p.parent, p.tracer,
                                 self.credentials.local_id(false,c.uid),self.credentials.local_id(false,c.euid),self.credentials.local_id(false,c.suid),self.credentials.local_id(false,c.fsuid),self.credentials.local_id(true,c.gid),self.credentials.local_id(true,c.egid),self.credentials.local_id(true,c.sgid),self.credentials.local_id(true,c.fsgid),c.groups.iter().map(|id|self.credentials.local_id(true,*id).to_string()).collect::<Vec<_>>().join(" "),p.virtual_bytes/1024,p.vm_sizes.data/1024,p.vm_sizes.stack/1024,p.peak_resident_bytes.max(p.mapped_bytes)/1024,p.mapped_bytes/1024,p.pending,p.shared_pending,p.blocked,p.ignored,p.caught).into_bytes()
                         }
                         b"limits" => p.limit_text(task_limit as u64),
@@ -3165,6 +3169,7 @@ impl Vfs {
                             "environ",
                             "comm",
                             "maps",
+                            "mem",
                             "smaps",
                             "smaps_rollup",
                             "auxv",

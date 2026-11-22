@@ -178,7 +178,7 @@ pub(crate) struct Process<C: Cpu> {
 }
 impl<C: Cpu> Process<C> {
     fn stopped(&self) -> bool {
-        self.signals.io.lifecycle().stopped()
+        self.signals.io.trace_stopped() || self.signals.io.lifecycle().stopped()
     }
     fn runnable(&self) -> bool {
         matches!(self.state, State::Ready) && !self.stopped()
@@ -1773,6 +1773,12 @@ impl<C: Cpu> Kernel<C> {
         let disposition = trames_kernel::signal::disposition(sig, action);
         if disposition == trames_kernel::signal::Disposition::Stop {
             self.publish_io_tasks(Some((pid, p)));
+            if p.signals
+                .io
+                .trace_point(sig, Some(shared), || p.cpu.architectural_state())
+            {
+                return Ok(true);
+            }
             if sig == 19 || !p.signals.io_directory.orphaned(&p.signals.io) {
                 return Ok(p
                     .signals
@@ -2266,7 +2272,7 @@ impl<C: Cpu> Kernel<C> {
                     euid: p.linux.vfs.credentials.euid,
                 };
                 if number == 117 {
-                    routes.ptrace(&p.signals.io, a).map(Some)
+                    routes.ptrace(&p.signals.io, a, &mut p.memory).map(Some)
                 } else {
                     routes.job_call(&p.signals.io, number, a).expect("original job authority").map(Some)
                 }

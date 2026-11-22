@@ -57,110 +57,120 @@ impl Memory {
         !report.has_requested_reads()
     }
     pub fn smaps(&self, rollup: bool) -> Result<Arc<[u8]>, MemoryError> {
+        self.smaps_at_root(rollup, None)
+    }
+    fn smaps_at_root(
+        &self,
+        rollup: bool,
+        root: Option<&MappingRoot>,
+    ) -> Result<Arc<[u8]>, MemoryError> {
         if let Some(shared) = &self.shared {
-            return shared.borrow().smaps(rollup);
+            return shared.borrow().smaps_at_root(rollup, root);
         }
         let mut total = Totals::default();
         let mut result = Ok(());
         let stack = self.image_ranges.map(|r| r.start_stack);
-        let text =
-            self.region_layout
-                .describe_maps(stack, !rollup, |out, start, end, perm, mapping| {
+        let text = self.region_layout.describe_maps(
+            stack,
+            !rollup,
+            root,
+            |out, start, end, perm, mapping| {
+                if result.is_err() {
+                    return;
+                }
+                let mut area = Totals::default();
+                let locked = self.locks.overlaps(start, end);
+                for (a, r) in self.anonymous.overlapping(start, end) {
+                    let lo = a.max(start);
+                    let hi = r.end.min(end);
+                    result = r.store.visit_resident(lo, hi, |base| {
+                        let owners = self
+                            .sparse_pages
+                            .borrow()
+                            .get(&base)
+                            .map_or(1, |p| Arc::strong_count(&p.bytes));
+                        area.page(
+                            owners,
+                            true,
+                            true,
+                            locked && self.locks.overlaps(base, base + PAGE_SIZE),
+                        );
+                    });
                     if result.is_err() {
                         return;
                     }
-                    let mut area = Totals::default();
-                    let locked = self.locks.overlaps(start, end);
-                    for (a, r) in self.anonymous.overlapping(start, end) {
-                        let lo = a.max(start);
-                        let hi = r.end.min(end);
-                        result = r.store.visit_resident(lo, hi, |base| {
-                            let owners = self
-                                .sparse_pages
-                                .borrow()
-                                .get(&base)
-                                .map_or(1, |p| Arc::strong_count(&p.bytes));
-                            area.page(
-                                owners,
-                                true,
-                                true,
-                                locked && self.locks.overlaps(base, base + PAGE_SIZE),
-                            );
-                        });
-                        if result.is_err() {
+                }
+                for (&base, &index) in self.pages.range(start..end) {
+                    let p = self.frames[index].as_ref().expect("mapped frame");
+                    if p.check_backing(base).is_err() {
+                        continue;
+                    }
+                    match p.charge.page_resident(p.bytes.shared().map(Arc::as_ref)) {
+                        Ok(0) => continue,
+                        Err(e) => {
+                            result = Err(e);
                             return;
                         }
+                        _ => {}
                     }
-                    for (&base, &index) in self.pages.range(start..end) {
-                        let p = self.frames[index].as_ref().expect("mapped frame");
-                        if p.check_backing(base).is_err() {
-                            continue;
-                        }
-                        match p.charge.page_resident(p.bytes.shared().map(Arc::as_ref)) {
-                            Ok(0) => continue,
-                            Err(e) => {
-                                result = Err(e);
-                                return;
-                            }
-                            _ => {}
-                        }
-                        let (owners, dirty, anon) = match &p.backing {
-                            Some(b) if !b.private_copy => {
-                                let pending = self.worker_dirty_backing(base);
-                                if pending == Some(true) && !b.shared {
-                                    (1, true, true)
-                                } else {
-                                    (
-                                        b.object
-                                            .mapped_residents()
-                                            .map_or(1, |m| m.resident_count().max(1)),
-                                        b.object.proc_dirty() || pending == Some(false),
-                                        false,
-                                    )
-                                }
-                            }
-                            _ => (Arc::strong_count(&p.bytes), true, true),
-                        };
-                        area.page(
-                            owners,
-                            dirty,
-                            anon,
-                            locked && self.locks.overlaps(base, base + PAGE_SIZE),
-                        );
-                    }
-                    if rollup {
-                        total.add(&area);
-                    } else {
-                        writeln!(
-                            out,
-                            "Size: {} kB\nKernelPageSize: {} kB\nMMUPageSize: {} kB",
-                            (end - start) / 1024,
-                            PAGE_SIZE / 1024,
-                            PAGE_SIZE / 1024
-                        )
-                        .unwrap();
-                        area.write(out);
-                        let shared = mapping.is_some_and(|m| m.shared);
-                        let may_write = mapping.is_none_or(|m| m.may_write);
-                        out.extend_from_slice(b"VmFlags:");
-                        for (flag, on) in [
-                            ("rd", perm.read && !mapping.is_some_and(|m| m.write_only)),
-                            ("wr", perm.write),
-                            ("ex", perm.execute),
-                            ("sh", shared && may_write),
-                            ("mr", true),
-                            ("mw", may_write),
-                            ("me", mapping.is_none_or(|m| m.may_execute)),
-                            ("ms", shared),
-                            ("lo", locked),
-                        ] {
-                            if on {
-                                write!(out, " {flag}").unwrap();
+                    let (owners, dirty, anon) = match &p.backing {
+                        Some(b) if !b.private_copy => {
+                            let pending = self.worker_dirty_backing(base);
+                            if pending == Some(true) && !b.shared {
+                                (1, true, true)
+                            } else {
+                                (
+                                    b.object
+                                        .mapped_residents()
+                                        .map_or(1, |m| m.resident_count().max(1)),
+                                    b.object.proc_dirty() || pending == Some(false),
+                                    false,
+                                )
                             }
                         }
-                        out.push(b'\n');
+                        _ => (Arc::strong_count(&p.bytes), true, true),
+                    };
+                    area.page(
+                        owners,
+                        dirty,
+                        anon,
+                        locked && self.locks.overlaps(base, base + PAGE_SIZE),
+                    );
+                }
+                if rollup {
+                    total.add(&area);
+                } else {
+                    writeln!(
+                        out,
+                        "Size: {} kB\nKernelPageSize: {} kB\nMMUPageSize: {} kB",
+                        (end - start) / 1024,
+                        PAGE_SIZE / 1024,
+                        PAGE_SIZE / 1024
+                    )
+                    .unwrap();
+                    area.write(out);
+                    let shared = mapping.is_some_and(|m| m.shared);
+                    let may_write = mapping.is_none_or(|m| m.may_write);
+                    out.extend_from_slice(b"VmFlags:");
+                    for (flag, on) in [
+                        ("rd", perm.read && !mapping.is_some_and(|m| m.write_only)),
+                        ("wr", perm.write),
+                        ("ex", perm.execute),
+                        ("sh", shared && may_write),
+                        ("mr", true),
+                        ("mw", may_write),
+                        ("me", mapping.is_none_or(|m| m.may_execute)),
+                        ("ms", shared),
+                        ("lo", locked),
+                    ] {
+                        if on {
+                            write!(out, " {flag}").unwrap();
+                        }
                     }
-                });
+                    out.push(b'\n');
+                }
+            },
+        );
         result?;
         if !rollup {
             return Ok(text);
@@ -184,6 +194,7 @@ impl Memory {
 pub type SmapsResult = Result<Arc<[u8]>, MemoryError>;
 pub struct SmapsRead {
     rollup: bool,
+    root: Option<MappingRoot>,
     body: OnceLock<SmapsResult>,
     event: Arc<Readiness>,
 }
@@ -198,7 +209,11 @@ impl SmapsRead {
 pub(super) type Requests = Mutex<Vec<Weak<SmapsRead>>>;
 impl MemoryReport {
     pub fn request_smaps(&self, rollup: bool) -> Arc<SmapsRead> {
+        self.request_smaps_at_root(rollup, None)
+    }
+    pub fn request_smaps_at_root(&self, rollup: bool, root: Option<MappingRoot>) -> Arc<SmapsRead> {
         let r = Arc::new(SmapsRead {
+            root,
             rollup,
             body: Default::default(),
             event: Default::default(),
@@ -227,9 +242,21 @@ impl MemoryReport {
         let requests = std::mem::take(&mut *q.lock().unwrap());
         let mut texts = [None, None];
         for r in requests.into_iter().filter_map(|w| w.upgrade()) {
-            let text = texts[usize::from(r.rollup)]
-                .get_or_insert_with(|| mm.map_or_else(|| Ok(Arc::from([])), |m| m.smaps(r.rollup)));
-            let _ = r.body.set(text.clone());
+            let render = || {
+                mm.map_or_else(
+                    || Ok(Arc::from([])),
+                    |m| m.smaps_at_root(r.rollup, r.root.as_ref()),
+                )
+            };
+            // Rollups have no file labels. Only unrooted headers can share the default sample.
+            let text = if r.rollup || r.root.is_none() {
+                texts[usize::from(r.rollup)]
+                    .get_or_insert_with(render)
+                    .clone()
+            } else {
+                render()
+            };
+            let _ = r.body.set(text);
             r.event.notify_locked();
         }
     }
