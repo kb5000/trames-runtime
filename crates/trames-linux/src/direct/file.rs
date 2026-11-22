@@ -860,11 +860,17 @@ impl DirectSyscalls {
             };
             if matches!(number, 63..=70 | 286 | 287) {
                 if let Some(target) = original.nonbyte_target() {
-                    let (command, output) =
-                        match import(number, args, memory, &mut self.scratch.borrow_mut(), false) {
-                            Ok(call) => call,
-                            Err(error) => return Some(IoAttempt::Complete(Err(error))),
-                        };
+                    let (command, output) = match import(
+                        number,
+                        args,
+                        memory,
+                        &mut self.scratch.borrow_mut(),
+                        false,
+                        false,
+                    ) {
+                        Ok(call) => call,
+                        Err(error) => return Some(IoAttempt::Complete(Err(error))),
+                    };
                     return Some(self.complete_file_attempt(
                         trames_vfs::FileWork::descriptor_owned(vfs, target, command),
                         output,
@@ -898,6 +904,7 @@ impl DirectSyscalls {
                 memory,
                 &mut self.scratch.borrow_mut(),
                 file.regular_file(),
+                file.unsigned_offsets(),
             ) {
                 Ok(call) => call,
                 Err(error) => return Some(IoAttempt::Complete(Err(error))),
@@ -1140,15 +1147,17 @@ pub(super) fn import(
     memory: &impl CpuMemory,
     scratch: &mut Vec<u8>,
     regular: bool,
+    unsigned_offsets: bool,
 ) -> Result<(trames_vfs::FileCommand, FileOutput), Errno> {
     use trames_vfs::FileCommand as Command;
+    let regular = regular && !unsigned_offsets;
     let offset = (matches!(number, 67..=70) || matches!(number, 286 | 287) && a[3] != u64::MAX)
         .then_some(a[3]);
     if matches!(number, 286 | 287) {
         crate::file_calls::vector_flags(a[5])?;
     }
     let regular_vectors = |write| {
-        if offset.is_some_and(|off| off > i64::MAX as u64) {
+        if offset.is_some_and(|off| off > i64::MAX as u64) && !unsigned_offsets {
             return Err(Errno(22));
         }
         Linux::file_vector_import::<true>(memory, a, write)
@@ -1169,7 +1178,7 @@ pub(super) fn import(
             let (parts, count) = if regular {
                 let vectors = regular_vectors(false)?;
                 (vectors.parts, vectors.total)
-            } else if number == 65 || number == 286 && offset.is_none() {
+            } else if unsigned_offsets || number == 65 || number == 286 && offset.is_none() {
                 Linux::readv_parts(memory, a)?
             } else {
                 Linux::positioned_vector_parts(memory, a, false)?
@@ -1192,7 +1201,7 @@ pub(super) fn import(
             if regular {
                 let vectors = regular_vectors(true)?;
                 Linux::gather_parts(memory, &vectors.parts, vectors.total, scratch)?;
-            } else if number == 66 || number == 287 && offset.is_none() {
+            } else if unsigned_offsets || number == 66 || number == 287 && offset.is_none() {
                 Linux::writev_parameters(a, memory, scratch)?;
             } else {
                 let (parts, count) = Linux::positioned_vector_parts(memory, a, true)?;
@@ -1387,11 +1396,17 @@ impl DirectSyscalls {
                 (None, Some(target))
             }
             trames_vfs::FileAccess::Descriptor(target) => {
-                let (command, output) =
-                    match import(number, a, memory, &mut self.scratch.borrow_mut(), false) {
-                        Ok(prepared) => prepared,
-                        Err(error) => return Some(Err(error)),
-                    };
+                let (command, output) = match import(
+                    number,
+                    a,
+                    memory,
+                    &mut self.scratch.borrow_mut(),
+                    false,
+                    false,
+                ) {
+                    Ok(prepared) => prepared,
+                    Err(error) => return Some(Err(error)),
+                };
                 let reply =
                     trames_vfs::FileWork::descriptor_reply(self.paths.as_ref()?, target, command);
                 return Some(self.finish_file_reply(reply, output, memory));
@@ -1403,6 +1418,7 @@ impl DirectSyscalls {
             memory,
             &mut self.scratch.borrow_mut(),
             fast.is_some() || target.as_ref().is_some_and(|file| file.regular_file()),
+            target.as_ref().is_some_and(|file| file.unsigned_offsets()),
         ) {
             Ok(prepared) => prepared,
             Err(error) => {

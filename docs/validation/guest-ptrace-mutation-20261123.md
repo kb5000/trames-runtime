@@ -1,5 +1,7 @@
 # Guest ptrace modification and single stepping — November 23, 2026
 
+Follow-up: [proc memory completion and the remaining upstream ptrace skip](guest-proc-mem-20261123.md).
+
 The remaining twelve original process-debugging gaps are closed. The Mac hardware executor and the iPad product interpreter running locally on the Mac each produced **96 passes and two upstream skips across 98 original gVisor cases in seven suites**. The complete ptrace binary produced **35 passes and one skip** on each executor. Original Google Test XML, requested case identities and upstream executable hashes were checked. No previous native-pass case in this selection became a gap. Reusing the previous inventory outside this selection changes the rolling native-pass gap count from **138 to 126**.
 
 ## Implemented behavior

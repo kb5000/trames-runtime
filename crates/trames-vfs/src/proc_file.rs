@@ -10,7 +10,7 @@ pub(super) struct ProcFile {
     source: Arc<dyn ProcSource>,
     target: Option<Arc<dyn ProcTask>>,
     memory: Option<trames_memory::MemoryReport>,
-    writer: std::sync::OnceLock<trames_memory::TransferTarget>,
+    memory_target: std::sync::OnceLock<trames_memory::TransferTarget>,
     saved: Option<Vec<u8>>,
     map_root: Option<trames_memory::MappingRoot>,
     payload: Option<Payload>,
@@ -101,12 +101,12 @@ impl ProcFile {
         let task = self.target.as_ref().ok_or(Errno(3))?;
         let memory = self.memory.as_ref().ok_or(Errno(3))?;
         if let Some(target) = task.open_memory(credentials, group, memory)? {
-            let _ = self.writer.set(target);
+            let _ = self.memory_target.set(target);
         }
         Ok(())
     }
-    pub(super) fn write_target(&self) -> Option<trames_memory::TransferTarget> {
-        self.writer.get().cloned()
+    pub(super) fn memory_target(&self) -> Option<trames_memory::TransferTarget> {
+        self.memory_target.get().cloned()
     }
     pub(super) fn local_memory(&self, caller: &impl trames_memory::CpuMemory) -> bool {
         self.memory
@@ -566,7 +566,7 @@ impl Vfs {
                 None
             },
             memory,
-            writer: Default::default(),
+            memory_target: Default::default(),
             saved,
             payload,
             smaps: Default::default(),

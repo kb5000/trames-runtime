@@ -226,7 +226,8 @@ impl DirectSyscalls {
             .as_ref()
             .and_then(|f| f.lookup(fd))
             .unwrap_or(Err(Errno(9)))?;
-        let flags = file.filesystem_target().status_flags();
+        let file_target = file.filesystem_target();
+        let flags = file_target.status_flags();
         if flags & trames_vfs::O_PATH != 0
             || matches!(op, 0 | 7) && !trames_vfs::fd_can_read(flags)
             || matches!(op, 1 | 8) && !trames_vfs::fd_can_write(flags)
@@ -251,6 +252,7 @@ impl DirectSyscalls {
             memory,
             &mut Vec::new(),
             false,
+            file_target.unsigned_offsets(),
         )?;
         let event = if u32_at(56) & 1 != 0 {
             Some(self.aio.as_ref().unwrap().1.event(u32_at(60))?)

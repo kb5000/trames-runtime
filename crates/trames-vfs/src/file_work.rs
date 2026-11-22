@@ -2,20 +2,22 @@
 //! Accepted filesystem operations. Host work owns original OFDs and owned bytes;
 //! guest pointers, source task execution and descriptor membership stay outside.
 use super::*;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 
 #[derive(Clone)]
 pub struct FileTarget(pub(super) SharedFd);
 impl FileTarget {
-    fn proc_write_command(&self, command: &FileCommand) -> bool {
+    fn proc_memory_command(&self, command: &FileCommand) -> bool {
         self.0
             .open
             .runtime_file
             .as_ref()
-            .is_some_and(|f| f.is_memory())
+            .is_some_and(|f| f.is_memory() && f.memory_target().is_some())
             && matches!(
                 command,
-                FileCommand::Write { .. } | FileCommand::WriteSync { .. }
+                FileCommand::Write { .. }
+                    | FileCommand::WriteSync { .. }
+                    | FileCommand::Read { .. }
             )
     }
     fn proc_position_command(&self, command: &FileCommand) -> bool {
@@ -41,8 +43,15 @@ impl FileTarget {
         self.0.open.read_zero_device(copy)
     }
 
+    pub fn unsigned_offsets(&self) -> bool {
+        self.0
+            .open
+            .runtime_file
+            .as_ref()
+            .is_some_and(|f| f.is_memory())
+    }
     pub fn regular_file(&self) -> bool {
-        self.0.open.is_regular_file()
+        self.0.open.is_regular_file() && !self.unsigned_offsets()
     }
 
     fn proc_read(&self, command: &FileCommand) -> Option<proc_file::ProcRead> {
@@ -58,7 +67,7 @@ impl FileTarget {
             return Some(proc_file::ProcRead::Complete(Err(Errno(9))));
         }
         if let Some(offset) = offset {
-            return Some(if *offset > i64::MAX as u64 {
+            return Some(if *offset > i64::MAX as u64 && !file.is_memory() {
                 proc_file::ProcRead::Complete(Err(Errno(22)))
             } else {
                 file.read_payload(*offset, *count)
@@ -114,11 +123,11 @@ impl FileTarget {
             if !fd_can_write(open.flags.get()) {
                 return Some(Err(Errno(9)));
             }
-            if file.write_target().is_some() || !file.local_memory(memory) {
+            if file.memory_target().is_some() || !file.local_memory(memory) {
                 return None;
             }
             if let Some(offset) = offset {
-                return Some(if *offset > i64::MAX as u64 {
+                return Some(if *offset > i64::MAX as u64 && !file.is_memory() {
                     Err(Errno(22))
                 } else {
                     file.write_local(*offset, bytes, memory)
@@ -146,6 +155,9 @@ impl FileTarget {
         };
         let open = &self.0.open;
         let file = open.runtime_file.as_ref()?;
+        if file.is_memory() && file.memory_target().is_some() {
+            return None;
+        }
         if !file.live_payload() {
             return None;
         }
@@ -153,7 +165,7 @@ impl FileTarget {
             return Some(Err(Errno(9)));
         }
         if let Some(offset) = offset {
-            if *offset > i64::MAX as u64 {
+            if *offset > i64::MAX as u64 && !file.is_memory() {
                 return Some(Err(Errno(22)));
             }
             return file
@@ -413,28 +425,44 @@ pub struct FileWork {
     sync_targets: Option<Vec<storage::FilesystemSync>>,
     namespace: Option<Box<namespace_work::NamespaceWork>>,
     proc_wait: Vec<proc_file::ProcWait>,
-    proc_write: Option<Box<ProcWrite>>,
+    proc_memory: Option<Box<ProcMemory>>,
     fuse_stat: Option<Box<fuse::Metadata>>,
     linger: Option<Box<trames_net::TcpLinger>>,
 }
-struct ProcWrite {
-    request: Arc<trames_memory::TransferRequest>,
+struct ProcMemory {
+    request: Option<Arc<trames_memory::TransferRequest>>,
+    position: Option<Arc<ProcPosition>>,
+    address: u64,
+    writing: bool,
+    requested: usize,
+    expected: usize,
+    done: usize,
+    output: Vec<u8>,
+}
+impl ProcMemory {
+    fn value(&mut self) -> FileValue {
+        if self.writing {
+            FileValue::Count(self.done as u64)
+        } else {
+            FileValue::Bytes(std::mem::take(&mut self.output))
+        }
+    }
 }
 struct ProcPosition {
     position: Arc<file_data::FilePosition>,
     offset: u64,
-    finished: AtomicBool,
+    committed: AtomicUsize,
 }
 impl ProcPosition {
-    fn finish(&self, count: Option<usize>) {
-        if self.finished.swap(true, Ordering::Relaxed) {
-            return;
-        }
+    fn record(&self, count: usize) {
+        self.committed.store(count, Ordering::Relaxed);
+    }
+}
+impl Drop for ProcPosition {
+    fn drop(&mut self) {
         {
             let mut state = self.position.lock().unwrap();
-            if let Some(n) = count {
-                state.value = self.offset + n as u64;
-            }
+            state.value = self.offset.wrapping_add(*self.committed.get_mut() as u64);
             state.pending -= 1;
         }
         self.position.notify_pending();
@@ -527,7 +555,7 @@ impl FileWork {
         }
     }
     pub fn waiting(&self) -> bool {
-        if self.proc_write.is_some()
+        if self.proc_memory.is_some()
             || self
                 .target
                 .as_ref()
@@ -553,8 +581,8 @@ impl FileWork {
             || matches!(&self.command, FileCommand::Transfer(t) if t.borrow().waits())
     }
     pub fn ready(&self) -> bool {
-        if let Some(write) = &self.proc_write {
-            return write.request.ready();
+        if let Some(io) = &self.proc_memory {
+            return io.request.as_ref().is_none_or(|r| r.ready());
         }
         if self
             .target
@@ -589,9 +617,9 @@ impl FileWork {
         }
     }
     pub fn wait_sources(&self, signal: &Arc<IoSignal>) -> std::io::Result<TransferWait> {
-        if let Some(write) = &self.proc_write {
+        if let Some(request) = self.proc_memory.as_ref().and_then(|io| io.request.as_ref()) {
             return Ok(TransferWait {
-                subscriptions: vec![write.request.subscribe(signal)],
+                subscriptions: vec![request.subscribe(signal)],
                 native: Vec::new(),
                 deadline: None,
             });
@@ -739,14 +767,14 @@ impl FileWork {
             sync_targets: None,
             namespace: None,
             proc_wait: Vec::new(),
-            proc_write: None,
+            proc_memory: None,
             fuse_stat: None,
             linger: None,
         }
     }
     pub fn host_work(&self) -> bool {
         if self.target.as_ref().is_some_and(|t| {
-            t.proc_write_command(&self.command) || t.proc_position_busy(&self.command)
+            t.proc_memory_command(&self.command) || t.proc_position_busy(&self.command)
         }) {
             return false;
         }
@@ -774,7 +802,7 @@ impl FileWork {
             sync_targets: None,
             namespace: None,
             proc_wait: Vec::new(),
-            proc_write: None,
+            proc_memory: None,
             fuse_stat: None,
             linger: None,
         }
@@ -792,7 +820,7 @@ impl FileWork {
             sync_targets: None,
             namespace: None,
             proc_wait: Vec::new(),
-            proc_write: None,
+            proc_memory: None,
             fuse_stat: None,
             linger: None,
         }
@@ -847,7 +875,7 @@ impl FileWork {
     /// Joined caller execution, with the same original VFS ownership contract.
     /// As for Vfs::truncate_fd, layout mutation requires joined execution Views.
     pub fn run_owned(vfs: &mut Vfs, target: FileTarget, mut command: FileCommand) -> FileOutcome {
-        if target.proc_write_command(&command) || target.proc_position_busy(&command) {
+        if target.proc_memory_command(&command) || target.proc_position_busy(&command) {
             return Self::from_vfs(vfs, target, command).run();
         }
 
@@ -876,7 +904,7 @@ impl FileWork {
         target: FileTarget,
         mut command: FileCommand,
     ) -> FileOutcome {
-        if target.proc_write_command(&command) || target.proc_position_busy(&command) {
+        if target.proc_memory_command(&command) || target.proc_position_busy(&command) {
             return Self::new(paths, target, command).run();
         }
         if matches!(
@@ -937,88 +965,131 @@ impl FileWork {
         self.layout_exclusive = Some(exclusive);
         self
     }
-    fn proc_write_step(&mut self) -> Option<Result<Option<u64>>> {
-        if let Some(write) = &mut self.proc_write {
-            let Some(result) = write.request.take() else {
-                return Some(Ok(None));
-            };
-            let result = match result {
-                Ok(b) => Ok(b.len() as u64),
-                Err(trames_memory::TransferError::Retired) => Ok(0),
-                Err(_) => Err(Errno(5)),
-            };
-            return Some(result.map(Some));
-        }
+    fn proc_memory_step(&mut self) -> Option<Result<Option<FileValue>>> {
         let target = self.target.as_ref()?;
-        if !target.proc_write_command(&self.command) {
+        if !target.proc_memory_command(&self.command) {
             return None;
         }
         let open = &target.0.open;
-        if !fd_can_write(open.flags.get()) {
-            return Some(Err(Errno(9)));
-        }
         let file = open.runtime_file.as_ref().unwrap();
-        let (bytes, offset) = match &self.command {
-            FileCommand::Write { bytes, offset } | FileCommand::WriteSync { bytes, offset, .. } => {
-                (bytes, offset)
+        if self.proc_memory.is_none() {
+            let (writing, requested, offset) = match &self.command {
+                FileCommand::Read { count, offset } => (false, *count, *offset),
+                FileCommand::Write { bytes, offset }
+                | FileCommand::WriteSync { bytes, offset, .. } => (true, bytes.len(), *offset),
+                _ => unreachable!(),
+            };
+            if writing && !fd_can_write(open.flags.get())
+                || !writing && !fd_can_read(open.flags.get())
+            {
+                return Some(Err(Errno(9)));
             }
-            _ => unreachable!(),
-        };
-        if bytes.is_empty() || !file.memory_alive() {
-            return Some(Ok(Some(0)));
+            if requested == 0 || !file.memory_alive() {
+                return Some(Ok(Some(if writing {
+                    FileValue::Count(0)
+                } else {
+                    FileValue::Bytes(Vec::new())
+                })));
+            }
+            let mut state = open.file_position.lock().unwrap();
+            if offset.is_none() && state.pending != 0 {
+                return Some(Ok(None));
+            }
+            let address = offset.unwrap_or(state.value);
+            let position = if offset.is_none() {
+                state.pending += 1;
+                Some(Arc::new(ProcPosition {
+                    position: open.file_position.clone(),
+                    offset: address,
+                    committed: AtomicUsize::new(0),
+                }))
+            } else {
+                None
+            };
+            self.proc_memory = Some(Box::new(ProcMemory {
+                request: None,
+                position,
+                address,
+                writing,
+                requested,
+                expected: 0,
+                done: 0,
+                output: Vec::new(),
+            }));
         }
-        let Some(remote) = file.write_target() else {
+        let io = self.proc_memory.as_mut().unwrap();
+        if let Some(request) = &io.request {
+            let Some(result) = request.take() else {
+                return Some(Ok(None));
+            };
+            io.request = None;
+            let data = match result {
+                Ok(data) => data,
+                Err(trames_memory::TransferError::Retired) => return Some(Ok(Some(io.value()))),
+                Err(_) if io.done != 0 => return Some(Ok(Some(io.value()))),
+                Err(_) => return Some(Err(Errno(5))),
+            };
+            let n = data.len();
+            io.done += n;
+            if !io.writing {
+                io.output.extend(data);
+                if let Some(position) = &io.position {
+                    position.record(io.done);
+                }
+            }
+            if n < io.expected || io.done == io.requested {
+                return Some(Ok(Some(io.value())));
+            }
+        }
+        let Some(remote) = file.memory_target() else {
             return Some(Err(Errno(95)));
         };
-        let mut state = open.file_position.lock().unwrap();
-        if offset.is_none() && state.pending != 0 {
-            return Some(Ok(None));
-        }
-        let address = offset.unwrap_or(state.value);
-        if offset.is_some_and(|n| n > i64::MAX as u64) {
-            return Some(Err(Errno(22)));
-        }
-        let position = if offset.is_none() {
-            state.pending += 1;
-            Some(Arc::new(ProcPosition {
-                position: open.file_position.clone(),
-                offset: address,
-                finished: AtomicBool::new(false),
-            }))
+        let Some(address) = io.address.checked_add(io.done as u64) else {
+            return Some(if io.done == 0 {
+                Err(Errno(5))
+            } else {
+                Ok(Some(io.value()))
+            });
+        };
+        io.expected = (io.requested - io.done).min(trames_memory::TRANSFER_WINDOW);
+        let request = if io.writing {
+            let bytes = match &self.command {
+                FileCommand::Write { bytes, .. } | FileCommand::WriteSync { bytes, .. } => bytes,
+                _ => unreachable!(),
+            };
+            let done = io.done;
+            let completion = io.position.as_ref().map(|p| {
+                let p = p.clone();
+                Box::new(move |n| {
+                    if let Some(n) = n {
+                        p.record(done + n);
+                    }
+                }) as Box<dyn Fn(Option<usize>) + Send + Sync>
+            });
+            remote.submit_forced_write(
+                address,
+                bytes[done..done + io.expected].to_vec(),
+                completion,
+            )
         } else {
-            None
+            remote.submit_forced_read(address, io.expected)
         };
-        drop(state);
-        let completion = position.as_ref().map(|p| {
-            let p = p.clone();
-            Box::new(move |n| p.finish(n)) as Box<dyn Fn(Option<usize>) + Send + Sync>
-        });
-        let request = match remote.submit_forced_write(
-            address,
-            bytes[..bytes.len().min(trames_memory::TRANSFER_WINDOW)].to_vec(),
-            completion,
-        ) {
-            Ok(request) => request,
-            Err(error) => {
-                if let Some(position) = position {
-                    position.finish(None);
-                }
-                return Some(if error == trames_memory::TransferError::Retired {
-                    Ok(Some(0))
-                } else {
-                    Err(Errno(5))
-                });
+        match request {
+            Ok(request) => {
+                io.request = Some(request);
+                Some(Ok(None))
             }
-        };
-        self.proc_write = Some(Box::new(ProcWrite { request }));
-        Some(Ok(None))
+            Err(trames_memory::TransferError::Retired) => Some(Ok(Some(io.value()))),
+            Err(_) if io.done != 0 => Some(Ok(Some(io.value()))),
+            Err(_) => Some(Err(Errno(5))),
+        }
     }
     pub fn run(mut self) -> FileOutcome {
-        if let Some(result) = self.proc_write_step() {
+        if let Some(result) = self.proc_memory_step() {
             return match result {
                 Ok(None) => FileOutcome::Waiting(self),
                 result => FileOutcome::Complete(FileReply {
-                    result: result.map(|n| FileValue::Count(n.unwrap())),
+                    result: result.map(Option::unwrap),
                     file_size_signal: false,
                     scratch: None,
                 }),
@@ -1342,14 +1413,16 @@ impl FileCommand {
                 count,
                 offset: Some(offset),
             } => {
-                if *offset > i64::MAX as u64 {
+                if *offset > i64::MAX as u64 && !target.unsigned_offsets() {
                     return Err(Errno(22));
                 }
                 v.pread_description(&descriptor, *count, *offset)
                     .map(FileValue::Bytes)
             }
             Self::Write { bytes, offset } | Self::WriteSync { bytes, offset, .. } => {
-                if offset.is_some_and(|offset| offset > i64::MAX as u64) {
+                if offset.is_some_and(|offset| offset > i64::MAX as u64)
+                    && !target.unsigned_offsets()
+                {
                     return Err(Errno(22));
                 }
                 let count = v.file_write_description(&descriptor, bytes, *offset)?;

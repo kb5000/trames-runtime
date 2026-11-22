@@ -14,11 +14,17 @@ pub const TRANSFER_WINDOW: usize = 256 * 1024;
 pub struct TransferRequest {
     address: u64,
     write: bool,
-    ptrace: u8,
+    mode: TransferMode,
     state: Mutex<TransferState>,
     signal: Option<Arc<IoSignal>>,
     ready: Arc<Readiness>,
     completion: Option<Box<dyn Fn(Option<usize>) + Send + Sync>>,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TransferMode {
+    Ordinary,
+    PtraceWord,
+    Forced,
 }
 enum TransferState {
     Queued(Vec<u8>),
@@ -42,9 +48,8 @@ impl Memory {
 }
 
 impl Memory {
-    /// Linux ptrace FOLL_FORCE access. Only the original mm owner calls this;
-    /// mapping permissions stay unchanged, while COW and code invalidation use
-    /// the ordinary page storage. Shared read-only file mappings remain protected.
+    /// Linux FOLL_FORCE word access through the original mm owner. Validate
+    /// both fragments before effects; short word reads never escape to a tracer.
     pub fn ptrace_word(
         &mut self,
         address: u64,
@@ -54,69 +59,47 @@ impl Memory {
             return shared.borrow_mut().ptrace_word(address, write);
         }
         Self::end(address, 8)?;
-        let mut done = 0;
-        // Validate both fragments before writing a word across a page boundary.
-        while done < 8 {
-            let at = address + done as u64;
-            let len = (8 - done).min((PAGE_SIZE - at % PAGE_SIZE) as usize);
-            let entry = self
-                .translation(at & !(PAGE_SIZE - 1))
-                .ok_or(MemoryError::Unmapped(at))?;
-            let page = self.translated_page(entry);
-            page.check_backing(at)?;
-            if write.is_some()
-                && page.backing.as_ref().is_some_and(|b| {
-                    b.shared && !page.permissions.write || !b.shared && !b.object.private_writable()
-                })
-            {
-                return Err(MemoryError::Permission {
-                    address: at,
-                    access: Access::Write,
-                });
-            }
-            done += len;
+        let mut at = address;
+        while at < address + 8 {
+            self.forced_page(at, write.is_some())?;
+            at = (address + 8).min((at & !(PAGE_SIZE - 1)) + PAGE_SIZE);
         }
-        if write.is_some() {
-            self.prepare_mmu_write(address, 8)?;
+        let mut bytes = write.unwrap_or_default();
+        let n = self.forced_bytes(address, &mut bytes, write.is_some())?;
+        if n != 8 {
+            return Err(MemoryError::InvalidRange);
         }
-        let mut bytes = [0; 8];
-        done = 0;
-        while done < 8 {
-            let at = address + done as u64;
-            let offset = (at % PAGE_SIZE) as usize;
-            let len = (8 - done).min(PAGE_SIZE as usize - offset);
-            let entry = self
-                .translation(at & !(PAGE_SIZE - 1))
-                .expect("validated word");
-            if let Some(input) = write {
-                let revision = self.code_revision.wrapping_add(1);
-                let page = self.translated_page_mut(entry);
-                page.write_bytes(offset, &input[done..done + len])
-                    .map_err(|e| e.at_access(at))?;
-                let executable = page.permissions.execute;
-                if executable {
-                    page.instruction_revision = revision;
-                }
-                self.note_parallel_write(entry.frame);
-                self.revision = self.revision.wrapping_add(1);
-                if executable {
-                    self.advance_code_revision();
-                }
-            } else {
-                self.translated_page(entry)
-                    .read_bytes(offset, &mut bytes[done..done + len])
-                    .map_err(|e| e.at_access(at))?;
-            }
-            done += len;
-        }
-        Ok(write.unwrap_or(bytes))
+        Ok(bytes)
     }
-}
-
-impl Memory {
-    fn ptrace_write_bytes(&mut self, address: u64, data: &[u8]) -> Result<usize, MemoryError> {
+    fn forced_page(&self, address: u64, write: bool) -> Result<Translation, MemoryError> {
+        Self::end(address, 1)?;
+        let entry = self
+            .translation(address & !(PAGE_SIZE - 1))
+            .ok_or(MemoryError::Unmapped(address))?;
+        let page = self.translated_page(entry);
+        page.check_backing(address)?;
+        // FOLL_FORCE can COW a private mapping, but cannot grant write access
+        // to a protected shared file mapping or an unwritable provider.
+        if write
+            && page.backing.as_ref().is_some_and(|b| {
+                b.shared && !page.permissions.write || !b.shared && !b.object.private_writable()
+            })
+        {
+            return Err(MemoryError::Permission {
+                address,
+                access: Access::Write,
+            });
+        }
+        Ok(entry)
+    }
+    fn forced_bytes(
+        &mut self,
+        address: u64,
+        data: &mut [u8],
+        write: bool,
+    ) -> Result<usize, MemoryError> {
         if let Some(shared) = &self.shared {
-            return shared.borrow_mut().ptrace_write_bytes(address, data);
+            return shared.borrow_mut().forced_bytes(address, data, write);
         }
         let mut done = 0;
         while done < data.len() {
@@ -124,37 +107,31 @@ impl Memory {
                 let at = address
                     .checked_add(done as u64)
                     .ok_or(MemoryError::InvalidRange)?;
-                Self::end(at, 1)?;
+                let entry = self.forced_page(at, write)?;
                 let len = (data.len() - done).min((PAGE_SIZE - at % PAGE_SIZE) as usize);
-                let entry = self
-                    .translation(at & !(PAGE_SIZE - 1))
-                    .ok_or(MemoryError::Unmapped(at))?;
-                let page = self.translated_page(entry);
-                page.check_backing(at)?;
-                if page.backing.as_ref().is_some_and(|b| {
-                    b.shared && !page.permissions.write || !b.shared && !b.object.private_writable()
-                }) {
-                    return Err(MemoryError::Permission {
-                        address: at,
-                        access: Access::Write,
-                    });
-                }
-                self.prepare_mmu_write(at, len)?;
-                let entry = self
-                    .translation(at & !(PAGE_SIZE - 1))
-                    .expect("retained mapping");
-                let revision = self.code_revision.wrapping_add(1);
-                let page = self.translated_page_mut(entry);
-                page.write_bytes((at % PAGE_SIZE) as usize, &data[done..done + len])
-                    .map_err(|e| e.at_access(at))?;
-                let executable = page.permissions.execute;
-                if executable {
-                    page.instruction_revision = revision;
-                }
-                self.note_parallel_write(entry.frame);
-                self.revision = self.revision.wrapping_add(1);
-                if executable {
-                    self.advance_code_revision();
+                let offset = (at % PAGE_SIZE) as usize;
+                if write {
+                    self.prepare_mmu_write(at, len)?;
+                    let entry = self
+                        .translation(at & !(PAGE_SIZE - 1))
+                        .expect("retained mapping");
+                    let revision = self.code_revision.wrapping_add(1);
+                    let page = self.translated_page_mut(entry);
+                    page.write_bytes(offset, &data[done..done + len])
+                        .map_err(|e| e.at_access(at))?;
+                    let executable = page.permissions.execute;
+                    if executable {
+                        page.instruction_revision = revision;
+                    }
+                    self.note_parallel_write(entry.frame);
+                    self.revision = self.revision.wrapping_add(1);
+                    if executable {
+                        self.advance_code_revision();
+                    }
+                } else {
+                    self.translated_page(entry)
+                        .read_bytes(offset, &mut data[done..done + len])
+                        .map_err(|e| e.at_access(at))?;
                 }
                 Ok(len)
             })();
@@ -179,7 +156,14 @@ impl TransferTarget {
         data: Vec<u8>,
         signal: Arc<IoSignal>,
     ) -> Result<Arc<TransferRequest>, TransferError> {
-        self.submit_inner(address, write, 0, data, Some(signal), None)
+        self.submit_inner(
+            address,
+            write,
+            TransferMode::Ordinary,
+            data,
+            Some(signal),
+            None,
+        )
     }
     pub fn submit_ptrace(
         &self,
@@ -188,7 +172,14 @@ impl TransferTarget {
         data: [u8; 8],
         signal: Arc<IoSignal>,
     ) -> Result<Arc<TransferRequest>, TransferError> {
-        self.submit_inner(address, write, 1, data.to_vec(), Some(signal), None)
+        self.submit_inner(
+            address,
+            write,
+            TransferMode::PtraceWord,
+            data.to_vec(),
+            Some(signal),
+            None,
+        )
     }
     pub fn submit_forced_write(
         &self,
@@ -196,13 +187,30 @@ impl TransferTarget {
         data: Vec<u8>,
         completion: Option<Box<dyn Fn(Option<usize>) + Send + Sync>>,
     ) -> Result<Arc<TransferRequest>, TransferError> {
-        self.submit_inner(address, true, 2, data, None, completion)
+        self.submit_inner(address, true, TransferMode::Forced, data, None, completion)
+    }
+    pub fn submit_forced_read(
+        &self,
+        address: u64,
+        length: usize,
+    ) -> Result<Arc<TransferRequest>, TransferError> {
+        if length == 0 || length > TRANSFER_WINDOW {
+            return Err(TransferError::Fault);
+        }
+        self.submit_inner(
+            address,
+            false,
+            TransferMode::Forced,
+            vec![0; length],
+            None,
+            None,
+        )
     }
     fn submit_inner(
         &self,
         address: u64,
         write: bool,
-        ptrace: u8,
+        mode: TransferMode,
         data: Vec<u8>,
         signal: Option<Arc<IoSignal>>,
         completion: Option<Box<dyn Fn(Option<usize>) + Send + Sync>>,
@@ -216,7 +224,7 @@ impl TransferTarget {
         let request = Arc::new(TransferRequest {
             address,
             write,
-            ptrace,
+            mode,
             state: Mutex::new(TransferState::Queued(data)),
             signal,
             ready: Arc::default(),
@@ -241,7 +249,9 @@ impl TransferTarget {
 }
 impl Drop for TransferRequest {
     fn drop(&mut self) {
-        if let Some(finish) = &self.completion {
+        if let (TransferState::Queued(_), Some(finish)) =
+            (self.state.get_mut().unwrap(), &self.completion)
+        {
             finish(None);
         }
     }
@@ -275,15 +285,15 @@ impl TransferRequest {
             unreachable!()
         };
         let result = if let Some(memory) = memory {
-            if self.ptrace == 2 {
+            if self.mode == TransferMode::Forced {
                 memory
-                    .ptrace_write_bytes(self.address, &data)
+                    .forced_bytes(self.address, &mut data, self.write)
                     .map(|n| {
                         data.truncate(n);
                         data
                     })
                     .map_err(|_| TransferError::Fault)
-            } else if self.ptrace == 1 {
+            } else if self.mode == TransferMode::PtraceWord {
                 memory
                     .ptrace_word(
                         self.address,
@@ -363,6 +373,23 @@ mod tests {
     }
 
     #[test]
+    fn forced_read_ignores_page_read_protection_and_keeps_exact_partial_results() {
+        let mut mm = Memory::default();
+        mm.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        mm.write_array(0x1ffc, *b"tail").unwrap();
+        mm.protect(0x1000, PAGE_SIZE, Permissions::NONE).unwrap();
+        mm.memory_report().bind_read_waker(Arc::new(|_| {}));
+        let request = mm.transfer_target().submit_forced_read(0x1ffc, 8).unwrap();
+        assert!(!request.ready());
+        mm.activate_proc_reads();
+        assert_eq!(request.take(), Some(Ok(b"tail".to_vec())));
+        assert!(mm.read_array::<4>(0x1ffc).is_err());
+        let request = mm.transfer_target().submit_forced_read(0x2000, 1).unwrap();
+        mm.activate_proc_reads();
+        assert_eq!(request.take(), Some(Err(TransferError::Fault)));
+    }
+
+    #[test]
     fn forced_write_keeps_partial_progress_and_completes_offset_before_waking() {
         let mut mm = Memory::default();
         mm.map(0x1000, PAGE_SIZE, Permissions::RX).unwrap();
@@ -375,9 +402,7 @@ mod tests {
                 0x1ffe,
                 b"abcd".to_vec(),
                 Some(Box::new(move |n| {
-                    if let Some(n) = n {
-                        output.store(n, Ordering::Relaxed);
-                    }
+                    output.store(n.expect("one successful completion"), Ordering::Relaxed);
                 })),
             )
             .unwrap();

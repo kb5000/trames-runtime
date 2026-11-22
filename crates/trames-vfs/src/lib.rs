@@ -3962,7 +3962,15 @@ impl Vfs {
     }
     pub fn pread(&self, fd: u32, count: usize, offset: u64) -> Result<Vec<u8>> {
         self.refresh_pseudo_fd(fd)?;
-        if offset > i64::MAX as u64 {
+        if offset > i64::MAX as u64
+            && !self
+                .descriptor(fd)?
+                .open
+                .borrow()
+                .runtime_file
+                .as_ref()
+                .is_some_and(|f| f.is_memory())
+        {
             return Err(Errno(22));
         }
         let descriptor = self.descriptor(fd)?;
@@ -4036,7 +4044,15 @@ impl Vfs {
         } {
             return Err(Errno(29));
         }
-        if offset > i64::MAX as u64 {
+        if offset > i64::MAX as u64
+            && !self
+                .descriptor(fd)?
+                .open
+                .borrow()
+                .runtime_file
+                .as_ref()
+                .is_some_and(|f| f.is_memory())
+        {
             return Err(Errno(22));
         }
         let descriptor = self.descriptor(fd)?;
@@ -4111,6 +4127,15 @@ impl Vfs {
         let mut file_position = o.file_position.lock().unwrap();
         if file_position.pending != 0 && o.runtime_file.as_ref().is_some_and(|f| f.is_memory()) {
             return Err(Errno(11));
+        }
+        if o.runtime_file.as_ref().is_some_and(|f| f.is_memory()) {
+            let value = match whence {
+                0 => offset as u64,
+                1 => file_position.value.wrapping_add(offset as u64),
+                _ => return Err(Errno(22)),
+            };
+            file_position.value = value;
+            return Ok(value);
         }
         let base = match whence {
             0 => 0,
