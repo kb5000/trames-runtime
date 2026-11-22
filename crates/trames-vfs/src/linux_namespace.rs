@@ -562,6 +562,9 @@ impl Vfs {
         Ok(())
     }
     pub fn unshare_cgroup(&mut self) -> Result<()> {
+        self.unshare_cgroup_at(None)
+    }
+    pub fn unshare_cgroup_at(&mut self, target: Option<&CgroupDestination>) -> Result<()> {
         if !self.credentials.has_local_cap(capabilities::SYS_ADMIN) {
             return Err(Errno(1));
         }
@@ -569,16 +572,7 @@ impl Vfs {
         if live.load(Ordering::Relaxed) >= MAX_NAMESPACES {
             return Err(Errno(28));
         }
-        let path = self.cgroup_path(self.pid);
-        let root = self
-            .cgroups
-            .borrow()
-            .fs
-            .borrow()
-            .paths
-            .get(&path)
-            .cloned()
-            .ok_or(Errno(2))?;
+        let (path, root) = self.cgroup_root_for_namespace(target)?;
         let inode = reserve_namespace(&live)?;
         self.cgroup_namespace = Arc::new(CgroupNamespace {
             user_namespace: self.credentials.user_namespace.clone(),

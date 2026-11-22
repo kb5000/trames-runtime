@@ -383,8 +383,47 @@ impl Default for Cgroups {
         out
     }
 }
+/// The directory stays pinned across clone setup, including close/reuse of the guest FD.
+pub struct CgroupDestination {
+    node: NodeRef,
+    caller: Credentials,
+}
 impl Cgroups {
-    fn check_fork(&mut self, pid: u32) -> (Result<()>, Vec<Arc<ControlEvents>>) {
+    fn member_group(&self, pid: u32) -> u64 {
+        self.tasks.get(&pid).map_or(ROOT, |task| task.group())
+    }
+    fn destination(&self, target: &CgroupDestination, source: u64, threaded: bool) -> Result<u64> {
+        let id = target.node.borrow().inode;
+        let dest = self.groups.get(&id).ok_or(Errno(2))?;
+        let fs = self.fs.borrow();
+        if !fs
+            .paths
+            .get(&dest.path)
+            .is_some_and(|n| Arc::ptr_eq(n, &target.node))
+        {
+            return Err(Errno(2));
+        }
+        let mut common = source;
+        while !below(&dest.path, &self.groups[&common].path) {
+            common = self.groups[&common]
+                .parent
+                .expect("root contains every cgroup");
+        }
+        for group in [id, common] {
+            let procs = &fs.paths[&child_path(&self.groups[&group].path, b"cgroup.procs")];
+            if !target.caller.allows_node(&procs.borrow(), 2) {
+                return Err(Errno(13));
+            }
+        }
+        if id != ROOT && dest.subtree_pids {
+            return Err(Errno(16));
+        }
+        if threaded && id != source {
+            return Err(Errno(95));
+        }
+        Ok(id)
+    }
+    fn check_fork(&mut self, pid: u32, id: u64) -> (Result<()>, Vec<Arc<ControlEvents>>) {
         if self
             .tasks
             .get(&pid)
@@ -392,7 +431,6 @@ impl Cgroups {
         {
             return (Err(Errno(4)), Vec::new());
         }
-        let id = self.tasks.get(&pid).map_or(ROOT, |task| task.group());
         for group in self.ancestors(id) {
             if !self.pids_enabled(group) {
                 continue;
@@ -423,8 +461,13 @@ impl Cgroups {
         }
         (Ok(()), Vec::new())
     }
-    fn fork_member(&mut self, parent: u32, child: u32, tgid: u32) -> Vec<Arc<ControlEvents>> {
-        let id = self.tasks.get(&parent).map_or(ROOT, |task| task.group());
+    fn fork_member(
+        &mut self,
+        parent: u32,
+        child: u32,
+        tgid: u32,
+        id: u64,
+    ) -> Vec<Arc<ControlEvents>> {
         let before = self.event_states(self.ancestors(id));
         let frozen = self.frozen(id);
         let pending = self
@@ -839,7 +882,11 @@ impl Vfs {
     /// Called before clone commits IDs/TID stores. All workers have joined;
     /// the following membership insertion cannot race another charge.
     pub fn cgroup_can_fork(&self, pid: u32) -> Result<()> {
-        let (result, events) = self.cgroups.borrow_mut().check_fork(pid);
+        let (result, events) = {
+            let mut cg = self.cgroups.borrow_mut();
+            let id = cg.member_group(pid);
+            cg.check_fork(pid, id)
+        };
         notify_events(events);
         result
     }
@@ -969,31 +1016,85 @@ impl Vfs {
     /// Compatibility setup for an already admitted task. Production birth
     /// validates limits and commits membership in cgroup_birth instead.
     pub fn cgroup_fork(&self, parent: u32, child: u32, tgid: u32) {
-        let events = self.cgroups.borrow_mut().fork_member(parent, child, tgid);
+        let events = {
+            let mut cg = self.cgroups.borrow_mut();
+            let id = cg.member_group(parent);
+            cg.fork_member(parent, child, tgid, id)
+        };
         notify_events(events);
     }
     /// One original membership/limit transaction; notifications are published
     /// only after the caller releases its family publication lock.
     pub fn cgroup_birth(&self, parent: u32, child: u32, tgid: u32) -> CgroupBirth {
         let mut cg = self.cgroups.borrow_mut();
-        let (result, mut events) = cg.check_fork(parent);
+        let id = cg.member_group(parent);
+        let (result, mut events) = cg.check_fork(parent, id);
         if result.is_ok() {
-            events.extend(cg.fork_member(parent, child, tgid));
+            events.extend(cg.fork_member(parent, child, tgid, id));
         }
         CgroupBirth { result, events }
+    }
+    pub(super) fn cgroup_root_for_namespace(
+        &self,
+        target: Option<&CgroupDestination>,
+    ) -> Result<(Vec<u8>, NodeRef)> {
+        let cg = self.cgroups.borrow();
+        let id = target.map_or_else(
+            || cg.member_group(self.pid),
+            |target| target.node.borrow().inode,
+        );
+        let path = cg.groups.get(&id).ok_or(Errno(2))?.path.clone();
+        let root = cg.fs.borrow().paths[&path].clone();
+        if target.is_some_and(|t| !Arc::ptr_eq(&t.node, &root)) {
+            return Err(Errno(2));
+        }
+        Ok((path, root))
+    }
+    pub fn clone_cgroup_destination(&self, fd: u32) -> Result<CgroupDestination> {
+        let d = self.descriptor(fd)?;
+        let open = d.open.borrow();
+        if !open
+            .mount
+            .as_ref()
+            .is_some_and(|m| m.kind == mounts::Kind::Cgroup)
+        {
+            return Err(Errno(9));
+        }
+        let node = open.node.as_ref().ok_or(Errno(9))?;
+        if !matches!(node.borrow().content, Content::Directory) {
+            return Err(Errno(9));
+        }
+        Ok(CgroupDestination {
+            node: node.clone(),
+            caller: self.credentials.clone(),
+        })
     }
     /// Task construction commits PID allocation and cgroup membership together.
     /// In particular, a rejected first child must leave namespace PID 1 free.
     /// Lock order is cgroup -> ancestor PID maps, matching cgroup PID queries;
     /// task/family publication and notifications happen after these guards drop.
     pub fn activate_child_birth(&mut self, parent: u32, child: u32, tgid: u32) -> CgroupBirth {
+        self.activate_child_birth_into(parent, child, tgid, None)
+    }
+    pub fn activate_child_birth_into(
+        &mut self,
+        parent: u32,
+        child: u32,
+        tgid: u32,
+        target: Option<&CgroupDestination>,
+    ) -> CgroupBirth {
         let mut cg = self.cgroups.borrow_mut();
         let mut events = Vec::new();
         let identity = self.pid_children.allocate_with(child, || {
-            let (result, changes) = cg.check_fork(parent);
+            let source = cg.member_group(parent);
+            let id = match target {
+                Some(target) => cg.destination(target, source, child != tgid)?,
+                None => source,
+            };
+            let (result, changes) = cg.check_fork(parent, id);
             events.extend(changes);
             result?;
-            events.extend(cg.fork_member(parent, child, tgid));
+            events.extend(cg.fork_member(parent, child, tgid, id));
             Ok(())
         });
         drop(cg);
@@ -1812,6 +1913,49 @@ mod tests {
         v.mkdir_at(AT_FDCWD, b"/sys/fs/cgroup/new", 0o755).unwrap();
         assert_eq!(v.cgroups.borrow().groups.len(), MAX_GROUPS);
         assert!(v.cgroups.borrow().dying.is_empty());
+    }
+    #[test]
+    fn directed_birth_pins_the_inode_and_checks_both_procs_files() {
+        let mut v = setup();
+        let path = b"/sys/fs/cgroup/child";
+        let procs = b"/sys/fs/cgroup/child/cgroup.procs";
+        v.mkdir_at(AT_FDCWD, path, 0o755).unwrap();
+        let fd = v.open_at(AT_FDCWD, path, O_PATH | O_DIRECTORY, 0).unwrap();
+        let stale = v.clone_cgroup_destination(fd).unwrap();
+        v.close(fd).unwrap();
+        v.unlink_at(AT_FDCWD, path, true).unwrap();
+        v.mkdir_at(AT_FDCWD, path, 0o755).unwrap();
+        assert_eq!(
+            v.activate_child_birth_into(1, 2, 2, Some(&stale)).result(),
+            Err(Errno(2))
+        );
+        assert!(v.cgroup_task(2).is_none());
+        let fd = v.open_at(AT_FDCWD, path, O_PATH | O_DIRECTORY, 0).unwrap();
+        let mut unprivileged = v.clone();
+        unprivileged.credentials.set_id(false, 65534).unwrap();
+        let target = unprivileged.clone_cgroup_destination(fd).unwrap();
+        v.chmod_at(AT_FDCWD, procs, 0o666).unwrap();
+        assert_eq!(
+            v.activate_child_birth_into(1, 2, 2, Some(&target)).result(),
+            Err(Errno(13))
+        );
+        assert!(v.cgroup_task(2).is_none());
+        v.chmod_at(AT_FDCWD, b"/sys/fs/cgroup/cgroup.procs", 0o666)
+            .unwrap();
+        assert_eq!(
+            v.activate_child_birth_into(1, 2, 1, Some(&target)).result(),
+            Err(Errno(95))
+        );
+        let mut child = v.clone();
+        child.unshare_cgroup_at(Some(&target)).unwrap();
+        assert_eq!(
+            child
+                .activate_child_birth_into(1, 2, 2, Some(&target))
+                .result(),
+            Ok(())
+        );
+        assert_eq!(child.cgroup_view_path(&child.cgroup_path(2)), b"/");
+        assert_eq!(v.cgroup_path(2), b"/child");
     }
     #[test]
     fn depth_limit_is_transactional_and_storage_budget_is_separate() {

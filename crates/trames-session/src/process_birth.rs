@@ -4,6 +4,7 @@
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+const CLONE_INTO_CGROUP: u64 = 1 << 33;
 const CLONE_PIDFD: u64 = 0x1000;
 
 pub(super) struct Child<C: Cpu> {
@@ -208,6 +209,7 @@ impl Birth {
         inherit_job: bool,
         host_terminal: Option<&Arc<trames_vfs::Pty>>,
         inherit_parent: Option<&Process<C>>,
+        target: Option<&trames_vfs::CgroupDestination>,
     ) -> Result<(), Errno> {
         let family = child.family.clone();
         let mut cgroup_birth = None;
@@ -225,7 +227,10 @@ impl Birth {
                     .vfs
                     .inherit_controlling(parent_control.controlling().as_deref());
             }
-            let birth = child.linux.vfs.activate_child_birth(parent, id, child.tgid);
+            let birth = child
+                .linux
+                .vfs
+                .activate_child_birth_into(parent, id, child.tgid, target);
             let admitted = birth.result();
             cgroup_birth = Some(birth);
             admitted?;
@@ -319,7 +324,7 @@ impl Birth {
             || signal > 64
             || word(64) != 0
             || word(72) != 0
-            || flags & (1 << 33) != 0
+            || flags & CLONE_INTO_CGROUP != 0 && (bytes.len() < 88 || word(80) > i32::MAX as u64)
         {
             return Err(Errno(22));
         }
@@ -335,11 +340,24 @@ impl Birth {
         if flags & CLONE_PIDFD != 0 && flags & 0x100000 != 0 && word(8) == word(24) {
             return Err(Errno(22));
         }
+        let target = if flags & CLONE_INTO_CGROUP != 0 {
+            Some(p.linux.vfs.clone_cgroup_destination(word(80) as u32)?)
+        } else {
+            None
+        };
         self.birth_with_pidfd(
             pid,
             p,
-            [flags | signal, top, word(24), word(56), word(16), 0],
+            [
+                (flags & !CLONE_INTO_CGROUP) | signal,
+                top,
+                word(24),
+                word(56),
+                word(16),
+                0,
+            ],
             word(8),
+            target.as_ref(),
         )
     }
     pub(super) fn clone_task<C: Cpu>(
@@ -351,7 +369,7 @@ impl Birth {
         if a[0] & CLONE_PIDFD != 0 && a[0] & (0x100000 | 0x400000) != 0 {
             return Err(Errno(22));
         }
-        self.birth_with_pidfd(pid, p, a, a[2])
+        self.birth_with_pidfd(pid, p, a, a[2], None)
     }
     fn birth_with_pidfd<C: Cpu>(
         &self,
@@ -359,6 +377,7 @@ impl Birth {
         p: &mut Process<C>,
         a: [u64; 6],
         pidfd_address: u64,
+        target: Option<&trames_vfs::CgroupDestination>,
     ) -> Result<Child<C>, Errno> {
         const ALLOWED: u64 = 0xff
             | CLONE_PIDFD
@@ -434,7 +453,7 @@ impl Birth {
             child.linux.vfs.unshare_ipc()?;
         }
         if a[0] & trames_vfs::CLONE_NEWCGROUP != 0 {
-            child.linux.vfs.unshare_cgroup()?;
+            child.linux.vfs.unshare_cgroup_at(target)?;
         }
         // PID namespace init inherits its parent's PGID/SID/tty, as
         // Linux copy_process does. Ancestor-only IDs appear as zero
@@ -529,6 +548,7 @@ impl Birth {
             true,
             None,
             inherit_parent.then_some(&*p),
+            target,
         )?;
         if let Some(slot) = pidfd {
             slot.publish()?;
@@ -850,6 +870,7 @@ impl Birth {
             false,
             false,
             child.terminal.as_ref(),
+            None,
             None,
         )?;
         let directory = p.signals.io_directory.clone();

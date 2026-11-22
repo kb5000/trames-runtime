@@ -11,7 +11,7 @@ pub use console::NativeConsole;
 pub use console::{CapturedBytes, CapturedConsole, ConsoleCallbacks, ConsoleIo, ConsoleStream};
 pub mod capabilities;
 mod cgroup;
-pub use cgroup::{CgroupBirth, CgroupTask};
+pub use cgroup::{CgroupBirth, CgroupDestination, CgroupTask};
 mod fs_context;
 mod path_queries;
 pub mod poll_mask;
