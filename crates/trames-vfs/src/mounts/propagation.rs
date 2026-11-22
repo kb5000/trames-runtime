@@ -246,16 +246,18 @@ impl Vfs {
         &self,
         namespace: &MountNamespace,
         added: Vec<Arc<Mount>>,
+        apply_options: impl FnOnce(),
     ) -> Result<()> {
         let root = added.first().ok_or(Errno(22))?;
         let attachment = root.parent.borrow().clone().ok_or(Errno(22))?;
-        self.publish_mounts_at(namespace, added, attachment)
+        self.publish_mounts_at(namespace, added, attachment, apply_options)
     }
     pub(super) fn publish_mounts_at(
         &self,
         namespace: &MountNamespace,
         added: Vec<Arc<Mount>>,
         attachment: Attachment,
+        apply_options: impl FnOnce(),
     ) -> Result<()> {
         let root = added.first().ok_or(Errno(22))?;
         let parents = self.propagation_parents(&attachment.parent)?;
@@ -375,6 +377,8 @@ impl Vfs {
         for (_, mounts) in &plans {
             self.register_mounts(mounts)?;
         }
+        // Apply superblock options after all fallible validation and before mount watchers wake.
+        apply_options();
         // A propagated mount goes beneath the mount already visible at
         // that dentry. Keeping a single parent edge per mountpoint also lets
         // unmount uncover the original tree without losing its descendants.

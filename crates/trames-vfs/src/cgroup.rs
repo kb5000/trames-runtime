@@ -102,6 +102,7 @@ struct Dying {
 pub(super) struct Cgroups {
     pub bpf: bpf::Registry,
     pub fs: FsHandle,
+    pub nsdelegate: Arc<AtomicBool>,
     groups: BTreeMap<u64, Group>,
     tasks: BTreeMap<u32, Arc<Member>>, // original global TID incarnation
     dying: Vec<Dying>,
@@ -279,7 +280,8 @@ impl CgroupTask {
         notify_events(events);
     }
 }
-/// Credentials and PID view belong to the caller, never the creator of an OFD.
+/// PID lookup and the runtime's administration check use the task doing I/O.
+/// Migration additionally checks the opener's credentials and cgroup namespace.
 #[derive(Clone)]
 pub(super) struct CgroupAccess {
     namespace: PidNamespace,
@@ -320,6 +322,8 @@ fn notify_events(events: Vec<Arc<ControlEvents>>) {
     }
 }
 pub(super) struct CgroupFile {
+    namespace: Arc<linux_namespace::CgroupNamespace>,
+    migration_credentials: Option<Credentials>,
     groups: Arc<SharedCell<Cgroups>>,
     node: NodeRef,
     id: u64,
@@ -365,6 +369,7 @@ impl Default for Cgroups {
     fn default() -> Self {
         let mut out = Self {
             bpf: bpf::Registry::default(),
+            nsdelegate: Arc::default(),
             fs: FsHandle::new(Filesystem {
                 shared_budget: trames_shared::SharedBudget::new(memfd::MEMFD_BYTES as usize),
                 paths: BTreeMap::new(),
@@ -385,6 +390,7 @@ impl Default for Cgroups {
 }
 /// The directory stays pinned across clone setup, including close/reuse of the guest FD.
 pub struct CgroupDestination {
+    namespace: Arc<linux_namespace::CgroupNamespace>,
     node: NodeRef,
     caller: Credentials,
 }
@@ -403,18 +409,9 @@ impl Cgroups {
         {
             return Err(Errno(2));
         }
-        let mut common = source;
-        while !below(&dest.path, &self.groups[&common].path) {
-            common = self.groups[&common]
-                .parent
-                .expect("root contains every cgroup");
-        }
-        for group in [id, common] {
-            let procs = &fs.paths[&child_path(&self.groups[&group].path, b"cgroup.procs")];
-            if !target.caller.allows_node(&procs.borrow(), 2) {
-                return Err(Errno(13));
-            }
-        }
+        drop(fs);
+        self.check_procs_write(id, &target.caller)?;
+        self.check_migration(source, id, &target.caller, &target.namespace)?;
         if id != ROOT && dest.subtree_pids {
             return Err(Errno(16));
         }
@@ -422,6 +419,40 @@ impl Cgroups {
             return Err(Errno(95));
         }
         Ok(id)
+    }
+    fn check_procs_write(&self, id: u64, credentials: &Credentials) -> Result<()> {
+        let control = &self.groups[&id].files[b"cgroup.procs".as_slice()];
+        let node = control.node.upgrade().ok_or(Errno(2))?;
+        if !credentials.allows_node(&node.borrow(), 2) {
+            return Err(Errno(13));
+        }
+        Ok(())
+    }
+    fn check_migration(
+        &self,
+        source: u64,
+        dest: u64,
+        credentials: &Credentials,
+        namespace: &linux_namespace::CgroupNamespace,
+    ) -> Result<()> {
+        let mut common = source;
+        while !below(&self.groups[&dest].path, &self.groups[&common].path) {
+            common = self.groups[&common]
+                .parent
+                .expect("root contains every cgroup");
+        }
+        self.check_procs_write(common, credentials)?;
+        // Containing the common ancestor is equivalent to containing both tasks'
+        // groups. A removed namespace root must never match a recreated pathname.
+        if let Some(root) = &namespace.root {
+            if self.nsdelegate.load(Ordering::Relaxed) {
+                let boundary = self.groups.get(&root.borrow().inode).ok_or(Errno(2))?;
+                if !below(&self.groups[&common].path, &boundary.path) {
+                    return Err(Errno(2));
+                }
+            }
+        }
+        Ok(())
     }
     fn check_fork(&mut self, pid: u32, id: u64) -> (Result<()>, Vec<Arc<ControlEvents>>) {
         if self
@@ -1065,6 +1096,7 @@ impl Vfs {
             return Err(Errno(9));
         }
         Ok(CgroupDestination {
+            namespace: self.cgroup_namespace.clone(),
             node: node.clone(),
             caller: self.credentials.clone(),
         })
@@ -1157,6 +1189,9 @@ impl Vfs {
             return Err(Errno(19));
         }
         Ok(Some(Arc::new(CgroupFile {
+            namespace: self.cgroup_namespace.clone(),
+            migration_credentials: (path.key[split + 1..] == *b"cgroup.procs")
+                .then(|| self.credentials.clone()),
             groups: self.cgroups.clone(),
             node: node.clone(),
             id,
@@ -1320,6 +1355,19 @@ impl CgroupFile {
         if !caller.admin {
             return Err(Errno(1));
         }
+        if self
+            .namespace
+            .root
+            .as_ref()
+            .is_some_and(|node| node.borrow().inode == id)
+            && cg.nsdelegate.load(Ordering::Relaxed)
+            && !matches!(
+                name.as_slice(),
+                b"cgroup.procs" | b"cgroup.threads" | b"cgroup.subtree_control"
+            )
+        {
+            return Err(Errno(1));
+        }
         if bytes.len() > 4096 {
             return Err(Errno(7));
         }
@@ -1478,10 +1526,17 @@ impl CgroupFile {
                 } else {
                     caller.global_pid(local)?
                 };
-                if id != ROOT && cg.groups.get(&id).ok_or(Errno(19))?.subtree_pids {
+                let member = cg.tasks.get(&target).ok_or(Errno(3))?;
+                let tgid = member.tgid();
+                cg.check_migration(
+                    member.group(),
+                    id,
+                    self.migration_credentials.as_ref().expect("procs opener"),
+                    &self.namespace,
+                )?;
+                if id != ROOT && cg.groups[&id].subtree_pids {
                     return Err(Errno(16));
                 }
-                let tgid = cg.tasks.get(&target).ok_or(Errno(3))?.tgid();
                 let tasks: Vec<_> = cg
                     .tasks
                     .values()
@@ -1913,6 +1968,31 @@ mod tests {
         v.mkdir_at(AT_FDCWD, b"/sys/fs/cgroup/new", 0o755).unwrap();
         assert_eq!(v.cgroups.borrow().groups.len(), MAX_GROUPS);
         assert!(v.cgroups.borrow().dying.is_empty());
+    }
+    #[test]
+    fn namespace_delegation_changes_only_on_successful_superblock_configuration() {
+        let mut v = setup();
+        let mountpoint = b"/second";
+        v.mkdir_at(AT_FDCWD, mountpoint, 0o755).unwrap();
+        v.mount(None, mountpoint, Some(b"cgroup2"), 0, Some(b"nsdelegate"))
+            .unwrap();
+        assert!(v.cgroups.borrow().nsdelegate.load(Ordering::Relaxed));
+        assert_eq!(
+            v.mount(None, mountpoint, Some(b"cgroup2"), 0, None),
+            Err(Errno(16))
+        );
+        assert_eq!(
+            v.mount(None, mountpoint, None, 32, Some(b"unknown")),
+            Err(Errno(95))
+        );
+        v.mount(None, mountpoint, None, 32 | 4096, None).unwrap();
+        assert!(v.cgroups.borrow().nsdelegate.load(Ordering::Relaxed));
+        let mut nested = v.clone();
+        nested.unshare_cgroup().unwrap();
+        nested.mount(None, mountpoint, None, 32, None).unwrap();
+        assert!(v.cgroups.borrow().nsdelegate.load(Ordering::Relaxed));
+        v.mount(None, mountpoint, None, 32, None).unwrap();
+        assert!(!v.cgroups.borrow().nsdelegate.load(Ordering::Relaxed));
     }
     #[test]
     fn directed_birth_pins_the_inode_and_checks_both_procs_files() {

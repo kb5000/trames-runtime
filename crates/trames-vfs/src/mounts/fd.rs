@@ -288,6 +288,7 @@ impl Vfs {
                     root_key,
                     kind: ctx.kind,
                     display: MountDisplay {
+                        nsdelegate: None,
                         source: Some(Arc::from(
                             state
                                 .source
@@ -543,7 +544,7 @@ impl Vfs {
             parent_tree.members.borrow_mut().append(&mut members);
         } else {
             let old = moved.propagation();
-            if let Err(e) = self.publish_mounts_at(&ns, members.clone(), link) {
+            if let Err(e) = self.publish_mounts_at(&ns, members.clone(), link, || {}) {
                 moved.set_propagation(old);
                 return Err(e);
             }

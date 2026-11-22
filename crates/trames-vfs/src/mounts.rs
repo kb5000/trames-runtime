@@ -135,6 +135,7 @@ impl Attachment {
 }
 #[derive(Clone, Default)]
 pub(super) struct MountDisplay {
+    nsdelegate: Option<Arc<std::sync::atomic::AtomicBool>>,
     source: Option<Arc<[u8]>>,
     tmpfs_mode: Option<u32>,
 }
@@ -743,7 +744,10 @@ impl Vfs {
             root: cgroup_root,
             root_key: b"/".to_vec(),
             kind: Kind::Cgroup,
-            display: Default::default(),
+            display: MountDisplay {
+                nsdelegate: Some(self.cgroups.borrow().nsdelegate.clone()),
+                ..Default::default()
+            },
             namespace: None,
             pid_namespace: None,
             devpts: None,
@@ -1175,6 +1179,23 @@ impl Vfs {
             None => self.follow_mounts(path),
         }
     }
+    fn cgroup_mount_options(&self, data: Option<&[u8]>) -> Result<Option<bool>> {
+        if !self.credentials.has_ns_cap(
+            &self.cgroup_namespace.user_namespace,
+            capabilities::SYS_ADMIN,
+        ) {
+            return Err(Errno(1));
+        }
+        let mut delegate = false;
+        for option in data.unwrap_or_default().split(|&b| b == b',') {
+            match option {
+                b"" => {}
+                b"nsdelegate" => delegate = true,
+                _ => return Err(Errno(95)),
+            }
+        }
+        Ok(self.cgroup_namespace.root.is_none().then_some(delegate))
+    }
     /// Mounts belong entirely to the guest. No host mount or pathname is used.
     pub fn mount(
         &mut self,
@@ -1283,6 +1304,14 @@ impl Vfs {
             if (attrs ^ parent.flags.get()) & locked != 0 {
                 return Err(Errno(1));
             }
+            if parent.kind == Kind::Cgroup && flags & BIND == 0 {
+                if let Some(value) = self.cgroup_mount_options(data)? {
+                    self.cgroups
+                        .borrow()
+                        .nsdelegate
+                        .store(value, Ordering::Relaxed);
+                }
+            }
             parent.flags.set(attrs);
             let events = self.mounts.as_ref().unwrap().0.borrow().events.clone();
             events.changed();
@@ -1308,6 +1337,7 @@ impl Vfs {
         let mut bind_origin = None;
         let mut fuse_binding = None;
         let mut tmpfs_mode = None;
+        let mut cgroup_options = None;
         if flags & BIND != 0 {
             let (_, target) =
                 self.resolve_entry_policy(AT_FDCWD, source.ok_or(Errno(22))?, true, true, 0, true)?;
@@ -1459,9 +1489,7 @@ impl Vfs {
                     (fs, root, b"/".to_vec(), Kind::Tmpfs, flags & ATTRS)
                 }
                 b"cgroup2" => {
-                    if data.is_some_and(|d| !d.is_empty()) {
-                        return Err(Errno(95));
-                    }
+                    cgroup_options = self.cgroup_mount_options(data)?;
                     let fs = self.cgroups.borrow().fs.clone();
                     let (root, key) = if let Some(root) = &self.cgroup_namespace.root {
                         let key = fs
@@ -1538,6 +1566,8 @@ impl Vfs {
                     source: Some(Arc::from(
                         source.filter(|s| !s.is_empty()).unwrap_or(b"none"),
                     )),
+                    nsdelegate: (mount_kind == Kind::Cgroup)
+                        .then(|| self.cgroups.borrow().nsdelegate.clone()),
                     tmpfs_mode,
                 }
             },
@@ -1578,7 +1608,14 @@ impl Vfs {
         }
         let mut added = vec![root];
         added.extend(additions.iter().map(|m| copies[&m.id].clone()));
-        self.publish_mounts(&ns, added)?;
+        self.publish_mounts(&ns, added, || {
+            if let Some(value) = cgroup_options {
+                self.cgroups
+                    .borrow()
+                    .nsdelegate
+                    .store(value, Ordering::Relaxed);
+            }
+        })?;
         if let Some(binding) = fuse_binding {
             binding.publish();
         }
@@ -2113,7 +2150,14 @@ pub(super) fn table_text(snapshot: &NamespaceSnapshot, info: bool) -> Vec<u8> {
             None => m.fs_name().to_owned(),
         };
         let flags = m.options();
-        let super_options = if let Some(mode) = m.display.tmpfs_mode {
+        let super_options = if m
+            .display
+            .nsdelegate
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            ",nsdelegate".to_owned()
+        } else if let Some(mode) = m.display.tmpfs_mode {
             format!(",mode={mode:o}")
         } else {
             m.fs.borrow()

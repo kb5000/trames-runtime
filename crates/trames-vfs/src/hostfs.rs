@@ -1051,7 +1051,7 @@ impl Vfs {
                 fallback: target.key,
             })),
         }));
-        self.publish_mounts(self.mounts.as_ref().unwrap(), vec![mount])
+        self.publish_mounts(self.mounts.as_ref().unwrap(), vec![mount], || {})
     }
 }
 
