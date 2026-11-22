@@ -645,13 +645,13 @@ impl<C: Cpu> Job<C> {
         if matches!(&self.waiting, Some(WaitState::Custody(wait)) if wait.signal.ready()) {
             return true;
         }
-        if self
+        if let Some(snapshot) = self
             .work
             .syscalls
             .as_ref()
-            .is_some_and(|s| s.io_signals.lifecycle().termination().is_some())
+            .filter(|s| s.io_signals.lifecycle().termination().is_some())
         {
-            return true;
+            return !snapshot.io_signals.exit_stop_held();
         }
         if self.stopped() {
             return self.work.syscalls.as_ref().is_some_and(|s| {

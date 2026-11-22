@@ -7,7 +7,9 @@ use trames_vfs::Errno;
 pub struct Pending(BTreeMap<u32, VecDeque<RetainedInfo>>);
 /// Keep sender translations alive through dequeue and ABI conversion, not just
 /// while the signal is queued. No reference to the sender's task is retained.
+#[derive(Clone)]
 pub struct RetainedInfo {
+    observed: bool,
     info: Info,
     _sender: Option<trames_vfs::PidReference>,
 }
@@ -39,6 +41,7 @@ impl Pending {
             return Err(Errno(11));
         }
         self.0.entry(sig).or_default().push_back(RetainedInfo {
+            observed: false,
             info,
             _sender: sender,
         });
@@ -51,11 +54,26 @@ impl Pending {
             return Err(Errno(11));
         }
         self.0.entry(sig).or_default().push_back(RetainedInfo {
+            observed: false,
             info,
             _sender: None,
         });
         Ok(())
     }
+    /// The tracee already selected this delivery. Put its exact sender and
+    /// payload ahead of signals arriving while the tracer held the stop.
+    pub(super) fn resume_observed(&mut self, sig: u32, mut info: RetainedInfo) {
+        info.observed = true;
+        self.0.entry(sig).or_default().push_front(info);
+    }
+
+    pub(super) fn remove_for_trace(&mut self, sig: u32) -> Option<RetainedInfo> {
+        if self.0.get(&sig)?.front()?.observed {
+            return None;
+        }
+        self.remove(&sig)
+    }
+
     pub fn remove(&mut self, sig: &u32) -> Option<RetainedInfo> {
         let q = self.0.get_mut(sig)?;
         let info = q.pop_front();

@@ -113,8 +113,15 @@ impl Inbox {
         self.pending.lock().unwrap().next(mask)
     }
     pub fn take(&self, sig: u32) -> Option<RetainedInfo> {
+        self.take_selected(|pending| pending.remove(&sig))
+    }
+
+    fn take_selected(
+        &self,
+        select: impl FnOnce(&mut Pending) -> Option<RetainedInfo>,
+    ) -> Option<RetainedInfo> {
         let mut pending = self.pending.lock().unwrap();
-        let result = pending.remove(&sig);
+        let result = select(&mut pending);
         self.bits.store(pending.bits(), Ordering::Relaxed);
         drop(pending);
         if result.is_some() {
@@ -122,6 +129,12 @@ impl Inbox {
         }
         result
     }
+    fn resume_observed_quiet(&self, sig: u32, info: RetainedInfo) {
+        let mut pending = self.pending.lock().unwrap();
+        pending.resume_observed(sig, info);
+        self.bits.store(pending.bits(), Ordering::Relaxed);
+    }
+
     pub fn discard(&self, sig: u32) {
         let mut pending = self.pending.lock().unwrap();
         if !pending.contains_key(&sig) {

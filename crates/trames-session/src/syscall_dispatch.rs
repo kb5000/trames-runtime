@@ -65,18 +65,28 @@ pub(crate) fn execute<C: Cpu>(
                     job.seccomp_entry = Some(entry);
                     break 'entry Some(result);
                 }
-                syscalls += 1;
                 if entry.action() == 0 {
+                    if snapshot
+                        .io_signals
+                        .trace_exit_stop(entry.fatal_signal(), || work.cpu.architectural_state())
+                    {
+                        job.seccomp_entry = Some(entry);
+                        job.pending_cpu = Some(result);
+                        job.pending_accounted = true;
+                        maintenance = true;
+                        break 'entry Some(SliceOutcome::Yield { instructions: 0 });
+                    }
                     if let Some(exit) =
                         snapshot.exit_thread(work.pid, entry.fatal_signal(), &mut *memory)
                     {
                         thread_exit = Some(exit);
+                        syscalls += 1;
                     } else {
                         job.seccomp_entry = Some(entry);
-                        syscalls -= 1;
                     }
                     break 'entry Some(result);
                 }
+                syscalls += 1;
                 if entry.action() == 0x0003_0000
                     && snapshot.io_signals.mask() & (1 << 30) == 0
                     && snapshot.actions.get(31).handler > 1
@@ -791,6 +801,16 @@ pub(crate) fn execute<C: Cpu>(
                 }
                 if matches!(work.cpu.x(8) as u32, 93 | 94) {
                     let status = (work.cpu.x(0) as u8 as i32) << 8;
+                    if snapshot
+                        .io_signals
+                        .trace_exit_stop(status, || work.cpu.architectural_state())
+                    {
+                        job.seccomp_entry = entry;
+                        job.pending_cpu = Some(result);
+                        job.pending_accounted = true;
+                        maintenance = true;
+                        break 'entry Some(SliceOutcome::Yield { instructions: 0 });
+                    }
                     if work.cpu.x(8) as u32 == 94 {
                         snapshot.io_signals.lifecycle().request_exit(status);
                     }

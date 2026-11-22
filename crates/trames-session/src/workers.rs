@@ -600,6 +600,9 @@ impl<C: Cpu> Starter<C> {
                                     break SliceOutcome::Yield { instructions: 0 };
                                 }
                                 if let Some(status) = snapshot.io_signals.lifecycle().termination() {
+                                    if snapshot.io_signals.exit_stop_held() || snapshot.io_signals.trace_exit_stop(status, || work.cpu.architectural_state()) {
+                                        maintenance=true;break SliceOutcome::Yield { instructions: 0 };
+                                    }
                                     if let (Some(pending),Some(authority)) = (job.gpu_pending.as_mut(),work.gpu.as_ref()) {
                                         if let Some(compile) = pending.compile.take() { authority.context.abandon(compile.job); }
                                     }
@@ -629,6 +632,12 @@ impl<C: Cpu> Starter<C> {
                                     }
                                 }
                                     }
+                                // Completion producers may hold resource locks. Publish a return
+                                // stop here, on the owning worker, before the next signal or instruction.
+                                if work.trace.take_return(|| !snapshot.io_signals.trace_stopped())
+                                    && snapshot.io_signals.trace_syscall_stop(false,||work.cpu.architectural_state()) {
+                                    maintenance=true;break SliceOutcome::Yield {instructions:0};
+                                }
                                 if let Some(crate::run_queue::WaitState::Child(wait)) = &job.waiting {
                                     if !snapshot.quiesced() {
                                     if let Some(value) = snapshot.children.wait(wait.request, &snapshot.io_routes.namespace, snapshot.io_signals.group(), work.memory.as_deref_mut().expect("child wait View")).transpose() {
@@ -921,6 +930,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                             }
                             let resumed_policy = matches!(job.pending_cpu,Some(SliceOutcome::Syscall {..})) && job.seccomp_entry.is_some();
                             let already_accounted = job.pending_cpu.is_some() && std::mem::take(&mut job.pending_accounted);
+                            let fresh_entry = job.pending_cpu.is_none();
                             let result = if let Some(pending) = job.pending_cpu.take() {
                                 pending
                             } else {
@@ -976,6 +986,14 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                 }
                             }
                             if matches!(result, SliceOutcome::Syscall { .. }) {
+                                if fresh_entry && work.syscalls.as_ref().is_some_and(|snapshot|snapshot.io_signals.trace_syscall_stop(true,||work.cpu.architectural_state())) {
+                                    // SVC has advanced PC. Keep the decoded entry pending until CONT;
+                                    // retries of this entry must not execute or account the instruction again.
+                                    work.trace.observe_entry();
+                                    job.pending_cpu=Some(result);
+                                    job.pending_accounted=true;
+                                    maintenance=true;break SliceOutcome::Yield {instructions:0};
+                                }
                                 // Transfer only the local Box pointer across the
                                 // borrow boundary; no View clone or message is made.
                                 let mut memory = job.work.memory.take().expect("syscall View");

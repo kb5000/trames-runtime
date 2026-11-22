@@ -5,10 +5,19 @@ use trames_engine::Cpu;
 
 #[derive(Default)]
 pub(crate) struct Trace(Option<Box<State>>);
+#[derive(Default)]
 struct State {
     enabled: bool,
+    observation: Observation,
     call: Option<Call>,
     line: String,
+}
+#[derive(Default, PartialEq, Eq)]
+enum Observation {
+    #[default]
+    Idle,
+    Entered,
+    Returned,
 }
 struct Call {
     pid: u32,
@@ -31,10 +40,23 @@ impl Trace {
         } else if enabled {
             self.0 = Some(Box::new(State {
                 enabled,
-                call: None,
                 line: String::with_capacity(256),
+                ..Default::default()
             }));
         }
+    }
+    pub fn observe_entry(&mut self) {
+        let state = self.0.get_or_insert_with(Default::default);
+        state.observation = Observation::Entered;
+    }
+    pub fn take_return(&mut self, can_publish: impl FnOnce() -> bool) -> bool {
+        if let Some(state) = self.0.as_mut() {
+            if state.observation == Observation::Returned && can_publish() {
+                state.observation = Observation::Idle;
+                return true;
+            }
+        }
+        false
     }
     /// Only called on the actual executor, outside the scheduling queue lock.
     pub fn begin(&mut self, pid: u32, number: u32, args: [u64; 6]) {
@@ -62,7 +84,18 @@ impl Trace {
         self.0.as_ref()?.call.as_ref().map(|call| call.number)
     }
     fn outcome(&mut self, outcome: Outcome) {
-        if let Some(call) = self.0.as_mut().and_then(|state| state.call.as_mut()) {
+        let Some(state) = self.0.as_mut() else {
+            return;
+        };
+        if state.observation == Observation::Entered {
+            state.observation = match outcome {
+                Outcome::Return(_) | Outcome::Replaced | Outcome::Restarted => {
+                    Observation::Returned
+                }
+                Outcome::Trapped => Observation::Idle,
+            };
+        }
+        if let Some(call) = state.call.as_mut() {
             if call.result.is_none() {
                 call.result = Some(outcome);
             }

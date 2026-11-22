@@ -8,6 +8,9 @@ const PTRACE_KILL: u64 = 8;
 const PTRACE_GETEVENTMSG: u64 = 0x4201;
 const PTRACE_GETSIGINFO: u64 = 0x4202;
 const PTRACE_CONT: u64 = 7;
+const PTRACE_SYSCALL: u64 = 24;
+const PTRACE_GET_SYSCALL_INFO: u64 = 0x420e;
+const PTRACE_O_TRACESYSGOOD: u64 = 1;
 const PTRACE_DETACH: u64 = 17;
 const PTRACE_SETOPTIONS: u64 = 0x4200;
 const PTRACE_GETREGSET: u64 = 0x4204;
@@ -16,6 +19,7 @@ const PTRACE_LISTEN: u64 = 0x4208;
 const PTRACE_GETSIGMASK: u64 = 0x420a;
 const PTRACE_SETSIGMASK: u64 = 0x420b;
 const PTRACE_O_TRACEEXEC: u64 = 1 << 4;
+const PTRACE_O_TRACEEXIT: u64 = 1 << 6;
 const PTRACE_O_EXITKILL: u64 = 1 << 20;
 const PTRACE_ATTACH: u64 = 16;
 const PTRACE_SEIZE: u64 = 0x4206;
@@ -27,14 +31,63 @@ pub(super) struct Relationship {
     child: Arc<crate::children::Child>,
     stop: Option<Arc<TraceStop>>,
     options: u64,
+    trace_syscalls: bool,
+    exit_reported: bool,
 }
 struct TraceStop {
     cpu: trames_execution::Aarch64State,
     status: u32,
     signal: Option<RetainedInfo>,
+    syscall: Option<SyscallStop>,
+    exit_status: Option<i32>,
+}
+
+#[derive(Clone, Copy)]
+enum SyscallStop {
+    Entry,
+    Exit,
 }
 
 impl TraceStop {
+    fn read_syscall_info(
+        &self,
+        len: u64,
+        output: u64,
+        memory: &mut impl trames_memory::CpuMemory,
+    ) -> Result<u64, Errno> {
+        // ARM64 ptrace_syscall_info uses the last meaningful byte, excluding tail padding.
+        let mut bytes = [0; 80];
+        bytes[4..8].copy_from_slice(&0xc00000b7u32.to_le_bytes());
+        bytes[8..16].copy_from_slice(&self.cpu.pc.to_le_bytes());
+        bytes[16..24].copy_from_slice(&self.cpu.sp.to_le_bytes());
+        let available = match self.syscall {
+            Some(SyscallStop::Entry) if self.status & 0x80 != 0 => {
+                bytes[0] = 1;
+                bytes[24..32].copy_from_slice(&self.cpu.registers[8].to_le_bytes());
+                for (dst, value) in bytes[32..]
+                    .chunks_exact_mut(8)
+                    .zip(&self.cpu.registers[..6])
+                {
+                    dst.copy_from_slice(&value.to_le_bytes());
+                }
+                80
+            }
+            Some(SyscallStop::Exit) if self.status & 0x80 != 0 => {
+                bytes[0] = 2;
+                let value = self.cpu.registers[0];
+                bytes[24..32].copy_from_slice(&value.to_le_bytes());
+                bytes[32] = u8::from((-4095..0).contains(&(value as i64)));
+                33
+            }
+            _ => 24,
+        };
+        let n = len.min(available) as usize;
+        if n != 0 {
+            memory.write(output, &bytes[..n]).map_err(|_| Errno(14))?;
+        }
+        Ok(available)
+    }
+
     fn read_regset(
         &self,
         kind: u64,
@@ -143,6 +196,60 @@ impl IoTask {
         shared: Option<bool>,
         registers: impl FnOnce() -> trames_execution::Aarch64State,
     ) -> bool {
+        self.publish_trace_stop(sig, shared, None, None, registers)
+    }
+
+    #[inline]
+    pub fn trace_syscall_stop(
+        &self,
+        entering: bool,
+        registers: impl FnOnce() -> trames_execution::Aarch64State,
+    ) -> bool {
+        if self.trace.get().is_none() {
+            return false;
+        }
+        self.publish_trace_stop(
+            5,
+            None,
+            Some(if entering {
+                SyscallStop::Entry
+            } else {
+                SyscallStop::Exit
+            }),
+            None,
+            registers,
+        )
+    }
+
+    pub fn trace_exit_stop(
+        &self,
+        status: i32,
+        registers: impl FnOnce() -> trames_execution::Aarch64State,
+    ) -> bool {
+        self.publish_trace_stop(5, None, None, Some(status), registers)
+    }
+
+    /// A pending group termination normally wakes every task. A tracer holding
+    /// the final event owns the next wake until it resumes or detaches.
+    pub fn exit_stop_held(&self) -> bool {
+        self.trace_stopped()
+            && self.trace.get().is_some_and(|slot| {
+                slot.lock().unwrap().as_ref().is_some_and(|rel| {
+                    rel.stop
+                        .as_ref()
+                        .is_some_and(|stop| stop.exit_status.is_some())
+                })
+            })
+    }
+
+    fn publish_trace_stop(
+        &self,
+        sig: u32,
+        shared: Option<bool>,
+        syscall: Option<SyscallStop>,
+        exit_status: Option<i32>,
+        registers: impl FnOnce() -> trames_execution::Aarch64State,
+    ) -> bool {
         let Some(slot) = self.trace.get() else {
             return false;
         };
@@ -150,23 +257,39 @@ impl IoTask {
         let Some(rel) = lock.as_mut() else {
             return false;
         };
-        if rel.stop.is_some() {
+        if rel.stop.is_some()
+            || syscall.is_some() && !rel.trace_syscalls
+            || exit_status.is_some() && (rel.exit_reported || rel.options & PTRACE_O_TRACEEXIT == 0)
+        {
             return false;
         }
         let signal = match shared {
-            Some(shared) => match self.take(sig, shared) {
+            Some(shared) => match (if shared { self.process() } else { &self.inbox })
+                .take_selected(|pending| pending.remove_for_trace(sig))
+            {
                 Some(info) => Some(info),
                 None => return false,
             },
             None => None,
         };
-        let status = if shared.is_none() && rel.options & PTRACE_O_TRACEEXEC != 0 {
+        let status = if exit_status.is_some() {
+            rel.exit_reported = true;
+            sig | (6 << 8)
+        } else if syscall.is_some() {
+            if rel.options & PTRACE_O_TRACESYSGOOD != 0 {
+                sig | 0x80
+            } else {
+                sig
+            }
+        } else if shared.is_none() && rel.options & PTRACE_O_TRACEEXEC != 0 {
             sig | (4 << 8)
         } else {
             sig
         };
         rel.stop = Some(Arc::new(TraceStop {
             cpu: registers(),
+            syscall,
+            exit_status,
             status,
             signal,
         }));
@@ -234,6 +357,8 @@ impl IoRoutes {
             child,
             stop: None,
             options: 0,
+            trace_syscalls: false,
+            exit_reported: false,
         });
         drop(slot);
         drop(list);
@@ -307,42 +432,56 @@ impl IoRoutes {
                 }
                 let stop = rel.stop.as_ref().ok_or(Errno(3))?;
                 match request {
-                    PTRACE_CONT | PTRACE_DETACH => {
+                    PTRACE_CONT | PTRACE_SYSCALL | PTRACE_DETACH => {
                         if options > 64 {
                             return Err(Errno(5));
                         }
                         if options != 0 {
-                            // On detach, return the original signal to normal delivery.
-                            // The original sender reference lives until it is queued again.
+                            // Only the original selected signal can be resumed. Keep its
+                            // namespace identity alive and let normal delivery consume it.
                             let info = stop
                                 .signal
-                                .as_deref()
-                                .filter(|_| {
-                                    request == PTRACE_DETACH && options == u64::from(stop.status)
-                                })
+                                .as_ref()
+                                .filter(|_| options == u64::from(stop.status))
                                 .ok_or(Errno(95))?;
-                            target.inbox.enqueue(stop.status, *info)?;
+                            target
+                                .inbox
+                                .resume_observed_quiet(stop.status, info.clone());
                         }
                         let notice = if request == PTRACE_DETACH {
                             rel.child.detach_trace()
                         } else {
                             rel.child.trace_event(None)
                         };
+                        rel.trace_syscalls = request == PTRACE_SYSCALL;
                         rel.stop = None;
                         if request == PTRACE_DETACH {
                             *slot = None;
                         }
                         target.trace_stop.store(false, Ordering::Release);
                         drop(slot);
+                        if options != 0 {
+                            target.inbox.changed();
+                        }
                         notice.notify();
                         target.wake_control();
                         return Ok(0);
                     }
                     PTRACE_SETOPTIONS
-                        if options & !(PTRACE_O_TRACEEXEC | PTRACE_O_EXITKILL) == 0 =>
+                        if options
+                            & !(PTRACE_O_TRACESYSGOOD
+                                | PTRACE_O_TRACEEXEC
+                                | PTRACE_O_TRACEEXIT
+                                | PTRACE_O_EXITKILL)
+                            == 0 =>
                     {
                         rel.options = options;
                         return Ok(0);
+                    }
+                    PTRACE_GET_SYSCALL_INFO => {
+                        let stop = stop.clone();
+                        drop(slot);
+                        return stop.read_syscall_info(addr, options, memory);
                     }
                     PTRACE_GETREGSET => {
                         let stop = stop.clone();
@@ -351,7 +490,9 @@ impl IoRoutes {
                     }
                     PTRACE_GETEVENTMSG => {
                         // Voluntary tracing currently admits leaders, so their TID survives exec.
-                        let message = if stop.status >> 8 == 4 {
+                        let message = if let Some(status) = stop.exit_status {
+                            status as u32 as u64
+                        } else if stop.status >> 8 == 4 {
                             self.namespace.local(target.tid()) as u64
                         } else {
                             0
@@ -366,7 +507,7 @@ impl IoRoutes {
                         let mut info = stop.signal.as_deref().copied().unwrap_or_else(|| Info {
                             sender: target.tgid(),
                             uid: target.credentials().read().uid,
-                            code: if stop.status >> 8 == 0 {
+                            code: if stop.syscall.is_none() && stop.status >> 8 == 0 {
                                 0
                             } else {
                                 stop.status as i32
@@ -386,14 +527,30 @@ impl IoRoutes {
                                 .visible(false, info.uid);
                         }
                         let mut bytes = [0; 128];
-                        write_siginfo(&mut bytes, stop.status & 0xff, info);
+                        write_siginfo(
+                            &mut bytes,
+                            if stop.syscall.is_some() {
+                                5
+                            } else {
+                                stop.status & 0xff
+                            },
+                            info,
+                        );
                         drop(slot);
                         memory.write_array(options, bytes).map_err(|_| Errno(14))?;
                         return Ok(0);
                     }
                     PTRACE_KILL => {
+                        if stop.exit_status.is_some() {
+                            let notice = rel.child.trace_event(None);
+                            rel.stop = None;
+                            target.trace_stop.store(false, Ordering::Release);
+                            drop(slot);
+                            notice.notify();
+                        } else {
+                            drop(slot);
+                        }
                         target.lifecycle().request_exit(9);
-                        drop(slot);
                         target.wake_control();
                         return Ok(0);
                     }
@@ -454,6 +611,58 @@ impl IoRoutes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn syscall_info_reports_full_size_and_copies_only_the_requested_prefix() {
+        use trames_memory::{Memory, Permissions, PAGE_SIZE};
+        let mut memory = Memory::default();
+        memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+        let mut stop = TraceStop {
+            cpu: Default::default(),
+            status: 0x85,
+            signal: None,
+            syscall: Some(SyscallStop::Entry),
+            exit_status: None,
+        };
+        stop.cpu.registers[..6].copy_from_slice(&[10, 11, 12, 13, 14, 15]);
+        stop.cpu.registers[8] = 57;
+        stop.cpu.pc = 0x1234;
+        stop.cpu.sp = 0x9876;
+        assert_eq!(stop.read_syscall_info(0, u64::MAX, &mut memory), Ok(80));
+        assert_eq!(
+            stop.read_syscall_info(1, u64::MAX, &mut memory),
+            Err(Errno(14))
+        );
+        memory.write_array(0x1000, [0xdd; 81]).unwrap();
+        assert_eq!(stop.read_syscall_info(7, 0x1000, &mut memory), Ok(80));
+        assert_eq!(
+            memory.read_array::<8>(0x1000).unwrap(),
+            [1, 0, 0, 0, 0xb7, 0, 0, 0xdd]
+        );
+        assert_eq!(stop.read_syscall_info(100, 0x1000, &mut memory), Ok(80));
+        let bytes = memory.read_array::<81>(0x1000).unwrap();
+        assert_eq!(&bytes[4..8], &0xc00000b7u32.to_le_bytes());
+        let words: Vec<_> = bytes[8..80]
+            .chunks_exact(8)
+            .map(|w| u64::from_le_bytes(w.try_into().unwrap()))
+            .collect();
+        assert_eq!(words, [0x1234, 0x9876, 57, 10, 11, 12, 13, 14, 15]);
+        assert_eq!(bytes[80], 0xdd);
+        stop.syscall = Some(SyscallStop::Exit);
+        for (result, error) in [(0i64, 0), (-1, 1), (-4095, 1), (-4096, 0)] {
+            stop.cpu.registers[0] = result as u64;
+            assert_eq!(stop.read_syscall_info(80, 0x1000, &mut memory), Ok(33));
+            assert_eq!(memory.read_array::<1>(0x1000).unwrap(), [2]);
+            assert_eq!(
+                memory.read_array::<8>(0x1018).unwrap(),
+                result.to_le_bytes()
+            );
+            assert_eq!(memory.read_array::<1>(0x1020).unwrap(), [error]);
+        }
+        stop.status = 5;
+        assert_eq!(stop.read_syscall_info(80, 0x1000, &mut memory), Ok(24));
+        assert_eq!(memory.read_array::<1>(0x1000).unwrap(), [0]);
+    }
 
     #[test]
     fn tracer_retirement_releases_a_stopped_child_and_closes_future_admission() {
