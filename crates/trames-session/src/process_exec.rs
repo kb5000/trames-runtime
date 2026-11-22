@@ -161,15 +161,10 @@ impl<C: Cpu> Kernel<C> {
         p.linux.vfs.unshare_descriptors();
         p.linux.vfs.close_exec();
         let credentials = runtime.linux.vfs.credentials.clone();
-        let dumpable = runtime.linux.vfs.dumpable();
+        let dumpable = runtime.linux.vfs.dumpable_state();
         std::mem::swap(&mut runtime.linux.vfs, &mut p.linux.vfs);
         runtime.linux.vfs.credentials = credentials;
-        runtime.linux.vfs.unshare_dumpable();
-        runtime
-            .linux
-            .vfs
-            .set_dumpable(dumpable)
-            .expect("prepared dumpable value");
+        runtime.linux.vfs.install_exec_dumpable(dumpable);
         runtime.linux.session_keys = p.linux.session_keys.clone();
         runtime.linux.personality = p.linux.personality.clone();
         runtime.linux.memory_policy = p.linux.memory_policy.clone();
@@ -1633,8 +1628,10 @@ impl Request {
                     .collect::<Vec<_>>()),
             );
             runtime.linux.vfs.credentials = execute_vfs.credentials.clone();
-            runtime.linux.vfs.unshare_dumpable();
-            runtime.linux.vfs.set_dumpable(execute_vfs.dumpable())?;
+            runtime
+                .linux
+                .vfs
+                .install_exec_dumpable(execute_vfs.dumpable_state());
             return Ok(Image {
                 cpu: runtime.cpu,
                 memory: runtime.memory,

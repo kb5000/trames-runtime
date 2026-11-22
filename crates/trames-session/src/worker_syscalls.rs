@@ -874,16 +874,24 @@ impl Snapshot {
         tid: u32,
         wake: &std::sync::Weak<dyn trames_vfs::IoWake>,
     ) -> Option<trames_linux::IoAttempt> {
-        (matches!(number, 270 | 271) && args[0] as u32 != self.io_signals.local_tid()).then(|| {
-            self.direct
-                .start_process_vm(number, args, memory, tid, wake, || {
-                    self.io_routes.directory.process_memory_target(
-                        &self.io_routes.namespace,
-                        &self.io_signals,
-                        args[0] as u32,
-                    )
-                })
-        })
+        let peek = number == 117 && matches!(args[0], 1 | 2);
+        (peek || matches!(number, 270 | 271) && args[0] as u32 != self.io_signals.local_tid()).then(
+            || {
+                self.direct
+                    .start_process_vm(number, args, memory, tid, wake, || {
+                        if peek {
+                            return self
+                                .io_routes
+                                .trace_read_target(&self.io_signals, args[1] as u32);
+                        }
+                        self.io_routes.directory.process_memory_target(
+                            &self.io_routes.namespace,
+                            &self.io_signals,
+                            args[0] as u32,
+                        )
+                    })
+            },
+        )
     }
     pub fn admit<C: Cpu>(&self, cpu: &C) -> bool {
         if self.seccomp.mode() == 0 {
@@ -976,6 +984,7 @@ impl Snapshot {
             number @ (270 | 271) if cpu.x(0) as u32 == self.io_signals.local_tid() => {
                 trames_linux::process_vm_local(number, std::array::from_fn(|i| cpu.x(i)), memory)
             }
+            117 if matches!(cpu.x(0), 1 | 2) => return None,
             117 => {
                 self.io_routes
                     .ptrace(&self.io_signals, std::array::from_fn(|i| cpu.x(i)), memory)

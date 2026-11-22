@@ -98,7 +98,9 @@ impl CredentialState {
         let target = self.current.read().unwrap();
         let binding = self.pidfd.lock().unwrap();
         let resources = binding.as_ref().ok_or(Errno(3))?;
-        if !caller.can_inspect_credentials(same_group, &target, resources.dumpable.get()) {
+        if !same_group && !resources.dumpable.may_inspect(caller)
+            || !caller.can_inspect_credentials(same_group, &target, resources.dumpable.get())
+        {
             return Err(Errno(13));
         }
         if !resources
@@ -146,6 +148,9 @@ impl CredentialState {
         let target = self.current.read().unwrap();
         let binding = self.pidfd.lock().unwrap();
         let resources = binding.as_ref().ok_or(Errno(3))?;
+        if !same_group && !resources.dumpable.may_inspect(caller) {
+            return Err(Errno(1));
+        }
         // Both READ_REALCREDS (setns) and ATTACH_REALCREDS (getfd) compare real IDs and permitted capabilities.
         if !same_group
             && !caller.has_ns_cap(&target.user_namespace, capabilities::SYS_PTRACE)
@@ -184,12 +189,14 @@ impl CredentialState {
 #[derive(Clone)]
 pub struct Dumpable(Arc<DumpPolicy>);
 struct DumpPolicy {
+    namespace: UserNamespace,
     enabled: std::sync::atomic::AtomicBool,
     filter: std::sync::atomic::AtomicU32,
 }
 impl Default for Dumpable {
     fn default() -> Self {
         Self(Arc::new(DumpPolicy {
+            namespace: UserNamespace::default(),
             enabled: true.into(),
             filter: 0x33.into(),
         }))
@@ -209,10 +216,17 @@ impl Dumpable {
         self.0.filter.store(value & 0x1ff, Ordering::Relaxed);
     }
     pub fn fork(&self) -> Self {
-        let copy = Self::default();
-        copy.set(self.get());
-        copy.set_filter(self.filter());
-        copy
+        self.in_namespace(self.0.namespace.clone())
+    }
+    fn in_namespace(&self, namespace: UserNamespace) -> Self {
+        Self(Arc::new(DumpPolicy {
+            namespace,
+            enabled: self.get().into(),
+            filter: self.filter().into(),
+        }))
+    }
+    fn may_inspect(&self, caller: &Credentials) -> bool {
+        self.get() || caller.has_ns_cap(&self.0.namespace, capabilities::SYS_PTRACE)
     }
 }
 
@@ -226,10 +240,25 @@ pub struct ExecCredentials {
     file_caps: Option<file_caps::FileCaps>,
     nosuid: bool,
     readable: bool,
+    mm_namespace: UserNamespace,
 }
 impl ExecCredentials {
     pub fn include_interpreter(&mut self, view: &Vfs, file: &ExecutableFile) {
-        self.readable &= view.allowed(&file.node.borrow(), 4);
+        let node = file.node.borrow();
+        if !view.allowed(&node, 4) {
+            self.readable = false;
+            Self::include_owner(&mut self.mm_namespace, node.uid, node.gid);
+        }
+    }
+    fn include_owner(namespace: &mut UserNamespace, uid: u32, gid: u32) {
+        while namespace.from_global(false, uid).is_none()
+            || namespace.from_global(true, gid).is_none()
+        {
+            let Some(parent) = namespace.parent() else {
+                break;
+            };
+            *namespace = parent;
+        }
     }
     pub fn no_new_privs(&self) -> bool {
         self.original.caps.no_new_privs.get()
@@ -278,7 +307,7 @@ impl ExecCredentials {
             && self.file_caps.is_some()
             && (self.file_caps.is_some_and(|f| f.effective)
                 || c.caps.permitted & !c.caps.ambient != 0);
-        view.unshare_dumpable();
+        view.dumpable = view.dumpable.in_namespace(self.mm_namespace.clone());
         view.dumpable.set(
             self.readable
                 && c.uid == c.euid
@@ -600,6 +629,10 @@ impl Vfs {
         self.dumpable.set(value != 0);
         Ok(())
     }
+    pub fn install_exec_dumpable(&mut self, prepared: Dumpable) {
+        prepared.set_filter(self.dumpable.filter());
+        self.dumpable = prepared;
+    }
     pub fn unshare_dumpable(&mut self) {
         self.dumpable = self.dumpable.fork();
     }
@@ -665,9 +698,15 @@ impl Vfs {
                 return Err(Errno(1));
             }
         }
+        let readable = self.allowed(&node, 4);
+        let mut mm_namespace = self.credentials.user_namespace.clone();
+        if !readable {
+            ExecCredentials::include_owner(&mut mm_namespace, node.uid, node.gid);
+        }
         Ok(ExecCredentials {
             original: self.credentials.clone(),
-            readable: self.allowed(&node, 4),
+            readable,
+            mm_namespace,
             uid: node.uid,
             gid: node.gid,
             mode: node.file_metadata().mode,
@@ -894,6 +933,27 @@ impl Vfs {
 #[cfg(test)]
 mod process_transfer_tests {
     use super::*;
+    #[test]
+    fn nondumpable_mm_requires_a_capability_in_the_executable_owners_namespace() {
+        let mut vfs = Vfs::default();
+        let initial = vfs.credentials.clone();
+        vfs.unshare_user().unwrap();
+        let nested = &vfs.credentials;
+        assert!(nested.has_ns_cap(&nested.user_namespace, capabilities::SYS_PTRACE));
+        let mut owner = nested.user_namespace.clone();
+        ExecCredentials::include_owner(&mut owner, initial.uid, initial.gid);
+        assert!(owner == initial.user_namespace);
+        let mm = Dumpable::default().in_namespace(owner);
+        mm.set(false);
+        for policy in [mm.clone(), mm.fork()] {
+            assert!(!policy.may_inspect(nested));
+            assert!(policy.may_inspect(&initial));
+        }
+        assert!(mm
+            .in_namespace(nested.user_namespace.clone())
+            .may_inspect(nested));
+    }
+
     #[test]
     fn accepted_target_matches_the_image_checked_with_real_credentials() {
         let vfs = Vfs::default();

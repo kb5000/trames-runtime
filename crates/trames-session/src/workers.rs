@@ -645,18 +645,18 @@ impl<C: Cpu> Starter<C> {
                                         snapshot.io_signals.take(sig, shared);
                                         continue;
                                     }
-                                    if disposition == trames_kernel::signal::Disposition::Terminate {
-                                        snapshot.io_signals.lifecycle().request_exit(sig as i32);
-                                        continue;
-                                    }
                                     let stop_held=matches!(&job.waiting,Some(crate::run_queue::WaitState::Namespace(_) | crate::run_queue::WaitState::Policy(_) | crate::run_queue::WaitState::Barrier(_))) || matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.hardware_wait.as_ref().is_some_and(|w|!w.ready())
                                         || job.gpu_pending.as_ref().is_some_and(|g|g.compile.is_some())
                                         || job.io.as_ref().is_some_and(|io|matches!(io.number,2|270|271) || io.file_pending().is_some_and(|f|!f.interruptible()))
                                         || job.retry.as_ref().is_some_and(|io|io.number==2 || io.file_checkpoint.is_some() || io.file.as_ref().is_some_and(|f|!f.interruptible()));
+                                    if sig!=9 && !stop_held && snapshot.io_signals.trace_point(sig,Some(shared),||work.cpu.architectural_state()) {
+                                        maintenance=true;break SliceOutcome::Yield {instructions:0};
+                                    }
+                                    if disposition == trames_kernel::signal::Disposition::Terminate {
+                                        snapshot.io_signals.lifecycle().request_exit(sig as i32);
+                                        continue;
+                                    }
                                     if disposition == trames_kernel::signal::Disposition::Stop && !stop_held {
-                                        if snapshot.io_signals.trace_point(sig,Some(shared),||work.cpu.architectural_state()) {
-                                            maintenance=true;break SliceOutcome::Yield {instructions:0};
-                                        }
                                         if sig!=19 && snapshot.io_routes.directory.orphaned(&snapshot.io_signals) {
                                             snapshot.io_signals.take(sig,shared);continue;
                                         }

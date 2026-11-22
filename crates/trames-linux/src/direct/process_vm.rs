@@ -65,11 +65,23 @@ impl Copy {
         &mut self,
         memory: &mut impl CpuMemory,
         signal: &Arc<IoSignal>,
+        peek: bool,
     ) -> Result<Option<u64>, Errno> {
         if let Some((request, local, requested)) = &self.inflight {
             let Some(result) = request.take() else {
                 return Ok(None);
             };
+            if peek {
+                let bytes = result.map_err(|e| match e {
+                    TransferError::Fault => Errno(5),
+                    other => errno(other),
+                })?;
+                if bytes.len() != 8 {
+                    return Err(Errno(5));
+                }
+                memory.write(*local, &bytes).map_err(|_| Errno(14))?;
+                return Ok(Some(0));
+            }
             let mut bytes = result.map_err(errno)?;
             let n = if self.write {
                 bytes.len()
@@ -129,13 +141,34 @@ impl DirectSyscalls {
         wake: &Weak<dyn IoWake>,
         admit: impl FnOnce() -> Result<Option<TransferTarget>, Errno>,
     ) -> IoAttempt {
-        let (local, remote) = match import(args, memory) {
+        // Linux PEEK returns one word through the fourth syscall argument.
+        // Short remote reads must leave the output word untouched.
+        let vectors = if number == 117 {
+            if !matches!(args[0], 1 | 2) {
+                return IoAttempt::Complete(Err(Errno(22)));
+            }
+            Ok(Some((vec![(args[3], 8)], vec![(args[2], 8)])))
+        } else {
+            import(args, memory)
+        };
+        let (local, remote) = match vectors {
             Ok(Some(vectors)) => vectors,
             Ok(None) => return IoAttempt::Complete(Ok(0)),
             Err(error) => return IoAttempt::Complete(Err(error)),
         };
         let target = match admit() {
             Ok(Some(target)) => target,
+            Ok(None) if number == 117 => {
+                return IoAttempt::Complete(
+                    memory
+                        .read_array::<8>(args[2])
+                        .map_err(|_| Errno(5))
+                        .and_then(|word| {
+                            memory.write_array(args[3], word).map_err(|_| Errno(14))?;
+                            Ok(0)
+                        }),
+                )
+            }
             Ok(None) => return IoAttempt::Complete(copy_local(number, local, remote, memory)),
             Err(error) => return IoAttempt::Complete(Err(error)),
         };
@@ -185,7 +218,7 @@ impl DirectSyscalls {
     ) -> IoAttempt {
         pending.signal.reset();
         let copy = pending.process_vm.as_mut().unwrap();
-        let result = match copy.step(memory, &pending.signal) {
+        let result = match copy.step(memory, &pending.signal, pending.number == 117) {
             Ok(None) => return IoAttempt::Blocked(pending),
             Ok(Some(n)) => Ok(n),
             Err(_) if copy.done != 0 => Ok(copy.done),
@@ -203,6 +236,35 @@ mod tests {
     struct Wake;
     impl IoWake for Wake {
         fn wake_io(&self, _: &Arc<IoSignal>) {}
+    }
+
+    #[test]
+    fn ptrace_word_never_copies_a_prefix_of_an_inaccessible_word() {
+        let mut local = Memory::default();
+        let mut remote = Memory::default();
+        local.map(PAGE_SIZE, PAGE_SIZE, Permissions::RW).unwrap();
+        remote.map(PAGE_SIZE, PAGE_SIZE, Permissions::RW).unwrap();
+        local.write_array(PAGE_SIZE, *b"sentinel").unwrap();
+        remote.write_array(2 * PAGE_SIZE - 4, *b"abcd").unwrap();
+        remote.memory_report().bind_read_waker(Arc::new(|_| {}));
+        let direct = DirectSyscalls::new(trames_vfs::Vfs::default().direct_descriptors());
+        let wake: Arc<dyn IoWake> = Arc::new(Wake);
+        let IoAttempt::Blocked(wait) = direct.start_process_vm(
+            117,
+            [2, 42, 2 * PAGE_SIZE - 4, PAGE_SIZE, 0, 0],
+            &mut local,
+            1,
+            &Arc::downgrade(&wake),
+            || Ok(Some(remote.transfer_target())),
+        ) else {
+            panic!("expected pending word");
+        };
+        assert!(remote.activate_proc_reads());
+        assert!(matches!(
+            direct.resume(wait, &mut local),
+            IoAttempt::Complete(Err(Errno(5)))
+        ));
+        assert_eq!(local.read_array::<8>(PAGE_SIZE).unwrap(), *b"sentinel");
     }
 
     #[test]

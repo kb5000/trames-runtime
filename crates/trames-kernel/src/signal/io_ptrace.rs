@@ -4,6 +4,9 @@
 use super::*;
 
 const PTRACE_TRACEME: u64 = 0;
+const PTRACE_KILL: u64 = 8;
+const PTRACE_GETEVENTMSG: u64 = 0x4201;
+const PTRACE_GETSIGINFO: u64 = 0x4202;
 const PTRACE_CONT: u64 = 7;
 const PTRACE_DETACH: u64 = 17;
 const PTRACE_SETOPTIONS: u64 = 0x4200;
@@ -11,6 +14,7 @@ const PTRACE_GETREGSET: u64 = 0x4204;
 const PTRACE_INTERRUPT: u64 = 0x4207;
 const PTRACE_LISTEN: u64 = 0x4208;
 const PTRACE_GETSIGMASK: u64 = 0x420a;
+const PTRACE_SETSIGMASK: u64 = 0x420b;
 const PTRACE_O_TRACEEXEC: u64 = 1 << 4;
 const PTRACE_O_EXITKILL: u64 = 1 << 20;
 const PTRACE_ATTACH: u64 = 16;
@@ -21,9 +25,62 @@ const PTRACE_O_MASK: u64 = 0xff | (1 << 20) | PTRACE_O_SUSPEND_SECCOMP;
 pub(super) struct Relationship {
     tracer: Weak<IoTask>,
     child: Arc<crate::children::Child>,
-    regs: Option<Box<[u64; 34]>>,
+    stop: Option<Arc<TraceStop>>,
     options: u64,
 }
+struct TraceStop {
+    cpu: trames_execution::Aarch64State,
+    status: u32,
+    signal: Option<RetainedInfo>,
+}
+
+impl TraceStop {
+    fn read_regset(
+        &self,
+        kind: u64,
+        iov: u64,
+        memory: &mut impl trames_memory::CpuMemory,
+    ) -> Result<u64, Errno> {
+        let (width, size) = match kind {
+            1 => (8, 272), // NT_PRSTATUS
+            2 => (4, 528), // NT_FPREGSET, including the ABI tail padding
+            _ => return Err(Errno(22)),
+        };
+        let desc = memory.read_array::<16>(iov).map_err(|_| Errno(14))?;
+        let base = u64::from_le_bytes(desc[..8].try_into().unwrap());
+        let requested = u64::from_le_bytes(desc[8..].try_into().unwrap());
+        if requested % width != 0 {
+            return Err(Errno(22));
+        }
+        let len = requested.min(size) as usize;
+        let out = iov.checked_add(8).ok_or(Errno(14))?;
+        let mut bytes = [0; 528];
+        if kind == 1 {
+            let words = self.cpu.registers.iter().copied().chain([
+                self.cpu.sp,
+                self.cpu.pc,
+                self.cpu.nzcv as u64,
+            ]);
+            for (dst, word) in bytes.chunks_exact_mut(8).zip(words) {
+                dst.copy_from_slice(&word.to_le_bytes());
+            }
+        } else {
+            for (dst, vector) in bytes.chunks_exact_mut(16).zip(self.cpu.vectors.iter()) {
+                dst.copy_from_slice(&vector.to_le_bytes());
+            }
+            bytes[512..516].copy_from_slice(&self.cpu.fpsr.to_le_bytes());
+            bytes[516..520].copy_from_slice(&self.cpu.fpcr.to_le_bytes());
+        }
+        if len != 0 {
+            memory.write(base, &bytes[..len]).map_err(|_| Errno(14))?;
+        }
+        memory
+            .write_array(out, (len as u64).to_le_bytes())
+            .map_err(|_| Errno(14))?;
+        Ok(0)
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Tracees {
     retired: bool,
@@ -93,21 +150,26 @@ impl IoTask {
         let Some(rel) = lock.as_mut() else {
             return false;
         };
-        if let Some(shared) = shared {
-            if self.take(sig, shared).is_none() {
-                return false;
-            }
+        if rel.stop.is_some() {
+            return false;
         }
+        let signal = match shared {
+            Some(shared) => match self.take(sig, shared) {
+                Some(info) => Some(info),
+                None => return false,
+            },
+            None => None,
+        };
         let status = if shared.is_none() && rel.options & PTRACE_O_TRACEEXEC != 0 {
             sig | (4 << 8)
         } else {
             sig
         };
-        let cpu = registers();
-        let mut regs = Box::new([0; 34]);
-        regs[..31].copy_from_slice(&cpu.registers);
-        regs[31..].copy_from_slice(&[cpu.sp, cpu.pc, cpu.nzcv as u64]);
-        rel.regs = Some(regs);
+        rel.stop = Some(Arc::new(TraceStop {
+            cpu: registers(),
+            status,
+            signal,
+        }));
         self.trace_stop.store(true, Ordering::Release);
         let notice = rel.child.trace_event(Some(status as i32));
         let uid = self.credentials().read().uid;
@@ -170,13 +232,47 @@ impl IoRoutes {
         *slot = Some(Relationship {
             tracer: Arc::downgrade(&tracer),
             child,
-            regs: None,
+            stop: None,
             options: 0,
         });
         drop(slot);
         drop(list);
         notice.notify();
         Ok(0)
+    }
+
+    /// A word read requires the original stopped child and current permission
+    /// to read its exact address space. An exec cannot redirect an accepted read.
+    pub fn trace_read_target(
+        &self,
+        caller: &IoTask,
+        pid: u32,
+    ) -> Result<Option<trames_memory::TransferTarget>, Errno> {
+        let id = self.namespace.global(pid).ok_or(Errno(3))?;
+        let task = self
+            .directory
+            .tasks(0, id)
+            .into_iter()
+            .find(|t| t.live())
+            .ok_or(Errno(3))?;
+        let slot = task.trace.get().ok_or(Errno(3))?.lock().unwrap();
+        let rel = slot.as_ref().ok_or(Errno(3))?;
+        if rel.stop.is_none() || !std::ptr::eq(rel.tracer.as_ptr(), caller) {
+            return Err(Errno(3));
+        }
+        let mm = task.proc_view.memory_report().ok_or(Errno(3))?;
+        if caller
+            .proc_view
+            .memory_report()
+            .is_some_and(|m| m.same_resource(&mm))
+        {
+            return Ok(None);
+        }
+        let credentials = caller.credentials().read().clone();
+        task.credentials()
+            .admit_process_memory(&credentials, &mm)
+            .map_err(|e| if e.0 == 1 { Errno(5) } else { e })
+            .map(Some)
     }
 
     pub fn ptrace(
@@ -209,18 +305,30 @@ impl IoRoutes {
                 if matches!(request, PTRACE_ATTACH | PTRACE_SEIZE) {
                     return Err(Errno(1));
                 }
-                let regs = rel.regs.as_ref().ok_or(Errno(3))?;
+                let stop = rel.stop.as_ref().ok_or(Errno(3))?;
                 match request {
                     PTRACE_CONT | PTRACE_DETACH => {
+                        if options > 64 {
+                            return Err(Errno(5));
+                        }
                         if options != 0 {
-                            return Err(Errno(95));
+                            // On detach, return the original signal to normal delivery.
+                            // The original sender reference lives until it is queued again.
+                            let info = stop
+                                .signal
+                                .as_deref()
+                                .filter(|_| {
+                                    request == PTRACE_DETACH && options == u64::from(stop.status)
+                                })
+                                .ok_or(Errno(95))?;
+                            target.inbox.enqueue(stop.status, *info)?;
                         }
                         let notice = if request == PTRACE_DETACH {
                             rel.child.detach_trace()
                         } else {
                             rel.child.trace_event(None)
                         };
-                        rel.regs = None;
+                        rel.stop = None;
                         if request == PTRACE_DETACH {
                             *slot = None;
                         }
@@ -236,26 +344,70 @@ impl IoRoutes {
                         rel.options = options;
                         return Ok(0);
                     }
-                    PTRACE_GETREGSET if addr == 1 => {
-                        let iov = memory.read_array::<16>(options).map_err(|_| Errno(14))?;
-                        let base = u64::from_le_bytes(iov[..8].try_into().unwrap());
-                        let len = u64::from_le_bytes(iov[8..].try_into().unwrap());
-                        if len % 8 != 0 {
+                    PTRACE_GETREGSET => {
+                        let stop = stop.clone();
+                        drop(slot);
+                        return stop.read_regset(addr, options, memory);
+                    }
+                    PTRACE_GETEVENTMSG => {
+                        // Voluntary tracing currently admits leaders, so their TID survives exec.
+                        let message = if stop.status >> 8 == 4 {
+                            self.namespace.local(target.tid()) as u64
+                        } else {
+                            0
+                        };
+                        drop(slot);
+                        memory
+                            .write_array(options, message.to_le_bytes())
+                            .map_err(|_| Errno(14))?;
+                        return Ok(0);
+                    }
+                    PTRACE_GETSIGINFO => {
+                        let mut info = stop.signal.as_deref().copied().unwrap_or_else(|| Info {
+                            sender: target.tgid(),
+                            uid: target.credentials().read().uid,
+                            code: if stop.status >> 8 == 0 {
+                                0
+                            } else {
+                                stop.status as i32
+                            },
+                            ..Default::default()
+                        });
+                        if info.user.is_none()
+                            && info.fault.is_none()
+                            && info.poll.is_none()
+                            && info.timer.is_none()
+                        {
+                            info.sender = self.namespace.local(info.sender);
+                            info.uid = caller
+                                .credentials()
+                                .read()
+                                .user_namespace
+                                .visible(false, info.uid);
+                        }
+                        let mut bytes = [0; 128];
+                        write_siginfo(&mut bytes, stop.status & 0xff, info);
+                        drop(slot);
+                        memory.write_array(options, bytes).map_err(|_| Errno(14))?;
+                        return Ok(0);
+                    }
+                    PTRACE_KILL => {
+                        target.lifecycle().request_exit(9);
+                        drop(slot);
+                        target.wake_control();
+                        return Ok(0);
+                    }
+                    PTRACE_SETSIGMASK => {
+                        if addr != 8 {
                             return Err(Errno(22));
                         }
-                        let size = (len.min(34 * 8)) as usize;
-                        let mut bytes = [0; 34 * 8];
-                        for (dst, word) in bytes.chunks_exact_mut(8).zip(regs.iter()) {
-                            dst.copy_from_slice(&word.to_le_bytes());
-                        }
-                        let out = options.checked_add(8).ok_or(Errno(14))?;
-                        drop(slot);
-                        if size != 0 {
-                            memory.write(base, &bytes[..size]).map_err(|_| Errno(14))?;
-                        }
-                        memory
-                            .write_array(out, (size as u64).to_le_bytes())
-                            .map_err(|_| Errno(14))?;
+                        let mask = u64::from_le_bytes(
+                            memory.read_array::<8>(options).map_err(|_| Errno(14))?,
+                        ) & !UNBLOCKABLE;
+                        let mut context = target.context.lock().unwrap();
+                        context.mask = mask;
+                        context.wait_mask = None;
+                        target.publish_mask(mask);
                         return Ok(0);
                     }
                     PTRACE_GETSIGMASK => {

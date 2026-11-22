@@ -1771,14 +1771,16 @@ impl<C: Cpu> Kernel<C> {
             return Ok(false);
         }
         let disposition = trames_kernel::signal::disposition(sig, action);
-        if disposition == trames_kernel::signal::Disposition::Stop {
-            self.publish_io_tasks(Some((pid, p)));
-            if p.signals
+        if sig != 9
+            && !p.stop_held()
+            && p.signals
                 .io
                 .trace_point(sig, Some(shared), || p.cpu.architectural_state())
-            {
-                return Ok(true);
-            }
+        {
+            return Ok(true);
+        }
+        if disposition == trames_kernel::signal::Disposition::Stop {
+            self.publish_io_tasks(Some((pid, p)));
             if sig == 19 || !p.signals.io_directory.orphaned(&p.signals.io) {
                 return Ok(p
                     .signals
@@ -2163,12 +2165,19 @@ impl<C: Cpu> Kernel<C> {
                 }
                 Ok(Some(0))
             },
-            number @ (270 | 271) => {
+            number @ (270 | 271 | 117) if number != 117 || matches!(a[0],1|2) => {
                 let direct = trames_linux::DirectSyscalls::new(p.linux.vfs.direct_descriptors());
                 let attempt = if let Some(wait) = p.byte_wait.take() {
                     direct.resume(wait, &mut p.memory)
                 } else {
                     direct.start_process_vm(number, a, &mut p.memory, pid, &Arc::downgrade(&self.byte_target), || {
+                        if number == 117 {
+                            let routes = trames_kernel::signal::IoRoutes {
+                                directory: p.signals.io_directory.clone(), namespace: p.linux.vfs.pid_namespace().clone(),
+                                uid: p.linux.vfs.credentials.uid, euid: p.linux.vfs.credentials.euid,
+                            };
+                            return routes.trace_read_target(&p.signals.io,a[1] as u32);
+                        }
                         p.signals.io_directory.process_memory_target(p.linux.vfs.pid_namespace(), &p.signals.io, a[0] as u32)
                     })
                 };
