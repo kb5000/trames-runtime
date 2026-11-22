@@ -95,6 +95,16 @@ pub enum Address {
 }
 
 impl Address {
+    /// A Linux wildcard's per-loopback receive slot also covers local IPv4 aliases.
+    pub(crate) fn covers_loopback_alias(self, destination: Address) -> bool {
+        #[cfg(feature = "proto-ipv4")]
+        if let (Self::Ipv4(local), Self::Ipv4(target)) = (self, destination) {
+            return local.is_loopback() && target.is_loopback();
+        }
+        let _ = destination;
+        false
+    }
+
     /// Create an address wrapping an IPv4 address with the given octets.
     #[cfg(feature = "proto-ipv4")]
     pub const fn v4(a0: u8, a1: u8, a2: u8, a3: u8) -> Address {

@@ -75,6 +75,7 @@ struct Inner {
     drivers: Vec<Weak<trames_shared::Readiness>>,
     driver_dirty: bool,
     driver_maintenance: bool,
+    close_batch_until: Option<Instant>,
     notifications: Vec<Arc<trames_shared::Readiness>>,
     injected: VecDeque<(u64, u32, [u8; 6], Vec<u8>)>,
     ethernet: VecDeque<(crate::netdev::View, crate::ethernet::Action)>,
@@ -217,6 +218,7 @@ struct State {
     requested_bind: Option<SocketAddr>,
     udp_shared: bool,
     udp_readable: Option<Arc<trames_shared::Readiness>>,
+    listener_ready: Option<Arc<trames_shared::Readiness>>,
     udp_group: Option<u64>,
     nodelay: bool,
     cork: bool,
@@ -350,6 +352,22 @@ impl State {
         // released as soon as the active open fails, even if the FD lives on.
         self.bound = self.requested_bind.filter(|addr| addr.port() != 0);
         self.connection = Connection::Failed(error);
+    }
+
+    fn add_listener_slot(
+        &mut self,
+        socket: tcp::Socket<'static>,
+        sockets: &mut SocketSet<'static>,
+        waiters: &mut BTreeMap<SocketHandle, Arc<trames_shared::Readiness>>,
+    ) {
+        let handle = sockets.add(socket);
+        if let Some(source) = &self.listener_ready {
+            sockets
+                .get_mut::<tcp::Socket>(handle)
+                .observe_io(Some(handle));
+            waiters.insert(handle, source.clone());
+        }
+        self.handles.push(handle);
     }
 
     fn new_tcp_socket(&self) -> tcp::Socket<'static> {
@@ -504,6 +522,7 @@ impl Fabric {
             drivers: Vec::new(),
             driver_dirty: false,
             driver_maintenance: false,
+            close_batch_until: None,
             notifications: Vec::new(),
             injected: VecDeque::new(),
             ethernet: VecDeque::new(),
@@ -587,6 +606,16 @@ impl Fabric {
         {
             let delay = deadline.saturating_duration_since(Instant::now());
             next = Some(next.map_or(delay, |d| d.min(delay)));
+        }
+        // A burst of final closes shares one follow-up wake. Other socket I/O
+        // can deliver the queued FINs earlier on the normal packet path.
+        if let Some(until) = inner.close_batch_until {
+            let remaining = until.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                inner.close_batch_until = None;
+            } else {
+                next = Some(next.map_or(remaining, |d| d.min(remaining)));
+            }
         }
         for view in inner
             .nodes
@@ -1364,9 +1393,12 @@ impl Node {
             }
             let endpoint = endpoint(target);
             let mut slots = 0;
+            let mut listen_endpoint = endpoint;
             for &handle in &state.handles {
                 let socket = self.sockets.get::<tcp::Socket>(handle);
-                if socket.listen_endpoint().addr == Some(endpoint.addr) {
+                if socket.listens_on_address(endpoint.addr) {
+                    listen_endpoint.addr =
+                        socket.listen_endpoint().addr.expect("per-address listener");
                     if socket.is_listening() {
                         continue 'listeners;
                     }
@@ -1375,8 +1407,8 @@ impl Node {
             }
             if slots > 0 && slots < state.backlog {
                 let mut socket = state.new_tcp_socket();
-                if socket.listen_queued(endpoint, state.backlog).is_ok() {
-                    state.handles.push(self.sockets.add(socket));
+                if socket.listen_queued(listen_endpoint, state.backlog).is_ok() {
+                    state.add_listener_slot(socket, &mut self.sockets, &mut self.tcp_waiters);
                 }
             }
         }
@@ -1471,9 +1503,13 @@ impl Node {
                     self.sockets.get::<tcp::Socket>(h).listen_endpoint().addr
                 };
                 if endpoint.is_some_and(|a| !desired.contains(&addr(a))) {
-                    if socket.kind == 1 && self.sockets.get::<tcp::Socket>(h).is_active() {
+                    if socket.kind == 1
+                        && (self.sockets.get::<tcp::Socket>(h).is_active()
+                            || self.sockets.get::<tcp::Socket>(h).accept_ready())
+                    {
                         true
                     } else {
+                        self.tcp_waiters.remove(&h);
                         self.sockets.remove(h);
                         false
                     }
@@ -1496,19 +1532,18 @@ impl Node {
                     .count();
                 if count == 0 {
                     let ep = SocketAddr::new(*a, bound.port());
-                    let handle = if socket.kind == 2 {
+                    if socket.kind == 2 {
                         let Ok(u) = state.bound_udp_handle(ep, false) else {
                             continue;
                         };
-                        self.sockets.add(u)
+                        state.handles.push(self.sockets.add(u));
                     } else {
                         let mut t = state.new_tcp_socket();
                         if t.listen_queued(endpoint(ep), state.backlog).is_err() {
                             continue;
                         }
-                        self.sockets.add(t)
-                    };
-                    state.handles.push(handle);
+                        state.add_listener_slot(t, &mut self.sockets, &mut self.tcp_waiters);
+                    }
                 }
             }
         }
@@ -1752,6 +1787,7 @@ impl Network {
                 requested_bind: None,
                 udp_shared: false,
                 udp_readable: None,
+                listener_ready: None,
                 udp_errors: (kind == 2).then(|| Arc::new(udp_errors::Errors::default())),
                 udp_group: None,
                 nodelay: false,
@@ -1832,6 +1868,7 @@ impl Drop for Socket {
     fn drop(&mut self) {
         let mut i = self.network.0.fabric.0.borrow_mut();
         let now = i.now();
+        let mut pending_fin = false;
         if let Some(n) = i.nodes.get_mut(&self.network.0.key) {
             n.dirty = true;
             let mut state = self.state.borrow_mut();
@@ -1863,6 +1900,10 @@ impl Drop for Socket {
                         n.sockets.remove(h);
                     } else {
                         s.close_final();
+                        pending_fin |= matches!(
+                            s.state(),
+                            tcp::State::FinWait1 | tcp::State::LastAck | tcp::State::FinWait2
+                        );
                         n.detached.push(DetachedTcp::new(
                             h,
                             fin_wait_seconds,
@@ -1875,6 +1916,12 @@ impl Drop for Socket {
                     n.sockets.remove(h);
                 }
             }
+        }
+        if pending_fin && i.close_batch_until.is_none() {
+            // Wake the existing driver on the first close. Further closes in
+            // this interval are covered by its deadline, including an idle guest.
+            i.close_batch_until = Some(Instant::now() + Duration::from_millis(4));
+            i.driver_dirty = true;
         }
     }
 }
@@ -2369,7 +2416,7 @@ mod shared_lifetime_tests {
     }
 
     #[test]
-    fn large_listeners_allocate_slots_as_connections_arrive_and_reuse_a_reset_slot() {
+    fn growing_listener_retains_reset_child_until_accepted() {
         let fabric = Fabric::new().unwrap();
         let net = fabric.environment(2, NetworkMode::Full).unwrap();
         let listener = net.socket(2, 1, 0).unwrap();
@@ -2386,15 +2433,26 @@ mod shared_lifetime_tests {
         let mut clients = (0..12).map(|_| connect()).collect::<Vec<_>>();
         assert_eq!(listener.state.borrow().handles.len(), clients.len() + 1);
         let reset = clients.pop().unwrap();
+        let reset_peer = reset.local_addr().unwrap();
         reset
             .set_option_bytes(1, 13, &crate::linger_bytes(Some(Duration::ZERO)))
             .unwrap();
         drop(reset);
         clients.push(connect());
-        assert_eq!(listener.state.borrow().handles.len(), clients.len() + 1);
-        for _ in &clients {
-            listener.accept().unwrap();
+        // One reset child, all live children, and one spare listening slot.
+        assert_eq!(listener.state.borrow().handles.len(), clients.len() + 2);
+        let mut errors = Vec::new();
+        for _ in 0..=clients.len() {
+            let (child, peer) = listener.accept().unwrap();
+            if child.get_option(1, 4).unwrap() == 104 {
+                assert_eq!(child.get_option(1, 4), Ok(0));
+                assert_eq!(child.peer_addr(), Err(NetError(107)));
+                errors.push(peer);
+            } else {
+                assert_eq!(child.peer_addr(), Ok(peer));
+            }
         }
+        assert_eq!(errors, [reset_peer]);
         assert_eq!(listener.state.borrow().handles.len(), 1);
     }
 

@@ -107,7 +107,7 @@ impl InterfaceInner {
                     shared = Some((rank, handle, socket.reuse_port_group));
                 }
             }
-            if let Some(((connected, specific, _), mut handle, group)) = shared {
+            if let Some(((priority, _), mut handle, group)) = shared {
                 if let Some(group) = group {
                     let flow = socket_flow(
                         IpEndpoint::new(src_addr, udp_repr.src_port),
@@ -125,9 +125,9 @@ impl InterfaceInner {
                         {
                             continue;
                         }
-                        if let Some((c, s, order)) = socket.shared_priority() {
+                        if let Some((candidate_priority, order)) = socket.shared_priority() {
                             let score = mix_flow(flow ^ mix_flow(order));
-                            if (c, s) == (connected, specific) && best.is_none_or(|old| score > old)
+                            if candidate_priority == priority && best.is_none_or(|old| score > old)
                             {
                                 best = Some(score);
                                 handle = candidate;

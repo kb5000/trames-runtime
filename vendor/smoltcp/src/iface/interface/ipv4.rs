@@ -181,6 +181,8 @@ impl InterfaceInner {
         }
 
         if !self.has_ip_addr(ipv4_repr.dst_addr)
+            && !(meta.ingress_index == 1 && ipv4_repr.dst_addr.is_loopback()
+                && self.in_same_network(&ipv4_repr.dst_addr.into()))
             && !self.has_multicast_group(ipv4_repr.dst_addr)
             && !self.is_broadcast_v4(ipv4_repr.dst_addr)
         {

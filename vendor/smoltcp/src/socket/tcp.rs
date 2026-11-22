@@ -452,6 +452,7 @@ pub struct Socket<'a> {
     pub(crate) listener_rank: u64,
     pub(crate) specific_bind: bool,
     accept_queue_capacity: usize,
+    reset_child: Option<Tuple>,
     defer_accept_secs: u32,
     deferred_until: Option<Instant>,
     /// Current 4-tuple (local and remote endpoints).
@@ -582,6 +583,7 @@ impl<'a> Socket<'a> {
             listener_rank: 0,
             specific_bind: false,
             accept_queue_capacity: 0,
+            reset_child: None,
             defer_accept_secs: 0,
             deferred_until: None,
             tuple: None,
@@ -987,6 +989,7 @@ impl<'a> Socket<'a> {
 
     pub fn accept_ready(&self) -> bool {
         self.state == State::CloseWait || self.state == State::Established && self.deferred_until.is_none()
+            || self.reset_child.is_some()
     }
 
     pub fn set_defer_accept(&mut self, seconds: u32) {
@@ -997,15 +1000,28 @@ impl<'a> Socket<'a> {
         self.defer_accept_secs = seconds;
     }
 
+    /// Accept can still report the peer after an established, queued child receives RST.
+    pub fn accept_endpoints(&self) -> Option<(IpEndpoint, IpEndpoint)> {
+        self.tuple.or(self.reset_child).map(|t| (t.local, t.remote))
+    }
+
     pub fn leave_accept_queue(&mut self) {
+        self.reset_child = None;
         self.accept_queue_capacity = 0;
         self.deferred_until = None;
+    }
+
+    pub fn listens_on_address(&self, destination: IpAddress) -> bool {
+        self.listen_endpoint.addr.is_none_or(|local| {
+            local == destination || self.accept_queue_capacity != 0 && !self.specific_bind
+                && local.covers_loopback_alias(destination)
+        })
     }
 
     pub(crate) fn queues_syn_for(&self, address: IpAddress, port: u16) -> bool {
         self.accept_queue_capacity != 0
             && self.listen_endpoint.port == port
-            && self.listen_endpoint.addr.is_none_or(|a| a == address)
+            && self.listens_on_address(address)
     }
 
     /// Return the local endpoint, or None if not connected.
@@ -1140,6 +1156,7 @@ impl<'a> Socket<'a> {
         self.state = State::Closed;
         self.stalled_since = None;
         self.failure = None;
+        self.reset_child = None;
         self.orphaned = false;
         self.syn_attempts = 0;
         self.deferred_until = None;
@@ -1873,10 +1890,7 @@ impl<'a> Socket<'a> {
                 && repr.src_port == tuple.remote.port
         } else {
             // We're listening, reject packets not matching the listen endpoint.
-            let addr_ok = match self.listen_endpoint.addr {
-                Some(addr) => ip_repr.dst_addr() == addr,
-                None => true,
-            };
+            let addr_ok = self.listens_on_address(ip_repr.dst_addr());
             addr_ok && repr.dst_port != 0 && repr.dst_port == self.listen_endpoint.port
         }
     }
@@ -2208,14 +2222,14 @@ impl<'a> Socket<'a> {
                     _ => Failure::Reset,
                 });
                 self.record_reset(cx);
+                if self.accept_queue_capacity != 0 {
+                    // A completed handshake already occupies the accept queue. Keep
+                    // its peer for accept(), but clear the wire tuple so it cannot
+                    // receive new segments or transmit a second reset.
+                    self.reset_child = self.tuple;
+                }
                 self.set_state(State::Closed);
                 self.tuple = None;
-                if self.accept_queue_capacity != 0 {
-                    // The application never accepted this child. Return its
-                    // slot to the same listener, discarding the aborted stream.
-                    let endpoint = self.listen_endpoint;
-                    self.listen(endpoint).expect("valid queued listen endpoint");
-                }
                 return None;
             }
 

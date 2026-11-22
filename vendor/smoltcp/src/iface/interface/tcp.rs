@@ -21,14 +21,21 @@ impl InterfaceInner {
 
         self.counters.in_segs += 1;
         let mut listener = None;
+        let mut full_priority = None;
+        let initial_syn = tcp_repr.control == TcpControl::Syn && tcp_repr.ack_number.is_none();
         let mut flow = None;
         for (handle, item) in sockets.iter_mut() {
             let Some(socket) = Socket::downcast_mut(item) else {
                 continue;
             };
-            if (socket.ingress_device != 0 && socket.ingress_device != ingress)
-                || !socket.accepts(self, &ip_repr, &tcp_repr)
-            {
+            if socket.ingress_device != 0 && socket.ingress_device != ingress {
+                continue;
+            }
+            if !socket.accepts(self, &ip_repr, &tcp_repr) {
+                if initial_syn && socket.queues_syn_for(dst_addr, tcp_repr.dst_port) {
+                    let priority = (socket.specific_bind, socket.ingress_device != 0);
+                    full_priority = Some(full_priority.map_or(priority, |old| priority.max(old)));
+                }
                 continue;
             }
             if socket.is_listening()
@@ -44,8 +51,7 @@ impl InterfaceInner {
                     )
                 });
                 let score = (
-                    socket.specific_bind,
-                    socket.ingress_device != 0,
+                    (socket.specific_bind, socket.ingress_device != 0),
                     mix_flow(key ^ mix_flow(socket.listener_rank)),
                 );
                 if listener.is_none_or(|(best, _)| score > best) {
@@ -57,7 +63,12 @@ impl InterfaceInner {
                 .process(self, &ip_repr, &tcp_repr)
                 .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
         }
-        if let Some((_, handle)) = listener {
+        if let Some(((priority, _), handle)) = listener {
+            // Backpressure belongs to the best matching listener group. A full
+            // device-bound group must not spill connections to a wildcard one.
+            if full_priority.is_some_and(|full| full > priority) {
+                return None;
+            }
             return sockets
                 .get_mut::<Socket>(handle)
                 .process(self, &ip_repr, &tcp_repr)
@@ -66,16 +77,7 @@ impl InterfaceInner {
 
         // A full accept queue drops new SYNs. An existing four-tuple has
         // already had a chance to handle the segment above.
-        if tcp_repr.control == TcpControl::Syn
-            && tcp_repr.ack_number.is_none()
-            && sockets
-                .items_mut()
-                .filter_map(|item| Socket::downcast_mut(&mut item.socket))
-                .any(|socket| {
-                    (socket.ingress_device == 0 || socket.ingress_device == ingress)
-                        && socket.queues_syn_for(dst_addr, tcp_repr.dst_port)
-                })
-        {
+        if full_priority.is_some() {
             return None;
         }
         if tcp_repr.control == TcpControl::Rst

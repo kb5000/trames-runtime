@@ -25,15 +25,28 @@ impl Socket {
     ) -> Option<trames_shared::IoSubscription> {
         let mut fabric = self.network.0.fabric.0.borrow_mut();
         let node = fabric.nodes.get_mut(&self.network.0.key)?;
-        let state = self.state.borrow();
-        if state.connection != Connection::Connected {
-            return None;
-        }
-        let h = *state.handles.first()?;
-        let source = node.tcp_waiters.entry(h).or_insert_with(|| {
-            node.sockets.get_mut::<tcp::Socket>(h).observe_io(Some(h));
-            Arc::default()
-        });
+        let mut state = self.state.borrow_mut();
+        let source = match state.connection {
+            Connection::Listening => {
+                if state.listener_ready.is_none() {
+                    let source = Arc::<trames_shared::Readiness>::default();
+                    for &h in &state.handles {
+                        node.sockets.get_mut::<tcp::Socket>(h).observe_io(Some(h));
+                        node.tcp_waiters.insert(h, source.clone());
+                    }
+                    state.listener_ready = Some(source);
+                }
+                state.listener_ready.as_ref().unwrap()
+            }
+            Connection::Connected => {
+                let h = *state.handles.first()?;
+                node.tcp_waiters.entry(h).or_insert_with(|| {
+                    node.sockets.get_mut::<tcp::Socket>(h).observe_io(Some(h));
+                    Arc::default()
+                })
+            }
+            _ => return None,
+        };
         let source = source.clone();
         drop(state);
         drop(fabric);
@@ -228,8 +241,7 @@ impl Socket {
             || (!self.network.is_isolated()
                 && (a == IpAddr::V4(self.network.0.info.ipv4)
                     || a == IpAddr::V6(self.network.0.info.ipv6)))
-            || (self.network.0.loopback_up.get()
-                && (a == IpAddr::V4(Ipv4Addr::LOCALHOST) || a == IpAddr::V6(Ipv6Addr::LOCALHOST)))
+            || self.network.0.loopback_up.get() && a.is_loopback()
     }
     fn destination(&self, a: SocketAddr) -> Result<()> {
         if a.port() == 0 && !matches!(self.kind, 3 | 4) {
@@ -264,13 +276,6 @@ impl Socket {
         }
         if self.network.0.mode == NetworkMode::Loopback && !self.own(v) {
             return Err(NetError(13));
-        }
-        if self.network.0.routing.get().is_none()
-            && v.is_loopback()
-            && !matches!(v,IpAddr::V4(a) if a==Ipv4Addr::LOCALHOST)
-            && v != IpAddr::V6(Ipv6Addr::LOCALHOST)
-        {
-            return Err(NetError(99));
         }
         if let Some(view) = self.network.0.routing.get() {
             self.route_source(view, v)?;
@@ -593,7 +598,7 @@ impl Socket {
             socket
                 .listen_queued(endpoint(a), backlog)
                 .map_err(|_| NetError(22))?;
-            state.handles.push(n.sockets.add(socket));
+            state.add_listener_slot(socket, &mut n.sockets, &mut n.tcp_waiters);
         }
         state.connection = Connection::Listening;
         state.read_closed = false;
@@ -620,24 +625,30 @@ impl Socket {
             .ok_or(NetError(11))?;
         let handle = state.handles.swap_remove(index);
         let s = n.sockets.get_mut::<tcp::Socket>(handle);
+        let (local, peer) = s.accept_endpoints().expect("ready passive child");
+        let (local, peer) = (address(local), address(peer));
+        let connected = s.state() != tcp::State::Closed;
+        let listen_address = s.listen_endpoint().addr.expect("per-address listener");
         s.leave_accept_queue();
-        let local = address(s.local_endpoint().unwrap());
-        let peer = address(s.remote_endpoint().unwrap());
+        if state.listener_ready.is_some() {
+            s.observe_io(None);
+            n.tcp_waiters.remove(&handle);
+        }
         if !state.handles.iter().any(|&other| {
             let slot = n.sockets.get::<tcp::Socket>(other);
-            slot.is_listening() && slot.listen_endpoint().addr == Some(ip(local.ip()))
+            slot.is_listening() && slot.listen_endpoint().addr == Some(listen_address)
         }) {
             let mut replacement = state.new_tcp_socket();
             replacement
-                .listen_queued(endpoint(local), state.backlog)
+                .listen_queued(IpEndpoint::new(listen_address, local.port()), state.backlog)
                 .map_err(|_| NetError(22))?;
-            state.handles.push(n.sockets.add(replacement));
+            state.add_listener_slot(replacement, &mut n.sockets, &mut n.tcp_waiters);
         }
         let accepted = State {
             handles: vec![handle],
             connection: Connection::Connected,
             bound: Some(local),
-            peer: Some(peer),
+            peer: connected.then_some(peer),
             error: None,
             connect_result_pending: false,
             read_closed: false,
@@ -651,6 +662,7 @@ impl Socket {
             requested_bind: None,
             udp_shared: false,
             udp_readable: None,
+            listener_ready: None,
             udp_errors: None,
             udp_group: None,
             nodelay: state.nodelay,
@@ -779,6 +791,13 @@ impl Socket {
                     return Err(NetError(state.error.take().unwrap_or(103)));
                 }
                 Connection::Idle => {}
+            }
+        }
+        if self.family == 10 && matches!(self.kind, 1 | 2) {
+            if let Some(local) = state.requested_bind.filter(|b| !b.ip().is_unspecified()) {
+                if local.is_ipv4() != a.is_ipv4() {
+                    return Err(NetError(if a.is_ipv4() { 101 } else { 97 }));
+                }
             }
         }
         if self.kind == 1 && a.port() == 0 && self.own(a.ip()) {
@@ -944,6 +963,7 @@ impl Socket {
                     }
                     n.iface.poll(now, &mut n.port, &mut n.sockets);
                     for handle in state.handles.drain(..) {
+                        n.tcp_waiters.remove(&handle);
                         n.sockets.remove(handle);
                     }
                     if state.connection == Connection::Connecting {
@@ -954,6 +974,9 @@ impl Socket {
                         state.connection = Connection::Idle;
                     }
                     n.dirty = true;
+                    if let Some(source) = state.listener_ready.take() {
+                        i.notifications.push(source);
+                    }
                     drop(state);
                     i.tick();
                     return Ok(());

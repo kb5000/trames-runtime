@@ -69,8 +69,13 @@ Linux listeners use protocol sockets as accept-queue slots. Only slots
 explicitly reserved by a listener participate. A SYN consumed by such a
 slot can request another one from its owner after the interface poll.
 An unmatched SYN for a full queue is dropped so the client may retry.
-Acceptance releases the queue association. An incoming RST before accept
-returns the transport to the same listener.
+A reset during the handshake returns the slot to its listener. A reset after
+the handshake retains the completed child's endpoints for accept and its
+one-shot socket error. A blocked listener subscribes to its own backlog
+slots and their replacements. Device-specific reuse groups take priority
+over wildcard bindings on matching ingress, including when their TCP queue
+fills. On the guest loopback link a wildcard slot can receive IPv4 traffic
+for other addresses in the configured loopback prefix.
 
 The TCP socket accepts live changes to its owned receive and transmit rings.
 Ring growth preserves wrapped and out-of-order bytes. Shrinking an established

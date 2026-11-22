@@ -266,9 +266,9 @@ impl<'a> Socket<'a> {
         self.peer = peer;
     }
 
-    pub(crate) fn shared_priority(&self) -> Option<(bool, bool, u64)> {
+    pub(crate) fn shared_priority(&self) -> Option<((bool, bool, bool), u64)> {
         self.reusable
-            .then_some((self.peer.is_some(), self.specific_bind, self.bind_order))
+            .then_some(((self.peer.is_some(), self.specific_bind, self.ingress_device != 0), self.bind_order))
     }
 
     /// Change a guest-owned queue's limit without backing unused capacity.
@@ -660,6 +660,7 @@ impl<'a> Socket<'a> {
         }
         if self.endpoint.addr.is_some()
             && self.endpoint.addr != Some(ip_repr.dst_addr())
+            && !(self.linux_receive && !self.specific_bind && self.endpoint.addr.is_some_and(|a| a.covers_loopback_alias(ip_repr.dst_addr())))
             && !cx.is_broadcast(&ip_repr.dst_addr())
             && !ip_repr.dst_addr().is_multicast()
         {

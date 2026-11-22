@@ -103,6 +103,15 @@ impl DescriptorFactory {
         protocol: u32,
         output: impl FnOnce([u32; 2]) -> Result<()>,
     ) -> Result<[u32; 2]> {
+        if matches!(family, 2 | 10) {
+            // Linux creates the first Internet socket before discovering that
+            // the protocol has no socketpair operation. Never publish that FD.
+            self.check_network_socket(family, kind, protocol)?;
+            self.network
+                .socket(family, kind & 0xf, protocol)
+                .map_err(|e| Errno(e.0))?;
+            return Err(Errno(95));
+        }
         if family != 1 {
             return Err(Errno(97));
         }
@@ -201,11 +210,7 @@ impl DescriptorFactory {
     pub(super) fn open_id(&self) -> u64 {
         next_id(&self.ids)
     }
-    /// IP and Unix creation retain their actual namespace and credentials.
-    pub fn socket(&self, family: u32, kind: u32, protocol: u32) -> Result<u32> {
-        if family == 1 {
-            return self.local_create(kind, protocol);
-        }
+    fn check_network_socket(&self, family: u32, kind: u32, protocol: u32) -> Result<()> {
         if matches!((family, kind & 0xf, protocol), (2, 2, 1) | (10, 2, 58)) {
             let [low, high] = self.network.ping_range();
             if !std::iter::once(self.credentials.egid)
@@ -225,6 +230,14 @@ impl DescriptorFactory {
         if kind & !(O_CLOEXEC | O_NONBLOCK | 0xf) != 0 {
             return Err(Errno(22));
         }
+        Ok(())
+    }
+    /// IP and Unix creation retain their actual namespace and credentials.
+    pub fn socket(&self, family: u32, kind: u32, protocol: u32) -> Result<u32> {
+        if family == 1 {
+            return self.local_create(kind, protocol);
+        }
+        self.check_network_socket(family, kind, protocol)?;
         let reserved = self.files.reserve()?;
         let socket = self
             .network
