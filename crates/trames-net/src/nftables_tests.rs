@@ -67,7 +67,15 @@ fn shared_batch(shared: &Firewall, r: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
     let mut requests = vec![start.as_slice()];
     requests.extend(r.iter().map(Vec::as_slice));
     requests.push(&end);
-    request_rules(shared, true, &requests, 1, true, 128, MAX_BYTES)
+    request_rules(
+        shared,
+        PacketHooks::GuestPackets,
+        &requests,
+        1,
+        true,
+        128,
+        MAX_BYTES,
+    )
 }
 #[test]
 fn dormant_and_socket_owned_tables_follow_hook_and_socket_lifetimes() {
@@ -223,16 +231,16 @@ fn counters_keep_parallel_packets_across_live_rule_publication() {
         for _ in 0..4 {
             let (rules, start) = (&rules, &start);
             scope.spawn(move || {
-                let packet = packet();
+                let mut packet = packet();
                 let ns = Namespace::default();
                 let graph = ns.graph.read().unwrap();
-                let ctx = Context {
+                let mut ctx = Context {
                     packet_type: crate::ethernet::PacketType::Host,
-                    packet: &packet,
+                    tuple: crate::conntrack::key(&packet).unwrap().tuple,
+                    packet: &mut packet,
                     hook: 3,
                     input: 0,
                     output: 1,
-                    tuple: crate::conntrack::key(&packet).unwrap().tuple,
                     track: None,
                     connections: None,
                     graph: &graph,
@@ -240,7 +248,7 @@ fn counters_keep_parallel_packets_across_live_rule_publication() {
                 };
                 start.wait();
                 for _ in 0..2000 {
-                    assert!(rules.read().unwrap().allows(&ctx));
+                    assert!(rules.read().unwrap().allows(&mut ctx));
                 }
             });
         }
@@ -287,19 +295,23 @@ fn packet() -> Vec<u8> {
 }
 fn allows(ns: &Namespace, hook: u32) -> bool {
     let graph = ns.graph.read().unwrap();
-    let packet = packet();
-    graph.firewall(ns.id()).read().unwrap().allows(&Context {
-        packet_type: crate::ethernet::PacketType::Host,
-        packet: &packet,
-        hook,
-        input: 3,
-        output: 4,
-        tuple: crate::conntrack::key(&packet).unwrap().tuple,
-        track: None,
-        connections: None,
-        graph: &graph,
-        namespace: ns.id(),
-    })
+    let mut packet = packet();
+    graph
+        .firewall(ns.id())
+        .read()
+        .unwrap()
+        .allows(&mut Context {
+            packet_type: crate::ethernet::PacketType::Host,
+            tuple: crate::conntrack::key(&packet).unwrap().tuple,
+            packet: &mut packet,
+            hook,
+            input: 3,
+            output: 4,
+            track: None,
+            connections: None,
+            graph: &graph,
+            namespace: ns.id(),
+        })
 }
 #[test]
 fn batch_rollback_generation_authority_capacity_and_namespace_are_real() {
@@ -417,7 +429,7 @@ fn jumps_priorities_live_counters_and_payload_match() {
     );
     assert!(!allows(&n, 3));
 }
-fn packet_rule_matches(exprs: Vec<Expr>, ctx: &Context<'_>) -> bool {
+fn packet_rule_matches(exprs: Vec<Expr>, ctx: &mut Context<'_>) -> bool {
     let mut rule = Rule {
         handle: 1,
         userdata: vec![],
@@ -433,11 +445,11 @@ fn packet_rule_matches(exprs: Vec<Expr>, ctx: &Context<'_>) -> bool {
 fn shifts_propagate_carries_across_overlapping_registers() {
     let ns = Namespace::default();
     let graph = ns.graph.read().unwrap();
-    let packet = packet();
-    let ctx = Context {
+    let mut packet = packet();
+    let mut ctx = Context {
         packet_type: crate::ethernet::PacketType::Host,
-        packet: &packet,
         tuple: crate::conntrack::key(&packet).unwrap().tuple,
+        packet: &mut packet,
         hook: 0,
         input: 1,
         output: 0,
@@ -477,7 +489,7 @@ fn shifts_propagate_carries_across_overlapping_registers() {
                     value: bytes(expected)
                 },
             ],
-            &ctx
+            &mut ctx
         ));
     }
 }
@@ -491,11 +503,11 @@ fn fib_and_addrtype_use_packet_address_and_selected_guest_interface() {
     assign(&net, wan, "192.0.2.3", 24);
     assign(&net, lan, "198.51.100.1", 24);
     let graph = net.1.graph.read().unwrap();
-    let packet = packet();
+    let mut packet = packet();
     let mut ctx = Context {
         packet_type: crate::ethernet::PacketType::Host,
-        packet: &packet,
         tuple: crate::conntrack::key(&packet).unwrap().tuple,
+        packet: &mut packet,
         hook: 0,
         input: wan,
         output: 0,
@@ -504,7 +516,7 @@ fn fib_and_addrtype_use_packet_address_and_selected_guest_interface() {
         track: None,
         connections: None,
     };
-    let fib = |ctx: &Context<'_>, result, flags, value: Vec<u8>| {
+    let fib = |ctx: &mut Context<'_>, result, flags, value: Vec<u8>| {
         packet_rule_matches(
             vec![
                 Expr::Fib {
@@ -521,13 +533,13 @@ fn fib_and_addrtype_use_packet_address_and_selected_guest_interface() {
             ctx,
         )
     };
-    assert!(fib(&ctx, 1, 2, wan.to_le_bytes().to_vec()));
-    assert!(fib(&ctx, 1, 2 | 32, 1u32.to_le_bytes().to_vec()));
+    assert!(fib(&mut ctx, 1, 2, wan.to_le_bytes().to_vec()));
+    assert!(fib(&mut ctx, 1, 2 | 32, 1u32.to_le_bytes().to_vec()));
     let mut name = vec![0; 16];
     name[..3].copy_from_slice(b"wan");
-    assert!(fib(&ctx, 2, 2 | 8, name));
-    assert!(fib(&ctx, 3, 1 | 8, 2u32.to_le_bytes().to_vec()));
-    let addrtype = |ctx: &Context<'_>| {
+    assert!(fib(&mut ctx, 2, 2 | 8, name));
+    assert!(fib(&mut ctx, 3, 1 | 8, 2u32.to_le_bytes().to_vec()));
+    let addrtype = |ctx: &mut Context<'_>| {
         packet_rule_matches(
             vec![Expr::AddrType {
                 source: 1 << 2,
@@ -537,13 +549,13 @@ fn fib_and_addrtype_use_packet_address_and_selected_guest_interface() {
             ctx,
         )
     };
-    assert!(addrtype(&ctx));
+    assert!(addrtype(&mut ctx));
     ctx.input = lan;
-    assert!(fib(&ctx, 2, 2 | 8, vec![0; 16]));
-    assert!(fib(&ctx, 3, 1 | 8, 1u32.to_le_bytes().to_vec()));
-    assert!(!addrtype(&ctx));
+    assert!(fib(&mut ctx, 2, 2 | 8, vec![0; 16]));
+    assert!(fib(&mut ctx, 3, 1 | 8, 1u32.to_le_bytes().to_vec()));
+    assert!(!addrtype(&mut ctx));
     ctx.tuple.destination = "203.0.113.8:1".parse().unwrap();
-    assert!(fib(&ctx, 1, 2 | 32, 0u32.to_le_bytes().to_vec()));
+    assert!(fib(&mut ctx, 1, 2 | 32, 0u32.to_le_bytes().to_vec()));
 }
 #[test]
 fn cycles_invalid_registers_and_native_hooks_are_rejected_atomically() {
@@ -1160,11 +1172,11 @@ fn xt_conntrack_checks_real_direction_expiry_status_and_revision_port_order() {
         let request = message(client, server, 17, 0, b"request");
         let new = connections.begin(&request, 0).unwrap();
         connections.finish(new, true);
-        let reply = message(server, client, 17, 0, b"reply");
+        let mut reply = message(server, client, 17, 0, b"reply");
         let track = connections.begin(&reply, 0).unwrap();
         let ctx = Context {
             packet_type: crate::ethernet::PacketType::Host,
-            packet: &reply,
+            packet: &mut reply,
             tuple: track.original.reverse().tuple,
             track: Some(track),
             connections: Some(&connections),
@@ -1617,11 +1629,11 @@ fn metadata_register_width_link_types_and_missing_devices() {
         .create_bridge(ns.id(), b"br-meta")
         .unwrap();
     let graph = ns.graph.read().unwrap();
-    let p = packet();
+    let mut p = packet();
     let mut ctx = Context {
         packet_type: crate::ethernet::PacketType::Broadcast,
-        packet: &p,
         tuple: crate::conntrack::key(&p).unwrap().tuple,
+        packet: &mut p,
         hook: 1,
         input: 1,
         output: 0,
@@ -1647,4 +1659,132 @@ fn metadata_register_width_link_types_and_missing_devices() {
     assert_eq!(&regs[..4], &1u32.to_ne_bytes());
     ctx.load_meta(27, &mut regs).unwrap();
     assert_eq!(&regs[..7], b"bridge\0");
+}
+
+fn set_payload(
+    base: u32,
+    offset: u32,
+    data: &[u8],
+    checksum: Option<u32>,
+    pseudo: bool,
+) -> Vec<u8> {
+    let mut value = vec![];
+    attr(&mut value, 1, data);
+    let mut imm = vec![];
+    number(&mut imm, 1, 8);
+    attr(&mut imm, 0x8002, &value);
+    let mut set = vec![];
+    for (key, val) in [(2, base), (3, offset), (4, data.len() as u32), (5, 8)] {
+        number(&mut set, key, val);
+    }
+    if let Some(field) = checksum {
+        number(&mut set, 6, 1);
+        number(&mut set, 7, field);
+    }
+    if pseudo {
+        number(&mut set, 8, 1);
+    }
+    [expression("immediate", &imm), expression("payload", &set)].concat()
+}
+
+#[test]
+fn payload_write_reaches_udp_peer_with_valid_checksum() {
+    let fabric = crate::Fabric::new().unwrap();
+    let a = Network::virtual_network(&fabric, 2, NetworkMode::Outbound).unwrap();
+    let b = Network::virtual_network(&fabric, 3, NetworkMode::Outbound).unwrap();
+    let rules = [
+        table("f"),
+        chain("f", "out", Some(3), 0, 1),
+        rule("f", "out", &set_payload(2, 9, b"BCD", Some(6), false)),
+    ];
+    assert_eq!(errno(&batch(&a.1, &rules)), 0);
+    let sender = a.socket(2, 2, 0).unwrap();
+    let receiver = b.socket(2, 2, 0).unwrap();
+    receiver.bind("0.0.0.0:19007".parse().unwrap()).unwrap();
+    sender
+        .send(b"abcde", 0, Some("10.0.0.3:19007".parse().unwrap()))
+        .unwrap();
+    assert_eq!(receiver.recv(16, 0).unwrap().data, b"aBCDe");
+    let native = Network::new(NetworkMode::Loopback);
+    assert_eq!(errno(&batch(&native.1, &rules)), -95);
+}
+
+#[test]
+fn payload_address_checksum_and_following_expression_observe_same_packet() {
+    use crate::conntrack::{message, State};
+    for (source, target, new_address, offset) in [
+        ("192.0.2.1:3001", "192.0.2.2:3002", "192.0.2.99", 16),
+        ("[fd00::1]:3001", "[fd00::2]:3002", "fd00::99", 24),
+    ] {
+        let new_address: std::net::IpAddr = new_address.parse().unwrap();
+        let bytes = match new_address {
+            std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
+            std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
+        };
+        let ns = Namespace::default();
+        let mut load = vec![];
+        for (key, val) in [(1, 1), (2, 1), (3, offset), (4, bytes.len() as u32)] {
+            number(&mut load, key, val);
+        }
+        let mut cmp = vec![];
+        number(&mut cmp, 1, 1);
+        number(&mut cmp, 2, 0);
+        let mut value = vec![];
+        attr(&mut value, 1, &bytes);
+        attr(&mut cmp, 0x8003, &value);
+        let mut rules = [
+            table("f"),
+            chain("f", "rewrite", Some(0), 0, 0),
+            rule(
+                "f",
+                "rewrite",
+                &[
+                    set_payload(1, offset, &bytes, new_address.is_ipv4().then_some(10), true),
+                    expression("payload", &load),
+                    expression("cmp", &cmp),
+                    verdict(1, None),
+                ]
+                .concat(),
+            ),
+        ];
+        if new_address.is_ipv6() {
+            for r in &mut rules {
+                r[16] = 10;
+            }
+        }
+        assert_eq!(errno(&batch(&ns, &rules)), 0);
+        let graph = ns.graph.read().unwrap();
+        let policy = graph.firewall(ns.id());
+        let mut state = State::default();
+        let mut packet = message(
+            source.parse().unwrap(),
+            target.parse().unwrap(),
+            17,
+            0,
+            b"odd length!",
+        );
+        let mut track = state.begin(&packet, 0).unwrap();
+        let hook = Hook {
+            graph: &graph,
+            namespace: ns.id(),
+            hook: 0,
+            input: 1,
+            output: 0,
+            raw: false,
+            packet_type: crate::ethernet::PacketType::Host,
+        };
+        assert!(policy
+            .read()
+            .unwrap()
+            .process(&mut packet, &hook, &mut track, &mut state));
+        assert_eq!(
+            crate::virtualnet::packet::header(&packet)
+                .unwrap()
+                .tuple
+                .destination
+                .ip(),
+            new_address
+        );
+        assert!(crate::virtualnet::packet::valid_transport(&packet));
+    }
 }

@@ -306,6 +306,13 @@ pub(crate) struct Header {
     pub first: bool,
 }
 pub(crate) fn header(p: &[u8]) -> Option<Header> {
+    parse_header(p, true)
+}
+// A rule can repair the IPv4 checksum in a subsequent expression.
+pub(crate) fn header_after_write(p: &[u8]) -> Option<Header> {
+    parse_header(p, false)
+}
+fn parse_header(p: &[u8], verify_checksum: bool) -> Option<Header> {
     let (src, dst, proto, offset, first) = match p.first()? >> 4 {
         4 => {
             if p.len() < 20 {
@@ -316,7 +323,7 @@ pub(crate) fn header(p: &[u8]) -> Option<Header> {
                 return None;
             }
             let packet = smoltcp::wire::Ipv4Packet::new_checked(p).ok()?;
-            if !packet.verify_checksum() {
+            if verify_checksum && !packet.verify_checksum() {
                 return None;
             }
             (

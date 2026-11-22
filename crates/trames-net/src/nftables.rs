@@ -2,6 +2,8 @@
 //! Bounded guest nf_tables ABI and packet filter. Wire identifiers follow Linux
 //! UAPI nf_tables.h/nfnetlink.h (GPL-2.0 WITH Linux-syscall-note).
 //! No host firewall calls; unsupported hooks/expressions fail before publication.
+#[path = "nft_payload.rs"]
+mod payload;
 #[path = "nft_sets.rs"]
 mod sets;
 #[path = "nft_xt_match.rs"]
@@ -241,6 +243,11 @@ enum Expr {
         offset: usize,
         len: usize,
     },
+    PayloadSet {
+        src: usize,
+        len: usize,
+        write: payload::Write,
+    },
     Compare {
         src: usize,
         op: u32,
@@ -371,8 +378,9 @@ fn expressions_in(
                     }
                     Expr::Verdict(code, chain)
                 } else {
-                    let v = value(need(&a, 2)?)?;
+                    let mut v = value(need(&a, 2)?)?;
                     let dest = reg(num(&a, 1)?, v.len()).map_err(|_| NetError(34))?;
+                    v.resize(v.len().next_multiple_of(4), 0);
                     initialized[dest..dest + v.len()].fill(true);
                     Expr::Immediate { dest, value: v }
                 }
@@ -405,26 +413,7 @@ fn expressions_in(
                 &ids.sets,
                 &mut initialized,
             )?),
-            "payload" => {
-                let a = fields(data, &[1, 2, 3, 4])?;
-                let base = num(&a, 2)?;
-                if !matches!(base, 1 | 2) {
-                    return Err(NetError(95));
-                }
-                let len = num(&a, 4)? as usize;
-                let dest = reg(num(&a, 1)?, len)?;
-                let offset = num(&a, 3)? as usize;
-                if offset > 65535 {
-                    return Err(NetError(22));
-                }
-                initialized[dest..dest + len].fill(true);
-                Expr::Payload {
-                    dest,
-                    base,
-                    offset,
-                    len,
-                }
-            }
+            "payload" => payload::parse(data, rule_family, &mut initialized)?,
             "cmp" => {
                 let a = fields(data, &[1, 2, 3])?;
                 let op = num(&a, 2)?;
@@ -951,6 +940,12 @@ fn next_handle(last: &mut u64) -> Result<u64> {
     *last = last.checked_add(1).ok_or(NetError(28))?;
     Ok(*last)
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PacketHooks {
+    Unavailable,
+    NativeSocket,
+    GuestPackets,
+}
 impl Ruleset {
     fn bounds(&self) -> Result<()> {
         let mut chains = 0;
@@ -1108,7 +1103,7 @@ impl Ruleset {
     }
     fn execute(
         &mut self,
-        packet_hooks: bool,
+        packet_hooks: PacketHooks,
         r: &[u8],
         port: u32,
         batch: bool,
@@ -1404,7 +1399,7 @@ impl Ruleset {
                 let typ = get(&a, 7).map(text).transpose()?;
                 // Native BSD socket I/O does not pass through the packet stack.
                 // Root hooks other than FORWARD cannot yet be promised safely.
-                if h.is_some_and(|(hook, _)| !packet_hooks || hook > 4)
+                if h.is_some_and(|(hook, _)| packet_hooks == PacketHooks::Unavailable || hook > 4)
                     || typ
                         .as_deref()
                         .is_some_and(|v| !matches!(v, "filter" | "nat"))
@@ -1531,6 +1526,15 @@ impl Ruleset {
                 };
                 let wire = get(&a, 4).unwrap_or_default().to_vec();
                 let expressions = expressions_in(&wire, family, self.tables.get(&key), ids)?;
+                // Native socket filters inspect a synthetic header; only a packet
+                // backend can deliver a modified datagram to its actual recipient.
+                if packet_hooks == PacketHooks::NativeSocket
+                    && expressions
+                        .iter()
+                        .any(|e| matches!(e, Expr::PayloadSet { .. }))
+                {
+                    return Err(NetError(95));
+                }
                 if key.1 != "nat"
                     && expressions
                         .iter()
@@ -1721,7 +1725,13 @@ pub(crate) fn request(
     let shared = ns.graph.read().unwrap().firewall(ns.id());
     request_rules(
         &shared,
-        ns.nft_packet_hooks.get(),
+        if !ns.nft_packet_hooks.get() {
+            PacketHooks::Unavailable
+        } else if ns.native.get().is_some() {
+            PacketHooks::NativeSocket
+        } else {
+            PacketHooks::GuestPackets
+        },
         requests,
         port,
         admin,
@@ -1732,7 +1742,7 @@ pub(crate) fn request(
 // The actual object transaction, also usable without a namespace owner graph.
 fn request_rules(
     shared: &Firewall,
-    packet_hooks: bool,
+    packet_hooks: PacketHooks,
     requests: &[&[u8]],
     port: u32,
     admin: bool,
@@ -1836,7 +1846,7 @@ fn request_rules(
     Ok(out)
 }
 pub(crate) struct Context<'a> {
-    pub packet: &'a [u8],
+    pub packet: &'a mut [u8],
     pub hook: u32,
     pub packet_type: crate::ethernet::PacketType,
     pub input: u32,
@@ -1918,7 +1928,7 @@ impl Context<'_> {
         (fragment == 0).then_some((offset, proto))
     }
     fn transport_header(&self) -> Option<(usize, u8, u16)> {
-        let p = self.packet;
+        let p = &*self.packet;
         if self.family() == 2 {
             Some((
                 (p[0] & 15) as usize * 4,
@@ -2099,7 +2109,7 @@ impl Ruleset {
             } else {
                 meta.output
             };
-            let ctx = Context {
+            let mut ctx = Context {
                 packet,
                 hook: meta.hook,
                 packet_type: meta.packet_type,
@@ -2112,7 +2122,7 @@ impl Ruleset {
                 namespace: meta.namespace,
             };
             let mut effects = Effects::default();
-            let v = t.verdict(n, &ctx, &mut 8192, &mut effects);
+            let v = t.verdict(n, &mut ctx, &mut 8192, &mut effects);
             if v == 0 {
                 return false;
             }
@@ -2162,7 +2172,7 @@ impl Ruleset {
 impl Rule {
     fn verdict(
         &self,
-        ctx: &Context<'_>,
+        ctx: &mut Context<'_>,
         effects: &mut Effects,
         sets: &sets::Sets,
     ) -> Option<(i32, Option<&str>)> {
@@ -2183,7 +2193,11 @@ impl Rule {
                 } => {
                     let start = if *base == 1 { 0 } else { ctx.transport()?.0 };
                     let b = ctx.packet.get(start + *offset..start + *offset + *len)?;
+                    regs[*dest + *len..*dest + len.next_multiple_of(4)].fill(0);
                     regs[*dest..*dest + *len].copy_from_slice(b);
+                }
+                Expr::PayloadSet { src, len, write } => {
+                    write.apply(ctx, &regs[*src..*src + *len])?;
                 }
                 Expr::Compare { src, op, value } => {
                     let cmp = regs[*src..*src + value.len()].cmp(value);
@@ -2493,7 +2507,7 @@ impl Table {
     fn verdict(
         &self,
         chain: &str,
-        ctx: &Context<'_>,
+        ctx: &mut Context<'_>,
         budget: &mut usize,
         effects: &mut Effects,
     ) -> i32 {
@@ -2539,7 +2553,7 @@ impl Ruleset {
         self.active_hooks & (1 << hook) != 0
     }
     #[cfg(test)]
-    pub fn allows(&self, ctx: &Context<'_>) -> bool {
+    pub fn allows(&self, ctx: &mut Context<'_>) -> bool {
         if self.tables.is_empty() {
             return true;
         }
