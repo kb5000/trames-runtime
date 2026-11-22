@@ -242,7 +242,7 @@ impl InterfaceInner {
         }
 
         #[cfg(feature = "socket-raw")]
-        let handled_by_raw_socket = self.raw_socket_filter(sockets, &ipv6_repr.into(), ip_payload, meta);
+        let handled_by_raw_socket = self.raw_socket_filter(sockets, &ipv6_repr.into(), ip_payload, meta, None);
         #[cfg(not(feature = "socket-raw"))]
         let handled_by_raw_socket = false;
 

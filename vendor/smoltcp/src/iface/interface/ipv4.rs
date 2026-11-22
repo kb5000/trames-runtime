@@ -146,7 +146,11 @@ impl InterfaceInner {
         let ip_repr = IpRepr::Ipv4(ipv4_repr);
 
         #[cfg(feature = "socket-raw")]
-        let handled_by_raw_socket = self.raw_socket_filter(sockets, &ip_repr, ip_payload, meta);
+        let handled_by_raw_socket = self.raw_socket_filter(
+            sockets, &ip_repr, ip_payload, meta,
+            (!ipv4_packet.more_frags() && ipv4_packet.frag_offset() == 0)
+                .then(|| &ipv4_packet.as_ref()[..usize::from(ipv4_packet.total_len())]),
+        );
         #[cfg(not(feature = "socket-raw"))]
         let handled_by_raw_socket = false;
 

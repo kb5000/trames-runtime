@@ -299,6 +299,7 @@ struct State {
     broadcast: bool,
     icmp6_filter: [u8; 32],
     raw_checksum: i32,
+    header_included: bool,
     raw_ingress: u32,
     hop_message: u32,
     device: Option<u32>,
@@ -329,7 +330,7 @@ pub(super) struct SocketMeta {
 }
 impl SocketMeta {
     fn raw_transport(&self) -> bool {
-        self.kind == 4 && matches!(self.protocol, 6 | 17)
+        self.kind == 4 && matches!(self.protocol, 6 | 17 | 255)
     }
     fn raw_udp(&self) -> bool {
         self.family == 2 && self.kind == 4 && self.protocol == 17
@@ -941,7 +942,7 @@ impl Inner {
             let mut packets: Vec<_> = self
                 .injected
                 .drain(..)
-                .map(|p| (p.node, Some((p.interface, p.kind)), p.source, p.bytes))
+                .map(|p| (p.node, Some((p.interface, p.kind)), p.source, None, p.bytes))
                 .collect();
             for (&key, node) in &mut self.nodes {
                 let poll = node.dirty
@@ -987,8 +988,8 @@ impl Inner {
                         self.notifications.push(source.clone());
                     }
                 }
-                while let Some(p) = node.port.tx.pop_front() {
-                    packets.push((key, None, [0; 6], p));
+                while let Some((p, route)) = node.port.tx.pop_front() {
+                    packets.push((key, None, [0; 6], route, p));
                 }
             }
             self.gateway.node.iface.poll(
@@ -996,16 +997,19 @@ impl Inner {
                 &mut self.gateway.node.port,
                 &mut self.gateway.node.sockets,
             );
-            while let Some(p) = self.gateway.node.port.tx.pop_front() {
-                packets.push((0, None, [0; 6], p));
+            while let Some((p, route)) = self.gateway.node.port.tx.pop_front() {
+                packets.push((0, None, [0; 6], route, p));
             }
             if packets.is_empty() {
                 break;
             }
-            for (source, ingress, peer, mut p) in packets {
+            for (source, ingress, peer, route, mut p) in packets {
                 let injected = ingress.map(|(index, _)| index);
                 let packet_type = ingress.map_or(PacketType::Host, |(_, kind)| kind);
-                let lo = packet::header(&p).is_some_and(|h| h.tuple.destination.ip().is_loopback());
+                let lo = route.map_or_else(
+                    || packet::header(&p).is_some_and(|h| h.tuple.destination.ip().is_loopback()),
+                    |ip| ip.is_loopback(),
+                );
                 if let Some(n) = self.nodes.get_mut(&source) {
                     let s = &mut n.links[usize::from(!lo)];
                     s.tx_packets += 1;
@@ -1099,6 +1103,7 @@ impl Inner {
                                     &mut p,
                                     h.tuple.destination.ip(),
                                     h.protocol,
+                                    route,
                                 )
                             });
                         if !delivered {
@@ -1158,6 +1163,7 @@ impl Inner {
                         view.namespace,
                         incoming.map(|index| (index, packet_type)),
                         &mut p,
+                        route,
                     );
                     let Some((route, next_hop)) = step else {
                         self.stats.dropped += 1;
@@ -1394,6 +1400,7 @@ impl Node {
         packet: &mut [u8],
         dest: IpAddr,
         protocol: u8,
+        route_hint: Option<IpAddr>,
     ) -> bool {
         let matches = |s: &SocketMeta| {
             s.kind == 4 && s.protocol == protocol && (s.family == 2) == dest.is_ipv4()
@@ -1407,10 +1414,10 @@ impl Node {
             return false;
         }
         let graph = view.graph.read().unwrap();
-        if !graph.own(view.namespace, dest) {
+        if !graph.own(view.namespace, route_hint.unwrap_or(dest)) {
             return false;
         }
-        let Some((route, None)) = graph.route_one(view.namespace, None, packet) else {
+        let Some((route, None)) = graph.route_one(view.namespace, None, packet, route_hint) else {
             return false;
         };
         if route.namespace != view.namespace || route.external || route.tunnel {
@@ -1836,7 +1843,7 @@ impl Network {
         if kind == 4 {
             return Err(NetError(94));
         }
-        if kind == 3 && !matches!((family, protocol), (_, 6 | 17) | (2, 1) | (10, 58)) {
+        if kind == 3 && !matches!((family, protocol), (_, 6 | 17 | 255) | (2, 1) | (10, 58)) {
             return Err(NetError(93));
         }
         let kind = if kind == 3 {
@@ -1848,7 +1855,7 @@ impl Network {
             kind
         };
         match (kind, protocol) {
-            (1, 0 | 6) | (2, 0 | 17) | (3 | 4, 1 | 58) | (4, 6 | 17) => {}
+            (1, 0 | 6) | (2, 0 | 17) | (3 | 4, 1 | 58) | (4, 6 | 17 | 255) => {}
             (1 | 2, _) => return Err(NetError(93)),
             _ => return Err(NetError(94)),
         };
@@ -1919,6 +1926,7 @@ impl Network {
                 multicast: None,
                 icmp6_filter: [0; 32],
                 raw_ingress: 0,
+                header_included: protocol == 255,
                 raw_checksum: if protocol == 58 { 2 } else { -1 },
                 hop_message: 52,
                 device: None,

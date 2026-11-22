@@ -226,7 +226,7 @@ impl Gateway {
         });
         for packet in replies {
             if self.node.port.tx.len() < 96 {
-                self.node.port.tx.push_back(packet);
+                self.node.port.tx.push_back((packet, None));
             }
         }
     }

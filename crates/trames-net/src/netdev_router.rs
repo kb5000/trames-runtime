@@ -92,13 +92,16 @@ impl Topology {
         input: Option<(u32, PacketType)>,
         packet: &mut [u8],
         external_reply: bool,
+        route_hint: &mut Option<IpAddr>,
     ) -> Option<(u32, Option<IpAddr>, Track)> {
         let packet_type = input.map_or(PacketType::Host, |(_, kind)| kind);
         let input = input.map(|(index, _)| index);
         let k = conntrack::key(packet)?;
         let connection = self.spaces[&namespace].connections.clone();
         let mut state = connection.lock().unwrap();
-        let initial_route = self.source(namespace, k.tuple.destination.ip()).ok();
+        let initial_route = self
+            .source(namespace, route_hint.unwrap_or(k.tuple.destination.ip()))
+            .ok();
         let initial_out = initial_route.map_or(0, |(_, i, _)| i);
         let first = if input.is_some() { 0 } else { 3 };
         let mut raw = Track::untracked(k, 0);
@@ -125,6 +128,9 @@ impl Topology {
                 return None;
             }
             let destination = conntrack::key(packet)?.tuple.destination.ip();
+            if destination != k.tuple.destination.ip() {
+                *route_hint = None;
+            }
             let local = !external_reply && self.own(namespace, destination);
             if let Some(input) = input.filter(|_| local) {
                 if !self.hook(
@@ -192,8 +198,10 @@ impl Topology {
         ns: u64,
         input: Option<(u32, PacketType)>,
         packet: &mut [u8],
+        mut route_hint: Option<IpAddr>,
     ) -> Option<(Delivery, Option<IpAddr>)> {
-        let (out, gateway, mut track) = self.route_namespace(ns, input, packet, false)?;
+        let (out, gateway, mut track) =
+            self.route_namespace(ns, input, packet, false, &mut route_hint)?;
         if out == 0 {
             return Some((
                 Delivery {
@@ -206,7 +214,10 @@ impl Topology {
                 None,
             ));
         }
-        let destination = conntrack::key(packet)?.tuple.destination.ip();
+        let destination = match route_hint {
+            Some(ip) => ip,
+            None => conntrack::key(packet)?.tuple.destination.ip(),
+        };
         if self.own(ns, destination) {
             let connections = self.spaces[&ns].connections.clone();
             let mut state = connections.lock().unwrap();
@@ -278,8 +289,13 @@ impl Topology {
             if !visited.insert(ns) {
                 return None;
             }
-            let (out, gateway, mut track) =
-                self.route_namespace(ns, input.map(|i| (i, PacketType::Host)), packet, false)?;
+            let (out, gateway, mut track) = self.route_namespace(
+                ns,
+                input.map(|i| (i, PacketType::Host)),
+                packet,
+                false,
+                &mut None,
+            )?;
             if first == 0 {
                 first = out;
             }
@@ -490,10 +506,11 @@ impl Topology {
                     Some((forward.input, PacketType::Host)),
                     packet,
                     true,
+                    &mut None,
                 )?;
                 return (out == 2).then_some(Some(forward));
             }
-            self.route_namespace(ns, None, packet, false)?;
+            self.route_namespace(ns, None, packet, false, &mut None)?;
             return Some(None);
         }
         let result = self.route_packet(ns, Some(2), packet)?;
@@ -523,7 +540,7 @@ impl Topology {
             crate::conntrack::State::default()
         };
         space.connections = Arc::new(Mutex::new(connections));
-        let Some((_, _, t)) = copy.route_namespace(ns, None, packet, false) else {
+        let Some((_, _, t)) = copy.route_namespace(ns, None, packet, false, &mut None) else {
             return false;
         };
         t.status & 32 != 0

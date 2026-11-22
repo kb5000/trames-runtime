@@ -660,3 +660,110 @@ fn destination_rules_control_guest_delivery_and_deletion_restores_the_route() {
         assert_eq!(rx.recv(32, 0).unwrap().data, b"restored");
     }
 }
+
+#[test]
+fn ipv4_hdrincl_preserves_wire_header_and_uses_the_send_route() {
+    let fabric = Fabric::new().unwrap();
+    let a = Network::virtual_network(&fabric, 2, NetworkMode::Full).unwrap();
+    let b = Network::virtual_network(&fabric, 3, NetworkMode::Full).unwrap();
+    let sender = a.socket(2, 3, 255).unwrap();
+    let receiver = b.socket(2, 3, 17).unwrap();
+    let udp = b.socket(2, 2, 0).unwrap();
+    udp.bind("0.0.0.0:43210".parse().unwrap()).unwrap();
+    assert_eq!(sender.get_option(0, 3), Ok(1));
+    assert_eq!(receiver.get_option(0, 3), Ok(0));
+    receiver.set_option(0, 3, 1).unwrap();
+    let mut packet = vec![0; 36];
+    packet[0] = 0x46;
+    packet[1] = 0x24;
+    packet[4..6].copy_from_slice(&0x1234u16.to_be_bytes());
+    packet[8] = 41;
+    packet[9] = 17;
+    packet[16..20].copy_from_slice(&[10, 0, 0, 3]);
+    packet[20..24].copy_from_slice(&[1, 1, 0, 0]);
+    packet[24..26].copy_from_slice(&43209u16.to_be_bytes());
+    packet[26..28].copy_from_slice(&43210u16.to_be_bytes());
+    packet[28..30].copy_from_slice(&12u16.to_be_bytes());
+    packet[32..].copy_from_slice(b"test");
+    let destination = Some("10.0.0.3:0".parse().unwrap());
+    assert_eq!(sender.send(&packet, 0, destination), Ok(36));
+    let received = receiver.recv(64, 0).unwrap().data;
+    assert_eq!(&received[..2], &packet[..2]);
+    assert_eq!(&received[2..4], &36u16.to_be_bytes());
+    assert_eq!(&received[4..10], &packet[4..10]);
+    assert_eq!(&received[12..16], &[10, 0, 0, 2]);
+    assert_eq!(&received[16..], &packet[16..]);
+    assert!(smoltcp::wire::Ipv4Packet::new_checked(&received)
+        .unwrap()
+        .verify_checksum());
+    assert_eq!(udp.recv(4, 0).unwrap().data, b"test");
+    assert!(matches!(sender.recv(64, 0), Err(NetError(11))));
+    assert_eq!(
+        sender.send(&packet[..19], 0, destination),
+        Err(NetError(22))
+    );
+    assert_eq!(
+        sender.send(&vec![0; 1501], 0, destination),
+        Err(NetError(90))
+    );
+
+    let local = a.socket(2, 3, 17).unwrap();
+    packet[4..6].fill(0);
+    sender
+        .send(&packet, 0, Some("127.0.0.1:0".parse().unwrap()))
+        .unwrap();
+    let received = local.recv(64, 0).unwrap().data;
+    assert_ne!(&received[4..6], &[0, 0]);
+    assert_eq!(&received[12..16], &[127, 0, 0, 1]);
+    assert_eq!(&received[16..], &packet[16..]);
+    assert!(matches!(receiver.recv(64, 0), Err(NetError(11))));
+}
+
+#[test]
+fn ipv4_hdrincl_multicast_preserves_the_supplied_ttl_and_header() {
+    let fabric = Fabric::new().unwrap();
+    let a = Network::virtual_network(&fabric, 2, NetworkMode::Full).unwrap();
+    let b = Network::virtual_network(&fabric, 3, NetworkMode::Full).unwrap();
+    let sender = a.socket(2, 3, 255).unwrap();
+    let rx = b.socket(2, 2, 0).unwrap();
+    rx.bind("0.0.0.0:19007".parse().unwrap()).unwrap();
+    rx.set_option_bytes(0, 35, &[239, 8, 1, 7, 10, 0, 0, 3])
+        .unwrap();
+    let mut packet = vec![0; 29];
+    packet[0] = 0x45;
+    packet[8] = 0;
+    packet[9] = 17;
+    packet[16..20].copy_from_slice(&[239, 8, 1, 7]);
+    packet[22..24].copy_from_slice(&19007u16.to_be_bytes());
+    packet[24..26].copy_from_slice(&9u16.to_be_bytes());
+    packet[28] = 42;
+    let address = Some("239.8.1.7:0".parse().unwrap());
+    sender.send(&packet, 0, address).unwrap();
+    assert!(matches!(rx.recv(1, 0), Err(NetError(11))));
+    packet[8] = 1;
+    sender.send(&packet, 0, address).unwrap();
+    assert_eq!(rx.recv(1, 0).unwrap().data, [42]);
+}
+
+#[test]
+fn ipv6_hdrincl_delivers_guest_transport_and_rejects_short_headers() {
+    let network = Network::managed_uplink(NetworkMode::Full).unwrap();
+    let sender = network.socket(10, 3, 255).unwrap();
+    let udp = network.socket(10, 2, 0).unwrap();
+    let destination = "[::1]:20009".parse().unwrap();
+    udp.bind(destination).unwrap();
+    assert_eq!(sender.get_option(41, 36), Ok(1));
+    let route = Some("[::1]:0".parse().unwrap());
+    assert_eq!(sender.send(&[0; 39], 0, route), Err(NetError(22)));
+    let packet =
+        crate::conntrack::message("[::1]:40002".parse().unwrap(), destination, 17, 0, b"ipv6");
+    assert_eq!(sender.send(&packet, 0, route), Ok(packet.len()));
+    let output = udp.recv(16, 0).unwrap();
+    assert_eq!(output.data, b"ipv6");
+    assert_eq!(output.address.unwrap().port(), 40002);
+    let transport = network.socket(10, 3, 17).unwrap();
+    assert_eq!(transport.get_option(41, 36), Ok(0));
+    transport.set_option(41, 36, 1).unwrap();
+    assert_eq!(transport.send(&packet, 0, route), Ok(packet.len()));
+    assert_eq!(udp.recv(16, 0).unwrap().data, b"ipv6");
+}

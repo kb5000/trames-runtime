@@ -316,15 +316,22 @@ impl Socket {
         bytes: &[u8],
         control: crate::DatagramControl,
     ) -> Result<usize> {
-        if self.raw_udp() && bytes.len() < 8 {
+        let hdrincl = self.kind == 4 && self.state.borrow().header_included;
+        if !hdrincl && self.raw_udp() && bytes.len() < 8 {
             return Err(NetError(22));
         }
-        if !self.raw_udp() && dest.port() == 0 {
+        if self.kind == 2 && dest.port() == 0 {
             return Err(NetError(22));
         }
         let v6 = dest.is_ipv6();
         if bytes.len()
-            > if self.raw_udp() {
+            > if hdrincl {
+                if v6 {
+                    65575
+                } else {
+                    65535
+                }
+            } else if self.raw_udp() {
                 65515
             } else if v6 {
                 65527
@@ -335,6 +342,9 @@ impl Socket {
             return Err(NetError(90));
         }
         let (dev, source) = self.group_source(dest, control.packet_info)?;
+        if hdrincl && bytes.len() > dev.mtu as usize {
+            return Err(NetError(90));
+        }
         let policy = self.state.borrow().ipv4_pmtu;
         if !v6 && self.kind == 2 && policy.enforce_mtu() && bytes.len() + 28 > dev.mtu as usize {
             return Err(self.udp_too_big(dest, dev.mtu));
@@ -367,7 +377,19 @@ impl Socket {
             !multicast || dev.index == 1 || state.multicast_value(if v6 { 19 } else { 34 }) != 0;
         drop(state);
         let view = self.network.0.routing.get().ok_or(NetError(95))?;
-        let mut packet = if self.raw_udp() {
+        let mut fabric = self.network.0.fabric.0.borrow_mut();
+        let mut packet = if hdrincl {
+            let port = &mut fabric
+                .nodes
+                .get_mut(&self.network.0.key)
+                .ok_or(NetError(100))?
+                .port;
+            let (packet, _) = port.complete_raw_header(bytes, source)?;
+            if packet::header(&packet).is_none_or(|h| h.protocol != 17) {
+                return Err(NetError(95));
+            }
+            packet
+        } else if self.raw_udp() {
             let (IpAddr::V4(source), IpAddr::V4(destination)) = (source, dest.ip()) else {
                 return Err(NetError(97));
             };
@@ -380,11 +402,16 @@ impl Socket {
             }
             packet
         };
-        if v6 {
+        let ttl = if hdrincl {
+            packet[if v6 { 7 } else { 8 }]
+        } else {
+            ttl
+        };
+        if v6 && !hdrincl {
             let mut header = smoltcp::wire::Ipv6Packet::new_unchecked(&mut packet);
             header.set_traffic_class(class);
             header.set_hop_limit(ttl);
-        } else {
+        } else if !hdrincl {
             packet[1] = class;
             packet[8] = ttl;
             let mut header = smoltcp::wire::Ipv4Packet::new_unchecked(&mut packet);
@@ -393,7 +420,6 @@ impl Socket {
             }
             header.fill_checksum();
         }
-        let mut fabric = self.network.0.fabric.0.borrow_mut();
         if !view
             .graph
             .read()

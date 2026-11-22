@@ -791,6 +791,7 @@ impl Socket {
             icmp6_filter: state.icmp6_filter,
             raw_ingress: 0,
             raw_checksum: state.raw_checksum,
+            header_included: state.header_included,
             hop_message: state.hop_message,
             device: state.device,
             raw_identifiers: std::collections::BTreeSet::new(),
@@ -1891,6 +1892,9 @@ impl Socket {
             (41, 16) if self.family == 10 && (-1..=255).contains(&value) => {
                 state.hop_limit = if value == -1 { 64 } else { value as u8 }
             }
+            (0, 3) | (41, 36) if self.kind == 4 && (self.family == 2) == (level == 0) => {
+                state.header_included = value != 0
+            }
             (0, 12) if self.family == 2 && self.kind == 4 => state.receive_hops = value != 0,
             (41, 51 | 8) if self.family == 10 && self.kind == 4 => {
                 state.receive_hops = value != 0;
@@ -2263,6 +2267,9 @@ impl Socket {
             }
         }
         match (level, name) {
+            (0, 3) | (41, 36) if self.kind == 4 && (self.family == 2) == (level == 0) => {
+                Ok(i32::from(state.header_included))
+            }
             (1, 3) => Ok(if self.kind == 3 {
                 2
             } else if self.kind == 4 {
@@ -2632,7 +2639,8 @@ impl Socket {
             .transpose()?
             .or(self.state.borrow().peer)
             .ok_or(NetError(89))?;
-        if self.raw_udp() && self.udp_group(a.ip()) {
+        let hdrincl = self.state.borrow().header_included;
+        if (hdrincl || self.raw_udp()) && self.udp_group(a.ip()) {
             return self.send_group(a, bytes, control);
         }
         let ipv6 = self.family == 10;
@@ -2640,15 +2648,17 @@ impl Socket {
         {
             return Err(NetError(95));
         }
-        self.destination(a)?;
-        let maximum = if self.raw_transport() {
+        let maximum = if hdrincl || self.raw_transport() {
             let mtu = self.path_mtu(a.ip())? as usize;
-            if ipv6 {
+            if hdrincl {
+                mtu.min(if ipv6 { 65575 } else { 65535 })
+            } else if ipv6 {
                 mtu.saturating_sub(40).min(65535)
             } else {
                 mtu.min(65535).saturating_sub(20)
             }
         } else {
+            self.destination(a)?;
             1400
         };
         if bytes.len() > maximum {
@@ -2657,7 +2667,8 @@ impl Socket {
         if self.state.borrow().bound.is_none() {
             self.ensure_bound()?;
         }
-        if !self.raw_transport()
+        if !hdrincl
+            && !self.raw_transport()
             && bytes.len() >= 8
             && bytes[0] == if self.family == 2 { 8 } else { 128 }
             && bytes[1] == 0
@@ -2681,12 +2692,21 @@ impl Socket {
             return Err(NetError(101));
         }
         let source = self.icmp_or_raw_source(state.bound.unwrap().ip(), a)?;
+        let n = fabric
+            .nodes
+            .get_mut(&self.network.0.key)
+            .ok_or(NetError(100))?;
         let fields = control.fields[usize::from(ipv6)];
         let class = fields
             .traffic_class
             .or(state.udp_options[usize::from(ipv6)].fields.traffic_class)
             .unwrap_or(0);
-        let data = if self.family == 2 {
+        let mut route = None;
+        let data = if hdrincl {
+            let (packet, header_destination) = n.port.complete_raw_header(bytes, source)?;
+            route = (header_destination != a.ip()).then_some(a.ip());
+            packet
+        } else if self.family == 2 {
             let (IpAddr::V4(source), IpAddr::V4(destination)) = (source, a.ip()) else {
                 return Err(NetError(97));
             };
@@ -2729,12 +2749,8 @@ impl Socket {
             }
             header
         };
-        let n = fabric
-            .nodes
-            .get_mut(&self.network.0.key)
-            .ok_or(NetError(100))?;
-        if self.raw_transport() {
-            n.port.send_raw(data)?;
+        if hdrincl || self.raw_transport() {
+            n.port.send_raw(data, route)?;
         } else {
             n.sockets
                 .get_mut::<raw::Socket>(state.handles[0])

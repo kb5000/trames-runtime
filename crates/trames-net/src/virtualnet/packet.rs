@@ -36,7 +36,8 @@ const FRAGMENT_BYTES: usize = 512 * 1024;
 #[derive(Default)]
 pub(crate) struct Port {
     pub rx: VecDeque<(Vec<u8>, u32)>,
-    pub tx: VecDeque<Vec<u8>>,
+    pub tx: VecDeque<(Vec<u8>, Option<IpAddr>)>,
+    next_raw_id: u16,
     serial: u32,
     fragments: Vec<Fragments>,
 }
@@ -57,12 +58,48 @@ impl Fragments {
     }
 }
 impl Port {
+    /// Linux fills IPv4 length and checksum, and supplies a zero source or ID.
+    /// IPv6 callers supply the complete header, including its source address.
+    pub(super) fn complete_raw_header(
+        &mut self,
+        bytes: &[u8],
+        source: IpAddr,
+    ) -> Result<(Vec<u8>, IpAddr)> {
+        let IpAddr::V4(source) = source else {
+            if bytes.len() < 40 || bytes[0] >> 4 != 6 {
+                return Err(NetError(22));
+            }
+            return Ok((
+                bytes.to_vec(),
+                Ipv6Addr::from(<[u8; 16]>::try_from(&bytes[24..40]).unwrap()).into(),
+            ));
+        };
+        let len = u16::try_from(bytes.len()).map_err(|_| NetError(90))?;
+        if bytes.len() < 20
+            || bytes[0] >> 4 != 4
+            || !(20..=bytes.len()).contains(&(usize::from(bytes[0] & 15) * 4))
+        {
+            return Err(NetError(22));
+        }
+        let mut packet = bytes.to_vec();
+        packet[2..4].copy_from_slice(&len.to_be_bytes());
+        if packet[12..16] == [0; 4] {
+            packet[12..16].copy_from_slice(&source.octets());
+        }
+        if packet[4..6] == [0; 2] {
+            self.next_raw_id = self.next_raw_id.wrapping_add(1).max(1);
+            packet[4..6].copy_from_slice(&self.next_raw_id.to_be_bytes());
+        }
+        smoltcp::wire::Ipv4Packet::new_unchecked(&mut packet).fill_checksum();
+        let destination = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+        Ok((packet, destination.into()))
+    }
     /// Queue an already formed IP datagram on the same egress path as the interface.
-    pub(super) fn send_raw(&mut self, packet: Vec<u8>) -> Result<()> {
+    pub(super) fn send_raw(&mut self, packet: Vec<u8>, route: Option<IpAddr>) -> Result<()> {
         if self.tx.len() >= QUEUE {
             return Err(NetError(11));
         }
-        self.tx.push_back(packet);
+        self.tx.push_back((packet, route));
         Ok(())
     }
     pub fn receive_packet(&mut self, p: Vec<u8>) -> bool {
@@ -263,13 +300,13 @@ impl TxToken for Tx<'_> {
                     fragment.extend_from_slice(&bits.to_be_bytes());
                     fragment.extend_from_slice(&id.to_be_bytes());
                     fragment.extend_from_slice(chunk);
-                    self.0.tx.push_back(fragment);
+                    self.0.tx.push_back((fragment, None));
                 }
             }
         } else if (len <= MTU || len <= 65535 && p.first().is_some_and(|b| b >> 4 == 4))
             && self.0.tx.len() < QUEUE
         {
-            self.0.tx.push_back(p);
+            self.0.tx.push_back((p, None));
         }
         r
     }
@@ -469,7 +506,10 @@ mod tests {
             }
             let mut port = Port::default();
             Tx(&mut port).consume(original.len(), |b| b.copy_from_slice(&original));
-            (original, port.tx.into_iter().collect())
+            (
+                original,
+                port.tx.into_iter().map(|(packet, _)| packet).collect(),
+            )
         } else {
             let mut original = vec![0; 3020];
             original[0] = 0x45;
