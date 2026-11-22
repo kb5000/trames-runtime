@@ -79,8 +79,9 @@ impl CredentialState {
         &self,
         caller: &Credentials,
         observed: &trames_memory::MemoryReport,
+        require_cap: bool,
     ) -> Result<trames_memory::TransferTarget> {
-        self.with_pidfd_resources(caller, false, |resources| {
+        self.with_pidfd_resources(caller, false, require_cap, |resources| {
             resources
                 .memory
                 .as_ref()
@@ -94,11 +95,13 @@ impl CredentialState {
         caller: &Credentials,
         same_group: bool,
         mm: &trames_memory::MemoryReport,
+        require_cap: bool,
     ) -> Result<()> {
         let target = self.current.read().unwrap();
         let binding = self.pidfd.lock().unwrap();
         let resources = binding.as_ref().ok_or(Errno(3))?;
-        if !same_group && !resources.dumpable.may_inspect(caller)
+        if require_cap && !caller.has_ns_cap(&target.user_namespace, capabilities::SYS_PTRACE)
+            || !same_group && !resources.dumpable.may_inspect(caller)
             || !caller.can_inspect_credentials(same_group, &target, resources.dumpable.get())
         {
             return Err(Errno(13));
@@ -118,8 +121,9 @@ impl CredentialState {
         same_group: bool,
         fd: u32,
         into: &SharedFiles,
+        require_cap: bool,
     ) -> Result<u32> {
-        self.with_pidfd_resources(caller, same_group, |resources| {
+        self.with_pidfd_resources(caller, same_group, require_cap, |resources| {
             let files = resources.table.upgrade().ok_or(Errno(3))?;
             into.receive_pidfd_slot(&files, fd)
         })
@@ -130,25 +134,28 @@ impl CredentialState {
         same_group: bool,
         flags: u64,
     ) -> Result<PidfdNamespaces> {
-        self.with_pidfd_resources(caller, same_group, |resources| {
+        self.with_pidfd_resources(caller, same_group, false, |resources| {
             resources.namespaces.select(flags)
         })
     }
     /// PTRACE_ATTACH uses the same objective credentials and dumpability
     /// transaction as pidfd_getfd. The caller has already excluded its own group.
-    pub fn check_trace_attach(&self, caller: &Credentials) -> Result<()> {
-        self.with_pidfd_resources(caller, false, |_| Ok(()))
+    pub fn check_trace_attach(&self, caller: &Credentials, require_cap: bool) -> Result<()> {
+        self.with_pidfd_resources(caller, false, require_cap, |_| Ok(()))
     }
     fn with_pidfd_resources<T>(
         &self,
         caller: &Credentials,
         same_group: bool,
+        require_cap: bool,
         accept: impl FnOnce(&PidfdResources) -> Result<T>,
     ) -> Result<T> {
         let target = self.current.read().unwrap();
         let binding = self.pidfd.lock().unwrap();
         let resources = binding.as_ref().ok_or(Errno(3))?;
-        if !same_group && !resources.dumpable.may_inspect(caller) {
+        if require_cap && !caller.has_ns_cap(&target.user_namespace, capabilities::SYS_PTRACE)
+            || !same_group && !resources.dumpable.may_inspect(caller)
+        {
             return Err(Errno(1));
         }
         // Both READ_REALCREDS (setns) and ATTACH_REALCREDS (getfd) compare real IDs and permitted capabilities.
@@ -976,19 +983,19 @@ mod process_transfer_tests {
         fs_caller.fsuid = creds.uid;
         fs_caller.fsgid = creds.gid;
         assert_eq!(
-            state.check_proc_memory(&fs_caller, false, &old.memory_report()),
+            state.check_proc_memory(&fs_caller, false, &old.memory_report(), false),
             Ok(())
         );
         fs_caller.fsuid = 1300;
         assert_eq!(
-            state.check_proc_memory(&fs_caller, false, &old.memory_report()),
+            state.check_proc_memory(&fs_caller, false, &old.memory_report(), false),
             Err(Errno(13))
         );
         let retained = state
-            .admit_process_memory(&creds, &old.memory_report())
+            .admit_process_memory(&creds, &old.memory_report(), false)
             .unwrap();
         assert!(matches!(
-            state.admit_process_memory(&Credentials::user(1300, 1300), &old.memory_report()),
+            state.admit_process_memory(&Credentials::user(1300, 1300), &old.memory_report(), false),
             Err(Errno(1))
         ));
         state.publish_pidfd_resources(
@@ -998,23 +1005,23 @@ mod process_transfer_tests {
             vfs.pidfd_namespace_source(),
         );
         assert!(state
-            .admit_process_memory(&creds, &old.memory_report())
+            .admit_process_memory(&creds, &old.memory_report(), false)
             .is_ok());
         policy.set(false);
         assert!(matches!(
-            state.admit_process_memory(&creds, &old.memory_report()),
+            state.admit_process_memory(&creds, &old.memory_report(), false),
             Err(Errno(1))
         ));
         publish(&new, &Dumpable::default());
         assert!(matches!(
-            state.admit_process_memory(&creds, &old.memory_report()),
+            state.admit_process_memory(&creds, &old.memory_report(), false),
             Err(Errno(3))
         ));
         assert!(state
-            .admit_process_memory(&creds, &new.memory_report())
+            .admit_process_memory(&creds, &new.memory_report(), false)
             .is_ok());
         assert_eq!(
-            state.check_proc_memory(&creds, false, &old.memory_report()),
+            state.check_proc_memory(&creds, false, &old.memory_report(), false),
             Err(Errno(3))
         );
         assert!(!retained.matches(&new.memory_report()));

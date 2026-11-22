@@ -133,6 +133,7 @@ impl IoRoutes {
                 target.tgid() == caller.tgid(),
                 a[1] as u32,
                 into.files(),
+                target.trace_requires_cap(caller.tgid(), self.namespace.ptrace_scope())?,
             )
             .map(u64::from)
     }

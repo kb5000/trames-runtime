@@ -2222,7 +2222,7 @@ impl<C: Cpu> Kernel<C> {
             260 => self.wait(pid, p, a),
             95 => self.waitid(pid, p, a),
             167 if prctl::entry(a) => prctl::call(
-                &mut p.cpu, &p.linux.command_name, Some(&p.parentage), Some(&p.family), a, &mut p.memory
+                &mut p.cpu, &p.linux.command_name, Some(&p.parentage), Some(&p.family), (&p.signals.io, p.linux.vfs.pid_namespace()), a, &mut p.memory
             ).expect("original task controls").map(Some),
             72 | 73 => self.poll(p, number, a, io),
             22 | 441 => self.epoll(p, number, a, io),

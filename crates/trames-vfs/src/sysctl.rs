@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Original environment sysctl capabilities; no coordinator or service task.
 use super::*;
+pub(super) const PTRACE_SCOPE: &[u8] = b"/proc/sys/kernel/yama/ptrace_scope";
 pub(super) const MAX_USER_NAMESPACES: &[u8] = b"/proc/sys/user/max_user_namespaces";
 
 #[derive(Clone, Copy)]
@@ -42,6 +43,7 @@ impl NameiPolicy {
 pub(super) enum Control {
     Network(network::Control),
     NrOpen(DescriptorCeiling),
+    PtraceScope(PidNamespace),
     OverflowId(bool, Arc<user_namespace::OverflowIds>),
     UtsName(bool, Arc<readiness::ProcWatch>),
     Namei(Protection, Arc<NameiPolicy>),
@@ -82,6 +84,10 @@ impl Control {
             Self::KeyLimit(..) | Self::OverflowId(..) | Self::MountMax(_) | Self::Namei(..) => {
                 credentials.euid == 0 && credentials.user_namespace.is_initial()
             }
+            Self::PtraceScope(_) => {
+                credentials.user_namespace.is_initial()
+                    && credentials.has_cap(capabilities::SYS_PTRACE)
+            }
             Self::NrOpen(_) => {
                 credentials.has_cap(capabilities::SYS_RESOURCE)
                     || credentials.euid == 0 && credentials.user_namespace.is_initial()
@@ -119,6 +125,7 @@ impl Control {
             Self::UserMap(control) => return control.read(offset, count),
             Self::Network(control) => return control.read(offset, count),
             Self::Namei(kind, policy) => policy.get(*kind),
+            Self::PtraceScope(ns) => ns.ptrace_scope(),
             Self::KeyLimit(root, keys) => keys.limit(*root),
             Self::MountMax(policy) => policy.get(),
             Self::OverflowId(group, ids) => ids.get(*group),
@@ -155,9 +162,11 @@ impl Control {
                 name.set(bytes_to_copy.split(|b| *b == 0).next().unwrap_or_default());
                 return Ok(bytes.len());
             }
+            Self::PtraceScope(_) if !self.authorized(credentials, tgid) => return Err(Errno(1)),
             Self::UserMap(control) => control.write(bytes, offset, credentials),
             Self::Network(control) => control.write(bytes, offset, control.authorized(credentials)),
             Self::OverflowId(..)
+            | Self::PtraceScope(_)
             | Self::Namei(..)
             | Self::KeyLimit(..)
             | Self::MountMax(_)
@@ -178,6 +187,7 @@ impl Control {
                     .parse::<u32>()
                     .map_err(|_| Errno(22))?;
                 match self {
+                    Self::PtraceScope(ns) => ns.set_ptrace_scope(value)?,
                     Self::OverflowId(group, ids) if value <= u16::MAX as u32 => {
                         ids.set(*group, value)
                     }
@@ -316,6 +326,8 @@ impl Vfs {
         }
         if let Some(control) = self.user_map_control(path) {
             Some(Control::UserMap(Arc::new(control)))
+        } else if path.as_ref() == PTRACE_SCOPE && self.uses_pseudo(path) {
+            Some(Control::PtraceScope(self.pid_namespace().clone()))
         } else if path.as_ref() == MAX_USER_NAMESPACES && self.uses_pseudo(path) {
             Some(Control::UserNamespaces(
                 self.credentials.user_namespace.clone(),

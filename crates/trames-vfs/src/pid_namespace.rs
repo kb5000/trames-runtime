@@ -14,6 +14,7 @@ pub(super) struct PidSpace {
     inode: u64,
     parent: Option<PidNamespace>,
     depth: usize,
+    ptrace_scope: Arc<std::sync::atomic::AtomicU32>,
     init: AtomicU64,
     dead: AtomicBool,
     maps: Mutex<Ids>,
@@ -83,6 +84,9 @@ impl PidNamespace {
         let n = Self(Arc::new(PidSpace {
             user_namespace,
             inode,
+            ptrace_scope: parent
+                .as_ref()
+                .map_or_else(|| Arc::new(1.into()), |p| p.0.ptrace_scope.clone()),
             parent,
             depth,
             init: AtomicU64::new(u64::MAX),
@@ -95,6 +99,22 @@ impl PidNamespace {
         }));
         all.push(Arc::downgrade(&n.0));
         Ok(n)
+    }
+    /// Shared by every PID namespace in this guest, independent of other guests.
+    pub fn ptrace_scope(&self) -> u32 {
+        self.0.ptrace_scope.load(Ordering::Relaxed)
+    }
+    pub(super) fn set_ptrace_scope(&self, value: u32) -> Result<()> {
+        if value > 3 {
+            return Err(Errno(22));
+        }
+        self.0
+            .ptrace_scope
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                (old != 3 || value == 3).then_some(value)
+            })
+            .map(|_| ())
+            .map_err(|_| Errno(22))
     }
     pub fn user_namespace(&self) -> &UserNamespace {
         &self.0.user_namespace
@@ -394,6 +414,23 @@ impl Vfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ptrace_scope_is_guest_wide_and_mode_three_is_irreversible() {
+        let root = PidNamespace::default();
+        let nested = PidNamespace::new(Some(root.clone()), root.0.registry.clone()).unwrap();
+        let other = PidNamespace::default();
+        assert_eq!(root.ptrace_scope(), 1);
+        assert_eq!(nested.set_ptrace_scope(4), Err(Errno(22)));
+        root.set_ptrace_scope(2).unwrap();
+        assert_eq!(nested.ptrace_scope(), 2);
+        nested.set_ptrace_scope(0).unwrap();
+        assert_eq!(root.ptrace_scope(), 0);
+        nested.set_ptrace_scope(3).unwrap();
+        assert_eq!(root.set_ptrace_scope(1), Err(Errno(22)));
+        assert_eq!(nested.ptrace_scope(), 3);
+        assert_eq!(other.ptrace_scope(), 1);
+    }
+
     #[test]
     fn credential_pid_uses_original_namespace_and_liveness_without_proc_projection() {
         struct Task(std::sync::atomic::AtomicBool);

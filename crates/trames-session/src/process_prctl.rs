@@ -11,10 +11,12 @@ pub(crate) fn call<C: Cpu>(
     name: &trames_vfs::TaskName,
     parent: Option<&trames_kernel::task_parent::Parentage>,
     family: Option<&trames_kernel::family::Family>,
+    trace: (&trames_kernel::signal::IoTask, &trames_vfs::PidNamespace),
     a: [u64; 6],
     memory: &mut impl CpuMemory,
 ) -> Option<Result<u64, Errno>> {
     Some(match a[0] {
+        0x5961_6d61 => trace.0.set_ptracer(trace.1, a[1]), // PR_SET_PTRACER
         1 if a[1] > 64 => Err(Errno(22)),
         1 => {
             parent?.set_death_signal(a[1] as u32);

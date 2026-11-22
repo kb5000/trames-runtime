@@ -26,6 +26,11 @@ const PTRACE_SEIZE: u64 = 0x4206;
 const PTRACE_O_SUSPEND_SECCOMP: u64 = 1 << 21;
 const PTRACE_O_MASK: u64 = 0xff | (1 << 20) | PTRACE_O_SUSPEND_SECCOMP;
 
+pub(super) enum Exception {
+    Any,
+    Task(Weak<IoTask>),
+}
+
 pub(super) struct Relationship {
     tracer: Weak<IoTask>,
     child: Arc<crate::children::Child>,
@@ -141,6 +146,69 @@ pub(super) struct Tracees {
 }
 
 impl IoTask {
+    /// Return whether admission also requires CAP_SYS_PTRACE in the target
+    /// namespace. The credentials layer checks it against the same image.
+    pub(super) fn trace_requires_cap(&self, caller_group: u32, scope: u32) -> Result<bool, Errno> {
+        if self.tgid() == caller_group || scope == 0 {
+            return Ok(false);
+        }
+        if scope == 3 {
+            return Err(Errno(1));
+        }
+        if scope == 2 {
+            return Ok(true);
+        }
+        let Some(parents) = self.parents.get().and_then(Weak::upgrade) else {
+            return Ok(true);
+        };
+        let Some(caller) = parents.original(caller_group) else {
+            return Ok(true);
+        };
+        if parents.descendant(self, &caller) {
+            return Ok(false);
+        }
+        if self
+            .trace
+            .get()
+            .and_then(|s| s.lock().unwrap().as_ref()?.tracer.upgrade())
+            .is_some_and(|t| t.live() && t.tgid() == caller_group)
+        {
+            return Ok(false);
+        }
+        let Some(leader) = parents.original(self.tgid()) else {
+            return Ok(true);
+        };
+        let Some(exception) = leader.ptracer.get() else {
+            return Ok(true);
+        };
+        let selected = exception.lock().unwrap();
+        Ok(match selected.as_ref() {
+            Some(Exception::Any) => false,
+            Some(Exception::Task(task)) => !task
+                .upgrade()
+                .is_some_and(|t| parents.descendant(&caller, &t)),
+            None => true,
+        })
+    }
+
+    pub fn set_ptracer(&self, ns: &PidNamespace, pid: u64) -> Result<u64, Errno> {
+        let parents = self.parents.get().and_then(Weak::upgrade).ok_or(Errno(3))?;
+        let leader = parents.original(self.tgid()).ok_or(Errno(3))?;
+        let exception = if pid == 0 {
+            None
+        } else if pid as i32 == -1 {
+            Some(Exception::Any)
+        } else {
+            let task = ns
+                .global(pid as u32)
+                .and_then(|id| parents.original(id))
+                .filter(|t| t.live())
+                .ok_or(Errno(22))?;
+            Some(Exception::Task(Arc::downgrade(&task)))
+        };
+        *leader.ptracer.get_or_init(Default::default).lock().unwrap() = exception;
+        Ok(0)
+    }
     #[inline]
     pub fn trace_stopped(&self) -> bool {
         self.trace_stop.load(Ordering::Acquire)
@@ -332,6 +400,13 @@ impl IoRoutes {
         let child = task.lifecycle().wait_child().ok_or(Errno(3))?;
         let creds = tracer.credentials().read().clone();
         let own = task.credentials().read();
+        let scope = self.namespace.ptrace_scope();
+        if scope == 3
+            || scope == 2
+                && !creds.has_ns_cap(&own.user_namespace, trames_vfs::capabilities::SYS_PTRACE)
+        {
+            return Err(Errno(1));
+        }
         if !(creds.user_namespace == own.user_namespace
             && own.caps.permitted & !creds.caps.permitted == 0)
             && !creds.has_ns_cap(&own.user_namespace, trames_vfs::capabilities::SYS_PTRACE)
@@ -395,7 +470,7 @@ impl IoRoutes {
         }
         let credentials = caller.credentials().read().clone();
         task.credentials()
-            .admit_process_memory(&credentials, &mm)
+            .admit_process_memory(&credentials, &mm, false)
             .map_err(|e| if e.0 == 1 { Errno(5) } else { e })
             .map(Some)
     }
@@ -601,7 +676,10 @@ impl IoRoutes {
             return Err(Errno(1));
         }
         let credentials = caller.credentials().read().clone();
-        target.credentials().check_trace_attach(&credentials)?;
+        target.credentials().check_trace_attach(
+            &credentials,
+            target.trace_requires_cap(caller.tgid(), self.namespace.ptrace_scope())?,
+        )?;
         // Keep authorized requests visibly unsupported until a live task can
         // publish and acknowledge its own tracing stop.
         Err(Errno(38))
@@ -611,6 +689,44 @@ impl IoRoutes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn designated_debugger_follows_the_original_task_and_its_descendants() {
+        let directory = IoDirectory::default();
+        let ns = PidNamespace::default();
+        let task = |id, parent| {
+            let task = Arc::new(IoTask::default());
+            directory.publish(&task, id, id, 1, 1000, 1000);
+            let relation = Arc::new(crate::task_parent::Parentage::default());
+            relation.set_parent_thread(parent);
+            directory.parents.publish(&task, id, &relation);
+            task
+        };
+        let owner = task(40, 0);
+        let target = task(41, 40);
+        let debugger = task(42, 40);
+        let descendant = task(43, 42);
+        assert_eq!(target.trace_requires_cap(owner.tgid(), 1), Ok(false));
+        assert_eq!(target.trace_requires_cap(debugger.tgid(), 1), Ok(true));
+        target.set_ptracer(&ns, debugger.tid().into()).unwrap();
+        assert_eq!(target.trace_requires_cap(descendant.tgid(), 1), Ok(false));
+        assert_eq!(target.trace_requires_cap(descendant.tgid(), 2), Ok(true));
+        assert_eq!(
+            target.trace_requires_cap(descendant.tgid(), 3),
+            Err(Errno(1))
+        );
+        assert_eq!(target.set_ptracer(&ns, 999), Err(Errno(22)));
+        assert_eq!(target.trace_requires_cap(debugger.tgid(), 1), Ok(false));
+        directory
+            .parents
+            .retire(&debugger, None, Default::default());
+        let replacement = task(42, 40);
+        assert_eq!(target.trace_requires_cap(replacement.tgid(), 1), Ok(true));
+        target.set_ptracer(&ns, u64::MAX).unwrap();
+        assert_eq!(target.trace_requires_cap(replacement.tgid(), 1), Ok(false));
+        target.set_ptracer(&ns, 0).unwrap();
+        assert_eq!(target.trace_requires_cap(replacement.tgid(), 1), Ok(true));
+    }
 
     #[test]
     fn syscall_info_reports_full_size_and_copies_only_the_requested_prefix() {

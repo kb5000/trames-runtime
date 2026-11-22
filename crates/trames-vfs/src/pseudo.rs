@@ -2099,7 +2099,7 @@ impl Vfs {
             b"/sys/class/block" | b"/sys/devices/virtual/block" | b"/sys/devices/virtual/block/vda" |
             b"/sys/devices/virtual/block/vda/vda1" | b"/sys/devices/virtual/block/vda/queue" |
             b"/sys/dev" | b"/sys/dev/block" | b"/dev/block" | b"/proc/fs" | b"/proc/sys" |
-            b"/proc/sys/kernel" | b"/proc/sys/kernel/keys" | b"/proc/sys/kernel/random" | b"/proc/sys/fs" | b"/proc/sys/vm" | b"/proc/sys/user" | b"/proc/sys/net" |
+            b"/proc/sys/kernel" | b"/proc/sys/kernel/yama" | b"/proc/sys/kernel/keys" | b"/proc/sys/kernel/random" | b"/proc/sys/fs" | b"/proc/sys/vm" | b"/proc/sys/user" | b"/proc/sys/net" |
             b"/proc/sys/net/ipv4" | b"/dev/pts" => return Ok(directory()),
             b"/dev/tty" => return Ok(Some((Content::Terminal, 0o20666))),
             b"/sys/devices/system/cpu/online"|b"/sys/devices/system/cpu/possible"|b"/sys/devices/system/cpu/present"=>return Ok(regular(cpu_topology::list(r.cpu_count).into_bytes())),
@@ -2187,6 +2187,7 @@ impl Vfs {
             name @ (b"/proc/sys/kernel/keys/maxkeys" | b"/proc/sys/kernel/keys/root_maxkeys") => return Ok(Some((file(format!("{}\n", self.key_registry().limit(name.ends_with(b"/root_maxkeys"))).into_bytes()), 0o100644))),
             b"/proc/sys/kernel/pid_max" => return Ok(regular(b"2147483647\n".to_vec())),
             b"/proc/sys/kernel/threads-max" => return Ok(regular(format!("{task_limit}\n").into_bytes())),
+            sysctl::PTRACE_SCOPE => return Ok(Some((file(format!("{}\n", self.pid_namespace().ptrace_scope()).into_bytes()), 0o100644))),
             sysctl::MAX_USER_NAMESPACES => return Ok(Some((file(format!("{}\n", self.user_namespace_limits().max()).into_bytes()), 0o100644))),
             name if name.starts_with(b"/proc/sys/fs/protected_") => {
                 return Ok(sysctl::Protection::at(name).map(|kind| (file(format!("{}\n", self.namei_policy.get(kind)).into_bytes()), 0o100644)));
@@ -2987,9 +2988,11 @@ impl Vfs {
                 .iter()
                 .map(|s| s.as_bytes().to_vec())
                 .collect(),
+            b"/proc/sys/kernel/yama" => vec![b"ptrace_scope".to_vec()],
             b"/proc/sys/kernel/keys" => vec![b"maxkeys".to_vec(), b"root_maxkeys".to_vec()],
             b"/proc/sys/kernel" => [
                 "keys",
+                "yama",
                 "ostype",
                 "osrelease",
                 "version",

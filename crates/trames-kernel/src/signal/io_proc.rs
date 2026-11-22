@@ -164,8 +164,19 @@ impl trames_vfs::ProcTask for IoTask {
         group: u32,
         memory: &trames_memory::MemoryReport,
     ) -> Result<(), trames_vfs::Errno> {
-        self.credentials()
-            .check_proc_memory(credentials, self.tgid() == group, memory)
+        self.credentials().check_proc_memory(
+            credentials,
+            self.tgid() == group,
+            memory,
+            self.trace_requires_cap(
+                group,
+                self.inbox
+                    .namespace
+                    .get()
+                    .map_or(1, PidNamespace::ptrace_scope),
+            )
+            .map_err(|_| Errno(13))?,
+        )
     }
     fn present(&self) -> bool {
         self.identifies(0, self.pid.load(Ordering::Relaxed))

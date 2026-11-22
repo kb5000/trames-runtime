@@ -66,6 +66,43 @@ impl State {
     }
 }
 impl Parents {
+    pub(crate) fn original(&self, tid: u32) -> Option<Arc<IoTask>> {
+        let state = self.0.lock().unwrap();
+        state.tasks.get(state.tids.get(&tid)?)?.original.upgrade()
+    }
+    /// Compare original process leaders under the same graph lock as reparent
+    /// and nonleader exec. A recycled numeric PID never becomes an ancestor.
+    pub(crate) fn descendant(&self, child: &IoTask, ancestor: &IoTask) -> bool {
+        let state = self.0.lock().unwrap();
+        if [child, ancestor]
+            .into_iter()
+            .any(|task| state.tids.get(&task.tid()) != Some(&(std::ptr::from_ref(task) as usize)))
+        {
+            return false;
+        }
+        let mut at = state.tids.get(&child.tgid()).copied();
+        let wanted = state.tids.get(&ancestor.tgid()).copied();
+        if wanted.is_none() || !ancestor.live() || !child.live() {
+            return false;
+        }
+        for _ in 0..state.tasks.len() {
+            let Some(id) = at else { break };
+            if Some(id) == wanted {
+                return true;
+            }
+            let Some(parent) = state
+                .tasks
+                .get(&id)
+                .and_then(|t| t.parent)
+                .and_then(|p| state.tasks.get(&p))
+                .and_then(|p| p.original.upgrade())
+            else {
+                break;
+            };
+            at = state.tids.get(&parent.tgid()).copied();
+        }
+        false
+    }
     pub fn publish(&self, task: &Arc<IoTask>, tid: u32, parentage: &Arc<Parentage>) {
         self.publish_from(task, tid, parentage, None);
     }

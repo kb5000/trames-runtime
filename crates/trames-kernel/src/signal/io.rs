@@ -210,6 +210,8 @@ pub struct IoTask {
     trace: std::sync::OnceLock<Mutex<Option<ptrace::Relationship>>>,
     tracees: Mutex<ptrace::Tracees>,
     trace_stop: AtomicBool,
+    ptracer: std::sync::OnceLock<Mutex<Option<ptrace::Exception>>>,
+    parents: std::sync::OnceLock<Weak<crate::task_parent::Parents>>,
     pub io: crate::usage::TaskIo,
     pub proc_view: trames_vfs::ProcessView,
     proc_pid: RwLock<Option<Arc<proc_views::ProcPid>>>,
@@ -243,6 +245,8 @@ impl Default for IoTask {
             trace: Default::default(),
             tracees: Default::default(),
             trace_stop: Default::default(),
+            ptracer: Default::default(),
+            parents: Default::default(),
             io: Default::default(),
             proc_view: Default::default(),
             proc_pid: Default::default(),
@@ -717,7 +721,7 @@ impl trames_vfs::TaskSignal for IoTask {
 }
 #[derive(Default)]
 pub struct IoDirectory {
-    pub parents: crate::task_parent::Parents,
+    pub parents: Arc<crate::task_parent::Parents>,
     groups: Mutex<BTreeMap<(u32, u32), Arc<Group>>>,
     updates: AtomicU32,
 }
@@ -813,7 +817,11 @@ impl IoDirectory {
         let credentials = caller.credentials().read().clone();
         target
             .credentials()
-            .admit_process_memory(&credentials, &remote)
+            .admit_process_memory(
+                &credentials,
+                &remote,
+                target.trace_requires_cap(caller.tgid(), ns.ptrace_scope())?,
+            )
             .map(Some)
     }
     pub fn orphaned(&self, task: &IoTask) -> bool {
@@ -885,6 +893,7 @@ impl IoDirectory {
         uid: u32,
         euid: u32,
     ) {
+        task.parents.get_or_init(|| Arc::downgrade(&self.parents));
         task.lifecycle().register(task, pid);
         task.credentials().publish_signal_ids(uid, euid);
         if task.pid.load(Ordering::Relaxed) == pid

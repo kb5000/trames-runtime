@@ -105,7 +105,7 @@ mod tests {
         caller.fsgid = 99;
         caller.caps.effective = 0;
         let copy = |caller: &Credentials| {
-            target.receive_pidfd_file(caller, false, fd, &receiver.shared_files())
+            target.receive_pidfd_file(caller, false, fd, &receiver.shared_files(), false)
         };
         caller.caps.permitted = 0;
         assert_eq!(copy(&caller), Err(Errno(1)));
@@ -124,7 +124,7 @@ mod tests {
         sender.close(fd).unwrap();
         assert_eq!(receiver.read(dup, 3).unwrap(), b"def");
         assert_eq!(
-            target.receive_pidfd_file(&caller, false, fd, &receiver.shared_files()),
+            target.receive_pidfd_file(&caller, false, fd, &receiver.shared_files(), false),
             Err(Errno(9))
         );
     }

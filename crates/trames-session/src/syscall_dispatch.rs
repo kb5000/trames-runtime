@@ -941,6 +941,7 @@ pub(crate) fn execute<C: Cpu>(
                         &snapshot.name,
                         snapshot.io_signals.parentage().map(|p| &**p),
                         snapshot.io_signals.family().map(|p| &**p),
+                        (&snapshot.io_signals, &snapshot.io_routes.namespace),
                         args,
                         &mut *memory,
                     )
