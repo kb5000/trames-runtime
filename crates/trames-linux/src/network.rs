@@ -134,6 +134,40 @@ pub(super) fn control(
             })
         }
         209 => {
+            let option = (a[1] as u32, a[2] as u32);
+            if matches!(option, (0, 66 | 67) | (41, 68 | 69)) {
+                let family = if option.0 == 0 { 2 } else { 10 };
+                let domain = socket.get_option(1, 39).map_err(net)?;
+                if domain != family
+                    && !(domain == 10 && family == 2 && socket.get_option(1, 3).map_err(net)? != 3)
+                {
+                    return Err(Errno(92));
+                }
+                let len = u32_at(memory, a[4])?;
+                if !factory
+                    .local_credentials()
+                    .has_ns_cap(socket.user_namespace(), trames_vfs::capabilities::NET_ADMIN)
+                {
+                    return Err(Errno(1));
+                }
+                if len != 30 {
+                    return Err(Errno(22));
+                }
+                let query = memory.read_array::<30>(a[3]).map_err(|_| Errno(14))?;
+                let end = query[..28].iter().position(|&c| c == 0).unwrap_or(28);
+                let name = std::str::from_utf8(&query[..end]).map_err(|_| Errno(2))?;
+                trames_net::xt_revision(
+                    family as u8,
+                    name,
+                    u32::from(query[29]),
+                    option.1 % 2 == 1,
+                )
+                .map_err(net)?;
+                memory
+                    .write(a[4], &len.to_le_bytes())
+                    .map_err(|_| Errno(14))?;
+                return Ok(0);
+            }
             if (a[1], a[2]) == (58, 1) {
                 return read_option(memory, a, || socket.icmp6_filter().map_err(net));
             }

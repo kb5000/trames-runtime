@@ -10,6 +10,7 @@ mod native;
 mod netdev;
 mod netlink;
 mod nftables;
+pub use nftables::xt_revision;
 mod packet_ring;
 mod packet_socket;
 mod protocol;

@@ -287,10 +287,9 @@ enum Expr {
         info: Vec<u8>,
     },
     FixedNat {
-        source: bool,
+        kind: FixedNatKind,
         addresses: Option<(std::net::IpAddr, std::net::IpAddr)>,
         ports: Option<(u16, u16)>,
-        masquerade: bool,
     },
     Zone(u16),
     AddrType {
@@ -334,13 +333,49 @@ fn value(bytes: &[u8]) -> Result<Vec<u8>> {
     }
     Ok(v.to_vec())
 }
-fn xt_nat_revision(name: &str, family: u8, revision: u32) -> bool {
-    matches!(family, 2 | 10)
-        && match name {
-            "MASQUERADE" => revision == 0,
-            "SNAT" | "DNAT" => revision <= 2 && (revision != 0 || family == 2),
-            _ => false,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FixedNatKind {
+    Source,
+    Destination,
+    Masquerade,
+    Redirect,
+}
+impl FixedNatKind {
+    fn named(name: &str) -> Option<Self> {
+        match name {
+            "SNAT" => Some(Self::Source),
+            "DNAT" => Some(Self::Destination),
+            "MASQUERADE" => Some(Self::Masquerade),
+            "REDIRECT" => Some(Self::Redirect),
+            _ => None,
         }
+    }
+    fn valid_hook(self, hook: u32) -> bool {
+        match self {
+            Self::Source => matches!(hook, 1 | 4),
+            Self::Masquerade => hook == 4,
+            Self::Destination | Self::Redirect => matches!(hook, 0 | 3),
+        }
+    }
+}
+
+/// Versions with a guest packet implementation, shared by both xtables probe ABIs.
+pub fn xt_revision(family: u8, name: &str, revision: u32, target: bool) -> Result<u32> {
+    let (min, max) = match (name, target) {
+        ("comment", false) => (0, 0),
+        (name, false) if xt_match::protocol(name, family).is_some() => (0, 0),
+        ("addrtype", false) => (u32::from(family != 2), 1),
+        ("conntrack", false) => (1, 3),
+        ("CT", true) => (0, 1),
+        ("MASQUERADE" | "REDIRECT", true) if matches!(family, 2 | 10) => (0, 0),
+        ("SNAT" | "DNAT", true) if matches!(family, 2 | 10) => (u32::from(family != 2), 2),
+        _ => return Err(NetError(2)),
+    };
+    if (min..=max).contains(&revision) {
+        Ok(max)
+    } else {
+        Err(NetError(93))
+    }
 }
 fn expressions_in(
     bytes: &[u8],
@@ -630,12 +665,8 @@ fn expressions_in(
                     }
                     Expr::Zone(u16::from_le_bytes(b[2..4].try_into().unwrap()))
                 } else {
-                    let masq = kind == "MASQUERADE";
-                    if !matches!(kind.as_str(), "MASQUERADE" | "DNAT" | "SNAT")
-                        || !xt_nat_revision(&kind, rule_family, revision)
-                    {
-                        return Err(NetError(2));
-                    }
+                    let nat = FixedNatKind::named(&kind).ok_or(NetError(2))?;
+                    xt_revision(rule_family, &kind, revision, true).map_err(|_| NetError(2))?;
                     let legacy = revision == 0 && rule_family == 2;
                     let size = if legacy {
                         20usize
@@ -652,7 +683,9 @@ fn expressions_in(
                         return Err(NetError(22));
                     }
                     let flags = word(if legacy { 4 } else { 0 });
-                    if masq && flags & 1 != 0 {
+                    if matches!(nat, FixedNatKind::Masquerade | FixedNatKind::Redirect)
+                        && flags & 1 != 0
+                    {
                         return Err(NetError(22));
                     }
                     if flags & !3 != 0 {
@@ -693,10 +726,9 @@ fn expressions_in(
                         Some((low, high))
                     };
                     Expr::FixedNat {
-                        source: kind != "DNAT",
+                        kind: nat,
                         addresses,
                         ports,
-                        masquerade: masq,
                     }
                 }
             }
@@ -1026,17 +1058,7 @@ impl Ruleset {
                 for r in &c.rules {
                     for e in &r.expressions {
                         match e {
-                            Expr::FixedNat {
-                                source, masquerade, ..
-                            } if !nat
-                                || if *masquerade {
-                                    hook != 4
-                                } else if *source {
-                                    !matches!(hook, 1 | 4)
-                                } else {
-                                    !matches!(hook, 0 | 3)
-                                } =>
-                            {
+                            Expr::FixedNat { kind, .. } if !nat || !kind.valid_hook(hook) => {
                                 return Err(NetError(22))
                             }
                             Expr::Nat { .. } | Expr::Masquerade { .. } if !nat => {
@@ -1116,25 +1138,20 @@ impl Ruleset {
             return Err(NetError(22));
         }
         if kind == 11 << 8 && !batch {
-            // Only revision probes for matches translated to our native
-            // payload expressions. Opaque xt match/target blobs remain rejected.
             let a = fields(&r[20..], &[1, 2, 3])?;
             let n = name(&a, 1)?;
             let revision = num(&a, 2)?;
             let target = num(&a, 3)?;
-            let supported = match (n.as_str(), target) {
-                ("comment", 0) if revision != 0 => return Err(NetError(93)),
-                ("comment", 0) => revision == 0,
-                (name, 0) if xt_match::protocol(name, r[16]).is_some() => revision == 0,
-                ("addrtype", 0) => revision == 1 || revision == 0 && r[16] == 2,
-                ("conntrack", 0) => xt_match::conntrack_size(revision).is_ok(),
-                ("MASQUERADE" | "SNAT" | "DNAT", 1) => xt_nat_revision(&n, r[16], revision),
-                ("CT", 1) => revision <= 1,
-                _ => false,
-            };
-            if !supported {
+            if target > 1 {
                 return Err(NetError(95));
             }
+            xt_revision(r[16], &n, revision, target == 1).map_err(|error| {
+                if n == "comment" && target == 0 {
+                    error
+                } else {
+                    NetError(95)
+                }
+            })?;
             return Ok(vec![message(kind, 0, seq, port, &r[16..])]);
         }
         if kind >> 8 != 10 {
@@ -2252,24 +2269,33 @@ impl Rule {
                 }
                 Expr::Zone(zone) => effects.zone = Some(*zone),
                 Expr::FixedNat {
-                    source,
+                    kind,
                     addresses,
                     ports,
-                    masquerade,
                 } => {
-                    if *source != matches!(ctx.hook, 1 | 4) {
+                    if !kind.valid_hook(ctx.hook) {
                         return Some((0, None));
                     }
-                    let address = if *masquerade {
-                        ctx.masquerade()
-                    } else {
-                        addresses.map(|(low, high)| ctx.nat_address(low, high))
+                    let address = match kind {
+                        FixedNatKind::Masquerade => ctx.masquerade(),
+                        FixedNatKind::Redirect if ctx.hook == 3 => Some(if ctx.family() == 2 {
+                            std::net::Ipv4Addr::LOCALHOST.into()
+                        } else {
+                            std::net::Ipv6Addr::LOCALHOST.into()
+                        }),
+                        FixedNatKind::Redirect => {
+                            ctx.graph
+                                .redirect_address(ctx.namespace, ctx.input, ctx.address(false))
+                        }
+                        _ => addresses.map(|(low, high)| ctx.nat_address(low, high)),
                     };
-                    if *masquerade && address.is_none() {
+                    if matches!(kind, FixedNatKind::Masquerade | FixedNatKind::Redirect)
+                        && address.is_none()
+                    {
                         return Some((0, None));
                     }
                     effects.nat = Some(NatAction {
-                        source: *source,
+                        source: matches!(kind, FixedNatKind::Source | FixedNatKind::Masquerade),
                         address,
                         ports: *ports,
                     });

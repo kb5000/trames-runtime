@@ -1415,6 +1415,40 @@ impl Topology {
             .find(|a| a.ip.is_ipv4() == ipv4)
             .map(|a| a.ip)
     }
+    pub(super) fn redirect_address(
+        &self,
+        id: u64,
+        index: u32,
+        destination: IpAddr,
+    ) -> Option<IpAddr> {
+        let IpAddr::V6(destination) = destination else {
+            return self
+                .interface_address(id, index, true)
+                .filter(|a| !a.is_unspecified());
+        };
+        // Linux restricts ingress REDIRECT only for node-, link- and site-local destinations.
+        fn scope(ip: std::net::Ipv6Addr) -> u8 {
+            if ip.is_multicast() {
+                return match ip.octets()[1] & 15 {
+                    n @ (1 | 2 | 5) => n,
+                    _ => 0,
+                };
+            }
+            if ip.is_loopback() {
+                1
+            } else if ip.is_unicast_link_local() {
+                2
+            } else if ip.segments()[0] & 0xffc0 == 0xfec0 {
+                5
+            } else {
+                0
+            }
+        }
+        let required = scope(destination);
+        self.devices.get(&(id, index))?.addresses.iter().map(|a| a.ip).find(|ip| {
+            matches!(ip, IpAddr::V6(v6) if v6.to_ipv4_mapped().is_none() && (required == 0 || scope(*v6) == required))
+        })
+    }
     pub(crate) fn device_kind(&self, id: u64, index: u32) -> Option<DeviceKind> {
         self.devices.get(&(id, index)).map(|d| d.kind)
     }

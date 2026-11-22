@@ -1788,3 +1788,109 @@ fn payload_address_checksum_and_following_expression_observe_same_packet() {
         assert!(crate::virtualnet::packet::valid_transport(&packet));
     }
 }
+
+#[test]
+fn xt_redirect_validates_hooks_and_translates_udp_in_both_directions() {
+    use crate::conntrack::{key, message, State};
+    use std::net::SocketAddr;
+    let fabric = crate::Fabric::new().unwrap();
+    let network = Network::virtual_network(&fabric, 2, NetworkMode::Outbound).unwrap();
+    let ns = &network.1;
+    for (family, client, public) in [
+        (2, "192.0.2.1:46540", "198.51.100.1:80"),
+        (10, "[2001:db8::1]:46540", "[2001:db8::2]:80"),
+    ] {
+        let from: SocketAddr = client.parse().unwrap();
+        let public: SocketAddr = public.parse().unwrap();
+        let nat_chain = |name, hook| {
+            let mut a = vec![];
+            string(&mut a, 1, "nat");
+            string(&mut a, 3, name);
+            let mut h = vec![];
+            number(&mut h, 1, hook);
+            number(&mut h, 2, (-100i32) as u32);
+            attr(&mut a, 0x8004, &h);
+            string(&mut a, 7, "nat");
+            req(3, family, 0x400, &a)
+        };
+        let redirect = |chain, flags: u32| {
+            let mut target = vec![];
+            string(&mut target, 1, "REDIRECT");
+            number(&mut target, 2, 0);
+            let (mut info, flag_offset, port_offset) = if family == 2 {
+                let mut info = vec![0; 20];
+                info[..4].copy_from_slice(&1u32.to_le_bytes());
+                (info, 4, 16)
+            } else {
+                (vec![0; 40], 0, 36)
+            };
+            info[flag_offset..flag_offset + 4].copy_from_slice(&flags.to_le_bytes());
+            for pair in info[port_offset..port_offset + 4].chunks_exact_mut(2) {
+                pair.copy_from_slice(&8080u16.to_be_bytes());
+            }
+            attr(&mut target, 3, &info);
+            let mut r = rule("nat", chain, &expression("target", &target));
+            r[16] = family;
+            r
+        };
+        let mut t = table("nat");
+        t[16] = family;
+        assert_eq!(
+            errno(&batch(ns, &[t, nat_chain("pre", 0), nat_chain("out", 3)])),
+            0
+        );
+        assert_eq!(
+            errno(&batch(ns, &[nat_chain("bad", 4), redirect("bad", 2)])),
+            -22
+        );
+        assert_eq!(errno(&batch(ns, &[redirect("pre", 3)])), -22);
+        assert_eq!(
+            errno(&batch(ns, &[redirect("pre", 2), redirect("out", 2)])),
+            0
+        );
+        let graph = ns.graph.read().unwrap();
+        let shared = graph.firewall(ns.id());
+        let rules = shared.read().unwrap();
+        for (hook, input) in [(0, 2), (3, 0), (0, 999)] {
+            let mut state = State::default();
+            let meta = Hook {
+                graph: &graph,
+                namespace: ns.id(),
+                hook,
+                input,
+                output: 0,
+                raw: false,
+                packet_type: crate::ethernet::PacketType::Host,
+            };
+            for _ in 0..2 {
+                let mut query = message(from, public, 17, 0, b"request");
+                let mut track = state.begin(&query, 0).unwrap();
+                let accepted = rules.process(&mut query, &meta, &mut track, &mut state);
+                if input == 999 {
+                    assert!(!accepted);
+                    break;
+                }
+                assert!(accepted);
+                let local = graph
+                    .interface_address(ns.id(), if hook == 3 { 1 } else { input }, family == 2)
+                    .unwrap();
+                let server = key(&query).unwrap().tuple.destination;
+                assert_eq!(server, SocketAddr::new(local, 8080));
+                assert!(crate::virtualnet::packet::valid_transport(&query));
+                state.finish(track, true);
+                let mut reply = message(server, from, 17, 0, b"response");
+                let mut track = state.begin(&reply, 0).unwrap();
+                assert!(track.reply);
+                assert!(rules.process(
+                    &mut reply,
+                    &Hook { hook: 4, ..meta },
+                    &mut track,
+                    &mut state
+                ));
+                assert_eq!(key(&reply).unwrap().tuple.source, public);
+                assert!(crate::virtualnet::packet::valid_transport(&reply));
+                state.finish(track, true);
+            }
+        }
+    }
+}
