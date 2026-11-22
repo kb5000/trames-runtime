@@ -96,6 +96,7 @@ impl IoTask {
         }
     }
     pub fn inherit_proc_pid(self: &Arc<Self>, leader: &Arc<Self>) {
+        self.rebind_thread_observer(leader);
         let binding = leader.proc_pid.read().unwrap().clone();
         if let Some(binding) = &binding {
             *binding.current.write().unwrap() = Arc::downgrade(self);

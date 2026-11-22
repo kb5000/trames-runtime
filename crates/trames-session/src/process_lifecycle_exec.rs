@@ -132,8 +132,8 @@ impl<C: Cpu> Lifecycle<C> {
             p.linux.vfs.set_process_context(pid);
             p.linux.vfs.set_lock_owner(p.tgid);
             p.signals.finish_io();
-            job.checkpoint = None;
-            job.seccomp_entry.take();
+            let accepted = job.checkpoint.take();
+            let checked_peers = matches!(p.exec_pending, Some(exec::Preparation::PeerExit(..)));
             let control = group.enter(&p.signals.io, pid);
             let image = Kernel::prepare_exec_request(
                 p,
@@ -146,6 +146,7 @@ impl<C: Cpu> Lifecycle<C> {
             let mut image = match image {
                 Ok(Some(image)) => image,
                 Ok(None) | Err(_) => {
+                    job.seccomp_entry.take();
                     if let Err(error) = image {
                         p.cpu.set_x(0, super::super::error(error));
                         job.work.trace.record(p.cpu.x(0));
@@ -169,6 +170,42 @@ impl<C: Cpu> Lifecycle<C> {
                 }
             };
             let actual = p.tgid;
+            if !checked_peers && pid != actual {
+                if let Some((_, original)) = members.iter().find(|(id, _)| *id == actual) {
+                    let leader = original.read();
+                    if let Some(hold) = leader.signals.io.trace_exec_peer_exit(|| {
+                        checkpoint
+                            .jobs
+                            .iter()
+                            .find(|j| j.work.pid == actual)
+                            .map_or_else(
+                                || leader.cpu.architectural_state(),
+                                |j| j.work.cpu.architectural_state(),
+                            )
+                    }) {
+                        let signal = trames_shared::IoSignal::new(pid, epoch.io_target.clone());
+                        let subscription = hold.acknowledgement.subscribe(&signal);
+                        if hold.acknowledgement.finished() {
+                            signal.notify();
+                        }
+                        p.exec_pending = Some(exec::Preparation::PeerExit(Box::new(image), hold));
+                        p.signals.begin_io();
+                        job.work.cpu = std::mem::take(&mut p.cpu);
+                        job.pending_cpu = accepted;
+                        job.pending_accounted = true;
+                        job.waiting = Some(crate::run_queue::WaitState::Custody(Arc::new(
+                            tasks::AdmissionWait {
+                                signal,
+                                subscriptions: vec![subscription],
+                            },
+                        )));
+                        control.finish(job.stop_hold());
+                        checkpoint.jobs.push(job);
+                        continue;
+                    }
+                }
+            }
+            job.seccomp_entry.take();
             let old_presence = members
                 .iter()
                 .find(|(id, _)| *id == actual && *id != pid)

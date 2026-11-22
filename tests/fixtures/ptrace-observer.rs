@@ -133,6 +133,49 @@ fn observe_vfork_done() {
     unsafe { close(channel[0]) };
 }
 
+fn observe_clone() {
+    let mut channel = [-1; 2];
+    assert_eq!(unsafe { pipe(channel.as_mut_ptr()) }, 0);
+    let child = unsafe { fork() };
+    assert!(child >= 0);
+    if child == 0 {
+        unsafe { close(channel[0]) };
+        assert_eq!(trace(0, 0, 0), 0);
+        assert_eq!(unsafe { raise(19) }, 0);
+        std::thread::spawn(move || {
+            let tid = unsafe { syscall(178) } as i32;
+            assert_eq!(
+                unsafe { write(channel[1], tid.to_ne_bytes().as_ptr().cast(), 4) },
+                4
+            );
+        })
+        .join()
+        .unwrap();
+        unsafe { _exit(42) }
+    }
+    unsafe { close(channel[1]) };
+    assert_eq!(wait(child), 0x137f);
+    assert_eq!(trace(0x4200, child, 1 << 3), 0);
+    assert_eq!(trace(7, child, 0), 0);
+    assert_eq!(wait(child), 0x3057f);
+    let mut tid = 0usize;
+    assert_eq!(trace(0x4201, child, ptr::addr_of_mut!(tid) as usize), 0);
+    assert!(tid > 0 && tid != child as usize);
+    assert_eq!(wait(tid as i32), 0x137f);
+    assert_eq!(trace(7, child, 0), 0);
+    assert_eq!(trace(7, tid as i32, 0), 0);
+    let mut actual = [0; 4];
+    assert_eq!(
+        unsafe { read(channel[0], actual.as_mut_ptr().cast(), 4) },
+        4
+    );
+    assert_eq!(i32::from_ne_bytes(actual), tid as i32);
+    assert_eq!(wait(tid as i32), 0);
+    assert_eq!(wait(child), 42 << 8);
+    unsafe { close(channel[0]) };
+    println!("observed distinct thread {tid} and process {child} exits");
+}
+
 fn observe_exit(mode: i32, expected: i32) {
     let child = unsafe { fork() };
     assert!(child >= 0);
@@ -173,6 +216,10 @@ extern "C" fn handle_signal(_: i32) {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("clone") {
+        observe_clone();
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("vfork-done") {
         observe_vfork_done();
         return;

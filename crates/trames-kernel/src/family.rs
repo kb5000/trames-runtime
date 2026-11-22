@@ -643,7 +643,7 @@ impl Families {
     }
 }
 
-fn exit_info(id: u32, uid: u32, status: i32) -> Info {
+pub(crate) fn exit_info(id: u32, uid: u32, status: i32) -> Info {
     Info {
         sender: id,
         uid,

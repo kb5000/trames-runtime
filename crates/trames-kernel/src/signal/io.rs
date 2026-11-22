@@ -5,7 +5,7 @@ use super::*;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering},
         Arc, Mutex, RwLock, Weak,
     },
 };
@@ -18,6 +18,7 @@ mod job;
 mod proc_views;
 #[path = "io_ptrace.rs"]
 mod ptrace;
+pub use ptrace::ExecPeerExit;
 #[path = "io_scheduling.rs"]
 mod scheduling;
 #[path = "io_terminal.rs"]
@@ -207,9 +208,9 @@ pub struct IoContext {
 }
 pub struct IoTask {
     pub(crate) posix_timers: std::sync::OnceLock<Arc<crate::timers::CpuSchedule>>,
-    trace: std::sync::OnceLock<Mutex<Option<ptrace::Relationship>>>,
+    trace: std::sync::OnceLock<Mutex<ptrace::TraceSlot>>,
     tracees: Mutex<ptrace::Tracees>,
-    trace_stop: AtomicBool,
+    trace_stop: AtomicU8,
     trace_control: AtomicBool,
     trace_run_generation: AtomicU64,
     ptracer: std::sync::OnceLock<Mutex<Option<ptrace::Exception>>>,
@@ -543,6 +544,7 @@ impl IoTask {
         }
     }
     pub fn exit(&self) {
+        self.trace_thread_exit(0);
         self.lifecycle()
             .retire(self.pid.load(Ordering::Relaxed), || {
                 self.live.store(false, Ordering::Relaxed)
@@ -551,22 +553,29 @@ impl IoTask {
     pub fn begin_exit(self: &Arc<Self>, pid: u32, status: i32) {
         if self.live() {
             self.lifecycle().register(self, pid);
-            self.lifecycle().begin_exit(pid, self, status, false, || {
-                self.live.store(false, Ordering::Relaxed)
-            });
+            self.try_exit(pid, status);
         }
     }
     pub fn try_exit_nonlast(self: &Arc<Self>, pid: u32, status: i32) -> bool {
-        self.lifecycle()
+        let retired = self
+            .lifecycle()
             .begin_exit(pid, self, status, true, || {
                 self.live.store(false, Ordering::Relaxed)
             })
-            .is_some()
+            .is_some();
+        if retired && pid != self.tgid() {
+            self.trace_thread_exit(status);
+        }
+        retired
     }
     pub fn try_exit(self: &Arc<Self>, pid: u32, status: i32) -> Option<bool> {
-        self.lifecycle().begin_exit(pid, self, status, false, || {
+        let last = self.lifecycle().begin_exit(pid, self, status, false, || {
             self.live.store(false, Ordering::Relaxed)
-        })
+        });
+        if last.is_some() && pid != self.tgid() {
+            self.trace_thread_exit(status);
+        }
+        last
     }
     pub fn finish_exit(self: &Arc<Self>, pid: u32) -> Option<i32> {
         let status = self.lifecycle().finish_exit(pid, self);

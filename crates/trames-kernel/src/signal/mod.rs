@@ -18,7 +18,7 @@ pub use actions::{Action, Actions};
 pub use alt_stack::{AltStack, SS_AUTODISARM, SS_DISABLE};
 pub use fault::Fault;
 pub use info::{write_siginfo, write_signalfd, Info};
-pub use io::{Inbox, IoContext, IoDirectory, IoRoutes, IoTask, TimerTarget};
+pub use io::{ExecPeerExit, Inbox, IoContext, IoDirectory, IoRoutes, IoTask, TimerTarget};
 pub use pending::{Pending, RetainedInfo};
 pub use reader::TaskReader;
 use trames_memory::{Access, CpuMemory};

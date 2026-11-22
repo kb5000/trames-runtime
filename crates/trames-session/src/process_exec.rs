@@ -1645,18 +1645,21 @@ pub(crate) trait Executor<C: Cpu>: Send + Sync {
     fn submit_image(&self, request: Request, result: Arc<Pending<C>>);
 }
 pub(super) enum Preparation<C: Cpu> {
+    PeerExit(Box<Image<C>>, Arc<trames_kernel::signal::ExecPeerExit>),
     Error(Errno),
     Disk(Arc<Pending<C>>),
 }
 impl<C: Cpu> Preparation<C> {
     pub(super) fn ready(&self) -> bool {
         match self {
+            Self::PeerExit(_, hold) => hold.acknowledgement.finished(),
             Self::Error(_) => true,
             Self::Disk(pending) => pending.ready(),
         }
     }
     pub(super) fn take(self) -> Result<Image<C>, ImageError> {
         match self {
+            Self::PeerExit(image, _) => Ok(*image),
             Self::Error(error) => Err(error.into()),
             Self::Disk(pending) => pending.take().expect("ready image result"),
         }
@@ -1666,6 +1669,7 @@ impl<C: Cpu> Preparation<C> {
         signal: &Arc<trames_shared::IoSignal>,
     ) -> trames_shared::IoSubscription {
         match self {
+            Self::PeerExit(_, hold) => hold.acknowledgement.subscribe(signal),
             Self::Disk(pending) => pending.subscribe(signal),
             Self::Error(_) => unreachable!("inline errors never wait"),
         }

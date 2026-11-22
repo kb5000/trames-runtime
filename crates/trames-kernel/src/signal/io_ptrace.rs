@@ -21,6 +21,8 @@ const PTRACE_LISTEN: u64 = 0x4208;
 const PTRACE_GETSIGMASK: u64 = 0x420a;
 const PTRACE_SETSIGMASK: u64 = 0x420b;
 const PTRACE_O_TRACEEXEC: u64 = 1 << 4;
+const PTRACE_O_TRACECLONE: u64 = 1 << 3;
+const PTRACE_O_TRACEVFORK: u64 = 1 << 2;
 const PTRACE_O_TRACEVFORKDONE: u64 = 1 << 5;
 const PTRACE_O_TRACEEXIT: u64 = 1 << 6;
 const PTRACE_O_EXITKILL: u64 = 1 << 20;
@@ -36,19 +38,31 @@ pub(super) enum Exception {
 
 const SUPPORTED_OPTIONS: u64 = PTRACE_O_TRACESYSGOOD
     | PTRACE_O_TRACEEXEC
+    | PTRACE_O_TRACEVFORK
+    | PTRACE_O_TRACECLONE
     | PTRACE_O_TRACEVFORKDONE
     | PTRACE_O_TRACEEXIT
     | PTRACE_O_EXITKILL;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Voluntary,
+    Inherited,
+    Nominated,
     Attach,
     Seize,
 }
+impl Mode {
+    fn observer(self) -> bool {
+        matches!(self, Self::Inherited | Self::Nominated)
+    }
+}
 #[derive(Clone, Copy)]
-enum StopOrigin {
+enum StopOrigin<'a> {
+    Retiring(&'a Arc<ExecPeerExit>),
     Normal,
     Control,
+    Clone(u32),
+    Vfork(u32),
     VforkDone(u32),
 }
 #[derive(Clone, Copy)]
@@ -57,8 +71,15 @@ enum ControlStop {
     Group,
     Interrupt,
 }
-pub(super) struct Relationship {
+#[derive(Default)]
+pub(super) struct TraceSlot {
+    relationship: Option<Relationship>,
+    retirement: Weak<ExecPeerExit>,
+}
+struct Relationship {
+    retiring: bool,
     mode: Mode,
+    thread_source: Option<Arc<crate::children::Child>>,
     admission: Option<Box<trames_vfs::Credentials>>,
     pending: Option<ControlStop>,
     listening: bool,
@@ -69,6 +90,7 @@ pub(super) struct Relationship {
     options: u64,
     trace_syscalls: bool,
     exit_reported: bool,
+    former_tid: Option<u32>,
 }
 struct TraceStop {
     cpu: trames_execution::Aarch64State,
@@ -76,14 +98,61 @@ struct TraceStop {
     signal: Option<RetainedInfo>,
     syscall: Option<SyscallStop>,
     exit_status: Option<i32>,
+    acknowledgement: Option<Arc<crate::completion::Completion>>,
     group_stop: bool,
-    vfork_child: Option<u32>,
+    event_pid: Option<u32>,
 }
 
 #[derive(Clone, Copy)]
 enum SyscallStop {
     Entry,
     Exit,
+}
+
+impl Drop for TraceStop {
+    fn drop(&mut self) {
+        if let Some(ack) = &self.acknowledgement {
+            ack.finish();
+        }
+    }
+}
+
+/// A prepared nonleader exec retains the retiring leader until its debugger
+/// acknowledges the exit. No CPU slot or address-space custody is held.
+pub struct ExecPeerExit {
+    task: Arc<IoTask>,
+    pub acknowledgement: Arc<crate::completion::Completion>,
+}
+impl Drop for ExecPeerExit {
+    fn drop(&mut self) {
+        let mut slot = self.task.trace.get().unwrap().lock().unwrap();
+        if !std::ptr::eq(slot.retirement.as_ptr(), self) {
+            return;
+        }
+        slot.retirement = Weak::new();
+        let mut notice = None;
+        let mut released = None;
+        if let Some(rel) = slot.relationship.as_mut().filter(|rel| rel.retiring) {
+            rel.retiring = false;
+            if rel.stop.as_ref().is_some_and(|stop| {
+                stop.acknowledgement
+                    .as_ref()
+                    .is_some_and(|a| Arc::ptr_eq(a, &self.acknowledgement))
+            }) {
+                released = rel.stop.take();
+                notice = Some(rel.child.trace_event(None));
+                self.task.trace_stop.fetch_and(!1, Ordering::Release);
+            }
+            rel.exit_reported = false;
+        }
+        self.task.trace_stop.fetch_and(!2, Ordering::Release);
+        drop(slot);
+        drop(released);
+        if let Some(notice) = notice {
+            notice.notify();
+        }
+        self.task.wake_control();
+    }
 }
 
 impl TraceStop {
@@ -176,6 +245,7 @@ impl TraceStop {
 pub(super) struct Tracees {
     retired: bool,
     tasks: Vec<Weak<IoTask>>,
+    observers: Vec<Weak<crate::children::Child>>,
 }
 
 impl IoTask {
@@ -203,25 +273,38 @@ impl IoTask {
         if self
             .trace
             .get()
-            .and_then(|s| s.lock().unwrap().as_ref()?.tracer.upgrade())
+            .and_then(|s| {
+                let slot = s.lock().unwrap();
+                let rel = slot.relationship.as_ref()?;
+                (!rel.mode.observer())
+                    .then(|| rel.tracer.upgrade())
+                    .flatten()
+            })
             .is_some_and(|t| t.live() && t.tgid() == caller_group)
         {
             return Ok(false);
         }
+        Ok(!self.nominated_observer(&caller))
+    }
+
+    fn nominated_observer(&self, caller: &IoTask) -> bool {
+        let Some(parents) = self.parents.get().and_then(Weak::upgrade) else {
+            return false;
+        };
         let Some(leader) = parents.original(self.tgid()) else {
-            return Ok(true);
+            return false;
         };
         let Some(exception) = leader.ptracer.get() else {
-            return Ok(true);
+            return false;
         };
         let selected = exception.lock().unwrap();
-        Ok(match selected.as_ref() {
-            Some(Exception::Any) => false,
-            Some(Exception::Task(task)) => !task
+        match selected.as_ref() {
+            Some(Exception::Any) => true,
+            Some(Exception::Task(task)) => task
                 .upgrade()
-                .is_some_and(|t| parents.descendant(&caller, &t)),
-            None => true,
-        })
+                .is_some_and(|t| parents.descendant(caller, &t)),
+            None => false,
+        }
     }
 
     pub fn set_ptracer(&self, ns: &PidNamespace, pid: u64) -> Result<u64, Errno> {
@@ -244,13 +327,13 @@ impl IoTask {
     }
     #[inline]
     pub fn trace_stopped(&self) -> bool {
-        self.trace_stop.load(Ordering::Acquire)
+        self.trace_stop.load(Ordering::Acquire) != 0
     }
 
     pub fn tracer_tid(&self) -> u32 {
         self.trace
             .get()
-            .and_then(|slot| slot.lock().unwrap().as_ref()?.tracer.upgrade())
+            .and_then(|slot| slot.lock().unwrap().relationship.as_ref()?.tracer.upgrade())
             .filter(|t| t.live())
             .map_or(0, |t| t.tid())
     }
@@ -277,7 +360,7 @@ impl IoTask {
             return;
         };
         let mut lock = slot.lock().unwrap();
-        let Some(rel) = lock.as_mut() else {
+        let Some(rel) = lock.relationship.as_mut() else {
             return;
         };
         if !continued {
@@ -300,39 +383,128 @@ impl IoTask {
         }
     }
 
+    pub(super) fn trace_thread_exit(&self, status: i32) {
+        let Some(slot) = self.trace.get() else { return };
+        let source = slot
+            .lock()
+            .unwrap()
+            .relationship
+            .as_ref()
+            .and_then(|rel| rel.thread_source.clone());
+        if let Some(source) = source {
+            if let Some((notice, signo, status)) = source.finish_quiet(Some(status), None, None) {
+                notice.signal(
+                    signo,
+                    crate::family::exit_info(self.tid(), self.credentials().read().uid, status),
+                );
+            }
+        }
+    }
+
+    pub(super) fn rebind_thread_observer(&self, previous_leader: &IoTask) {
+        let Some(slot) = self.trace.get() else { return };
+        let mut guard = slot.lock().unwrap();
+        let Some(rel) = guard
+            .relationship
+            .as_mut()
+            .filter(|r| r.thread_source.is_some())
+        else {
+            return;
+        };
+        let Some(tracer) = rel.tracer.upgrade() else {
+            return;
+        };
+        let Some(queue) = tracer.lifecycle().wait_children() else {
+            return;
+        };
+        let Some(original) = self.lifecycle().wait_child() else {
+            return;
+        };
+        // Nonleader exec retires the old leader and takes its PID. Its previous
+        // observer record belongs to that task, even if the debugger is the same.
+        if let Some(old) = previous_leader.trace.get() {
+            let former = old.lock().unwrap().relationship.take();
+            if let Some(former) = former {
+                former.child.detach_trace().notify();
+            }
+        }
+        rel.former_tid = Some(
+            tracer
+                .inbox
+                .namespace
+                .get()
+                .map_or(self.tid(), |ns| ns.local(self.tid())),
+        );
+        rel.child.detach_trace().notify();
+        if let Ok(notice) = original.trace_by_parent(&queue) {
+            rel.child = original;
+            rel.thread_source = None;
+            drop(guard);
+            notice.notify();
+            return;
+        }
+        let Ok(wait) = original.observe(&tracer, &queue) else {
+            guard.relationship = None;
+            return;
+        };
+        rel.child = wait.clone();
+        rel.thread_source = None;
+        drop(guard);
+        // Preserve lock order with tracer retirement and cover a simultaneous
+        // departure between rebinding the task and registering its exit record.
+        let mut list = tracer.tracees.lock().unwrap();
+        if list.retired {
+            drop(list);
+            wait.detach_trace().notify();
+        } else {
+            list.observers.push(Arc::downgrade(&wait));
+        }
+    }
     pub fn is_traced(&self) -> bool {
         self.trace
             .get()
-            .is_some_and(|slot| slot.lock().unwrap().is_some())
+            .is_some_and(|slot| slot.lock().unwrap().relationship.is_some())
     }
 
     pub(crate) fn release_tracees(&self) {
         // Close admission even when retirement races this parent's first tracee.
         let list = &self.tracees;
-        let tasks = {
+        let (tasks, observers) = {
             let mut list = list.lock().unwrap();
             list.retired = true;
-            std::mem::take(&mut list.tasks)
+            (
+                std::mem::take(&mut list.tasks),
+                std::mem::take(&mut list.observers),
+            )
         };
         for task in tasks.into_iter().filter_map(|t| t.upgrade()) {
             let mut slot = task.trace.get().unwrap().lock().unwrap();
             if slot
+                .relationship
                 .as_ref()
                 .is_none_or(|r| !std::ptr::eq(r.tracer.as_ptr(), self))
             {
                 continue;
             }
-            let rel = slot.take().unwrap();
+            let rel = slot.relationship.take().unwrap();
             let notice = rel.child.detach_trace();
+            task.trace_run_generation.store(0, Ordering::Relaxed);
+            task.trace_control.store(false, Ordering::Release);
+            task.trace_stop.fetch_and(!1, Ordering::Release);
+            drop(slot);
+            if let Some(ack) = rel.stop.as_ref().and_then(|s| s.acknowledgement.as_ref()) {
+                ack.finish();
+            }
             if rel.options & PTRACE_O_EXITKILL != 0 {
                 task.lifecycle().request_exit(9);
             }
-            task.trace_run_generation.store(0, Ordering::Relaxed);
-            task.trace_control.store(false, Ordering::Release);
-            task.trace_stop.store(false, Ordering::Release);
-            drop(slot);
             notice.notify();
             task.wake_control();
+        }
+        // A task may already have retired while its exit still belongs to
+        // this tracer. Release the original wait record in that case too.
+        for wait in observers.into_iter().filter_map(|w| w.upgrade()) {
+            wait.detach_trace().notify();
         }
     }
 
@@ -370,6 +542,92 @@ impl IoTask {
         )
     }
 
+    /// Called after successful birth and before the guest child becomes runnable.
+    pub fn trace_birth(
+        &self,
+        child: &Arc<IoTask>,
+        vfork: bool,
+        registers: impl FnOnce() -> trames_execution::Aarch64State,
+    ) {
+        let Some(slot) = self.trace.get() else { return };
+        let option = if vfork {
+            PTRACE_O_TRACEVFORK
+        } else {
+            PTRACE_O_TRACECLONE
+        };
+        let (tracer, options) = {
+            let guard = slot.lock().unwrap();
+            let Some(rel) = guard
+                .relationship
+                .as_ref()
+                .filter(|r| r.options & option != 0)
+            else {
+                return;
+            };
+            let Some(tracer) = rel.tracer.upgrade() else {
+                return;
+            };
+            (tracer, rel.options)
+        };
+        let thread_source =
+            (child.tid() != child.tgid()).then(|| crate::children::Child::thread_source(child));
+        let Some(original) = thread_source
+            .clone()
+            .or_else(|| child.lifecycle().wait_child())
+        else {
+            return;
+        };
+        let Some(family) = tracer.lifecycle().wait_children() else {
+            return;
+        };
+        let mut list = tracer.tracees.lock().unwrap();
+        if list.retired {
+            return;
+        }
+        let mut child_slot = child.trace.get_or_init(Default::default).lock().unwrap();
+        if child_slot.relationship.is_some() {
+            return;
+        }
+        let Ok(wait) = original.observe(&tracer, &family) else {
+            return;
+        };
+        list.tasks.retain(|t| t.strong_count() != 0);
+        list.tasks.push(Arc::downgrade(child));
+        list.observers.retain(|w| w.strong_count() != 0);
+        list.observers.push(Arc::downgrade(&wait));
+        child_slot.relationship = Some(Relationship {
+            retiring: false,
+            mode: Mode::Inherited,
+            thread_source,
+            admission: None,
+            pending: Some(ControlStop::Attach),
+            listening: false,
+            continued_while_stopped: false,
+            tracer: Arc::downgrade(&tracer),
+            child: wait,
+            stop: None,
+            options,
+            trace_syscalls: false,
+            exit_reported: false,
+            former_tid: None,
+        });
+        child.trace_control.store(true, Ordering::Release);
+        drop(child_slot);
+        drop(list);
+        self.publish_trace_stop(
+            5,
+            None,
+            None,
+            None,
+            if vfork {
+                StopOrigin::Vfork(child.tid())
+            } else {
+                StopOrigin::Clone(child.tid())
+            },
+            registers,
+        );
+    }
+
     pub fn trace_vfork_done(
         &self,
         release: &crate::completion::Completion,
@@ -379,6 +637,56 @@ impl IoTask {
             && release.vfork_child().is_some_and(|id| {
                 self.publish_trace_stop(5, None, None, None, StopOrigin::VforkDone(id), registers)
             })
+    }
+
+    pub fn trace_exec_peer_exit(
+        self: &Arc<Self>,
+        registers: impl FnOnce() -> trames_execution::Aarch64State,
+    ) -> Option<Arc<ExecPeerExit>> {
+        // Group admission serializes image replacements. Competing nonleader
+        // execs must still await the same retiring leader after releasing custody.
+        {
+            let mut slot = self.trace.get()?.lock().unwrap();
+            if let Some(hold) = slot.retirement.upgrade() {
+                return Some(hold);
+            }
+            let rel = slot.relationship.as_ref()?;
+            if rel.retiring {
+                // A canceled exec dropped its final reference while we took
+                // the lock. Adopt the outstanding stop (or its acknowledgement).
+                let ack = rel
+                    .stop
+                    .as_ref()
+                    .and_then(|s| s.acknowledgement.clone())
+                    .unwrap_or_else(|| {
+                        let ack = Arc::new(crate::completion::Completion::default());
+                        ack.finish();
+                        ack
+                    });
+                let hold = Arc::new(ExecPeerExit {
+                    task: self.clone(),
+                    acknowledgement: ack,
+                });
+                slot.retirement = Arc::downgrade(&hold);
+                return Some(hold);
+            }
+            if rel.options & PTRACE_O_TRACEEXIT == 0 {
+                return None;
+            }
+        }
+        let hold = Arc::new(ExecPeerExit {
+            task: self.clone(),
+            acknowledgement: Arc::new(crate::completion::Completion::default()),
+        });
+        self.publish_trace_stop(
+            5,
+            None,
+            None,
+            Some(0),
+            StopOrigin::Retiring(&hold),
+            registers,
+        )
+        .then_some(hold)
     }
 
     pub fn trace_exit_stop(
@@ -394,11 +702,15 @@ impl IoTask {
     pub fn exit_stop_held(&self) -> bool {
         self.trace_stopped()
             && self.trace.get().is_some_and(|slot| {
-                slot.lock().unwrap().as_ref().is_some_and(|rel| {
-                    rel.stop
-                        .as_ref()
-                        .is_some_and(|stop| stop.exit_status.is_some())
-                })
+                slot.lock()
+                    .unwrap()
+                    .relationship
+                    .as_ref()
+                    .is_some_and(|rel| {
+                        rel.stop
+                            .as_ref()
+                            .is_some_and(|stop| stop.exit_status.is_some())
+                    })
             })
     }
 
@@ -408,18 +720,30 @@ impl IoTask {
         shared: Option<bool>,
         syscall: Option<SyscallStop>,
         exit_status: Option<i32>,
-        origin: StopOrigin,
+        origin: StopOrigin<'_>,
         registers: impl FnOnce() -> trames_execution::Aarch64State,
     ) -> bool {
         let Some(slot) = self.trace.get() else {
             return false;
         };
         let mut lock = slot.lock().unwrap();
-        let Some(rel) = lock.as_mut() else {
+        let TraceSlot {
+            relationship,
+            retirement,
+        } = &mut *lock;
+        let Some(rel) = relationship.as_mut() else {
             return false;
         };
-        let vfork_child = if let StopOrigin::VforkDone(id) = origin {
-            if rel.options & PTRACE_O_TRACEVFORKDONE == 0 {
+        let vfork_child = if let StopOrigin::Clone(id)
+        | StopOrigin::Vfork(id)
+        | StopOrigin::VforkDone(id) = origin
+        {
+            let required = match origin {
+                StopOrigin::Clone(_) => PTRACE_O_TRACECLONE,
+                StopOrigin::Vfork(_) => PTRACE_O_TRACEVFORK,
+                _ => PTRACE_O_TRACEVFORKDONE,
+            };
+            if rel.options & required == 0 {
                 return false;
             }
             let Some(tracer) = rel.tracer.upgrade() else {
@@ -430,7 +754,11 @@ impl IoTask {
             None
         };
         let control = matches!(origin, StopOrigin::Control);
-        if rel.stop.is_some()
+        // Lifecycle observers never intercept the original signal delivery.
+        if rel.mode.observer() && shared.is_some() {
+            return false;
+        }
+        if rel.stop.is_some() && exit_status.is_none()
             || syscall.is_some() && !rel.trace_syscalls
             || exit_status.is_some() && (rel.exit_reported || rel.options & PTRACE_O_TRACEEXIT == 0)
         {
@@ -476,10 +804,18 @@ impl IoTask {
         };
         let status = if let Some(status) = control_status {
             status
+        } else if matches!(origin, StopOrigin::Clone(_)) {
+            sig | (3 << 8)
+        } else if matches!(origin, StopOrigin::Vfork(_)) {
+            sig | (2 << 8)
         } else if vfork_child.is_some() {
             sig | (5 << 8)
         } else if exit_status.is_some() {
             rel.exit_reported = true;
+            if let StopOrigin::Retiring(hold) = origin {
+                *retirement = Arc::downgrade(hold);
+                rel.retiring = true;
+            }
             sig | (6 << 8)
         } else if syscall.is_some() {
             if rel.options & PTRACE_O_TRACESYSGOOD != 0 {
@@ -495,14 +831,34 @@ impl IoTask {
         rel.continued_while_stopped = false;
         rel.stop = Some(Arc::new(TraceStop {
             cpu: registers(),
+            acknowledgement: if let StopOrigin::Retiring(hold) = origin {
+                Some(hold.acknowledgement.clone())
+            } else {
+                None
+            },
             group_stop,
-            vfork_child,
+            event_pid: if matches!(origin, StopOrigin::Normal)
+                && shared.is_none()
+                && syscall.is_none()
+                && exit_status.is_none()
+            {
+                rel.former_tid.take().filter(|_| status >> 8 == 4)
+            } else {
+                vfork_child
+            },
             syscall,
             exit_status,
             status,
             signal,
         }));
-        self.trace_stop.store(true, Ordering::Release);
+        self.trace_stop.fetch_or(
+            if matches!(origin, StopOrigin::Retiring(_)) {
+                3
+            } else {
+                1
+            },
+            Ordering::Release,
+        );
         let notice = rel.child.trace_event(Some(status as i32));
         let uid = self.credentials().read().uid;
         drop(lock);
@@ -565,13 +921,19 @@ impl IoRoutes {
         options: u64,
         admission: Option<trames_vfs::Credentials>,
     ) -> Result<u64, Errno> {
-        let child = task.lifecycle().wait_child().ok_or(Errno(3))?;
+        let thread_source =
+            (task.tid() != task.tgid()).then(|| crate::children::Child::thread_source(task));
+        let child = thread_source
+            .clone()
+            .or_else(|| task.lifecycle().wait_child())
+            .ok_or(Errno(3))?;
         let mut list = tracer.tracees.lock().unwrap();
         if list.retired || !tracer.live() || !task.live() {
             return Err(Errno(3));
         }
         let parent_tid = task.parentage().ok_or(Errno(3))?.parent_thread();
-        if parent_tid != tracer.tid()
+        if mode != Mode::Nominated
+            && parent_tid != tracer.tid()
             && (mode == Mode::Voluntary
                 || !self
                     .directory
@@ -582,21 +944,34 @@ impl IoRoutes {
             return Err(Errno(3));
         }
         let mut slot = task.trace.get_or_init(Default::default).lock().unwrap();
-        if slot.is_some() {
+        if slot.relationship.is_some() {
             return Err(Errno(1));
         }
         let parent_wait = tracer.lifecycle().wait_children().ok_or(Errno(3))?;
-        let notice = child.trace_by_parent(&parent_wait)?;
+        let (child, notice) = if mode == Mode::Nominated {
+            if !task.nominated_observer(tracer) {
+                return Err(Errno(1));
+            }
+            let wait = child.observe(tracer, &parent_wait)?;
+            list.observers.retain(|w| w.strong_count() != 0);
+            list.observers.push(Arc::downgrade(&wait));
+            (wait, None)
+        } else {
+            let notice = child.trace_by_parent(&parent_wait)?;
+            (child, Some(notice))
+        };
         list.tasks
             .retain(|t| t.strong_count() != 0 && !Weak::ptr_eq(t, &Arc::downgrade(task)));
         list.tasks.push(Arc::downgrade(task));
         let pending = match mode {
-            Mode::Attach => Some(ControlStop::Attach),
+            Mode::Attach | Mode::Nominated => Some(ControlStop::Attach),
             Mode::Seize if task.lifecycle().stopped() => Some(ControlStop::Group),
             _ => None,
         };
-        *slot = Some(Relationship {
+        slot.relationship = Some(Relationship {
+            retiring: false,
             mode,
+            thread_source,
             admission: admission.map(Box::new),
             listening: false,
             continued_while_stopped: false,
@@ -607,12 +982,15 @@ impl IoRoutes {
             options,
             trace_syscalls: false,
             exit_reported: false,
+            former_tid: None,
         });
         task.trace_control
             .store(pending.is_some(), Ordering::Release);
         drop(slot);
         drop(list);
-        notice.notify();
+        if let Some(notice) = notice {
+            notice.notify();
+        }
         if pending.is_some() {
             task.wake_control();
         }
@@ -634,8 +1012,8 @@ impl IoRoutes {
             .find(|t| t.live())
             .ok_or(Errno(3))?;
         let slot = task.trace.get().ok_or(Errno(3))?.lock().unwrap();
-        let rel = slot.as_ref().ok_or(Errno(3))?;
-        if rel.stop.is_none() || !std::ptr::eq(rel.tracer.as_ptr(), caller) {
+        let rel = slot.relationship.as_ref().ok_or(Errno(3))?;
+        if rel.mode.observer() || rel.stop.is_none() || !std::ptr::eq(rel.tracer.as_ptr(), caller) {
             return Err(Errno(3));
         }
         let mm = task.proc_view.memory_report().ok_or(Errno(3))?;
@@ -682,9 +1060,18 @@ impl IoRoutes {
         if let Some(lock) = target.trace.get() {
             let mut slot = lock.lock().unwrap();
             if let Some(rel) = slot
+                .relationship
                 .as_mut()
                 .filter(|r| std::ptr::eq(r.tracer.as_ptr(), caller))
             {
+                if rel.mode.observer()
+                    && !matches!(
+                        request,
+                        PTRACE_CONT | PTRACE_DETACH | PTRACE_SYSCALL | PTRACE_GETEVENTMSG
+                    )
+                {
+                    return Err(Errno(95));
+                }
                 if matches!(request, PTRACE_ATTACH | PTRACE_SEIZE) {
                     return Err(Errno(1));
                 }
@@ -749,13 +1136,20 @@ impl IoRoutes {
                         };
                         rel.trace_syscalls = request == PTRACE_SYSCALL;
                         rel.continued_while_stopped = false;
-                        rel.stop = None;
+                        let released = rel.stop.take();
                         if request == PTRACE_DETACH {
-                            *slot = None;
+                            slot.relationship = None;
                             target.trace_control.store(false, Ordering::Release);
                         }
-                        target.trace_stop.store(false, Ordering::Release);
+                        target.trace_stop.fetch_and(!1, Ordering::Release);
                         drop(slot);
+                        // Completion may enter the run queue. Wake after unlocking
+                        // the tracee, including when a reader still holds its snapshot.
+                        if let Some(ack) =
+                            released.as_ref().and_then(|s| s.acknowledgement.as_ref())
+                        {
+                            ack.finish();
+                        }
                         if options != 0 {
                             target.inbox.changed();
                         }
@@ -778,13 +1172,12 @@ impl IoRoutes {
                         return stop.read_regset(addr, options, memory);
                     }
                     PTRACE_GETEVENTMSG => {
-                        // Voluntary tracing currently admits leaders, so their TID survives exec.
                         let message = if let Some(status) = stop.exit_status {
                             status as u32 as u64
-                        } else if let Some(id) = stop.vfork_child {
+                        } else if let Some(id) = stop.event_pid {
                             u64::from(id)
                         } else if stop.status >> 8 == 4 {
-                            self.namespace.local(target.tid()) as u64
+                            u64::from(self.namespace.local(target.tid()))
                         } else {
                             0
                         };
@@ -837,9 +1230,14 @@ impl IoRoutes {
                     PTRACE_KILL => {
                         if stop.exit_status.is_some() {
                             let notice = rel.child.trace_event(None);
-                            rel.stop = None;
-                            target.trace_stop.store(false, Ordering::Release);
+                            let released = rel.stop.take();
+                            target.trace_stop.fetch_and(!1, Ordering::Release);
                             drop(slot);
+                            if let Some(ack) =
+                                released.as_ref().and_then(|s| s.acknowledgement.as_ref())
+                            {
+                                ack.finish();
+                            }
                             notice.notify();
                         } else {
                             drop(slot);
@@ -924,18 +1322,19 @@ impl IoRoutes {
             .parents
             .original(parent_tid)
             .map(|p| p.tgid());
-        if target.tid() != target.tgid()
-            || (parent_tid != caller.tid() && parent_group != Some(caller.tgid()))
-        {
-            return Err(Errno(38));
-        }
         let tracer = self
             .directory
             .tasks(0, caller.tid())
             .into_iter()
             .find(|t| std::ptr::eq(&**t, caller))
             .ok_or(Errno(3))?;
-        let (mode, flags) = if request == PTRACE_SEIZE {
+        let direct = parent_tid == caller.tid() || parent_group == Some(caller.tgid());
+        let (mode, flags) = if !direct || target.tid() != target.tgid() {
+            if request != PTRACE_ATTACH || !target.nominated_observer(caller) {
+                return Err(Errno(38));
+            }
+            (Mode::Nominated, 0)
+        } else if request == PTRACE_SEIZE {
             (Mode::Seize, options)
         } else {
             (Mode::Attach, 0)
@@ -998,7 +1397,8 @@ mod tests {
             syscall: Some(SyscallStop::Entry),
             exit_status: None,
             group_stop: false,
-            vfork_child: None,
+            acknowledgement: None,
+            event_pid: None,
         };
         stop.cpu.registers[..6].copy_from_slice(&[10, 11, 12, 13, 14, 15]);
         stop.cpu.registers[8] = 57;
@@ -1062,6 +1462,32 @@ mod tests {
         child.attach(Some(&children), 43, 42, 1000);
         assert_eq!(routes.trace_me(&task), Ok(0));
         assert_eq!(routes.trace_me(&task), Err(Errno(1)));
+        let request = |op, data| {
+            routes.ptrace(
+                &tracer,
+                [op, 43, 0, data, 0, 0],
+                &mut trames_memory::Memory::default(),
+            )
+        };
+        assert!(task.trace_point(5, None, Default::default));
+        assert_eq!(request(PTRACE_SETOPTIONS, PTRACE_O_TRACEEXIT), Ok(0));
+        assert_eq!(request(PTRACE_CONT, 0), Ok(0));
+        for acknowledge in [false, true] {
+            let hold = task.trace_exec_peer_exit(Default::default).unwrap();
+            let other = task.trace_exec_peer_exit(|| unreachable!()).unwrap();
+            assert!(Arc::ptr_eq(&hold, &other));
+            let acknowledgement = hold.acknowledgement.clone();
+            drop(hold);
+            assert!(!acknowledgement.finished());
+            if acknowledge {
+                assert_eq!(request(PTRACE_CONT, 0), Ok(0));
+                assert!(acknowledgement.finished());
+            }
+            assert!(task.trace_stopped());
+            drop(other);
+            assert!(acknowledgement.finished());
+            assert!(!task.trace_stopped());
+        }
         assert!(task.trace_point(5, None, Default::default));
         assert!(task.trace_stopped());
         assert_eq!(task.tracer_tid(), 42);

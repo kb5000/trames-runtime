@@ -12,9 +12,29 @@ use trames_memory::CpuMemory;
 use trames_shared::Readiness;
 use trames_vfs::{Errno, IoSignal, IoSubscription, PidNamespace};
 
+// An observed thread can disappear before its tracer waits. Its wait queue
+// retains the exit record until acknowledgement or debugger retirement.
+enum WaitLink {
+    Natural(Weak<Child>),
+    Observed(Arc<Child>),
+}
+impl WaitLink {
+    fn upgrade(&self) -> Option<Arc<Child>> {
+        match self {
+            Self::Natural(weak) => weak.upgrade(),
+            Self::Observed(wait) => Some(wait.clone()),
+        }
+    }
+    fn live(&self) -> bool {
+        match self {
+            Self::Natural(w) => w.strong_count() != 0,
+            Self::Observed(_) => true,
+        }
+    }
+}
 #[derive(Default)]
 pub struct Children {
-    entries: Mutex<BTreeMap<u32, Weak<Child>>>,
+    entries: Mutex<BTreeMap<(u32, bool), WaitLink>>,
     changed: Arc<Readiness>,
     reaped: AtomicBool,
     collected: Mutex<crate::usage::Usage>,
@@ -89,6 +109,8 @@ struct State {
     event: Option<i32>,
     trap: Option<i32>,
     traced_by_parent: bool,
+    observer: Option<Box<Observer>>,
+    observer_only: bool,
     stopped: bool,
     exited: bool,
     reaped: bool,
@@ -99,11 +121,22 @@ struct State {
     children_usage: Weak<Children>,
     exit_usage: crate::usage::Usage,
 }
+// The tracer has its own wait record. The real child retains its PID,
+// credentials, natural parent and reap callbacks until ordinary wait completes.
+struct Observer {
+    wait: Arc<Child>,
+    deferred: Option<(i32, Option<(bool, u64)>)>,
+}
 impl Child {
     /// Allocated only when an application requests a process descriptor.
     pub fn pidfd(&self, id: u32) -> Arc<trames_vfs::PidFd> {
         let mut state = self.0.lock().unwrap();
-        let (exited, reaped) = (state.exited, state.reaped);
+        let exited = state.exited
+            || state
+                .observer
+                .as_ref()
+                .is_some_and(|o| o.deferred.is_some());
+        let reaped = state.reaped;
         state
             .pidfd
             .get_or_insert_with(|| Arc::new(trames_vfs::PidFd::new(id, exited, reaped)))
@@ -159,6 +192,8 @@ impl Child {
         group: &Arc<crate::task_control::Group>,
         children: &Arc<Children>,
     ) {
+        // A nominated debugger can wait on a guest that never forked from it.
+        group.bind_wait_children(children);
         let mut state = self.0.lock().unwrap();
         state.group_usage = Arc::downgrade(group);
         state.children_usage = Arc::downgrade(children);
@@ -235,7 +270,7 @@ impl Child {
             (std::mem::replace(&mut state.parent, next), previous_id)
         };
         if let Some(old) = previous.upgrade() {
-            old.entries.lock().unwrap().remove(&previous_id);
+            old.entries.lock().unwrap().remove(&(previous_id, false));
             notices.push(Notice(Some(old), Weak::new(), Vec::new()));
         }
         if let Some(parent) = parent {
@@ -246,7 +281,7 @@ impl Child {
                 .entries
                 .lock()
                 .unwrap()
-                .insert(id, Arc::downgrade(self));
+                .insert((id, false), WaitLink::Natural(Arc::downgrade(self)));
             notices.push(Notice(Some(parent.clone()), Weak::new(), Vec::new()));
         }
         notices
@@ -284,6 +319,92 @@ impl Child {
     fn publish(&self, status: Option<i32>, exited: bool) {
         self.publish_quiet(status, exited).notify();
     }
+    pub(crate) fn thread_source(task: &crate::signal::IoTask) -> Arc<Child> {
+        Arc::new(Child(Mutex::new(State {
+            id: task.tid(),
+            group: task.group(),
+            credentials: task.credentials().clone(),
+            group_usage: Arc::downgrade(task.lifecycle()),
+            ..Default::default()
+        })))
+    }
+    pub(crate) fn observe(
+        self: &Arc<Self>,
+        tracer: &crate::signal::IoTask,
+        family: &Arc<Children>,
+    ) -> Result<Arc<Self>, Errno> {
+        let mut entries = family.entries.lock().unwrap();
+        let mut real = self.0.lock().unwrap();
+        if real.exited
+            || real.reaped
+            || real.observer.is_some()
+            || entries
+                .get(&(real.id, true))
+                .and_then(WaitLink::upgrade)
+                .is_some()
+        {
+            return Err(Errno(3));
+        }
+        let owner = Arc::new(crate::task_parent::Parentage::default());
+        owner.set_parent_thread(tracer.tid());
+        let source = Arc::downgrade(self);
+        let queue = Arc::downgrade(family);
+        let key = (real.id, true);
+        let wait = Arc::new_cyclic(|observer: &Weak<Child>| {
+            let identity = observer.clone();
+            Self(Mutex::new(State {
+                id: real.id,
+                group: real.group,
+                credentials: real.credentials.clone(),
+                group_usage: real.group_usage.clone(),
+                children_usage: real.children_usage.clone(),
+                parent: Arc::downgrade(family),
+                parent_group: Arc::downgrade(tracer.lifecycle()),
+                owner: Some(owner),
+                traced_by_parent: true,
+                observer_only: true,
+                on_reap: Some(Box::new(move || {
+                    if let Some(queue) = queue.upgrade() {
+                        let mut entries = queue.entries.lock().unwrap();
+                        if entries
+                            .get(&key)
+                            .and_then(WaitLink::upgrade)
+                            .is_some_and(|w| std::ptr::eq(Arc::as_ptr(&w), identity.as_ptr()))
+                        {
+                            entries.remove(&key);
+                        }
+                    }
+                    if let (Some(real), Some(wait)) = (source.upgrade(), identity.upgrade()) {
+                        real.finish_observation(&wait);
+                    }
+                })),
+                ..Default::default()
+            }))
+        });
+        entries.insert((real.id, true), WaitLink::Observed(wait.clone()));
+        real.observer = Some(Box::new(Observer {
+            wait: wait.clone(),
+            deferred: None,
+        }));
+        Ok(wait)
+    }
+    fn finish_observation(&self, wait: &Arc<Child>) {
+        let mut real = self.0.lock().unwrap();
+        if !real
+            .observer
+            .as_ref()
+            .is_some_and(|o| Arc::ptr_eq(&o.wait, wait))
+        {
+            return;
+        }
+        let Some((status, policy)) = real.observer.take().unwrap().deferred else {
+            return;
+        };
+        let info = crate::family::exit_info(real.id, real.credentials.read().uid, status);
+        let (notice, signo, _) = Self::finish_status(&mut real, status, policy);
+        drop(real);
+        notice.signal(signo, info);
+    }
     pub(crate) fn trace_by_parent(&self, parent: &Arc<Children>) -> Result<Notice, Errno> {
         let mut state = self.0.lock().unwrap();
         if state.reaped || state.exited || state.parent.as_ptr() != Arc::as_ptr(parent) {
@@ -296,7 +417,13 @@ impl Child {
         let mut state = self.0.lock().unwrap();
         state.trap = None;
         state.traced_by_parent = false;
-        Notice(state.parent.upgrade(), Weak::new(), Vec::new())
+        let cleanup = if state.observer_only {
+            state.reaped = true;
+            state.on_reap.take().into_iter().collect()
+        } else {
+            Vec::new()
+        };
+        Notice(state.parent.upgrade(), Weak::new(), cleanup)
     }
     pub(crate) fn trace_event(&self, signal: Option<i32>) -> Notice {
         let mut state = self.0.lock().unwrap();
@@ -334,6 +461,30 @@ impl Child {
         usage: Option<crate::usage::Usage>,
     ) -> Option<(Notice, u32, i32)> {
         let mut state = self.0.lock().unwrap();
+        if let Some(observer) = state.observer.as_mut() {
+            if status.is_none() {
+                if let Some((_, policy)) = &mut observer.deferred {
+                    *policy = parent;
+                }
+                return None;
+            }
+            if observer.deferred.is_some() {
+                return None;
+            }
+            let status = status?;
+            observer.deferred = Some((status, parent));
+            let wait = observer.wait.clone();
+            state.event = None;
+            state.stopped = false;
+            if let Some(usage) = usage {
+                state.exit_usage = usage;
+            }
+            let mut exit = wait.finish_quiet(Some(status), None, usage);
+            if let (Some(pid), Some((notice, _, _))) = (state.pidfd.clone(), exit.as_mut()) {
+                notice.2.push(Box::new(move || pid.publish(false)));
+            }
+            return exit;
+        }
         if state.reaped || status.is_some() == state.exited {
             return None;
         }
@@ -341,6 +492,13 @@ impl Child {
             state.exit_usage = usage;
         }
         let status = status.or(state.event)?;
+        Some(Self::finish_status(&mut state, status, parent))
+    }
+    fn finish_status(
+        state: &mut State,
+        status: i32,
+        parent: Option<(bool, u64)>,
+    ) -> (Notice, u32, i32) {
         state.exited = true;
         state.stopped = false;
         state.event = Some(status);
@@ -367,11 +525,11 @@ impl Child {
         if let Some(pid) = state.pidfd.clone() {
             cleanup.push(Box::new(move || pid.publish(auto_reap)));
         }
-        Some((
+        (
             Notice(parent, state.parent_group.clone(), cleanup),
             signo,
             status,
-        ))
+        )
     }
     pub fn clear(&self) {
         self.publish(None, false);
@@ -515,9 +673,10 @@ impl Children {
     ) -> Vec<u32> {
         let entries = self.entries.lock().unwrap();
         let mut ids = Vec::new();
-        for child in entries.values().filter_map(Weak::upgrade) {
+        for child in entries.values().filter_map(WaitLink::upgrade) {
             let state = child.0.lock().unwrap();
-            if !state.reaped
+            if !state.observer_only
+                && !state.reaped
                 && state.parent.as_ptr() == Arc::as_ptr(self)
                 && state
                     .owner
@@ -538,10 +697,11 @@ impl Children {
     pub(crate) fn transfer_owner(self: &Arc<Self>, old: u32, new: u32) -> Option<Notice> {
         let entries = self.entries.lock().unwrap();
         let mut moved = false;
-        for child in entries.values().filter_map(Weak::upgrade) {
+        for child in entries.values().filter_map(WaitLink::upgrade) {
             let state = child.0.lock().unwrap();
             let Some(owner) = &state.owner else { continue };
-            if owner.parent_thread() == old
+            if !state.observer_only
+                && owner.parent_thread() == old
                 && !state.reaped
                 && state.parent.as_ptr() == Arc::as_ptr(self)
             {
@@ -563,7 +723,7 @@ impl Children {
     pub fn ready(self: &Arc<Self>, request: Wait, namespace: &PidNamespace, group: u32) -> bool {
         let entries = self.entries.lock().unwrap();
         let mut found = false;
-        for child in entries.values().filter_map(Weak::upgrade) {
+        for child in entries.values().filter_map(WaitLink::upgrade) {
             let state = child.0.lock().unwrap();
             if !state.reaped
                 && state.parent.as_ptr() == Arc::as_ptr(self)
@@ -584,9 +744,13 @@ impl Children {
         let entries = self.entries.lock().unwrap();
         let mut changed = false;
         let mut cleanup = Vec::new();
-        for child in entries.values().filter_map(Weak::upgrade) {
+        for child in entries.values().filter_map(WaitLink::upgrade) {
             let mut state = child.0.lock().unwrap();
-            if !state.reaped && state.exited && state.parent.as_ptr() == Arc::as_ptr(self) {
+            if !state.observer_only
+                && !state.reaped
+                && state.exited
+                && state.parent.as_ptr() == Arc::as_ptr(self)
+            {
                 state.reaped = true;
                 state.event = None;
                 self.collected.lock().unwrap().include(state.exit_usage);
@@ -613,10 +777,10 @@ impl Children {
         memory: &mut impl CpuMemory,
     ) -> Result<Option<u64>, Errno> {
         let mut entries = self.entries.lock().unwrap();
-        entries.retain(|_, child| child.strong_count() != 0);
+        entries.retain(|_, child| child.live());
         let mut found = false;
         let options = request.options();
-        for child in entries.values().filter_map(Weak::upgrade) {
+        for child in entries.values().filter_map(WaitLink::upgrade) {
             let mut state = child.0.lock().unwrap();
             if state.reaped
                 || state.parent.as_ptr() != Arc::as_ptr(self)
@@ -651,9 +815,11 @@ impl Children {
                     state.event = None;
                 }
                 if state.reaped {
-                    self.collected.lock().unwrap().include(usage);
-                    self.reaped.store(true, Ordering::Relaxed);
-                    state.presence.reap();
+                    if !state.observer_only {
+                        self.collected.lock().unwrap().include(usage);
+                        self.reaped.store(true, Ordering::Relaxed);
+                        state.presence.reap();
+                    }
                     cleanup = state.on_reap.take();
                 }
             }
@@ -771,6 +937,63 @@ mod tests {
             nonblocking_pidfd: false,
             number: 95,
             args: [0, 0, 0x1000, options, 0x1100, 0],
+        }
+    }
+    #[test]
+    fn observer_exit_handoff_survives_nowait_adoption_and_tracer_departure() {
+        let namespace = PidNamespace::default();
+        let mut mem = memory();
+        for auto_reap in [false, true] {
+            for detach in [false, true] {
+                let parent = Arc::new(Children::default());
+                let adopter = Arc::new(Children::default());
+                let debugger = Arc::new(Children::default());
+                let original = child(&parent, 42, 1);
+                let observer = original
+                    .observe(&crate::signal::IoTask::default(), &debugger)
+                    .unwrap();
+                original
+                    .finish_quiet(Some(17 << 8), Some((false, 1)), None)
+                    .unwrap()
+                    .0
+                    .notify();
+                assert_eq!(
+                    debugger.wait(waitid(4 | 0x01000000), &namespace, 1, &mut mem),
+                    Ok(Some(0))
+                );
+                assert_eq!(parent.wait(wait4(1), &namespace, 1, &mut mem), Ok(Some(0)));
+                original.attach(Some(&adopter), 42, 1, 1234);
+                assert!(original
+                    .finish_quiet(None, Some((auto_reap, 1)), None)
+                    .is_none());
+                if detach {
+                    observer.detach_trace().notify();
+                } else {
+                    assert_eq!(
+                        debugger.wait(wait4(0), &namespace, 1, &mut mem),
+                        Ok(Some(42))
+                    );
+                }
+                assert_eq!(original.reaped(), auto_reap);
+                if !auto_reap {
+                    assert_eq!(
+                        adopter.wait(wait4(0), &namespace, 1, &mut mem),
+                        Ok(Some(42))
+                    );
+                    assert_eq!(
+                        mem.read_array::<4>(0x1000).unwrap(),
+                        (17i32 << 8).to_le_bytes()
+                    );
+                }
+                assert_eq!(
+                    adopter.wait(wait4(1), &namespace, 1, &mut mem),
+                    Err(Errno(10))
+                );
+                assert_eq!(
+                    debugger.wait(wait4(1), &namespace, 1, &mut mem),
+                    Err(Errno(10))
+                );
+            }
         }
     }
     #[test]
