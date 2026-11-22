@@ -233,6 +233,7 @@ fn counters_keep_parallel_packets_across_live_rule_publication() {
                     output: 1,
                     tuple: crate::conntrack::key(&packet).unwrap().tuple,
                     track: None,
+                    connections: None,
                     graph: &graph,
                     namespace: ns.id(),
                 };
@@ -293,6 +294,7 @@ fn allows(ns: &Namespace, hook: u32) -> bool {
         output: 4,
         tuple: crate::conntrack::key(&packet).unwrap().tuple,
         track: None,
+        connections: None,
         graph: &graph,
         namespace: ns.id(),
     })
@@ -439,6 +441,7 @@ fn shifts_propagate_carries_across_overlapping_registers() {
         graph: &graph,
         namespace: ns.id(),
         track: None,
+        connections: None,
     };
     let initial = [0x8000_0001u32, 0xc000_0002];
     for (left, bits, dest, expected) in [
@@ -495,6 +498,7 @@ fn fib_and_addrtype_use_packet_address_and_selected_guest_interface() {
         graph: &graph,
         namespace: net.namespace_id(),
         track: None,
+        connections: None,
     };
     let fib = |ctx: &Context<'_>, result, flags, value: Vec<u8>| {
         packet_rule_matches(
@@ -1068,5 +1072,131 @@ fn first_and_established_packets_reach_filters_with_the_same_nat_binding() {
         assert_eq!(key(&reply).unwrap().tuple.source, public);
         assert!(crate::virtualnet::packet::valid_transport(&reply));
         state.finish(track, true);
+    }
+}
+
+#[test]
+fn xt_transport_matches_ports_flags_options_and_icmp_codes() {
+    use super::xt_match::Transport;
+
+    let mut info = [0; 12];
+    info[..2].copy_from_slice(&4000u16.to_le_bytes());
+    info[2..4].copy_from_slice(&5000u16.to_le_bytes());
+    info[4..6].copy_from_slice(&80u16.to_le_bytes());
+    info[6..8].copy_from_slice(&80u16.to_le_bytes());
+    info[8..12].copy_from_slice(&[2, 0x12, 2, 0]);
+    let tcp = Transport::parse(6, &info).unwrap();
+    let mut segment = [0; 28];
+    segment[..2].copy_from_slice(&4000u16.to_be_bytes());
+    segment[2..4].copy_from_slice(&80u16.to_be_bytes());
+    segment[12] = 7 << 4;
+    segment[13] = 2;
+    segment[20..].copy_from_slice(&[1, 2, 4, 5, 180, 0, 0, 0]);
+    assert_eq!(tcp.matches(&segment), Some(true));
+    assert_eq!(tcp.matches(&segment[..24]), None);
+    assert_eq!(tcp.matches(&segment[..12]), None);
+    segment[13] = 0x12;
+    assert_eq!(tcp.matches(&segment), Some(false));
+    info[11] = 4;
+    assert_eq!(
+        Transport::parse(6, &info).unwrap().matches(&segment),
+        Some(true)
+    );
+    segment[12] = 5 << 4;
+    assert_eq!(
+        Transport::parse(6, &info).unwrap().matches(&segment),
+        Some(false)
+    );
+    info[11] |= 8;
+    assert_eq!(
+        Transport::parse(6, &info).unwrap().matches(&segment),
+        Some(true)
+    );
+    info[8] = 2; // invert UDP destination
+    let udp = Transport::parse(17, &info[..10]).unwrap();
+    assert_eq!(udp.matches(&segment[..8]), Some(false));
+    segment[2..4].copy_from_slice(&81u16.to_be_bytes());
+    assert_eq!(udp.matches(&segment[..8]), Some(true));
+    assert_eq!(udp.matches(&segment[..7]), None);
+
+    let mut icmp = [0; 8];
+    icmp[..2].copy_from_slice(&[3, 4]);
+    assert_eq!(
+        Transport::parse(1, &[3, 3, 5, 0]).unwrap().matches(&icmp),
+        Some(true)
+    );
+    assert_eq!(
+        Transport::parse(1, &[255, 0, 0, 0]).unwrap().matches(&icmp),
+        Some(true)
+    );
+    assert_eq!(
+        Transport::parse(58, &[255, 0, 0, 0])
+            .unwrap()
+            .matches(&icmp),
+        Some(false)
+    );
+    assert_eq!(
+        Transport::parse(58, &[3, 3, 5, 1]).unwrap().matches(&icmp),
+        Some(false)
+    );
+}
+
+#[test]
+fn xt_conntrack_checks_real_direction_expiry_status_and_revision_port_order() {
+    use crate::conntrack::{message, State};
+    for (client, server) in [
+        ("192.0.2.1:49152", "198.51.100.2:443"),
+        ("[fd00::1]:49152", "[fd01::2]:443"),
+    ] {
+        let (client, server) = (client.parse().unwrap(), server.parse().unwrap());
+        let ns = Namespace::default();
+        let graph = ns.graph.read().unwrap();
+        let mut connections = State::default();
+        let request = message(client, server, 17, 0, b"request");
+        let new = connections.begin(&request, 0).unwrap();
+        connections.finish(new, true);
+        let reply = message(server, client, 17, 0, b"reply");
+        let track = connections.begin(&reply, 0).unwrap();
+        let ctx = Context {
+            packet: &reply,
+            tuple: track.original.reverse().tuple,
+            track: Some(track),
+            connections: Some(&connections),
+            graph: &graph,
+            namespace: ns.id(),
+            hook: 0,
+            input: 1,
+            output: 0,
+        };
+        for revision in 1..=3 {
+            let mut b = vec![0; xt_match::conntrack_size(revision).unwrap()];
+            // Established reply, original destination port, time remaining and any
+            // overlapping status bit. The connection has SEEN_REPLY but not EXPECTED.
+            let flags = 1u16 | 64 | 128 | 512 | 4096;
+            b[146..148].copy_from_slice(&flags.to_le_bytes());
+            b[148..150].copy_from_slice(&4096u16.to_le_bytes());
+            b[150] = 2;
+            b[if revision == 1 { 151 } else { 152 }] = 3;
+            b[132..136].copy_from_slice(&65u32.to_le_bytes());
+            if revision == 3 {
+                b[140..142].copy_from_slice(&440u16.to_le_bytes());
+                b[156..158].copy_from_slice(&445u16.to_le_bytes());
+            } else {
+                b[140..142].copy_from_slice(&443u16.to_be_bytes());
+            }
+            assert!(xt_match::conntrack_matches(&ctx, revision, &b));
+            b[132..136].fill(0);
+            assert!(!xt_match::conntrack_matches(&ctx, revision, &b));
+            b[132..136].copy_from_slice(&65u32.to_le_bytes());
+            b[148..150].fill(0);
+            assert!(!xt_match::conntrack_matches(&ctx, revision, &b));
+        }
+        let mut b = [0; 152];
+        b[146] = 1;
+        b[150] = 1;
+        let invalid = Context { track: None, ..ctx };
+        assert!(xt_match::conntrack_matches(&invalid, 1, &b));
+        b[146] = 2;
+        assert!(!xt_match::conntrack_matches(&invalid, 1, &b));
     }
 }

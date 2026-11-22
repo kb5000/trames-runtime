@@ -2,6 +2,8 @@
 //! Bounded guest nf_tables ABI and packet filter. Wire identifiers follow Linux
 //! UAPI nf_tables.h/nfnetlink.h (GPL-2.0 WITH Linux-syscall-note).
 //! No host firewall calls; unsupported hooks/expressions fail before publication.
+#[path = "nft_xt_match.rs"]
+mod xt_match;
 use crate::{
     netlink::{attr, message, Namespace},
     NetError,
@@ -251,6 +253,7 @@ enum Expr {
         dest: usize,
         flags: u32,
     },
+    TransportMatch(xt_match::Transport),
     ConntrackMatch {
         revision: u32,
         info: Vec<u8>,
@@ -536,18 +539,17 @@ fn expressions_in(bytes: &[u8], rule_family: u8) -> Result<Vec<Expr>> {
                     }
                     Expr::Comment
                 } else if kind == "conntrack" {
-                    if revision > 3 || b.len() != if revision == 3 { 168 } else { 160 } {
-                        return Err(NetError(95));
-                    }
-                    let flags = u16::from_le_bytes(b[146..148].try_into().unwrap());
-                    let inverse = u16::from_le_bytes(b[148..150].try_into().unwrap());
-                    if flags & 128 != 0 || inverse & !flags != 0 {
-                        return Err(NetError(95));
-                    }
+                    let size = xt_match::conntrack_size(revision)?;
+                    xt_match::check_size(b, size)?;
                     Expr::ConntrackMatch {
                         revision,
                         info: b.to_vec(),
                     }
+                } else if let Some(proto) = xt_match::protocol(&kind, rule_family) {
+                    if revision != 0 {
+                        return Err(NetError(2));
+                    }
+                    Expr::TransportMatch(xt_match::Transport::parse(proto, b)?)
                 } else {
                     if kind != "addrtype" || revision > 1 || revision == 0 && rule_family != 2 {
                         return Err(NetError(2));
@@ -820,6 +822,27 @@ fn rule_data(family: u8, table: &str, chain: &str, r: &Rule) -> Vec<u8> {
             integer(&mut c, 2, packets.get());
             attr(&mut e, 2, &c);
             attr(&mut wire, kind, &e);
+        } else if matches!(expr, Expr::TransportMatch(_) | Expr::ConntrackMatch { .. }) {
+            let outer = attrs(b).expect("validated match expression");
+            let inner = attrs(get(&outer, 2).unwrap()).expect("validated xt match");
+            let size = match expr {
+                Expr::TransportMatch(m) => m.info_size(),
+                Expr::ConntrackMatch { revision, .. } => {
+                    xt_match::conntrack_size(*revision).unwrap()
+                }
+                _ => unreachable!(),
+            };
+            let mut info = get(&inner, 3).unwrap()[..size].to_vec();
+            info.resize(size.next_multiple_of(8), 0);
+            let mut data = vec![];
+            attr(&mut data, 1, get(&inner, 1).unwrap());
+            attr(&mut data, 2, get(&inner, 2).unwrap());
+            attr(&mut data, 3, &info);
+            let mut e = vec![];
+            string(&mut e, 1, "match");
+            // nftables dumps NFTA_EXPR_DATA without NLA_F_NESTED.
+            attr(&mut e, 2, &data);
+            attr(&mut wire, kind, &e);
         } else if let Expr::Verdict(code, Some(target)) = expr {
             // The original wire names the chain at insertion time. A dump must
             // refer to the same chain after a rename.
@@ -1038,9 +1061,10 @@ impl Ruleset {
             let target = num(&a, 3)?;
             let supported = match (n.as_str(), target) {
                 ("comment", 0) if revision != 0 => return Err(NetError(93)),
-                ("comment" | "tcp" | "udp" | "icmp" | "icmp6", 0) => revision == 0,
+                ("comment", 0) => revision == 0,
+                (name, 0) if xt_match::protocol(name, r[16]).is_some() => revision == 0,
                 ("addrtype", 0) => revision == 1 || revision == 0 && r[16] == 2,
-                ("conntrack", 0) => revision <= 3,
+                ("conntrack", 0) => xt_match::conntrack_size(revision).is_ok(),
                 ("MASQUERADE" | "SNAT" | "DNAT", 1) => xt_nat_revision(&n, r[16], revision),
                 ("CT", 1) => revision <= 1,
                 _ => false,
@@ -1418,15 +1442,24 @@ impl Ruleset {
                 {
                     return Err(NetError(22));
                 }
+                let mut declared_protocol = None;
                 let compatibility = get(&a, 5)
                     .map(|b| -> Result<Vec<u8>> {
                         let a = fields(b, &[1, 2])?;
-                        if num(&a, 1)? > 255 || num(&a, 2)? & !2 != 0 {
+                        let protocol = num(&a, 1)?;
+                        let flags = num(&a, 2)?;
+                        if protocol > 255 || flags & !2 != 0 {
                             return Err(NetError(95));
+                        }
+                        if flags == 0 {
+                            declared_protocol = Some(protocol);
                         }
                         Ok(b.to_vec())
                     })
                     .transpose()?;
+                if expressions.iter().any(|e| matches!(e, Expr::TransportMatch(m) if declared_protocol != Some(u32::from(m.protocol)))) {
+                    return Err(NetError(22));
+                }
                 if get(&a, 8).is_some_and(|b| !b.is_empty()) {
                     return Err(NetError(22));
                 }
@@ -1651,6 +1684,7 @@ pub(crate) struct Context<'a> {
     pub output: u32,
     pub tuple: crate::virtualnet::packet::Tuple,
     pub track: Option<crate::conntrack::Track>,
+    connections: Option<&'a crate::conntrack::State>,
     pub graph: &'a crate::netdev::Topology,
     pub namespace: u64,
 }
@@ -1721,13 +1755,17 @@ impl Context<'_> {
             .unwrap_or(0)
     }
     fn transport(&self) -> Option<(usize, u8)> {
+        let (offset, proto, fragment) = self.transport_header()?;
+        (fragment == 0).then_some((offset, proto))
+    }
+    fn transport_header(&self) -> Option<(usize, u8, u16)> {
         let p = self.packet;
         if self.family() == 2 {
-            if u16::from_be_bytes([p[6], p[7]]) & 0x1fff != 0 {
-                None
-            } else {
-                Some(((p[0] & 15) as usize * 4, p[9]))
-            }
+            Some((
+                (p[0] & 15) as usize * 4,
+                p[9],
+                u16::from_be_bytes([p[6], p[7]]) & 0x1fff,
+            ))
         } else {
             let mut proto = p[6];
             let mut offset = 40;
@@ -1739,8 +1777,9 @@ impl Context<'_> {
                     }
                     44 => {
                         let b = p.get(offset..offset + 8)?;
-                        if u16::from_be_bytes([b[2], b[3]]) & 0xfff8 != 0 {
-                            return None;
+                        let fragment = u16::from_be_bytes([b[2], b[3]]) >> 3;
+                        if fragment != 0 {
+                            return Some((offset + 8, b[0], fragment));
                         }
                         8
                     }
@@ -1748,7 +1787,7 @@ impl Context<'_> {
                         let b = p.get(offset..offset + 2)?;
                         (b[1] as usize + 2) * 4
                     }
-                    _ => return Some((offset, proto)),
+                    _ => return Some((offset, proto, 0)),
                 };
                 let header = p.get(offset..offset + len)?;
                 proto = header[0];
@@ -1871,6 +1910,7 @@ impl Ruleset {
                 output,
                 tuple: h.tuple,
                 track: Some(*track),
+                connections: Some(conn),
                 graph: meta.graph,
                 namespace: meta.namespace,
             };
@@ -2020,68 +2060,31 @@ impl Rule {
                     });
                     return Some((1, None));
                 }
-                Expr::ConntrackMatch { revision, info } => {
-                    let t = ctx.track?;
-                    let b = info;
-                    let le = |i| u16::from_le_bytes(b[i..i + 2].try_into().unwrap());
-                    let flags = le(146);
-                    let inverse = le(148);
-                    let check =
-                        |flag, matched| flags & flag == 0 || (matched ^ (inverse & flag != 0));
-                    let state = if t.state == 64 { 256 } else { t.state }
-                        | if t.status & 16 != 0 { 64 } else { 0 }
-                        | if t.status & 32 != 0 { 128 } else { 0 };
-                    let mask = if *revision <= 1 {
-                        u32::from(b[150])
-                    } else {
-                        u32::from(le(150))
-                    };
-                    let status = if *revision <= 1 {
-                        u32::from(b[151])
-                    } else {
-                        u32::from(le(152))
-                    };
-                    if !check(1, state & mask != 0)
-                        || !check(2, u32::from(t.original.protocol) == u32::from(le(136)))
-                        || !check(64, t.status & status == status)
-                        || !check(4096, !t.reply)
-                    {
+                Expr::TransportMatch(m) => {
+                    let (offset, protocol, fragment) = ctx.transport_header()?;
+                    if protocol != m.protocol {
                         return None;
                     }
-                    let reply = t.translated.reverse();
-                    let endpoints = [
-                        t.original.tuple.source,
-                        t.original.tuple.destination,
-                        reply.tuple.source,
-                        reply.tuple.destination,
-                    ];
-                    for (i, ep) in endpoints.into_iter().enumerate() {
-                        let addr = match ep.ip() {
-                            std::net::IpAddr::V4(v) => {
-                                let mut a = [0; 16];
-                                a[..4].copy_from_slice(&v.octets());
-                                a
-                            }
-                            std::net::IpAddr::V6(v) => v.octets(),
-                        };
-                        let a = i * 32;
-                        let matched = addr
-                            .iter()
-                            .enumerate()
-                            .all(|(j, v)| v & b[a + 16 + j] == b[a + j] & b[a + 16 + j]);
-                        if !check(4 << i, matched) {
-                            return None;
-                        }
-                        let p = 138 + i * 2;
-                        let low = if *revision == 3 {
-                            le(p)
+                    if fragment != 0 {
+                        return if fragment == 1 && protocol == 6 {
+                            Some((0, None))
                         } else {
-                            u16::from_be_bytes(b[p..p + 2].try_into().unwrap())
+                            None
                         };
-                        let high = if *revision == 3 { le(154 + i * 2) } else { low };
-                        if !check(256 << i, ep.port() >= low && ep.port() <= high) {
-                            return None;
-                        }
+                    }
+                    match ctx
+                        .packet
+                        .get(offset..)
+                        .and_then(|segment| m.matches(segment))
+                    {
+                        Some(true) => {}
+                        Some(false) => return None,
+                        None => return Some((0, None)),
+                    }
+                }
+                Expr::ConntrackMatch { revision, info } => {
+                    if !xt_match::conntrack_matches(ctx, *revision, info) {
+                        return None;
                     }
                 }
                 Expr::CtGet {

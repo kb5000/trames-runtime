@@ -414,6 +414,16 @@ impl State {
         self.index
             .insert((t.zone, t.translated.reverse()), (t.id, true));
     }
+    pub fn seconds_remaining(&self, id: u64) -> Option<u32> {
+        Some(
+            self.entries
+                .get(&id)?
+                .expires
+                .saturating_duration_since(Instant::now())
+                .as_secs()
+                .min(u64::from(u32::MAX)) as u32,
+        )
+    }
     pub fn records(&self) -> Vec<(Track, u32)> {
         let now = Instant::now();
         self.entries
