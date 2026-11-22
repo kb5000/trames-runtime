@@ -131,6 +131,11 @@ pub fn build_initial_stack(
         arguments: (arg_start, arg_end),
         environment: (env_start, env_end),
         start_stack: sp,
+        executable: trames_memory::ExecutableRanges {
+            code: elf.code,
+            data: elf.data,
+            start_brk: elf.brk_base,
+        },
     });
     for (index, word) in words.iter().enumerate() {
         elf.memory

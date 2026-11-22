@@ -586,7 +586,15 @@ impl Vfs {
         runtime: &RuntimeInfo,
         target: &ProcessInfo,
     ) -> bool {
-        let own = self.proc_namespace(at).local(self.pid);
+        self.may_inspect_pid(self.proc_namespace(at).local(self.pid), runtime, target)
+    }
+
+    pub(super) fn may_inspect_pid(
+        &self,
+        own: u32,
+        runtime: &RuntimeInfo,
+        target: &ProcessInfo,
+    ) -> bool {
         self.credentials.can_read_proc_task(
             runtime
                 .processes

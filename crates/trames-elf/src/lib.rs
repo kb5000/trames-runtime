@@ -45,6 +45,8 @@ pub struct LoadedElf {
     pub phnum: u16,
     pub start_entry: u64,
     pub interpreter_base: u64,
+    pub code: (u64, u64),
+    pub data: (u64, u64),
     pub brk_base: u64,
 }
 
@@ -137,7 +139,9 @@ pub fn load_with_files(
         phnum: main.phnum,
         start_entry,
         interpreter_base,
-        brk_base: main.end,
+        code: main.executable.code,
+        data: main.executable.data,
+        brk_base: main.executable.start_brk,
     })
 }
 struct Image {
@@ -145,7 +149,7 @@ struct Image {
     phdr: Option<u64>,
     phnum: u16,
     bias: u64,
-    end: u64,
+    executable: trames_memory::ExecutableRanges,
 }
 struct Header<'a> {
     bias: u64,
@@ -246,6 +250,8 @@ fn map_image(
         .checked_add(bias)
         .ok_or(SegmentMapping("entry overflow"))?;
     let mut segments = Vec::new();
+    let mut code = (u64::MAX, 0u64);
+    let mut data = (0u64, 0u64);
     for pos in (phoff..phend).step_by(PH_SIZE) {
         if u32_at(bytes, pos) != 1 {
             continue;
@@ -283,6 +289,14 @@ fn map_image(
             .checked_add(memsz)
             .filter(|&end| address < ADDRESS_LIMIT && end <= ADDRESS_LIMIT)
             .ok_or(SegmentMapping("segment address range"))?;
+        // Linux binfmt_elf records file-backed ends, excluding the BSS tail.
+        let file_end = address + filesz as u64;
+        code.0 = code.0.min(address);
+        if flags & 1 != 0 {
+            code.1 = code.1.max(file_end);
+        }
+        data.0 = data.0.max(address);
+        data.1 = data.1.max(file_end);
         if memsz == 0 {
             continue;
         }
@@ -363,7 +377,11 @@ fn map_image(
         phdr,
         phnum,
         bias,
-        end,
+        executable: trames_memory::ExecutableRanges {
+            code,
+            data,
+            start_brk: end,
+        },
     })
 }
 
@@ -522,6 +540,8 @@ mod tests {
         assert_eq!(e.interpreter_base, INTERPRETER_BASE);
         assert_eq!(e.phdr, Some(0x40001040));
         assert_eq!(e.brk_base, 0x40002000);
+        assert_eq!(e.code, (0x40001000, 0x40001000 + 210));
+        assert_eq!(e.data, e.code);
         // ART boot images and compressed-reference heaps may occupy this range.
         e.memory
             .map(0x7000_1000, PAGE_SIZE, Permissions::RW)

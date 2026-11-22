@@ -375,9 +375,8 @@ impl ProcSource for Source {
             if content && target.is_some() {
                 fields = fields.with_content();
             }
-            let memory = task.memory_report();
             let bytes = if demand.residency() {
-                memory.as_ref().map(|report| {
+                task.memory_report().map(|report| {
                     *resident
                         .entry(report.identity())
                         .or_insert_with(|| report.resident_bytes())
@@ -388,11 +387,7 @@ impl ProcSource for Source {
             if path == b"/proc/meminfo" {
                 continue;
             }
-            if let Some(mut info) = task.observe(fields, bytes) {
-                info.start_stack = memory
-                    .as_ref()
-                    .and_then(|m| m.image_ranges())
-                    .map_or(0, |r| r.start_stack);
+            if let Some(info) = task.observe(fields, bytes) {
                 processes.push(info);
             }
         }

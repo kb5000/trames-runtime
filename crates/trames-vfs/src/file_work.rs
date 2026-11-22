@@ -1005,11 +1005,14 @@ impl PathQueries {
             .map_or(&original.fs, |mount| &mount.fs)
             .clone();
         let mut view = Vfs::empty(fs);
+        if open.mount_file.is_some() {
+            view.cgroup_namespace = original.cgroup_namespace.clone();
+        }
         if matches!(open.sysctl_control, Some(sysctl::Control::UtsName(..))) {
             view.uts = original.uts.clone();
         }
+        view.pid = original.pid;
         if matches!(open.control, Some(events::SharedControl::FuseFile(_))) {
-            view.pid = original.pid;
             view.pid_ns = original.pid_ns.clone();
         }
         view.lock_owner = original.lock_owner;

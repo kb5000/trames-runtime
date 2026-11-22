@@ -3534,7 +3534,7 @@ impl Vfs {
         }
         if let Some(file) = &o.mount_file {
             let mut position = o.file_position.lock().unwrap();
-            let bytes = file.read(position.value, count);
+            let bytes = file.read(position.value, count, &self.cgroup_namespace.path);
             position.value += bytes.len() as u64;
             drop(position);
             o.notify_read(&bytes);
@@ -3542,7 +3542,7 @@ impl Vfs {
         }
         if let Some(file) = &o.runtime_file {
             let mut position = o.file_position.lock().unwrap();
-            let bytes = file.read(position.value, count)?;
+            let bytes = file.read(position.value, count, self)?;
             position.value += bytes.len() as u64;
             drop(position);
             o.notify_read(&bytes);
@@ -3979,12 +3979,14 @@ impl Vfs {
             return Err(Errno(9));
         }
         if let Some(file) = &o.mount_file {
-            let data = file.read(offset, count);
+            let data = file.read(offset, count, &self.cgroup_namespace.path);
             o.notify_read(&data);
             return Ok(data);
         }
         if let Some(file) = &o.runtime_file {
-            return file.read(offset, count).inspect(|data| o.notify_read(data));
+            return file
+                .read(offset, count, self)
+                .inspect(|data| o.notify_read(data));
         }
         if let Some(control) = &o.sysctl_control {
             return control

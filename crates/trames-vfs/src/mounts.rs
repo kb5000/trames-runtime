@@ -2095,7 +2095,7 @@ impl Mount {
         out
     }
 }
-pub(super) fn table_text(snapshot: &NamespaceSnapshot, info: bool) -> Vec<u8> {
+pub(super) fn table_text(snapshot: &NamespaceSnapshot, info: bool, cgroup_root: &[u8]) -> Vec<u8> {
     let Some(table) = snapshot.mount.upgrade() else {
         return Vec::new();
     };
@@ -2168,6 +2168,9 @@ pub(super) fn table_text(snapshot: &NamespaceSnapshot, info: bool) -> Vec<u8> {
         };
         if info {
             let root = match m.kind {
+                Kind::Cgroup => {
+                    linux_namespace::relative_cgroup_path(cgroup_root, &filesystem_root)
+                }
                 Kind::Proc | Kind::Sysfs | Kind::Devpts => m
                     .root_path()
                     .strip_prefix(m.root_key.as_slice())
@@ -2937,7 +2940,7 @@ mod boundary_tests {
             .unwrap();
         v.chroot(b"/a").unwrap();
         v.chdir(b"/").unwrap();
-        let text = String::from_utf8(table_text(&v.namespace_snapshot(), true)).unwrap();
+        let text = String::from_utf8(table_text(&v.namespace_snapshot(), true, b"/")).unwrap();
         assert!(text.contains(" /a / "));
         assert!(text.contains(" /space\\040here "));
         assert!(!text.contains(" /proc "));
@@ -3042,7 +3045,7 @@ mod boundary_tests {
             .unwrap();
         v.getdents(dir, 4096).unwrap();
         assert!(node.borrow().times[0].seconds > old.seconds);
-        let text = String::from_utf8(table_text(&v.namespace_snapshot(), false)).unwrap();
+        let text = String::from_utf8(table_text(&v.namespace_snapshot(), false, b"/")).unwrap();
         assert!(text.contains("ram\\040disk /a tmpfs ro,nodiratime,relatime,mode=755 "));
         assert!(text.contains("ram\\040disk /b tmpfs rw,mode=755 "));
     }

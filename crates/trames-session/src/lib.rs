@@ -823,6 +823,8 @@ mod tests {
             phnum: 2,
             start_entry: 0x4000,
             interpreter_base: 0,
+            code: (0x4000, 0x5000),
+            data: (0x5000, 0x5000),
             brk_base: 0x5000,
         }
     }

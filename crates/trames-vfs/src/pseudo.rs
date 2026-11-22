@@ -743,6 +743,69 @@ mod tests {
         );
     }
     #[test]
+    fn image_stats_report_original_ranges_and_redact_other_users_addresses() {
+        let mut v = Vfs::default();
+        let user = Credentials::user(1000, 1000);
+        v.credentials = user.clone();
+        let mut task = ProcessInfo {
+            pid: 2,
+            tgid: 2,
+            state: 'R',
+            command: b"image".to_vec(),
+            credentials: user,
+            image_ranges: Some(trames_memory::ImageRanges {
+                executable: trames_memory::ExecutableRanges {
+                    code: (0x1100, 0x2040),
+                    data: (0x3100, 0x3210),
+                    start_brk: 0x4000,
+                },
+                start_stack: 0x8100,
+                arguments: (0x8300, 0x8310),
+                environment: (0x8310, 0x8360),
+            }),
+            vm_sizes: trames_memory::VmSizes {
+                executable: 3 * 4096,
+                data: 4096,
+                stack: 2 * 4096,
+            },
+            ..Default::default()
+        };
+        let publish = |v: &mut Vfs, task: &ProcessInfo| {
+            v.set_runtime_info(
+                1,
+                RuntimeInfo {
+                    processes: vec![task.clone()],
+                    ..Default::default()
+                },
+            )
+        };
+        publish(&mut v, &task);
+        let fields = |v: &mut Vfs| {
+            let stat = String::from_utf8(read(v, b"/proc/2/stat")).unwrap();
+            stat.split_whitespace()
+                .skip(3)
+                .map(|s| s.parse::<i128>().unwrap())
+                .collect::<Vec<_>>()
+        };
+        // The numeric slice starts with field 4 (parent PID).
+        let visible = fields(&mut v);
+        assert_eq!(&visible[22..25], &[0x1100, 0x2040, 0x8100]);
+        assert_eq!(
+            &visible[41..48],
+            &[0x3100, 0x3210, 0x4000, 0x8300, 0x8310, 0x8310, 0x8360]
+        );
+        assert_eq!(read(&mut v, b"/proc/2/statm"), b"0 0 0 2 0 3 0\n");
+        let status = String::from_utf8(read(&mut v, b"/proc/2/status")).unwrap();
+        assert!(status.contains("VmExe:\t8 kB\nVmLib:\t4 kB\n"));
+        v.credentials = Credentials::user(2000, 2000);
+        let hidden = fields(&mut v);
+        assert_eq!(&hidden[22..25], &[1, 1, 0]);
+        assert_eq!(&hidden[41..48], &[0; 7]);
+        task.state = 'Z';
+        publish(&mut v, &task);
+        assert_eq!(&fields(&mut v)[22..25], &[0; 3]);
+    }
+    #[test]
     fn common_devices_and_cross_process_privacy_have_real_behavior() {
         let mut v = Vfs::default();
         snapshot(&mut v);
@@ -810,7 +873,7 @@ pub struct ProcessInfo {
     pub maps: Vec<u8>,
     pub user_ticks: u64,
     pub start_ticks: u64,
-    pub start_stack: u64,
+    pub image_ranges: Option<trames_memory::ImageRanges>,
     /// Mount-local PTY number and guest-wide foreground process group.
     pub terminal_stat: Option<(u32, u32)>,
     pub fds: Vec<FdInfo>,
@@ -1878,6 +1941,13 @@ impl Vfs {
         &self,
         at: &P,
     ) -> Result<Option<(Content, u32)>> {
+        self.pseudo_content_for_reader(at, self)
+    }
+    pub(super) fn pseudo_content_for_reader<P: PathArg + ?Sized>(
+        &self,
+        at: &P,
+        reader: &Vfs,
+    ) -> Result<Option<(Content, u32)>> {
         let path = at.key();
         if let Some(content) = simple_device::builtin(path) {
             return Ok(Some(content));
@@ -2239,12 +2309,17 @@ impl Vfs {
                             .unwrap_or_else(|| nul_list(&p.environment)),
                         b"auxv" => p.auxiliary.clone(),
                         b"maps" => p.maps.clone(),
-                        b"mounts" => mounts::table_text(&p.namespaces, false),
-                        b"mountinfo" => mounts::table_text(&p.namespaces, true),
+                        b"mounts" => {
+                            mounts::table_text(&p.namespaces, false, &self.cgroup_namespace.path)
+                        }
+                        b"mountinfo" => {
+                            mounts::table_text(&p.namespaces, true, &self.cgroup_namespace.path)
+                        }
                         b"statm" => format!(
-                            "{} {} 0 0 0 {} 0\n",
+                            "{} {} 0 {} 0 {} 0\n",
                             p.virtual_bytes / 4096,
                             p.mapped_bytes / 4096,
+                            p.image_ranges.map_or(0, |r| r.executable.text_bytes()) / 4096,
                             (p.vm_sizes.data + p.vm_sizes.stack) / 4096
                         )
                         .into_bytes(),
@@ -2280,7 +2355,32 @@ impl Vfs {
                             fields[20] = p.virtual_bytes.to_string();
                             fields[21] = (p.mapped_bytes / 4096).to_string();
                             fields[22] = u64::MAX.to_string();
-                            fields[25] = p.start_stack.to_string();
+                            if let Some(image) = p.image_ranges.filter(|_| p.state != 'Z') {
+                                if reader.may_inspect_pid(
+                                    self.proc_namespace(at).local(reader.pid),
+                                    &r,
+                                    p,
+                                ) {
+                                    let exe = image.executable;
+                                    fields[23] = exe.code.0.to_string();
+                                    fields[24] = exe.code.1.to_string();
+                                    fields[25] = image.start_stack.to_string();
+                                    for (field, value) in fields[42..49].iter_mut().zip([
+                                        exe.data.0,
+                                        exe.data.1,
+                                        exe.start_brk,
+                                        image.arguments.0,
+                                        image.arguments.1,
+                                        image.environment.0,
+                                        image.environment.1,
+                                    ]) {
+                                        *field = value.to_string();
+                                    }
+                                } else {
+                                    fields[23] = "1".into();
+                                    fields[24] = "1".into();
+                                }
+                            }
                             fields[36] = p.processor.to_string();
                             format!("{} ({name}) {}\n", p.pid, fields.join(" ")).into_bytes()
                         }
@@ -2331,6 +2431,12 @@ impl Vfs {
                                     ));
                                 }
                             }
+                            let text = p
+                                .image_ranges
+                                .map_or(0, |r| r.executable.text_bytes())
+                                .min(p.vm_sizes.executable);
+                            let library = (p.vm_sizes.executable - text) / 1024;
+                            let text = text / 1024;
                             let fd_size = p
                                 .fds
                                 .iter()
@@ -2339,7 +2445,7 @@ impl Vfs {
                                 .unwrap_or(0)
                                 .max(64)
                                 .next_power_of_two();
-                            format!("Name:\t{name}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t{fd_size}\nGroups:\t{}\nVmSize:\t{} kB\nVmData:\t{} kB\nVmStk:\t{} kB\nVmHWM:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{threads}\nSigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\n", p.state, state_description(p.state), p.tgid, p.pid, p.parent,
+                            format!("Name:\t{name}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t{fd_size}\nGroups:\t{}\nVmSize:\t{} kB\nVmData:\t{} kB\nVmStk:\t{} kB\nVmExe:\t{text} kB\nVmLib:\t{library} kB\nVmHWM:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{threads}\nSigPnd:\t{:016x}\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\n", p.state, state_description(p.state), p.tgid, p.pid, p.parent,
                                 self.credentials.local_id(false,c.uid),self.credentials.local_id(false,c.euid),self.credentials.local_id(false,c.suid),self.credentials.local_id(false,c.fsuid),self.credentials.local_id(true,c.gid),self.credentials.local_id(true,c.egid),self.credentials.local_id(true,c.sgid),self.credentials.local_id(true,c.fsgid),c.groups.iter().map(|id|self.credentials.local_id(true,*id).to_string()).collect::<Vec<_>>().join(" "),p.virtual_bytes/1024,p.vm_sizes.data/1024,p.vm_sizes.stack/1024,p.peak_resident_bytes.max(p.mapped_bytes)/1024,p.mapped_bytes/1024,p.pending,p.shared_pending,p.blocked,p.ignored,p.caught).into_bytes()
                         }
                         b"limits" => p.limit_text(task_limit as u64),

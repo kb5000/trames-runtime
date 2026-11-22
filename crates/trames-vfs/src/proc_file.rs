@@ -146,7 +146,7 @@ impl ProcFile {
         }
         ProcRead::Complete(Ok(bytes.expect("admitted original mm reader")))
     }
-    pub fn read(&self, offset: u64, count: usize) -> Result<Vec<u8>> {
+    pub fn read(&self, offset: u64, count: usize, caller: &Vfs) -> Result<Vec<u8>> {
         if count == 0 {
             return Ok(Vec::new());
         }
@@ -156,11 +156,11 @@ impl ProcFile {
                 ProcRead::Waiting(_) => Err(Errno(11)),
             };
         }
-        let text = self.text()?;
+        let text = self.text(caller)?;
         let start = offset.min(text.len() as u64) as usize;
         Ok(text[start..text.len().min(start.saturating_add(count))].to_vec())
     }
-    fn text(&self) -> Result<Vec<u8>> {
+    fn text(&self, caller: &Vfs) -> Result<Vec<u8>> {
         if let Some(saved) = &self.saved {
             return Ok(saved.clone());
         }
@@ -197,7 +197,11 @@ impl ProcFile {
             &self.path,
             ProcRefresh::for_path(&self.path),
             view.proc_namespace(&path),
-            view.pid,
+            if self.target.is_some() && self.path.ends_with(b"/stat") {
+                caller.pid
+            } else {
+                view.pid
+            },
         );
         query.retained = self.target.as_ref();
         let mut runtime = self.source.observe(query);
@@ -221,7 +225,7 @@ impl ProcFile {
             }
         }
         view.pseudo.borrow_mut().runtime = runtime;
-        match view.pseudo_content(&path)? {
+        match view.pseudo_content_for_reader(&path, caller)? {
             Some((Content::File(data), _)) => data.read_at(0, data.len() as usize),
             _ => Err(Errno(3)),
         }

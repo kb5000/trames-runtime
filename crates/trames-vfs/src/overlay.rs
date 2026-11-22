@@ -1129,7 +1129,7 @@ mod tests {
         );
         std::thread::spawn(move || drop(accepted)).join().unwrap();
         v.umount(b"/lower", 0).unwrap();
-        let old = String::from_utf8(mounts::table_text(&observed.namespaces, true)).unwrap();
+        let old = String::from_utf8(mounts::table_text(&observed.namespaces, true, b"/")).unwrap();
         assert!(old.contains(" /merged ") && old.contains(" /lower "));
     }
     #[test]
@@ -1162,7 +1162,7 @@ mod tests {
         write(&mut v, b"/merged/file", b"new");
         v.sync().unwrap();
         assert_eq!(read(&mut v, b"/upper/file"), b"new");
-        let old = String::from_utf8(mounts::table_text(&observed.namespaces, true)).unwrap();
+        let old = String::from_utf8(mounts::table_text(&observed.namespaces, true, b"/")).unwrap();
         assert!(
             old.contains(" /merged "),
             "old proc metadata remains readable"

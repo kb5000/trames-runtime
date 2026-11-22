@@ -293,6 +293,8 @@ impl super::report::RegionLayout {
                 let mapping = entry.map(|(_, m)| m);
                 if mapping.is_some_and(|m| matches!(m.origin, Origin::Stack)) {
                     sizes.stack += end - start;
+                } else if perm.execute && !perm.write {
+                    sizes.executable += end - start;
                 } else if perm.write && !mapping.is_some_and(|m| m.shared) {
                     sizes.data += end - start;
                 }
@@ -394,17 +396,19 @@ mod tests {
         assert_eq!(
             report.vm_sizes(),
             VmSizes {
+                executable: 0,
                 data: 2 * p,
                 stack: 2 * p
             }
         );
         assert_eq!(report.resident_bytes(), resident);
         let mut child = mm.clone();
-        child.protect(3 * p, p, Permissions::R).unwrap();
+        child.protect(3 * p, p, Permissions::RX).unwrap();
         child.map_fixed(p, p, Permissions::RW).unwrap();
         assert_eq!(
             child.memory_report().vm_sizes(),
             VmSizes {
+                executable: p,
                 data: 2 * p,
                 stack: p
             }
@@ -413,6 +417,7 @@ mod tests {
         assert_eq!(
             child.memory_report().vm_sizes(),
             VmSizes {
+                executable: p,
                 data: 2 * p,
                 stack: 0
             }
@@ -420,6 +425,7 @@ mod tests {
         assert_eq!(
             report.vm_sizes(),
             VmSizes {
+                executable: 0,
                 data: 2 * p,
                 stack: 2 * p
             }

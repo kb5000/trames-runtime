@@ -870,6 +870,7 @@ impl ProcessView {
         if let Some(memory) = &image.memory {
             info.virtual_bytes = memory.virtual_bytes();
             if demand.residency() {
+                info.image_ranges = memory.image_ranges();
                 info.vm_sizes = memory.vm_sizes();
                 info.mapped_bytes = residency.unwrap_or_else(|| memory.resident_bytes());
                 info.peak_resident_bytes = memory.peak_with_residency(info.mapped_bytes);
@@ -997,7 +998,7 @@ mod tests {
         let observe = || {
             let mut info = ProcessInfo::default();
             source.observe(&mut info, ProcRefresh::Namespaces);
-            mounts::table_text(&info.namespaces, true)
+            mounts::table_text(&info.namespaces, true, b"/")
         };
         assert!(!observe().windows(7).any(|w| w == b" /mount"));
         owner
@@ -1009,7 +1010,7 @@ mod tests {
         owner.umount(b"/mount", 0).unwrap();
         assert!(!observe().windows(7).any(|w| w == b" /mount"));
         assert!(
-            mounts::table_text(&retained.namespaces, true)
+            mounts::table_text(&retained.namespaces, true, b"/")
                 .windows(7)
                 .any(|w| w == b" /mount"),
             "an immutable observation can finish after detach without becoming a mount use"
@@ -1069,7 +1070,7 @@ mod tests {
             source.observe(&mut info, ProcRefresh::Namespaces);
             ready.send(()).unwrap();
             resume.recv_timeout(Duration::from_secs(5)).unwrap();
-            mounts::table_text(&info.namespaces, true)
+            mounts::table_text(&info.namespaces, true, b"/")
         });
         let observed = observed.recv_timeout(Duration::from_secs(5));
         let result = owner.umount(b"/mount", 0);

@@ -4,10 +4,28 @@
 use super::*;
 use std::sync::{Arc, OnceLock, RwLock};
 
+/// Main ELF file ranges after applying its load bias.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExecutableRanges {
+    pub code: (u64, u64),
+    pub data: (u64, u64),
+    pub start_brk: u64,
+}
+
+impl ExecutableRanges {
+    pub fn text_bytes(self) -> u64 {
+        self.code
+            .1
+            .next_multiple_of(PAGE_SIZE)
+            .saturating_sub(self.code.0 & !(PAGE_SIZE - 1))
+    }
+}
+
 /// Original image bytes, independent of argv/envp pointer-array edits. These
 /// ranges describe guest addresses only; observing them touches no guest page.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ImageRanges {
+    pub executable: ExecutableRanges,
     pub arguments: (u64, u64),
     pub environment: (u64, u64),
     pub start_stack: u64,
@@ -35,6 +53,7 @@ impl Drop for ReportOwner {
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VmSizes {
+    pub executable: u64,
     pub data: u64,
     pub stack: u64,
 }
@@ -527,6 +546,7 @@ mod tests {
         let report = memory.memory_report();
         assert_eq!(report.image_ranges(), None);
         let image = ImageRanges {
+            executable: Default::default(),
             start_stack: 0,
             arguments: (0x1000, 0x1008),
             environment: (0x1008, 0x1010),
@@ -542,6 +562,7 @@ mod tests {
         assert_eq!(fork.memory_report().image_ranges(), Some(image));
         assert_ne!(fork.memory_report().identity(), report.identity());
         fork.set_image_ranges(ImageRanges {
+            executable: Default::default(),
             start_stack: 0,
             arguments: (0x2000, 0x2008),
             environment: (0x2008, 0x2008),
@@ -549,6 +570,7 @@ mod tests {
         assert_eq!(report.image_ranges(), Some(image));
         let mut shared = memory.share();
         shared.set_image_ranges(ImageRanges {
+            executable: Default::default(),
             start_stack: 0,
             arguments: image.arguments,
             environment: (0x1010, 0x1020),

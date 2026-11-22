@@ -105,6 +105,7 @@ mod tests {
         memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         memory.write(0x1000, b"one\0two\0E=1\0x=2\0").unwrap();
         let image = ProcImage(ImageRanges {
+            executable: Default::default(),
             start_stack: 0,
             arguments: (0x1000, 0x1008),
             environment: (0x1008, 0x1010),
@@ -137,6 +138,7 @@ mod tests {
         memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
         memory.write(0x1ffc, b"E=1\0").unwrap();
         let image = ProcImage(ImageRanges {
+            executable: Default::default(),
             start_stack: 0,
             arguments: (0, 0),
             environment: (0x1ffc, 0x2004),

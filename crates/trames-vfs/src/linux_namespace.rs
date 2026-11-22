@@ -84,6 +84,25 @@ pub(super) struct CgroupNamespace {
     pub path: Vec<u8>,
     live: Arc<std::sync::atomic::AtomicUsize>,
 }
+pub(super) fn relative_cgroup_path(root: &[u8], path: &[u8]) -> Vec<u8> {
+    if root == b"/" {
+        return path.to_vec();
+    }
+    let components = |p: &[u8]| {
+        p.split(|b| *b == b'/')
+            .filter(|p| !p.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<_>>()
+    };
+    let root = components(root);
+    let target = components(path);
+    let common = root.iter().zip(&target).take_while(|(a, b)| a == b).count();
+    let mut parts = vec![b"..".to_vec(); root.len() - common];
+    parts.extend_from_slice(&target[common..]);
+    let mut out = b"/".to_vec();
+    out.extend(parts.join(&b'/'));
+    out
+}
 impl Default for CgroupNamespace {
     fn default() -> Self {
         Self {
@@ -584,20 +603,7 @@ impl Vfs {
         Ok(())
     }
     pub(super) fn cgroup_view_path(&self, path: &[u8]) -> Vec<u8> {
-        let components = |p: &[u8]| {
-            p.split(|b| *b == b'/')
-                .filter(|p| !p.is_empty())
-                .map(<[u8]>::to_vec)
-                .collect::<Vec<_>>()
-        };
-        let root = components(&self.cgroup_namespace.path);
-        let target = components(path);
-        let common = root.iter().zip(&target).take_while(|(a, b)| a == b).count();
-        let mut parts = vec![b"..".to_vec(); root.len() - common];
-        parts.extend_from_slice(&target[common..]);
-        let mut out = b"/".to_vec();
-        out.extend(parts.join(&b'/'));
-        out
+        relative_cgroup_path(&self.cgroup_namespace.path, path)
     }
     pub fn unshare_uts(&mut self) -> Result<()> {
         if !self.credentials.has_local_cap(capabilities::SYS_ADMIN) {
@@ -1109,7 +1115,18 @@ mod tests {
         );
         assert!(v.stat_at(AT_FDCWD, b"/private-cgroup/inner").is_ok());
         assert!(v.stat_at(AT_FDCWD, b"/private-cgroup/outer").is_err());
+        let fd = v.open_at(AT_FDCWD, b"/proc/self/mountinfo", 0, 0).unwrap();
+        let roots = |v: &mut Vfs| {
+            String::from_utf8(v.pread(fd, 65536, 0).unwrap())
+                .unwrap()
+                .lines()
+                .filter(|l| l.contains(" - cgroup2 "))
+                .map(|l| l.split_whitespace().nth(3).unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(roots(&mut v), ["/..", "/"]);
         v.setns(root, CLONE_NEWCGROUP).unwrap();
+        assert_eq!(roots(&mut v), ["/", "/outer"]);
         assert_eq!(v.cgroup_view_path(b"/outer"), b"/outer");
     }
     #[test]

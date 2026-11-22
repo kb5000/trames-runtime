@@ -253,11 +253,11 @@ impl<C: Cpu> Process<C> {
                 0
             },
             virtual_bytes: self.memory.virtual_bytes(),
-            start_stack: self
-                .memory
-                .memory_report()
-                .image_ranges()
-                .map_or(0, |r| r.start_stack),
+            image_ranges: if demand.residency() {
+                self.memory.memory_report().image_ranges()
+            } else {
+                None
+            },
             maps,
             affinity: self.signals.io.scheduling.affinity(),
             processor: self.last_cpu as u32,
@@ -307,6 +307,7 @@ mod tests {
     fn image(memory: &mut trames_memory::Memory, bytes: &[u8]) {
         memory.write(0x5800, bytes).unwrap();
         memory.set_image_ranges(trames_memory::ImageRanges {
+            executable: Default::default(),
             start_stack: 0,
             arguments: (0x5800, 0x5804),
             environment: (0x5804, 0x5808),
@@ -419,6 +420,7 @@ mod tests {
         process.memory.write(0x5000, b"a").unwrap();
         process.memory.write(0x6000, b"b").unwrap();
         process.memory.set_image_ranges(trames_memory::ImageRanges {
+            executable: Default::default(),
             start_stack: 0,
             arguments: (0x4000, 0x4001),
             environment: (0x5000, 0x7000),

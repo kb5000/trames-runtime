@@ -7119,6 +7119,7 @@ mod tests {
         let mut k = kernel();
         let mut p = process();
         p.memory.set_image_ranges(trames_memory::ImageRanges {
+            executable: Default::default(),
             start_stack: 0,
             arguments: (0x2000, 0x2008),
             environment: (0x2008, 0x200e),

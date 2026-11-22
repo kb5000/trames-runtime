@@ -13,12 +13,12 @@ pub(crate) struct MountFile {
     _root_use: Option<MountUse>,
 }
 impl MountFile {
-    pub fn text(&self) -> Vec<u8> {
+    fn text(&self, cgroup_root: &[u8]) -> Vec<u8> {
         let (snapshot, _lease) = self.snapshot.project();
-        table_text(&snapshot, self.info)
+        table_text(&snapshot, self.info, cgroup_root)
     }
-    pub fn read(&self, offset: u64, count: usize) -> Vec<u8> {
-        let text = self.text();
+    pub fn read(&self, offset: u64, count: usize, cgroup_root: &[u8]) -> Vec<u8> {
+        let text = self.text(cgroup_root);
         let start = offset.min(text.len() as u64) as usize;
         text[start..text.len().min(start.saturating_add(count))].to_vec()
     }
