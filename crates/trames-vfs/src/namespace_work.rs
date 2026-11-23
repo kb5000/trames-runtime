@@ -4,6 +4,7 @@ use super::*;
 
 pub enum NamespaceCall {
     MountFd(MountFdCall),
+    MountQuery(MountQuery),
     MqOpen {
         name: Vec<u8>,
         flags: u32,
@@ -110,7 +111,9 @@ impl NamespaceCall {
     fn paths(&self) -> Vec<(i32, Option<&[u8]>, bool)> {
         match self {
             Self::MountFd(call) => call.operands(),
-            Self::Memfd(_) | Self::MqOpen { .. } | Self::MqUnlink(_) => Vec::new(),
+            Self::Memfd(_) | Self::MqOpen { .. } | Self::MqUnlink(_) | Self::MountQuery(_) => {
+                Vec::new()
+            }
             Self::Mount {
                 source,
                 target,
@@ -185,12 +188,22 @@ impl NamespaceCall {
         matches!(self, Self::MountFd(call) if call.topology())
             || matches!(
                 self,
-                Self::Mount { .. } | Self::Umount { .. } | Self::PivotRoot { .. }
+                Self::Mount { .. }
+                    | Self::Umount { .. }
+                    | Self::PivotRoot { .. }
+                    | Self::MountQuery(_)
             )
+    }
+    fn admin(&self, v: &Vfs) -> Result<Arc<mounts::admin::Admin>> {
+        match self {
+            Self::MountQuery(query) => v.mount_query_admin(query.namespace),
+            _ => v.mount_admin(),
+        }
     }
     fn execute_locked(&self, v: &mut Vfs) -> Result<FileValue> {
         match self {
             Self::MountFd(call) => return call.run(v).map(FileValue::Count),
+            Self::MountQuery(query) => return v.mount_query(query).map(FileValue::Bytes),
             Self::Mount {
                 source,
                 target,
@@ -233,6 +246,11 @@ impl NamespaceCall {
                     return call.run(v).map(FileValue::Count);
                 }
                 return call.run(v).map(FileValue::Count);
+            }
+            Self::MountQuery(query) => {
+                let admin = self.admin(v)?;
+                let _lease = admin.enter();
+                return v.mount_query(query).map(FileValue::Bytes);
             }
             Self::Mount {
                 source,
@@ -581,7 +599,7 @@ impl NamespaceWork {
         }
         self.waiting = None;
         let admin = if self.call.topology() {
-            match view.mount_admin() {
+            match self.call.admin(view) {
                 Ok(admin) => Some(admin),
                 Err(error) => return NamespaceRun::Complete(Err(error)),
             }

@@ -80,6 +80,10 @@ pub enum FileOutput {
     None,
     Write,
     Scalar(u64),
+    MountQuery {
+        address: u64,
+        list: bool,
+    },
     Vectors(Vec<(u64, usize)>),
     Stat(u64),
     Buffer {
@@ -133,6 +137,12 @@ impl FileOutput {
                     }
                     Self::Scalar(address) => {
                         memory.write(*address, &bytes).map_err(|_| Errno(14))?
+                    }
+                    Self::MountQuery { address, list } => {
+                        if !bytes.is_empty() {
+                            memory.write(*address, &bytes).map_err(|_| Errno(14))?;
+                        }
+                        return Ok(if *list { (bytes.len() / 8) as u64 } else { 0 });
                     }
                     Self::Vectors(parts) => Linux::scatter(memory, parts, &bytes)?,
                     Self::Buffer {

@@ -121,6 +121,7 @@ mod memfd;
 pub use memfd::MemfdParameters;
 mod mounts;
 pub use mounts::fd::{MountAttributes, MountFdCall};
+pub use mounts::query::{MountQuery, MountQueryKind, UNIQUE_MOUNT_ID_BASE};
 use mounts::{Mount, PathArg};
 pub use mounts::{MountNamespace, ResolvedPath, CLONE_NEWNS};
 mod syscall_names;
@@ -669,11 +670,23 @@ struct MetadataTarget {
 pub struct StatMount {
     pub id: u64,
     pub is_root: bool,
+    mounted: bool,
 }
 impl StatMount {
+    fn mounted(id: u64, is_root: bool) -> Self {
+        Self {
+            id,
+            is_root,
+            mounted: true,
+        }
+    }
+    pub fn unique_id(self) -> Option<u64> {
+        self.mounted.then_some(UNIQUE_MOUNT_ID_BASE + self.id)
+    }
     fn for_open(open: &OpenDescription) -> Self {
         Self {
             id: Vfs::open_mount_id(open),
+            mounted: open.mount.is_some(),
             is_root: open.mount.as_ref().is_some_and(|m| {
                 open.node.as_ref().is_some_and(|n| Arc::ptr_eq(n, &m.root))
                     || m.kind == mounts::Kind::Nsfs && open.namespace_resource.is_some()
@@ -4333,6 +4346,7 @@ impl Vfs {
             Some(ResolvedTarget::Inode(file)) => {
                 let mount = StatMount {
                     id: file.mount.as_ref().map_or(1, |m| m.id),
+                    mounted: file.mount.is_some(),
                     is_root: file
                         .mount
                         .as_ref()
@@ -4356,7 +4370,14 @@ impl Vfs {
                 .as_ref()
                 .and_then(|m| m.root.host.get())
                 .is_some_and(|root| root.matches_stat(&stat));
-            return Ok((stat, StatMount { id, is_root }));
+            return Ok((
+                stat,
+                StatMount {
+                    id,
+                    is_root,
+                    mounted: p.mount.is_some(),
+                },
+            ));
         }
         let n = self.node(&p)?;
         let is_root = p
@@ -4365,7 +4386,16 @@ impl Vfs {
             .map_or_else(|| p.key == b"/", |m| Arc::ptr_eq(&n, &m.root));
         let mount = p.mount.map(OpenMount::Owner);
         let out = self.stat_inode(&n, mount.as_ref());
-        out.map(|stat| (stat, StatMount { id, is_root }))
+        out.map(|stat| {
+            (
+                stat,
+                StatMount {
+                    id,
+                    is_root,
+                    mounted: mount.is_some(),
+                },
+            )
+        })
     }
     pub fn stat_fd(&self, fd: u32) -> Result<[u8; 128]> {
         self.stat_fd_with_mount(fd).map(|(stat, _)| stat)

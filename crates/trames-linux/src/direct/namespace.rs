@@ -4,8 +4,78 @@ use super::*;
 use trames_vfs::NamespaceCall as Call;
 
 pub(crate) fn supported(number: u32) -> bool {
-    matches!(number, 5..=17 | 33..=41 | 43 | 44 | 49..=55 | 88 | 180 | 181 | 276 | 279 | 428..=432 | 442 | 452)
+    matches!(number, 5..=17 | 33..=41 | 43 | 44 | 49..=55 | 88 | 180 | 181 | 276 | 279 | 428..=432 | 442 | 452 | 457 | 458)
 }
+
+fn mount_query(
+    list: bool,
+    [request, address, capacity, flags, _, _]: [u64; 6],
+    memory: &impl CpuMemory,
+) -> Result<(Call, FileOutput), Errno> {
+    use trames_vfs::{MountQuery, MountQueryKind, UNIQUE_MOUNT_ID_BASE};
+    let flags = flags as u32;
+    if flags & !u32::from(list) != 0 {
+        return Err(Errno(22));
+    }
+    if list && capacity > 1_000_000 {
+        return Err(Errno(75));
+    }
+    let check_range = |bytes| {
+        if address > trames_memory::ADDRESS_LIMIT || bytes > trames_memory::ADDRESS_LIMIT - address
+        {
+            Err(Errno(14))
+        } else {
+            Ok(())
+        }
+    };
+    if list {
+        check_range(capacity * 8)?;
+    }
+    let size = u32::from_le_bytes(memory.read_array(request).map_err(|_| Errno(14))?) as usize;
+    if size > trames_memory::PAGE_SIZE as usize {
+        return Err(Errno(7));
+    }
+    if size < 24 {
+        return Err(Errno(22));
+    }
+    let mut bytes = [0; trames_memory::PAGE_SIZE as usize];
+    memory
+        .read(request, &mut bytes[..size])
+        .map_err(|_| Errno(14))?;
+    if size > 32 && bytes[32..size].iter().any(|&byte| byte != 0) {
+        return Err(Errno(7));
+    }
+    let u64_at = |i| u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
+    let (mount, param, namespace) = (u64_at(8), u64_at(16), u64_at(24));
+    if mount <= UNIQUE_MOUNT_ID_BASE
+        || bytes[4..8] != [0; 4]
+        || list && param != 0 && param <= UNIQUE_MOUNT_ID_BASE
+    {
+        return Err(Errno(22));
+    }
+    let kind = if list {
+        MountQueryKind::List {
+            cursor: param,
+            count: capacity as usize,
+            reverse: flags != 0,
+        }
+    } else {
+        check_range(capacity)?;
+        MountQueryKind::Stat {
+            mask: param,
+            capacity,
+        }
+    };
+    Ok((
+        Call::MountQuery(MountQuery {
+            namespace,
+            mount,
+            kind,
+        }),
+        FileOutput::MountQuery { address, list },
+    ))
+}
+
 pub(super) fn import(
     number: u32,
     a: [u64; 6],
@@ -14,6 +84,7 @@ pub(super) fn import(
 ) -> Result<(Call, FileOutput), Errno> {
     let output = FileOutput::None;
     let call = match number {
+        457 | 458 => return mount_query(number == 458, a, memory),
         428..=432 => {
             use trames_vfs::MountFdCall as M;
             let opt = |address| {

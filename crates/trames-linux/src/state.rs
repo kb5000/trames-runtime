@@ -990,7 +990,13 @@ impl Linux {
         mount: trames_vfs::StatMount,
     ) -> Result<u64> {
         let mut out = [0u8; 256];
-        out[..4].copy_from_slice(&0x17ffu32.to_le_bytes()); // BASIC_STATS and MNT_ID; no birth time.
+        let unique = a[3] & 0x4000 != 0;
+        let (mount_mask, id) = if unique {
+            mount.unique_id().map_or((0, 0), |id| (0x4000u32, id))
+        } else {
+            (0x1000, mount.id)
+        };
+        out[..4].copy_from_slice(&(0x7ff | mount_mask).to_le_bytes());
         out[4..8].copy_from_slice(&stat[56..60]);
         const ATTR_MOUNT_ROOT: u64 = 0x2000;
         out[8..16]
@@ -1015,7 +1021,7 @@ impl Linux {
             out[offset..offset + 4].copy_from_slice(&(major as u32).to_le_bytes());
             out[offset + 4..offset + 8].copy_from_slice(&(minor as u32).to_le_bytes());
         }
-        out[144..152].copy_from_slice(&mount.id.to_le_bytes());
+        out[144..152].copy_from_slice(&id.to_le_bytes());
         memory.write(a[4], &out).map_err(|_| Errno(14))?;
         Ok(0)
     }
@@ -1628,7 +1634,7 @@ impl Linux {
     ) -> Result<u64>;
         pub fn has_syscall;
         {
-            5..=17 | 33..=41 | 43 | 44 | 49..=55 | 88 | 180 | 181 | 276 | 279 | 428..=432 | 442 | 452 => {
+            5..=17 | 33..=41 | 43 | 44 | 49..=55 | 88 | 180 | 181 | 276 | 279 | 428..=432 | 442 | 452 | 457 | 458 => {
                 crate::direct::namespace::owner(number as u32, a, memory, &mut self.vfs)
             },
             219 => crate::keyctl(&self.session_keys, &self.vfs.key_registry(), &self.vfs.credentials, a, memory),

@@ -75,6 +75,15 @@ impl State {
         }
         self
     }
+
+    pub(super) fn dominating_group(&self, visible: &BTreeSet<u64>) -> u64 {
+        self.master
+            .iter()
+            .chain(&self.lineage)
+            .map(|g| g.id)
+            .find(|id| visible.contains(id))
+            .unwrap_or(0)
+    }
 }
 fn members(namespaces: &[MountNamespace]) -> Vec<Arc<Mount>> {
     namespaces
@@ -112,9 +121,15 @@ impl Mount {
 pub(super) type Metadata = Mutex<State>;
 
 impl MountNamespace {
-    pub(super) fn create(table: Table) -> Self {
+    pub(super) fn create(mut table: Table, policy: &Arc<MountPolicy>) -> Self {
+        let id = table.id;
+        table.registry = Some(Arc::downgrade(policy));
         let table = Arc::new(SharedCell::new(table));
         table.borrow().admin.register(&table);
+        policy
+            .namespaces
+            .borrow_mut()
+            .insert(id, Arc::downgrade(&table));
         Self(table)
     }
 }

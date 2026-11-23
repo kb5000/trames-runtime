@@ -116,10 +116,7 @@ impl File {
             kind,
             reference: None,
             open: None,
-            mount: StatMount {
-                id: self.mount.id,
-                is_root: false,
-            },
+            mount: StatMount::mounted(self.mount.id, false),
             dev: self.mount.device(),
             owner_ns: fs.namespace.clone(),
             reader_ns: v.credentials.user_namespace.clone(),
@@ -142,10 +139,7 @@ impl File {
                 &self.reference.fs.namespace,
                 &v.credentials.user_namespace,
             )?,
-            StatMount {
-                id: self.mount.id,
-                is_root: false,
-            },
+            StatMount::mounted(self.mount.id, false),
         ))
     }
     pub(crate) fn disable_flush(&self) {

@@ -4,6 +4,7 @@ use super::*;
 pub(super) mod admin;
 pub(crate) mod fd;
 mod propagation;
+pub(crate) mod query;
 mod registry;
 pub(super) use registry::Registry;
 #[cfg(test)]
@@ -39,6 +40,7 @@ pub(super) struct MountPolicy {
     limit: std::sync::atomic::AtomicU32,
     groups: propagation::Groups,
     path_changes: AtomicU64,
+    namespaces: SharedCell<BTreeMap<u64, std::sync::Weak<SharedCell<Table>>>>,
 }
 impl Default for MountPolicy {
     fn default() -> Self {
@@ -46,6 +48,7 @@ impl Default for MountPolicy {
             limit: std::sync::atomic::AtomicU32::new(128),
             groups: Default::default(),
             path_changes: AtomicU64::new(0),
+            namespaces: Default::default(),
         }
     }
 }
@@ -108,6 +111,24 @@ pub(super) enum Kind {
     Overlay,
     #[cfg(all(feature = "hostfs", unix))]
     Host,
+}
+impl Kind {
+    fn statfs_magic(self) -> u64 {
+        match self {
+            Kind::Root => 0x5452414d4553u64,
+            Kind::Tmpfs => 0x01021994,
+            Kind::Fuse => 0x65735546,
+            Kind::Proc => 0x9fa0,
+            Kind::Sysfs => 0x62656572,
+            Kind::Devpts => 0x1cd1,
+            Kind::Cgroup => 0x63677270,
+            Kind::Nsfs => 0x6e736673,
+            Kind::Mqueue => 0x19800202,
+            Kind::Overlay => 0x794c7630,
+            #[cfg(all(feature = "hostfs", unix))]
+            Kind::Host => 0x686f7374,
+        }
+    }
 }
 #[derive(Clone)]
 pub(super) struct Attachment {
@@ -536,6 +557,7 @@ pub(super) struct Table {
     // A query-local topology snapshot is observation, never mutable authority.
     // Accepted nsfs opens upgrade this original resource instead.
     original: Option<std::sync::Weak<SharedCell<Table>>>,
+    registry: Option<std::sync::Weak<MountPolicy>>,
 }
 impl Table {
     fn new(root: Arc<Mount>, mounts: Vec<Arc<Mount>>) -> Result<Self> {
@@ -548,6 +570,7 @@ impl Table {
             events: Arc::default(),
             admin: Arc::default(),
             original: None,
+            registry: None,
         })
     }
     pub(super) fn project(source: &Arc<SharedCell<Self>>) -> Self {
@@ -569,6 +592,14 @@ impl Table {
                     .clone()
                     .unwrap_or_else(|| Arc::downgrade(source)),
             ),
+            registry: None,
+        }
+    }
+}
+impl Drop for Table {
+    fn drop(&mut self) {
+        if let Some(policy) = self.registry.as_ref().and_then(std::sync::Weak::upgrade) {
+            policy.namespaces.borrow_mut().remove(&self.id);
         }
     }
 }
@@ -777,7 +808,10 @@ impl Vfs {
             paths.cwd_mount = Some(root.clone());
             paths.root_mount = Some(root);
         }
-        self.mounts = Some(MountNamespace::create(table));
+        self.mounts = Some(MountNamespace::create(
+            table,
+            &self.pseudo.borrow().mount_policy,
+        ));
         Ok(())
     }
     // Resolve owner topology only for pathname/namespace operations. Ordinary
@@ -1092,7 +1126,10 @@ impl Vfs {
         if let Some(admin) = shared_admin {
             table.admin = admin;
         }
-        self.mounts = Some(MountNamespace::create(table));
+        self.mounts = Some(MountNamespace::create(
+            table,
+            &self.pseudo.borrow().mount_policy,
+        ));
         Ok(())
     }
 }
@@ -2087,6 +2124,56 @@ impl Mount {
             Kind::Host => "trames-host",
         }
     }
+    fn source(&self) -> &[u8] {
+        self.display.source.as_deref().unwrap_or_else(|| {
+            if self.kind == Kind::Root {
+                b"/dev/vda1"
+            } else {
+                self.fs_name().as_bytes()
+            }
+        })
+    }
+    fn super_options(&self) -> String {
+        if self
+            .display
+            .nsdelegate
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            "nsdelegate".to_owned()
+        } else if let Some(mode) = self.display.tmpfs_mode {
+            format!("mode={mode:o}")
+        } else {
+            self.fs
+                .borrow()
+                .overlay
+                .as_ref()
+                .map(|o| escape_mount_field(o.options()))
+                .unwrap_or_default()
+        }
+    }
+    fn super_readonly(&self) -> bool {
+        self.fs
+            .super_readonly
+            .as_ref()
+            .map_or_else(|| self.readonly(), |ro| ro.load(Ordering::Relaxed))
+    }
+    fn reported_root(&self, filesystem_root: Vec<u8>, cgroup_root: &[u8]) -> Vec<u8> {
+        let root = match self.kind {
+            Kind::Cgroup => linux_namespace::relative_cgroup_path(cgroup_root, &filesystem_root),
+            Kind::Proc | Kind::Sysfs | Kind::Devpts => self
+                .root_path()
+                .strip_prefix(self.root_key.as_slice())
+                .unwrap_or(b"/")
+                .to_vec(),
+            _ => filesystem_root,
+        };
+        if root.is_empty() {
+            b"/".to_vec()
+        } else {
+            root
+        }
+    }
     fn options(&self) -> String {
         let flags = self.flags.get();
         let mut out = if flags & MS_RDONLY != 0 { "ro" } else { "rw" }.to_owned();
@@ -2154,53 +2241,20 @@ pub(super) fn table_text(snapshot: &NamespaceSnapshot, info: bool, cgroup_root: 
         if target.is_empty() {
             target.push(b'/');
         }
-        let source = match m.display.source.as_deref() {
-            Some(source) => escape_mount_field(source),
-            None if m.kind == Kind::Root => "/dev/vda1".to_owned(),
-            None => m.fs_name().to_owned(),
-        };
+        let source = escape_mount_field(m.source());
         let flags = m.options();
-        let super_options = if m
-            .display
-            .nsdelegate
-            .as_ref()
-            .is_some_and(|flag| flag.load(Ordering::Relaxed))
-        {
-            ",nsdelegate".to_owned()
-        } else if let Some(mode) = m.display.tmpfs_mode {
-            format!(",mode={mode:o}")
-        } else {
-            m.fs.borrow()
-                .overlay
-                .as_ref()
-                .map(|o| format!(",{}", escape_mount_field(o.options())))
-                .unwrap_or_default()
-        };
+        let super_options = m.super_options();
+        let separator = if super_options.is_empty() { "" } else { "," };
         if info {
-            let root = match m.kind {
-                Kind::Cgroup => {
-                    linux_namespace::relative_cgroup_path(cgroup_root, &filesystem_root)
-                }
-                Kind::Proc | Kind::Sysfs | Kind::Devpts => m
-                    .root_path()
-                    .strip_prefix(m.root_key.as_slice())
-                    .unwrap_or(b"/")
-                    .to_vec(),
-                _ => filesystem_root,
-            };
-            let root = if root.is_empty() { b"/".to_vec() } else { root };
+            let root = m.reported_root(filesystem_root, cgroup_root);
             let dev = m.device();
             let parent = m
                 .parent
                 .borrow()
                 .as_ref()
                 .map_or(table.root_parent_id, |a| a.parent.id);
-            let super_readonly =
-                m.fs.super_readonly
-                    .as_ref()
-                    .map_or_else(|| m.readonly(), |readonly| readonly.load(Ordering::Relaxed));
             text.push_str(&format!(
-                "{} {} {}:{} {} {} {}{} - {} {} {}{}\n",
+                "{} {} {}:{} {} {} {}{} - {} {} {}{}{}\n",
                 m.id,
                 parent,
                 (dev >> 8) & 0xfff,
@@ -2221,16 +2275,18 @@ pub(super) fn table_text(snapshot: &NamespaceSnapshot, info: bool, cgroup_root: 
                 },
                 m.fs_name(),
                 source,
-                if super_readonly { "ro" } else { "rw" },
+                if m.super_readonly() { "ro" } else { "rw" },
+                separator,
                 super_options,
             ));
         } else {
             text.push_str(&format!(
-                "{} {} {} {}{} 0 0\n",
+                "{} {} {} {}{}{} 0 0\n",
                 source,
                 escape_mount_field(&target),
                 m.fs_name(),
                 flags,
+                separator,
                 super_options,
             ));
         }
@@ -2257,20 +2313,7 @@ impl Vfs {
                 Some(Box::new(fuse::Metadata::statfs(self, m, fs, stat_flags)?));
             return query.defer();
         }
-        let magic = match m.kind {
-            Kind::Root => 0x5452414d4553u64,
-            Kind::Tmpfs => 0x01021994,
-            Kind::Fuse => 0x65735546,
-            Kind::Proc => 0x9fa0,
-            Kind::Sysfs => 0x62656572,
-            Kind::Devpts => 0x1cd1,
-            Kind::Cgroup => 0x63677270,
-            Kind::Nsfs => 0x6e736673,
-            Kind::Mqueue => 0x19800202,
-            Kind::Overlay => 0x794c7630,
-            #[cfg(all(feature = "hostfs", unix))]
-            Kind::Host => 0x686f7374,
-        };
+        let magic = m.kind.statfs_magic();
         let capacity = Self::filesystem_capacity(&m.fs.borrow());
         if matches!(m.kind, Kind::Root | Kind::Tmpfs | Kind::Overlay) {
             for (offset, value) in [
