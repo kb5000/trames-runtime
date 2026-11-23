@@ -68,3 +68,33 @@ median milliseconds from 32 measured pairs after two warm-up pairs.
 | Unix socketpair | 13.026 | 12.979 | -0.36% |
 | Unix stream send and receive | 20.893 | 20.909 | +0.07% |
 | Unix datagram send and receive | 22.366 | 22.334 | -0.14% |
+
+## Chain entry validation follow-up
+
+Chain labels and the terminal marker retain their wire entries and counter
+slots. They carry no executable rule body. The parser resolves table entry
+points, policy offsets and jumps through one executable-entry check, and its
+graph walk checks fallthrough destinations. The evaluator drops a packet if
+it encounters a record without a rule body.
+
+The IPv4 and IPv6 regression tests cover rule-boundary lookup, metadata-only
+records and atomic rejection when an offset is invalid. Rejection leaves the
+previous table and counters in place and precedes counter copyout. The two
+historical upstream crash cases still have no Trames test records.
+
+The Mac runner and the interpreter each passed 58 original IPv4 and IPv6
+iptables tests. The two IPv4 initial-table tests used the upstream
+userspace-kernel mode. Both runners also passed the signed Alpine legacy
+tool checks for legitimate user chains, counters and REDIRECT. Runtime CI
+passed all eight stages, and the ARM64 iOS FFI check passed.
+
+Runner SHA-256 values were
+`44973bc238b9d95031a7d1641c8863f18a75662e9ad1f8eabf8b18946bad6390`
+for Mac and
+`bef22c3be435a7274ce95f235ef2496037bc6d85e78b18cac9f3d2c8dd514275`
+for the interpreter. Logs and case selections are under
+`target/gvisor-iptables-entry-20261123` in the iPad checkout.
+
+The same six ordinary socket workloads ran for 32 paired samples against
+Runtime `c856286`. Median elapsed changes ranged from -1.12% to
++0.35%.

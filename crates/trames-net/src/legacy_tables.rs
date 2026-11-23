@@ -174,10 +174,15 @@ impl Tables {
 
 struct Entry {
     offset: usize,
+    counters: ChainCounters,
+    // Chain labels and the end of the image occupy wire entries with counter
+    // slots. Only packet rules have a body that the evaluator can execute.
+    packet_rule: Option<PacketRule>,
+}
+struct PacketRule {
     action: Action,
     unconditional: bool,
     rule: Rule,
-    counters: ChainCounters,
 }
 #[derive(Clone, Copy)]
 enum Action {
@@ -186,7 +191,6 @@ enum Action {
     Return,
     Jump { offset: usize, tail: bool },
     Continue,
-    Marker,
 }
 
 pub(super) struct LegacyTable {
@@ -279,7 +283,7 @@ impl LegacyTable {
             }
             let action = match target {
                 "" if parameters.len() == STANDARD - XT_HEADER && revision == 0 => {
-                    match word(parameters, 0) as i32 {
+                    Some(match word(parameters, 0) as i32 {
                         -1 => Action::Drop,
                         -2 => Action::Accept,
                         -5 => Action::Return,
@@ -288,14 +292,14 @@ impl LegacyTable {
                             tail: flags & (if family == 2 { 2 } else { 4 }) != 0,
                         },
                         _ => return Err(NetError(95)),
-                    }
+                    })
                 }
                 "ERROR"
                     if parameters.len() == ERROR - XT_HEADER
                         && revision == 0
                         && expressions.is_empty() =>
                 {
-                    Action::Marker
+                    None
                 }
                 "" | "ERROR" => return Err(NetError(22)),
                 name_str => {
@@ -306,25 +310,27 @@ impl LegacyTable {
                         return Err(NetError(22));
                     }
                     expressions.push(target);
-                    Action::Continue
+                    Some(Action::Continue)
                 }
             };
-            let rule = Rule {
-                handle: 0,
-                userdata: Vec::new(),
-                wire: Vec::new(),
-                compatibility: None,
-                expressions: {
-                    expressions.push(Expr::Verdict(1, None));
-                    expressions
-                },
-            };
+            let packet_rule = action.map(|action| {
+                expressions.push(Expr::Verdict(1, None));
+                PacketRule {
+                    action,
+                    unconditional,
+                    rule: Rule {
+                        handle: 0,
+                        userdata: Vec::new(),
+                        wire: Vec::new(),
+                        compatibility: None,
+                        expressions,
+                    },
+                }
+            });
             entry[layout.counters..base].fill(0);
             out.push(Entry {
                 offset,
-                action,
-                unconditional,
-                rule,
+                packet_rule,
                 counters: ChainCounters {
                     bytes: Counter::default(),
                     packets: Counter::default(),
@@ -332,30 +338,18 @@ impl LegacyTable {
             });
             offset += next;
         }
-        if out.len() != count
-            || !out
-                .last()
-                .is_some_and(|entry| matches!(entry.action, Action::Marker))
-        {
+        if out.len() != count || !out.last().is_some_and(|entry| entry.packet_rule.is_none()) {
             return Err(NetError(22));
         }
-        let find = |entries: &[Entry], offset| {
-            entries
-                .binary_search_by_key(&offset, |entry| entry.offset)
-                .map_err(|_| NetError(22))
-        };
         let mut start_index = [0; HOOKS];
         let mut policy_index = [0; HOOKS];
         for hook in 0..HOOKS {
             if name.hooks() & (1 << hook) == 0 {
                 continue;
             }
-            let start = find(&out, start[hook])?;
-            let idx = find(&out, policy[hook])?;
-            let fallback = &out[idx];
-            if matches!(out[start].action, Action::Marker)
-                || !matches!(fallback.action, Action::Accept | Action::Drop)
-                || !fallback.unconditional
+            let (start, _) = Self::resolve_rule(&out, start[hook])?;
+            let (idx, fallback) = Self::resolve_rule(&out, policy[hook])?;
+            if !matches!(fallback.action, Action::Accept | Action::Drop) || !fallback.unconditional
             {
                 return Err(NetError(22));
             }
@@ -363,12 +357,11 @@ impl LegacyTable {
             policy_index[hook] = idx;
         }
         for idx in 0..out.len() {
-            if let Action::Jump { offset, tail } = out[idx].action {
-                let next = find(&out, offset)?;
-                if matches!(out[next].action, Action::Marker) {
-                    return Err(NetError(22));
-                }
-                out[idx].action = Action::Jump { offset: next, tail };
+            if let Some(Action::Jump { offset, tail }) =
+                out[idx].packet_rule.as_ref().map(|rule| rule.action)
+            {
+                let (next, _) = Self::resolve_rule(&out, offset)?;
+                out[idx].packet_rule.as_mut().unwrap().action = Action::Jump { offset: next, tail };
             }
         }
         // Iterative graph walk. Each edge stays inside the checked entry index,
@@ -384,6 +377,14 @@ impl LegacyTable {
         })
     }
 
+    fn resolve_rule(entries: &[Entry], offset: usize) -> Result<(usize, &PacketRule)> {
+        let index = entries
+            .binary_search_by_key(&offset, |entry| entry.offset)
+            .map_err(|_| NetError(22))?;
+        let rule = entries[index].packet_rule.as_ref().ok_or(NetError(22))?;
+        Ok((index, rule))
+    }
+
     fn check_links(entries: &[Entry], start: &[usize; HOOKS], hooks: u8) -> Result<()> {
         let mut states = vec![0; entries.len()];
         let mut pending = Vec::new();
@@ -394,18 +395,19 @@ impl LegacyTable {
             states.fill(0);
             pending.push((entry, false));
             while let Some((idx, returning)) = pending.pop() {
+                let state = states.get_mut(idx).ok_or(NetError(22))?;
                 if returning {
-                    states[idx] = 2;
+                    *state = 2;
                     continue;
                 }
-                match states[idx] {
+                match *state {
                     2 => continue,
                     1 => return Err(NetError(40)),
                     _ => {}
                 }
-                states[idx] = 1;
+                let entry = entries[idx].packet_rule.as_ref().ok_or(NetError(22))?;
+                *state = 1;
                 pending.push((idx, true));
-                let entry = &entries[idx];
                 for expression in &entry.rule.expressions {
                     match expression {
                         Expr::FixedNat { kind, .. } if !kind.valid_hook(hook as u32) => {
@@ -428,10 +430,6 @@ impl LegacyTable {
                         Action::Continue | Action::Jump { tail: false, .. }
                     );
                 if can_continue {
-                    let next = entries.get(idx + 1).ok_or(NetError(22))?;
-                    if matches!(next.action, Action::Marker) {
-                        return Err(NetError(22));
-                    }
                     pending.push((idx + 1, false));
                 }
             }
@@ -450,8 +448,11 @@ impl LegacyTable {
             let Some(entry) = self.entries.get(index) else {
                 return false;
             };
+            let Some(rule) = &entry.packet_rule else {
+                return false;
+            };
             let bytes = &self.wire[entry.offset..entry.offset + self.layout.entry()];
-            if !entry.unconditional
+            if !rule.unconditional
                 && !self
                     .layout
                     .matches(bytes, ctx, header.protocol, header.first)
@@ -459,7 +460,7 @@ impl LegacyTable {
                 index += 1;
                 continue;
             }
-            match entry.rule.verdict(ctx, effects, &self.empty_sets) {
+            match rule.rule.verdict(ctx, effects, &self.empty_sets) {
                 None => {
                     index += 1;
                     continue;
@@ -468,9 +469,9 @@ impl LegacyTable {
                 Some(_) => {}
             }
             entry.counters.record(ctx.packet.len());
-            match entry.action {
+            match rule.action {
                 Action::Accept => return true,
-                Action::Drop | Action::Marker => return false,
+                Action::Drop => return false,
                 Action::Continue if effects.nat.is_some() => return true,
                 Action::Continue => {
                     index += 1;
@@ -691,8 +692,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn replacement_preserves_table_on_counter_write_failure() {
-        let family = 2;
+    fn only_packet_rules_can_be_resolved_at_wire_offsets() {
+        for family in [2, 10] {
+            let table = LegacyTable::initial(family, Name::Filter);
+            assert!(LegacyTable::resolve_rule(&table.entries, 0).is_ok());
+            let end_marker = table.entries.last().unwrap().offset;
+            assert!(table.entries.last().unwrap().packet_rule.is_none());
+            assert!(matches!(
+                LegacyTable::resolve_rule(&table.entries, end_marker),
+                Err(NetError(22))
+            ));
+            assert!(matches!(
+                LegacyTable::resolve_rule(&table.entries, 8),
+                Err(NetError(22))
+            ));
+        }
+    }
+
+    #[test]
+    fn replacement_is_atomic_for_invalid_entry_offsets_and_counter_write_faults() {
+        for family in [2, 10] {
+            check_replacement_is_atomic(family);
+        }
+    }
+
+    fn check_replacement_is_atomic(family: u8) {
         let name = Name::Filter;
         let firewall = Firewall::default();
         let initial = LegacyTable::initial(family, name);
@@ -722,6 +746,21 @@ mod tests {
         replace.extend_from_slice(&initial.wire);
         let input_verdict = REPLACE_HEADER + initial.layout.entry() + XT_HEADER;
         replace[input_verdict..input_verdict + 4].copy_from_slice(&(-1i32).to_le_bytes());
+
+        let before_replacement = firewall.legacy_get(family, 65, &query, len).unwrap();
+        let mut partial_entry = replace.clone();
+        put_word(&mut partial_entry, 44 + 4, 8);
+        assert!(matches!(
+            firewall.legacy_replace(family, &partial_entry, |_, _| {
+                panic!("validation must precede counter copyout")
+            }),
+            Err(NetError(22))
+        ));
+        assert_eq!(
+            firewall.legacy_get(family, 65, &query, len).unwrap(),
+            before_replacement
+        );
+
         assert!(matches!(
             firewall.legacy_replace(family, &replace, |_, _| Err(NetError(14))),
             Err(NetError(14))
