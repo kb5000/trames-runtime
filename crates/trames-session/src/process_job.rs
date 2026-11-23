@@ -17,7 +17,7 @@ fn pair(p: &mut Process<Interpreter>) -> (u32, u32, Arc<trames_vfs::Pty>) {
     pair_kind(p, true)
 }
 fn pair_kind(p: &mut Process<Interpreter>, private: bool) -> (u32, u32, Arc<trames_vfs::Pty>) {
-    p.linux.vfs.set_runtime_info(1, Default::default());
+    p.linux.vfs.set_runtime_info(p.tgid, Default::default());
     p.linux.vfs.enable_terminal().unwrap();
     p.linux.vfs.set_controlling_terminal(None).unwrap();
     if private {
@@ -49,6 +49,18 @@ fn pair_kind(p: &mut Process<Interpreter>, private: bool) -> (u32, u32, Arc<tram
     let slave = p.linux.vfs.open_pty_peer(master, 2 | 0x100).unwrap();
     (master, slave, pair)
 }
+const SHELL_PID: u32 = 10;
+const JOB_PID: u32 = 11;
+
+fn job_shell() -> Box<Process<Interpreter>> {
+    // Global init does not count as an outside parent for an orphaned group.
+    let mut shell = super::tests::process();
+    shell.tgid = SHELL_PID;
+    shell.set_session(SHELL_PID);
+    shell.set_group(SHELL_PID);
+    shell
+}
+
 fn call(code: &mut Vec<u32>, number: u32, args: &[u32], index: u32) {
     for (r, &value) in args.iter().enumerate() {
         code.push(mov(r as u32, value & 0xffff));
@@ -91,8 +103,8 @@ fn run(
     k.cpu_count = 2;
     k.workers = crate::workers::Pool::new(slots);
     k.per_cpu = vec![Duration::ZERO; 2];
-    k.processes.insert(1, root);
-    k.processes.insert(2, child);
+    k.processes.insert(root.tgid, root);
+    k.processes.insert(child.tgid, child);
     assert!(k
         .parallel_epoch(&mut CapturedOutput::default(), 100_000, true)
         .unwrap());
@@ -241,7 +253,7 @@ fn background_nonblocking_read_stops_and_resumes_on_the_only_slot_without_owner(
         .flat_map(|slots| (0..3).map(move |operation| (slots, operation)))
     {
         let mut k = super::tests::kernel();
-        let mut root = super::tests::process();
+        let mut root = job_shell();
         let (master, slave, pair) = pair(&mut root);
         root.linux
             .vfs
@@ -249,8 +261,8 @@ fn background_nonblocking_read_stops_and_resumes_on_the_only_slot_without_owner(
             .unwrap();
         {
             let mut tty = pair.terminal.borrow_mut();
-            tty.session = 1;
-            tty.foreground = 1;
+            tty.session = SHELL_PID;
+            tty.foreground = SHELL_PID;
             if operation == 1 {
                 let flags = tty.lflag() | 256;
                 tty.attributes[12..16].copy_from_slice(&flags.to_le_bytes());
@@ -262,12 +274,14 @@ fn background_nonblocking_read_stops_and_resumes_on_the_only_slot_without_owner(
             .set_status_flags(slave, trames_vfs::O_NONBLOCK)
             .unwrap();
         root.memory.write(0x1080, b"ok\n").unwrap();
-        root.memory.write_array(0x1120, 2u32.to_le_bytes()).unwrap();
+        root.memory
+            .write_array(0x1120, JOB_PID.to_le_bytes())
+            .unwrap();
         filter(&mut k, &mut root, 0x7fff0000);
         let mut child = root.fork();
-        child.tgid = 2;
-        child.family.set_parent(1);
-        child.set_group(2);
+        child.tgid = JOB_PID;
+        child.family.set_parent(SHELL_PID);
+        child.set_group(JOB_PID);
         let mut code = Vec::new();
         let (number, args) = match operation {
             0 => (63, [slave, 0x1300, 3]),
@@ -278,14 +292,19 @@ fn background_nonblocking_read_stops_and_resumes_on_the_only_slot_without_owner(
         park(&mut code);
         let mut parent = Vec::new();
         // Negative process-group wait verifies live family wait indexing too.
-        call(&mut parent, 260, &[(-2i32) as u32, 0x1200, 2, 0], 0);
+        call(
+            &mut parent,
+            260,
+            &[(-(JOB_PID as i32)) as u32, 0x1200, 2, 0],
+            0,
+        );
         call(&mut parent, 29, &[slave, 0x5410, 0x1120], 1);
         call(&mut parent, 64, &[master, 0x1080, 3], 2);
-        call(&mut parent, 129, &[2, 18], 3);
-        call(&mut parent, 260, &[2, 0x1204, 8, 0], 4);
+        call(&mut parent, 129, &[JOB_PID, 18], 3);
+        call(&mut parent, 260, &[JOB_PID, 0x1204, 8, 0], 4);
         park(&mut parent);
         run(&mut k, root, child, slots, code, parent);
-        let p = k.processes.read(&2);
+        let p = k.processes.read(&JOB_PID);
         assert_eq!(
             p.memory.read_u64(0x1800).unwrap(),
             [3, 1, 0][operation],
@@ -296,8 +315,11 @@ fn background_nonblocking_read_stops_and_resumes_on_the_only_slot_without_owner(
         }
         assert!(!p.stopped());
         drop(p);
-        let p = k.processes.read(&1);
-        for (i, value) in [2, 0, 3, 0, 2].into_iter().enumerate() {
+        let p = k.processes.read(&SHELL_PID);
+        for (i, value) in [u64::from(JOB_PID), 0, 3, 0, u64::from(JOB_PID)]
+            .into_iter()
+            .enumerate()
+        {
             assert_eq!(
                 p.memory.read_u64(0x1800 + i as u64 * 8).unwrap(),
                 value,
@@ -487,7 +509,7 @@ fn tty_detach_steal_hangup_and_last_nonleader_exit_use_original_resources() {
 #[test]
 fn filtered_tty_control_adoption_retains_original_fd_after_close_and_reuse() {
     let mut k = super::tests::kernel();
-    let mut root = super::tests::process();
+    let mut root = job_shell();
     let (_, slave, pair) = pair(&mut root);
     root.linux
         .vfs
@@ -495,19 +517,19 @@ fn filtered_tty_control_adoption_retains_original_fd_after_close_and_reuse() {
         .unwrap();
     {
         let mut tty = pair.terminal.borrow_mut();
-        tty.session = 1;
-        tty.foreground = 1;
+        tty.session = SHELL_PID;
+        tty.foreground = SHELL_PID;
         root.memory.write(0x1300, &tty.attributes).unwrap();
     }
     filter(&mut k, &mut root, 0x7fff0000);
     let mut child = root.fork();
-    child.tgid = 2;
-    child.family.set_parent(1);
-    child.set_group(2);
-    k.publish_task(1, &root);
-    k.publish_task(2, &child);
+    child.tgid = JOB_PID;
+    child.family.set_parent(SHELL_PID);
+    child.set_group(JOB_PID);
+    k.publish_task(SHELL_PID, &root);
+    k.publish_task(JOB_PID, &child);
     k.call(
-        2,
+        JOB_PID,
         &mut child,
         29,
         [slave as u64, 0x5402, 0x1300, 0, 0, 0],
@@ -516,9 +538,9 @@ fn filtered_tty_control_adoption_retains_original_fd_after_close_and_reuse() {
     assert!(child.byte_wait.is_some());
     child.linux.vfs.close(slave).unwrap();
     assert_eq!(child.linux.vfs.eventfd(99, 0).unwrap(), slave);
-    pair.terminal.borrow_mut().foreground = 2;
+    pair.terminal.borrow_mut().foreground = JOB_PID;
     assert_eq!(
-        routes(&root).send(&root.signals.io, 129, [2, 18, 0, 0, 0, 0]),
+        routes(&root).send(&root.signals.io, 129, [u64::from(JOB_PID), 18, 0, 0, 0, 0]),
         Some(Ok(0))
     );
     let mut code = vec![mov(10, 0x1800), 0xf9000140];
@@ -526,7 +548,7 @@ fn filtered_tty_control_adoption_retains_original_fd_after_close_and_reuse() {
     let mut parent = Vec::new();
     park(&mut parent);
     run(&mut k, root, child, 1, code, parent);
-    let child = k.processes.read(&2);
+    let child = k.processes.read(&JOB_PID);
     assert_eq!(child.memory.read_u64(0x1800).unwrap(), 0);
     assert_eq!(
         child.seccomp.evaluations(),
@@ -539,7 +561,7 @@ fn filtered_tty_control_adoption_retains_original_fd_after_close_and_reuse() {
 fn serial_background_write_and_ioctl_waits_wake_on_ignored_continue() {
     for number in [64, 29] {
         let mut k = super::tests::kernel();
-        let mut root = super::tests::process();
+        let mut root = job_shell();
         let (_, slave, pair) = pair(&mut root);
         root.linux
             .vfs
@@ -547,25 +569,31 @@ fn serial_background_write_and_ioctl_waits_wake_on_ignored_continue() {
             .unwrap();
         {
             let mut tty = pair.terminal.borrow_mut();
-            tty.session = 1;
-            tty.foreground = 1;
+            tty.session = SHELL_PID;
+            tty.foreground = SHELL_PID;
             let flags = tty.lflag() | 256;
             tty.attributes[12..16].copy_from_slice(&flags.to_le_bytes());
             root.memory.write(0x1300, &tty.attributes).unwrap();
         }
         root.memory.write(0x1100, b"x").unwrap();
         let mut child = root.fork();
-        child.tgid = 2;
-        child.family.set_parent(1);
-        child.set_group(2);
-        k.publish_task(1, &root);
-        k.publish_task(2, &child);
+        child.tgid = JOB_PID;
+        child.family.set_parent(SHELL_PID);
+        child.set_group(JOB_PID);
+        k.publish_task(SHELL_PID, &root);
+        k.publish_task(JOB_PID, &child);
         let args = if number == 64 {
             [slave as u64, 0x1100, 1, 0, 0, 0]
         } else {
             [slave as u64, 0x5402, 0x1300, 0, 0, 0]
         };
-        k.call(2, &mut child, number, args, &mut CapturedOutput::default());
+        k.call(
+            JOB_PID,
+            &mut child,
+            number,
+            args,
+            &mut CapturedOutput::default(),
+        );
         assert!(child.byte_wait.is_some());
         assert!(!child.byte_wait.as_ref().unwrap().signal.ready());
         assert!(child.signals.io.lifecycle().consume_stop(22, || child
@@ -573,15 +601,21 @@ fn serial_background_write_and_ioctl_waits_wake_on_ignored_continue() {
             .io
             .take(22, true)
             .is_some()));
-        pair.terminal.borrow_mut().foreground = 2;
+        pair.terminal.borrow_mut().foreground = JOB_PID;
         // SIGCONT's default disposition need not enqueue a user signal; the
         // original control event must still wake this serial resource wait.
         assert_eq!(
-            routes(&root).send(&root.signals.io, 129, [2, 18, 0, 0, 0, 0]),
+            routes(&root).send(&root.signals.io, 129, [u64::from(JOB_PID), 18, 0, 0, 0, 0]),
             Some(Ok(0))
         );
         assert!(child.byte_wait.as_ref().unwrap().signal.ready());
-        k.call(2, &mut child, number, args, &mut CapturedOutput::default());
+        k.call(
+            JOB_PID,
+            &mut child,
+            number,
+            args,
+            &mut CapturedOutput::default(),
+        );
         assert_eq!(child.cpu.x(0), u64::from(number == 64));
         assert!(child.byte_wait.is_none());
     }

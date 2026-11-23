@@ -23,7 +23,7 @@ The 238 original gVisor cases cover `chroot`, `mount`, `mount_fd`, `stat` and `s
 | Mac hardware executor | 232 | 0 | 6 |
 | Product interpreter on Mac | 231 | 1 | 6 |
 
-The Mac outcomes match the rolling baseline. The product interpreter retains the previously reproduced sysfs user-namespace permission failure in `MountTest.UserNamespaceSysfsMountOverEmptyDir`.
+The Mac outcomes match the rolling baseline. This run reproduced the sysfs user-namespace permission failure in `MountTest.UserNamespaceSysfsMountOverEmptyDir`. The [fixture follow-up](interpreter-fixtures-20261123.md) restores that case with the same guest setup used by the Mac harness.
 
 All eight runtime CI stages and ARM64 iOS FFI compilation passed. Local traces, original XML, hashes and performance samples are under `target/mount-query` in the iPad checkout. Final Trames case artifacts are in `paired/` and the CI record is in `ci-paired/summary.json`.
 

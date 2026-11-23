@@ -11,7 +11,7 @@ import subprocess
 import time
 import xml.etree.ElementTree as ET
 
-from run import executed_case, TRACEE_WAIT, classify, execute, guest_terminal, guest_binary, guest_test_work, save, suite_flags, child_check_failure
+from run import executed_case, TRACEE_WAIT, classify, execute, guest_terminal, guest_binary, guest_wrapper, save, suite_flags, child_check_failure
 
 
 class Progress:
@@ -98,12 +98,7 @@ def run(args,output,plan,env,runner,name,store,snapshot,cache,timeout):
             shutil.rmtree(store);subprocess.run(['/bin/cp','-cR',str(snapshot),str(store)],check=True)
         stem='chunk-%06d'%serial;serial+=1
         work='/tmp/gvisor-'+stem;guest_xml=work+'/result.xml';xml=output/'logs'/(stem+'.xml')
-        wrapper='export TEST_SRCDIR=/opt/gvisor/runfiles RUNFILES_DIR=/opt/gvisor/runfiles; ' + guest_test_work(suite) + 'unset TEST_ON_GVISOR GVISOR_SAVE_TEST; shift; "$@" & child=$!; wait "$child"'
-        if suite=='posix_acl':
-            # Match native Linux's existing tmpfs fixture, without changing the
-            # original binary or treating an unexercised ACL as a passing case.
-            wrapper='mkdir -p /dev/shm; mount -t tmpfs -o mode=1777 tmpfs /dev/shm; '+wrapper
-        terminal, wrapper = guest_terminal(suite, wrapper)
+        terminal, wrapper = guest_terminal(suite, guest_wrapper(suite, pid2=True))
         argv=[runner,'debug','env-run',name,'--no-windows',terminal,'--','/bin/sh','-ec',wrapper,'trames-gvisor',work,*guest_binary(suite),*suite_flags(suite),'--gtest_color=no','--gtest_filter='+':'.join(selected),'--gtest_output=xml:'+guest_xml]
         stdout=output/'logs'/(stem+'.stdout');stderr=output/'logs'/(stem+'.stderr')
         budget=lambda case:timeout(suite,case) if case else 30

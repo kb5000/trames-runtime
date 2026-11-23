@@ -120,8 +120,20 @@ remain isolated. Adding more groups may require their original helper binaries,
 runfiles, mounts, capabilities, network fixtures or UAPI headers; use the upstream
 BUILD graph as the reference. No unsupported test should be silently omitted.
 
-The binaries can also be transported to iPad for interpreter coverage, but this
-entry currently automates Mac HVF only; no physical iPad pass is implied.
+For interpreter coverage on the development host, use the product
+`trames-run` CLI with the same original reference plan and binaries:
+
+```sh
+python3 tests/gvisor/interpreter.py --runner /path/to/trames-run \
+  --rootfs /path/to/alpine-minirootfs.tar.gz --binaries /tmp/gvisor-artifacts/bin \
+  --reference /tmp/gvisor-native/plan.json --output /tmp/gvisor-interpreter \
+  --suites mount --case-filter 'MountTest.UserNamespaceSysfs*'
+```
+
+The interpreter harness copies a clean imported store for each case and uses
+the same guest setup as the Mac harness, including writable sysfs for mount and
+rename. It retains original per-case XML and the executable hashes. Interpreter
+results on the development host do not exercise a physical iPad.
 
 ## Broad Linux/ARM64 coverage
 

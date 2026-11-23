@@ -98,6 +98,17 @@ def guest_test_work(suite):
     return work
 
 
+def guest_wrapper(suite, *, pid2):
+    wrapper = (
+        'export TEST_SRCDIR=/opt/gvisor/runfiles RUNFILES_DIR=/opt/gvisor/runfiles; '
+        + guest_test_work(suite)
+        + 'unset TEST_ON_GVISOR GVISOR_SAVE_TEST; shift; '
+    )
+    if suite == 'posix_acl':
+        wrapper = 'mkdir -p /dev/shm; mount -t tmpfs -o mode=1777 tmpfs /dev/shm; ' + wrapper
+    return wrapper + ('"$@" & child=$!; wait "$child"' if pid2 else 'exec "$@"')
+
+
 def guest_terminal(suite, wrapper):
     if suite == 'host_pty':
         # Keep an inherited copy even when the shell backgrounds the test and
@@ -480,11 +491,7 @@ def trames(args, output):
             work = '/tmp/gvisor-'+token+'-'+str(index)
             guest_xml = work+'/result.xml'
             xml = output/'logs'/(str(index)+'.xml')
-            wrapper = 'export TEST_SRCDIR=/opt/gvisor/runfiles RUNFILES_DIR=/opt/gvisor/runfiles; ' + guest_test_work(suite['name']) + 'unset TEST_ON_GVISOR GVISOR_SAVE_TEST; shift; exec "$@"'
-            if suite['name']=='posix_acl':
-                wrapper='mkdir -p /dev/shm; mount -t tmpfs -o mode=1777 tmpfs /dev/shm; '+wrapper
-            if args.network=='internal':
-                wrapper=wrapper.replace('exec "$@"', '"$@" & child=$!; wait "$child"')
+            wrapper = guest_wrapper(suite['name'], pid2=args.network == 'internal')
             terminal, wrapper = guest_terminal(suite['name'], wrapper)
             argv = [runner,'debug','env-run',name,'--no-windows',terminal,'--','/bin/sh','-ec',wrapper,'trames-gvisor',work,
                     *guest_binary(suite['name']),*suite_flags(suite['name']),'--gtest_color=no','--gtest_filter='+case,'--gtest_output=xml:'+guest_xml]

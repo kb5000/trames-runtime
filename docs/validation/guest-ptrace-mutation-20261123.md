@@ -57,7 +57,7 @@ The additional interpreter kernel conformance target produced 498 passes, four f
 * `process::job_tests::serial_background_write_and_ioctl_waits_wake_on_ignored_continue`
 * `workers::tests::thread_group_stop_wait_continue_runs_on_one_slot_without_owner_requests`
 
-These are existing terminal job-control fixture failures, not new ptrace passes or regressions. Their logs remain with the evidence.
+Their logs remain with the evidence. The [fixture follow-up](interpreter-fixtures-20261123.md) restores all four checks by giving each stopped job a same-session shell parent separate from global init.
 
 ## Ordinary workload performance
 

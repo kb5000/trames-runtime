@@ -2203,6 +2203,8 @@ mod tests {
 
     #[test]
     fn thread_group_stop_wait_continue_runs_on_one_slot_without_owner_requests() {
+        // A same-session non-init parent keeps the child group from becoming orphaned.
+        const SHELL_PID: u32 = 41;
         for slots in [1, 4] {
             use trames_kernel::{
                 children::{Child, Children},
@@ -2223,19 +2225,24 @@ mod tests {
                 ..Default::default()
             };
             sibling.io.share_process(&child.io);
-            for (task, pid, tgid) in [(&parent, 1, 1), (&child, 42, 42), (&sibling, 43, 42)] {
+            for (task, pid, tgid) in [
+                (&parent, SHELL_PID, SHELL_PID),
+                (&child, 42, 42),
+                (&sibling, 43, 42),
+            ] {
                 task.publish_policy(&Default::default(), true);
                 task.begin_io();
-                task.io.set_session(1);
-                directory.publish(&task.io, pid, tgid, if pid == 1 { 1 } else { 42 }, 0, 0);
+                task.io.set_session(SHELL_PID);
+                directory.publish(&task.io, pid, tgid, tgid, 0, 0);
             }
             let children = Arc::new(Children::default());
             let event = Arc::new(Child::default());
-            event.attach(Some(&children), 42, 1, 0);
+            event.attach(Some(&children), 42, 42, 0);
             child
                 .io
                 .lifecycle()
                 .bind(&event, Some(parent.io.lifecycle()), 42, 0);
+            assert!(!directory.orphaned(&child.io));
             let mut memory = Memory::default();
             memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
             memory.map(0x2000, PAGE_SIZE, Permissions::RW).unwrap();
@@ -2282,7 +2289,7 @@ mod tests {
             for (task, pid, pc) in [
                 (&child, 42, 0x1800),
                 (&sibling, 43, 0x1800),
-                (&parent, 1, 0x1000),
+                (&parent, SHELL_PID, 0x1000),
             ] {
                 let mut snapshot = syscall_snapshot();
                 snapshot.io_signals = task.io.clone();
@@ -2329,7 +2336,7 @@ mod tests {
             }
             let results = epoch.drain();
             assert!(results.iter().all(|d| d.serviced_syscalls == 0));
-            let sender = results.iter().find(|d| d.pid == 1).unwrap();
+            let sender = results.iter().find(|d| d.pid == SHELL_PID).unwrap();
             assert_eq!(
                 sender.syscalls,
                 16,
