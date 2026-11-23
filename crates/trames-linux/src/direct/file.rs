@@ -748,10 +748,11 @@ impl DirectSyscalls {
             ));
         }
         if namespace::supported(number) {
-            let (call, output) = match namespace::import(number, args, memory) {
-                Ok(call) => call,
-                Err(error) => return Some(IoAttempt::Complete(Err(error))),
-            };
+            let (call, output) =
+                match namespace::import(number, args, memory, || vfs.check_mount_admin()) {
+                    Ok(call) => call,
+                    Err(error) => return Some(IoAttempt::Complete(Err(error))),
+                };
             if !vfs.namespace_host_work() {
                 // All instruction views are joined here. Use the original
                 // caller VFS directly, as before worker admission existed.

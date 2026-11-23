@@ -1628,7 +1628,7 @@ impl Linux {
     ) -> Result<u64>;
         pub fn has_syscall;
         {
-            5..=17 | 33..=41 | 43 | 44 | 49..=55 | 88 | 180 | 181 | 276 | 279 | 428..=432 | 452 => {
+            5..=17 | 33..=41 | 43 | 44 | 49..=55 | 88 | 180 | 181 | 276 | 279 | 428..=432 | 442 | 452 => {
                 crate::direct::namespace::owner(number as u32, a, memory, &mut self.vfs)
             },
             219 => crate::keyctl(&self.session_keys, &self.vfs.key_registry(), &self.vfs.credentials, a, memory),

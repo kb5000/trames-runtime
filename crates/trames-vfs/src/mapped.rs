@@ -668,6 +668,16 @@ impl MappingWriter {
         writers: &Arc<Writers>,
         mount: Option<&MappingMount>,
     ) -> Result<Self> {
+        let _admission = if let Some(mount) = mount {
+            let mount = mount.identity();
+            let guard = mount.writer_admission.lock().unwrap();
+            if mount.flags.get() & mounts::MS_RDONLY != 0 {
+                return Err(Errno(30));
+            }
+            Some(guard)
+        } else {
+            None
+        };
         let inode = node.borrow();
         inode.revoke_file_caps()?;
         Ok(Self {

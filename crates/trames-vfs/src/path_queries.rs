@@ -245,6 +245,10 @@ impl Vfs {
     }
 }
 impl PathQueries {
+    pub fn check_mount_admin(&self) -> Result<()> {
+        self.view.borrow().check_mount_admin()
+    }
+
     pub fn fuse_clone(
         &self,
         fd: u32,

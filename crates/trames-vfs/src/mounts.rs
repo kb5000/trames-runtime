@@ -175,6 +175,8 @@ pub(super) struct MountIdentity {
     pub flags: Arc<MountFlags>,
     propagation: propagation::Metadata,
     pub writers: Arc<mapped::Writers>,
+    // Serialize a read-only transition with admission of new shared writers.
+    pub(super) writer_admission: std::sync::Mutex<()>,
 }
 pub(super) struct MountData {
     directory_users: std::sync::atomic::AtomicUsize,
@@ -216,6 +218,13 @@ impl MountUse {
 impl MountIdentity {
     pub(super) fn in_use(&self) -> bool {
         self.users.load(Ordering::Relaxed) != 0
+    }
+    fn hold_mount_writers(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
+        let guard = self.writer_admission.lock().unwrap();
+        if self.writers.active() {
+            return Err(Errno(16));
+        }
+        Ok(guard)
     }
 }
 impl Drop for MountUse {
@@ -361,6 +370,7 @@ impl Mount {
             display: init.display,
             pid_namespace: init.pid_namespace,
             devpts: init.devpts,
+            writer_admission: Default::default(),
             propagation: Default::default(),
             writers: init.writers,
         });
@@ -1293,9 +1303,6 @@ impl Vfs {
             {
                 return Err(Errno(30));
             }
-            if flags & MS_RDONLY != 0 && parent.writers.active() {
-                return Err(Errno(16));
-            }
             let mut attrs = flags & ATTRS;
             if preserve_atime {
                 attrs |= parent.flags.get() & ATIME_FLAGS;
@@ -1304,6 +1311,9 @@ impl Vfs {
             if (attrs ^ parent.flags.get()) & locked != 0 {
                 return Err(Errno(1));
             }
+            let _writers = (attrs & MS_RDONLY != 0 && !parent.readonly())
+                .then(|| parent.hold_mount_writers())
+                .transpose()?;
             if parent.kind == Kind::Cgroup && flags & BIND == 0 {
                 if let Some(value) = self.cgroup_mount_options(data)? {
                     self.cgroups
@@ -2185,6 +2195,10 @@ pub(super) fn table_text(snapshot: &NamespaceSnapshot, info: bool, cgroup_root: 
                 .borrow()
                 .as_ref()
                 .map_or(table.root_parent_id, |a| a.parent.id);
+            let super_readonly =
+                m.fs.super_readonly
+                    .as_ref()
+                    .map_or_else(|| m.readonly(), |readonly| readonly.load(Ordering::Relaxed));
             text.push_str(&format!(
                 "{} {} {}:{} {} {} {}{} - {} {} {}{}\n",
                 m.id,
@@ -2207,7 +2221,7 @@ pub(super) fn table_text(snapshot: &NamespaceSnapshot, info: bool, cgroup_root: 
                 },
                 m.fs_name(),
                 source,
-                if m.readonly() { "ro" } else { "rw" },
+                if super_readonly { "ro" } else { "rw" },
                 super_options,
             ));
         } else {

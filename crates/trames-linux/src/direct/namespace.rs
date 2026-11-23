@@ -4,12 +4,13 @@ use super::*;
 use trames_vfs::NamespaceCall as Call;
 
 pub(crate) fn supported(number: u32) -> bool {
-    matches!(number, 5..=17 | 33..=41 | 43 | 44 | 49..=55 | 88 | 180 | 181 | 276 | 279 | 428..=432 | 452)
+    matches!(number, 5..=17 | 33..=41 | 43 | 44 | 49..=55 | 88 | 180 | 181 | 276 | 279 | 428..=432 | 442 | 452)
 }
 pub(super) fn import(
     number: u32,
     a: [u64; 6],
     memory: &mut impl CpuMemory,
+    check_mount_admin: impl FnOnce() -> Result<(), Errno>,
 ) -> Result<(Call, FileOutput), Errno> {
     let output = FileOutput::None;
     let call = match number {
@@ -61,6 +62,36 @@ pub(super) fn import(
                 },
             };
             Call::MountFd(operation)
+        }
+        442 => {
+            let [fd, path, flags, addr, size, _] = a;
+            let flags = flags as u32;
+            if flags & !(0x100 | 0x800 | 0x1000 | 0x8000) != 0 || size < 32 {
+                return Err(Errno(22));
+            }
+            if size > trames_memory::PAGE_SIZE {
+                return Err(Errno(7));
+            }
+            check_mount_admin()?;
+            let mut bytes = [0; trames_memory::PAGE_SIZE as usize];
+            memory
+                .read(addr, &mut bytes[..size as usize])
+                .map_err(|_| Errno(14))?;
+            if bytes[32..size as usize].iter().any(|&b| b != 0) {
+                return Err(Errno(7));
+            }
+            let u64_at = |i| u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap());
+            let attrs = trames_vfs::MountAttributes::new(u64_at(0), u64_at(8), u64_at(16))?;
+            Call::MountFd(trames_vfs::MountFdCall::SetAttr {
+                fd: fd as i32,
+                path: if attrs.is_empty() {
+                    Vec::new()
+                } else {
+                    Linux::path(memory, path)?
+                },
+                flags,
+                attrs,
+            })
         }
         180 => {
             let name = Linux::path(memory, a[0])?;
@@ -365,7 +396,7 @@ impl DirectSyscalls {
             return None;
         }
         let paths = self.paths.as_ref()?;
-        let (call, output) = match import(number, args, memory) {
+        let (call, output) = match import(number, args, memory, || paths.check_mount_admin()) {
             Ok(call) => call,
             Err(error) => return Some(Err(error)),
         };
@@ -389,7 +420,7 @@ pub(crate) fn owner(
     memory: &mut impl CpuMemory,
     vfs: &mut trames_vfs::Vfs,
 ) -> Result<u64, Errno> {
-    let (call, output) = import(number, args, memory)?;
+    let (call, output) = import(number, args, memory, || vfs.check_mount_admin())?;
     output.apply(call.execute(vfs), memory)
 }
 

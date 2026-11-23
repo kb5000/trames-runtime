@@ -31,9 +31,54 @@ pub enum MountFdCall {
         target: Vec<u8>,
         flags: u32,
     },
+    SetAttr {
+        fd: i32,
+        path: Vec<u8>,
+        flags: u32,
+        attrs: MountAttributes,
+    },
 }
 const EMPTY: u32 = 0x1000;
 const RECURSIVE: u32 = 0x8000;
+
+pub struct MountAttributes {
+    set: u64,
+    clear: u64,
+}
+
+impl MountAttributes {
+    pub fn new(set: u64, clear: u64, propagation: u64) -> Result<Self> {
+        const ATTR_ATIME: u64 = 0x70;
+        const ATTR_IDMAP: u64 = 0x100000;
+        const ATTR_NOSYMFOLLOW: u64 = 0x200000;
+        if (set | clear) & !(0xff | ATTR_IDMAP | ATTR_NOSYMFOLLOW) != 0
+            || clear & ATTR_IDMAP != 0
+            || !matches!(propagation, 0 | 0x20000 | 0x40000 | 0x80000 | 0x100000)
+        {
+            return Err(Errno(22));
+        }
+        let atime = match (set & ATTR_ATIME, clear & ATTR_ATIME) {
+            (0, 0) => (0, 0),
+            (0, ATTR_ATIME) => (MS_RELATIME, MS_NOATIME | MS_RELATIME),
+            (0x10, ATTR_ATIME) => (MS_NOATIME, MS_NOATIME | MS_RELATIME),
+            (0x20, ATTR_ATIME) => (0, MS_NOATIME | MS_RELATIME),
+            _ => return Err(Errno(22)),
+        };
+        if propagation != 0 || (set | clear) & (ATTR_IDMAP | ATTR_NOSYMFOLLOW) != 0 {
+            return Err(Errno(95));
+        }
+        let ordinary = |attrs| attrs & 15 | if attrs & 0x80 != 0 { MS_NODIRATIME } else { 0 };
+        Ok(Self {
+            set: ordinary(set) | atime.0,
+            clear: ordinary(clear) | atime.1,
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.set == 0 && self.clear == 0
+    }
+}
+
 impl MountFdCall {
     pub(crate) fn operands(&self) -> Vec<(i32, Option<&[u8]>, bool)> {
         fn operand(fd: i32, path: &[u8], follow: bool) -> (i32, Option<&[u8]>, bool) {
@@ -53,13 +98,29 @@ impl MountFdCall {
                 operand(*from, source, flags & 1 != 0),
                 operand(*to, target, flags & 0x10 != 0),
             ],
+            Self::SetAttr {
+                fd,
+                path,
+                flags,
+                attrs,
+            } => {
+                if attrs.is_empty() {
+                    return Vec::new();
+                }
+                let path = if path.is_empty() && *flags & EMPTY != 0 && *fd == AT_FDCWD {
+                    b".".as_slice()
+                } else {
+                    path
+                };
+                vec![operand(*fd, path, flags & 0x100 == 0)]
+            }
         }
     }
     pub(crate) fn topology(&self) -> bool {
         matches!(
             self,
             Self::Move { .. } | Self::Mount { .. } | Self::Tree { .. }
-        )
+        ) || matches!(self, Self::SetAttr { attrs, .. } if !attrs.is_empty())
     }
     pub(crate) fn run(&self, v: &mut Vfs) -> Result<u64> {
         match self {
@@ -83,6 +144,15 @@ impl MountFdCall {
                 flags,
             } => {
                 v.move_mount_fd(*from, source, *to, target, *flags)?;
+                Ok(0)
+            }
+            Self::SetAttr {
+                fd,
+                path,
+                flags,
+                attrs,
+            } => {
+                v.mount_setattr(*fd, path, *flags, attrs)?;
                 Ok(0)
             }
         }
@@ -119,6 +189,10 @@ pub(crate) struct DetachedTree {
     members: SharedCell<Vec<Arc<Mount>>>,
 }
 impl Vfs {
+    pub fn check_mount_admin(&self) -> Result<()> {
+        self.can_mount().map(|_| ())
+    }
+
     fn can_mount(&self) -> Result<&MountNamespace> {
         let ns = self.mounts.as_ref().ok_or(Errno(22))?;
         if !self
@@ -128,6 +202,74 @@ impl Vfs {
             return Err(Errno(1));
         }
         Ok(ns)
+    }
+    fn mount_setattr(
+        &self,
+        fd: i32,
+        path: &[u8],
+        flags: u32,
+        attrs: &MountAttributes,
+    ) -> Result<()> {
+        let ns = self.can_mount()?;
+        if attrs.is_empty() {
+            return Ok(());
+        }
+        let target = self.mount_operand(fd, path, flags & 0x100 == 0, flags & EMPTY != 0)?;
+        if !self.is_mount_root(&target) {
+            return Err(Errno(22));
+        }
+        let root = target.mount.as_ref().ok_or(Errno(22))?;
+        let members = if ns.0.borrow().mounts.iter().any(|m| Arc::ptr_eq(m, root)) {
+            ns.0.borrow().mounts.clone()
+        } else {
+            let tree = detached(root, ns.id()).ok_or(Errno(22))?;
+            if !Arc::ptr_eq(root, &tree.root) {
+                return Err(Errno(22));
+            }
+            let members = tree.members.borrow().clone();
+            members
+        };
+        let mut selected = vec![root.clone()];
+        if flags & RECURSIVE != 0 {
+            let mut children = BTreeMap::<u64, Vec<Arc<Mount>>>::new();
+            for member in members {
+                let parent = member.parent.borrow().as_ref().map(|link| link.parent.id);
+                if let Some(parent) = parent {
+                    children.entry(parent).or_default().push(member);
+                }
+            }
+            let mut i = 0;
+            while let Some(mount) = selected.get(i) {
+                if let Some(nested) = children.remove(&mount.id) {
+                    selected.extend(nested);
+                }
+                i += 1;
+            }
+        }
+
+        let mut updates = Vec::new();
+        let mut writer_gates = Vec::new();
+        for mount in &selected {
+            let old = mount.flags.local();
+            let new = (old & !attrs.clear) | attrs.set;
+            let changed = old ^ new;
+            if changed == 0 {
+                continue;
+            }
+            if mount.inherited.load(Ordering::Relaxed) & changed != 0 {
+                return Err(Errno(1));
+            }
+            if changed & new & MS_RDONLY != 0 {
+                writer_gates.push(mount.hold_mount_writers()?);
+            }
+            updates.push((mount, new));
+        }
+        // A failed check on a descendant leaves every mount unchanged.
+        for (mount, new) in updates {
+            mount.flags.set(new);
+        }
+        ns.0.borrow().events.changed();
+        Ok(())
     }
     fn fsopen(&mut self, kind: &[u8], flags: u32) -> Result<u32> {
         self.can_mount()?;

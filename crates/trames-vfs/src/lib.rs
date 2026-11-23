@@ -120,7 +120,7 @@ pub use mapped::MappingFile;
 mod memfd;
 pub use memfd::MemfdParameters;
 mod mounts;
-pub use mounts::fd::MountFdCall;
+pub use mounts::fd::{MountAttributes, MountFdCall};
 use mounts::{Mount, PathArg};
 pub use mounts::{MountNamespace, ResolvedPath, CLONE_NEWNS};
 mod syscall_names;
