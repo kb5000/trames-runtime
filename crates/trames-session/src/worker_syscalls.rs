@@ -618,6 +618,20 @@ impl Snapshot {
     }
     pub fn synchronous_fault(&self, fault: &trames_engine::CpuFault) -> Option<bool> {
         let info = crate::process::fault_info(fault)?;
+        if matches!(
+            fault,
+            trames_engine::CpuFault::Memory {
+                error: trames_memory::MemoryError::Limit,
+                ..
+            }
+        ) && self
+            .io_signals
+            .cgroup()
+            .is_some_and(trames_vfs::CgroupTask::memory_oom)
+        {
+            self.io_signals.lifecycle().request_exit(9);
+            return Some(false);
+        }
         let caught = if self.io_signals.is_traced() {
             self.io_signals.inbox.discard(info.signal);
             self.io_signals

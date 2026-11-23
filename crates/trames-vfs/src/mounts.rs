@@ -1614,6 +1614,9 @@ impl Vfs {
                     let root = fs.borrow().paths[b"/".as_slice()].clone();
                     (fs, root, b"/".to_vec(), Kind::Tmpfs, flags & ATTRS)
                 }
+                b"cgroup" if self.cgroup_v1_conflicts(data.unwrap_or_default()) => {
+                    return Err(Errno(16));
+                }
                 b"cgroup2" => {
                     cgroup_options = self.cgroup_mount_options(data)?;
                     let fs = self.cgroups.borrow().fs.clone();

@@ -43,6 +43,11 @@ impl<C: Cpu> Lifecycle<C> {
                 job.work.control.refund(1);
                 continue;
             }
+            let _memory_scope = p
+                .signals
+                .io
+                .cgroup()
+                .map(trames_vfs::CgroupTask::memory_scope);
             let began = Instant::now();
             p.signals.io.proc_view.begin_accounting(began, slot);
             let _execution = job.domain.as_ref().expect("native mm").enter_scoped(slot);

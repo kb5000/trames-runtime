@@ -59,6 +59,11 @@ impl<C: Cpu> Lifecycle<C> {
                     continue;
                 }
             }
+            let _memory_scope = p
+                .signals
+                .io
+                .cgroup()
+                .map(trames_vfs::CgroupTask::memory_scope);
             let began = Instant::now();
             p.linux.vfs.sync_task_namespaces();
             p.linux.vfs.set_process_context(job.work.pid);

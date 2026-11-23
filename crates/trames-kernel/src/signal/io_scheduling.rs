@@ -248,6 +248,9 @@ impl IoRoutes {
                     (1u64 << cpus) - 1
                 };
                 let mask = u64::from_le_bytes(bytes) & valid;
+                if mask & target.cpuset() == 0 {
+                    return Err(Errno(22));
+                }
                 if mask == 0 {
                     return Err(Errno(22));
                 }
@@ -259,7 +262,7 @@ impl IoRoutes {
                     return Err(Errno(22));
                 }
                 memory
-                    .write_array(a[2], target.scheduling.affinity().to_le_bytes())
+                    .write_array(a[2], target.effective_affinity().to_le_bytes())
                     .map(|()| 8)
                     .map_err(|_| Errno(14))
             }

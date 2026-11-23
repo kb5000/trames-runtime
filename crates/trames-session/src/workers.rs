@@ -573,6 +573,8 @@ impl<C: Cpu> Starter<C> {
                         snapshot.direct.swap_scratch(&mut direct_scratch);
                         snapshot.direct.swap_disk_cache(&mut file_cache);
                     }
+                    let cpu_share = work.syscalls.as_ref().and_then(|s| s.io_signals.cgroup()).and_then(trames_vfs::CgroupTask::cpu_share);
+                    let _memory_scope = work.syscalls.as_ref().and_then(|snapshot| snapshot.io_signals.cgroup()).map(trames_vfs::CgroupTask::memory_scope);
                     let began = Instant::now();
                     if let Some(snapshot)=&work.syscalls {snapshot.io_signals.proc_view.begin_accounting(began,index);}
                     let mut instructions = 0;
@@ -583,6 +585,7 @@ impl<C: Cpu> Starter<C> {
                     let mut credit = 0;
                     let mut syscalls = 0;
                     let mut syscall_time = Duration::ZERO;
+                    let mut resource_start = began;
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         loop {
                             job.restart_sleep_after_stop();
@@ -598,7 +601,7 @@ impl<C: Cpu> Starter<C> {
                                 if let Some(state) = snapshot.io_signals.take_trace_update() {
                                     work.cpu.restore_architectural_state(&state);
                                 }
-                                if epoch.is_some() && snapshot.io_signals.scheduling.affinity() & (1u64 << index) == 0 {
+                                if epoch.is_some() && snapshot.io_signals.effective_affinity() & (1u64 << index) == 0 {
                                     yielded = true;
                                     break SliceOutcome::Yield { instructions: 0 };
                                 }
@@ -713,7 +716,7 @@ impl<C: Cpu> Starter<C> {
                                                         for (i, value) in wait.request.args.iter().enumerate() { work.cpu.set_x(i, *value); }
                                                         work.cpu.set_pc(work.cpu.pc().wrapping_sub(4));
                                                     } else { work.trace.finish(&mut work.cpu, 0u64.wrapping_sub(4)); }
-                                                } else { work.trace.finish(&mut work.cpu, 0u64.wrapping_sub(4)); }
+                                                } else if !matches!(waiting, crate::run_queue::WaitState::Cgroup(_)) { work.trace.finish(&mut work.cpu, 0u64.wrapping_sub(4)); }
                                             }
                                             let pending = job.io.take().as_ref().map(crate::run_queue::IoCall::from).or_else(|| job.retry.take());
                                             if let Some(pending) = pending {
@@ -734,6 +737,13 @@ impl<C: Cpu> Starter<C> {
                                         }
                                     }
                                 }
+                            }
+                            if let Some(crate::run_queue::WaitState::Cgroup(deadline)) = &job.waiting {
+                                if *deadline > Instant::now() {
+                                    parked = job.waiting.take();
+                                    break SliceOutcome::Yield { instructions: 0 };
+                                }
+                                job.waiting = None;
                             }
                             work.trace.flush();
                             if let Some(crate::run_queue::WaitState::Barrier(wait)) = &job.waiting {
@@ -924,6 +934,15 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                             }
                             if job.pending_cpu.is_none() && work.syscalls.as_ref().is_some_and(|s|s.quiesced()) {
                                 maintenance=true;break SliceOutcome::Yield {instructions:0};
+                            }
+                            if let Some(task) = work.syscalls.as_ref().and_then(|s| s.io_signals.cgroup()).filter(|task| epoch.is_some() && task.resource_limited()) {
+                                let now = Instant::now();
+                                let elapsed = now.saturating_duration_since(resource_start);
+                                resource_start = now;
+                                if let Some(deadline) = task.resource_deadline(now, elapsed).filter(|deadline| *deadline > now) {
+                                    parked = Some(crate::run_queue::WaitState::Cgroup(deadline));
+                                    break SliceOutcome::Yield { instructions: 0 };
+                                }
                             }
                             if epoch.as_ref().is_some_and(|epoch| epoch.should_yield(index, began, instructions != 0 || syscalls != 0 || (!C::EXACT_INSTRUCTIONS && chunks != 0))) {
                                 yielded = true;
@@ -1200,6 +1219,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                     }
                     work.control.remaining.fetch_add(credit, Ordering::Relaxed);
                     let elapsed = began.elapsed();
+                    if let Some(share) = cpu_share { share.account(elapsed); }
                     let after = work.cpu.decode_stats();
                     if running && profile_native_overlap {
                         active.fetch_sub(1, Ordering::Relaxed);

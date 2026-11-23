@@ -356,6 +356,18 @@ impl IoTask {
     pub fn lifecycle(&self) -> &Arc<crate::task_control::Group> {
         self.lifecycle.get_or_init(Arc::default)
     }
+    pub fn cpuset(&self) -> u64 {
+        self.cgroup().map_or(u64::MAX, trames_vfs::CgroupTask::cpus)
+    }
+    pub fn effective_affinity(&self) -> u64 {
+        let cpus = self.cpuset();
+        let mask = self.scheduling.affinity() & cpus;
+        if mask == 0 {
+            cpus
+        } else {
+            mask
+        }
+    }
     pub fn cgroup(&self) -> Option<&trames_vfs::CgroupTask> {
         self.cgroup.get()
     }
@@ -689,6 +701,9 @@ struct Policy {
     namespace: PidNamespace,
 }
 impl trames_vfs::TaskSignal for IoTask {
+    fn cpu_elapsed(&self) -> std::time::Duration {
+        self.proc_view.elapsed()
+    }
     fn terminate_process(&self) {
         // The resource already accepted a kill of this original process. Its
         // leader may have retired during exec; its shared inbox/group did not.

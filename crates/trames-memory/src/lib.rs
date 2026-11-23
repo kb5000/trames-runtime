@@ -33,9 +33,11 @@ mod smaps;
 pub use backing::MappedResidents;
 pub use proc_maps::{MappingFileInfo, MappingRoot};
 pub use smaps::{SmapsRead, SmapsResult};
+mod cgroup_memory;
 mod report;
 mod reservations;
 mod residency;
+pub use cgroup_memory::{CgroupMemoryScope, CgroupMemoryTarget, MemoryCgroup};
 pub use report::{ExecutableRanges, ImageRanges, MemoryReport, VmSizes};
 #[cfg(test)]
 mod ownership_tests;

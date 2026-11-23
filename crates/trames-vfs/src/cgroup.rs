@@ -10,6 +10,10 @@ use std::{
     },
 };
 
+mod controllers;
+pub use controllers::CpuShare;
+use controllers::{CONTROLLERS, PIDS};
+
 const ROOT: u64 = 5 << 32;
 const UNLIMITED: u32 = i32::MAX as u32;
 const MAX_GROUPS: usize = 128;
@@ -31,6 +35,7 @@ const FILES: &[(&str, u32)] = &[
     ("cgroup.max.depth", 0o644),
     ("cgroup.max.descendants", 0o644),
     ("cgroup.stat", 0o444),
+    ("cpu.stat", 0o444),
     ("cgroup.freeze", 0o644),
     ("cgroup.kill", 0o200),
     // crun opens io.max even for an empty OCI blockIO object. Expose the
@@ -43,10 +48,19 @@ const ALLOW_MULTI: u32 = 2;
 const REPLACE: u32 = 4;
 const MAX_DEVICE_PROGRAMS: usize = 64;
 
-#[derive(Default)]
 struct DeviceRules {
     programs: Vec<Arc<bpf::Program>>,
     flags: u32,
+    revision: u64,
+}
+impl Default for DeviceRules {
+    fn default() -> Self {
+        Self {
+            programs: Vec::new(),
+            flags: 0,
+            revision: 1,
+        }
+    }
 }
 /// A single snapshot serves device opens, mknod and effective queries.
 /// Hierarchy edits rebuild affected snapshots under the cgroup topology lock.
@@ -81,7 +95,12 @@ struct Group {
     location: Arc<GroupLocation>,
     parent: Option<u64>,
     freeze: bool,
-    subtree_pids: bool,
+    subtree: u8,
+    cpu: controllers::CpuSettings,
+    cpu_usage: u64,
+    cpus: Option<u64>,
+    mems: Option<u64>,
+    memory: Option<Arc<trames_memory::MemoryCgroup>>,
     max_depth: u32,
     max_descendants: u32,
     descendants: u32,
@@ -108,24 +127,39 @@ pub(super) struct Cgroups {
     tasks: BTreeMap<u32, Arc<Member>>, // original global TID incarnation
     dying: Vec<Dying>,
     kill: BTreeSet<u32>,
+    weighted: Arc<AtomicBool>,
 }
 struct Member {
     pid: AtomicU32,
     tgid: AtomicU32,
     group: AtomicU64,
     exited: std::sync::OnceLock<Arc<GroupLocation>>,
+    cpu_base: AtomicU64,
+    cpus: AtomicU64,
+    cpu_limited: AtomicBool,
+    bandwidth: SharedCell<Arc<[Arc<controllers::CpuBandwidth>]>>,
+    memory: Arc<trames_memory::CgroupMemoryTarget>,
+    share: SharedCell<Arc<CpuShare>>,
+    weighted: Arc<AtomicBool>,
     frozen: AtomicBool,
     acknowledged: AtomicBool,
     kill_pending: AtomicBool,
     wake: Mutex<Option<Weak<dyn TaskSignal>>>,
 }
 impl Member {
-    fn new(pid: u32, tgid: u32, group: u64, frozen: bool) -> Self {
+    fn new(pid: u32, tgid: u32, group: u64, frozen: bool, weighted: Arc<AtomicBool>) -> Self {
         Self {
             pid: AtomicU32::new(pid),
             tgid: AtomicU32::new(tgid),
             group: AtomicU64::new(group),
             exited: Default::default(),
+            cpu_base: AtomicU64::new(0),
+            cpus: AtomicU64::new(u64::MAX),
+            cpu_limited: AtomicBool::new(false),
+            bandwidth: Default::default(),
+            memory: Arc::default(),
+            share: Default::default(),
+            weighted,
             frozen: AtomicBool::new(frozen),
             acknowledged: AtomicBool::new(frozen),
             kill_pending: AtomicBool::new(false),
@@ -137,6 +171,20 @@ impl Member {
     }
     fn group(&self) -> u64 {
         self.group.load(Ordering::Relaxed)
+    }
+    fn cpu_clock(&self) -> u64 {
+        self.wake
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .map_or(0, |task| {
+                task.cpu_elapsed().as_nanos().min(u64::MAX as u128) as u64
+            })
+    }
+    fn cpu_delta(&self) -> u64 {
+        self.cpu_clock()
+            .saturating_sub(self.cpu_base.load(Ordering::Relaxed))
     }
     fn notify(&self) {
         let target = self.wake.lock().unwrap().as_ref().and_then(Weak::upgrade);
@@ -166,6 +214,75 @@ pub struct CgroupTask {
     member: Arc<Member>,
 }
 impl CgroupTask {
+    pub fn memory_scope(&self) -> trames_memory::CgroupMemoryScope {
+        self.member.memory.scope()
+    }
+
+    pub fn cpu_share(&self) -> Option<Arc<CpuShare>> {
+        self.member
+            .weighted
+            .load(Ordering::Relaxed)
+            .then(|| self.member.share.borrow().clone())
+    }
+    pub fn resource_limited(&self) -> bool {
+        self.member.cpu_limited.load(Ordering::Relaxed) || self.member.memory.above_high()
+    }
+    pub fn resource_deadline(
+        &self,
+        now: std::time::Instant,
+        elapsed: std::time::Duration,
+    ) -> Option<std::time::Instant> {
+        let high = self.member.memory.high_delay();
+        let deadline = (!high.is_zero()).then(|| now + high);
+        if !self.member.cpu_limited.load(Ordering::Relaxed) {
+            return deadline;
+        }
+        self.member
+            .bandwidth
+            .borrow()
+            .iter()
+            .filter_map(|bandwidth| bandwidth.charge(now, elapsed))
+            .chain(deadline)
+            .max()
+    }
+    pub fn cpus(&self) -> u64 {
+        self.member.cpus.load(Ordering::Relaxed)
+    }
+    pub fn memory_oom(&self) -> bool {
+        let Some((origin, limit)) = self.member.memory.take_oom() else {
+            return false;
+        };
+        let kill_group = origin.oom_group_within(&limit);
+        let victims = {
+            let cg = self.groups.borrow();
+            let mut seen = BTreeSet::new();
+            cg.tasks
+                .values()
+                .filter_map(|task| {
+                    let memory = cg.memory_at(task.group());
+                    let selected = task.tgid() == self.member.tgid()
+                        || memory
+                            .as_ref()
+                            .zip(kill_group.as_ref())
+                            .is_some_and(|(current, group)| current.is_within(group));
+                    if !selected || seen.contains(&task.tgid()) {
+                        return None;
+                    }
+                    let victim = task.wake.lock().unwrap().as_ref().and_then(Weak::upgrade)?;
+                    seen.insert(task.tgid());
+                    Some((victim, memory.unwrap_or_else(|| origin.clone())))
+                })
+                .collect::<Vec<_>>()
+        };
+        if let Some(group) = kill_group {
+            group.record_group_kill();
+        }
+        for (task, group) in victims {
+            group.record_oom_kill();
+            task.terminate_process();
+        }
+        true
+    }
     pub fn path_status(&self) -> (Vec<u8>, bool) {
         let cg = self.groups.borrow();
         let id = self.member.group();
@@ -239,6 +356,7 @@ impl CgroupTask {
             self.member
                 .exited
                 .get_or_init(|| cg.groups[&id].location.clone());
+            cg.settle_cpu(&self.member);
             cg.tasks.remove(&pid);
             cg.kill.remove(&pid);
             cg.adjust(
@@ -294,6 +412,7 @@ pub(super) struct CgroupAccess {
     namespace: PidNamespace,
     pid: u32,
     admin: bool,
+    cpus: usize,
 }
 impl CgroupAccess {
     fn visible_pid(&self, pid: u32) -> u32 {
@@ -375,6 +494,7 @@ fn child_path(path: &[u8], name: &[u8]) -> Vec<u8> {
 }
 impl Default for Cgroups {
     fn default() -> Self {
+        let weighted = Arc::new(AtomicBool::new(false));
         let mut out = Self {
             bpf: bpf::Registry::default(),
             nsdelegate: Arc::default(),
@@ -388,11 +508,16 @@ impl Default for Cgroups {
                 volume: None,
             }),
             groups: BTreeMap::new(),
-            tasks: BTreeMap::from([(1, Arc::new(Member::new(1, 1, ROOT, false)))]),
+            tasks: BTreeMap::from([(
+                1,
+                Arc::new(Member::new(1, 1, ROOT, false, weighted.clone())),
+            )]),
             dying: Vec::new(),
             kill: BTreeSet::new(),
+            weighted,
         };
         out.add_group(b"/".to_vec(), None, 0o755, (0, 0));
+        out.publish_bandwidth(&out.tasks[&1]);
         out
     }
 }
@@ -420,7 +545,7 @@ impl Cgroups {
         drop(fs);
         self.check_procs_write(id, &target.caller)?;
         self.check_migration(source, id, &target.caller, &target.namespace)?;
-        if id != ROOT && dest.subtree_pids {
+        if id != ROOT && dest.subtree != 0 {
             return Err(Errno(16));
         }
         if threaded && id != source {
@@ -516,7 +641,12 @@ impl Cgroups {
             .tasks
             .get(&parent)
             .is_some_and(|task| task.kill_pending.load(Ordering::Relaxed));
-        let member = Arc::new(Member::new(child, tgid, id, frozen));
+        let member = Arc::new(Member::new(child, tgid, id, frozen, self.weighted.clone()));
+        member.memory.set(self.memory_at(id));
+        self.publish_bandwidth(&member);
+        member
+            .cpus
+            .store(self.effective_cpus(id, u64::MAX), Ordering::Relaxed);
         member.kill_pending.store(pending, Ordering::Relaxed);
         assert!(self.tasks.insert(child, member).is_none());
         self.adjust(id, 1, i64::from(frozen));
@@ -599,7 +729,12 @@ impl Cgroups {
                 }),
                 parent,
                 freeze: false,
-                subtree_pids: false,
+                subtree: 0,
+                cpu: controllers::CpuSettings::default(),
+                cpu_usage: 0,
+                cpus: None,
+                mems: None,
+                memory: None,
                 max_depth: UNLIMITED,
                 max_descendants: UNLIMITED,
                 descendants: 0,
@@ -615,14 +750,19 @@ impl Cgroups {
                 pids_local_signal: self.file_events(&path, b"pids.events.local"),
             },
         );
-        if self.pids_enabled(id) {
-            let _ = self.install_pids(id, true, owner);
+        if parent.is_some() {
+            let available = self.available_controllers(id);
+            for (_, bit) in CONTROLLERS {
+                if available & bit != 0 {
+                    let _ = self.install_controller(id, bit, true, owner);
+                }
+            }
         }
     }
     fn pids_enabled(&self, id: u64) -> bool {
         self.groups[&id]
             .parent
-            .is_some_and(|parent| self.groups[&parent].subtree_pids)
+            .is_some_and(|parent| self.groups[&parent].subtree & PIDS != 0)
     }
     fn current(&self, id: u64) -> u64 {
         self.groups[&id].current
@@ -675,15 +815,16 @@ impl Cgroups {
             }
         }
     }
-    fn install_pids(
+    fn install_files(
         &mut self,
         id: u64,
+        files: &[(&str, u32)],
         enable: bool,
         owner: (u32, u32),
     ) -> (Vec<Arc<ControlEvents>>, Vec<NodeRef>) {
         let mut events = Vec::new();
         let mut nodes = Vec::new();
-        for (name, mode) in PIDS_FILES {
+        for (name, mode) in files {
             let path = child_path(&self.groups[&id].location.path, name.as_bytes());
             if enable {
                 self.add_node(path, false, *mode, owner);
@@ -709,6 +850,15 @@ impl Cgroups {
                 }
             }
         }
+        (events, nodes)
+    }
+    fn install_pids(
+        &mut self,
+        id: u64,
+        enable: bool,
+        owner: (u32, u32),
+    ) -> (Vec<Arc<ControlEvents>>, Vec<NodeRef>) {
+        let (events, nodes) = self.install_files(id, PIDS_FILES, enable, owner);
         let path = self.groups[&id].location.path.clone();
         let signal = self.groups[&id]
             .files
@@ -800,6 +950,16 @@ impl DescriptorFactory {
         flags: u32,
         replace: u32,
     ) -> Result<()> {
+        self.bpf_attach_device_at_revision(target, program, flags, replace, 0)
+    }
+    pub fn bpf_attach_device_at_revision(
+        &self,
+        target: u32,
+        program: u32,
+        flags: u32,
+        replace: u32,
+        revision: u64,
+    ) -> Result<()> {
         // Linux delegates attachment through the two original guest descriptors.
         // Creating a verified program or acquiring its descriptor by ID stays privileged.
         let mode = flags & !REPLACE;
@@ -820,6 +980,9 @@ impl DescriptorFactory {
         };
         let mut cg = self.cgroups.borrow_mut();
         let group = cg.groups.get(&id).ok_or(Errno(19))?;
+        if revision != 0 && revision != group.device_rules.revision {
+            return Err(Errno(116));
+        }
         if group
             .location
             .ancestors
@@ -868,21 +1031,34 @@ impl DescriptorFactory {
             }
         }
         rules.flags = mode;
+        rules.revision = rules.revision.wrapping_add(1);
         cg.refresh_device_filters(id);
         Ok(())
     }
     pub fn bpf_detach_device(&self, target: u32, program: u32) -> Result<()> {
+        self.bpf_detach_device_at_revision(target, program, 0)
+    }
+    pub fn bpf_detach_device_at_revision(
+        &self,
+        target: u32,
+        program: u32,
+        revision: u64,
+    ) -> Result<()> {
         self.bpf_authorized()?;
         let id = self.bpf_group(target)?;
         let program = self.bpf_program(program)?;
         let mut cg = self.cgroups.borrow_mut();
         let rules = &mut cg.groups.get_mut(&id).ok_or(Errno(19))?.device_rules;
+        if revision != 0 && revision != rules.revision {
+            return Err(Errno(116));
+        }
         let index = rules
             .programs
             .iter()
             .position(|p| p.id == program.id)
             .ok_or(Errno(2))?;
         rules.programs.remove(index);
+        rules.revision = rules.revision.wrapping_add(1);
         if rules.programs.is_empty() {
             rules.flags = 0;
         }
@@ -891,20 +1067,21 @@ impl DescriptorFactory {
     }
     pub fn bpf_query_device(&self, target: u32, effective: bool) -> Result<(u32, Vec<u32>)> {
         self.bpf_query_cgroup(target, 6, effective)
+            .map(|(flags, ids, _)| (flags, ids))
     }
     pub fn bpf_query_cgroup(
         &self,
         target: u32,
         hook: u32,
         effective: bool,
-    ) -> Result<(u32, Vec<u32>)> {
+    ) -> Result<(u32, Vec<u32>, u64)> {
         self.bpf_authorized()?;
         let id = self.bpf_group(target)?;
         let cg = self.cgroups.borrow();
         let group = cg.groups.get(&id).ok_or(Errno(19))?;
         match hook {
             // The ingress/egress slots have no attached packet programs.
-            0 | 1 => Ok((0, Vec::new())),
+            0 | 1 => Ok((0, Vec::new(), u64::from(!effective))),
             6 if effective => Ok((
                 0,
                 group
@@ -914,10 +1091,12 @@ impl DescriptorFactory {
                     .iter()
                     .map(|p| p.id)
                     .collect(),
+                0,
             )),
             6 => Ok((
                 group.device_rules.flags,
                 group.device_rules.programs.iter().map(|p| p.id).collect(),
+                group.device_rules.revision,
             )),
             _ => Err(Errno(22)),
         }
@@ -984,6 +1163,15 @@ impl Vfs {
         notify_events(events);
         result
     }
+    pub(super) fn cgroup_v1_conflicts(&self, data: &[u8]) -> bool {
+        let active = self.cgroups.borrow().available_controllers(ROOT);
+        data.split(|&item| item == b',').any(|option| {
+            CONTROLLERS
+                .iter()
+                .any(|(name, bit)| option == name.as_bytes() && active & bit != 0)
+        })
+    }
+
     pub(super) fn cgroup_subsystems(&self) -> Vec<u8> {
         format!(
             "#subsys_name\thierarchy\tnum_cgroups\tenabled\npids\t0\t{}\t1\n",
@@ -1236,6 +1424,7 @@ impl Vfs {
             namespace: self.pid_ns.clone(),
             pid: self.pid,
             admin: self.credentials.has_cap(capabilities::SYS_ADMIN),
+            cpus: self.pseudo.borrow().runtime.cpu_count,
         }
     }
     pub(super) fn cgroup_file(
@@ -1342,18 +1531,43 @@ impl CgroupFile {
                     .collect();
                 ids.iter().map(|id| format!("{id}\n")).collect::<String>()
             }
-            b"cgroup.controllers" => if id == ROOT || cg.pids_enabled(id) {
-                "pids\n"
-            } else {
-                ""
+            b"cgroup.controllers" => controllers::list(cg.available_controllers(id)),
+            b"cgroup.subtree_control" => controllers::list(group.subtree),
+            b"cpu.stat" => {
+                let usage = cg.cpu_usage(id) / 1_000;
+                format!("usage_usec {usage}\nuser_usec {usage}\nsystem_usec 0\n")
             }
-            .to_owned(),
-            b"cgroup.subtree_control" => if cg.groups.get(&id).ok_or(Errno(19))?.subtree_pids {
-                "pids\n"
-            } else {
-                ""
+            b"cpu.max" => format!(
+                "{} {}\n",
+                group
+                    .cpu
+                    .quota
+                    .map_or_else(|| "max".to_owned(), |n| n.to_string()),
+                group.cpu.period
+            ),
+            b"cpu.weight" => format!("{}\n", group.cpu.weight),
+            b"cpuset.cpus" => controllers::format_mask(group.cpus.unwrap_or(0)),
+            b"cpuset.cpus.effective" => controllers::format_mask(
+                cg.effective_cpus(id, controllers::possible_cpus(caller.cpus)),
+            ),
+            b"cpuset.mems" => controllers::format_mask(group.mems.unwrap_or(0)),
+            b"cpuset.mems.effective" => "0\n".to_owned(),
+            b"memory.current" => format!("{}\n", group.memory.as_ref().ok_or(Errno(19))?.current()),
+            b"memory.max" => {
+                controllers::limit_text(group.memory.as_ref().ok_or(Errno(19))?.limit())
             }
-            .to_owned(),
+            b"memory.high" => {
+                controllers::limit_text(group.memory.as_ref().ok_or(Errno(19))?.high())
+            }
+            b"memory.oom.group" => format!(
+                "{}\n",
+                u8::from(group.memory.as_ref().ok_or(Errno(19))?.oom_group())
+            ),
+            b"memory.events" | b"memory.events.local" => group
+                .memory
+                .as_ref()
+                .ok_or(Errno(19))?
+                .format_events(name == b"memory.events.local"),
             b"cgroup.max.depth" | b"cgroup.max.descendants" => {
                 let limit = if name == b"cgroup.max.depth" {
                     group.max_depth
@@ -1432,7 +1646,10 @@ impl CgroupFile {
             && cg.nsdelegate.load(Ordering::Relaxed)
             && !matches!(
                 name.as_slice(),
-                b"cgroup.procs" | b"cgroup.threads" | b"cgroup.subtree_control"
+                b"cgroup.procs"
+                    | b"cgroup.threads"
+                    | b"cgroup.subtree_control"
+                    | b"memory.oom.group"
             )
         {
             return Err(Errno(1));
@@ -1522,44 +1739,85 @@ impl CgroupFile {
                 }
             }
             b"cgroup.subtree_control" => {
-                let mut enable = cg.groups.get(&id).ok_or(Errno(19))?.subtree_pids;
-                for token in text.split_whitespace() {
-                    enable = match token {
-                        "+pids" => true,
-                        "-pids" => false,
-                        _ => return Err(Errno(22)),
-                    };
-                }
-                if enable == cg.groups.get(&id).ok_or(Errno(19))?.subtree_pids {
-                    return Ok(Some(bytes.len()));
-                }
-                if enable && id != ROOT && !cg.pids_enabled(id) {
-                    return Err(Errno(2));
-                }
-                let children: Vec<_> = cg
-                    .groups
-                    .iter()
-                    .filter(|(_, g)| g.parent == Some(id))
-                    .map(|(id, _)| *id)
-                    .collect();
-                if !enable && children.iter().any(|id| cg.groups[id].subtree_pids)
-                    || enable && id != ROOT && cg.tasks.values().any(|task| task.group() == id)
-                {
-                    return Err(Errno(16));
-                }
-                cg.groups.get_mut(&id).expect("group").subtree_pids = enable;
-                let mut events = Vec::new();
-                let mut nodes = Vec::new();
-                for child in children {
-                    let (changed, removed) = cg.install_pids(child, enable, caller.owner);
-                    events.extend(changed);
-                    nodes.extend(removed);
-                }
+                let change = cg.change_controllers(id, text, caller.owner)?;
                 drop(cg);
-                notify_events(events);
-                for node in nodes {
+                for task in change.reschedule {
+                    task.notify();
+                }
+                notify_events(change.events);
+                for node in change.nodes {
                     inotify::notify_removed(&node);
                 }
+            }
+            b"cpu.max" => {
+                cg.groups.get_mut(&id).unwrap().cpu.set_limit(text)?;
+                let tasks: Vec<_> = cg
+                    .tasks
+                    .values()
+                    .filter(|task| cg.publish_bandwidth(task))
+                    .cloned()
+                    .collect();
+                drop(cg);
+                for task in tasks {
+                    task.notify();
+                }
+            }
+            b"cpu.weight" => {
+                let cpu = &mut cg.groups.get_mut(&id).unwrap().cpu;
+                cpu.set_weight(text)?;
+                if cpu.weight != 100 {
+                    cg.weighted.store(true, Ordering::Relaxed);
+                } else if cg.weighted.load(Ordering::Relaxed) {
+                    cg.weighted.store(
+                        cg.groups.values().any(|group| group.cpu.weight != 100),
+                        Ordering::Relaxed,
+                    );
+                }
+            }
+            b"cpuset.cpus" | b"cpuset.mems" => {
+                let cpus = name == b"cpuset.cpus";
+                let possible = if cpus {
+                    controllers::possible_cpus(caller.cpus)
+                } else {
+                    1
+                };
+                let mask = if text.is_empty() {
+                    None
+                } else {
+                    Some(controllers::parse_mask(text, possible)?)
+                };
+                let group = cg.groups.get_mut(&id).unwrap();
+                if cpus {
+                    group.cpus = mask;
+                    let tasks = cg.publish_cpuset();
+                    drop(cg);
+                    for task in tasks {
+                        task.notify();
+                    }
+                } else {
+                    group.mems = mask;
+                }
+            }
+            b"memory.max" | b"memory.high" => {
+                let limit = controllers::memory_limit(text)?;
+                let memory = cg.groups[&id].memory.as_ref().ok_or(Errno(19))?;
+                if name == b"memory.max" {
+                    memory.set_limit(limit);
+                } else {
+                    memory.set_high(limit);
+                }
+            }
+            b"memory.oom.group" => {
+                let enabled = match text {
+                    "0" | "+0" => false,
+                    "1" | "+1" => true,
+                    _ => return Err(Errno(22)),
+                };
+                cg.groups[&id]
+                    .memory
+                    .as_ref()
+                    .ok_or(Errno(19))?
+                    .set_oom_group(enabled);
             }
             b"pids.max" => {
                 let limit = if text == "max" {
@@ -1625,7 +1883,7 @@ impl CgroupFile {
                         self.migration_credentials.as_ref().expect("procs opener"),
                         &self.namespace,
                     )?;
-                    if id != ROOT && cg.groups[&id].subtree_pids {
+                    if id != ROOT && cg.groups[&id].subtree != 0 {
                         return Err(Errno(16));
                     }
                     return Ok(Some(bytes.len()));
@@ -1637,7 +1895,7 @@ impl CgroupFile {
                     self.migration_credentials.as_ref().expect("procs opener"),
                     &self.namespace,
                 )?;
-                if id != ROOT && cg.groups[&id].subtree_pids {
+                if id != ROOT && cg.groups[&id].subtree != 0 {
                     return Err(Errno(16));
                 }
                 let tasks: Vec<_> = cg
@@ -1656,9 +1914,13 @@ impl CgroupFile {
                 let mut changed = Vec::new();
                 for task in tasks {
                     let old_group = task.group();
+                    cg.settle_cpu(&task);
                     let old_ack = task.acknowledged.load(Ordering::Relaxed);
                     cg.adjust(old_group, -1, -i64::from(old_ack));
                     task.group.store(id, Ordering::Relaxed);
+                    task.memory.set(cg.memory_at(id));
+                    let cpus = cg.effective_cpus(id, u64::MAX);
+                    let moved_cpu = task.cpus.swap(cpus, Ordering::Relaxed) != cpus;
                     let moved = task.frozen.swap(frozen, Ordering::Relaxed) != frozen;
                     let ack = if moved {
                         let target = task.wake.lock().unwrap().as_ref().and_then(Weak::upgrade);
@@ -1668,7 +1930,7 @@ impl CgroupFile {
                     };
                     task.acknowledged.store(ack, Ordering::Relaxed);
                     cg.adjust(id, 1, i64::from(ack));
-                    if moved {
+                    if cg.publish_bandwidth(&task) || moved || moved_cpu {
                         changed.push(task);
                     }
                 }

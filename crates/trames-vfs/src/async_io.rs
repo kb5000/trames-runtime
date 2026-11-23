@@ -13,6 +13,9 @@ pub trait AsyncOwners {
 }
 pub trait TaskSignal: Send + Sync {
     fn raise(&self, signal: u32);
+    fn cpu_elapsed(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
     /// An accepted process-wide kill retains the original process incarnation,
     /// even if the particular member captured by the resource has retired.
     fn terminate_process(&self) {

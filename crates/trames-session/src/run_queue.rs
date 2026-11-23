@@ -36,6 +36,7 @@ pub(super) enum WaitState {
         deadline: Option<Instant>,
     },
     ClockSleep(Arc<crate::clock_sleep::ClockSleep>),
+    Cgroup(Instant),
     Sleep {
         deadline: Instant,
         remaining: u64,
@@ -183,7 +184,7 @@ impl WaitState {
     fn deadline(&self) -> Option<Instant> {
         match self {
             Self::Futex { deadline, .. } => *deadline,
-            Self::Sleep { deadline, .. } => Some(*deadline),
+            Self::Sleep { deadline, .. } | Self::Cgroup(deadline) => Some(*deadline),
             Self::ClockSleep(wait) => wait.deadline(),
             Self::OwnerEvent
             | Self::Child(_)
@@ -551,7 +552,15 @@ impl<C: Cpu> Job<C> {
         self.work
             .syscalls
             .as_ref()
-            .map_or(self.affinity, |s| s.io_signals.scheduling.affinity())
+            .map_or(self.affinity, |s| s.io_signals.effective_affinity())
+    }
+    fn cpu_share(&self) -> Option<Arc<trames_vfs::CpuShare>> {
+        self.work
+            .syscalls
+            .as_ref()?
+            .io_signals
+            .cgroup()?
+            .cpu_share()
     }
     pub(super) fn guest_waiting(&self) -> bool {
         self.stopped()
@@ -620,6 +629,7 @@ impl<C: Cpu> Job<C> {
                             WaitState::Signal(_)
                                 | WaitState::Sleep { .. }
                                 | WaitState::ClockSleep(_)
+                                | WaitState::Cgroup(_)
                         )
                 })
                 .and_then(WaitState::deadline),
@@ -843,6 +853,7 @@ impl Stats {
 #[derive(Default)]
 struct Queues<C: Cpu> {
     ready: VecDeque<Box<Job<C>>>,
+    cpu_service_floor: u64,
     parked: parked::Parked<C>,
     members: BTreeSet<u32>,
     host_admissions: BTreeSet<u32>,
@@ -1886,7 +1897,9 @@ impl<C: Cpu> Epoch<C> {
                     && !job.restart_sleep_after_stop()
                 {
                     let waiting = job.waiting.take().unwrap();
-                    job.work.trace.finish(&mut job.work.cpu, waiting.expire());
+                    if !matches!(waiting, WaitState::Cgroup(_)) {
+                        job.work.trace.finish(&mut job.work.cpu, waiting.expire());
+                    }
                 }
                 // I/O must perform a final resource check and scatter, even on
                 // timeout. Keep its pending call and do not execute SVC twice.
@@ -1983,10 +1996,25 @@ impl<C: Cpu> Epoch<C> {
                 && self.control.budget_ready())
             .then(|| {
                 preferred.or_else(|| {
-                    q.ready.iter().position(|j| {
-                        j.affinity() & (1 << slot) != 0
-                            && !q.initial_slots.contains_key(&j.work.pid)
-                    })
+                    let mut eligible = q.ready.iter().enumerate().filter(|(_, job)| {
+                        job.affinity() & (1 << slot) != 0
+                            && !q.initial_slots.contains_key(&job.work.pid)
+                    });
+                    let (first, job) = eligible.next()?;
+                    let Some(share) = job.cpu_share() else {
+                        return Some(first);
+                    };
+                    let floor = q.cpu_service_floor;
+                    let initial = (first, share.service().max(floor));
+                    Some(
+                        eligible
+                            .filter_map(|(i, job)| Some((i, job.cpu_share()?.service().max(floor))))
+                            .fold(
+                                initial,
+                                |best, next| if next.1 < best.1 { next } else { best },
+                            )
+                            .0,
+                    )
                 })
             })
             .flatten();
@@ -2032,6 +2060,10 @@ impl<C: Cpu> Epoch<C> {
             }
             if let Some(i) = available {
                 let mut job = q.ready.remove(i).unwrap();
+                if let Some(share) = job.cpu_share() {
+                    q.cpu_service_floor = q.cpu_service_floor.max(share.service());
+                    share.start(q.cpu_service_floor);
+                }
                 self.refresh_ready(&q);
                 let work = &mut job.work;
                 q.initial_slots.remove(&work.pid);
@@ -2178,7 +2210,9 @@ impl<C: Cpu> Epoch<C> {
                 && !job.restart_sleep_after_stop()
             {
                 let waiting = job.waiting.take().unwrap();
-                job.work.trace.finish(&mut job.work.cpu, waiting.expire());
+                if !matches!(waiting, WaitState::Cgroup(_)) {
+                    job.work.trace.finish(&mut job.work.cpu, waiting.expire());
+                }
             }
             if job.ring_ready() || !job.guest_waiting() {
                 self.ready(&mut q, job);

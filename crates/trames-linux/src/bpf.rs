@@ -95,7 +95,10 @@ pub(super) fn call(
         }
         8 | 9 => {
             // BPF_PROG_ATTACH / BPF_PROG_DETACH
-            tail(20)?;
+            tail(32)?;
+            if u32_at(20) != 0 {
+                return Err(Errno(22));
+            }
             if u32_at(8) != 6 {
                 if command == 8
                     && matches!(u32_at(8), 0 | 1)
@@ -108,12 +111,18 @@ pub(super) fn call(
             if command == 8 {
                 // Linux ignores replace_bpf_fd without BPF_F_REPLACE.
                 // Older cilium/runc passes -1 in this unused field.
-                factory.bpf_attach_device(u32_at(0), u32_at(4), u32_at(12), u32_at(16))?;
+                factory.bpf_attach_device_at_revision(
+                    u32_at(0),
+                    u32_at(4),
+                    u32_at(12),
+                    u32_at(16),
+                    u64_at(24),
+                )?;
             } else {
                 if u32_at(12) != 0 || u32_at(16) != 0 {
                     return Err(Errno(22));
                 }
-                factory.bpf_detach_device(u32_at(0), u32_at(4))?;
+                factory.bpf_detach_device_at_revision(u32_at(0), u32_at(4), u64_at(24))?;
             }
             Ok(0)
         }
@@ -165,11 +174,19 @@ pub(super) fn call(
         }
         16 => {
             // BPF_PROG_QUERY
-            tail(28)?;
-            if u32_at(8) & !1 != 0 {
+            tail(64)?;
+            if u32_at(8) & !1 != 0
+                || u32_at(28) != 0
+                || [32, 40, 48].into_iter().any(|i| u64_at(i) != 0)
+            {
                 return Err(Errno(22));
             }
-            let (flags, ids) = factory.bpf_query_cgroup(u32_at(0), u32_at(4), u32_at(8) == 1)?;
+            let (flags, ids, revision) =
+                factory.bpf_query_cgroup(u32_at(0), u32_at(4), u32_at(8) == 1)?;
+            let revision_bytes = size.saturating_sub(56).min(8);
+            if revision_bytes != 0 {
+                Linux::check(memory, a[1] + 56, revision_bytes, Access::Write)?;
+            }
             let capacity = u32_at(24) as usize;
             let count_only = capacity == 0 || u64_at(16) == 0;
             Linux::check(memory, a[1] + 12, 4, Access::Write)?;
@@ -189,6 +206,11 @@ pub(super) fn call(
             memory
                 .write(a[1] + 24, &(ids.len() as u32).to_le_bytes())
                 .map_err(|_| Errno(14))?;
+            if revision_bytes != 0 {
+                memory
+                    .write(a[1] + 56, &revision.to_le_bytes()[..revision_bytes])
+                    .map_err(|_| Errno(14))?;
+            }
             if !count_only && capacity < ids.len() {
                 Err(Errno(28))
             } else {

@@ -53,7 +53,8 @@ impl Account {
         self.record_peak(self.resident_bytes())
     }
     pub(super) fn native_allowed(&self) -> bool {
-        self.local.limit.load(Ordering::Relaxed) >= ADDRESS_LIMIT as usize
+        !CgroupMemoryTarget::active()
+            && self.local.limit.load(Ordering::Relaxed) >= ADDRESS_LIMIT as usize
             && self
                 .total
                 .as_ref()
@@ -146,12 +147,14 @@ pub(super) struct Charge {
     // 0 = untouched, 1 = first charge, 2 = charged, 3 = native extent,\n    // 4 = moving a native page into ordinary backing. Region guards
     // may be disjoint; this state serializes only the page's first allocation.
     state: AtomicU8,
+    cgroup: std::sync::OnceLock<Arc<MemoryCgroup>>,
 }
 impl Charge {
     pub(super) fn new(account: &Arc<Account>) -> Arc<Self> {
         Arc::new(Self {
             account: account.clone(),
             state: AtomicU8::new(0),
+            cgroup: Default::default(),
         })
     }
     /// A fresh fork charge has no concurrent consumers until task publication.
@@ -164,12 +167,14 @@ impl Charge {
         Ok(Arc::new(Self {
             account: account.clone(),
             state: AtomicU8::new(if resident { 2 } else { 0 }),
+            cgroup: Default::default(),
         }))
     }
     pub(super) fn native(account: &Arc<Account>) -> Arc<Self> {
         Arc::new(Self {
             account: account.clone(),
             state: AtomicU8::new(3),
+            cgroup: Default::default(),
         })
     }
     pub(super) fn promote_native(&self) -> Result<(), MemoryError> {
@@ -182,7 +187,7 @@ impl Charge {
                 .compare_exchange(3, 4, Ordering::Acquire, Ordering::Acquire)
             {
                 Ok(_) => {
-                    let result = self.account.take(PAGE_SIZE as usize);
+                    let result = self.take();
                     self.state
                         .store(if result.is_ok() { 2 } else { 3 }, Ordering::Release);
                     return result;
@@ -218,6 +223,20 @@ impl Charge {
             Err(MemoryError::Limit)
         }
     }
+    fn take(&self) -> Result<(), MemoryError> {
+        self.account.take(PAGE_SIZE as usize)?;
+        match CgroupMemoryTarget::charge_page() {
+            Ok(Some(charge)) => {
+                let _ = self.cgroup.set(charge);
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(error) => {
+                self.account.release(PAGE_SIZE as usize);
+                Err(error)
+            }
+        }
+    }
     pub(super) fn ensure(&self) -> Result<(), MemoryError> {
         if self.resident() {
             return Ok(());
@@ -228,7 +247,7 @@ impl Charge {
                 .compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire)
             {
                 Ok(_) => {
-                    let result = self.account.take(PAGE_SIZE as usize);
+                    let result = self.take();
                     self.state
                         .store(if result.is_ok() { 2 } else { 0 }, Ordering::Release);
                     return result;
@@ -243,6 +262,9 @@ impl Drop for Charge {
     fn drop(&mut self) {
         if self.state.load(Ordering::Relaxed) == 2 {
             self.account.release(PAGE_SIZE as usize);
+            if let Some(group) = self.cgroup.get() {
+                group.release();
+            }
         }
     }
 }

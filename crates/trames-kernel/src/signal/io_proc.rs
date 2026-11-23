@@ -314,7 +314,7 @@ impl trames_vfs::ProcTask for IoTask {
             info.parent = family.parent();
         }
         if demand.content() {
-            info.affinity = self.scheduling.affinity();
+            info.affinity = self.effective_affinity();
             info.nice = self.scheduling.nice();
             info.scheduler = self.scheduling.policy();
             info.pending = self.inbox.bits();

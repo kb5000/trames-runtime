@@ -125,6 +125,11 @@ impl<C: Cpu> Lifecycle<C> {
                     .expect("accepted original memory operation");
                 let number = call.number();
                 let kind = call.index();
+                let _memory_scope = p
+                    .signals
+                    .io
+                    .cgroup()
+                    .map(trames_vfs::CgroupTask::memory_scope);
                 let began = Instant::now();
                 // The selected mapping ABI has no host terminal/output effects.
                 // Use the same Linux implementation as the joined caller.
