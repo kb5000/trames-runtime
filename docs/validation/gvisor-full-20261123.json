@@ -1,0 +1,255 @@
+{
+  "scope": "14530 enabled original ARM64 cases in 254 groups",
+  "gvisor_revision": "89cacadae21eca4270a8f7c79281d0426d33ac5f",
+  "production": {
+    "runtime_revision": "ede0384f3ccb3d62a893c3e5e068d8bdea58e069",
+    "runner_build_runtime_revision": "9a20d6a4cc19825c8991db7b2ebcdf05592a0728",
+    "production_sources_identical": true,
+    "runtime_delta": [
+      "crates/trames-net/src/legacy_tables.rs",
+      "docs/validation/gvisor-iptables-20261123.md"
+    ],
+    "runners": {
+      "mac": {
+        "path": "/Users/main/dev/trames/target/gvisor-full-20261123/mac-runner",
+        "sha256": "44973bc238b9d95031a7d1641c8863f18a75662e9ad1f8eabf8b18946bad6390"
+      },
+      "interpreter": {
+        "path": "/Users/main/dev/trames/target/gvisor-full-20261123/interpreter-runner",
+        "sha256": "bef22c3be435a7274ce95f235ef2496037bc6d85e78b18cac9f3d2c8dd514275"
+      }
+    },
+    "ipad_revision": "1bbd61be0f8c89ba17fabc1061b62900c025d616",
+    "mac_revision": "5e48fdfb8218993f420d1b24fac46fa54cb16f92"
+  },
+  "native_kernel": "7.0.0-43-generic",
+  "native_counts": {
+    "passed": 13965,
+    "failed": 36,
+    "skipped": 525,
+    "timeout": 4
+  },
+  "native_passing": 13965,
+  "executors": {
+    "mac": {
+      "first_run_counts": {
+        "passed": 13982,
+        "skipped": 507,
+        "failed": 37,
+        "timeout": 4
+      },
+      "first_run_on_native_passed": {
+        "passed": 13935,
+        "skipped": 20,
+        "timeout": 1,
+        "failed": 9
+      },
+      "verified_counts": {
+        "passed": 14014,
+        "failed": 28,
+        "skipped": 485,
+        "timeout": 3
+      },
+      "verified_on_native_passed": {
+        "passed": 13965
+      },
+      "profiles": {
+        "mac-singleton-retry": {
+          "network": "internal",
+          "cpus": 2,
+          "case_execution": {
+            "chunk_size": 1,
+            "fresh_store": true,
+            "timeout_base": 60.0,
+            "suite_timeouts": {},
+            "upstream_wait_timeouts": {
+              "mmap_eternal": {
+                "MmapEternalTest.PageTableLeak": 90
+              },
+              "flock": {
+                "FlockTest.BlockingLockNoBlockingForSharedLocks": 45
+              },
+              "ppoll": {
+                "PpollTest.SignalMaskBlocksSignal": 45
+              },
+              "vfork": {
+                "VforkTest.ParentStopsUntilChildExits": 20,
+                "VforkTest.ParentStopsUntilChildExecves": 40,
+                "VforkTest.ExecedChildExitDoesntUnstopParent": 30,
+                "VforkTest.SigchldReceivedDuringVforkIsDelivered": 20
+              },
+              "sigstop": {
+                "SigstopTest.Correctness": 45
+              },
+              "itimer": {
+                "ItimerTest.DeliversSIGALRMToMainThread": 45,
+                "ItimerTest.DeliversSIGPROFToThreadsRoughlyFairlyActive": 100,
+                "ItimerTest.DeliversSIGPROFToThreadsRoughlyFairlyIdle": 220
+              },
+              "pselect": {
+                "PselectTest.SignalMaskBlocksSignal": 45
+              }
+            },
+            "reference_timing_extension": "max(base,min(90,native_seconds*3+2))"
+          }
+        },
+        "mac-userspace": {
+          "network": "internal",
+          "cpus": 2,
+          "upstream_userspace_abi": true,
+          "case_execution": {
+            "chunk_size": 1,
+            "fresh_store": true,
+            "timeout_base": 90.0,
+            "suite_timeouts": {},
+            "upstream_wait_timeouts": {
+              "mmap_eternal": {
+                "MmapEternalTest.PageTableLeak": 90
+              },
+              "flock": {
+                "FlockTest.BlockingLockNoBlockingForSharedLocks": 45
+              },
+              "ppoll": {
+                "PpollTest.SignalMaskBlocksSignal": 45
+              },
+              "vfork": {
+                "VforkTest.ParentStopsUntilChildExits": 20,
+                "VforkTest.ParentStopsUntilChildExecves": 40,
+                "VforkTest.ExecedChildExitDoesntUnstopParent": 30,
+                "VforkTest.SigchldReceivedDuringVforkIsDelivered": 20
+              },
+              "sigstop": {
+                "SigstopTest.Correctness": 45
+              },
+              "itimer": {
+                "ItimerTest.DeliversSIGALRMToMainThread": 45,
+                "ItimerTest.DeliversSIGPROFToThreadsRoughlyFairlyActive": 100,
+                "ItimerTest.DeliversSIGPROFToThreadsRoughlyFairlyIdle": 220
+              },
+              "pselect": {
+                "PselectTest.SignalMaskBlocksSignal": 45
+              }
+            },
+            "reference_timing_extension": "max(base,min(90,native_seconds*3+2))"
+          }
+        },
+        "mac-affinity": {
+          "network": "internal",
+          "cpus": 4,
+          "case_execution": {
+            "chunk_size": 1,
+            "fresh_store": true,
+            "timeout_base": 60.0,
+            "suite_timeouts": {},
+            "upstream_wait_timeouts": {
+              "mmap_eternal": {
+                "MmapEternalTest.PageTableLeak": 90
+              },
+              "flock": {
+                "FlockTest.BlockingLockNoBlockingForSharedLocks": 45
+              },
+              "ppoll": {
+                "PpollTest.SignalMaskBlocksSignal": 45
+              },
+              "vfork": {
+                "VforkTest.ParentStopsUntilChildExits": 20,
+                "VforkTest.ParentStopsUntilChildExecves": 40,
+                "VforkTest.ExecedChildExitDoesntUnstopParent": 30,
+                "VforkTest.SigchldReceivedDuringVforkIsDelivered": 20
+              },
+              "sigstop": {
+                "SigstopTest.Correctness": 45
+              },
+              "itimer": {
+                "ItimerTest.DeliversSIGALRMToMainThread": 45,
+                "ItimerTest.DeliversSIGPROFToThreadsRoughlyFairlyActive": 100,
+                "ItimerTest.DeliversSIGPROFToThreadsRoughlyFairlyIdle": 220
+              },
+              "pselect": {
+                "PselectTest.SignalMaskBlocksSignal": 45
+              }
+            },
+            "reference_timing_extension": "max(base,min(90,native_seconds*3+2))"
+          }
+        }
+      },
+      "raw_results_sha256": "d11e5fcf2ff22b2fa034904ea52f4da1025885a03e2eae4b78ef6fc6147be69a"
+    },
+    "interpreter": {
+      "first_run_counts": {
+        "passed": 13926,
+        "skipped": 507,
+        "failed": 84,
+        "timeout": 8,
+        "no_result": 5
+      },
+      "first_run_on_native_passed": {
+        "passed": 13879,
+        "skipped": 20,
+        "failed": 56,
+        "timeout": 5,
+        "no_result": 5
+      },
+      "verified_counts": {
+        "passed": 14014,
+        "failed": 28,
+        "skipped": 485,
+        "timeout": 3
+      },
+      "verified_on_native_passed": {
+        "passed": 13965
+      },
+      "profiles": {
+        "interpreter-singleton-retry": {
+          "network": "full",
+          "cpus": 2,
+          "case_execution": {
+            "timeout_base": 90.0,
+            "suite_timeouts": {},
+            "chunk_size": 1
+          }
+        },
+        "interpreter-userspace": {
+          "network": "full",
+          "cpus": 2,
+          "upstream_userspace_abi": true,
+          "case_execution": {
+            "timeout_base": 90.0,
+            "suite_timeouts": {},
+            "chunk_size": 1
+          }
+        },
+        "interpreter-affinity": {
+          "network": "loopback",
+          "cpus": 4,
+          "case_execution": {
+            "timeout_base": 60.0,
+            "suite_timeouts": {},
+            "chunk_size": 1
+          }
+        },
+        "interpreter-udp-full": {
+          "network": "full",
+          "cpus": 2,
+          "case_execution": {
+            "timeout_base": 60.0,
+            "suite_timeouts": {},
+            "chunk_size": 1
+          }
+        },
+        "interpreter-udp6-full": {
+          "network": "full",
+          "cpus": 2,
+          "case_execution": {
+            "timeout_base": 60.0,
+            "suite_timeouts": {},
+            "chunk_size": 1
+          }
+        }
+      },
+      "raw_results_sha256": "ab49910471a9c212cf1f53f9a83201387f621e143608f7d1e8f045175ae5392d"
+    }
+  },
+  "evidence": "target/gvisor-full-20261123",
+  "native_evidence": "target/local-ci/io/gvisor-full-native-20261123-final"
+}

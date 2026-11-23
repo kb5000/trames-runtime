@@ -135,6 +135,15 @@ the same guest setup as the Mac harness, including writable sysfs for mount and
 rename. It retains original per-case XML and the executable hashes. Interpreter
 results on the development host do not exercise a physical iPad.
 
+For broad interpreter runs, `--chunk-size 50` starts each original GTest chunk
+in a fresh store. It audits the exact XML case set and exit status, then splits
+aborted or timed-out chunks into retries. Affinity, isolated loopback and TUN/TAP
+cases keep separate processes. `--suite-timeout NAME=SECONDS` preserves the
+upstream suites' intentional long waits. `--exec-file /GUEST=HOST` imports extra
+fixture executables, such as Bash and its loader, and records their hashes.
+The `host_pty` suite uses the product's `--pty` terminal. `--network full`
+permits guest bridge, veth and TUN traffic that loopback-only policy rejects.
+
 ## Broad Linux/ARM64 coverage
 
 `--expanded` resolves the original `cc_binary`/`cc_library` dependency graph

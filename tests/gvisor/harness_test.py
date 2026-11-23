@@ -97,6 +97,30 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(progress.completed,{'T.Pass'})
         self.assertIsNone(xml_rows(self.root/'missing.xml',0,['T.Pass']))
         self.assertEqual(classify(self.root/'missing.xml',0,False,'T.Pass')[0],'no_result')
+    def test_interpreter_retries_abnormal_chunks_and_keeps_the_exact_case_set(self):
+        from interpreter_chunks import run
+        seed = self.root / 'seed'
+        seed.mkdir()
+        output = self.root / 'output'
+        (output / 'logs').mkdir(parents=True)
+        calls = []
+        def execute_chunk(argv, stdout, stderr, *args, **kwargs):
+            selected = next(arg.split('=', 1)[1].split(':') for arg in argv if arg.startswith('--gtest_filter='))
+            calls.append(selected)
+            stdout.write_text('[ RUN      ] ' + selected[0] + '\n')
+            stderr.write_text('')
+            xml = Path(argv[argv.index('--export') + 1].split('=', 1)[1])
+            xml.write_text('<testsuites><testsuite>' + ''.join(
+                '<testcase classname="T" name="' + case.split('.', 1)[1] + '"/>'
+                for case in selected) + '</testsuite></testsuites>')
+            return (134 if len(selected) > 1 else 0), False, 0.1
+        args = argparse.Namespace(timeout=5, suite_timeouts={}, min_free_gib=0, chunk_size=50,
+                                  test_on_gvisor=False, mount_fusectl=False)
+        with patch('interpreter_chunks.execute', side_effect=execute_chunk):
+            rows = run(args, output, [dict(name='example', cases=['T.A', 'T.B'])], ['runner'], seed)
+        self.assertEqual(calls, [['T.A', 'T.B'], ['T.A'], ['T.B']])
+        self.assertEqual([(row['case'], row['status']) for row in rows], [('T.A', 'passed'), ('T.B', 'passed')])
+        self.assertTrue(all(row['code'] == 0 and row['chunk_cases'] == 1 for row in rows))
     def test_child_noise_does_not_extend_the_active_case(self):
         path=self.root/'stdout';path.write_text('[ RUN      ] T.Parent\n')
         progress=Progress(path,['T.Parent'],lambda _:5);progress.remaining();since=progress.since
