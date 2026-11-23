@@ -59,11 +59,11 @@ const CHANGEABLE: u32 = 0x400 | O_NONBLOCK | O_NOATIME | 0x2000 | O_DIRECT;
 /// This has no Files root and never resolves a numeric FD after acceptance.
 pub struct DescriptorControl(Descriptor);
 impl DescriptorControl {
-    pub(super) fn pidfd(&self) -> Result<(Arc<PidFd>, bool)> {
+    pub(super) fn pidfd(&self) -> Result<(Arc<PidFd>, u32)> {
         let open = self.0.open.borrow();
         match &open.control {
             Some(events::SharedControl::Pid(pid)) if open.flags.get() & O_PATH == 0 => {
-                Ok((pid.clone(), open.flags.get() & O_NONBLOCK != 0))
+                Ok((pid.clone(), open.flags.get()))
             }
             _ => Err(Errno(9)),
         }

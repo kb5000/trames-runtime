@@ -228,6 +228,7 @@ pub(crate) struct Topology {
 pub(crate) struct View {
     pub graph: Arc<RwLock<Topology>>,
     pub namespace: u64,
+    pub ip_settings: Arc<crate::IpSettings>,
 }
 const LOOPBACK_V4: Address = Address {
     ip: IpAddr::V4(Ipv4Addr::LOCALHOST),

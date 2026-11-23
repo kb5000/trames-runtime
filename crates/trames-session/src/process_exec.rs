@@ -184,7 +184,7 @@ impl<C: Cpu> Kernel<C> {
         p.wait_event.exec();
         p.signals.exec();
 
-        p.membarrier_registered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        p.membarrier_registered = Arc::new(std::sync::atomic::AtomicU32::new(0));
         p.state = State::Ready;
         old_memory
     }

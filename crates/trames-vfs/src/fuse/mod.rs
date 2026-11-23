@@ -5,15 +5,20 @@ use std::sync::OnceLock;
 
 mod mount;
 pub(crate) use mount::{option_fd, prepare, File, Metadata, Mounted, PathOperation};
+mod control;
+pub(super) use control::{Abort, Controller};
 mod transport;
 pub use transport::{Caller, Connection, Request};
 
 /// Only attached daemon file descriptions hold this reference. Outstanding
 /// filesystem requests must wake up when the final daemon closes its device.
-struct Daemon(Arc<Connection>);
+struct Daemon {
+    connection: Arc<Connection>,
+    mounted: std::sync::Weak<Mounted>,
+}
 impl Drop for Daemon {
     fn drop(&mut self) {
-        self.0.abort();
+        self.connection.abort();
     }
 }
 pub struct Device {
@@ -42,7 +47,7 @@ impl Device {
     fn install(self: &Arc<Self>, daemon: Arc<Daemon>) {
         let target: Arc<dyn IoWake> = self.clone();
         let wake = IoSignal::new(0, Arc::downgrade(&target));
-        let sub = daemon.0.subscribe(&wake);
+        let sub = daemon.connection.subscribe(&wake);
         assert!(self.relay.set((wake, sub)).is_ok());
         assert!(self.daemon.set(daemon).is_ok());
         self.attached.notify_atomic();
@@ -51,7 +56,10 @@ impl Device {
     fn connect(self: &Arc<Self>, caller: Caller) -> Result<Arc<Connection>> {
         self.reserve()?;
         let connection = Connection::new(caller);
-        self.install(Arc::new(Daemon(connection.clone())));
+        self.install(Arc::new(Daemon {
+            connection: connection.clone(),
+            mounted: Default::default(),
+        }));
         Ok(connection)
     }
     pub(super) fn attach_clone(self: &Arc<Self>, original: &Self) -> Result<()> {
@@ -64,7 +72,10 @@ impl Device {
         Ok(())
     }
     pub(super) fn connection(&self) -> Result<&Connection> {
-        self.daemon.get().map(|d| d.0.as_ref()).ok_or(Errno(1))
+        self.daemon
+            .get()
+            .map(|d| d.connection.as_ref())
+            .ok_or(Errno(1))
     }
     pub(super) fn poll(&self, events: u16) -> (u16, [u64; 2]) {
         self.connection().map_or((8, [0; 2]), |c| c.poll(events))

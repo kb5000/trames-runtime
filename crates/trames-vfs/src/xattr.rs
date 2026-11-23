@@ -222,7 +222,9 @@ impl Vfs {
         }
         let old_times = n.times;
         let old_mode = n.mode;
-        let mut next = value.map(<[u8]>::to_vec);
+        let mut next = value
+            .filter(|bytes| !acl::name(name) || !bytes.is_empty())
+            .map(<[u8]>::to_vec);
         if acl::name(name) {
             if let Some(value) = &mut next {
                 acl::validate(value)?;

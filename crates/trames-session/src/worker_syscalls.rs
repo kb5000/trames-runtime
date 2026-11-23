@@ -90,7 +90,7 @@ pub(super) struct Snapshot {
     pub session_keys: trames_vfs::SessionKeys,
     pub personality: trames_linux::TaskPersonality,
     pub memory_policy: Arc<trames_linux::TaskMemoryPolicy>,
-    pub membarrier_registered: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pub membarrier_registered: Option<Arc<std::sync::atomic::AtomicU32>>,
     pub vfork_release: Option<Arc<trames_kernel::vfork::Release>>,
     pub native_space: Option<crate::space::Native>,
     pub namespaces: Option<trames_vfs::TaskNamespaces>,

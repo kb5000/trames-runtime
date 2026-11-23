@@ -89,6 +89,7 @@ pub(super) enum Sysctl {
     UnprivilegedPort,
     LocalPortRange,
     TcpSack,
+    Ip(trames_net::IpSysctl),
     Forwarding(bool),
     Ipv4Ingress(u32, trames_net::Ipv4Ingress),
     BridgeFilter(bool),
@@ -148,6 +149,17 @@ impl Sysctl {
             b"/proc/sys/net/ipv4/ip_unprivileged_port_start" => Some(Self::UnprivilegedPort),
             b"/proc/sys/net/ipv4/ip_local_port_range" => Some(Self::LocalPortRange),
             b"/proc/sys/net/ipv4/tcp_sack" => Some(Self::TcpSack),
+            b"/proc/sys/net/ipv4/tcp_recovery" => Some(Self::Ip(trames_net::IpSysctl::TcpRecovery)),
+            b"/proc/sys/net/ipv6/auto_flowlabels" => {
+                Some(Self::Ip(trames_net::IpSysctl::AutoFlowLabels))
+            }
+            b"/proc/sys/net/ipv6/bindv6only" => Some(Self::Ip(trames_net::IpSysctl::BindV6Only)),
+            b"/proc/sys/net/ipv6/ip6frag_time" => {
+                Some(Self::Ip(trames_net::IpSysctl::Ipv6FragmentTime))
+            }
+            b"/proc/sys/net/ipv6/ip_nonlocal_bind" => {
+                Some(Self::Ip(trames_net::IpSysctl::Ipv6NonlocalBind))
+            }
             b"/proc/sys/net/ipv4/ip_forward" | b"/proc/sys/net/ipv4/conf/all/forwarding" => {
                 Some(Self::Forwarding(false))
             }
@@ -180,6 +192,7 @@ impl Control {
                 format!("{low}\t{high}\n")
             }
             Sysctl::TcpSack => format!("{}\n", u8::from(n.tcp_sack().map_err(|e| Errno(e.0))?)),
+            Sysctl::Ip(knob) => format!("{}\n", n.ip_sysctl(knob)),
             Sysctl::UnprivilegedPort => format!("{}\n", n.unprivileged_port()),
             Sysctl::BridgeFilter(ipv6) => format!("{}\n", u8::from(n.bridge_filter(ipv6))),
             Sysctl::Ipv4Ingress(scope, flag) => format!(
@@ -211,6 +224,14 @@ impl Control {
             return Err(Errno(22));
         }
         let text = std::str::from_utf8(bytes).map_err(|_| Errno(22))?;
+        if let Sysctl::Ip(knob) = self.kind {
+            self.namespace
+                .network
+                .borrow()
+                .set_ip_sysctl(knob, text.trim().parse().map_err(|_| Errno(22))?)
+                .map_err(|e| Errno(e.0))?;
+            return Ok(bytes.len());
+        }
         if let Sysctl::StableSecret(scope) = self.kind {
             let secret = text.trim().parse().map_err(|_| Errno(22))?;
             self.namespace
@@ -457,6 +478,7 @@ impl Vfs {
                     mount_use: Default::default(),
                     directory_mount: Default::default(),
                     namespace_resource: None,
+                    link_credentials: None,
                     file_authority: Default::default(),
                     tcp_publication: Default::default(),
                     socket_control: Some(network_io::SocketControl::new(&socket, namespace)),

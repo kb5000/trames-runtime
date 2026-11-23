@@ -98,19 +98,27 @@ impl IoRoutes {
         pid: i32,
         flags: u32,
     ) -> Result<u64, Errno> {
-        if pid <= 0 || flags & !trames_vfs::O_NONBLOCK != 0 {
+        if pid <= 0 || flags & !(trames_vfs::O_NONBLOCK | trames_vfs::PIDFD_THREAD) != 0 {
             return Err(Errno(22));
         }
         let global = self.namespace.global(pid as u32).ok_or(Errno(3))?;
         let task = self.directory.proc_task(global).ok_or(Errno(3))?;
-        if task.tgid() != global {
+        if task.tgid() != global && flags & trames_vfs::PIDFD_THREAD == 0 {
             return Err(Errno(2));
         }
-        let target = task.lifecycle().pidfd().ok_or(Errno(3))?;
+        let target = Self::task_pidfd(&task, global).ok_or(Errno(3))?;
         factory
             .reserve_pidfd(target, flags)?
             .publish()
             .map(u64::from)
+    }
+
+    fn task_pidfd(task: &IoTask, id: u32) -> Option<Arc<trames_vfs::PidFd>> {
+        if id == task.tgid() {
+            task.lifecycle().pidfd()
+        } else {
+            task.thread_wait(id).map(|source| source.pidfd(id))
+        }
     }
 
     pub fn pidfd_getfd(
@@ -144,9 +152,7 @@ impl IoRoutes {
             .proc_task(pidfd.pid())
             .filter(|t| t.live())
             .ok_or(Errno(3))?;
-        if !target
-            .lifecycle()
-            .pidfd()
+        if !Self::task_pidfd(&target, pidfd.pid())
             .is_some_and(|current| Arc::ptr_eq(&current, pidfd))
         {
             return Err(Errno(3));
@@ -174,32 +180,48 @@ impl IoRoutes {
         a: [u64; 6],
         memory: &impl CpuMemory,
     ) -> Result<u64, Errno> {
-        if a[3] as u32 != 0 {
+        let scope = a[3] as u32;
+        if !matches!(scope, 0 | 1 | 2 | 4) {
             return Err(Errno(22));
         }
-        let (target, _) = files.pidfd(a[0] as u32)?;
+        let (target, flags) = files.pidfd_flags(a[0] as u32)?;
         let global = target.pid();
-        let observed = self
-            .directory
-            .proc_task(global)
-            .and_then(|t| t.lifecycle().pidfd())
-            .ok_or(Errno(3))?;
-        if !Arc::ptr_eq(&observed, &target) {
-            return Err(Errno(3));
-        }
-        let local = self.namespace.local(global);
-        if local == 0 {
+        if self.namespace.local(global) == 0 {
             return Err(Errno(22));
         }
-        let args = [u64::from(local), a[1], a[2], 0, 0, 0];
-        // Global IDs are never recycled in a session. Signal delivery can now
-        // use the ordinary permission, disposition and group-queue checks.
-        if a[2] != 0 {
-            self.queued(source, 138, args, memory, true)
+        let thread = scope == 1 || scope == 0 && flags & trames_vfs::PIDFD_THREAD != 0;
+        let groups = if scope == 4 {
+            let mut groups = std::collections::BTreeMap::<_, Vec<_>>::new();
+            for task in self.directory.tasks(2, global) {
+                groups.entry(task.tgid()).or_default().push(task);
+            }
+            groups.into_values().collect()
         } else {
-            self.send(source, 129, args)
-        }
-        .expect("process-directed route")
+            let task = self.directory.proc_task(global).ok_or(Errno(3))?;
+            if !Self::task_pidfd(&task, global).is_some_and(|pid| Arc::ptr_eq(&pid, &target)) {
+                return Err(Errno(3));
+            }
+            vec![if thread {
+                vec![task]
+            } else {
+                self.directory.tasks(1, global)
+            }]
+        };
+        let sig = a[1] as u32;
+        let user = (a[2] != 0)
+            .then(|| {
+                let user = memory.read_array::<48>(a[2]).map_err(|_| Errno(14))?;
+                Self::signal_info(
+                    memory,
+                    a[2],
+                    user,
+                    sig,
+                    true,
+                    scope != 4 && source.tid() == global,
+                )
+            })
+            .transpose()?;
+        self.deliver_signal(source, sig, thread, groups, user)
     }
     fn queued(
         &self,
@@ -214,17 +236,39 @@ impl IoRoutes {
         } else {
             (131, a, a[3])
         };
-        let user = match memory.read_array::<48>(address) {
-            Ok(bytes) => bytes,
-            Err(_) => return Some(Err(Errno(14))),
-        };
-        if number == 240 && (a[0] as i32 <= 0 || a[1] as i32 <= 0) {
-            return Some(Err(Errno(22)));
-        }
-        let code = i32::from_le_bytes(user[8..12].try_into().unwrap());
         let sig = a[if number == 240 { 2 } else { 1 }] as u32;
+        let target = a[if number == 240 { 1 } else { 0 }] as u32;
+        Some((|| {
+            let user = memory.read_array::<48>(address).map_err(|_| Errno(14))?;
+            if number == 240 && (a[0] as i32 <= 0 || a[1] as i32 <= 0) {
+                return Err(Errno(22));
+            }
+            let user = Self::signal_info(
+                memory,
+                address,
+                user,
+                sig,
+                check_signo,
+                self.namespace.local(source.tid()) == target,
+            )?;
+            if number == 138 && a[0] as i32 <= 0 {
+                return Err(Errno(3));
+            }
+            self.send_info(source, route, args, Some(user))
+                .expect("queued signal route")
+        })())
+    }
+    fn signal_info(
+        memory: &impl CpuMemory,
+        address: u64,
+        user: [u8; 48],
+        sig: u32,
+        check_signo: bool,
+        to_self: bool,
+    ) -> Result<[u8; 48], Errno> {
+        let code = i32::from_le_bytes(user[8..12].try_into().unwrap());
         if check_signo && u32::from_le_bytes(user[..4].try_into().unwrap()) != sig {
-            return Some(Err(Errno(22)));
+            return Err(Errno(22));
         }
         let limit = match sig {
             4 => 11,
@@ -244,22 +288,16 @@ impl IoRoutes {
                 .and_then(|at| memory.read_array::<80>(at).ok())
             {
                 Some(bytes) => bytes,
-                None => return Some(Err(Errno(14))),
+                None => return Err(Errno(14)),
             };
             if expansion.iter().any(|b| *b != 0) {
-                return Some(Err(Errno(7)));
+                return Err(Errno(7));
             }
         }
-        let target = a[if number == 240 { 1 } else { 0 }] as u32;
-        if (code >= 0 || code == -6)
-            && self.namespace.local(trames_vfs::ProcTask::pid(source)) != target
-        {
-            return Some(Err(Errno(1)));
+        if (code >= 0 || code == -6) && !to_self {
+            return Err(Errno(1));
         }
-        if number == 138 && a[0] as i32 <= 0 {
-            return Some(Err(Errno(3)));
-        }
-        self.send_info(source, route, args, Some(user))
+        Ok(user)
     }
     fn send_info(
         &self,
@@ -273,10 +311,6 @@ impl IoRoutes {
             if sig > 64 {
                 return Err(Errno(22));
             }
-            let can_kill = source
-                .credentials()
-                .read()
-                .has_cap(trames_vfs::capabilities::KILL);
             let mut groups = Vec::new();
             let thread = number != 129;
             if thread {
@@ -335,47 +369,100 @@ impl IoRoutes {
                     }
                 }
             }
-            let mut found = false;
-            let mut allowed = false;
-            for tasks in groups {
-                let Some(target) = tasks.first() else {
-                    continue;
-                };
-                found = true;
-                if !can_kill
-                    && !(sig == 18 && source.session() == target.session())
-                    && !{
-                        let (matched, namespace) = {
-                            let c = target.credentials().read();
-                            (
-                                [self.uid, self.euid]
-                                    .iter()
-                                    .any(|id| *id == c.uid || *id == c.suid),
-                                c.user_namespace.clone(),
-                            )
-                        };
-                        matched
-                            || source
-                                .credentials()
-                                .read()
-                                .has_ns_cap(&namespace, trames_vfs::capabilities::KILL)
+            self.deliver_signal(source, sig, thread, groups, user)
+        })())
+    }
+    fn deliver_signal(
+        &self,
+        source: &IoTask,
+        sig: u32,
+        thread: bool,
+        groups: Vec<Vec<Arc<IoTask>>>,
+        user: Option<[u8; 48]>,
+    ) -> Result<u64, Errno> {
+        if sig > 64 {
+            return Err(Errno(22));
+        }
+        let can_kill = source
+            .credentials()
+            .read()
+            .has_cap(trames_vfs::capabilities::KILL);
+        let mut found = false;
+        let mut allowed = false;
+        for tasks in groups {
+            let Some(target) = tasks.first() else {
+                continue;
+            };
+            found = true;
+            if !can_kill
+                && !(sig == 18 && source.session() == target.session())
+                && !{
+                    let (matched, namespace) = {
+                        let c = target.credentials().read();
+                        (
+                            [self.uid, self.euid]
+                                .iter()
+                                .any(|id| *id == c.uid || *id == c.suid),
+                            c.user_namespace.clone(),
+                        )
+                    };
+                    matched
+                        || source
+                            .credentials()
+                            .read()
+                            .has_ns_cap(&namespace, trames_vfs::capabilities::KILL)
+                }
+            {
+                continue;
+            }
+            allowed = true;
+            if sig == 0 {
+                continue;
+            }
+            let live: Vec<_> = tasks
+                .iter()
+                .filter(|t| t.live.load(Ordering::Relaxed))
+                .collect();
+            let Some(target) = live.first() else { continue };
+            if matches!(sig, 9 | 18..=22) {
+                target.job_signal(
+                    sig,
+                    !thread,
+                    Info {
+                        user,
+                        sender: source.tgid(),
+                        uid: self.uid,
+                        code: user.map_or(if thread { -6 } else { 0 }, |bytes| {
+                            i32::from_le_bytes(bytes[8..12].try_into().unwrap())
+                        }),
+                        ..Default::default()
+                    },
+                    target.ancestor_sender(source.tgid()),
+                )?;
+                continue;
+            }
+            let queue = if thread {
+                &target.inbox
+            } else {
+                target.process().as_ref()
+            };
+            let queued = {
+                let policy = target.policy.read().unwrap();
+                let policy = policy.as_ref().expect("published target policy");
+                policy.actions.with_action(sig, |action| {
+                    let masked = live.iter().any(|t| t.mask() & (1u64 << (sig - 1)) != 0);
+                    let init =
+                        policy.namespace.is_nested() && policy.namespace.local(target.tgid()) == 1;
+                    if init
+                        && action.handler <= 1
+                        && !masked
+                        && !(sig == 9 && policy.namespace.local(source.tgid()) == 0)
+                        || action.handler == 1 && !masked
+                    {
+                        return Ok(false);
                     }
-                {
-                    continue;
-                }
-                allowed = true;
-                if sig == 0 {
-                    continue;
-                }
-                let live: Vec<_> = tasks
-                    .iter()
-                    .filter(|t| t.live.load(Ordering::Relaxed))
-                    .collect();
-                let Some(target) = live.first() else { continue };
-                if matches!(sig, 9 | 18..=22) {
-                    target.job_signal(
+                    queue.enqueue_quiet(
                         sig,
-                        !thread,
                         Info {
                             user,
                             sender: source.tgid(),
@@ -383,62 +470,26 @@ impl IoRoutes {
                             code: user.map_or(if thread { -6 } else { 0 }, |bytes| {
                                 i32::from_le_bytes(bytes[8..12].try_into().unwrap())
                             }),
-                            ..Default::default()
+                            ..Info::default()
                         },
-                        target.ancestor_sender(source.tgid()),
-                    )?;
-                    continue;
-                }
-                let queue = if thread {
-                    &target.inbox
-                } else {
-                    target.process().as_ref()
-                };
-                let queued = {
-                    let policy = target.policy.read().unwrap();
-                    let policy = policy.as_ref().expect("published target policy");
-                    policy.actions.with_action(sig, |action| {
-                        let masked = live.iter().any(|t| t.mask() & (1u64 << (sig - 1)) != 0);
-                        let init = policy.namespace.is_nested()
-                            && policy.namespace.local(target.tgid()) == 1;
-                        if init
-                            && action.handler <= 1
-                            && !masked
-                            && !(sig == 9 && policy.namespace.local(source.tgid()) == 0)
-                            || action.handler == 1 && !masked
-                        {
-                            return Ok(false);
-                        }
-                        queue.enqueue_quiet(
-                            sig,
-                            Info {
-                                user,
-                                sender: source.tgid(),
-                                uid: self.uid,
-                                code: user.map_or(if thread { -6 } else { 0 }, |bytes| {
-                                    i32::from_le_bytes(bytes[8..12].try_into().unwrap())
-                                }),
-                                ..Info::default()
-                            },
-                        )
-                    })?
-                };
-                // No policy/sighand/queue lock may enter a readiness callback.
-                if queued {
-                    queue.changed();
-                }
-                if thread {
-                    target.wake();
-                } else if let Some(target) = live.iter().find(|t| t.ready()) {
-                    target.wake();
-                }
+                    )
+                })?
+            };
+            // No policy/sighand/queue lock may enter a readiness callback.
+            if queued {
+                queue.changed();
             }
-            if allowed {
-                Ok(0)
-            } else {
-                Err(Errno(if found { 1 } else { 3 }))
+            if thread {
+                target.wake();
+            } else if let Some(target) = live.iter().find(|t| t.ready()) {
+                target.wake();
             }
-        })())
+        }
+        if allowed {
+            Ok(0)
+        } else {
+            Err(Errno(if found { 1 } else { 3 }))
+        }
     }
 }
 

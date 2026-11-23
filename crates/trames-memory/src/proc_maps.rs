@@ -34,6 +34,8 @@ impl MappingRoot {
 pub(super) enum Origin {
     Private,
     Stack,
+    Vdso,
+    Vvar,
     SharedAnon(u64),
     File(MappingFileInfo),
     Other,
@@ -88,6 +90,34 @@ impl Mapping {
 #[derive(Default, Clone)]
 pub(super) struct Mappings(Option<Arc<Vec<(u64, Mapping)>>>);
 impl Mappings {
+    pub(super) fn vvar_at(&self, address: u64) -> bool {
+        self.spans()[self.overlap(address, address.saturating_add(1))]
+            .first()
+            .is_some_and(|(_, mapping)| mapping.origin == Origin::Vvar)
+    }
+    pub(super) fn check_vvar_protection(
+        &self,
+        start: u64,
+        end: u64,
+        permissions: Permissions,
+    ) -> Result<(), MemoryError> {
+        if permissions.write || permissions.execute {
+            if let Some((base, _)) = self.spans()[self.overlap(start, end)]
+                .iter()
+                .find(|(_, mapping)| mapping.origin == Origin::Vvar)
+            {
+                return Err(MemoryError::Permission {
+                    address: start.max(*base),
+                    access: if permissions.write {
+                        crate::Access::Write
+                    } else {
+                        crate::Access::Execute
+                    },
+                });
+            }
+        }
+        Ok(())
+    }
     fn spans(&self) -> &[(u64, Mapping)] {
         self.0.as_deref().map_or(&[], Vec::as_slice)
     }
@@ -178,6 +208,29 @@ impl Mappings {
 }
 
 impl Memory {
+    pub fn identify_vdso(&mut self, base: u64) {
+        if let Some(shared) = &self.shared {
+            return shared.borrow_mut().identify_vdso(base);
+        }
+        self.apply_proc_edits(vec![
+            (
+                base,
+                Mapping {
+                    origin: Origin::Vdso,
+                    ..Mapping::private(base + PAGE_SIZE)
+                },
+            ),
+            (
+                base + PAGE_SIZE,
+                Mapping {
+                    origin: Origin::Vvar,
+                    may_write: false,
+                    may_execute: false,
+                    ..Mapping::private(base + 2 * PAGE_SIZE)
+                },
+            ),
+        ]);
+    }
     /// ARM permits loads through writable mappings. Procfs reports the requested VMA flags.
     pub fn report_write_only(&mut self, start: u64, len: u64, enabled: bool) {
         if let Some(mm) = &self.shared {
@@ -376,6 +429,14 @@ impl super::report::RegionLayout {
                             origin: Origin::File(f),
                             ..
                         }) => root.map_or(f.path.as_ref(), |r| r.visible(f)),
+                        Some(Mapping {
+                            origin: Origin::Vvar,
+                            ..
+                        }) => b"[vvar]",
+                        Some(Mapping {
+                            origin: Origin::Vdso,
+                            ..
+                        }) => b"[vdso]",
                         Some(Mapping {
                             origin: Origin::SharedAnon(_),
                             name: None,

@@ -40,6 +40,7 @@ pub(crate) struct Port {
     next_raw_id: u16,
     serial: u32,
     fragments: Vec<Fragments>,
+    pub(super) ip_settings: Option<Arc<crate::IpSettings>>,
 }
 struct Fragments {
     mark: u32,
@@ -210,7 +211,15 @@ impl Port {
                     covered: Vec::new(),
                     end: None,
                     poisoned: false,
-                    expires: now + Duration::from_secs(60),
+                    expires: now
+                        + Duration::from_secs(
+                            self.ip_settings
+                                .as_ref()
+                                .filter(|_| version == 6)
+                                .map_or(60, |settings| {
+                                    settings.get(crate::IpSysctl::Ipv6FragmentTime) as u64
+                                }),
+                        ),
                     updated: now,
                     received: 0,
                 });
@@ -299,6 +308,22 @@ impl TxToken for Tx<'_> {
     {
         let mut p = vec![0; len];
         let r = f(&mut p);
+        if p.len() >= 44
+            && p[0] >> 4 == 6
+            && matches!(p[6], 6 | 17)
+            && self.0.ip_settings.as_ref().is_some_and(|settings| {
+                matches!(settings.get(crate::IpSysctl::AutoFlowLabels), 1 | 3)
+            })
+            && p[1] & 0x0f == 0
+            && p[2..4] == [0, 0]
+        {
+            use std::hash::{Hash, Hasher};
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            p[6].hash(&mut hash);
+            p[8..44].hash(&mut hash);
+            let label = (hash.finish() as u32 & 0x7ffff) | 0x80000;
+            smoltcp::wire::Ipv6Packet::new_unchecked(&mut p).set_flow_label(label);
+        }
         // smoltcp implements IPv4 fragmentation; supply the missing IPv6 adapter.
         if len > MTU && p.first().is_some_and(|b| b >> 4 == 6) && len <= 65575 {
             let chunks = (len - 40).div_ceil(1448);

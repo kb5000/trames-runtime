@@ -133,6 +133,46 @@ pub(super) struct DiskBacking {
     // Open descriptions own strong leases; closed cached inodes own no FDs.
     pub(super) files: std::sync::Mutex<[std::sync::Weak<File>; 2]>,
     pub(super) charge: std::sync::OnceLock<Arc<file_accounting::FileCharge>>,
+    pub(super) preallocated_on_load: u64,
+}
+pub(super) fn reserve_backing_range(file: &File, offset: u64, end: u64) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    let result = {
+        use std::os::fd::AsRawFd;
+        // SAFETY: A retained writable FD and a validated, nonnegative range.
+        unsafe { libc::fallocate(file.as_raw_fd(), 1, offset as i64, (end - offset) as i64) }
+    };
+    #[cfg(target_vendor = "apple")]
+    let result = {
+        use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+        let _ = offset;
+        let allocated = file
+            .metadata()
+            .map_err(host_errno)?
+            .blocks()
+            .saturating_mul(512);
+        if allocated >= end {
+            return Ok(());
+        }
+        let mut request = libc::fstore_t {
+            fst_flags: libc::F_ALLOCATEALL | libc::F_ALLOCATEPERSIST,
+            fst_posmode: libc::F_PEOFPOSMODE,
+            fst_offset: 0,
+            fst_length: (end - allocated) as i64,
+            fst_bytesalloc: 0,
+        };
+        // SAFETY: F_PREALLOCATE takes a mutable fstore_t on this retained FD.
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut request) }
+    };
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    let result = {
+        let _ = (file, offset, end);
+        return Err(Errno(95));
+    };
+    if result < 0 {
+        return Err(host_errno(io::Error::last_os_error()));
+    }
+    Ok(())
 }
 impl DiskObject {
     // Held under the existing byte lock. Sync revocation before admitting a
@@ -218,8 +258,14 @@ impl DiskBacking {
     // update this store-local scalar; ordinary reads and overwrites do not.
     pub(super) fn register_size(&self, length: u64) {
         if let Some(store) = &self._store {
-            self.charge
-                .get_or_init(|| file_accounting::FileCharge::register(store.used.clone(), length));
+            self.charge.get_or_init(|| {
+                let charge = file_accounting::FileCharge::register(
+                    store.used.clone(),
+                    length.max(self.preallocated_on_load),
+                );
+                charge.set_preallocated(self.preallocated_on_load);
+                charge
+            });
         }
     }
     pub(super) fn update_size(&self, length: u64) {
@@ -412,6 +458,16 @@ impl FileData {
             Self::Plain(file) if file.tmpfs => Some(file.clone()),
             Self::Mapped(data) => data.tmpfs_file(),
             _ => None,
+        }
+    }
+    pub(super) fn reserve_keep_size(&self, offset: u64, end: u64) -> Result<()> {
+        match self {
+            Self::Plain(file) => file.reserve_keep_size(offset, end),
+            Self::Mapped(data) => data
+                .plain_file()
+                .ok_or(Errno(95))?
+                .reserve_keep_size(offset, end),
+            _ => Err(Errno(95)),
         }
     }
     pub(super) fn growth_charge(&self, length: u64) -> u64 {
@@ -639,6 +695,7 @@ impl DiskStore {
             backing: Arc::new(DiskBacking {
                 files: std::sync::Mutex::default(),
                 charge: std::sync::OnceLock::new(),
+                preallocated_on_load: 0,
                 path,
                 remove_on_drop: std::sync::atomic::AtomicBool::new(true),
                 _store: Some(self.clone()),
@@ -651,13 +708,28 @@ impl DiskStore {
     fn load(self: &Arc<Self>, inode: u64) -> Result<FileData> {
         let path = self.object_path(inode);
         regular(&path)?;
-        let length = fs::symlink_metadata(&path).map_err(host_errno)?.len();
+        let meta = fs::symlink_metadata(&path).map_err(host_errno)?;
+        let length = meta.len();
+        #[cfg(unix)]
+        let preallocated_on_load = {
+            use std::os::unix::fs::MetadataExt;
+            let allocated = meta.blocks().saturating_mul(512);
+            let block = 4096;
+            if allocated > length.div_ceil(block).saturating_mul(block) {
+                allocated
+            } else {
+                0
+            }
+        };
+        #[cfg(not(unix))]
+        let preallocated_on_load = 0;
         Ok(FileData::disk(DiskObject {
             capabilities: None,
             length,
             backing: Arc::new(DiskBacking {
                 files: std::sync::Mutex::default(),
                 charge: std::sync::OnceLock::new(),
+                preallocated_on_load,
                 path,
                 remove_on_drop: std::sync::atomic::AtomicBool::new(false),
                 _store: Some(self.clone()),

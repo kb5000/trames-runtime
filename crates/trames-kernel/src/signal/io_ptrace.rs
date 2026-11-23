@@ -486,15 +486,28 @@ impl IoTask {
         }
     }
 
+    pub(super) fn thread_wait(&self, tid: u32) -> Option<Arc<crate::children::Child>> {
+        let mut record = self.thread_wait.lock().unwrap();
+        if tid != self.tid() || tid == self.tgid() {
+            return None;
+        }
+        match &*record {
+            ThreadWait::Open(source) => Some(source.clone()),
+            ThreadWait::Unopened if self.live() => {
+                let source = crate::children::Child::thread_source(self);
+                *record = ThreadWait::Open(source.clone());
+                Some(source)
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn trace_thread_exit(&self, status: i32) {
-        let Some(slot) = self.trace.get() else { return };
-        let source = slot
-            .lock()
-            .unwrap()
-            .relationship
-            .as_ref()
-            .and_then(|rel| rel.thread_source.clone());
-        if let Some(source) = source {
+        if self.tid() == self.tgid() {
+            return;
+        }
+        let source = std::mem::replace(&mut *self.thread_wait.lock().unwrap(), ThreadWait::Retired);
+        if let ThreadWait::Open(source) = source {
             if let Some((notice, signo, status)) = source.finish_quiet(Some(status), None, None) {
                 notice.signal(
                     signo,
@@ -694,12 +707,14 @@ impl IoTask {
                 admission,
             )
         };
-        let thread_source =
-            (child.tid() != child.tgid()).then(|| crate::children::Child::thread_source(child));
-        let Some(original) = thread_source
-            .clone()
-            .or_else(|| child.lifecycle().wait_child())
-        else {
+        let tid = child.tid();
+        let thread_source = child.thread_wait(tid);
+        let original = if tid == child.tgid() {
+            child.lifecycle().wait_child()
+        } else {
+            thread_source.clone()
+        };
+        let Some(original) = original else {
             return;
         };
         let Some(family) = tracer.lifecycle().wait_children() else {
@@ -1059,12 +1074,14 @@ impl IoRoutes {
         options: u64,
         admission: Option<trames_vfs::Credentials>,
     ) -> Result<u64, Errno> {
-        let thread_source =
-            (task.tid() != task.tgid()).then(|| crate::children::Child::thread_source(task));
-        let child = thread_source
-            .clone()
-            .or_else(|| task.lifecycle().wait_child())
-            .ok_or(Errno(3))?;
+        let tid = task.tid();
+        let thread_source = task.thread_wait(tid);
+        let child = if tid == task.tgid() {
+            task.lifecycle().wait_child()
+        } else {
+            thread_source.clone()
+        }
+        .ok_or(Errno(3))?;
         let mut list = tracer.tracees.lock().unwrap();
         if list.retired || !tracer.live() || !task.live() {
             return Err(Errno(3));

@@ -884,7 +884,7 @@ pub(crate) fn request(
                 }
                 if request[18..20] != [0; 2]
                     || !matches!(request[22], 0 | 253)
-                    || kind == 24 && !matches!(route_kind, 1 | 6 | 7 | 8 | 9)
+                    || kind == 24 && family == 2 && !matches!(route_kind, 1 | 6 | 7 | 8 | 9)
                     || u32v(&request[24..28])? & !4 != 0
                     || a.iter().any(|(k, _)| !matches!(k, 1 | 4 | 5 | 6 | 7 | 15))
                 {
@@ -918,7 +918,7 @@ pub(crate) fn request(
                     .transpose()?
                     .filter(|ip| *ip != IpAddr::V4(Ipv4Addr::UNSPECIFIED));
                 let mut device = get(&a, 4).map(u32v).transpose()?.unwrap_or(0);
-                if kind == 24 && route_kind == 1 && device == 0 {
+                if kind == 24 && !matches!(route_kind, 6..=9) && device == 0 {
                     let gw = gateway.ok_or(NetError(19))?;
                     device = graph
                         .gateway_device(ns, gw, None)

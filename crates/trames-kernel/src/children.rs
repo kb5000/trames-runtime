@@ -111,6 +111,7 @@ struct State {
     traced_by_parent: bool,
     observer: Option<Box<Observer>>,
     observer_only: bool,
+    thread_source: bool,
     stopped: bool,
     exited: bool,
     reaped: bool,
@@ -325,6 +326,7 @@ impl Child {
             group: task.group(),
             credentials: task.credentials().clone(),
             group_usage: Arc::downgrade(task.lifecycle()),
+            thread_source: true,
             ..Default::default()
         })))
     }
@@ -344,6 +346,11 @@ impl Child {
                 .is_some()
         {
             return Err(Errno(3));
+        }
+        // Keep one PID identity available through an observed thread's exit,
+        // including descriptors first opened after the observer was installed.
+        if real.thread_source && real.pidfd.is_none() {
+            real.pidfd = Some(Arc::new(trames_vfs::PidFd::new(real.id, false, false)));
         }
         let owner = Arc::new(crate::task_parent::Parentage::default());
         owner.set_parent_thread(tracer.tid());
@@ -417,12 +424,17 @@ impl Child {
         let mut state = self.0.lock().unwrap();
         state.trap = None;
         state.traced_by_parent = false;
-        let cleanup = if state.observer_only {
+        let mut cleanup: Vec<OnReap> = if state.observer_only {
             state.reaped = true;
             state.on_reap.take().into_iter().collect()
         } else {
             Vec::new()
         };
+        if state.observer_only && state.exited {
+            if let Some(pid) = state.pidfd.clone() {
+                cleanup.push(Box::new(move || pid.publish(true)));
+            }
+        }
         Notice(state.parent.upgrade(), Weak::new(), cleanup)
     }
     pub(crate) fn trace_event(&self, signal: Option<i32>) -> Notice {
@@ -461,6 +473,7 @@ impl Child {
         usage: Option<crate::usage::Usage>,
     ) -> Option<(Notice, u32, i32)> {
         let mut state = self.0.lock().unwrap();
+        let thread_pidfd = state.thread_source.then(|| state.pidfd.clone()).flatten();
         if let Some(observer) = state.observer.as_mut() {
             if status.is_none() {
                 if let Some((_, policy)) = &mut observer.deferred {
@@ -474,6 +487,11 @@ impl Child {
             let status = status?;
             observer.deferred = Some((status, parent));
             let wait = observer.wait.clone();
+            // The observer can remain waitable after the executor and its
+            // thread record have been released.
+            if let Some(pidfd) = thread_pidfd {
+                wait.0.lock().unwrap().pidfd = Some(pidfd);
+            }
             state.event = None;
             state.stopped = false;
             if let Some(usage) = usage {
@@ -506,8 +524,8 @@ impl Child {
         let signo = parent.map_or(state.exit_signal.signo, |(_, image)| {
             state.exit_signal.delivered(image)
         });
-        let auto_reap =
-            !state.traced_by_parent && signo == 17 && parent.is_some_and(|(auto, _)| auto);
+        let auto_reap = state.thread_source
+            || !state.traced_by_parent && signo == 17 && parent.is_some_and(|(auto, _)| auto);
         let parent = state.parent.upgrade();
         if auto_reap {
             state.reaped = true;

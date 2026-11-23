@@ -46,7 +46,7 @@ use pipe::{Pipe, PipeEnd};
 pub use stream_transfer::{StreamTransfer, TransferWait};
 mod descriptor_factory;
 mod pidfd;
-pub use pidfd::{PendingPidFd, PidFd};
+pub use pidfd::{PendingPidFd, PidFd, PIDFD_THREAD};
 mod fd_allocator;
 mod fd_table;
 mod resource_limits;
@@ -309,6 +309,7 @@ struct SharedOpenDescription {
     mount_use: std::sync::OnceLock<mounts::MountUse>,
     directory_mount: std::sync::OnceLock<mounts::DirectoryPin>,
     namespace_resource: Option<linux_namespace::SharedNamespace>,
+    link_credentials: Option<(u64, UserNamespace)>,
     file_authority: std::sync::OnceLock<file_io::PublishedFile>,
     tcp_publication: std::sync::Mutex<Option<DirectTcpFd>>,
     socket_control: Option<network_io::SocketControl>,
@@ -442,6 +443,8 @@ type NodeRef = Arc<Inode>;
 struct Inode {
     text_users: std::sync::atomic::AtomicIsize,
     proc_node: std::sync::OnceLock<proc_source::ProcNode>,
+    removed_directory_parent: std::sync::OnceLock<NodeRef>,
+    fuse_abort: std::sync::OnceLock<fuse::Abort>,
     seq_file: bool,
     regular_file: bool,
     active_file_work: std::sync::atomic::AtomicUsize,
@@ -475,6 +478,8 @@ impl Inode {
             seq_file: false,
             regular_file: !node.volatile && matches!(node.content, Content::File(_)),
             proc_node: Default::default(),
+            removed_directory_parent: Default::default(),
+            fuse_abort: Default::default(),
             active_file_work: std::sync::atomic::AtomicUsize::new(0),
             layout: Default::default(),
             metadata: std::sync::Mutex::new(()),
@@ -1131,6 +1136,7 @@ impl Default for Vfs {
                             mount_use: Default::default(),
                             directory_mount: Default::default(),
                             namespace_resource: None,
+                            link_credentials: None,
                             file_authority: Default::default(),
                             tcp_publication: Default::default(),
                             socket_control: None,
@@ -1349,10 +1355,10 @@ impl Vfs {
         }
         path.writable()?;
         if Self::cgroup_mount(path)
-            || path
-                .mount
-                .as_ref()
-                .is_some_and(|m| m.devpts.is_some() || m.kind == mounts::Kind::Mqueue)
+            || path.mount.as_ref().is_some_and(|m| {
+                m.devpts.is_some()
+                    || matches!(m.kind, mounts::Kind::Mqueue | mounts::Kind::FuseControl)
+            })
         {
             return Err(Errno(1));
         }
@@ -1528,6 +1534,7 @@ impl Vfs {
                             mount_use: Default::default(),
                             directory_mount: Default::default(),
                             namespace_resource: None,
+                            link_credentials: None,
                             file_authority: Default::default(),
                             tcp_publication: Default::default(),
                             socket_control: None,
@@ -1592,6 +1599,7 @@ impl Vfs {
         } else {
             let i = path.iter().rposition(|b| *b == b'/').ok_or(Errno(2))?;
             let parent = self.node(&ResolvedPath {
+                retained_directory: None,
                 proc_binding: None,
                 key: path[..i.max(1)].to_vec(),
                 mount: path.mount.clone(),
@@ -1696,6 +1704,9 @@ impl Vfs {
             // filesystem-name whitelist (which used to exclude mqueue roots).
             query.pin_mount(path.mount());
         }
+        if let Some(directory) = path.retained_directory() {
+            return Ok(directory.clone());
+        }
         if path
             .mount()
             .is_some_and(|m| m.kind == mounts::Kind::Cgroup && m.root.borrow().links == 0)
@@ -1729,13 +1740,14 @@ impl Vfs {
                 return host.lookup(&mount.fs, key);
             }
         }
-        path.mount()
-            .map_or(&self.fs, |m| &m.fs)
-            .borrow()
-            .paths
-            .get(key)
-            .cloned()
-            .ok_or(Errno(2))
+        let filesystem = path.mount().map_or(&self.fs, |m| &m.fs);
+        let fs = filesystem.borrow();
+        if let Some(node) = fs.paths.get(key) {
+            return Ok(node.clone());
+        }
+        let overlay = fs.overlay.clone();
+        drop(fs);
+        overlay.ok_or(Errno(2))?.lookup_new(filesystem, key)
     }
     fn descriptor(&self, fd: u32) -> Result<Descriptor> {
         if let Some(query) = &self.query {
@@ -1780,11 +1792,16 @@ impl Vfs {
             .is_ok_and(|n| matches!(n.borrow().content, Content::Directory))
     }
     fn base(&self, dirfd: i32) -> Result<ResolvedPath> {
+        self.path_base(dirfd, None)
+    }
+    fn path_base(&self, dirfd: i32, accepted: Option<&Descriptor>) -> Result<ResolvedPath> {
         let path = if dirfd == AT_FDCWD {
             let paths = self.context.paths.borrow();
             self.location(paths.cwd_node.as_ref().ok_or(Errno(2))?, &paths.cwd_mount)?
         } else {
-            let o_descriptor = self.descriptor(dirfd as u32)?;
+            let o_descriptor = accepted
+                .cloned()
+                .map_or_else(|| self.descriptor(dirfd as u32), Ok)?;
             let o = o_descriptor.open.borrow();
             let n = o.node.as_ref().ok_or(Errno(20))?;
             if !matches!(n.borrow().content, Content::Directory) {
@@ -1874,6 +1891,7 @@ impl Vfs {
         if let Some(file) = &magic {
             Ok(MetadataTarget {
                 path: ResolvedPath {
+                    retained_directory: None,
                     proc_binding: None,
                     key: file.label.clone(),
                     mount: file.mount.clone(),
@@ -1916,6 +1934,7 @@ impl Vfs {
             policy,
             stop_magic,
             None,
+            None,
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -1928,6 +1947,7 @@ impl Vfs {
         policy: u64,
         stop_magic: bool,
         operation: Option<fuse::PathOperation>,
+        accepted: Option<&Descriptor>,
     ) -> Result<ResolvedEntry> {
         self.begin_proc_query();
         if path.is_empty() {
@@ -1955,7 +1975,7 @@ impl Vfs {
         let mut current = if path[0] == b'/' {
             self.follow_mounts(root.clone())?
         } else {
-            self.base(dirfd)?
+            self.path_base(dirfd, accepted)?
         };
         if path[0] == b'/' {
             Self::check_resolve_mount(&root, &current, policy)?;
@@ -2000,6 +2020,9 @@ impl Vfs {
                 Self::check_resolve_mount(&current, &parent, policy)?;
                 current = parent;
                 continue;
+            }
+            if current.retained_directory.is_some() {
+                return Err(Errno(2));
             }
             if part.len() > 255 {
                 return Err(Errno(if self.proc_directory_tree(&current) {
@@ -2113,6 +2136,7 @@ impl Vfs {
                             &current,
                             &ResolvedPath {
                                 key: Vec::new(),
+                                retained_directory: None,
                                 proc_binding: None,
                                 mount: self.mount_for_path(open.borrow().mount.as_ref()),
                             },
@@ -2125,6 +2149,7 @@ impl Vfs {
                             &current,
                             &ResolvedPath {
                                 key: file.label.clone(),
+                                retained_directory: None,
                                 proc_binding: None,
                                 mount: file.mount.clone(),
                             },
@@ -2149,6 +2174,7 @@ impl Vfs {
                         Self::check_resolve_mount(
                             &current,
                             &ResolvedPath {
+                                retained_directory: None,
                                 proc_binding: None,
                                 key: file.label.clone(),
                                 mount: file.mount.clone(),
@@ -2276,6 +2302,7 @@ impl Vfs {
             0,
             false,
             Some(fuse::PathOperation::Readlink),
+            None,
         )?;
         self.check_proc_inspection(&dest, true)?;
         if let Some(target) = self.proc_directory_readlink(&dest)? {
@@ -2369,12 +2396,13 @@ impl Vfs {
     pub fn import_alias(&mut self, existing: &[u8], alias: &[u8], executable: bool) -> Result<()> {
         let source = self.resolve_final(AT_FDCWD, existing, false)?;
         let dest = self.resolve_final(AT_FDCWD, alias, false)?;
-        self.link_resolved(&source, &dest, Some(executable))
+        self.link_resolved(&source, &dest, None, Some(executable))
     }
     fn link_resolved(
         &mut self,
         source: &ResolvedPath,
         dest: &ResolvedPath,
+        retained: Option<&NodeRef>,
         import_executable: Option<bool>,
     ) -> Result<()> {
         if source.mount.as_ref().map(|m| m.id) != dest.mount.as_ref().map(|m| m.id) {
@@ -2385,6 +2413,9 @@ impl Vfs {
         #[cfg(all(feature = "hostfs", unix))]
         let host_source = source.key.clone();
         let source = self.node(source)?;
+        if retained.is_some_and(|node| !Arc::ptr_eq(node, &source)) {
+            return Err(Errno(2));
+        }
         if self.node(dest).is_ok() {
             return Err(Errno(17));
         }
@@ -2556,6 +2587,7 @@ impl Vfs {
             let mut fs = filesystem.borrow_mut();
             fs.paths.remove(&p.key);
             if is_dir {
+                let _ = node.removed_directory_parent.set(parent.clone());
                 let mut prefix = p.key.clone();
                 prefix.push(b'/');
                 let stale: Vec<_> = fs
@@ -2610,6 +2642,9 @@ impl Vfs {
             drop(n);
             fs.paths.insert(p.key.clone(), node.clone());
             return Err(e);
+        }
+        if is_dir {
+            let _ = node.removed_directory_parent.set(parent.clone());
         }
         drop(fs);
         drop(node_metadata);
@@ -2709,6 +2744,7 @@ impl Vfs {
             policy,
             true,
             (!PATH_TRUNCATE && policy == 0).then_some(fuse::PathOperation::Open(flags)),
+            None,
         );
         let (mut p, target) = match resolved {
             Ok(entry) => entry,
@@ -2741,6 +2777,7 @@ impl Vfs {
                 .location(&file.node, &file.mount)
                 .unwrap_or(ResolvedPath {
                     key: file.label.clone(),
+                    retained_directory: None,
                     proc_binding: file
                         .node
                         .proc_node
@@ -3173,6 +3210,7 @@ impl Vfs {
                     mount_use: Default::default(),
                     directory_mount: Default::default(),
                     namespace_resource: None,
+                    link_credentials: Some(self.credentials.open_identity()),
                     file_authority: Default::default(),
                     tcp_publication: Default::default(),
                     socket_control: None,
@@ -4122,6 +4160,9 @@ impl Vfs {
         {
             return Err(Errno(22));
         }
+        if matches!(whence, 3 | 4) && !node.regular_file {
+            return Err(Errno(22));
+        }
         let length = if o.oom.is_some() {
             0
         } else {
@@ -4150,18 +4191,9 @@ impl Vfs {
             file_position.value = value;
             return Ok(value);
         }
-        let base = match whence {
-            0 => 0,
-            1 => file_position.value as i64,
-            2 => length as i64,
-            _ => return Err(Errno(22)),
-        };
-        let new = base
-            .checked_add(offset)
-            .filter(|&n| n >= 0)
-            .ok_or(Errno(22))?;
-        file_position.value = new as u64;
-        Ok(new as u64)
+        let new = file_io::seek_offset(file_position.value, length, offset, whence)?;
+        file_position.value = new;
+        Ok(new)
     }
     fn stat_node(&self, node: &Node, mount: Option<&OpenMount>) -> Result<[u8; 128]> {
         let mut out = Self::stat_node_fields(node, node.stat_device(mount));
@@ -4228,6 +4260,7 @@ impl Vfs {
                 .filter(|proc| proc.path.ends_with(b"/task"))
             {
                 let at = ResolvedPath {
+                    retained_directory: None,
                     proc_binding: proc.binding.clone(),
                     key: proc.path.clone(),
                     mount: self.mount_for_path(mount),
@@ -4274,6 +4307,7 @@ impl Vfs {
                     prefix.push(b'/');
                 }
                 let at = ResolvedPath {
+                    retained_directory: None,
                     proc_binding: None,
                     key: path,
                     mount: self.mount_for_path(mount),
@@ -4335,6 +4369,7 @@ impl Vfs {
             0,
             !nofollow,
             Some(fuse::PathOperation::Stat),
+            None,
         )?;
         match magic {
             Some(ResolvedTarget::Descriptor(open)) => {

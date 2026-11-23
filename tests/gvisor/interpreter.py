@@ -25,6 +25,8 @@ def main():
     parser.add_argument('--case-filter', default='*', help='Select original GoogleTest names by glob')
     parser.add_argument('--timeout', type=float, default=30)
     parser.add_argument('--cpus', type=int, default=2)
+    parser.add_argument('--test-on-gvisor', action='store_true', help='Use the original userspace-kernel ABI mode')
+    parser.add_argument('--mount-fusectl', action='store_true', help='Mount fusectl for the fuse suite')
     args = parser.parse_args()
     if args.timeout <= 0 or args.cpus < 1:
         parser.error('timeout and CPU count must be positive')
@@ -65,6 +67,10 @@ def main():
         runtime_sha256=digest(args.runner), rootfs_sha256=digest(args.rootfs),
         runfiles_sha256={str(p.relative_to(binaries)): digest(p) for p in runfiles},
     )
+    if args.test_on_gvisor:
+        plan['upstream_userspace_abi'] = True
+    if args.mount_fusectl and any(s['name'] == 'fuse' for s in suites):
+        plan['fusectl_fixture'] = True
     save(output / 'plan.json', plan)
     command = [
         str(args.runner.resolve()),
@@ -101,7 +107,9 @@ def main():
                 try:
                     argv = [
                         *command, '--storage', str(storage), '--export', f'{guest_output}={xml}',
-                        '--guest', '--', '/bin/sh', '-ec', guest_wrapper(name, pid2=True),
+                        '--guest', '--', '/bin/sh', '-ec', guest_wrapper(
+                            name, pid2=True, test_on_gvisor=args.test_on_gvisor,
+                            mount_fusectl=args.mount_fusectl),
                         'trames-gvisor', '/tmp/gvisor', *guest_binary(name), *suite_flags(name),
                         '--gtest_color=no', '--gtest_filter=' + case, '--gtest_output=xml:' + guest_output,
                     ]

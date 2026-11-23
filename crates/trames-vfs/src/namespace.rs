@@ -6,7 +6,7 @@ pub(super) const RENAME_EXCHANGE: u32 = 2;
 
 impl Vfs {
     pub fn link_at(&mut self, oldfd: i32, old: &[u8], newfd: i32, new: &[u8]) -> Result<()> {
-        self.link_at_follow(oldfd, old, newfd, new, false)
+        self.link_at_follow(oldfd, old, newfd, new, false, false)
     }
     pub(super) fn link_at_follow(
         &mut self,
@@ -15,15 +15,61 @@ impl Vfs {
         newfd: i32,
         new: &[u8],
         follow: bool,
+        empty_path: bool,
     ) -> Result<()> {
-        let source = self.resolve_final(oldfd, old, follow)?;
+        let accepted = if empty_path && oldfd != AT_FDCWD && !old.starts_with(b"/") {
+            let descriptor = self.descriptor(oldfd as u32)?;
+            let open = descriptor.open.borrow();
+            let Some((identity, namespace)) = &open.link_credentials else {
+                return Err(Errno(2));
+            };
+            if self.credentials.open_identity().0 != *identity
+                && !self
+                    .credentials
+                    .has_ns_cap(namespace, capabilities::DAC_READ_SEARCH)
+            {
+                return Err(Errno(2));
+            }
+            drop(open);
+            Some(descriptor)
+        } else {
+            None
+        };
+        let (source, retained) = if old.is_empty() && empty_path {
+            match &accepted {
+                Some(descriptor) => {
+                    let open = descriptor.open.borrow();
+                    let node = open.node.clone().ok_or(Errno(2))?;
+                    (
+                        self.location(&node, &self.mount_for_path(open.mount.as_ref()))?,
+                        Some(node),
+                    )
+                }
+                None => (self.base(oldfd)?, None),
+            }
+        } else {
+            (
+                self.resolve_entry_operation(
+                    oldfd,
+                    old,
+                    follow,
+                    false,
+                    0,
+                    false,
+                    None,
+                    accepted.as_ref(),
+                )?
+                .0,
+                None,
+            )
+        };
         let dest = self.resolve_final(newfd, new, false)?;
         if self.proc_directory_tree(&dest) {
             self.node(&source)?;
             self.node(&dest)?;
             return Err(Errno(17));
         }
-        self.link_resolved(&source, &dest, None)
+        self.link_resolved(&source, &dest, retained.as_ref(), None)
     }
     pub(super) fn check_link_source(&self, source: &Node) -> Result<()> {
         if self.credentials.fsuid == source.uid

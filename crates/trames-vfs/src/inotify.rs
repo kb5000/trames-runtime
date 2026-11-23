@@ -530,6 +530,7 @@ impl Vfs {
         }
         Some((
             self.node(&ResolvedPath {
+                retained_directory: None,
                 proc_binding: None,
                 key: path[..i.max(1)].to_vec(),
                 mount: path.mount.clone(),

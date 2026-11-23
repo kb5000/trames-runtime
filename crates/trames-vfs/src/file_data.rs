@@ -562,6 +562,31 @@ impl PlainFile {
         };
         file.reserve(offset, end)
     }
+    pub fn reserve_keep_size(&self, offset: u64, end: u64) -> Result<()> {
+        let mut data = self.bytes.write().unwrap();
+        let charge = self.charge.get();
+        let growth = charge.map(|c| c.grow(end)).transpose()?.flatten();
+        match &mut *data {
+            Bytes::Memory(bytes) => {
+                let length = usize::try_from(end).map_err(|_| Errno(27))?;
+                bytes
+                    .try_reserve_exact(length.saturating_sub(bytes.len()))
+                    .map_err(|_| Errno(12))?;
+            }
+            Bytes::Disk(disk) => {
+                let backing = disk.open(true)?;
+                storage::reserve_backing_range(&backing, offset, end)?;
+            }
+            Bytes::Tmpfs(file) => return file.reserve(offset, end),
+        }
+        if let Some(charge) = charge {
+            charge.set_preallocated(charge.preallocated().max(end));
+        }
+        if let Some(growth) = growth {
+            growth.commit(end);
+        }
+        Ok(())
+    }
     pub fn fault_read(&self, offset: u64) -> Result<Vec<u8>> {
         let page = trames_memory::PAGE_SIZE;
         if !self.tmpfs {
@@ -580,6 +605,7 @@ impl PlainFile {
     }
     pub fn truncate(&self, length: u64) -> Result<()> {
         let mut data = self.bytes.write().unwrap();
+        let shrinks = length <= data.len();
         let growth = self
             .charge
             .get()
@@ -599,6 +625,11 @@ impl PlainFile {
                 d.revoke_caps()?;
                 d.open(true)?.set_len(length).map_err(storage::host_errno)?;
                 d.length = length;
+            }
+        }
+        if shrinks {
+            if let Some(charge) = self.charge.get() {
+                charge.set_preallocated(0);
             }
         }
         if let Some(growth) = growth {

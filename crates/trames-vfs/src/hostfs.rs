@@ -620,6 +620,7 @@ impl HostFs {
                         backing: Arc::new(storage::DiskBacking {
                             files: std::sync::Mutex::default(),
                             charge: std::sync::OnceLock::new(),
+                            preallocated_on_load: 0,
                             path: Default::default(),
                             remove_on_drop: AtomicBool::new(false),
                             _store: None,

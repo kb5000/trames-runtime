@@ -335,6 +335,7 @@ impl ExecCredentials {
         c.fsgid = c.egid;
         c.suid = c.euid;
         c.sgid = c.egid;
+        c.renew_open_identity();
         view.credentials = c;
         no_new_privs
     }
@@ -342,6 +343,7 @@ impl ExecCredentials {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Credentials {
     file_secure_exec: bool,
+    open_identity: u64,
     pub user_namespace: UserNamespace,
     pub uid: u32,
     pub euid: u32,
@@ -355,6 +357,13 @@ pub struct Credentials {
     pub caps: capabilities::Capabilities,
 }
 impl Credentials {
+    pub fn renew_open_identity(&mut self) {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        self.open_identity = NEXT.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(super) fn open_identity(&self) -> (u64, UserNamespace) {
+        (self.open_identity, self.user_namespace.clone())
+    }
     pub fn secure_exec(&self) -> bool {
         self.file_secure_exec || self.uid != self.euid || self.gid != self.egid
     }
@@ -402,8 +411,9 @@ impl Credentials {
                 && t.caps.permitted & !self.caps.effective == 0
     }
     pub fn user(uid: u32, gid: u32) -> Self {
-        Self {
+        let mut credentials = Self {
             file_secure_exec: false,
+            open_identity: 0,
             user_namespace: UserNamespace::default(),
             uid,
             euid: uid,
@@ -415,7 +425,9 @@ impl Credentials {
             fsgid: gid,
             groups: Vec::new(),
             caps: capabilities::Capabilities::for_uid(uid),
-        }
+        };
+        credentials.renew_open_identity();
+        credentials
     }
     pub fn has_cap(&self, cap: u32) -> bool {
         self.user_namespace.is_initial() && self.caps.has(cap)
@@ -444,6 +456,7 @@ impl Credentials {
         self.user_namespace = namespace;
         self.caps = capabilities::Capabilities::default();
         self.caps.no_new_privs = nnp;
+        self.renew_open_identity();
     }
     pub fn inode_cap(&self, cap: u32, uid: u32, gid: u32) -> bool {
         self.has_local_cap(cap)
@@ -767,6 +780,7 @@ impl Vfs {
             0,
             false,
             Some(fuse::PathOperation::Access(mode)),
+            None,
         )?;
         let node = view.node(&path)?;
         if let Some((m, fs)) = path

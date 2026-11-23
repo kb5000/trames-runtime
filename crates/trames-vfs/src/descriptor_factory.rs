@@ -470,6 +470,7 @@ impl DescriptorFactory {
                         mount_use: Default::default(),
                         directory_mount: Default::default(),
                         namespace_resource: None,
+                        link_credentials: None,
                         file_authority: Default::default(),
                         tcp_publication: Default::default(),
                         socket_control: None,

@@ -12,6 +12,7 @@ pub(crate) struct Domain {
     paused: AtomicBool,
     host_pause: Arc<AtomicBool>,
     interrupts: Mutex<BTreeMap<usize, Active>>,
+    membarrier_registered: Option<Arc<std::sync::atomic::AtomicU32>>,
 }
 struct Active {
     interrupt: Option<Arc<dyn trames_engine::ExecutionInterrupt>>,
@@ -191,14 +192,27 @@ pub(crate) struct Checkpoint<C: Cpu> {
     requesters: BTreeSet<u32>,
 }
 impl<C: Cpu> Domains<C> {
-    pub fn barrier_domains(&self, original: u64, global: bool) -> Vec<Arc<Domain>> {
-        if global {
-            self.entries
+    pub fn barrier_domains(&self, original: u64, scope: crate::barrier::Scope) -> Vec<Arc<Domain>> {
+        use crate::barrier::{Scope, REGISTER_GLOBAL};
+        match scope {
+            Scope::Private => vec![self.entries[&original].domain.clone()],
+            Scope::Global => self
+                .entries
                 .values()
                 .map(|entry| entry.domain.clone())
-                .collect()
-        } else {
-            vec![self.entries[&original].domain.clone()]
+                .collect(),
+            Scope::RegisteredGlobal => self
+                .entries
+                .values()
+                .filter(|entry| {
+                    entry
+                        .domain
+                        .membarrier_registered
+                        .as_ref()
+                        .is_some_and(|state| state.load(Ordering::Relaxed) & REGISTER_GLOBAL != 0)
+                })
+                .map(|entry| entry.domain.clone())
+                .collect(),
         }
     }
     pub fn interrupt_host_pause(&self) {
@@ -232,6 +246,11 @@ impl<C: Cpu> Domains<C> {
                 paused: AtomicBool::new(false),
                 host_pause: self.host_pause.clone(),
                 interrupts: Mutex::new(BTreeMap::new()),
+                membarrier_registered: job
+                    .work
+                    .syscalls
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.membarrier_registered.clone()),
             }),
             keys,
             jobs: Vec::new(),
@@ -681,7 +700,7 @@ mod tests {
         let identity = caller.work.memory.as_deref().unwrap() as *const _ as usize;
         let domain = caller.domain.as_ref().unwrap().clone();
         let native = domain.enter(3, Arc::new(AtomicBool::new(false))).unwrap();
-        let request = epoch.memory_barrier(domain.id, false, 0);
+        let request = epoch.memory_barrier(domain.id, crate::barrier::Scope::Private, 0);
         let wait = crate::barrier::Wait::new(request.clone());
         let wake = trames_vfs::IoSignal::new(1, epoch.io_target.clone());
         wait.bind(&wake);

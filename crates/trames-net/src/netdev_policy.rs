@@ -241,7 +241,7 @@ impl Topology {
         if route.destination != route.destination.network() {
             return Err(NetError(22));
         }
-        if entry.kind == 1 {
+        if !matches!(entry.kind, 6..=9) {
             let d = self.device(id, route.device)?;
             if let Some(g) = route.gateway.filter(|_| add) {
                 if g.is_multicast()
@@ -355,7 +355,7 @@ impl Topology {
                 .chain(p.tables.get(&r.table).into_iter().flatten().copied())
                 .filter(|e| e.route.destination.contains(destination))
                 .filter(|e| {
-                    e.kind != 1
+                    matches!(e.kind, 6..=9)
                         || self.devices.get(&(id, e.route.device)).is_some_and(|d| {
                             d.up && d.master.is_none()
                                 && context.device.is_none_or(|i| i == d.index)

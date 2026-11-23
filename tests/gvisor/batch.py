@@ -61,6 +61,8 @@ def main():
     p.add_argument('--rootfs',type=Path)
     p.add_argument('--custom-rootfs',action='store_true',help='Import --rootfs as a custom fixture instead of the pinned Alpine distribution')
     p.add_argument('--fresh-store',action='store_true')
+    p.add_argument('--test-on-gvisor',action='store_true')
+    p.add_argument('--mount-fusectl',action='store_true')
     p.add_argument('--reference-timings',type=Path)
     p.add_argument('--chunk-size',type=int,default=1)
     p.add_argument('--reuse',type=Path)
@@ -73,6 +75,8 @@ def main():
     p.add_argument('--time-budget',type=float,default=0)
     p.add_argument('--min-free-gib',type=float,default=8)
     a=p.parse_args()
+    if a.platform == 'native' and (a.test_on_gvisor or a.mount_fusectl):
+        p.error('the selected guest fixtures apply only to Trames')
     if a.jobs<1:p.error('jobs must be positive')
     out=a.output.resolve();out.mkdir(parents=True,exist_ok=False)
     binaries=a.binaries.resolve()
@@ -106,6 +110,8 @@ def main():
         destination=out/('worker-%02d'%index)
         cmd=[sys.executable,str(HERE/'run.py'),a.platform,'--binaries',str(binaries),'--output',str(destination),'--network','internal','--cpus',str(a.cpus),'--timeout',str(a.timeout),'--time-budget',str(a.time_budget),'--min-free-gib',str(a.min_free_gib)]
         if a.fresh_store:cmd+=['--fresh-store']
+        if a.test_on_gvisor:cmd+=['--test-on-gvisor']
+        if a.mount_fusectl:cmd+=['--mount-fusectl']
         if a.reference_timings:cmd+=['--reference-timings',str(a.reference_timings.resolve())]
         if a.platform=='trames':cmd+=['--chunk-size',str(a.chunk_size)]
         if a.reuse:

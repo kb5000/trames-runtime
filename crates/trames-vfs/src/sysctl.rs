@@ -41,6 +41,7 @@ impl NameiPolicy {
 }
 #[derive(Clone)]
 pub(super) enum Control {
+    FuseAbort(fuse::Abort),
     Network(network::Control),
     NrOpen(DescriptorCeiling),
     PtraceScope(PidNamespace),
@@ -71,6 +72,7 @@ impl Control {
     }
     pub fn authorized(&self, credentials: &Credentials, tgid: u32) -> bool {
         match self {
+            Self::FuseAbort(control) => control.authorized(credentials),
             Self::Comm { task, thread_entry } => {
                 *thread_entry && task.comm().is_some_and(|(group, _)| group == tgid)
             }
@@ -96,6 +98,7 @@ impl Control {
     }
     pub fn read(&self, offset: u64, count: usize, caller: &Vfs) -> Result<Vec<u8>> {
         let value = match self {
+            Self::FuseAbort(_) => return Err(Errno(13)),
             Self::TaskIo { task, whole } => {
                 let text = task.io_text(*whole, caller.lock_owner, &caller.credentials)?;
                 return Ok(slice(&text, offset, count));
@@ -140,6 +143,12 @@ impl Control {
         let credentials = &caller.credentials;
         let tgid = caller.lock_owner;
         let n = match self {
+            Self::FuseAbort(control) => {
+                if !control.authorized(credentials) {
+                    return Err(Errno(13));
+                }
+                return Ok(control.write(bytes.len()));
+            }
             Self::TaskIo { .. } => return Err(Errno(5)),
             Self::CoreFilter(task) => {
                 let value = parse_dump_filter(bytes)?;
@@ -263,6 +272,19 @@ fn slice(bytes: &[u8], offset: u64, count: usize) -> Vec<u8> {
 }
 impl Vfs {
     pub(super) fn sysctl_control(&self, path: &ResolvedPath) -> Option<Control> {
+        if path
+            .mount
+            .as_ref()
+            .is_some_and(|mount| mount.kind == mounts::Kind::FuseControl)
+        {
+            return self
+                .node(path)
+                .ok()?
+                .fuse_abort
+                .get()
+                .cloned()
+                .map(Control::FuseAbort);
+        }
         if matches!(
             path.as_ref(),
             b"/proc/sys/kernel/overflowuid" | b"/proc/sys/kernel/overflowgid"

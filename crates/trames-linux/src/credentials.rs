@@ -58,15 +58,17 @@ pub fn credential_call(
         next.fs_identity() != credentials.fs_identity()
             || next.caps.permitted & !credentials.caps.permitted != 0
     });
-    if changed {
+    if changed || number == 91 {
         if sensitive {
             dumpable.set(false);
         }
-        *credentials = next.unwrap();
+        let mut next = next.unwrap();
+        next.renew_open_identity();
+        *credentials = next;
     }
     Ok(CredentialResult {
         value,
-        changed,
+        changed: changed || number == 91,
         sensitive,
     })
 }

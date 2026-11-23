@@ -3,6 +3,8 @@
 use super::*;
 use std::sync::atomic::AtomicU8;
 
+pub const PIDFD_THREAD: u32 = 0x80; // O_EXCL
+
 pub struct PidFd {
     pid: u32,
     state: AtomicU8,
@@ -73,8 +75,11 @@ impl DescriptorFactory {
 }
 impl FdFlags {
     pub fn pidfd(&self, fd: u32) -> Result<(Arc<PidFd>, bool)> {
-        let descriptor = self.descriptor_control(fd)?;
-        descriptor.pidfd()
+        let (target, flags) = self.pidfd_flags(fd)?;
+        Ok((target, flags & O_NONBLOCK != 0))
+    }
+    pub fn pidfd_flags(&self, fd: u32) -> Result<(Arc<PidFd>, u32)> {
+        self.descriptor_control(fd)?.pidfd()
     }
 }
 

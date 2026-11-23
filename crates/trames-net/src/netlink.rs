@@ -25,6 +25,7 @@ pub(super) struct Namespace {
     pub(super) loopback: Option<std::sync::Arc<crate::netdev::Loopback>>,
     pub(super) ping_range: Cell<[u32; 2]>,
     pub(super) unprivileged_port: Cell<u16>,
+    pub(super) ip_settings: Arc<crate::IpSettings>,
     pub(super) port_config: parking_lot::Mutex<()>,
     quota: Arc<crate::socket_quota::Quota<128>>,
     _reservation: crate::socket_quota::Reservation<128>,
@@ -64,6 +65,7 @@ impl Namespace {
             loopback: None,
             ping_range: Cell::new([0, i32::MAX as u32]),
             unprivileged_port: Cell::new(1024),
+            ip_settings: Arc::default(),
             port_config: Default::default(),
             quota,
             _reservation: reservation,
@@ -143,6 +145,7 @@ impl Namespace {
         let view = crate::netdev::View {
             graph: self.graph.clone(),
             namespace: self.id(),
+            ip_settings: self.ip_settings.clone(),
         };
         let stack = fabric.dynamic_environment(
             n.mode(),

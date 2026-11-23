@@ -108,14 +108,16 @@ mod tests {
     #[test]
     fn complete_membarrier_abi_runs_on_sources_without_owner_or_mm_checkpoints() {
         for (command, flags, registered, expected) in [
-            (0, 0, false, 537i64),
-            (16, 0, false, 0),
-            (512, 0, true, 16),
-            (8, 0, false, -1),
-            (8, 0, true, 0),
-            (1, 0, false, 0),
-            (32, 0, true, -22),
-            (8, 1, true, -22),
+            (0, 0, 0, 543i64),
+            (4, 0, 0, 0),
+            (16, 0, 4, 0),
+            (512, 0, 20, 20),
+            (8, 0, 4, -1),
+            (8, 0, 20, 0),
+            (1, 0, 0, 0),
+            (2, 0, 4, 0),
+            (32, 0, 16, -22),
+            (8, 1, 16, -22),
         ] {
             let mut p = process();
             p.membarrier_registered

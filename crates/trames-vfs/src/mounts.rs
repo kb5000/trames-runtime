@@ -102,6 +102,7 @@ pub(super) enum Kind {
     Root,
     Tmpfs,
     Fuse,
+    FuseControl,
     Proc,
     Sysfs,
     Devpts,
@@ -118,6 +119,7 @@ impl Kind {
             Kind::Root => 0x5452414d4553u64,
             Kind::Tmpfs => 0x01021994,
             Kind::Fuse => 0x65735546,
+            Kind::FuseControl => 0x65735543,
             Kind::Proc => 0x9fa0,
             Kind::Sysfs => 0x62656572,
             Kind::Devpts => 0x1cd1,
@@ -625,6 +627,7 @@ pub struct ResolvedPath {
     pub(super) key: Vec<u8>,
     pub(super) mount: Option<Arc<Mount>>,
     pub(super) proc_binding: Option<Arc<proc_source::ProcPath>>,
+    pub(super) retained_directory: Option<NodeRef>,
 }
 impl std::fmt::Debug for ResolvedPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -654,6 +657,8 @@ impl PartialEq for ResolvedPath {
     fn eq(&self, other: &Self) -> bool {
         self.key == other.key
             && self.mount.as_ref().map(|m| m.id) == other.mount.as_ref().map(|m| m.id)
+            && self.retained_directory.as_ref().map(Arc::as_ptr)
+                == other.retained_directory.as_ref().map(Arc::as_ptr)
     }
 }
 impl<const N: usize> PartialEq<&[u8; N]> for ResolvedPath {
@@ -666,6 +671,7 @@ impl From<Vec<u8>> for ResolvedPath {
         Self {
             key,
             mount: None,
+            retained_directory: None,
             proc_binding: None,
         }
     }
@@ -697,6 +703,9 @@ pub(super) trait PathArg {
     fn proc_binding(&self) -> Option<&Arc<proc_source::ProcPath>> {
         None
     }
+    fn retained_directory(&self) -> Option<&NodeRef> {
+        None
+    }
 }
 impl PathArg for [u8] {
     fn key(&self) -> &[u8] {
@@ -714,6 +723,9 @@ impl PathArg for Vec<u8> {
     }
 }
 impl PathArg for ResolvedPath {
+    fn retained_directory(&self) -> Option<&NodeRef> {
+        self.retained_directory.as_ref()
+    }
     fn proc_binding(&self) -> Option<&Arc<proc_source::ProcPath>> {
         self.proc_binding.as_ref()
     }
@@ -842,6 +854,7 @@ impl Vfs {
                 return Ok(ResolvedPath {
                     key: mount.key_of(node).ok_or(Errno(2))?,
                     mount: Some(mount.clone()),
+                    retained_directory: None,
                     proc_binding: None,
                 });
             }
@@ -849,11 +862,13 @@ impl Vfs {
                 return Ok(ResolvedPath {
                     key: proc.path.clone(),
                     mount: mount.clone(),
+                    retained_directory: None,
                     proc_binding: proc.binding.clone(),
                 });
             }
             if let Some(key) = self.pseudo.borrow().path_of(node) {
                 return Ok(ResolvedPath {
+                    retained_directory: None,
                     proc_binding: None,
                     key,
                     mount: mount.clone(),
@@ -866,11 +881,18 @@ impl Vfs {
         let key = match mount {
             Some(m) => m
                 .key_of(node)
-                .or_else(|| self.pseudo.borrow().path_of(node))
-                .ok_or(Errno(2))?,
-            None => self.path_of(node)?,
+                .or_else(|| self.pseudo.borrow().path_of(node)),
+            None => self.path_of(node).ok(),
+        };
+        let (key, retained_directory) = match key {
+            Some(key) => (key, None),
+            None if node.removed_directory_parent.get().is_some() => {
+                (Vec::new(), Some(node.clone()))
+            }
+            None => return Err(Errno(2)),
         };
         Ok(ResolvedPath {
+            retained_directory,
             proc_binding: None,
             key,
             mount: mount.clone(),
@@ -892,6 +914,7 @@ impl Vfs {
                 .root
                 .clone();
             Ok(ResolvedPath {
+                retained_directory: None,
                 proc_binding: None,
                 key: root.root_path(),
                 mount: Some(root),
@@ -899,6 +922,9 @@ impl Vfs {
         }
     }
     pub(super) fn follow_mounts(&self, mut path: ResolvedPath) -> Result<ResolvedPath> {
+        if path.retained_directory.is_some() {
+            return Ok(path);
+        }
         for _ in self.mount_walk() {
             let Some(current) = &path.mount else {
                 return Ok(path);
@@ -943,6 +969,7 @@ impl Vfs {
                 .get()
                 .and_then(|proc| proc.binding.clone());
             path = ResolvedPath {
+                retained_directory: None,
                 proc_binding: binding,
                 key: next.root_path(),
                 mount: Some(next),
@@ -953,6 +980,10 @@ impl Vfs {
     pub(super) fn parent_location(&self, path: &ResolvedPath) -> Result<ResolvedPath> {
         if *path == self.root_location()? {
             return Ok(path.clone());
+        }
+        if let Some(directory) = &path.retained_directory {
+            let parent = directory.removed_directory_parent.get().ok_or(Errno(2))?;
+            return self.location(parent, &path.mount);
         }
         let mut at = path.clone();
         for _ in self.mount_walk() {
@@ -967,6 +998,7 @@ impl Vfs {
                 return Ok(at);
             };
             at = ResolvedPath {
+                retained_directory: None,
                 proc_binding: None,
                 key: a.key(),
                 mount: Some(a.parent),
@@ -985,6 +1017,9 @@ impl Vfs {
         path: &ResolvedPath,
         root: &ResolvedPath,
     ) -> Result<Vec<u8>> {
+        if path.retained_directory.is_some() {
+            return Err(Errno(2));
+        }
         let mut at = path.clone();
         let mut suffix = Vec::new();
         for _ in self.mount_walk() {
@@ -1040,6 +1075,7 @@ impl Vfs {
                 return Err(Errno(2));
             };
             at = ResolvedPath {
+                retained_directory: None,
                 proc_binding: None,
                 key: a.key(),
                 mount: Some(a.parent),
@@ -1141,7 +1177,13 @@ impl Vfs {
         }
         match path.mount().map(|m| m.kind) {
             Some(
-                Kind::Tmpfs | Kind::Fuse | Kind::Cgroup | Kind::Nsfs | Kind::Mqueue | Kind::Overlay,
+                Kind::Tmpfs
+                | Kind::Fuse
+                | Kind::FuseControl
+                | Kind::Cgroup
+                | Kind::Nsfs
+                | Kind::Mqueue
+                | Kind::Overlay,
             ) => false,
             #[cfg(all(feature = "hostfs", unix))]
             Some(Kind::Host) => false,
@@ -1494,9 +1536,26 @@ impl Vfs {
             match kind.ok_or(Errno(22))? {
                 b"fuse" => {
                     let (fs, binding) = fuse::prepare(self, data.ok_or(Errno(22))?)?;
-                    fuse_binding = Some(binding);
+                    fuse_binding = binding;
                     let root = fs.borrow().paths[b"/".as_slice()].clone();
                     (fs, root, b"/".to_vec(), Kind::Fuse, flags & ATTRS)
+                }
+                b"fusectl" => {
+                    if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
+                        return Err(Errno(1));
+                    }
+                    if data.is_some_and(|data| !data.is_empty()) {
+                        return Err(Errno(22));
+                    }
+                    let fs = self.pseudo.borrow().fuse_control.filesystem()?;
+                    let root = fs.borrow().paths[b"/".as_slice()].clone();
+                    (
+                        fs,
+                        root,
+                        b"/".to_vec(),
+                        Kind::FuseControl,
+                        (flags & ATTRS) | MS_NOSUID | MS_NODEV | MS_NOEXEC,
+                    )
                 }
                 b"overlay" => {
                     let (fs, readonly) =
@@ -2113,6 +2172,7 @@ impl Mount {
             Kind::Root => "rootfs",
             Kind::Tmpfs => "tmpfs",
             Kind::Fuse => "fuse",
+            Kind::FuseControl => "fusectl",
             Kind::Proc => "proc",
             Kind::Sysfs => "sysfs",
             Kind::Devpts => "devpts",
@@ -2258,7 +2318,7 @@ pub(super) fn table_text(snapshot: &NamespaceSnapshot, info: bool, cgroup_root: 
                 m.id,
                 parent,
                 (dev >> 8) & 0xfff,
-                dev & 0xff,
+                (dev & 0xff) | ((dev >> 12) & !0xff),
                 escape_mount_field(&root),
                 escape_mount_field(&target),
                 flags,

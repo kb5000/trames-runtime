@@ -51,6 +51,7 @@ pub enum NamespaceCall {
     },
     Link {
         follow: bool,
+        empty_path: bool,
         oldfd: i32,
         old: Vec<u8>,
         newfd: i32,
@@ -143,6 +144,7 @@ impl NamespaceCall {
                 newfd,
                 new,
                 follow,
+                ..
             } => vec![(*oldfd, Some(old), *follow), (*newfd, Some(new), false)],
             Self::Rename {
                 oldfd,
@@ -286,7 +288,8 @@ impl NamespaceCall {
                 newfd,
                 new,
                 follow,
-            } => v.link_at_follow(*oldfd, old, *newfd, new, *follow)?,
+                empty_path,
+            } => v.link_at_follow(*oldfd, old, *newfd, new, *follow, *empty_path)?,
             Self::Rename {
                 oldfd,
                 old,

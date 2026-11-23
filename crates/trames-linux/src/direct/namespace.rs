@@ -238,11 +238,12 @@ pub(super) fn import(
             path: Linux::path(memory, a[2])?,
         },
         37 => {
-            if a[4] & !0x400 != 0 {
+            if a[4] & !0x1400 != 0 {
                 return Err(Errno(22));
             }
             Call::Link {
                 follow: a[4] & 0x400 != 0,
+                empty_path: a[4] & 0x1000 != 0,
                 oldfd: a[0] as i32,
                 old: Linux::path(memory, a[1])?,
                 newfd: a[2] as i32,

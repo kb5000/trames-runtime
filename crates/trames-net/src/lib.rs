@@ -110,6 +110,38 @@ fn socket_buffer_size(option: u32, value: i32) -> usize {
 
 #[derive(Clone)]
 pub struct Network(Backend, Arc<netlink::Namespace>);
+#[derive(Clone, Copy)]
+pub enum IpSysctl {
+    TcpRecovery,
+    AutoFlowLabels,
+    BindV6Only,
+    Ipv6FragmentTime,
+    Ipv6NonlocalBind,
+}
+pub(crate) struct IpSettings([std::sync::atomic::AtomicI32; 5]);
+impl Default for IpSettings {
+    fn default() -> Self {
+        Self([1, 1, 0, 60, 0].map(std::sync::atomic::AtomicI32::new))
+    }
+}
+impl IpSettings {
+    pub(crate) fn get(&self, knob: IpSysctl) -> i32 {
+        self.0[knob as usize].load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn set(&self, knob: IpSysctl, value: i32) -> Result<()> {
+        let valid = match knob {
+            IpSysctl::TcpRecovery => true,
+            IpSysctl::AutoFlowLabels => (0..=3).contains(&value),
+            IpSysctl::BindV6Only | IpSysctl::Ipv6NonlocalBind => matches!(value, 0 | 1),
+            IpSysctl::Ipv6FragmentTime => value > 0,
+        };
+        if !valid {
+            return Err(NetError(22));
+        }
+        self.0[knob as usize].store(value, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+}
 #[derive(Clone)]
 enum Backend {
     Native(native::Network),
@@ -121,6 +153,12 @@ impl Default for Network {
     }
 }
 impl Network {
+    pub fn ip_sysctl(&self, knob: IpSysctl) -> i32 {
+        self.1.ip_settings.get(knob)
+    }
+    pub fn set_ip_sysctl(&self, knob: IpSysctl, value: i32) -> Result<()> {
+        self.1.ip_settings.set(knob, value)
+    }
     pub fn is_managed_uplink(&self) -> bool {
         self.1.graph.read().unwrap().managed(self.namespace_id())
     }
@@ -276,6 +314,7 @@ impl Network {
         let view = netdev::View {
             graph: namespace.graph.clone(),
             namespace: namespace.id(),
+            ip_settings: namespace.ip_settings.clone(),
         };
         let stack = fabric.dynamic_environment(mode, view, loopback)?;
         fabric.bind_driver(&namespace.fabric.changed);
@@ -287,6 +326,7 @@ impl Network {
         stack.attach_routing(netdev::View {
             graph: namespace.graph.clone(),
             namespace: namespace.id(),
+            ip_settings: namespace.ip_settings.clone(),
         })?;
         namespace.nft_packet_hooks.set(true);
         Ok(Self(Backend::Virtual(stack), namespace))
@@ -404,6 +444,7 @@ impl Network {
         stack.attach_routing(netdev::View {
             graph: namespace.graph.clone(),
             namespace: namespace.id(),
+            ip_settings: namespace.ip_settings.clone(),
         })?;
         namespace.nft_packet_hooks.set(true);
         Ok(Self(Backend::Virtual(stack), namespace))
@@ -528,13 +569,17 @@ impl Network {
             )?),
             Backend::Virtual(n) => SocketBackend::Virtual(n.socket(family, kind, protocol)?),
         };
-        Ok(Socket::wrap(
+        let socket = Socket::wrap(
             backend,
             self.1.clone(),
             reservation,
             kind,
             kind & 0xf == 2 && matches!((family, protocol), (2, 1) | (10, 58)),
-        ))
+        );
+        if family == 10 && matches!(kind, 1 | 2) && self.ip_sysctl(IpSysctl::BindV6Only) != 0 {
+            socket.set_option_bytes(41, 26, &1i32.to_ne_bytes())?;
+        }
+        Ok(socket)
     }
 }
 /// Closing task's wait for acknowledgement of the original stream's FIN.

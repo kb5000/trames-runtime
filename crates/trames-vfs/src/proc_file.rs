@@ -332,6 +332,7 @@ impl ProcFile {
         let renderer = self.renderer.lock().unwrap();
         let view = renderer.view.borrow();
         let path = ResolvedPath {
+            retained_directory: None,
             proc_binding: None,
             key: self.path.clone(),
             mount: self

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Optional AArch64 Linux clock vDSO, independent of the execution backend.
 //! Immutable guest RX code and R calibration data use ordinary guest memory.
-use trames_memory::{Access, Memory, MemoryError, Permissions, PAGE_SIZE};
+use trames_memory::{Memory, MemoryError, Permissions, PAGE_SIZE};
 #[path = "vdso/code.rs"]
 mod code;
 pub const AUXV: u64 = 33; // AT_SYSINFO_EHDR
@@ -152,6 +152,7 @@ pub fn install(memory: &mut Memory) -> Result<u64, MemoryError> {
     memory.write(base, IMAGE.get_or_init(image))?;
     memory.protect(base, PAGE_SIZE, Permissions::RX)?;
     memory.protect(base + DATA, PAGE_SIZE, Permissions::R)?;
+    memory.identify_vdso(base);
     Ok(base)
 }
 pub fn initialize(memory: &mut Memory, base: u64, time: TimeBase) -> Result<(), MemoryError> {
@@ -163,14 +164,6 @@ pub fn initialize(memory: &mut Memory, base: u64, time: TimeBase) -> Result<(), 
     if time.frequency > u64::MAX / 1_000_000_000 || time.nanos >= 1_000_000_000 {
         return Err(MemoryError::InvalidRange);
     }
-    let permissions = Permissions {
-        read: memory.check(address, 1, Access::Read).is_ok(),
-        write: memory.check(address, 1, Access::Write).is_ok(),
-        execute: memory.check(address, 1, Access::Execute).is_ok(),
-    };
-    if !permissions.write {
-        memory.protect(address, PAGE_SIZE, Permissions::RW)?;
-    }
     let mut bytes = [0; 32];
     for (i, v) in [time.counter, time.frequency, time.seconds, time.nanos]
         .into_iter()
@@ -178,16 +171,13 @@ pub fn initialize(memory: &mut Memory, base: u64, time: TimeBase) -> Result<(), 
     {
         word(&mut bytes, i * 8, v, 8);
     }
-    let result = memory.write(address, &bytes);
-    if !permissions.write {
-        memory.protect(address, PAGE_SIZE, permissions)?;
-    }
-    result
+    memory.update_vvar(address, &bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trames_memory::Access;
     fn time() -> TimeBase {
         TimeBase {
             counter: 71,
@@ -217,9 +207,15 @@ mod tests {
     fn recalibration_preserves_guest_permissions_and_can_disable_the_fast_clock() {
         let mut m = Memory::default();
         let base = install(&mut m).unwrap();
-        m.protect(base + DATA, PAGE_SIZE, Permissions::RW).unwrap();
+        assert!(matches!(
+            m.protect(base + DATA, PAGE_SIZE, Permissions::RW),
+            Err(MemoryError::Permission {
+                access: Access::Write,
+                ..
+            })
+        ));
         initialize(&mut m, base, time()).unwrap();
-        assert!(m.check(base + DATA, 1, Access::Write).is_ok());
+        assert!(m.check(base + DATA, 1, Access::Write).is_err());
         initialize(
             &mut m,
             base,

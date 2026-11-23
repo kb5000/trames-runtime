@@ -3,6 +3,26 @@
 use super::*;
 use file_data::{FilePosition, PlainFile};
 
+pub(super) fn seek_offset(position: u64, length: u64, offset: i64, whence: u32) -> Result<u64> {
+    if matches!(whence, 3 | 4) {
+        let offset = u64::try_from(offset).map_err(|_| Errno(22))?;
+        if offset >= length {
+            return Err(Errno(6));
+        }
+        // Generic filesystem behavior when no extent map is available.
+        return Ok(if whence == 3 { offset } else { length });
+    }
+    let base = match whence {
+        0 => 0,
+        1 => position as i64,
+        2 => length as i64,
+        _ => return Err(Errno(22)),
+    };
+    base.checked_add(offset)
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or(Errno(22))
+}
+
 /// One accepted operation. Prepared caches carry no inode, data or OFD lease.
 #[derive(Clone)]
 pub struct DirectFile {
@@ -564,20 +584,13 @@ impl DirectFile {
         if position.pending != 0 {
             return None;
         }
-        let base = match whence {
-            0 => 0,
-            1 => position.value as i64,
-            2 => self.data.len() as i64,
-            _ => return Some(Err(Errno(22))),
+        let length = if matches!(whence, 2..=4) {
+            self.data.len()
+        } else {
+            0
         };
-        let value = base
-            .checked_add(offset)
-            .filter(|n| *n >= 0)
-            .ok_or(Errno(22));
-        Some(value.map(|n| {
-            position.value = n as u64;
-            n as u64
-        }))
+        let value = seek_offset(position.value, length, offset, whence);
+        Some(value.inspect(|&n| position.value = n))
     }
     pub fn stat(&self) -> Result<[u8; 128]> {
         #[cfg(all(feature = "hostfs", unix))]

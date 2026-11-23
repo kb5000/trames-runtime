@@ -1017,6 +1017,7 @@ pub struct RuntimeInfo {
 }
 #[derive(Default)]
 pub(super) struct PseudoFs {
+    pub(super) fuse_control: Arc<fuse::Controller>,
     pub(super) user_namespace_limits: std::sync::OnceLock<Arc<user_namespace::UserNamespaceLimits>>,
     pub(super) keys: Arc<KeyRegistry>,
     pub(super) mount_policy: Arc<mounts::MountPolicy>,
@@ -1755,6 +1756,7 @@ impl Vfs {
                     mount_use: Default::default(),
                     directory_mount: Default::default(),
                     namespace_resource: original.namespace_resource.clone(),
+                    link_credentials: None,
                     file_authority: Default::default(),
                     tcp_publication: Default::default(),
                     socket_control: None,
@@ -2178,6 +2180,7 @@ impl Vfs {
             b"/proc/sys/kernel/randomize_va_space" => return Ok(regular(b"0\n".to_vec())),
             // MAP_FIXED admits guest address zero. No low-address floor is configured.
             b"/proc/sys/vm/mmap_min_addr" => return Ok(regular(b"0\n".to_vec())),
+            b"/proc/sys/vm/max_map_count" => return Ok(regular(format!("{}\n", trames_memory::MAX_PAGE_DESCRIPTORS).into_bytes())),
             b"/proc/sys/kernel/shmmax" | b"/proc/sys/kernel/shmall" => return Ok(regular(format!("{}\n", sysv_shm::MAX_SIZE).into_bytes())),
             b"/proc/sys/kernel/shmmni" => return Ok(regular(format!("{}\n", sysv_shm::MAX_SEGMENTS).into_bytes())),
             b"/proc/sys/kernel/sem" => return Ok(regular(format!("{}\t{}\t{}\t{}\n", sysv_semaphore::MAX_SEMS, sysv_semaphore::MAX_SEMS * sysv_semaphore::MAX_SETS, sysv_semaphore::MAX_OPS, sysv_semaphore::MAX_SETS).into_bytes())),
@@ -2201,6 +2204,9 @@ impl Vfs {
             b"/proc/sys/net/bridge/bridge-nf-call-iptables"|b"/proc/sys/net/bridge/bridge-nf-call-ip6tables"|b"/proc/sys/net/ipv4/ip_forward"|b"/proc/sys/net/ipv4/conf/all/forwarding"|b"/proc/sys/net/ipv6/conf/all/forwarding"=>return Ok(Some((file(Vec::new()),0o100644))),
             b"/proc/sys/net/bridge"|b"/proc/sys/net/ipv4/conf"|b"/proc/sys/net/ipv4/conf/all"|b"/proc/sys/net/ipv6"|b"/proc/sys/net/ipv6/conf"|b"/proc/sys/net/ipv6/conf/all"=>return Ok(directory()),
             b"/proc/sys/net/ipv4/ip_local_port_range" | b"/proc/sys/net/ipv4/tcp_sack" if self.network.has_guest_transport() => return Ok(Some((file(Vec::new()),0o100644))),
+            b"/proc/sys/net/ipv4/tcp_recovery" | b"/proc/sys/net/ipv6/auto_flowlabels"
+            | b"/proc/sys/net/ipv6/bindv6only" | b"/proc/sys/net/ipv6/ip6frag_time"
+            | b"/proc/sys/net/ipv6/ip_nonlocal_bind" => return Ok(Some((file(Vec::new()),0o100644))),
             b"/proc/sys/net/ipv4/ip_local_port_range" => return Ok(regular(b"49152\t65535\n".to_vec())),
             b"/proc/sys/net/ipv4/ip_default_ttl" => return Ok(regular(b"64\n".to_vec())),
             b"/proc/sys/net/ipv4/ping_group_range" | b"/proc/sys/net/ipv4/ip_unprivileged_port_start" => return Ok(Some((file(Vec::new()),0o100644))),
@@ -3029,7 +3035,11 @@ impl Vfs {
                 b"suid_dumpable".to_vec(),
             ],
             b"/proc/sys/user" => vec![b"max_user_namespaces".to_vec()],
-            b"/proc/sys/vm" => vec![b"overcommit_memory".to_vec(), b"mmap_min_addr".to_vec()],
+            b"/proc/sys/vm" => vec![
+                b"overcommit_memory".to_vec(),
+                b"mmap_min_addr".to_vec(),
+                b"max_map_count".to_vec(),
+            ],
             b"/proc/sys/net" => vec![b"ipv4".to_vec(), b"ipv6".to_vec(), b"bridge".to_vec()],
             b"/proc/sys/net/bridge" => vec![
                 b"bridge-nf-call-iptables".to_vec(),
@@ -3066,7 +3076,15 @@ impl Vfs {
                 }
                 names
             }
-            b"/proc/sys/net/ipv6" => vec![b"conf".to_vec()],
+            b"/proc/sys/net/ipv6" => [
+                "conf",
+                "auto_flowlabels",
+                "bindv6only",
+                "ip6frag_time",
+                "ip_nonlocal_bind",
+            ]
+            .map(|name| name.as_bytes().to_vec())
+            .to_vec(),
             b"/proc/sys/net/ipv4" => [
                 "conf",
                 "ip_forward",
@@ -3074,6 +3092,7 @@ impl Vfs {
                 "ip_local_port_range",
                 "ip_default_ttl",
                 "ping_group_range",
+                "tcp_recovery",
             ]
             .iter()
             .map(|s| s.as_bytes().to_vec())

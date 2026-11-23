@@ -1193,7 +1193,11 @@ impl Ruleset {
         if kind >> 8 != 10 {
             return Err(NetError(95));
         }
-        let op = kind & 255;
+        let (op, destroy) = match kind & 255 {
+            26 => (2, true), // NFT_MSG_DESTROYTABLE
+            27 => (5, true), // NFT_MSG_DESTROYCHAIN
+            op => (op, false),
+        };
         let dump = flags & 0x300 == 0x300;
         let read = matches!(op, 1 | 4 | 7 | 10 | 13 | 16);
         if flags & 1 == 0 || flags & !(1 | 4 | 0x100 | 0x200 | 0x400 | 0x800) != 0 {
@@ -1354,7 +1358,7 @@ impl Ruleset {
                 }
                 remove.push(key.clone());
             }
-            if remove.is_empty() && !flush {
+            if remove.is_empty() && !flush && !destroy {
                 return Err(NetError(2));
             }
             for key in remove {
@@ -1363,11 +1367,23 @@ impl Ruleset {
             return Ok(out);
         }
         let key = (family, name(&a, 1)?);
+        let chain_selector = if op == 5 {
+            if let Some(raw) = get(&a, 2) {
+                Some(Ok(u64v(raw)?))
+            } else {
+                Some(Err(name(&a, 3)?))
+            }
+        } else {
+            None
+        };
         if let Some(t) = self.tables.get(&key) {
             if t.owner.is_some_and(|owner| owner != port) {
                 return Err(NetError(1));
             }
         } else if op != 0 {
+            if destroy {
+                return Ok(out);
+            }
             return Err(NetError(2));
         }
         match op {
@@ -1550,12 +1566,16 @@ impl Ruleset {
             }
             5 => {
                 let t = self.tables.get_mut(&key).ok_or(NetError(2))?;
-                let cn = if let Some(raw) = get(&a, 2) {
-                    t.chain_name(u64v(raw)?)?
-                } else {
-                    name(&a, 3)?
+                let cn = match chain_selector.unwrap() {
+                    Ok(handle) => match t.chain_name(handle) {
+                        Err(NetError(2)) if destroy => return Ok(out),
+                        result => result?,
+                    },
+                    Err(name) => name,
                 };
-                let c = t.chains.get(&cn).ok_or(NetError(2))?;
+                let Some(c) = t.chains.get(&cn) else {
+                    return if destroy { Ok(out) } else { Err(NetError(2)) };
+                };
                 if c.binding != Binding::Regular {
                     return Err(NetError(95));
                 }
@@ -1841,7 +1861,12 @@ fn request_rules(
                 }
                 return Ok(vec![]);
             }
-            if batch && !matches!(kind(r) & 255, 0 | 2 | 3 | 5 | 6 | 8 | 9 | 11 | 12 | 14) {
+            if batch
+                && !matches!(
+                    kind(r) & 255,
+                    0 | 2 | 3 | 5 | 6 | 8 | 9 | 11 | 12 | 14 | 26 | 27
+                )
+            {
                 return Err(NetError(95));
             }
             let generated = staged.execute(packet_hooks, r, port, batch, &mut ids)?;

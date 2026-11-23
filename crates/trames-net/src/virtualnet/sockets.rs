@@ -496,6 +496,7 @@ impl Socket {
                 let view = self.network.0.routing.get().ok_or(NetError(19))?;
                 let device = view.graph.read().unwrap().device(view.namespace, index)?;
                 if !multicast_scope
+                    && !self.ipv6_nonlocal_bind()
                     && !device
                         .addresses
                         .iter()
@@ -515,6 +516,13 @@ impl Socket {
             }
         }
         self.bind_locked(a, true)
+    }
+    fn ipv6_nonlocal_bind(&self) -> bool {
+        self.network
+            .0
+            .routing
+            .get()
+            .is_some_and(|view| view.ip_settings.get(crate::IpSysctl::Ipv6NonlocalBind) != 0)
     }
     pub(super) fn ensure_bound(&self) -> Result<()> {
         let _binding = self.network.0.binding.lock();
@@ -568,7 +576,10 @@ impl Socket {
                 _ => {}
             }
         }
-        if !(self.own(a.ip()) || (self.kind == 2 || self.raw_udp()) && self.udp_group(a.ip())) {
+        if !(self.own(a.ip())
+            || (self.kind == 2 || self.raw_udp()) && self.udp_group(a.ip())
+            || a.is_ipv6() && self.ipv6_nonlocal_bind())
+        {
             return Err(NetError(99));
         }
         if self.kind == 4 {

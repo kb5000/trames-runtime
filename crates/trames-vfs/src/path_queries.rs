@@ -206,6 +206,7 @@ impl Vfs {
             let source = self.pseudo.borrow();
             let mut pseudo = view.pseudo.borrow_mut();
             pseudo.enabled = source.enabled;
+            pseudo.fuse_control = source.fuse_control.clone();
             pseudo.nodes = source.nodes.clone();
             pseudo.source = source.source.clone();
             pseudo.publication = Some({
@@ -453,6 +454,7 @@ impl PathQueries {
         let pseudo = {
             let root = publication.borrow();
             Arc::new(SharedCell::new(pseudo::PseudoFs {
+                fuse_control: root.fuse_control.clone(),
                 boot_id: root.boot_id.clone(),
                 user_namespace_limits: Default::default(), // Resolved through publication.
                 keys: root.keys.clone(),

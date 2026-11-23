@@ -1069,6 +1069,36 @@ impl Memory {
             return shared.borrow_mut().protect(address, len, permissions);
         }
         let end = Self::mapping_end(address, len)?;
+        self.region_layout
+            .origins
+            .check_vvar_protection(address, end, permissions)?;
+        self.protect_range(address, end, permissions)
+    }
+
+    /// Update the original special mapping while the session owns its mm.
+    pub fn update_vvar(&mut self, address: u64, bytes: &[u8; 32]) -> Result<(), MemoryError> {
+        if let Some(shared) = &self.shared {
+            return shared.borrow_mut().update_vvar(address, bytes);
+        }
+        let end = Self::mapping_end(address, PAGE_SIZE)?;
+        if !self.region_layout.origins.vvar_at(address)
+            || self.check(address, 1, Access::Read).is_err()
+        {
+            return Ok(());
+        }
+        self.protect_range(address, end, Permissions::RW)?;
+        let written = self.write(address, bytes);
+        self.protect_range(address, end, Permissions::R)?;
+        written
+    }
+
+    fn protect_range(
+        &mut self,
+        address: u64,
+        end: u64,
+        permissions: Permissions,
+    ) -> Result<(), MemoryError> {
+        let len = end - address;
         self.check_mapped_range(address, end)?;
         self.attachments.check_protect(address, end, permissions)?;
         for (&base, &frame) in self.pages.range(address..end) {

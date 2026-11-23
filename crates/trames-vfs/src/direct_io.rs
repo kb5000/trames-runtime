@@ -78,10 +78,10 @@ impl EventCounter {
             .to_vec())
     }
     pub(super) fn write(&self, bytes: &[u8]) -> Result<usize> {
-        if bytes.len() < 8 {
+        if bytes.len() != 8 {
             return Err(Errno(22));
         }
-        let value = u64::from_le_bytes(bytes[..8].try_into().expect("eight bytes"));
+        let value = u64::from_le_bytes(bytes.try_into().expect("eight bytes"));
         if value == u64::MAX {
             return Err(Errno(22));
         }

@@ -297,6 +297,7 @@ pub(super) fn peer_descriptor(end: &PtyEnd, flags: u32, id: u64, owner: (u32, u3
                 mount_use: Default::default(),
                 directory_mount: Default::default(),
                 namespace_resource: None,
+                link_credentials: None,
                 file_authority: Default::default(),
                 tcp_publication: Default::default(),
                 socket_control: None,

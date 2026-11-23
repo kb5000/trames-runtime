@@ -692,9 +692,14 @@ pub(super) fn anonymous_descriptor(id: u64, flags: u32, anonymous: Anonymous) ->
         2
     };
     let control = SharedControl::capture(&anonymous);
+    let pid_flags = if matches!(anonymous, Anonymous::Pid(_)) {
+        flags & PIDFD_THREAD
+    } else {
+        0
+    };
     resource_descriptor(
         id,
-        access | flags & (O_NONBLOCK | O_CLOEXEC),
+        access | flags & (O_NONBLOCK | O_CLOEXEC) | pid_flags,
         FdKind::Anonymous,
         None,
         control,
@@ -738,6 +743,7 @@ pub(super) fn mounted_resource_descriptor(
                 mount_use: Default::default(),
                 directory_mount: Default::default(),
                 namespace_resource: None,
+                link_credentials: None,
                 file_authority: Default::default(),
                 tcp_publication: Default::default(),
                 socket_control: None,

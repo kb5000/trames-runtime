@@ -204,6 +204,13 @@ struct Node {
     polls: u64,
     configuration_lo: bool,
 }
+impl Node {
+    fn set_ip_settings(&mut self, settings: &Arc<crate::IpSettings>) {
+        for port in [&mut self.port, &mut self.filter_rx, &mut self.gateway_rx] {
+            port.ip_settings = Some(settings.clone());
+        }
+    }
+}
 struct Namespace {
     data: Arc<NamespaceData>,
 }
@@ -880,6 +887,7 @@ impl Fabric {
         let key = i.next_node;
         i.next_node = i.next_node.checked_add(1).ok_or(NetError(28))?;
         let mut node = make_node(2, i.now())?;
+        node.set_ip_settings(&routing.ip_settings);
         let ns = Arc::new(Namespace {
             data: Arc::new(NamespaceData {
                 fabric: self.clone(),
@@ -1791,7 +1799,15 @@ impl Network {
                 Err(NetError(16))
             };
         }
-        self.0.routing.set(view).map_err(|_| NetError(16))
+        let settings = view.ip_settings.clone();
+        self.0.routing.set(view).map_err(|_| NetError(16))?;
+        let mut fabric = self.0.fabric.0.borrow_mut();
+        fabric
+            .nodes
+            .get_mut(&self.0.key)
+            .ok_or(NetError(100))?
+            .set_ip_settings(&settings);
+        Ok(())
     }
     pub(crate) fn inject_frame(
         &self,

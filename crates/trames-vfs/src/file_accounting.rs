@@ -40,6 +40,7 @@ impl FileQuota {
 pub(super) struct FileCharge {
     used: Arc<AtomicU64>,
     size: AtomicU64,
+    preallocated: AtomicU64,
     quota: OnceLock<Arc<FileQuota>>,
 }
 impl FileCharge {
@@ -48,6 +49,7 @@ impl FileCharge {
         Arc::new(Self {
             used,
             size: AtomicU64::new(length),
+            preallocated: AtomicU64::new(0),
             quota: OnceLock::new(),
         })
     }
@@ -62,6 +64,7 @@ impl FileCharge {
         self.size.load(Ordering::Relaxed)
     }
     pub fn publish(&self, length: u64) {
+        let length = length.max(self.preallocated.load(Ordering::Relaxed));
         if self.size() == length {
             return;
         }
@@ -71,6 +74,12 @@ impl FileCharge {
         } else if old > length {
             self.used.fetch_sub(old - length, Ordering::Relaxed);
         }
+    }
+    pub fn preallocated(&self) -> u64 {
+        self.preallocated.load(Ordering::Relaxed)
+    }
+    pub fn set_preallocated(&self, length: u64) {
+        self.preallocated.store(length, Ordering::Relaxed);
     }
     /// The file's original byte/resize lock protects its charge. Charging the
     /// proposed EOF before host allocation excludes concurrent oversubscription.

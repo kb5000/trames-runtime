@@ -209,6 +209,7 @@ pub struct IoContext {
 pub struct IoTask {
     pub(crate) posix_timers: std::sync::OnceLock<Arc<crate::timers::CpuSchedule>>,
     trace: std::sync::OnceLock<Mutex<ptrace::TraceSlot>>,
+    thread_wait: Mutex<ThreadWait>,
     tracees: Mutex<ptrace::Tracees>,
     trace_stop: AtomicU8,
     trace_control: AtomicBool,
@@ -243,11 +244,19 @@ pub struct IoTask {
     pid_references: Mutex<[Option<trames_vfs::PidReference>; 4]>,
     wake: Mutex<Weak<IoSignal>>,
 }
+#[derive(Default)]
+enum ThreadWait {
+    #[default]
+    Unopened,
+    Open(Arc<crate::children::Child>),
+    Retired,
+}
 impl Default for IoTask {
     fn default() -> Self {
         Self {
             posix_timers: Default::default(),
             trace: Default::default(),
+            thread_wait: Default::default(),
             tracees: Default::default(),
             trace_stop: Default::default(),
             trace_control: Default::default(),

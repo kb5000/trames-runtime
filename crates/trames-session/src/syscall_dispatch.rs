@@ -136,11 +136,7 @@ pub(crate) fn execute<C: Cpu>(
                             .trace
                             .finish(&mut work.cpu, 0u64.wrapping_sub(error.0 as u64)),
                         Ok(crate::barrier::Action::Fence(scope)) => {
-                            let request = epoch.memory_barrier(
-                                domain.id,
-                                matches!(scope, crate::barrier::Scope::Global),
-                                index,
-                            );
+                            let request = epoch.memory_barrier(domain.id, scope, index);
                             if let Some(value) = request.finish() {
                                 work.trace.finish(&mut work.cpu, value);
                             } else {

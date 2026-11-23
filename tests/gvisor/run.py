@@ -98,7 +98,7 @@ def guest_test_work(suite):
     return work
 
 
-def guest_wrapper(suite, *, pid2):
+def guest_wrapper(suite, *, pid2, test_on_gvisor=False, mount_fusectl=False):
     wrapper = (
         'export TEST_SRCDIR=/opt/gvisor/runfiles RUNFILES_DIR=/opt/gvisor/runfiles; '
         + guest_test_work(suite)
@@ -106,6 +106,10 @@ def guest_wrapper(suite, *, pid2):
     )
     if suite == 'posix_acl':
         wrapper = 'mkdir -p /dev/shm; mount -t tmpfs -o mode=1777 tmpfs /dev/shm; ' + wrapper
+    if suite == 'fuse' and mount_fusectl:
+        wrapper = 'mkdir -p "$1/fusectl"; mount -t fusectl fusectl "$1/fusectl"; ' + wrapper
+    if test_on_gvisor:
+        wrapper += 'export TEST_ON_GVISOR=trames; '
     return wrapper + ('"$@" & child=$!; wait "$child"' if pid2 else 'exec "$@"')
 
 
@@ -218,6 +222,7 @@ SUITE_FIXTURES = {
     'multiprocess_fixture': {'concurrency'},
     'memfd_tmpfs_fixture': {'memfd'},
     'writable_sysfs_fixture': {'mount', 'rename'},
+    'fusectl_fixture': {'fuse'},
 }
 
 def evidence_stem(directory, row, index):
@@ -260,7 +265,7 @@ def reuse_rows(args, plan):
         raise RuntimeError('Cannot reuse results from different binaries')
     for key in ('kernel', 'uid', 'runtime_sha256', 'nofile', 'machine', 'network',
                 'cpus', 'rootfs_sha256', 'runfiles_sha256', 'process_context',
-                'native_init_sha256', 'fresh_store', 'custom_rootfs'):
+                'native_init_sha256', 'fresh_store', 'custom_rootfs', 'upstream_userspace_abi'):
         if previous.get(key) != plan.get(key):
             raise RuntimeError('Cannot reuse results with a different ' + key)
     for key, owners in SUITE_FIXTURES.items():
@@ -293,6 +298,7 @@ def reuse_rows(args, plan):
 # These upstream cases include a deliberate wait. Allow it to finish and
 # leave time for guest startup and XML export.
 UPSTREAM_WAIT_TIMEOUTS = {
+    'mmap_eternal': {'MmapEternalTest.PageTableLeak': 90},
     'flock': {'FlockTest.BlockingLockNoBlockingForSharedLocks': 45},
     'ppoll': {'PpollTest.SignalMaskBlocksSignal': 45},
     'vfork': {
@@ -408,6 +414,8 @@ def trames(args, output):
     plan['rootfs_sha256']=digest(args.rootfs.resolve())
     if any(s['name'] == 'tuntap' for s in plan['suites']):plan['tun_netns_per_case'] = True
     if args.custom_rootfs:plan['custom_rootfs'] = True
+    if args.test_on_gvisor:plan['upstream_userspace_abi'] = True
+    if args.mount_fusectl and any(s['name'] == 'fuse' for s in plan['suites']):plan['fusectl_fixture'] = True
     if any(s['name'] in ('rename','mount') for s in plan['suites']):plan['writable_sysfs_fixture'] = True
     plan['runfiles_sha256']={str(p.relative_to(binaries)):digest(p) for p in (binaries/'runfiles').rglob('*') if p.is_file()}
 
@@ -491,7 +499,8 @@ def trames(args, output):
             work = '/tmp/gvisor-'+token+'-'+str(index)
             guest_xml = work+'/result.xml'
             xml = output/'logs'/(str(index)+'.xml')
-            wrapper = guest_wrapper(suite['name'], pid2=args.network == 'internal')
+            wrapper = guest_wrapper(suite['name'], pid2=args.network == 'internal',
+                                    test_on_gvisor=args.test_on_gvisor, mount_fusectl=args.mount_fusectl)
             terminal, wrapper = guest_terminal(suite['name'], wrapper)
             argv = [runner,'debug','env-run',name,'--no-windows',terminal,'--','/bin/sh','-ec',wrapper,'trames-gvisor',work,
                     *guest_binary(suite['name']),*suite_flags(suite['name']),'--gtest_color=no','--gtest_filter='+case,'--gtest_output=xml:'+guest_xml]
@@ -521,6 +530,8 @@ def main():
     p.add_argument('--chunk-size',type=int,default=1,help='Original GTest cases per process; aborted chunks are retried separately')
     p.add_argument('--reuse-completed',action='store_true',help='Also retain completed assertion/abort outcomes with matching executable/environment identities')
     p.add_argument('--fresh-store',action='store_true',help='APFS-clone the clean imported store for each Trames case')
+    p.add_argument('--test-on-gvisor',action='store_true',help='Run selected original cases in their userspace-kernel ABI mode')
+    p.add_argument('--mount-fusectl',action='store_true',help='Mount the guest FUSE control filesystem for the fuse suite')
     p.add_argument('--reference-timings',type=Path,help='Native results used only to extend timeout for original slow cases')
     p.add_argument('--suite-timeout',action='append',default=[],help='Upstream groups needing a longer timeout: NAME=SECONDS')
     p.add_argument('--time-budget',type=float,default=0,help='Wall seconds per worker; remaining cases stay explicitly unrun')
@@ -535,6 +546,8 @@ def main():
     p.add_argument('--rootfs',type=Path)
     p.add_argument('--custom-rootfs',action='store_true',help='Import --rootfs as a custom fixture instead of the pinned Alpine distribution')
     a = p.parse_args()
+    if a.platform == 'native' and (a.test_on_gvisor or a.mount_fusectl):
+        p.error('the selected guest fixtures apply only to Trames')
     a.suite_timeouts={name:float(seconds) for name,seconds in (v.split('=',1) for v in a.suite_timeout)}
     if any(v<=0 for v in a.suite_timeouts.values()):p.error('suite timeouts must be positive')
     if a.chunk_size<1:p.error('chunk size must be positive')

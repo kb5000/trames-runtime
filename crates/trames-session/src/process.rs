@@ -169,7 +169,7 @@ pub(crate) struct Process<C: Cpu> {
     space: crate::space::Native,
     #[cfg(all(test, trames_interpreter_conformance))]
     rekey: Option<u32>,
-    membarrier_registered: Arc<std::sync::atomic::AtomicBool>,
+    membarrier_registered: Arc<std::sync::atomic::AtomicU32>,
     limits: Arc<trames_kernel::limits::Limits>,
     oom: Arc<trames_vfs::OomTask>,
     seccomp: seccomp::Seccomp,
@@ -601,7 +601,7 @@ impl<C: Cpu> Process<C> {
             },
             #[cfg(all(test, trames_interpreter_conformance))]
             rekey: None,
-            membarrier_registered: Arc::new(std::sync::atomic::AtomicBool::new(
+            membarrier_registered: Arc::new(std::sync::atomic::AtomicU32::new(
                 self.membarrier_registered
                     .load(std::sync::atomic::Ordering::Relaxed),
             )),
@@ -4755,7 +4755,7 @@ pub(super) fn run<C: Cpu>(
         space: Default::default(),
         #[cfg(all(test, trames_interpreter_conformance))]
         rekey: None,
-        membarrier_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        membarrier_registered: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         limits,
         oom: Arc::new(trames_vfs::OomTask::default()),
         seccomp: policy,
@@ -6491,7 +6491,7 @@ mod tests {
             space: Default::default(),
             #[cfg(all(test, trames_interpreter_conformance))]
             rekey: None,
-            membarrier_registered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            membarrier_registered: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             limits,
             oom: Arc::new(trames_vfs::OomTask::default()),
             seccomp: seccomp::Seccomp::default(),

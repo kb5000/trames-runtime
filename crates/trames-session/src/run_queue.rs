@@ -898,7 +898,7 @@ impl<C: Cpu> Epoch<C> {
     pub fn memory_barrier(
         &self,
         original: u64,
-        global: bool,
+        scope: crate::barrier::Scope,
         caller: usize,
     ) -> Arc<crate::barrier::Request> {
         let request = crate::barrier::Request::new();
@@ -907,7 +907,7 @@ impl<C: Cpu> Epoch<C> {
             .lock()
             .unwrap()
             .domains
-            .barrier_domains(original, global);
+            .barrier_domains(original, scope);
         // Do not notify/drop acknowledgement resources under the queue lock.
         for domain in domains {
             domain.barrier(&request, caller);

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Guest memory barriers over original execution leases, never guest bytes.
 use std::sync::{
-    atomic::{fence, AtomicBool, AtomicUsize, Ordering},
+    atomic::{fence, AtomicU32, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use trames_vfs::{Errno, IoSignal, IoSubscription, Readiness};
@@ -10,28 +10,29 @@ use trames_vfs::{Errno, IoSignal, IoSubscription, Readiness};
 pub(crate) enum Scope {
     Private,
     Global,
+    RegisteredGlobal,
 }
 pub(crate) enum Action {
     Complete(u64),
     Fence(Scope),
 }
-pub(crate) fn prepare(registered: &AtomicBool, command: u64, flags: u64) -> Result<Action, Errno> {
+pub(crate) const REGISTER_GLOBAL: u32 = 4;
+pub(crate) const REGISTER_PRIVATE: u32 = 16;
+
+pub(crate) fn prepare(registered: &AtomicU32, command: u64, flags: u64) -> Result<Action, Errno> {
     if flags as u32 != 0 {
         return Err(Errno(22));
     }
     match command as u32 {
-        0 => Ok(Action::Complete(1 | 8 | 16 | 512)),
-        16 => {
-            registered.store(true, Ordering::Relaxed);
+        0 => Ok(Action::Complete(1 | 2 | 4 | 8 | 16 | 512)),
+        command @ (REGISTER_GLOBAL | REGISTER_PRIVATE) => {
+            registered.fetch_or(command, Ordering::Relaxed);
             Ok(Action::Complete(0))
         }
-        512 => Ok(Action::Complete(if registered.load(Ordering::Relaxed) {
-            16
-        } else {
-            0
-        })),
-        8 if !registered.load(Ordering::Relaxed) => Err(Errno(1)),
+        512 => Ok(Action::Complete(registered.load(Ordering::Relaxed).into())),
+        8 if registered.load(Ordering::Relaxed) & REGISTER_PRIVATE == 0 => Err(Errno(1)),
         8 => Ok(Action::Fence(Scope::Private)),
+        2 => Ok(Action::Fence(Scope::RegisteredGlobal)),
         1 => Ok(Action::Fence(Scope::Global)),
         _ => Err(Errno(22)),
     }

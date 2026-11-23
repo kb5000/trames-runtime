@@ -55,7 +55,7 @@ impl Vfs {
     }
     /// Mode-zero allocation reserves the virtual inode's storage quota and
     /// extends logical EOF without changing existing bytes or the fd position.
-    /// KEEP_SIZE is supported for shared files; guest hole punching is separate.
+    /// KEEP_SIZE preserves the guest's logical EOF and current file position.
     pub fn allocate_fd(&mut self, fd: u32, mode: u64, offset: u64, length: u64) -> Result<()> {
         let end = Self::allocation_end(offset, length)?;
         {
@@ -125,8 +125,6 @@ impl Vfs {
                     if mode == 0 && end > self.file_size_limit.get() {
                         return Err(Errno(27));
                     }
-                } else if mode != 0 {
-                    return Err(Errno(95));
                 }
                 if mode == 0 {
                     old.max(end)
@@ -167,12 +165,16 @@ impl Vfs {
                     usize::try_from(length).map_err(|_| Errno(27))?,
                 )
                 .map_err(storage::host_errno)?;
+            } else if matches!(request, FileResize::Allocate { mode: 1, .. }) {
+                data.reserve_keep_size(offset, end)?;
             }
         }
         if data.growth_charge(length) > available {
             return Err(Errno(28));
         }
-        data.truncate(length)?;
+        if !matches!(request, FileResize::Allocate { mode: 1, .. }) {
+            data.truncate(length)?;
+        }
         let meta = n.file_metadata();
         if !self.credentials.has_cap(capabilities::FSETID) {
             n.mode = meta.mode & !0o4000;
@@ -279,6 +281,7 @@ impl Vfs {
                 mount_use: Default::default(),
                 directory_mount: Default::default(),
                 namespace_resource: None,
+                link_credentials: None,
                 file_authority: Default::default(),
                 tcp_publication: Default::default(),
                 socket_control: None,

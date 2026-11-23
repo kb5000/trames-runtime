@@ -3,6 +3,9 @@ use super::*;
 
 pub(crate) struct Mounted {
     pub connection: Arc<Connection>,
+    filesystem: FsHandle,
+    controller: Arc<Controller>,
+    minor: u64,
     namespace: UserNamespace,
     uid: u32,
     gid: u32,
@@ -14,6 +17,7 @@ pub(crate) struct Mounted {
 impl Drop for Mounted {
     fn drop(&mut self) {
         self.connection.abort();
+        self.controller.remove(self.minor);
     }
 }
 impl Mounted {
@@ -93,12 +97,18 @@ impl Drop for Binding {
 pub(crate) fn option_fd(data: &[u8], ns: &UserNamespace) -> Result<u32> {
     Options::parse(data, ns).map(|o| o.fd)
 }
-pub(crate) fn prepare(v: &Vfs, data: &[u8]) -> Result<(FsHandle, Binding)> {
+pub(crate) fn prepare(v: &Vfs, data: &[u8]) -> Result<(FsHandle, Option<Binding>)> {
     let ns = &v.credentials.user_namespace;
     let opts = Options::parse(data, ns)?;
     let dev = v.fuse_device(opts.fd)?.ok_or(Errno(22))?;
     if dev.namespace != *ns {
         return Err(Errno(22));
+    }
+    if let Some(daemon) = dev.daemon.get() {
+        let mounted = daemon.mounted.upgrade().ok_or(Errno(16))?;
+        let mut fs = mounted.filesystem.clone();
+        fs.fuse = Some(mounted);
+        return Ok((fs, None));
     }
     let c = Caller {
         uid: ns.visible(false, v.credentials.fsuid),
@@ -108,20 +118,34 @@ pub(crate) fn prepare(v: &Vfs, data: &[u8]) -> Result<(FsHandle, Binding)> {
     let mut fs = mounts::ram_filesystem(0, 1, opts.mode, opts.uid, opts.gid, false)?;
     let connection = Connection::new(c);
     dev.reserve()?;
-    let binding = Binding {
-        device: dev,
-        daemon: Some(Arc::new(Daemon(connection.clone()))),
-    };
-    fs.fuse = Some(Arc::new(Mounted {
-        connection,
+    let root = fs.borrow().paths[b"/".as_slice()].clone();
+    let minor = root.borrow().device;
+    root.borrow_mut().device = (minor & 0xff) | ((minor & !0xff) << 12);
+    let controller = v.pseudo.borrow().fuse_control.clone();
+    let mounted = Arc::new(Mounted {
+        connection: connection.clone(),
+        filesystem: fs.clone(),
+        controller,
+        minor,
         namespace: ns.clone(),
         uid: opts.uid,
         gid: opts.gid,
         allow_other: opts.allow_other,
         access_unsupported: Default::default(),
         flush_unsupported: Default::default(),
-    }));
-    Ok((fs, binding))
+    });
+    let binding = Binding {
+        device: dev,
+        daemon: Some(Arc::new(Daemon {
+            connection,
+            mounted: Arc::downgrade(&mounted),
+        })),
+    };
+    mounted
+        .controller
+        .add(minor, opts.uid, opts.gid, &mounted.connection)?;
+    fs.fuse = Some(mounted);
+    Ok((fs, Some(binding)))
 }
 
 // Wire offsets below are the Linux ARM64 fuse_attr_out and struct stat ABIs.

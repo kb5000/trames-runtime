@@ -98,7 +98,8 @@ def run(args,output,plan,env,runner,name,store,snapshot,cache,timeout):
             shutil.rmtree(store);subprocess.run(['/bin/cp','-cR',str(snapshot),str(store)],check=True)
         stem='chunk-%06d'%serial;serial+=1
         work='/tmp/gvisor-'+stem;guest_xml=work+'/result.xml';xml=output/'logs'/(stem+'.xml')
-        terminal, wrapper = guest_terminal(suite, guest_wrapper(suite, pid2=True))
+        terminal, wrapper = guest_terminal(suite, guest_wrapper(
+            suite, pid2=True, test_on_gvisor=args.test_on_gvisor, mount_fusectl=args.mount_fusectl))
         argv=[runner,'debug','env-run',name,'--no-windows',terminal,'--','/bin/sh','-ec',wrapper,'trames-gvisor',work,*guest_binary(suite),*suite_flags(suite),'--gtest_color=no','--gtest_filter='+':'.join(selected),'--gtest_output=xml:'+guest_xml]
         stdout=output/'logs'/(stem+'.stdout');stderr=output/'logs'/(stem+'.stderr')
         budget=lambda case:timeout(suite,case) if case else 30

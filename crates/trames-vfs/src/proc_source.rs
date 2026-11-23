@@ -227,6 +227,7 @@ impl Vfs {
         };
         Some(ResolvedPath {
             key,
+            retained_directory: None,
             proc_binding: binding,
             mount: self.mount_for_path(open.mount.as_ref()),
         })
