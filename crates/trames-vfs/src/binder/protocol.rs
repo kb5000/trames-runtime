@@ -48,6 +48,7 @@ impl Ioctl {
         if file.open.flags.get() & O_PATH != 0 {
             return Err(Errno(9));
         }
+        file.open.check_device_ioctl(cmd)?;
         process.check_owner(factory.local_sender_credentials()[0])?;
         match cmd {
             VERSION => {

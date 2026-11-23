@@ -142,6 +142,11 @@ impl<C: Cpu> crate::workers::Work<C> {
     pub fn credential_call(&mut self, number: u32, args: [u64; 6], memory: &mut impl CpuMemory) {
         let snapshot = self.syscalls.as_mut().expect("credential task");
         let mut state = snapshot.namespaces.take().expect("original task authority");
+        if matches!(number, 444..=446) {
+            let result = state.landlock_call(number, args, memory);
+            self.finish_namespaces(state, result);
+            return;
+        }
         let directory = snapshot.io_routes.directory.clone();
         let namespace = snapshot.io_routes.namespace.clone();
         let local = namespace.local(self.pid);
@@ -1076,19 +1081,23 @@ impl Snapshot {
             }
             25 if matches!(cpu.x(1), 8..=11 | 15 | 16) => {
                 self.direct.record_fd_control();
+                let domain = self.io_signals.credentials().read().landlock.clone();
+                let owners = self.io_routes.async_owners(&domain);
                 self.fd_flags.async_control(
                     cpu.x(0) as u32,
                     cpu.x(1) as u32,
                     cpu.x(2),
                     memory,
-                    &self.io_routes,
+                    &owners,
                 )
             }
             29 if trames_vfs::DescriptorControl::status_ioctl_request(cpu.x(1) as u32) => {
                 self.direct.record_fd_control();
                 let fd = cpu.x(0) as u32;
+                let domain = self.io_signals.credentials().read().landlock.clone();
+                let owners = self.io_routes.async_owners(&domain);
                 self.fd_flags.descriptor_control(fd).and_then(|control| {
-                    control.status_ioctl(fd, cpu.x(1) as u32, cpu.x(2), memory, &self.io_routes)
+                    control.status_ioctl(fd, cpu.x(1) as u32, cpu.x(2), memory, &owners)
                 })
             }
             number @ (19 | 20 | 26 | 59 | 74 | 85 | 198 | 199 | 280 | 425) => self

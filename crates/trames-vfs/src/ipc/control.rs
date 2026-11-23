@@ -48,6 +48,7 @@ impl LocalConnection {
             peer.credentials.get(),
             peer.network.clone(),
             peer.ownership.clone(),
+            peer.domain.clone(),
         )?;
         self.client.credentials.set(self.identity);
         *accepted.name.borrow_mut() = peer.name.borrow().clone();
@@ -195,6 +196,16 @@ impl Vfs {
         };
         if peer.kind != socket.kind {
             return Err(Errno(91));
+        }
+        if abstract_
+            && !self
+                .credentials
+                .landlock
+                .allows_scope(&peer.domain, landlock::ABSTRACT_UNIX_SOCKET)
+            && !(socket.kind == 2
+                && std::sync::Weak::ptr_eq(&socket.datagram_peer.borrow(), &Arc::downgrade(&peer)))
+        {
+            return Err(Errno(1));
         }
         Ok(peer)
     }

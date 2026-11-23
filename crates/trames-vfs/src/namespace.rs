@@ -173,6 +173,38 @@ impl Vfs {
         let target_dir = target
             .as_ref()
             .is_some_and(|n| matches!(n.borrow().content, Content::Directory));
+        if self.credentials.landlock.fs_mask() != 0 {
+            let source_parent = source.parent();
+            let dest_parent = dest.parent();
+            self.landlock_check(
+                &source_parent,
+                Some(&old_parent),
+                if is_dir {
+                    landlock::REMOVE_DIR
+                } else {
+                    landlock::REMOVE_FILE
+                },
+            )?;
+            let mut dest_rights = landlock::make(src.borrow().mode);
+            if target.is_some() {
+                dest_rights |= if target_dir {
+                    landlock::REMOVE_DIR
+                } else {
+                    landlock::REMOVE_FILE
+                };
+            }
+            self.landlock_check(&dest_parent, Some(&new_parent), dest_rights)?;
+            if exchange {
+                let target = target.as_ref().expect("exchange destination");
+                self.landlock_check(
+                    &source_parent,
+                    Some(&old_parent),
+                    landlock::make(target.borrow().mode),
+                )?;
+                self.landlock_reparent(&dest_parent, &source_parent, target)?;
+            }
+            self.landlock_reparent(&source_parent, &dest_parent, &src)?;
+        }
         if exchange && target_dir && mounts::below(&source, &dest) {
             return Err(Errno(22));
         }

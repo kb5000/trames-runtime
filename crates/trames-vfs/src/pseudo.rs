@@ -1756,6 +1756,7 @@ impl Vfs {
                     mount_use: Default::default(),
                     directory_mount: Default::default(),
                     namespace_resource: original.namespace_resource.clone(),
+                    landlock_denied: 0,
                     link_credentials: None,
                     file_authority: Default::default(),
                     tcp_publication: Default::default(),

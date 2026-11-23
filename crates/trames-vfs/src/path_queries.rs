@@ -258,6 +258,9 @@ impl PathQueries {
     ) -> Result<u64> {
         self.view.borrow().fuse_clone(fd, address, memory)
     }
+    pub fn open_pty_peer(&self, end: &PtyEnd, flags: u32) -> Result<u32> {
+        self.view.borrow().open_pty_peer_end(end, flags)
+    }
     pub fn pending_fifo_open(&self, fd: u32) -> Option<crate::FifoOpen> {
         self.view.borrow().shared_files().pending_fifo_open(fd)
     }

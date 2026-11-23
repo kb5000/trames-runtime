@@ -124,6 +124,14 @@ pub(crate) fn resource_network(
                             s.opcode() == 16,
                         )
                     } else if s.opcode() == 56 {
+                        v.credentials
+                            .landlock
+                            .check_tcp(
+                                &socket,
+                                request.path.as_deref().unwrap(),
+                                trames_vfs::landlock::BIND_TCP,
+                            )
+                            .map_err(|e| Errno(e.0))?;
                         socket.bind_authorized(
                             request.path.as_deref().unwrap(),
                             v.credentials
@@ -138,6 +146,14 @@ pub(crate) fn resource_network(
                             }
                         })
                     } else {
+                        v.credentials
+                            .landlock
+                            .check_tcp(
+                                &socket,
+                                request.path.as_deref().unwrap(),
+                                trames_vfs::landlock::CONNECT_TCP,
+                            )
+                            .map_err(|e| Errno(e.0))?;
                         socket.connect_bytes(request.path.as_deref().unwrap())
                     };
                     result.map_err(|e| Errno(if e.0 == 115 { 11 } else { e.0 }))?;

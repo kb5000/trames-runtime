@@ -1870,6 +1870,7 @@ impl Linux {
             167 if a[0] == crate::PR_SET_VMA => Self::set_vma_name(memory, a),
             167 if matches!(a[0], 15 | 16) => crate::task_name_call(&self.command_name, a, memory),
             169 => crate::gettimeofday(memory, a[0], a[1]),
+            444..=446 => self.vfs.landlock_call(number as u32, a, memory),
             @dynamic number if crate::credential_entry(number as u32, a) => {
                 let dumpable = self.vfs.dumpable_state();
                 crate::credential_call(

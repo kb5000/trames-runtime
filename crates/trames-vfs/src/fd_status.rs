@@ -87,6 +87,7 @@ impl DescriptorControl {
         if open.flags.get() & O_PATH != 0 {
             return Err(Errno(9));
         }
+        open.check_device_ioctl(request)?;
         match request {
             0x5450 | 0x5451 => self.0.cloexec.set(request == 0x5451),
             0x5421 | 0x5452 => {

@@ -1292,6 +1292,9 @@ impl DirectSyscalls {
             }
         }
         if number == 29 {
+            if let Err(error) = fd.check_device_ioctl(args[1] as u32) {
+                return Some(Err(error));
+            }
             if let Some(error) = Self::terminal_probe(args, fd) {
                 return Some(Err(error));
             }
@@ -1320,11 +1323,15 @@ impl DirectSyscalls {
             return self.local_message(fd, number, args, memory);
         }
         if number == 29 && args[1] as u32 == 0x5441 {
+            let factory = self.resources.as_ref()?;
+            let end = fd.pty_endpoint()?;
+            let flags = args[2] as u32;
             return Some(
-                self.resources
-                    .as_ref()?
-                    .open_pty_peer(fd.pty_endpoint()?, args[2] as u32)
-                    .map(u64::from),
+                match &self.paths {
+                    Some(paths) => paths.open_pty_peer(end, flags),
+                    None => factory.open_pty_peer(end, flags),
+                }
+                .map(u64::from),
             );
         }
         let deferred = Cell::new(false);

@@ -111,7 +111,9 @@ impl CredentialState {
         let binding = self.pidfd.lock().unwrap();
         let resources = binding.as_ref().ok_or(Errno(3))?;
         if require_cap && !caller.has_ns_cap(&target.user_namespace, capabilities::SYS_PTRACE)
-            || !same_group && !resources.dumpable.may_inspect(caller)
+            || !same_group
+                && (!caller.landlock.contains(&target.landlock)
+                    || !resources.dumpable.may_inspect(caller))
             || !caller.can_inspect_credentials(same_group, &target, resources.dumpable.get())
         {
             return Err(Errno(13));
@@ -344,6 +346,7 @@ impl ExecCredentials {
 pub struct Credentials {
     file_secure_exec: bool,
     open_identity: u64,
+    pub landlock: landlock::Domain,
     pub user_namespace: UserNamespace,
     pub uid: u32,
     pub euid: u32,
@@ -403,17 +406,19 @@ impl Credentials {
     }
     fn can_inspect_credentials(&self, same_group: bool, t: &Credentials, dumpable: bool) -> bool {
         same_group
-            || self.has_ns_cap(&t.user_namespace, capabilities::SYS_PTRACE)
-            || dumpable
-                && [t.uid, t.euid, t.suid].iter().all(|id| *id == self.fsuid)
-                && [t.gid, t.egid, t.sgid].iter().all(|id| *id == self.fsgid)
-                && self.user_namespace == t.user_namespace
-                && t.caps.permitted & !self.caps.effective == 0
+            || self.landlock.contains(&t.landlock)
+                && (self.has_ns_cap(&t.user_namespace, capabilities::SYS_PTRACE)
+                    || dumpable
+                        && [t.uid, t.euid, t.suid].iter().all(|id| *id == self.fsuid)
+                        && [t.gid, t.egid, t.sgid].iter().all(|id| *id == self.fsgid)
+                        && self.user_namespace == t.user_namespace
+                        && t.caps.permitted & !self.caps.effective == 0)
     }
     pub fn user(uid: u32, gid: u32) -> Self {
         let mut credentials = Self {
             file_secure_exec: false,
             open_identity: 0,
+            landlock: Default::default(),
             user_namespace: UserNamespace::default(),
             uid,
             euid: uid,

@@ -202,12 +202,14 @@ impl Metadata {
         mount: Arc<mounts::MountData>,
         path: Vec<u8>,
         flags: u32,
+        denied: u64,
     ) {
         self.open = Some(Box::new(OpenPlan {
             id,
             mount,
             path,
             flags,
+            denied,
             slot: None,
         }));
     }
@@ -331,6 +333,26 @@ impl Metadata {
                 }
                 if flags & O_PATH != 0 {
                     return self.publish_open(None, attr.try_into().unwrap()).map(Some);
+                }
+                let access = if kind == 0o040000 {
+                    landlock::READ_DIR
+                } else {
+                    (if fd_can_read(flags) {
+                        landlock::READ_FILE
+                    } else {
+                        0
+                    }) | (if fd_can_write(flags) {
+                        landlock::WRITE_FILE
+                    } else {
+                        0
+                    }) | (if flags & O_TRUNC != 0 {
+                        landlock::TRUNCATE
+                    } else {
+                        0
+                    })
+                };
+                if self.open.as_ref().expect("FUSE open intent").denied & access != 0 {
+                    return Err(Errno(13));
                 }
                 if kind == 0o120000 {
                     return Err(Errno(40));
@@ -563,6 +585,7 @@ struct OpenPlan {
     mount: Arc<mounts::MountData>,
     path: Vec<u8>,
     flags: u32,
+    denied: u64,
     slot: Option<fd_table::ReservedFd>,
 }
 

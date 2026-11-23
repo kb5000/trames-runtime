@@ -25,6 +25,8 @@ def main():
     parser.add_argument('--case-filter', default='*', help='Select original GoogleTest names by glob')
     parser.add_argument('--timeout', type=float, default=30)
     parser.add_argument('--cpus', type=int, default=2)
+    parser.add_argument('--network', choices=['off', 'loopback'], default='off',
+                        help='Enable guest loopback sockets for suites that require TCP or UDP')
     parser.add_argument('--test-on-gvisor', action='store_true', help='Use the original userspace-kernel ABI mode')
     parser.add_argument('--mount-fusectl', action='store_true', help='Mount fusectl for the fuse suite')
     args = parser.parse_args()
@@ -61,7 +63,7 @@ def main():
     binaries = args.binaries.resolve()
     runfiles = [path for path in sorted((binaries / 'runfiles').rglob('*')) if path.is_file()]
     plan.update(
-        suites=suites, executor='interpreter', network='internal', process_context='pid2',
+        suites=suites, executor='interpreter', network=args.network, process_context='pid2',
         cpus=args.cpus, timeout=args.timeout, fresh_store=True,
         writable_sysfs_fixture=any(s['name'] in ('mount', 'rename') for s in suites),
         runtime_sha256=digest(args.runner), rootfs_sha256=digest(args.rootfs),
@@ -74,7 +76,7 @@ def main():
     save(output / 'plan.json', plan)
     command = [
         str(args.runner.resolve()),
-        '--network', 'off', '--virtual-network', '2', '--cpus', str(args.cpus),
+        '--network', args.network, '--virtual-network', '2', '--cpus', str(args.cpus),
         '--memory-budget', '5GiB', '--process-memory-budget', '4GiB',
         '--max-instructions', '200000000000',
     ]

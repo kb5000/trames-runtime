@@ -52,7 +52,8 @@ impl Drop for ExecutingFile {
 }
 
 pub struct ExecutableFile {
-    notification: Arc<FileClose>,
+    pub(super) notification: Arc<FileClose>,
+    pub(super) backing_key: Option<Vec<u8>>,
     _mount_use: Option<mounts::MountUse>,
     #[cfg(all(feature = "hostfs", unix))]
     _host_file: Option<Arc<hostfs::OpenFile>>,
@@ -114,6 +115,7 @@ impl Vfs {
             return Err(Errno(22));
         }
         let mut path_link = None;
+        let mut landlock_path = None;
         let accepted = if path.is_empty() {
             if flags & 0x1000 == 0 {
                 return Err(Errno(2));
@@ -144,6 +146,7 @@ impl Vfs {
                 None => {
                     let node = self.node(&resolved)?;
                     path_link = self.event_link(&resolved, &node);
+                    landlock_path = Some(resolved.clone());
                     ResolvedInode {
                         node,
                         label: self
@@ -172,6 +175,10 @@ impl Vfs {
             return Err(Errno(13));
         }
         drop(n);
+        if landlock_path.is_none() {
+            landlock_path = self.landlock_retained_path(&accepted);
+        }
+        self.landlock_execute(landlock_path.as_ref(), node)?;
         #[cfg(all(feature = "hostfs", unix))]
         if !_open_host && node.host.get().is_some() {
             return Ok(None);
@@ -187,6 +194,7 @@ impl Vfs {
         let notification = FileClose::open::<false>(node, 0, link);
         Ok(Some(Arc::new(ExecutableFile {
             notification,
+            backing_key: landlock_path.map(|path| path.key),
             _mount_use: mount_use,
             #[cfg(all(feature = "hostfs", unix))]
             _host_file: host_file,

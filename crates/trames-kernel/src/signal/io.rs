@@ -994,11 +994,22 @@ struct Owner {
     id: u32,
     uid: u32,
     euid: u32,
+    domain: trames_vfs::landlock::Domain,
 }
-impl AsyncOwners for IoRoutes {
+struct ScopedOwners<'a>(&'a IoRoutes, &'a trames_vfs::landlock::Domain);
+impl IoRoutes {
+    pub fn async_owners<'a>(
+        &'a self,
+        domain: &'a trames_vfs::landlock::Domain,
+    ) -> impl AsyncOwners + 'a {
+        ScopedOwners(self, domain)
+    }
+}
+impl AsyncOwners for ScopedOwners<'_> {
     fn resolve(&self, kind: u32, pid: u32) -> Result<Arc<dyn AsyncOwner>, Errno> {
-        let id = self.namespace.global(pid).ok_or(Errno(3))?;
+        let id = self.0.namespace.global(pid).ok_or(Errno(3))?;
         let group = self
+            .0
             .directory
             .groups
             .lock()
@@ -1010,12 +1021,13 @@ impl AsyncOwners for IoRoutes {
             group: Arc::downgrade(&group),
             kind,
             id,
-            uid: self.uid,
-            euid: self.euid,
+            uid: self.0.uid,
+            euid: self.0.euid,
+            domain: self.1.clone(),
         }))
     }
     fn visible(&self, pid: u32) -> u32 {
-        self.namespace.local(pid)
+        self.0.namespace.local(pid)
     }
 }
 impl AsyncOwner for Owner {
@@ -1080,10 +1092,13 @@ impl AsyncOwner for Owner {
             .filter(|t| t.belongs(self.kind, self.id))
             .filter(|t| {
                 let c = t.credentials().read();
-                self.euid == 0
+                (self.euid == 0
                     || [self.uid, self.euid]
                         .iter()
-                        .any(|id| *id == c.uid || *id == c.suid)
+                        .any(|id| *id == c.uid || *id == c.suid))
+                    && self
+                        .domain
+                        .allows_scope(&c.landlock, trames_vfs::landlock::SIGNAL)
             })
             .collect();
         let mut delivered = BTreeSet::new();
@@ -1412,7 +1427,9 @@ mod tests {
             uid: 1000,
             euid: 1000,
         };
-        let owner = routes.resolve(1, 42).unwrap();
+        let domain = trames_vfs::landlock::Domain::default();
+        let owners = routes.async_owners(&domain);
+        let owner = owners.resolve(1, 42).unwrap();
         owner.signal(35, 7, 1);
         assert!(!leader.ready());
         assert!(thread.ready());
@@ -1426,7 +1443,7 @@ mod tests {
         owner.signal(35, 7, 1);
         assert!(!replacement.ready());
         assert_eq!(owner.identity(), (1, 0));
-        routes.resolve(1, 42).unwrap().signal(35, 9, 1);
+        owners.resolve(1, 42).unwrap().signal(35, 9, 1);
         assert!(replacement.ready());
     }
     #[test]

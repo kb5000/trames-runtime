@@ -324,6 +324,9 @@ impl Vfs {
         {
             return Err(Errno(16));
         }
+        if cmd == 7 {
+            self.landlock_check_mount()?;
+        }
         match (cmd, key, value) {
             (0, Some(key @ (b"ro" | b"rw")), None) => state.readonly = key == b"ro",
             (1, Some(b"source"), Some(src))
@@ -639,6 +642,7 @@ impl Vfs {
         if flags & !0x77 != 0 {
             return Err(Errno(22));
         }
+        self.landlock_check_mount()?;
         let src = self.mount_operand(from, source, flags & 1 != 0, flags & 4 != 0)?;
         let dst = self.mount_operand(to, target, flags & 0x10 != 0, flags & 0x40 != 0)?;
         let moved = src.mount.as_ref().ok_or(Errno(22))?;

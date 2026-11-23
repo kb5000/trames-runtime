@@ -12,6 +12,7 @@ pub(crate) fn call(vfs: &mut Vfs, a: [u64; 6], memory: &mut impl CpuMemory) -> R
     if vfs.flags(a[0] as u32)? & trames_vfs::O_PATH != 0 {
         return Err(Errno(9));
     }
+    vfs.check_device_ioctl(a[0] as u32, a[1] as u32)?;
     if a[1] as u32 == trames_vfs::fuse::CLONE {
         return vfs.fuse_clone(a[0] as u32, a[2], memory);
     }

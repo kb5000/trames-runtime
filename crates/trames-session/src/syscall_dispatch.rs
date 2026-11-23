@@ -244,10 +244,11 @@ pub(crate) fn execute<C: Cpu>(
                 .syscalls
                 .as_ref()
                 .is_some_and(|s| s.namespaces.is_some())
-            && trames_linux::credential_entry(
-                work.cpu.x(8) as u32,
-                std::array::from_fn(|i| work.cpu.x(i)),
-            )
+            && (matches!(work.cpu.x(8) as u32, 444..=446)
+                || trames_linux::credential_entry(
+                    work.cpu.x(8) as u32,
+                    std::array::from_fn(|i| work.cpu.x(i)),
+                ))
         {
             let number = work.cpu.x(8) as u32;
             let args = std::array::from_fn(|i| work.cpu.x(i));

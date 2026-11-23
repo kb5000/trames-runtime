@@ -98,6 +98,11 @@ impl Vfs {
         self.fd_writable(fd)?;
         let descriptor = self.descriptor(fd)?;
         let open = descriptor.open.borrow();
+        if matches!(request, FileResize::Truncate(_))
+            && open.landlock_denied & landlock::TRUNCATE != 0
+        {
+            return Err(Errno(13));
+        }
         let node = open.node.clone().ok_or(Errno(22))?;
         let anonymous = node.borrow().seals.is_some();
         let available = if anonymous {
@@ -281,6 +286,7 @@ impl Vfs {
                 mount_use: Default::default(),
                 directory_mount: Default::default(),
                 namespace_resource: None,
+                landlock_denied: 0,
                 link_credentials: None,
                 file_authority: Default::default(),
                 tcp_publication: Default::default(),

@@ -1996,6 +1996,13 @@ impl<C: Cpu> Kernel<C> {
         pub(super) fn has_session_syscall;
         {
             @dynamic number if trames_linux::credential_entry(number, a) => self.credential_call(pid, p, number, a).map(Some),
+            444..=446 => {
+                let result = p.linux.vfs.landlock_call(number, a, &p.memory)?;
+                if number == 446 {
+                    p.signals.io.credentials().publish(&p.linux.vfs.credentials);
+                }
+                Ok(Some(result))
+            },
             25 | 29
                 if number == 25 && matches!(a[1], 4 | 8..=11 | 15 | 16)
                     || number == 29 && trames_vfs::DescriptorControl::status_ioctl_request(a[1] as u32) =>
@@ -2010,12 +2017,13 @@ impl<C: Cpu> Kernel<C> {
                     uid: p.linux.vfs.credentials.uid,
                     euid: p.linux.vfs.credentials.euid,
                 };
+                let owners = routes.async_owners(&p.linux.vfs.credentials.landlock);
                 let value = if number == 29 {
-                    p.linux.vfs.descriptor_control(a[0] as u32)?.status_ioctl(a[0] as u32, a[1] as u32, a[2], &mut p.memory, &routes)
+                    p.linux.vfs.descriptor_control(a[0] as u32)?.status_ioctl(a[0] as u32, a[1] as u32, a[2], &mut p.memory, &owners)
                 } else if a[1] == 4 {
                     p.linux.vfs.descriptor_control(a[0] as u32)?.short(a[0] as u32,4,a[2],&p.linux.vfs.credentials)
                 } else {
-                    flags.async_control(a[0] as u32, a[1] as u32, a[2], &mut p.memory, &routes)
+                    flags.async_control(a[0] as u32, a[1] as u32, a[2], &mut p.memory, &owners)
                 };
                 value.map(Some)
             },

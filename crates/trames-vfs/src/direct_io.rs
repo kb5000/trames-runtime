@@ -424,6 +424,15 @@ impl DirectFd {
             Some(Errno(if self.flags & O_PATH != 0 { 9 } else { 25 }))
         }
     }
+    pub fn check_device_ioctl(&self, request: u32) -> Result<()> {
+        if let Some(file) = &self._file {
+            return file.open.check_device_ioctl(request);
+        }
+        self.origin
+            .as_ref()
+            .and_then(OfdIdentity::open)
+            .map_or(Ok(()), |open| open.check_device_ioctl(request))
+    }
     pub fn check_read_access(&self) -> Result<()> {
         if !fd_can_read(self.flags) {
             Err(Errno(9))
@@ -611,6 +620,7 @@ impl DirectFd {
                     | events::SharedControl::Signal(_)
                     | events::SharedControl::MountTree(_)
                     | events::SharedControl::FsContext(_)
+                    | events::SharedControl::Landlock(_)
                     | events::SharedControl::Bpf(_),
                 ) => return None,
                 Some(events::SharedControl::Cgroup(file)) => {

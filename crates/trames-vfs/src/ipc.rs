@@ -137,6 +137,7 @@ pub struct LocalResource {
     // Pending accepts have no file inode until installed as a description.
     inode: AtomicU64,
     ownership: std::sync::Weak<ownership::Ownership>,
+    domain: landlock::Domain,
     namespace: Arc<SharedCell<LocalNamespace>>,
     network: Arc<linux_namespace::RootNetwork>,
     pathname_binding: std::sync::OnceLock<binding::OwnedBinding>,
@@ -274,6 +275,7 @@ impl LocalResource {
         credentials: [u32; 3],
         network: Arc<linux_namespace::RootNetwork>,
         ownership: std::sync::Weak<ownership::Ownership>,
+        domain: landlock::Domain,
     ) -> Result<Arc<Self>> {
         let mut ns = network.local.borrow_mut();
         ns.sockets.retain(|socket| socket.strong_count() != 0);
@@ -281,7 +283,7 @@ impl LocalResource {
             .retain(|_, socket| socket.strong_count() != 0);
         // Original file-table reservations enforce RLIMIT_NOFILE. A network
         // namespace is shared by many processes and has no 1024-socket quota.
-        let core = Self::new(kind, credentials, network.clone(), ownership);
+        let core = Self::new(kind, credentials, network.clone(), ownership, domain);
         ns.sockets.push(Arc::downgrade(&core));
         Ok(core)
     }
@@ -290,10 +292,12 @@ impl LocalResource {
         credentials: [u32; 3],
         network: Arc<linux_namespace::RootNetwork>,
         ownership: std::sync::Weak<ownership::Ownership>,
+        domain: landlock::Domain,
     ) -> Arc<Self> {
         Arc::new(Self {
             inode: AtomicU64::new(0),
             ownership,
+            domain,
             namespace: network.local.clone(),
             network,
             pathname_binding: std::sync::OnceLock::new(),
@@ -713,6 +717,7 @@ impl Vfs {
             ],
             network.clone(),
             Arc::downgrade(&self.shared_files().0.local_ownership),
+            self.credentials.landlock.clone(),
         )?;
         Ok(LocalSocket::view(core))
     }
@@ -743,6 +748,7 @@ impl Vfs {
                     mount_use: Default::default(),
                     directory_mount: Default::default(),
                     namespace_resource: None,
+                    landlock_denied: 0,
                     link_credentials: None,
                     file_authority: Default::default(),
                     tcp_publication: Default::default(),

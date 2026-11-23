@@ -109,7 +109,14 @@ impl Vfs {
         address: u64,
         memory: &impl trames_memory::CpuMemory,
     ) -> Result<u64> {
-        let to = self.fuse_device(fd)?.ok_or(Errno(25))?;
+        let descriptor = self.descriptor(fd)?;
+        let open = descriptor.open.borrow();
+        open.check_device_ioctl(CLONE)?;
+        let Some(events::SharedControl::Fuse(to)) = &open.control else {
+            return Err(Errno(25));
+        };
+        let to = to.clone();
+        drop(open);
         let source = u32::from_le_bytes(memory.read_array(address).map_err(|_| Errno(14))?);
         let from = self.fuse_device(source)?.ok_or(Errno(22))?;
         to.attach_clone(&from)?;

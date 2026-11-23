@@ -4,6 +4,7 @@ use super::*;
 use std::time::{Duration, Instant};
 
 pub(super) enum Anonymous {
+    Landlock(Arc<landlock::Ruleset>),
     Pid(Arc<PidFd>),
     FsContext(Arc<mounts::fd::FsContext>),
     Sync(Arc<sync_file::File>),
@@ -42,6 +43,7 @@ impl SignalMask {
     }
 }
 pub(super) enum SharedControl {
+    Landlock(Arc<landlock::Ruleset>),
     Pid(Arc<PidFd>),
     FsContext(Arc<mounts::fd::FsContext>),
     MountTree(Arc<mounts::fd::DetachedTree>),
@@ -63,6 +65,7 @@ pub(super) enum SharedControl {
 impl SharedControl {
     fn capture(control: &Anonymous) -> Option<Self> {
         Some(match control {
+            Anonymous::Landlock(ruleset) => Self::Landlock(ruleset.clone()),
             Anonymous::Pid(pid) => Self::Pid(pid.clone()),
             Anonymous::FsContext(ctx) => Self::FsContext(ctx.clone()),
             Anonymous::Sync(file) => Self::Sync(file.clone()),
@@ -77,6 +80,7 @@ impl SharedControl {
     }
     pub(super) fn owner_projection(&self) -> Option<Anonymous> {
         Some(match self {
+            Self::Landlock(ruleset) => Anonymous::Landlock(ruleset.clone()),
             Self::Pid(pid) => Anonymous::Pid(pid.clone()),
             Self::MountTree(_) => return None,
             Self::FsContext(ctx) => Anonymous::FsContext(ctx.clone()),
@@ -148,6 +152,7 @@ impl WatchState {
 impl Anonymous {
     pub(super) fn name(&self) -> &'static [u8] {
         match self {
+            Self::Landlock(_) => b"anon_inode:[landlock-ruleset]",
             Self::Pid(_) => b"anon_inode:[pidfd]",
             Self::FsContext(_) => b"anon_inode:[fscontext]",
             Self::Sync(_) => b"anon_inode:[sync_file]",
@@ -176,6 +181,7 @@ impl Anonymous {
                     0
                 }
             }
+            Self::Landlock(_) => events & 0x145,
             Self::FsContext(_) | Self::Bpf(_) => 0,
             Self::Inotify(i) => {
                 if i.queue.available() != 0 {
@@ -227,7 +233,8 @@ impl Anonymous {
         match self {
             Self::Event(counter) => counter.read(count),
             Self::Timer(timer) => timer.read(count),
-            Self::Pid(_)
+            Self::Landlock(_)
+            | Self::Pid(_)
             | Self::FsContext(_)
             | Self::Sync(_)
             | Self::Bpf(_)
@@ -743,6 +750,7 @@ pub(super) fn mounted_resource_descriptor(
                 mount_use: Default::default(),
                 directory_mount: Default::default(),
                 namespace_resource: None,
+                landlock_denied: 0,
                 link_credentials: None,
                 file_authority: Default::default(),
                 tcp_publication: Default::default(),

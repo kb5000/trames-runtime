@@ -1062,6 +1062,9 @@ impl IoRoutes {
         {
             return Err(Errno(1));
         }
+        if !creds.landlock.contains(&own.landlock) {
+            return Err(Errno(1));
+        }
         drop(own);
         self.trace_child(&tracer, &tracee, Mode::Voluntary, 0, Some(creds))
     }

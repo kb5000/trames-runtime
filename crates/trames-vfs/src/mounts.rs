@@ -525,7 +525,7 @@ impl MountData {
         let result = node.borrow().path_in(&fs.paths, &root);
         result
     }
-    fn root_path(&self) -> Vec<u8> {
+    pub(super) fn root_path(&self) -> Vec<u8> {
         // Proc/sysfs inodes live in PseudoFs, never in the backing disk's path
         // map. Their immutable mount keys cannot be found by scanning that map.
         if matches!(self.kind, Kind::Proc | Kind::Sysfs) && self.root.borrow().volatile {
@@ -1009,6 +1009,25 @@ impl Vfs {
         }
         Err(Errno(40))
     }
+    pub(super) fn landlock_parent(&self, path: &ResolvedPath) -> Option<ResolvedPath> {
+        if let Some(directory) = &path.retained_directory {
+            return self
+                .location(directory.removed_directory_parent.get()?, &path.mount)
+                .ok();
+        }
+        if let Some(mount) = &path.mount {
+            if path.key == mount.root_path() {
+                let attachment = mount.parent.borrow().clone()?;
+                return Some(ResolvedPath {
+                    retained_directory: None,
+                    proc_binding: None,
+                    key: attachment.key(),
+                    mount: Some(attachment.parent),
+                });
+            }
+        }
+        (path.key != b"/").then(|| path.parent())
+    }
     pub(super) fn path_visible(&self, path: &ResolvedPath) -> Result<Vec<u8>> {
         self.render_path::<false>(path, &self.root_location()?)
     }
@@ -1324,6 +1343,7 @@ impl Vfs {
         ) {
             return Err(Errno(1));
         }
+        self.landlock_check_mount()?;
         let flags = if flags & 0xffff0000 == 0xc0ed0000 {
             flags & 0xffff
         } else {
@@ -1841,6 +1861,7 @@ impl Vfs {
         if flags & !(2 | 8) != 0 {
             return Err(Errno(22));
         }
+        self.landlock_check_mount()?;
         let target = self.mount_location(target, flags & 8 == 0)?;
         let mount = target.mount.as_ref().ok_or(Errno(22))?;
         if !self.is_mount_root(&target) {
@@ -1865,6 +1886,7 @@ impl Vfs {
         {
             return Err(Errno(1));
         }
+        self.landlock_check_mount()?;
         let _change = self.path_change();
         let new = self.resolve(AT_FDCWD, new_root)?;
         if !matches!(self.node(&new)?.borrow().content, Content::Directory) {

@@ -383,10 +383,13 @@ impl IoRoutes {
         if sig > 64 {
             return Err(Errno(22));
         }
-        let can_kill = source
-            .credentials()
-            .read()
-            .has_cap(trames_vfs::capabilities::KILL);
+        let (can_kill, domain) = {
+            let credentials = source.credentials().read();
+            (
+                credentials.has_cap(trames_vfs::capabilities::KILL),
+                credentials.landlock.clone(),
+            )
+        };
         let mut found = false;
         let mut allowed = false;
         for tasks in groups {
@@ -412,6 +415,12 @@ impl IoRoutes {
                             .read()
                             .has_ns_cap(&namespace, trames_vfs::capabilities::KILL)
                 }
+            {
+                continue;
+            }
+            const SCOPE: u64 = trames_vfs::landlock::SIGNAL;
+            if domain.scoped(SCOPE)
+                && !domain.allows_scope(&target.credentials().read().landlock, SCOPE)
             {
                 continue;
             }

@@ -32,6 +32,7 @@ mod async_io;
 mod user_namespace;
 pub use user_namespace::{UserNamespace, CLONE_NEWUSER};
 mod keyrings;
+pub mod landlock;
 pub use keyrings::{KeyOperation, KeyRegistry, KeyResult, SessionKeys};
 mod credentials;
 mod fd_status;
@@ -310,6 +311,7 @@ struct SharedOpenDescription {
     directory_mount: std::sync::OnceLock<mounts::DirectoryPin>,
     namespace_resource: Option<linux_namespace::SharedNamespace>,
     link_credentials: Option<(u64, UserNamespace)>,
+    landlock_denied: u64,
     file_authority: std::sync::OnceLock<file_io::PublishedFile>,
     tcp_publication: std::sync::Mutex<Option<DirectTcpFd>>,
     socket_control: Option<network_io::SocketControl>,
@@ -1136,6 +1138,7 @@ impl Default for Vfs {
                             mount_use: Default::default(),
                             directory_mount: Default::default(),
                             namespace_resource: None,
+                            landlock_denied: 0,
                             link_credentials: None,
                             file_authority: Default::default(),
                             tcp_publication: Default::default(),
@@ -1534,6 +1537,7 @@ impl Vfs {
                             mount_use: Default::default(),
                             directory_mount: Default::default(),
                             namespace_resource: None,
+                            landlock_denied: 0,
                             link_credentials: None,
                             file_authority: Default::default(),
                             tcp_publication: Default::default(),
@@ -1577,6 +1581,9 @@ impl Vfs {
     ) -> Result<()> {
         let filesystem = path.filesystem(self);
         let _namespace = filesystem.namespace.lock().unwrap();
+        if exclusive {
+            self.landlock_check_parent(&path, None, landlock::make(mode))?;
+        }
         #[cfg(all(feature = "hostfs", unix))]
         if let Some(host) = &filesystem.host {
             let host_mode = if exclusive && !matches!(content, Content::Symlink(_)) {
@@ -2079,7 +2086,29 @@ impl Vfs {
                                 path.push(b'/');
                                 path.extend_from_slice(part);
                             }
-                            Some((path, flags))
+                            let denied = if flags & O_PATH == 0
+                                && self.credentials.landlock.fs_mask() != 0
+                            {
+                                let root = ResolvedPath {
+                                    key: m.root_path(),
+                                    mount: Some(m.clone()),
+                                    retained_directory: None,
+                                    proc_binding: None,
+                                };
+                                // Daemon-backed leaf rules are unavailable until FUSE
+                                // publishes stable identities to the guest inode table.
+                                self.landlock_denied(
+                                    &root,
+                                    None,
+                                    landlock::READ_FILE
+                                        | landlock::WRITE_FILE
+                                        | landlock::READ_DIR
+                                        | landlock::TRUNCATE,
+                                )?
+                            } else {
+                                0
+                            };
+                            Some((path, flags, denied))
                         } else {
                             None
                         };
@@ -2093,8 +2122,14 @@ impl Vfs {
                             trailing,
                             operation,
                         )?;
-                        if let Some((path, flags)) = open {
-                            pending.prepare_open(self.open_id(), m.shared.clone(), path, flags);
+                        if let Some((path, flags, denied)) = open {
+                            pending.prepare_open(
+                                self.open_id(),
+                                m.shared.clone(),
+                                path,
+                                flags,
+                                denied,
+                            );
                         }
                         query.prepared.borrow_mut().fuse = Some(Box::new(pending));
                         return query.defer();
@@ -2410,6 +2445,7 @@ impl Vfs {
         }
         let filesystem = dest.filesystem(self);
         let _namespace = filesystem.namespace.lock().unwrap();
+        let source_path = source;
         #[cfg(all(feature = "hostfs", unix))]
         let host_source = source.key.clone();
         let source = self.node(source)?;
@@ -2423,6 +2459,11 @@ impl Vfs {
             dest.writable()?;
             self.check_link_source(&source.borrow())?;
             self.check_parent_write(dest)?;
+            if self.credentials.landlock.fs_mask() != 0 {
+                let mode = source.borrow().mode;
+                self.landlock_check_parent(dest, None, landlock::make(mode))?;
+                self.landlock_reparent(&source_path.parent(), &dest.parent(), &source)?;
+            }
         }
         let executable = import_executable == Some(true);
         // Synthesized endpoints have a separate inode allocation/lifetime and
@@ -2508,6 +2549,7 @@ impl Vfs {
             return Err(Errno(17));
         }
         if Self::cgroup_mount(&p) {
+            self.landlock_check_parent(&p, None, landlock::MAKE_DIR)?;
             return self.cgroup_mkdir(&p, mode);
         }
         self.check_parent_write(&p)?;
@@ -2564,6 +2606,17 @@ impl Vfs {
         };
         if directory != is_dir {
             return Err(Errno(if is_dir { 21 } else { 20 }));
+        }
+        if !is_queue {
+            self.landlock_check_parent(
+                &p,
+                Some(&parent),
+                if is_dir {
+                    landlock::REMOVE_DIR
+                } else {
+                    landlock::REMOVE_FILE
+                },
+            )?;
         }
         if Self::cgroup_mount(&p) {
             return if directory {
@@ -2930,7 +2983,10 @@ impl Vfs {
             self.check_parent_write(&p)?;
             #[cfg(all(feature = "hostfs", unix))]
             let native_created = if let Some(host) = &p.filesystem(self).host {
-                match host.create_open(&p.filesystem(self), &p.key, flags, mode & !self.umask()) {
+                let filesystem = p.filesystem(self);
+                let _namespace = filesystem.namespace.lock().unwrap();
+                self.landlock_check_parent(&p, None, landlock::MAKE_REG)?;
+                match host.create_open(&filesystem, &p.key, flags, mode & !self.umask()) {
                     Ok((node, lease)) => {
                         self.notification_link(&p, &node, true);
                         self.notification_entry(&p, inotify::CREATE, 0, false);
@@ -2958,6 +3014,19 @@ impl Vfs {
             }
         }
         let node = forced_node.map_or_else(|| self.node(&p), Ok)?;
+        let landlock_denied = if self.credentials.landlock.fs_mask() == 0 {
+            0
+        } else {
+            let retained = magic
+                .as_ref()
+                .and_then(|file| self.landlock_retained_path(file));
+            let path = if magic.is_some() {
+                retained.as_ref()
+            } else {
+                Some(&p)
+            };
+            self.landlock_open::<PATH_TRUNCATE>(path, &node, flags)?
+        };
         if existed && flags & O_CREAT != 0 {
             self.check_sticky_create(&p, &node)?;
         }
@@ -3210,6 +3279,7 @@ impl Vfs {
                     mount_use: Default::default(),
                     directory_mount: Default::default(),
                     namespace_resource: None,
+                    landlock_denied,
                     link_credentials: Some(self.credentials.open_identity()),
                     file_authority: Default::default(),
                     tcp_publication: Default::default(),

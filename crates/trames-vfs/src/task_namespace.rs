@@ -264,6 +264,23 @@ impl Vfs {
     }
 }
 impl TaskNamespaces {
+    pub fn landlock_call(
+        &mut self,
+        number: u32,
+        args: [u64; 6],
+        memory: &impl trames_memory::CpuMemory,
+    ) -> Result<u64> {
+        self.refresh = false;
+        let result = self
+            .view
+            .view
+            .borrow_mut()
+            .landlock_call(number, args, memory);
+        if number == 446 && result.is_ok() {
+            self.publish_credentials();
+        }
+        result
+    }
     /// Only owned credential data is exposed; the private VFS/RC island cannot
     /// escape through this callback. The caller publishes after a real commit.
     pub fn with_credentials<T>(

@@ -87,6 +87,7 @@ impl DescriptorFactory {
             ],
             self.local_network.clone(),
             Arc::downgrade(&self.files.0.local_ownership),
+            self.credentials.landlock.clone(),
         )
     }
     pub fn local_create(&self, kind: u32, protocol: u32) -> Result<u32> {
@@ -128,6 +129,19 @@ impl DescriptorFactory {
     }
     /// TIOCGPTPEER accepts the original full master OFD; no pathname relookup.
     pub fn open_pty_peer(&self, end: &PtyEnd, flags: u32) -> Result<u32> {
+        self.open_pty_peer_checked(end, flags, || {
+            if self.credentials.landlock.pty_peer_required() {
+                return Err(Errno(13));
+            }
+            Ok(0)
+        })
+    }
+    pub(super) fn open_pty_peer_checked(
+        &self,
+        end: &PtyEnd,
+        flags: u32,
+        check: impl FnOnce() -> Result<u64>,
+    ) -> Result<u32> {
         if !end.master {
             return Err(Errno(25));
         }
@@ -148,7 +162,8 @@ impl DescriptorFactory {
             };
             self.devices.check(node.mode, device.rdev(), 6)?;
         }
-        let descriptor = pty::peer_descriptor(end, flags, self.open_id(), self.owner);
+        let denied = check()?;
+        let descriptor = pty::peer_descriptor(end, flags, self.open_id(), self.owner, denied);
         let number = reservation.publish(descriptor, None)?;
         if let Some(task) = &self.terminal_task {
             end.pair.bind_signal_route(task.clone());
@@ -281,6 +296,9 @@ impl DescriptorFactory {
         if socket.is_netlink() {
             return socket.netlink_address(address, self.local_pid(self.local_identity[0]), false);
         }
+        self.credentials
+            .landlock
+            .check_tcp(socket, address, landlock::BIND_TCP)?;
         socket.bind_authorized(address, self.can_bind_service(socket))
     }
     pub fn connect_socket(
@@ -291,6 +309,9 @@ impl DescriptorFactory {
         if socket.is_netlink() {
             return socket.netlink_address(address, self.local_pid(self.local_identity[0]), true);
         }
+        self.credentials
+            .landlock
+            .check_tcp(socket, address, landlock::CONNECT_TCP)?;
         socket.connect_bytes(address)
     }
     pub fn project_socket_credentials(&self, [pid, uid, gid]: [u32; 3]) -> [u32; 3] {
@@ -470,6 +491,7 @@ impl DescriptorFactory {
                         mount_use: Default::default(),
                         directory_mount: Default::default(),
                         namespace_resource: None,
+                        landlock_denied: 0,
                         link_credentials: None,
                         file_authority: Default::default(),
                         tcp_publication: Default::default(),

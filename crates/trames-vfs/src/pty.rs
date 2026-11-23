@@ -273,11 +273,35 @@ impl Vfs {
     /// lazy unmount, rather than reopening a path in the caller's namespace.
     pub fn open_pty_peer(&mut self, fd: u32, flags: u32) -> Result<u32> {
         let end = self.pty(fd)?.filter(|end| end.master).ok_or(Errno(25))?;
-        self.descriptor_factory().open_pty_peer(&end, flags)
+        self.open_pty_peer_end(&end, flags)
+    }
+
+    pub(super) fn open_pty_peer_end(&self, end: &PtyEnd, flags: u32) -> Result<u32> {
+        let factory = self.descriptor_factory();
+        if !self.credentials.landlock.pty_peer_required() {
+            return factory.open_pty_peer(end, flags);
+        }
+        factory.open_pty_peer_checked(end, flags, || {
+            let mount = self.mount_for_path(
+                end.pair
+                    .mount
+                    .as_ref()
+                    .map(|m| OpenMount::Shared(m.clone()))
+                    .as_ref(),
+            );
+            let path = self.location(&end.pair.slave, &mount).ok();
+            self.landlock_open::<false>(path.as_ref(), &end.pair.slave, flags)
+        })
     }
 }
 
-pub(super) fn peer_descriptor(end: &PtyEnd, flags: u32, id: u64, owner: (u32, u32)) -> Descriptor {
+pub(super) fn peer_descriptor(
+    end: &PtyEnd,
+    flags: u32,
+    id: u64,
+    owner: (u32, u32),
+    landlock_denied: u64,
+) -> Descriptor {
     let node = end.pair.slave.clone();
     Descriptor {
         open: OpenHandle::new(OpenDescription {
@@ -297,6 +321,7 @@ pub(super) fn peer_descriptor(end: &PtyEnd, flags: u32, id: u64, owner: (u32, u3
                 mount_use: Default::default(),
                 directory_mount: Default::default(),
                 namespace_resource: None,
+                landlock_denied,
                 link_credentials: None,
                 file_authority: Default::default(),
                 tcp_publication: Default::default(),
