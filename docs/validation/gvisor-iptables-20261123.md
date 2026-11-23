@@ -98,3 +98,39 @@ for the interpreter. Logs and case selections are under
 The same six ordinary socket workloads ran for 32 paired samples against
 Runtime `c856286`. Median elapsed changes ranged from -1.12% to
 +0.35%.
+
+## UserChainTargetCrash closure
+
+Both remaining original cases now have passing results on both executors:
+
+| Original case | Mac HVF | Interpreter on Mac |
+| --- | --- | --- |
+| `IPTablesBasic.UserChainTargetCrash` | passed | passed |
+| `IP6TablesTest.UserChainTargetCrash` | passed | passed |
+
+The unchanged November 17 ARM64 binaries ran separately in fresh Alpine
+stores with two guest CPUs and the ordinary upstream test mode. Each result
+has completed GoogleTest XML, exit status zero and no skips. The runners are
+the source-verified `9a20d6a` executables fingerprinted above. The interpreter
+run does not represent a physical iPad test.
+
+The existing entry-validation fix already rejects these images. This
+follow-up adds regression tests without changing production code. The tests
+recreate the original four-entry images, reject chain labels, terminal
+markers and interior offsets as hook, policy and jump destinations, and
+reject fallthrough into a chain label. Rejection precedes counter copyout
+and preserves the old wire image and live counters. Positive controls accept
+hooks entering a chain body and a legitimate jump to a returning user chain.
+
+All 204 `trames-net` unit tests, 13 integration tests and its doc-test check
+passed, as did scoped Clippy and workspace formatting. Unchanged production checks, iOS FFI,
+guest-tool acceptance and the 32-pair socket performance measurements above
+are reused. Local evidence, including both original case plans, XML and the
+126-case closure audit, is under `target/gvisor-user-chain-20261123` in the
+iPad checkout.
+
+The audit matches all 126 original November 23 gaps to passing Mac and
+interpreter evidence from the five documented batches. The cumulative
+comparison is **13,864/13,864 native-passing cases**, with zero remaining
+gaps in that fixed selection. This is a rolling result across revisions;
+it is not a full same-revision rerun or coverage of every Linux interface.

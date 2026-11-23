@@ -716,6 +716,140 @@ mod tests {
         }
     }
 
+    #[test]
+    fn user_chain_target_crash_rejects_the_original_ipv4_and_ipv6_payloads() {
+        for family in [2, 10] {
+            let layout = Layout::for_family(family);
+            // Match gVisor's MakeUserChainTargetReplacePayload{4,6}: a chain
+            // label, two ACCEPT rules and the terminal ERROR marker. INPUT
+            // and OUTPUT point at the label instead of its first packet rule.
+            let mut wire = Vec::new();
+            let label = default_entry(&mut wire, layout, ERROR);
+            label[2..7].copy_from_slice(b"ERROR");
+            label[XT_HEADER..XT_HEADER + 8].copy_from_slice(b"my_chain");
+            let accept = wire.len();
+            for _ in 0..2 {
+                let target = default_entry(&mut wire, layout, STANDARD);
+                target[XT_HEADER..XT_HEADER + 4].copy_from_slice(&(-2i32).to_le_bytes());
+            }
+            let marker = default_entry(&mut wire, layout, ERROR);
+            marker[2..7].copy_from_slice(b"ERROR");
+            marker[XT_HEADER..XT_HEADER + 5].copy_from_slice(b"ERROR");
+            let mut start = [0; HOOKS];
+            let mut policy = [0; HOOKS];
+            start[2] = accept;
+            policy[1..=3].fill(accept);
+            let replace = filter_replacement(wire, 4, start, policy);
+            assert_replacement_rejected(family, &replace);
+
+            // The label itself is legal metadata when the hooks enter its
+            // packet body. Keep this positive control beside the crash case.
+            let mut valid = replace;
+            put_word(&mut valid, 44 + 4, accept);
+            put_word(&mut valid, 44 + 3 * 4, accept);
+            Firewall::default()
+                .legacy_replace(family, &valid, |_, _| Ok(()))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn chain_metadata_is_rejected_as_hook_policy_jump_and_fallthrough_destination() {
+        for family in [2, 10] {
+            let initial = LegacyTable::initial(family, Name::Filter);
+            let layout = initial.layout;
+            let mut wire = initial.wire.clone();
+            let label_offset = initial.entries.last().unwrap().offset;
+            let label_name = label_offset + layout.entry() + XT_HEADER;
+            wire[label_name..label_name + ERROR - XT_HEADER].fill(0);
+            wire[label_name..label_name + 8].copy_from_slice(b"my_chain");
+            let body_offset = wire.len();
+            let body = default_entry(&mut wire, layout, STANDARD);
+            body[XT_HEADER..XT_HEADER + 4].copy_from_slice(&(-5i32).to_le_bytes());
+            let marker_offset = wire.len();
+            let marker = default_entry(&mut wire, layout, ERROR);
+            marker[2..7].copy_from_slice(b"ERROR");
+            marker[XT_HEADER..XT_HEADER + 5].copy_from_slice(b"ERROR");
+            let start = std::array::from_fn(|hook| initial.entries[initial.start[hook]].offset);
+            let mut policy =
+                std::array::from_fn(|hook| initial.entries[initial.policy[hook]].offset);
+            policy[1] = start[2];
+            let mut valid = filter_replacement(wire, 6, start, policy);
+            let verdict = REPLACE_HEADER + layout.entry() + XT_HEADER;
+            put_word(&mut valid, verdict, body_offset);
+            Firewall::default()
+                .legacy_replace(family, &valid, |_, _| Ok(()))
+                .unwrap();
+
+            for destination in [label_offset, marker_offset, label_offset + 8] {
+                for hook in 1..=3 {
+                    for field in [44, 64] {
+                        let mut invalid = valid.clone();
+                        put_word(&mut invalid, field + hook * 4, destination);
+                        assert_replacement_rejected(family, &invalid);
+                    }
+                }
+                let mut invalid = valid.clone();
+                put_word(&mut invalid, verdict, destination);
+                assert_replacement_rejected(family, &invalid);
+            }
+
+            // A conditional last built-in rule must not fall through into
+            // the user-chain header, even when all explicit offsets are valid.
+            let mut invalid = valid;
+            put_word(&mut invalid, 64 + 3 * 4, start[2]);
+            let output = REPLACE_HEADER + start[3];
+            invalid[output] = 1; // Source address match makes the rule conditional.
+            assert_replacement_rejected(family, &invalid);
+        }
+    }
+
+    fn filter_replacement(
+        wire: Vec<u8>,
+        count: usize,
+        start: [usize; HOOKS],
+        policy: [usize; HOOKS],
+    ) -> Vec<u8> {
+        let mut replace = vec![0; REPLACE_HEADER];
+        replace[..6].copy_from_slice(b"filter");
+        put_word(&mut replace, 32, Name::Filter.hooks() as usize);
+        put_word(&mut replace, 36, count);
+        put_word(&mut replace, 40, wire.len());
+        for hook in 1..=3 {
+            put_word(&mut replace, 44 + hook * 4, start[hook]);
+            put_word(&mut replace, 64 + hook * 4, policy[hook]);
+        }
+        put_word(&mut replace, 84, 4); // Counter slots in the original filter table.
+        replace.extend(wire);
+        replace
+    }
+
+    fn assert_replacement_rejected(family: u8, replace: &[u8]) {
+        let firewall = Firewall::default();
+        let initial = LegacyTable::initial(family, Name::Filter);
+        let mut query = [0; ENTRIES_HEADER];
+        query[..6].copy_from_slice(b"filter");
+        put_word(&mut query, 32, initial.wire.len());
+        let len = query.len() + initial.wire.len();
+        firewall.legacy_get(family, 65, &query, len).unwrap();
+        let mut counters = query.to_vec();
+        put_word(&mut counters, 32, initial.entries.len());
+        counters.resize(ENTRIES_HEADER + initial.entries.len() * 16, 0);
+        counters[ENTRIES_HEADER..ENTRIES_HEADER + 8].copy_from_slice(&5u64.to_le_bytes());
+        firewall.legacy_add_counters(family, &counters).unwrap();
+        let before = firewall.legacy_get(family, 65, &query, len).unwrap();
+        assert!(matches!(
+            firewall.legacy_replace(family, replace, |_, _| {
+                panic!("invalid chain destinations must fail before counter copyout")
+            }),
+            Err(NetError(22))
+        ));
+        assert_eq!(
+            firewall.legacy_get(family, 65, &query, len).unwrap(),
+            before
+        );
+    }
+
     fn check_replacement_is_atomic(family: u8) {
         let name = Name::Filter;
         let firewall = Firewall::default();
