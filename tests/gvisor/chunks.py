@@ -11,7 +11,7 @@ import subprocess
 import time
 import xml.etree.ElementTree as ET
 
-from run import executed_case, TRACEE_WAIT, classify, execute, guest_terminal, guest_binary, guest_wrapper, save, suite_flags, child_check_failure
+from run import executed_case, TRACEE_WAIT, SINGLE_CASE_SUITES, classify, execute, guest_terminal, guest_binary, guest_wrapper, save, suite_flags, child_check_failure
 
 
 class Progress:
@@ -69,7 +69,7 @@ def run(args,output,plan,env,runner,name,store,snapshot,cache,timeout):
     # later case must start with the environment's full configured CPU set.
     # The isolated loopback binary reuses fixed ports across cases. TIME_WAIT
     # from one successful test must not affect the next bind.
-    single={'affinity','socket_inet_loopback_isolated','tuntap'}
+    single=set(SINGLE_CASE_SUITES)
     remaining_budget=lambda: not args.time_budget or time.monotonic()-started<args.time_budget
 
     def checkpoint():save(output/'results.json',rows)

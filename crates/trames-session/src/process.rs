@@ -675,6 +675,9 @@ struct HostContext {
     root: Arc<trames_kernel::signal::IoTask>,
     directory: Arc<trames_kernel::signal::IoDirectory>,
 }
+#[cfg(all(test, trames_interpreter_conformance))]
+type EpochObserver<C> = Arc<std::sync::OnceLock<std::sync::Weak<crate::run_queue::Epoch<C>>>>;
+
 pub(crate) struct Kernel<C: Cpu> {
     host_launches: Arc<host::Launches<C>>,
     #[cfg(all(test, trames_interpreter_conformance))]
@@ -760,6 +763,8 @@ pub(crate) struct Kernel<C: Cpu> {
     proc_owner_waits: Vec<proc::ProcReadWait<C>>,
     host_wait: Option<trames_linux::HostWait>,
     host_context: Option<HostContext>,
+    #[cfg(all(test, trames_interpreter_conformance))]
+    execution_epoch_for_test: Option<EpochObserver<C>>,
     profile_syscalls: bool,
     idle: Duration,
     load: Arc<std::sync::Mutex<crate::proc_views::Load>>,
@@ -3948,6 +3953,10 @@ impl<C: Cpu> Kernel<C> {
             self.workers.events(),
             persistent,
         );
+        #[cfg(all(test, trames_interpreter_conformance))]
+        if let Some(observer) = &self.execution_epoch_for_test {
+            assert!(observer.set(Arc::downgrade(&epoch)).is_ok());
+        }
         epoch.bind_session(terminal);
         epoch.bind_host_wait(io.waits_for_host());
         epoch.bind_timers(self.timers.clone());
@@ -4860,6 +4869,8 @@ pub(super) fn run<C: Cpu>(
         proc_owner_waits: Vec::new(),
         host_wait: None,
         host_context: None,
+        #[cfg(all(test, trames_interpreter_conformance))]
+        execution_epoch_for_test: None,
         profile_syscalls: runtime.profile_syscalls,
         idle: Duration::ZERO,
         load: Arc::default(),
@@ -6760,6 +6771,7 @@ mod tests {
             proc_owner_waits: Vec::new(),
             host_wait: None,
             host_context: None,
+            execution_epoch_for_test: None,
             profile_syscalls: false,
             idle: Duration::ZERO,
             load: Arc::default(),

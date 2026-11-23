@@ -1115,6 +1115,7 @@ mod tests {
     fn host_pause_resume_keeps_original_cpus_views_and_one_cohort() {
         struct Pauses {
             pages: Vec<Arc<SharedPage>>,
+            epoch: Arc<std::sync::OnceLock<std::sync::Weak<crate::run_queue::Epoch<Cpu>>>>,
             previous: Vec<u64>,
             stable: usize,
             since: Instant,
@@ -1142,32 +1143,47 @@ mod tests {
                     Instant::now() < self.deadline,
                     "pause/resume failed to progress"
                 );
-                let current: Vec<_> = self.pages.iter().map(|p| count(p)).collect();
                 if self.paused {
-                    if current == self.previous {
-                        self.stable += 1;
-                    } else {
-                        assert!(self.stable < 3, "guest executed after host pause settled");
-                        self.stable = 0;
-                        self.previous = current;
+                    let epoch = self.epoch.get().unwrap().upgrade().unwrap();
+                    // Equal samples do not acknowledge a pause: an in-flight
+                    // CPU may be descheduled between them. Observe the queue
+                    // after every execution/completion lease has returned,
+                    // then read counters and require them to remain unchanged.
+                    if !epoch.host_pause_settled_for_test() {
+                        assert_eq!(self.stable, 0, "settled host pause became active");
+                        return Ok(trames_linux::HostState::Running);
                     }
+                    let current: Vec<_> = self.pages.iter().map(|p| count(p)).collect();
+                    if self.stable == 0 {
+                        self.previous = current;
+                        self.since = Instant::now();
+                    } else {
+                        assert_eq!(
+                            current, self.previous,
+                            "guest executed after host pause settled"
+                        );
+                    }
+                    self.stable += 1;
                     if self.stable >= 3 && self.since.elapsed() >= Duration::from_millis(20) {
                         self.paused = false;
                         self.stable = 0;
                         self.cycles += 1;
                     }
-                } else if current
-                    .iter()
-                    .zip(&self.previous)
-                    .all(|(now, before)| now > before)
-                {
-                    if self.cycles == 3 {
-                        self.cancel = true;
-                        return Ok(trames_linux::HostState::Cancelled);
+                } else {
+                    let current: Vec<_> = self.pages.iter().map(|p| count(p)).collect();
+                    if current
+                        .iter()
+                        .zip(&self.previous)
+                        .all(|(now, before)| now > before)
+                    {
+                        if self.cycles == 3 {
+                            self.cancel = true;
+                            return Ok(trames_linux::HostState::Cancelled);
+                        }
+                        self.previous = current;
+                        self.paused = true;
+                        self.since = Instant::now();
                     }
-                    self.previous = current;
-                    self.paused = true;
-                    self.since = Instant::now();
                 }
                 Ok(trames_linux::HostState::Running)
             }
@@ -1181,6 +1197,8 @@ mod tests {
             k.cpu_count = cpus;
             k.workers = crate::workers::Pool::new(slots);
             k.per_cpu = vec![Duration::ZERO; cpus];
+            let epoch = Arc::new(std::sync::OnceLock::new());
+            k.execution_epoch_for_test = Some(epoch.clone());
             let mut pages = Vec::new();
             for id in 1..=cpus {
                 let mut p = super::super::tests::process();
@@ -1200,6 +1218,7 @@ mod tests {
             }
             let mut host = Pauses {
                 pages,
+                epoch,
                 previous: vec![0; cpus],
                 stable: 0,
                 since: Instant::now(),

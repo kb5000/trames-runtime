@@ -5,13 +5,13 @@ import subprocess
 import sys
 
 from chunks import Progress, xml_rows
-from run import TRACEE_WAIT, classify, execute, guest_binary, guest_terminal, guest_wrapper, save, suite_flags, watchdog
+from run import TRACEE_WAIT, SINGLE_CASE_SUITES, classify, execute, guest_binary, guest_terminal, guest_wrapper, save, suite_flags, watchdog
 
 
 def run(args, output, suites, command, seed):
     rows = []
     serial = 0
-    single = {'affinity', 'socket_inet_loopback_isolated', 'tuntap'}
+    single = set(SINGLE_CASE_SUITES)
     disk_stopped = False
 
     def checkpoint():

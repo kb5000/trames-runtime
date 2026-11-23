@@ -87,6 +87,8 @@ def main():
     }
     if any(s['name'] == 'host_pty' for s in suites):
         plan['host_pty_fixture'] = 'product guest PTY supplied by --pty'
+    if any(s['name'] == 'socket_stress' for s in suites):
+        plan['isolated_socket_stress_per_case'] = True
     plan['case_execution'] = dict(timeout_base=args.timeout, suite_timeouts=args.suite_timeouts, chunk_size=args.chunk_size)
     save(output / 'plan.json', plan)
     command = [

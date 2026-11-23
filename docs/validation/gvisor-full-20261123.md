@@ -13,6 +13,11 @@ this fixed ARM64 selection, rather than every Linux interface or kernel
 behavior. Native failures, skips and timeouts remain outside the passing
 oracle. The interpreter ran on the development Mac, not a physical iPad.
 
+The subsequent [batch stability follow-up](batch-stability-20261123.md) reproduces
+and fixes the intermittent mapping-custody failure, isolates socket pressure
+cases, and corrects the inotify budget. The initial results below remain the
+historical full-run evidence.
+
 ## Initial full-run results
 
 | Executor | Pass | Assertion | Timeout | No result | Skip |

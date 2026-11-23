@@ -31,7 +31,12 @@ pub(in crate::process) fn wait_view(
 }
 
 impl<C: Cpu> Lifecycle<C> {
-    pub(super) fn release_layout_bytes(&self, epoch: &Epoch<C>, mut checkpoint: Checkpoint<C>) {
+    pub(super) fn release_layout_bytes(
+        &self,
+        epoch: &Epoch<C>,
+        mut checkpoint: Checkpoint<C>,
+        custody: tasks::Cohort<C>,
+    ) {
         let began = Instant::now();
         for job in &mut checkpoint.jobs {
             drop(job.work.memory.take());
@@ -75,6 +80,7 @@ impl<C: Cpu> Lifecycle<C> {
             }
         };
         drop(report);
+        drop(custody);
         if pending && !epoch.control.stopped() {
             let wait = wait.expect("original byte borrower");
             epoch.defer_checkpoint(checkpoint, wait.signal, wait.subscriptions);

@@ -1970,10 +1970,15 @@ impl<C: Cpu> Epoch<C> {
                 if let Some((checkpoint, subscriptions)) = Self::claim_checkpoint(&mut q, true) {
                     // The existing executor owns only this quiescent scope.
                     // No task/mm acquisition or operation holds the queue lock.
+                    // Restoring jobs can let another CPU park on this scope's
+                    // still-retained custody. Its release remains an actual
+                    // producer until the complete handler has returned.
+                    q.completing += 1;
                     drop(q);
                     drop(subscriptions);
                     lifecycle.run(self, checkpoint, slot, engine);
                     q = self.queues.lock().unwrap();
+                    q.completing -= 1;
                     continue;
                 }
             }
@@ -2334,6 +2339,29 @@ impl<C: Cpu> Epoch<C> {
             assert!(!self.control.stopped(), "cohort stopped before I/O park");
             let left = deadline.saturating_duration_since(Instant::now());
             assert!(!left.is_zero(), "I/O did not park");
+            q = self.changed.wait_timeout(q, left).unwrap().0;
+        }
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
+    pub(crate) fn lifecycle_for_test(&self) -> &crate::process::lifecycle::Lifecycle<C> {
+        self.lifecycle.get().expect("bound source lifecycle")
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
+    pub(crate) fn host_pause_settled_for_test(&self) -> bool {
+        let q = self.queues.lock().unwrap();
+        self.host_pause.load(Ordering::Relaxed) && q.running == 0 && q.completing == 0
+    }
+    #[cfg(all(test, trames_interpreter_conformance))]
+    pub(crate) fn await_ready_job(&self, pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut q = self.queues.lock().unwrap();
+        while !q.ready.iter().any(|job| job.work.pid == pid) {
+            assert!(
+                !self.control.stopped(),
+                "cohort stopped before job publication"
+            );
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(!left.is_zero(), "job was not published");
             q = self.changed.wait_timeout(q, left).unwrap().0;
         }
     }
@@ -2715,6 +2743,23 @@ mod tests {
             assert_eq!(returned[0].worker, 3);
             assert_eq!(returned[0].pid, 7);
         }
+    }
+    #[test]
+    fn host_pause_settles_only_after_running_jobs_and_completions_return() {
+        let epoch = Epoch::new(Arc::new(Control::new(1000)));
+        epoch.add(job(1, &epoch));
+        let running = epoch.take(0).unwrap();
+        epoch.pause_host(true);
+        assert!(!epoch.host_pause_settled_for_test());
+        epoch.park(running, None);
+        assert!(epoch.host_pause_settled_for_test());
+        epoch.queues.lock().unwrap().completing += 1;
+        assert!(!epoch.host_pause_settled_for_test());
+        epoch.queues.lock().unwrap().completing -= 1;
+        assert!(epoch.host_pause_settled_for_test());
+        epoch.pause_host(false);
+        assert!(!epoch.host_pause_settled_for_test());
+        assert!(epoch.take(0).is_some());
     }
     #[test]
     fn host_pause_resume_reannounces_idle_after_ignored_paused_notification() {

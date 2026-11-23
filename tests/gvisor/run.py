@@ -212,12 +212,16 @@ def classify(xml, code, timed_out, expected):
 # These flags describe the named suites, not the worker or its other tests.
 UDP_INTERFACE_SUITES = {'socket_ipv4_udp_unbound_external_networking',
                        'socket_ipv6_udp_unbound_external_networking'}
+# Port-exhaustion tests shrink the namespace ephemeral range and leave TCP
+# TIME_WAIT state. Native Linux also fails when these cases share one process.
+SINGLE_CASE_SUITES = frozenset({'affinity', 'socket_inet_loopback_isolated', 'socket_stress', 'tuntap'})
 NATIVE_UDP_INTERFACES = Path(__file__).with_name('native-udp-interfaces.sh').resolve()
 SUITE_FIXTURES = {
     'native_udp_interfaces_sha256': UDP_INTERFACE_SUITES,
     'tun_netns_per_case': {'tuntap'},
     'host_pty_fixture': {'host_pty'},
     'isolated_loopback_per_case': {'socket_inet_loopback_isolated'},
+    'isolated_socket_stress_per_case': {'socket_stress'},
     'setgid_fixture': {'setgid'},
     'multiprocess_fixture': {'concurrency'},
     'memfd_tmpfs_fixture': {'memfd'},
@@ -298,6 +302,9 @@ def reuse_rows(args, plan):
 # These upstream cases include a deliberate wait. Allow it to finish and
 # leave time for guest startup and XML export.
 UPSTREAM_WAIT_TIMEOUTS = {
+    # Creates 1000 watched directories before a five-second epoll workload.
+    # The original case takes about 22s on the private-store guest fixture.
+    'inotify': {'Inotify.EpollNoDeadlock': 60},
     'mmap_eternal': {'MmapEternalTest.PageTableLeak': 90},
     'flock': {'FlockTest.BlockingLockNoBlockingForSharedLocks': 45},
     'ppoll': {'PpollTest.SignalMaskBlocksSignal': 45},
@@ -428,6 +435,8 @@ def trames(args, output):
         plan['setgid_fixture'] = suite_flags('setgid')
     if any(s['name'] == 'socket_inet_loopback_isolated' for s in plan['suites']):
         plan['isolated_loopback_per_case'] = True
+    if any(s['name'] == 'socket_stress' for s in plan['suites']):
+        plan['isolated_socket_stress_per_case'] = True
     if any(s['name'] == 'memfd' for s in plan['suites']):
         plan['memfd_tmpfs_fixture'] = True
     save(output/'plan.json', plan)

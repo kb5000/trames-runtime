@@ -678,6 +678,7 @@ mod tests {
     fn domain(id: u64) -> Arc<Domain> {
         Arc::new(Domain {
             id,
+            membarrier_registered: None,
             paused: AtomicBool::new(false),
             host_pause: Arc::default(),
             interrupts: Mutex::default(),
@@ -840,6 +841,7 @@ mod tests {
     #[test]
     fn pause_closes_both_preentry_orders_and_guard_withdraws_the_cpu() {
         let domain = Arc::new(Domain {
+            membarrier_registered: None,
             id: 1,
             paused: AtomicBool::new(false),
             host_pause: Arc::default(),

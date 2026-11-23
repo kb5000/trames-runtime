@@ -79,11 +79,12 @@ fn memory_observations_keep_shared_mm_cohorts_without_mapping_checkpoints() {
                     p.cpu.set_x(20 + i, value);
                 }
                 p.cpu.set_x(8, number as u64);
+                p.cpu.set_x(19, u64::MAX);
                 k.processes.insert(id as u32, p);
             }
             drop(memory);
             assert!(k
-                .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
+                .parallel_epoch(&mut trames_linux::CapturedOutput::default(), u64::MAX, true)
                 .unwrap());
             assert!(k.worker_syscalls > 0);
             assert_eq!(k.worker_syscalls, k.syscalls);
@@ -100,6 +101,10 @@ fn memory_observations_keep_shared_mm_cohorts_without_mapping_checkpoints() {
             assert_eq!(k.service_requests, 0);
             for (id, p) in k.processes.iter() {
                 assert_eq!(p.cpu.x(19), expected, "pid={id} number={number}");
+                assert!(
+                    matches!(p.state, State::Futex { .. }),
+                    "pid={id} number={number} must reach its infinite wait"
+                );
                 assert_eq!(
                     p.memory.resident_bytes(),
                     used,

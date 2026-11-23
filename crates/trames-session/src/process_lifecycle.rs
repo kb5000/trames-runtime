@@ -292,7 +292,7 @@ impl<C: Cpu> Lifecycle<C> {
             }
         };
         if checkpoint.layout_only {
-            self.release_layout_bytes(epoch, checkpoint);
+            self.release_layout_bytes(epoch, checkpoint, custody);
             return;
         }
         let groups = match self.admit_groups(&checkpoint, &mut custody, &epoch.io_target) {
@@ -357,6 +357,11 @@ impl<C: Cpu> Lifecycle<C> {
             )
         }))
         .unwrap_or(Err(RuntimeError::Arguments("lifecycle worker panicked")));
+        // All original bodies and Views have been prepared. Release structural
+        // custody before publishing those jobs to other CPUs, and before cold
+        // accounting can block. No resumed additive mmap should wait on the
+        // already-completed operation that made it runnable.
+        drop(custody);
         let began = Instant::now();
         if let Some(wait) = pending_image {
             epoch.defer_checkpoint(checkpoint, wait.signal, wait.subscriptions);
@@ -674,6 +679,59 @@ mod tests {
     use crate::workers::{Control, Event};
     use trames_cpu::Cpu;
     use trames_memory::Permissions;
+
+    #[test]
+    fn resumed_mapping_releases_custody_before_cold_accounting() {
+        let mut kernel = super::super::tests::kernel();
+        kernel
+            .processes
+            .insert(1, super::super::tests::admitted_process(&kernel));
+        kernel
+            .processes
+            .insert(4, super::super::tests::admitted_process(&kernel));
+        kernel.publish_io_tasks(None);
+        let epoch =
+            Epoch::with_events(Arc::new(Control::new(10000)), kernel.workers.events(), true);
+        epoch.bind_lifecycle(Lifecycle::capture(&kernel));
+        for (id, _, view) in kernel.prepare_parallel_views(&[(1, 0), (4, 0)]).unwrap() {
+            epoch.add(kernel.capture_worker(
+                id,
+                view,
+                &epoch.control,
+                &mut Default::default(),
+                &mut Default::default(),
+                &mut Default::default(),
+            ));
+        }
+        let mut caller = epoch.take(0).unwrap();
+        assert_eq!(caller.work.pid, 1);
+        let original = caller.work.task.as_ref().unwrap().clone();
+        let foreign = epoch.take(0).unwrap();
+        epoch.park(foreign, Some(crate::run_queue::WaitState::OwnerEvent));
+        caller.work.cpu.set_x(8, 222);
+        put_args(&mut caller.work.cpu, [0x8000, 4096, 3, 0x32, u64::MAX, 0]);
+        let lifecycle = epoch.lifecycle_for_test();
+        let accounting = lifecycle.report.lock().unwrap();
+        epoch.checkpoint(caller, SliceOutcome::Syscall { instructions: 0 });
+        let worker_epoch = epoch.clone();
+        let worker = std::thread::spawn(move || worker_epoch.take(0));
+        epoch.await_ready_job(1);
+        // The original handler is now held at its cold accounting lock, after
+        // publishing the resumed job. Another executor must already be able
+        // to acquire that task and mm for the next additive mapping syscall.
+        let admitted = matches!(
+            tasks::admit_one(&original, 1, &epoch.io_target),
+            Ok(Some(_))
+        );
+        epoch.stop();
+        drop(accounting);
+        assert!(worker.join().unwrap().is_none());
+        assert!(
+            admitted,
+            "published mapping job still waits on completed scope custody"
+        );
+        assert_eq!(epoch.drain().len(), 2);
+    }
 
     #[test]
     fn disk_image_wait_retains_accepted_files_and_frees_the_only_slot() {

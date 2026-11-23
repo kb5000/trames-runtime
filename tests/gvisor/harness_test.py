@@ -29,6 +29,8 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(watchdog(args, 'vfork', 'VforkTest.ParentStopsUntilChildExecves'), 40)
         self.assertEqual(watchdog(args, 'flock', 'FlockTest.BlockingLockNoBlockingForSharedLocks'), 45)
         self.assertEqual(watchdog(args, 'flock', 'FlockTest.Basic'), 20)
+        self.assertEqual(watchdog(args, 'inotify', 'Inotify.EpollNoDeadlock'), 60)
+        self.assertEqual(watchdog(args, 'inotify', 'Inotify.Basic'), 20)
         self.assertEqual(watchdog(args, 'sigstop', 'SigstopTest.Correctness'), 45)
         self.assertEqual(watchdog(args, 'itimer', 'ItimerTest.DeliversSIGPROFToThreadsRoughlyFairlyIdle'), 220)
         args.timeout = 7
@@ -37,6 +39,8 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(watchdog(args, 'vfork', 'VforkTest.SigchldReceivedDuringVforkIsDelivered'), 20)
         args.suite_timeouts['ppoll'] = 15
         self.assertEqual(watchdog(args, 'ppoll', 'PpollTest.SignalMaskBlocksSignal'), 15)
+        args.suite_timeouts['inotify'] = 12
+        self.assertEqual(watchdog(args, 'inotify', 'Inotify.EpollNoDeadlock'), 12)
     def test_mixed_results_need_matching_xml_and_exit(self):
         path=self.xml('<testcase classname="T" name="Pass" time="0.01"/><testcase classname="T" name="Fail"><failure message="original assertion"/></testcase><testcase classname="T" name="Skip"><skipped message="upstream gate"/></testcase>')
         rows=xml_rows(path,1,['T.Pass','T.Fail','T.Skip'])
@@ -121,6 +125,11 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(calls, [['T.A', 'T.B'], ['T.A'], ['T.B']])
         self.assertEqual([(row['case'], row['status']) for row in rows], [('T.A', 'passed'), ('T.B', 'passed')])
         self.assertTrue(all(row['code'] == 0 and row['chunk_cases'] == 1 for row in rows))
+        calls.clear()
+        with patch('interpreter_chunks.execute', side_effect=execute_chunk):
+            rows = run(args, output, [dict(name='socket_stress', cases=['T.A', 'T.B'])], ['runner'], seed)
+        self.assertEqual(calls, [['T.A'], ['T.B']], 'port-exhaustion cases must start isolated')
+        self.assertEqual([row['status'] for row in rows], ['passed', 'passed'])
     def test_child_noise_does_not_extend_the_active_case(self):
         path=self.root/'stdout';path.write_text('[ RUN      ] T.Parent\n')
         progress=Progress(path,['T.Parent'],lambda _:5);progress.remaining();since=progress.since
