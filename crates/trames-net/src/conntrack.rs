@@ -199,6 +199,13 @@ pub(crate) struct State {
     index: BTreeMap<(u16, Key), (u64, bool)>,
 }
 impl State {
+    pub fn original_destination(&self, key: Key) -> Option<SocketAddr> {
+        let (id, _) = self.index.get(&(0, key))?;
+        let entry = self.entries.get(id)?;
+        (entry.expires > Instant::now() && entry.track.status & 8 != 0)
+            .then_some(entry.track.original.tuple.destination)
+    }
+
     fn remove(&mut self, id: u64) {
         self.entries.remove(&id);
         self.index.retain(|_, v| v.0 != id);

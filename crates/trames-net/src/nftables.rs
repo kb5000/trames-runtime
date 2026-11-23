@@ -118,11 +118,15 @@ fn number(out: &mut Vec<u8>, k: u16, v: u32) {
 fn integer(out: &mut Vec<u8>, k: u16, v: u64) {
     attr(out, k, &v.to_be_bytes());
 }
+#[path = "legacy_tables.rs"]
+pub mod legacy;
+
 #[derive(Clone)]
 pub(crate) struct Ruleset {
     generation: u32,
     next: u64,
     active_hooks: u8,
+    legacy: legacy::Tables,
     tables: BTreeMap<(u8, String), Table>,
 }
 impl Default for Ruleset {
@@ -131,6 +135,7 @@ impl Default for Ruleset {
             generation: 1,
             next: 0,
             active_hooks: 0,
+            legacy: Default::default(),
             tables: BTreeMap::new(),
         }
     }
@@ -391,6 +396,142 @@ pub fn xt_revision(family: u8, name: &str, revision: u32, target: bool) -> Resul
         Err(NetError(93))
     }
 }
+fn xt_match_expression(rule_family: u8, kind: &str, revision: u32, b: &[u8]) -> Result<Expr> {
+    Ok(if kind == "mark" {
+        xt_revision(rule_family, kind, revision, false).map_err(|_| NetError(2))?;
+        xt_match::check_size(b, 12)?;
+        Expr::MarkMatch {
+            value: u32::from_ne_bytes(b[..4].try_into().unwrap()),
+            mask: u32::from_ne_bytes(b[4..8].try_into().unwrap()),
+            invert: b[8],
+        }
+    } else if kind == "comment" {
+        if revision != 0 {
+            return Err(NetError(2));
+        }
+        if b.len() != 256 {
+            return Err(NetError(22));
+        }
+        Expr::Comment
+    } else if kind == "conntrack" {
+        let size = xt_match::conntrack_size(revision)?;
+        xt_match::check_size(b, size)?;
+        Expr::ConntrackMatch {
+            revision,
+            info: b.to_vec(),
+        }
+    } else if let Some(proto) = xt_match::protocol(kind, rule_family) {
+        if revision != 0 {
+            return Err(NetError(2));
+        }
+        Expr::TransportMatch(xt_match::Transport::parse(proto, b)?)
+    } else {
+        if kind != "addrtype" || revision > 1 || revision == 0 && rule_family != 2 {
+            return Err(NetError(2));
+        }
+        if (revision == 0 && !matches!(b.len(), 12 | 16)) || (revision == 1 && b.len() != 8) {
+            return Err(NetError(22));
+        }
+        let source = u16::from_le_bytes(b[..2].try_into().unwrap());
+        let destination = u16::from_le_bytes(b[2..4].try_into().unwrap());
+        let word = u32::from_le_bytes(b[4..8].try_into().unwrap());
+        let flags = if revision == 0 {
+            u32::from(word != 0) | (u32::from(b[8..12] != [0; 4]) << 1)
+        } else {
+            word
+        };
+        if flags & 12 == 12 {
+            return Err(NetError(22));
+        }
+        if flags & !15 != 0 || (source | destination) & !0x2e != 0 {
+            return Err(NetError(95));
+        }
+        Expr::AddrType {
+            source,
+            destination,
+            flags,
+        }
+    })
+}
+
+fn xt_target_expression(rule_family: u8, kind: &str, revision: u32, b: &[u8]) -> Result<Expr> {
+    Ok(if kind == "MARK" {
+        xt_revision(rule_family, kind, revision, true).map_err(|_| NetError(2))?;
+        xt_match::check_size(b, 8)?;
+        Expr::MarkTarget {
+            value: u32::from_ne_bytes(b[..4].try_into().unwrap()),
+            mask: u32::from_ne_bytes(b[4..8].try_into().unwrap()),
+        }
+    } else if kind == "CT" {
+        if revision > 1
+            || b.len() != if revision == 0 { 40 } else { 72 }
+            || b[..2] != [0, 0]
+            || b[4..].iter().any(|b| *b != 0)
+        {
+            return Err(NetError(95));
+        }
+        Expr::Zone(u16::from_le_bytes(b[2..4].try_into().unwrap()))
+    } else {
+        let nat = FixedNatKind::named(kind).ok_or(NetError(2))?;
+        xt_revision(rule_family, kind, revision, true).map_err(|_| NetError(2))?;
+        let legacy = revision == 0 && rule_family == 2;
+        let size = if legacy {
+            20usize
+        } else if revision == 2 {
+            44
+        } else {
+            40
+        };
+        if b.len() != size && b.len() != size.next_multiple_of(8) {
+            return Err(NetError(22));
+        }
+        let word = |at| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+        if legacy && word(0) != 1 {
+            return Err(NetError(22));
+        }
+        let flags = word(if legacy { 4 } else { 0 });
+        if matches!(nat, FixedNatKind::Masquerade | FixedNatKind::Redirect) && flags & 1 != 0 {
+            return Err(NetError(22));
+        }
+        if flags & !3 != 0 {
+            return Err(NetError(95));
+        }
+        let addresses = if flags & 1 == 0 {
+            None
+        } else {
+            let address = |at: usize| -> std::net::IpAddr {
+                if rule_family == 2 {
+                    std::net::Ipv4Addr::from(<[u8; 4]>::try_from(&b[at..at + 4]).unwrap()).into()
+                } else {
+                    std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&b[at..at + 16]).unwrap()).into()
+                }
+            };
+            let (start, end) = if legacy { (8, 12) } else { (4, 20) };
+            let range = (address(start), address(end));
+            if range.0 > range.1 {
+                return Err(NetError(22));
+            }
+            Some(range)
+        };
+        let ports = if flags & 2 == 0 {
+            None
+        } else {
+            let at = if legacy { 16 } else { 36 };
+            let low = u16::from_be_bytes(b[at..at + 2].try_into().unwrap());
+            let high = u16::from_be_bytes(b[at + 2..at + 4].try_into().unwrap());
+            if low > high {
+                return Err(NetError(22));
+            }
+            Some((low, high))
+        };
+        Expr::FixedNat {
+            kind: nat,
+            addresses,
+            ports,
+        }
+    })
+}
+
 fn expressions_in(
     bytes: &[u8],
     rule_family: u8,
@@ -618,155 +759,11 @@ fn expressions_in(
             }
             "match" => {
                 let a = fields(data, &[1, 2, 3])?;
-                let kind = name(&a, 1)?;
-                let revision = num(&a, 2)?;
-                let b = need(&a, 3)?;
-                if kind == "mark" {
-                    xt_revision(rule_family, &kind, revision, false).map_err(|_| NetError(2))?;
-                    xt_match::check_size(b, 12)?;
-                    Expr::MarkMatch {
-                        value: u32::from_ne_bytes(b[..4].try_into().unwrap()),
-                        mask: u32::from_ne_bytes(b[4..8].try_into().unwrap()),
-                        invert: b[8],
-                    }
-                } else if kind == "comment" {
-                    if revision != 0 {
-                        return Err(NetError(2));
-                    }
-                    if b.len() != 256 {
-                        return Err(NetError(22));
-                    }
-                    Expr::Comment
-                } else if kind == "conntrack" {
-                    let size = xt_match::conntrack_size(revision)?;
-                    xt_match::check_size(b, size)?;
-                    Expr::ConntrackMatch {
-                        revision,
-                        info: b.to_vec(),
-                    }
-                } else if let Some(proto) = xt_match::protocol(&kind, rule_family) {
-                    if revision != 0 {
-                        return Err(NetError(2));
-                    }
-                    Expr::TransportMatch(xt_match::Transport::parse(proto, b)?)
-                } else {
-                    if kind != "addrtype" || revision > 1 || revision == 0 && rule_family != 2 {
-                        return Err(NetError(2));
-                    }
-                    if (revision == 0 && !matches!(b.len(), 12 | 16))
-                        || (revision == 1 && b.len() != 8)
-                    {
-                        return Err(NetError(22));
-                    }
-                    let source = u16::from_le_bytes(b[..2].try_into().unwrap());
-                    let destination = u16::from_le_bytes(b[2..4].try_into().unwrap());
-                    let word = u32::from_le_bytes(b[4..8].try_into().unwrap());
-                    let flags = if revision == 0 {
-                        u32::from(word != 0) | (u32::from(b[8..12] != [0; 4]) << 1)
-                    } else {
-                        word
-                    };
-                    if flags & 12 == 12 {
-                        return Err(NetError(22));
-                    }
-                    if flags & !15 != 0 || (source | destination) & !0x2e != 0 {
-                        return Err(NetError(95));
-                    }
-                    Expr::AddrType {
-                        source,
-                        destination,
-                        flags,
-                    }
-                }
+                xt_match_expression(rule_family, &name(&a, 1)?, num(&a, 2)?, need(&a, 3)?)?
             }
             "target" => {
                 let a = fields(data, &[1, 2, 3])?;
-                let kind = name(&a, 1)?;
-                let revision = num(&a, 2)?;
-                let b = need(&a, 3)?;
-                if kind == "MARK" {
-                    xt_revision(rule_family, &kind, revision, true).map_err(|_| NetError(2))?;
-                    xt_match::check_size(b, 8)?;
-                    Expr::MarkTarget {
-                        value: u32::from_ne_bytes(b[..4].try_into().unwrap()),
-                        mask: u32::from_ne_bytes(b[4..8].try_into().unwrap()),
-                    }
-                } else if kind == "CT" {
-                    if revision > 1
-                        || b.len() != if revision == 0 { 40 } else { 72 }
-                        || b[..2] != [0, 0]
-                        || b[4..].iter().any(|b| *b != 0)
-                    {
-                        return Err(NetError(95));
-                    }
-                    Expr::Zone(u16::from_le_bytes(b[2..4].try_into().unwrap()))
-                } else {
-                    let nat = FixedNatKind::named(&kind).ok_or(NetError(2))?;
-                    xt_revision(rule_family, &kind, revision, true).map_err(|_| NetError(2))?;
-                    let legacy = revision == 0 && rule_family == 2;
-                    let size = if legacy {
-                        20usize
-                    } else if revision == 2 {
-                        44
-                    } else {
-                        40
-                    };
-                    if b.len() != size && b.len() != size.next_multiple_of(8) {
-                        return Err(NetError(22));
-                    }
-                    let word = |at| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
-                    if legacy && word(0) != 1 {
-                        return Err(NetError(22));
-                    }
-                    let flags = word(if legacy { 4 } else { 0 });
-                    if matches!(nat, FixedNatKind::Masquerade | FixedNatKind::Redirect)
-                        && flags & 1 != 0
-                    {
-                        return Err(NetError(22));
-                    }
-                    if flags & !3 != 0 {
-                        return Err(NetError(95));
-                    }
-                    let addresses = if flags & 1 == 0 {
-                        None
-                    } else {
-                        let address = |at: usize| -> std::net::IpAddr {
-                            if rule_family == 2 {
-                                std::net::Ipv4Addr::from(
-                                    <[u8; 4]>::try_from(&b[at..at + 4]).unwrap(),
-                                )
-                                .into()
-                            } else {
-                                std::net::Ipv6Addr::from(
-                                    <[u8; 16]>::try_from(&b[at..at + 16]).unwrap(),
-                                )
-                                .into()
-                            }
-                        };
-                        let (start, end) = if legacy { (8, 12) } else { (4, 20) };
-                        let range = (address(start), address(end));
-                        if range.0 > range.1 {
-                            return Err(NetError(22));
-                        }
-                        Some(range)
-                    };
-                    let ports = if flags & 2 == 0 {
-                        None
-                    } else {
-                        let at = if legacy { 16 } else { 36 };
-                        let low = u16::from_be_bytes(b[at..at + 2].try_into().unwrap());
-                        let high = u16::from_be_bytes(b[at + 2..at + 4].try_into().unwrap());
-                        if low > high {
-                            return Err(NetError(22));
-                        }
-                        Some((low, high))
-                    };
-                    Expr::FixedNat {
-                        kind: nat,
-                        addresses,
-                        ports,
-                    }
-                }
+                xt_target_expression(rule_family, &name(&a, 1)?, num(&a, 2)?, need(&a, 3)?)?
             }
             "nat" | "masq" => {
                 let kind = name(&a, 1)?;
@@ -2178,6 +2175,41 @@ pub(crate) struct Hook<'a> {
     pub output: u32,
     pub raw: bool,
 }
+enum HookChain<'a> {
+    Nft(&'a Table, &'a str, &'a Chain),
+    Legacy(legacy::Name, &'a legacy::LegacyTable),
+}
+impl HookChain<'_> {
+    fn is_nat(&self) -> bool {
+        match self {
+            Self::Nft(_, _, chain) => chain.chain_type == "nat",
+            Self::Legacy(name, _) => *name == legacy::Name::Nat,
+        }
+    }
+
+    fn reroutes(&self, hook: u32) -> bool {
+        match self {
+            Self::Nft(_, _, chain) => chain.chain_type == "route",
+            Self::Legacy(name, _) => *name == legacy::Name::Mangle && hook == 3,
+        }
+    }
+
+    fn accepts(&self, ctx: &mut Context<'_>, effects: &mut Effects) -> bool {
+        match self {
+            Self::Nft(table, name, chain) => match table.verdict(name, ctx, &mut 8192, effects) {
+                0 => false,
+                verdict if verdict < 0 => {
+                    if let Some(counters) = &chain.counters {
+                        counters.record(ctx.packet.len());
+                    }
+                    chain.policy != 0
+                }
+                _ => true,
+            },
+            Self::Legacy(_, table) => table.evaluate(ctx, effects),
+        }
+    }
+}
 impl Ruleset {
     pub fn process(
         &self,
@@ -2209,22 +2241,29 @@ impl Ruleset {
                         } else {
                             p
                         };
-                        chains.push((stage, p, t, n, c));
+                        chains.push((stage, p, HookChain::Nft(t, n, c)));
                     }
                 }
+            }
+        }
+        for (name, table) in self.legacy.at_hook(family, meta.hook) {
+            let priority = name.priority(nat_priority);
+            if (priority < -200) == meta.raw {
+                chains.push((priority, priority, HookChain::Legacy(name, table)));
             }
         }
         chains.sort_by_key(|v| (v.0, v.1));
         let nat_stage = matches!(meta.hook, 0 | 1 | 3 | 4) && !meta.raw;
         let mut applied = false;
-        for (priority, _, t, n, c) in chains {
+        for (priority, _, chain) in chains {
             if nat_stage && !applied && priority >= nat_priority {
                 if !conn.existing_nat(track, packet, source) {
                     return false;
                 }
                 applied = true;
             }
-            if c.chain_type == "nat"
+            let is_nat = chain.is_nat();
+            if is_nat
                 && (track.reply
                     || if source {
                         track.snat_done
@@ -2267,22 +2306,15 @@ impl Ruleset {
             };
             // Only a route-type OUTPUT chain requests a fresh route after a mark
             // or routing header change. Filter-chain marks remain visible to later hooks.
-            let before_route = (c.chain_type == "route").then(|| route_fields(ctx.packet, family));
+            let before_route = chain
+                .reroutes(meta.hook)
+                .then(|| route_fields(ctx.packet, family));
             let chain_mark = ctx.mark;
             let mut effects = Effects::default();
-            let v = t.verdict(n, &mut ctx, &mut 8192, &mut effects);
-            *mark = ctx.mark;
-            if v == 0 {
+            if !chain.accepts(&mut ctx, &mut effects) {
                 return false;
             }
-            if v < 0 {
-                if let Some(counts) = &c.counters {
-                    counts.record(packet.len());
-                }
-                if c.policy == 0 {
-                    return false;
-                }
-            }
+            *mark = ctx.mark;
             if before_route
                 .is_some_and(|before| chain_mark != *mark || route_fields(packet, family) != before)
             {
@@ -2315,9 +2347,7 @@ impl Ruleset {
                 track.mark = mark;
             }
             if let Some(nat) = effects.nat {
-                if c.chain_type != "nat"
-                    || !conn.nat(track, packet, nat.source, nat.address, nat.ports)
-                {
+                if !is_nat || !conn.nat(track, packet, nat.source, nat.address, nat.ports) {
                     return false;
                 }
                 if nat.source {
@@ -2741,7 +2771,7 @@ impl Ruleset {
             .filter(|t| !t.dormant)
             .flat_map(|t| t.chains.values())
             .filter_map(|c| c.hook)
-            .fold(0, |mask, (h, _)| mask | (1 << h));
+            .fold(self.legacy.active(), |mask, (h, _)| mask | (1 << h));
     }
     pub fn has_rules(&self) -> bool {
         self.active_hooks != 0

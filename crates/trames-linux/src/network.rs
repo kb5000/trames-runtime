@@ -12,11 +12,13 @@ type Result<T> = std::result::Result<T, Errno>;
 pub(crate) mod data;
 pub(crate) mod local;
 pub(crate) mod unix;
+mod xtables;
 pub(super) fn control_number(number: u32) -> bool {
     matches!(number, 200..=205 | 208..=210 | 242)
 }
 pub(super) fn control_publishes(number: u32, a: [u64; 6]) -> bool {
-    matches!(number, 200 | 201 | 203 | 208 | 210)
+    matches!(number, 200 | 201 | 203 | 210)
+        || number == 208 && !xtables::handles(number, a)
         || number == 209 && (a[1] as u32, a[2] as u32) == (1, 4)
 }
 /// Identical socket control ABI for owner and executing-worker dispatch.
@@ -29,6 +31,9 @@ pub(super) fn control(
 ) -> Option<Result<u64>> {
     if !control_number(number) {
         return None;
+    }
+    if xtables::handles(number, a) {
+        return Some(xtables::control(factory, socket, number, a, memory));
     }
     Some((|| match number {
         200 | 203 => {

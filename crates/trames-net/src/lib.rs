@@ -10,7 +10,7 @@ mod native;
 mod netdev;
 mod netlink;
 mod nftables;
-pub use nftables::xt_revision;
+pub use nftables::{legacy as xtables_abi, xt_revision};
 mod packet_ring;
 mod packet_socket;
 mod protocol;
@@ -153,6 +153,11 @@ impl Default for Network {
     }
 }
 impl Network {
+    pub fn xtables_names(&self, family: u8) -> Vec<u8> {
+        let firewall = self.1.graph.read().unwrap().firewall(self.namespace_id());
+        firewall.legacy_names(family)
+    }
+
     pub fn ip_sysctl(&self, knob: IpSysctl) -> i32 {
         self.1.ip_settings.get(knob)
     }
@@ -685,6 +690,75 @@ impl Drop for Socket {
     }
 }
 impl Socket {
+    fn firewall(&self) -> Arc<nftables::Firewall> {
+        self.namespace
+            .graph
+            .read()
+            .unwrap()
+            .firewall(self.namespace.id())
+    }
+
+    pub fn xtables_get(
+        &self,
+        family: u8,
+        option: u32,
+        header: &[u8],
+        len: usize,
+    ) -> Result<Vec<u8>> {
+        self.firewall().legacy_get(family, option, header, len)
+    }
+
+    pub fn xtables_replace(
+        &self,
+        family: u8,
+        image: &[u8],
+        counters: impl FnOnce(u64, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        self.firewall().legacy_replace(family, image, counters)
+    }
+
+    pub fn xtables_add_counters(&self, family: u8, bytes: &[u8]) -> Result<()> {
+        self.firewall().legacy_add_counters(family, bytes)
+    }
+
+    pub fn original_destination(&self, family: u8) -> Result<SocketAddr> {
+        let info = self.info().ok_or(NetError(92))?;
+        if !matches!(info.protocol, 6 | 132) && (info.kind != 1 || info.protocol != 0) {
+            return Err(NetError(92));
+        }
+        let address = |address: Option<SocketAddr>| {
+            let address = address.ok_or(NetError(2))?;
+            match (family, address) {
+                (2, SocketAddr::V4(_)) | (10, SocketAddr::V6(_)) => Ok(address),
+                (2, SocketAddr::V6(v6)) => v6
+                    .ip()
+                    .to_ipv4_mapped()
+                    .map(|ip| (ip, v6.port()).into())
+                    .ok_or(NetError(2)),
+                _ => Err(NetError(2)),
+            }
+        };
+        let key = conntrack::Key {
+            protocol: if info.protocol == 132 { 132 } else { 6 },
+            tuple: virtualnet::packet::Tuple {
+                source: address(info.local)?,
+                destination: address(info.peer)?,
+            },
+        };
+        let connections = self
+            .namespace
+            .graph
+            .read()
+            .unwrap()
+            .connections(self.namespace.id());
+        let result = connections
+            .lock()
+            .unwrap()
+            .original_destination(key)
+            .ok_or(NetError(2));
+        result
+    }
+
     /// Called once for a fresh file description, including accepted sockets.
     pub fn publish_inode(self: &Arc<Self>, id: u64, owner: (u32, u32)) {
         self.initialize_inode_owner(owner.0, owner.1);

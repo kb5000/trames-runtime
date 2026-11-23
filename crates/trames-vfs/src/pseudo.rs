@@ -2521,6 +2521,14 @@ impl Vfs {
                         .map(|ns| ns.network.borrow().clone());
                     let info = network.as_ref().and_then(|n| n.info());
                     return Ok(match parts[i + 1] {
+                        name @ (b"ip_tables_names" | b"ip6_tables_names") => {
+                            let family = if name == b"ip_tables_names" { 2 } else { 10 };
+                            regular(
+                                network
+                                    .as_ref()
+                                    .map_or_else(Vec::new, |n| n.xtables_names(family)),
+                            )
+                        }
                         name @ (b"snmp" | b"netstat") => {
                             proc_inet::transport_statistics(network.as_ref(), name)
                                 .and_then(regular)
@@ -3247,8 +3255,20 @@ impl Vfs {
                         }
                         names.extend(
                             [
-                                "route", "if_inet6", "dev", "tcp", "tcp6", "udp", "udp6", "raw",
-                                "raw6", "icmp", "icmp6", "unix",
+                                "route",
+                                "if_inet6",
+                                "dev",
+                                "tcp",
+                                "tcp6",
+                                "udp",
+                                "udp6",
+                                "raw",
+                                "raw6",
+                                "icmp",
+                                "icmp6",
+                                "unix",
+                                "ip_tables_names",
+                                "ip6_tables_names",
                             ]
                             .iter()
                             .map(|s| s.as_bytes().to_vec()),
