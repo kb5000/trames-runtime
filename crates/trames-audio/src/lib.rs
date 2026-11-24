@@ -13,7 +13,23 @@ pub const PROFILE: u64 = 0x0001_0008;
 pub const AUXV_KEY: u64 = 0x5452_000a;
 pub const CAPS_KEY: u64 = 0x5452_000b;
 pub const OPEN: u64 = 1;
-pub type Notify = Arc<dyn Fn() + Send + Sync>;
+/// Retained original notification endpoint, independent of descriptor numbers.
+pub trait Notification: Send + Sync {
+    fn notify(&self);
+    /// FD-driven producers attach only when the consumer actually waits.
+    fn register(
+        &self,
+        _source: std::sync::Weak<dyn trames_shared::ReadinessDriver>,
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::from_raw_os_error(95))
+    }
+}
+impl<F: Fn() + Send + Sync> Notification for F {
+    fn notify(&self) {
+        self()
+    }
+}
+pub type Notify = Arc<dyn Notification>;
 struct Stream {
     native: native::Stream,
     scratch: Vec<u8>,
@@ -88,21 +104,26 @@ impl Context {
             let Some(notify) = notify else {
                 return Ok((-22i64) as u64);
             };
-            let native = match native::Stream::new(&a, notify) {
+            #[allow(unused_mut)]
+            let mut native = match native::Stream::new(&a, notify) {
                 Ok(s) => s,
                 Err(e) => return Ok(e as u64),
             };
             let id = self.0.ids.fetch_add(1, Ordering::Relaxed) + 1;
-            let stream = Stream {
-                native,
-                scratch: vec![0; 65536],
-                frame_bytes: a[3] as usize * if a[4] == 0 { 2 } else { 4 },
-            };
-            self.0
-                .streams
-                .lock()
-                .unwrap()
-                .insert(id, Arc::new(Mutex::new(stream)));
+            let stream = Arc::new_cyclic(|_owner| {
+                #[cfg(target_os = "linux")]
+                native.bind_owner(_owner.clone());
+                Mutex::new(Stream {
+                    native,
+                    scratch: vec![0; 65536],
+                    frame_bytes: a[3] as usize * if a[4] == 0 { 2 } else { 4 },
+                })
+            });
+            #[cfg(target_os = "linux")]
+            if let Err(error) = stream.lock().unwrap().native.register() {
+                return Ok(error as u64);
+            }
+            self.0.streams.lock().unwrap().insert(id, stream);
             return Ok(id);
         }
         if op == 2 {
@@ -145,7 +166,10 @@ impl Context {
                 }
             }
             7 => {
-                let stats = stream.native.status();
+                let stats = match stream.native.status() {
+                    Ok(stats) => stats,
+                    Err(error) => return Ok(error as u64),
+                };
                 let mut bytes = [0; 64];
                 for (dst, n) in bytes.chunks_exact_mut(8).zip(stats) {
                     dst.copy_from_slice(&n.to_le_bytes());
@@ -195,3 +219,6 @@ mod tests {
         assert!(context.invoke(&mut memory, 0, 0x9000, 128, None).is_err());
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests;

@@ -10,6 +10,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install native PCM test headers (Linux only)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y libasound2-dev
+      - name: Compile ALSA ABI oracle
+        if: runner.os == 'Linux'
+        run: python3 scripts/check-alsa-abi.py
       - run: rustup show
       - run: python3 scripts/check-execution-boundaries.py
       - run: python3 scripts/build-guest-cli.py

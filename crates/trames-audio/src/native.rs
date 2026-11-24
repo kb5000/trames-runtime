@@ -19,7 +19,7 @@ mod apple {
     }
     unsafe extern "C" fn wake(data: *mut c_void) {
         // SAFETY: the native lease retains this box through the final callback.
-        unsafe { (&*data.cast::<Notify>())() };
+        unsafe { (&*data.cast::<Notify>()).notify() };
     }
     unsafe extern "C" fn release(data: *mut c_void) {
         // SAFETY: the final native callback lease releases this box exactly once.
@@ -64,10 +64,10 @@ mod apple {
         pub fn control(&mut self, op: u64) -> i64 {
             unsafe { trames_audio_control(self.pointer, op) }
         }
-        pub fn status(&self) -> [u64; 8] {
+        pub fn status(&self) -> Result<[u64; 8], i64> {
             let mut a = [0; 8];
             unsafe { trames_audio_status(self.pointer, a.as_mut_ptr()) };
-            a
+            Ok(a)
         }
     }
     impl Drop for Stream {
@@ -87,9 +87,9 @@ mod apple {
 }
 #[cfg(target_vendor = "apple")]
 pub use apple::*;
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
 pub struct Stream;
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
 impl Stream {
     pub fn new(_: &[u64; 16], _: Notify) -> Result<Self, i64> {
         Err(-95)
@@ -103,7 +103,13 @@ impl Stream {
     pub fn control(&mut self, _: u64) -> i64 {
         -95
     }
-    pub fn status(&self) -> [u64; 8] {
-        [0; 8]
+    pub fn status(&self) -> Result<[u64; 8], i64> {
+        Err(-95)
     }
 }
+
+#[cfg(target_os = "linux")]
+#[path = "linux.rs"]
+mod linux;
+#[cfg(target_os = "linux")]
+pub use linux::Stream;

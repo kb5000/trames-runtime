@@ -21,6 +21,20 @@ impl Drop for NativeWriter {
     }
 }
 impl NativeEvent {
+    /// Retain only a weak native producer: the stream owns its descriptors and
+    /// unregisters before native close. Already parked readers reattach on wake.
+    pub fn attach_source(&self, source: std::sync::Weak<dyn trames_shared::ReadinessDriver>) {
+        let sources = self
+            .0
+            .counter
+            .native_sources
+            .get_or_init(|| Box::new(Mutex::new(Vec::new())));
+        let mut sources = sources.lock().unwrap();
+        sources.retain(|s| s.strong_count() != 0);
+        sources.push(source);
+        drop(sources);
+        self.0.counter.readiness.notify_atomic();
+    }
     pub fn notify(&self) {
         // Saturation already leaves the level-triggered descriptor readable.
         let _ = self.0.counter.write(&1u64.to_le_bytes());
@@ -31,7 +45,10 @@ impl NativeEvent {
     }
 }
 
+type NativeSources = Mutex<Vec<std::sync::Weak<dyn trames_shared::ReadinessDriver>>>;
 pub(super) struct EventCounter {
+    // No allocation for ordinary eventfds, GPU or callback-only producers.
+    native_sources: std::sync::OnceLock<Box<NativeSources>>,
     count: AtomicU64,
     native_writers: AtomicU64,
     semaphore: bool,
@@ -43,15 +60,33 @@ impl trames_shared::ReadinessDriver for EventCounter {
         self.native_writers.load(Ordering::Relaxed) != 0
     }
     fn notification_only(&self) -> bool {
-        true
+        self.native_sources.get().is_none_or(|sources| {
+            sources
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|s| s.strong_count() == 0)
+        })
     }
-    fn attach(&self, _: Arc<HostEvents>) -> std::io::Result<()> {
+    fn attach(&self, events: Arc<HostEvents>) -> std::io::Result<()> {
+        if let Some(sources) = self.native_sources.get() {
+            let producers: Vec<_> = sources
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .collect();
+            for producer in producers {
+                producer.attach(events.clone())?;
+            }
+        }
         Ok(())
     }
 }
 impl EventCounter {
     pub(super) fn new(count: u64, semaphore: bool) -> Self {
         Self {
+            native_sources: Default::default(),
             count: AtomicU64::new(count),
             native_writers: AtomicU64::new(0),
             semaphore,

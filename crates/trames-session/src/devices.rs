@@ -12,13 +12,28 @@ fn notification(
     events: Option<&NativeEvents>,
     memory: &impl CpuMemory,
     address: u64,
-) -> Result<Option<trames_audio::Notify>, MemoryError> {
+) -> Result<Option<std::sync::Arc<dyn Fn() + Send + Sync>>, MemoryError> {
     // Preserve the original FD lookup before reading the rest of the record.
     let fd = memory.read_u64(address)?;
     Ok(u32::try_from(fd)
         .ok()
         .and_then(|fd| events?.event(fd).ok())
-        .map(|event| std::sync::Arc::new(move || event.notify()) as trames_audio::Notify))
+        .map(|event| {
+            std::sync::Arc::new(move || event.notify()) as std::sync::Arc<dyn Fn() + Send + Sync>
+        }))
+}
+struct AudioNotification(trames_vfs::NativeEvent);
+impl trames_audio::Notification for AudioNotification {
+    fn notify(&self) {
+        self.0.notify()
+    }
+    fn register(
+        &self,
+        source: std::sync::Weak<dyn trames_shared::ReadinessDriver>,
+    ) -> std::io::Result<()> {
+        self.0.attach_source(source);
+        Ok(())
+    }
 }
 pub(super) fn audio(
     context: &trames_audio::Context,
@@ -29,10 +44,11 @@ pub(super) fn audio(
     size: u64,
 ) -> Result<u64, MemoryError> {
     let notify = if op == trames_audio::OPEN && size == 128 {
-        let Some(notify) = notification(events, memory, address)? else {
+        let fd = memory.read_u64(address)?;
+        let Some(event) = u32::try_from(fd).ok().and_then(|fd| events?.event(fd).ok()) else {
             return Ok((-22i64) as u64);
         };
-        Some(notify)
+        Some(std::sync::Arc::new(AudioNotification(event)) as trames_audio::Notify)
     } else {
         None
     };
