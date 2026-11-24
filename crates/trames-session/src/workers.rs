@@ -14,8 +14,6 @@ use std::{
 };
 use trames_engine::{Cpu, DecodeStats, SliceOutcome};
 use trames_memory::parallel::View;
-#[cfg(all(test, trames_interpreter_conformance))]
-use trames_memory::CpuMemory;
 
 /// Local interpreter polls, not scheduler quanta. Completing one of these does
 /// not send a message, wait for peers, or give up the CPU or memory view.
@@ -575,6 +573,8 @@ impl<C: Cpu> Starter<C> {
                     }
                     let cpu_share = work.syscalls.as_ref().and_then(|s| s.io_signals.cgroup()).and_then(trames_vfs::CgroupTask::cpu_share);
                     let _memory_scope = work.syscalls.as_ref().and_then(|snapshot| snapshot.io_signals.cgroup()).map(trames_vfs::CgroupTask::memory_scope);
+                    let _file_actor = work.syscalls.as_ref().map(|snapshot| trames_vfs::FileActorScope::enter(
+                        snapshot.io_signals.credentials().clone(), snapshot.io_signals.tid()));
                     let began = Instant::now();
                     if let Some(snapshot)=&work.syscalls {snapshot.io_signals.proc_view.begin_accounting(began,index);}
                     let mut instructions = 0;
@@ -669,7 +669,7 @@ impl<C: Cpu> Starter<C> {
                                 if let Some((sig, shared, action)) = snapshot.next_io_signal() {
                                     let disposition = trames_kernel::signal::disposition(sig, action);
                                     let namespace_init = snapshot.io_routes.namespace.is_nested() && snapshot.identities[0] == 1;
-                                    let stop_held=matches!(&job.waiting,Some(crate::run_queue::WaitState::Namespace(_) | crate::run_queue::WaitState::Policy(_) | crate::run_queue::WaitState::Barrier(_))) || matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.hardware_wait.as_ref().is_some_and(|w|!w.ready())
+                                    let stop_held=matches!(&job.waiting,Some(crate::run_queue::WaitState::Namespace(_) | crate::run_queue::WaitState::Policy(_) | crate::run_queue::WaitState::Barrier(_) | crate::run_queue::WaitState::Page(_))) || matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.hardware_wait.as_ref().is_some_and(|w|!w.ready())
                                         || job.gpu_pending.as_ref().is_some_and(|g|g.compile.is_some())
                                         || job.io.as_ref().is_some_and(|io|matches!(io.number,2|270|271) || io.file_pending().is_some_and(|f|!f.interruptible()))
                                         || job.retry.as_ref().is_some_and(|io|io.number==2 || io.file_checkpoint.is_some() || io.file.as_ref().is_some_and(|f|!f.interruptible()));
@@ -696,7 +696,7 @@ impl<C: Cpu> Starter<C> {
                                     if disposition == trames_kernel::signal::Disposition::Handler {
                                         if let Some(p)=job.io.as_ref().and_then(|io|io.file_pending()).or_else(||job.retry.as_ref()?.file.clone()) {p.fuse_interrupt();}
                                     }
-                                    let uninterruptible = matches!(&job.waiting,Some(crate::run_queue::WaitState::Namespace(_) | crate::run_queue::WaitState::Policy(_) | crate::run_queue::WaitState::Barrier(_))) || matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.gpu_pending.is_some() || job.io.as_ref().is_some_and(|io| io.file_pending().is_some_and(|f|!f.interruptible()) || matches!(io.number, 2 | 270 | 271))
+                                    let uninterruptible = matches!(&job.waiting,Some(crate::run_queue::WaitState::Namespace(_) | crate::run_queue::WaitState::Policy(_) | crate::run_queue::WaitState::Barrier(_) | crate::run_queue::WaitState::Page(_))) || matches!(&job.waiting,Some(crate::run_queue::WaitState::Completion(wait)) if !wait.release.finished()) || job.pending_cpu.is_some() || job.gpu_pending.is_some() || job.io.as_ref().is_some_and(|io| io.file_pending().is_some_and(|f|!f.interruptible()) || matches!(io.number, 2 | 270 | 271))
                                         || job.retry.as_ref().is_some_and(|call| call.file.as_ref().is_some_and(|f|!f.interruptible()) || call.number == 2);
                                     if disposition == trames_kernel::signal::Disposition::Handler && !uninterruptible {
                                         if let Some(info) = snapshot.io_signals.take(sig, shared) {
@@ -746,6 +746,9 @@ impl<C: Cpu> Starter<C> {
                                 job.waiting = None;
                             }
                             work.trace.flush();
+                            if let Some(crate::run_queue::WaitState::Page(wait)) = &job.waiting {
+                                if wait.ready() { job.waiting = None; }
+                            }
                             if let Some(crate::run_queue::WaitState::Barrier(wait)) = &job.waiting {
                                 if let Some(value) = wait.finish() { work.trace.finish(&mut work.cpu, value); job.waiting=None; continue; }
                                 maintenance=true; break SliceOutcome::Yield { instructions:0 };
@@ -935,6 +938,13 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                             if job.pending_cpu.is_none() && work.syscalls.as_ref().is_some_and(|s|s.quiesced()) {
                                 maintenance=true;break SliceOutcome::Yield {instructions:0};
                             }
+                            if job.pending_cpu.is_none() {
+                                if let Some(snapshot) = &work.syscalls {
+                                    if !snapshot.resume_rseq(&mut work.cpu, work.memory.as_deref_mut().expect("rseq View"), index) {
+                                        continue;
+                                    }
+                                }
+                            }
                             if let Some(task) = work.syscalls.as_ref().and_then(|s| s.io_signals.cgroup()).filter(|task| epoch.is_some() && task.resource_limited()) {
                                 let now = Instant::now();
                                 let elapsed = now.saturating_duration_since(resource_start);
@@ -993,6 +1003,13 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                 result
                             };
                             // A lone runnable task can retain this assignment indefinitely.
+                            if let Some(snapshot) = &work.syscalls {
+                                snapshot.io_signals.proc_view.sample_perf(|now| trames_vfs::perf::Sample {
+                                    ip: work.cpu.pc(), pid: snapshot.io_signals.tgid(), tid: snapshot.io_signals.tid(),
+                                    time: now.saturating_duration_since(snapshot.started).as_nanos().min(u64::MAX as u128) as u64,
+                                    cpu: index as u32,
+                                });
+                            }
                             // Inspect CPU timers and limits at quantum boundaries and amortize checks
                             // for workloads repeatedly entering the kernel before a quantum.
                             if matches!(result, SliceOutcome::Yield { .. }) || chunks & 255 == 0 {
@@ -1020,6 +1037,10 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                 maintenance=true;break SliceOutcome::Yield {instructions:0};
                             }
                             if let (SliceOutcome::Fault(fault),Some(snapshot)) = (&result,work.syscalls.as_ref()) {
+                                if let Some(pending) = fault.pending_page() {
+                                    parked = Some(crate::run_queue::WaitState::Page(crate::run_queue::PageWait::new(pending.wait.clone())));
+                                    break SliceOutcome::Yield { instructions: 0 };
+                                }
                                 if let Some(caught) = snapshot.synchronous_fault(fault) {
                                     if !caught {
                                         fatal_fault=match result { SliceOutcome::Fault(fault)=>Some(fault), _=>unreachable!() };
@@ -1156,6 +1177,10 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                                                 unreachable!("handled checkpoint")
                                             }
                                         };
+                                        if let Some(pending) = fault.pending_page() {
+                                            parked = Some(crate::run_queue::WaitState::Page(crate::run_queue::PageWait::new(pending.wait.clone())));
+                                            break SliceOutcome::Yield { instructions: 0 };
+                                        }
                                         if let Some(caught) = work.syscalls.as_ref().and_then(|s| s.synchronous_fault(&fault)) {
                                             if !caught { fatal_fault = Some(fault); }
                                             continue;
@@ -1191,6 +1216,9 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                     }
                     // Withdraw before requesting a checkpoint: this worker is
                     // already out of guest code and must not kick its next job.
+                    if thread_exit.is_none() {
+                        if let Some(snapshot) = &work.syscalls { snapshot.io_signals.rseq.preempt(); }
+                    }
                     drop(execution_guard);
                     if let Some(epoch) = epoch.as_ref().filter(|epoch| epoch.source_lifecycle()) {
                         match &outcome {
@@ -1288,7 +1316,10 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                         // their actual owner finishes it on the Retired event.
                         completed.fatal_fault = fatal_fault;
                         epoch.finish(completed);
-                    } else if done.send(Event::<C>::Done(Box::new(job.finish(outcome, 0)))).is_err() { return; }
+                    } else {
+                        if let Some(wait) = parked { job.waiting = Some(wait); }
+                        if done.send(Event::<C>::Done(Box::new(job.finish(outcome, 0)))).is_err() { return; }
+                    }
                     }
                     // Bound descriptors by host workers, not queued guest
                     // tasks, and release orphan handles at the cohort boundary.

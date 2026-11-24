@@ -16,6 +16,13 @@ pub(crate) struct FileCaps {
 
 impl FileCaps {
     pub(super) fn parse(bytes: &[u8], ns: &UserNamespace) -> Result<Self> {
+        Self::decode_record(bytes, ns, true)
+    }
+    // Daemon records carry namespace-relative IDs, not setter authority.
+    pub(super) fn decode(bytes: &[u8], ns: &UserNamespace) -> Result<Self> {
+        Self::decode_record(bytes, ns, false)
+    }
+    fn decode_record(bytes: &[u8], ns: &UserNamespace, setter: bool) -> Result<Self> {
         if !matches!(bytes.len(), 20 | 24) {
             return Err(Errno(22));
         }
@@ -26,7 +33,7 @@ impl FileCaps {
             (V3, 24) => word(20),
             _ => return Err(Errno(22)),
         };
-        if root != 0 && !ns.is_initial() {
+        if setter && root != 0 && !ns.is_initial() {
             return Err(Errno(1));
         }
         Ok(Self {

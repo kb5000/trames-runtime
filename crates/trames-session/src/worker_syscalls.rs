@@ -29,6 +29,7 @@ pub(super) struct ExitResources<'a> {
 }
 impl ExitResources<'_> {
     pub fn retire(&self, status: i32, last: bool, memory: &mut impl CpuMemory) -> Exit {
+        self.task.rseq.clear();
         self.parents.retire_with(
             self.task,
             || self.task.lifecycle().survivor(),
@@ -442,6 +443,173 @@ pub(super) fn futex_parameters(
     }
     futex_key(memory, vm, a[0], a[1] & 128 != 0)
 }
+
+// Linux futex2 currently accepts only U32 words. Flags and values are
+// validated before obtaining any queue key or publishing a registration.
+fn futex2_flags(flags: u32, value: u64) -> Result<(), Errno> {
+    if flags & !0x83 != 0 || flags & 3 != 2 || value > u32::MAX as u64 {
+        return Err(Errno(22));
+    }
+    Ok(())
+}
+struct Futex2Word {
+    address: u64,
+    value: u32,
+    flags: u32,
+}
+fn futex2_words(
+    memory: &impl CpuMemory,
+    address: u64,
+    count: usize,
+) -> Result<Vec<Futex2Word>, Errno> {
+    let mut words = Vec::with_capacity(count);
+    for index in 0..count {
+        let at = address.checked_add(index as u64 * 24).ok_or(Errno(14))?;
+        let bytes = memory.read_array::<24>(at).map_err(|_| Errno(14))?;
+        let value = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        let flags = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+        if bytes[20..24] != [0; 4] {
+            return Err(Errno(22));
+        }
+        futex2_flags(flags, value)?;
+        words.push(Futex2Word {
+            address: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            value: value as u32,
+            flags,
+        });
+    }
+    Ok(words)
+}
+fn futex2_key(
+    memory: &impl CpuMemory,
+    vm: u64,
+    address: u64,
+    flags: u32,
+) -> Result<crate::futex::Key, Errno> {
+    if address & 3 != 0 {
+        return Err(Errno(22));
+    }
+    futex_key(memory, vm, address, flags & 128 != 0)
+}
+fn futex2_deadline(
+    memory: &impl CpuMemory,
+    address: u64,
+    clock: u32,
+    started: Instant,
+) -> Result<Option<Instant>, Errno> {
+    if address == 0 {
+        return Ok(None);
+    }
+    if !matches!(clock, 0 | 1) {
+        return Err(Errno(22));
+    }
+    futex_wait_parameters(
+        memory,
+        [
+            0,
+            9 | if clock == 0 { 256 } else { 0 },
+            0,
+            address,
+            0,
+            u32::MAX as u64,
+        ],
+        started,
+    )
+    .map(|(_, deadline)| deadline)
+}
+pub(super) fn futex2_wait(
+    table: &crate::futex::Futexes,
+    memory: &impl CpuMemory,
+    caller: (u64, u32),
+    number: u32,
+    a: [u64; 6],
+    started: Instant,
+    target: Option<std::sync::Weak<dyn crate::futex::Wake>>,
+) -> Result<crate::run_queue::WaitState, Errno> {
+    let (vm, pid) = caller;
+    let (wait, deadline) = if number == 449 {
+        let count = a[1] as u32;
+        if a[2] as u32 != 0 || !(1..=128).contains(&count) || a[0] == 0 {
+            return Err(Errno(22));
+        }
+        let deadline = futex2_deadline(memory, a[3], a[4] as u32, started)?;
+        let words = futex2_words(memory, a[0], count as usize)?;
+        let mut keys = Vec::with_capacity(words.len());
+        for word in &words {
+            keys.push(futex2_key(memory, vm, word.address, word.flags)?);
+        }
+        let wait = table.wait_vector(&keys, pid, target, || {
+            for word in &words {
+                let value = u32::from_le_bytes(
+                    memory
+                        .read_array::<4>(word.address)
+                        .map_err(|_| Errno(14))?,
+                );
+                if value != word.value {
+                    return Err(Errno(11));
+                }
+            }
+            Ok(())
+        })?;
+        (wait, deadline)
+    } else {
+        let flags = a[3] as u32;
+        futex2_flags(flags, a[1])?;
+        futex2_flags(flags, a[2])?;
+        let deadline = futex2_deadline(memory, a[4], a[5] as u32, started)?;
+        if a[2] == 0 {
+            return Err(Errno(22));
+        }
+        let key = futex2_key(memory, vm, a[0], flags)?;
+        let wait = table.wait_target(key, pid, a[2] as u32, target, || {
+            let value = u32::from_le_bytes(memory.read_array::<4>(a[0]).map_err(|_| Errno(14))?);
+            if value != a[1] as u32 {
+                return Err(Errno(11));
+            }
+            Ok(())
+        })?;
+        (wait, deadline)
+    };
+    Ok(crate::run_queue::WaitState::Futex { wait, deadline })
+}
+pub(super) fn futex2_queue(
+    table: &crate::futex::Futexes,
+    memory: &impl CpuMemory,
+    vm: u64,
+    number: u32,
+    a: [u64; 6],
+) -> Result<crate::futex::Effect, Errno> {
+    if number == 454 {
+        let flags = a[3] as u32;
+        futex2_flags(flags, a[1])?;
+        if a[1] == 0 || (a[2] as i32) < 0 {
+            return Err(Errno(22));
+        }
+        let key = futex2_key(memory, vm, a[0], flags)?;
+        table.wake_regular(key, a[2] as u32, a[1] as u32)
+    } else {
+        if a[1] as u32 != 0 || a[0] == 0 {
+            return Err(Errno(22));
+        }
+        let words = futex2_words(memory, a[0], 2)?;
+        if words[0].flags != words[1].flags || (a[2] as i32) < 0 || (a[3] as i32) < 0 {
+            return Err(Errno(22));
+        }
+        let old = futex2_key(memory, vm, words[0].address, words[0].flags)?;
+        let new = futex2_key(memory, vm, words[1].address, words[1].flags)?;
+        table.requeue_regular(old, new, a[2] as u32, a[3] as u32, || {
+            let value = u32::from_le_bytes(
+                memory
+                    .read_array::<4>(words[0].address)
+                    .map_err(|_| Errno(14))?,
+            );
+            if value != words[0].value {
+                return Err(Errno(11));
+            }
+            Ok(())
+        })
+    }
+}
 /// One ABI/validation implementation for owner and worker queue operations.
 pub(super) fn futex_queue(
     table: &crate::futex::Futexes,
@@ -692,6 +860,7 @@ impl Snapshot {
         }
         let mut frame = self.io_frame();
         let mut state = cpu.architectural_state();
+        state.pc = self.io_signals.rseq.signal(memory, state.pc)?;
         let sme = cpu
             .sme_config()
             .map(|c| (c, cpu.sme_state(), C::features().hwcap2 & (1 << 37) != 0));
@@ -712,6 +881,53 @@ impl Snapshot {
         }
         self.commit_io_frame(frame);
         Ok(())
+    }
+    pub fn resume_rseq<C: Cpu>(
+        &self,
+        cpu: &mut C,
+        memory: &mut impl CpuMemory,
+        index: usize,
+    ) -> bool {
+        match self.io_signals.rseq.resume(memory, cpu.pc(), index as u32) {
+            Ok(pc) => {
+                if pc != cpu.pc() {
+                    cpu.clear_exclusive();
+                    cpu.set_pc(pc);
+                }
+                true
+            }
+            Err(_) => {
+                let fault = trames_kernel::signal::Fault {
+                    signal: 11,
+                    code: 128,
+                    address: 0,
+                };
+                let caught = if self.io_signals.is_traced() {
+                    self.io_signals.inbox.discard(11);
+                    self.io_signals
+                        .inbox
+                        .enqueue(
+                            11,
+                            trames_kernel::signal::Info {
+                                code: 128,
+                                fault: Some(0),
+                                ..Default::default()
+                            },
+                        )
+                        .is_ok()
+                } else {
+                    fault.queue(
+                        &self.actions,
+                        self.io_signals.mask(),
+                        &self.io_signals.inbox,
+                    )
+                };
+                if !caught {
+                    self.io_signals.lifecycle().request_exit(11);
+                }
+                false
+            }
+        }
     }
     pub fn return_io_signal<C: Cpu>(
         &self,
@@ -739,7 +955,8 @@ impl Snapshot {
         Ok(())
     }
     fn futex_wait<C: Cpu>(&self, cpu: &C) -> bool {
-        cpu.x(8) as u32 == 98 && matches!(cpu.x(1) & 127, 0 | 9 | 6)
+        matches!(cpu.x(8) as u32, 449 | 455)
+            || cpu.x(8) as u32 == 98 && matches!(cpu.x(1) & 127, 0 | 9 | 6)
     }
     pub fn wait<C: Cpu>(
         &self,
@@ -761,6 +978,17 @@ impl Snapshot {
         }
         if !self.futex_wait(cpu) {
             return None;
+        }
+        if matches!(cpu.x(8) as u32, 449 | 455) {
+            return Some(futex2_wait(
+                &self.futex.table,
+                memory,
+                (self.futex.vm, pid),
+                cpu.x(8) as u32,
+                std::array::from_fn(|i| cpu.x(i)),
+                self.started,
+                Some(epoch.futex_target()),
+            ));
         }
         Some((|| {
             let key = futex_parameters(memory, self.futex.vm, std::array::from_fn(|i| cpu.x(i)))?;
@@ -801,7 +1029,8 @@ impl Snapshot {
         })())
     }
     fn futex_queue<C: Cpu>(&self, cpu: &C) -> bool {
-        cpu.x(8) as u32 == 98 && matches!(cpu.x(1) & 127, 1 | 10 | 3 | 4 | 5 | 7 | 8)
+        matches!(cpu.x(8) as u32, 454 | 456)
+            || cpu.x(8) as u32 == 98 && matches!(cpu.x(1) & 127, 1 | 10 | 3 | 4 | 5 | 7 | 8)
     }
     pub fn timer_entry<C: Cpu>(&self, cpu: &C) -> Option<crate::process::seccomp::EntryDecision> {
         (self.seccomp.mode() != 0
@@ -845,7 +1074,7 @@ impl Snapshot {
         match cpu.x(8) as u32 {
             number if trames_kernel::scheduling::call(number) => true,
             93 | 94 => self.exit_files.is_some(),
-            142 | 153 | 165 | 434 | 438 => true,
+            142 | 153 | 165 | 241 | 434 | 438 => true,
             96 => self.io_signals.thread_addresses().is_some(),
             167 => match cpu.x(0) {
                 1 | 2 => self.io_signals.parentage().is_some(),
@@ -959,7 +1188,7 @@ impl Snapshot {
         // futex/epoll checkpoint. Ordinary unfiltered calls keep the old path.
         if !matches!(
             cpu.x(8) as u32,
-            25 | 92 | 219 | 98..=101 | 113..=115 | 117 | 124 | 139 | 154..=157 | 163 | 164 | 261 | 166 | 168 | 169 | 172..=179 | 270 | 271 | 278
+            25 | 92 | 219 | 98..=101 | 113..=115 | 117 | 124 | 139 | 154..=157 | 163 | 164 | 261 | 166 | 168 | 169 | 172..=179 | 270 | 271 | 278 | 293
         ) && !(cpu.x(8) as u32 == 29
             && trames_vfs::DescriptorControl::status_ioctl_request(cpu.x(1) as u32))
             && !(matches!(cpu.x(8) as u32, 160..=162) && self.uts.is_some())
@@ -1072,6 +1301,14 @@ impl Snapshot {
                 self.direct.descriptor_factory()?,
                 std::array::from_fn(|i| cpu.x(i)),
             ),
+            241 => self.io_routes.perf_event_open(
+                &self.io_signals,
+                &self.fd_flags,
+                self.direct.descriptor_factory()?,
+                std::array::from_fn(|i| cpu.x(i)),
+                self.cpus,
+                memory,
+            ),
             434 => self.io_routes.pidfd_open(
                 self.direct.descriptor_factory()?,
                 cpu.x(0) as i32,
@@ -1124,6 +1361,21 @@ impl Snapshot {
             number @ (29 | 62..=66 | 73 | 86 | 87 | 116 | 206 | 207 | 210..=212) => self
                 .direct
                 .invoke(number, std::array::from_fn(|i| cpu.x(i)), memory)?,
+            293 => self
+                .io_signals
+                .rseq
+                .call(memory, std::array::from_fn(|i| cpu.x(i))),
+            number @ (454 | 456) => futex2_queue(
+                &self.futex.table,
+                memory,
+                self.futex.vm,
+                number,
+                std::array::from_fn(|i| cpu.x(i)),
+            )
+            .map(|effect| {
+                self.futex.record(&effect, number == 456);
+                effect.total()
+            }),
             // Every non-wait futex command shares the canonical validation and
             // terminal unsupported result; unknown operations are not owner work.
             98 if matches!(cpu.x(1) & 127, 7 | 8) => (|| {
@@ -1318,10 +1570,10 @@ mod tests {
     use trames_memory::{Memory, Permissions, PAGE_SIZE};
     #[test]
     fn recognized_entries_and_legacy_diagnostic_embeddings_keep_their_actual_handlers() {
-        assert!(unknown_syscall::<Cpu>(293, [0; 6]));
+        assert!(unknown_syscall::<Cpu>(294, [0; 6]));
         for number in [
-            0, 1, 4, 292, 13, 31, 56, 93, 94, 98, 99, 100, 113, 142, 167, 179, 220, 221, 236, 268,
-            277, 280, 283, 425, 426, 427, 452,
+            0, 1, 4, 292, 13, 31, 56, 93, 94, 98, 99, 100, 113, 142, 167, 179, 220, 221, 236, 241,
+            268, 277, 280, 283, 293, 425, 426, 427, 449, 452, 454, 455, 456,
         ] {
             assert!(
                 !unknown_syscall::<Cpu>(number, [0; 6]),
@@ -1543,7 +1795,7 @@ mod tests {
         };
         let mut view = memory.parallel_view(&mut Default::default()).unwrap();
         let mut cpu = Cpu::new(0x4004, 0);
-        cpu.set_x(8, 293);
+        cpu.set_x(8, 294);
         assert!(!snapshot.unknown_entry(&cpu));
         assert_eq!(snapshot.invoke(&cpu, &mut view), None);
         cpu.set_x(8, 98);

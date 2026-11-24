@@ -8,6 +8,11 @@ pub enum MountFdCall {
         kind: Vec<u8>,
         flags: u32,
     },
+    Pick {
+        fd: i32,
+        path: Vec<u8>,
+        flags: u32,
+    },
     Config {
         fd: u32,
         cmd: u32,
@@ -44,6 +49,7 @@ const RECURSIVE: u32 = 0x8000;
 pub struct MountAttributes {
     set: u64,
     clear: u64,
+    propagation: u64,
 }
 
 impl MountAttributes {
@@ -64,18 +70,27 @@ impl MountAttributes {
             (0x20, ATTR_ATIME) => (0, MS_NOATIME | MS_RELATIME),
             _ => return Err(Errno(22)),
         };
-        if propagation != 0 || (set | clear) & (ATTR_IDMAP | ATTR_NOSYMFOLLOW) != 0 {
+        if (set | clear) & ATTR_IDMAP != 0 {
             return Err(Errno(95));
         }
-        let ordinary = |attrs| attrs & 15 | if attrs & 0x80 != 0 { MS_NODIRATIME } else { 0 };
+        let ordinary = |attrs| {
+            attrs & 15
+                | if attrs & 0x80 != 0 { MS_NODIRATIME } else { 0 }
+                | if attrs & ATTR_NOSYMFOLLOW != 0 {
+                    MS_NOSYMFOLLOW
+                } else {
+                    0
+                }
+        };
         Ok(Self {
             set: ordinary(set) | atime.0,
             clear: ordinary(clear) | atime.1,
+            propagation,
         })
     }
 
     pub fn is_empty(&self) -> bool {
-        self.set == 0 && self.clear == 0
+        self.set == 0 && self.clear == 0 && self.propagation == 0
     }
 }
 
@@ -86,6 +101,7 @@ impl MountFdCall {
         }
         match self {
             Self::Open { .. } => vec![],
+            Self::Pick { fd, path, flags } => vec![operand(*fd, path, flags & 2 == 0)],
             Self::Config { fd, .. } | Self::Mount { fd, .. } => vec![(*fd as i32, None, false)],
             Self::Tree { fd, path, flags } => vec![operand(*fd, path, flags & 0x100 == 0)],
             Self::Move {
@@ -119,12 +135,13 @@ impl MountFdCall {
     pub(crate) fn topology(&self) -> bool {
         matches!(
             self,
-            Self::Move { .. } | Self::Mount { .. } | Self::Tree { .. }
+            Self::Move { .. } | Self::Mount { .. } | Self::Tree { .. } | Self::Pick { .. }
         ) || matches!(self, Self::SetAttr { attrs, .. } if !attrs.is_empty())
     }
     pub(crate) fn run(&self, v: &mut Vfs) -> Result<u64> {
         match self {
             Self::Open { kind, flags } => v.fsopen(kind, *flags).map(u64::from),
+            Self::Pick { fd, path, flags } => v.fspick(*fd, path, *flags).map(u64::from),
             Self::Config {
                 fd,
                 cmd,
@@ -161,6 +178,7 @@ impl MountFdCall {
 
 pub(crate) struct FsContext {
     creator: Credentials,
+    owner: UserNamespace,
     kind: Kind,
     pid: PidNamespace,
     net_owner: UserNamespace,
@@ -170,11 +188,12 @@ enum Phase {
     Parameters,
     Created(Arc<Mount>),
     Mounted(FsHandle),
+    Reconfigure(FsHandle),
 }
 struct ContextState {
     source: Option<Vec<u8>>,
     parameters: BTreeMap<Vec<u8>, Vec<u8>>,
-    readonly: bool,
+    readonly: Option<bool>,
     phase: Phase,
 }
 /// The originating OFD owns the detached tree. Membership moves to its new
@@ -264,9 +283,20 @@ impl Vfs {
             }
             updates.push((mount, new));
         }
-        // A failed check on a descendant leaves every mount unchanged.
+        let propagation = if attrs.propagation == 0 {
+            Vec::new()
+        } else {
+            self.plan_propagation(&selected, attrs.propagation)?
+        };
+        // Validation and peer-group allocation finish before any publication.
         for (mount, new) in updates {
             mount.flags.set(new);
+        }
+        for (mount, state) in propagation {
+            mount.set_propagation(state);
+        }
+        if attrs.propagation != 0 {
+            self.normalize_propagation();
         }
         ns.0.borrow().events.changed();
         Ok(())
@@ -287,14 +317,45 @@ impl Vfs {
             if flags == 1 { O_CLOEXEC } else { 0 },
             events::Anonymous::FsContext(Arc::new(FsContext {
                 creator: self.credentials.clone(),
+                owner: self.credentials.user_namespace.clone(),
                 kind,
                 pid: self.pid_ns.clone(),
                 net_owner: self.root_network.user_namespace.clone(),
                 state: std::sync::Mutex::new(ContextState {
                     source: None,
                     parameters: BTreeMap::new(),
-                    readonly: false,
+                    readonly: None,
                     phase: Phase::Parameters,
+                }),
+            })),
+        )
+    }
+    fn fspick(&mut self, fd: i32, path: &[u8], flags: u32) -> Result<u32> {
+        self.can_mount()?;
+        if flags & !15 != 0 {
+            return Err(Errno(22));
+        }
+        let target = self.mount_operand(fd, path, flags & 2 == 0, flags & 8 != 0)?;
+        if !self.is_mount_root(&target) {
+            return Err(Errno(22));
+        }
+        let mount = target.mount.as_ref().ok_or(Errno(22))?;
+        if mount.kind != Kind::Tmpfs {
+            return Err(Errno(95));
+        }
+        self.anonymous(
+            if flags & 1 != 0 { O_CLOEXEC } else { 0 },
+            events::Anonymous::FsContext(Arc::new(FsContext {
+                creator: self.credentials.clone(),
+                owner: mount.fs.owner.clone(),
+                kind: mount.kind,
+                pid: self.pid_ns.clone(),
+                net_owner: self.root_network.user_namespace.clone(),
+                state: std::sync::Mutex::new(ContextState {
+                    source: None,
+                    parameters: BTreeMap::new(),
+                    readonly: None,
+                    phase: Phase::Reconfigure(mount.fs.clone()),
                 }),
             })),
         )
@@ -319,7 +380,8 @@ impl Vfs {
         let ctx = self.fs_context(fd)?;
         let mut state = ctx.state.lock().unwrap();
         if matches!(state.phase, Phase::Created(_))
-            || matches!(state.phase, Phase::Mounted(_)) && matches!(cmd, 6 | 8)
+            || matches!(state.phase, Phase::Mounted(_) | Phase::Reconfigure(_))
+                && matches!(cmd, 6 | 8)
             || matches!(state.phase, Phase::Parameters) && cmd == 7
         {
             return Err(Errno(16));
@@ -328,7 +390,7 @@ impl Vfs {
             self.landlock_check_mount()?;
         }
         match (cmd, key, value) {
-            (0, Some(key @ (b"ro" | b"rw")), None) => state.readonly = key == b"ro",
+            (0, Some(key @ (b"ro" | b"rw")), None) => state.readonly = Some(key == b"ro"),
             (1, Some(b"source"), Some(src))
                 if state.source.is_none() && matches!(state.phase, Phase::Parameters) =>
             {
@@ -341,7 +403,7 @@ impl Vfs {
                         b"mode" | b"size" | b"nr_blocks" | b"nr_inodes" | b"uid" | b"gid"
                     ) =>
             {
-                if matches!(state.phase, Phase::Mounted(_))
+                if matches!(state.phase, Phase::Mounted(_) | Phase::Reconfigure(_))
                     && matches!(key, b"mode" | b"uid" | b"gid")
                 {
                     return Err(Errno(95));
@@ -363,7 +425,7 @@ impl Vfs {
             (6..=8, None, None) => {
                 if !self
                     .credentials
-                    .has_ns_cap(&ctx.creator.user_namespace, capabilities::SYS_ADMIN)
+                    .has_ns_cap(&ctx.owner, capabilities::SYS_ADMIN)
                 {
                     return Err(Errno(1));
                 }
@@ -380,11 +442,29 @@ impl Vfs {
                 let (limit, nodes, mode, uid, gid) =
                     tmpfs_options(&data, self.pseudo.borrow().runtime.memory_limit as u64)?;
                 if cmd == 7 {
-                    let Phase::Mounted(fs) = &state.phase else {
-                        return Err(Errno(16));
+                    let fs = match &state.phase {
+                        Phase::Mounted(fs) | Phase::Reconfigure(fs) => fs,
+                        _ => return Err(Errno(16)),
                     };
                     let ro = fs.super_readonly.as_ref().ok_or(Errno(95))?;
+                    let _writers = state
+                        .readonly
+                        .filter(|readonly| *readonly && !ro.load(Ordering::Relaxed))
+                        .map(|_| fs.hold_writers())
+                        .transpose()?;
                     let mut data = fs.borrow_mut();
+                    let limit = if state.parameters.contains_key(b"size".as_slice())
+                        || state.parameters.contains_key(b"nr_blocks".as_slice())
+                    {
+                        limit
+                    } else {
+                        data.limits.file_bytes
+                    };
+                    let nodes = if state.parameters.contains_key(b"nr_inodes".as_slice()) {
+                        nodes
+                    } else {
+                        data.limits.nodes
+                    };
                     let capacity = Vfs::filesystem_capacity(&data);
                     if capacity.nodes_used > nodes || capacity.used_bytes > limit {
                         return Err(Errno(22));
@@ -394,7 +474,13 @@ impl Vfs {
                         nodes,
                     };
                     data.quota.configure(limit, data.volume);
-                    ro.store(state.readonly, Ordering::Relaxed);
+                    if let Some(readonly) = state.readonly {
+                        ro.store(readonly, Ordering::Relaxed);
+                    }
+                    drop(data);
+                    drop(_writers);
+                    state.parameters.clear();
+                    state.readonly = None;
                     return Ok(());
                 }
                 let (fs, root, root_key) = match ctx.kind {
@@ -407,8 +493,10 @@ impl Vfs {
                             gid.unwrap_or(ctx.creator.fsgid),
                             true,
                         )?;
-                        fs.super_readonly =
-                            Some(Arc::new(std::sync::atomic::AtomicBool::new(state.readonly)));
+                        fs.super_readonly = Some(Arc::new(std::sync::atomic::AtomicBool::new(
+                            state.readonly.unwrap_or(false),
+                        )));
+                        fs.owner = ctx.owner.clone();
                         let root = fs.borrow().paths[b"/".as_slice()].clone();
                         (fs, root, b"/".to_vec())
                     }
@@ -446,7 +534,11 @@ impl Vfs {
                     namespace: None,
                     pid_namespace: (ctx.kind == Kind::Proc).then(|| ctx.pid.clone()),
                     devpts: None,
-                    flags: Cell::new(if state.readonly { MS_RDONLY } else { 0 }),
+                    flags: Cell::new(if state.readonly.unwrap_or(false) {
+                        MS_RDONLY
+                    } else {
+                        0
+                    }),
                     writers: Arc::default(),
                     parent: RefCell::new(None),
                 })));
@@ -457,7 +549,7 @@ impl Vfs {
     }
     fn fsmount(&mut self, fd: u32, flags: u32, attrs: u32) -> Result<u32> {
         self.can_mount()?;
-        if flags & !1 != 0 || attrs & !0xbf != 0 {
+        if flags & !1 != 0 || attrs & !(0xbf | 0x200000) != 0 {
             return Err(Errno(22));
         }
         let atime = match attrs & 0x30 {
@@ -470,12 +562,19 @@ impl Vfs {
         let mut state = ctx.state.lock().unwrap();
         let root = match &state.phase {
             Phase::Parameters => return Err(Errno(22)),
-            Phase::Mounted(_) => return Err(Errno(16)),
+            Phase::Mounted(_) | Phase::Reconfigure(_) => return Err(Errno(16)),
             Phase::Created(root) => copy_mount(root)?,
         };
-        let attrs = (attrs & 15) as u64 | atime | if attrs & 0x80 != 0 { MS_NODIRATIME } else { 0 };
+        let attrs = (attrs & 15) as u64
+            | atime
+            | if attrs & 0x80 != 0 { MS_NODIRATIME } else { 0 }
+            | if attrs & 0x200000 != 0 {
+                MS_NOSYMFOLLOW
+            } else {
+                0
+            };
         let local = attrs
-            | if root.kind != Kind::Tmpfs && state.readonly {
+            | if root.kind != Kind::Tmpfs && state.readonly.unwrap_or(false) {
                 MS_RDONLY
             } else {
                 0
@@ -509,10 +608,11 @@ impl Vfs {
         if let Some(events::SharedControl::MountTree(tree)) = &o.control {
             return self.location(&tree.root.root, &Some(tree.root.clone()));
         }
-        self.location(
-            o.node.as_ref().ok_or(Errno(22))?,
-            &self.mount_for_path(o.mount.as_ref()),
-        )
+        if o.node.is_none() && !matches!(o.control, Some(events::SharedControl::FuseFile(_))) {
+            return Err(Errno(22));
+        }
+        drop(o);
+        self.mount_inode_location(self.proc_open_node(&desc.open, b"")?)
     }
     fn mount_path_descriptor(
         &mut self,
@@ -581,6 +681,9 @@ impl Vfs {
                 None,
             );
         }
+        if m.propagation().unbindable {
+            return Err(Errno(22));
+        }
         let ns = self.mounts.as_ref().ok_or(Errno(22))?;
         let is_attached = ns.0.borrow().mounts.iter().any(|src| Arc::ptr_eq(src, m));
         let tree = detached(m, ns.id());
@@ -614,6 +717,12 @@ impl Vfs {
                     };
                     if !Arc::ptr_eq(&link.parent, &old) || index == 0 && !below(&link.key(), &p.key)
                     {
+                        continue;
+                    }
+                    if child.propagation().unbindable {
+                        if child.inherited.load(Ordering::Relaxed) & LOCK_ATTACHMENT != 0 {
+                            return Err(Errno(1));
+                        }
                         continue;
                     }
                     let copy = copy_mount(child)?;
@@ -754,6 +863,117 @@ fn detached(mount: &Arc<Mount>, namespace: u64) -> Option<Arc<DetachedTree>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn nosymfollow_is_a_live_mount_attribute_and_keeps_nofollow_capabilities() {
+        let mut v = Vfs::default();
+        v.mkdir_at(AT_FDCWD, b"/mnt", 0o755).unwrap();
+        v.mount(None, b"/mnt", Some(b"tmpfs"), MS_NOSYMFOLLOW, None)
+            .unwrap();
+        let fd = v
+            .open_at(AT_FDCWD, b"/mnt/file", O_CREAT | 2, 0o600)
+            .unwrap();
+        v.close(fd).unwrap();
+        v.symlink_at(b"file", AT_FDCWD, b"/mnt/link").unwrap();
+        assert_eq!(v.open_at(AT_FDCWD, b"/mnt/link", 0, 0), Err(Errno(40)));
+        assert_eq!(v.readlink_at(AT_FDCWD, b"/mnt/link").unwrap(), b"file");
+        let link = v
+            .open_at(AT_FDCWD, b"/mnt/link", O_PATH | O_NOFOLLOW, 0)
+            .unwrap();
+        let stat = v.statfs_fd(link).unwrap();
+        assert_ne!(
+            u64::from_le_bytes(stat[80..88].try_into().unwrap()) & 8192,
+            0
+        );
+        v.mount_setattr(
+            AT_FDCWD,
+            b"/mnt",
+            0,
+            &MountAttributes::new(0, 0x200000, 0).unwrap(),
+        )
+        .unwrap();
+        assert!(v.open_at(AT_FDCWD, b"/mnt/link", 0, 0).is_ok());
+        v.mount_setattr(
+            AT_FDCWD,
+            b"/mnt",
+            0,
+            &MountAttributes::new(0x200000, 0, 0).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v.open_at(AT_FDCWD, b"/mnt/link", 0, 0), Err(Errno(40)));
+    }
+    #[test]
+    fn unbindable_subtrees_are_pruned_from_both_recursive_bind_interfaces() {
+        let mut v = Vfs::default();
+        for path in [b"/src".as_slice(), b"/dst", b"/tree"] {
+            v.mkdir_at(AT_FDCWD, path, 0o755).unwrap();
+        }
+        v.mount(None, b"/src", Some(b"tmpfs"), 0, None).unwrap();
+        v.mkdir_at(AT_FDCWD, b"/src/sub", 0o755).unwrap();
+        v.mount(None, b"/src/sub", Some(b"tmpfs"), 0, None).unwrap();
+        v.mkdir_at(AT_FDCWD, b"/src/sub/hidden", 0o755).unwrap();
+        v.mount_setattr(
+            AT_FDCWD,
+            b"/src/sub",
+            0,
+            &MountAttributes::new(0, 0, 1 << 17).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            v.mount(Some(b"/src/sub"), b"/dst", None, 4096, None),
+            Err(Errno(22))
+        );
+        assert_eq!(v.open_tree(AT_FDCWD, b"/src/sub", 1), Err(Errno(22)));
+        v.mount(Some(b"/src"), b"/dst", None, 4096 | 16384, None)
+            .unwrap();
+        assert_eq!(v.stat_at(AT_FDCWD, b"/dst/sub/hidden"), Err(Errno(2)));
+        let tree = v.open_tree(AT_FDCWD, b"/src", 1 | RECURSIVE).unwrap();
+        v.move_mount_fd(tree as i32, b"", AT_FDCWD, b"/tree", 4)
+            .unwrap();
+        assert_eq!(v.stat_at(AT_FDCWD, b"/tree/sub/hidden"), Err(Errno(2)));
+    }
+    #[test]
+    fn picked_tmpfs_context_retains_original_filesystem_limits_across_aliases() {
+        let mut v = Vfs::default();
+        for path in [b"/mnt".as_slice(), b"/alias"] {
+            v.mkdir_at(AT_FDCWD, path, 0o755).unwrap();
+        }
+        v.mount(
+            None,
+            b"/mnt",
+            Some(b"tmpfs"),
+            0,
+            Some(b"size=1048576,nr_inodes=99"),
+        )
+        .unwrap();
+        v.mount(Some(b"/mnt"), b"/alias", None, 4096, None).unwrap();
+        let context = v.fspick(AT_FDCWD, b"/alias", 1).unwrap();
+        v.fsconfigure(context, 1, Some(b"nr_inodes"), Some(b"123"))
+            .unwrap();
+        v.fsconfigure(context, 7, None, None).unwrap();
+        for path in [b"/mnt".as_slice(), b"/alias"] {
+            let stat = v.statfs_at(path).unwrap();
+            assert_eq!(
+                u64::from_le_bytes(stat[16..24].try_into().unwrap()) * 4096,
+                1048576
+            );
+            assert_eq!(u64::from_le_bytes(stat[40..48].try_into().unwrap()), 123);
+        }
+        let file = v
+            .open_at(AT_FDCWD, b"/mnt/file", O_CREAT | 2, 0o600)
+            .unwrap();
+        let desc = v.descriptor(file).unwrap();
+        let mount = desc.open.borrow().mount.as_ref().unwrap().identity.clone();
+        let writer = mapped::MountWrite::new(&mount).unwrap();
+        v.fsconfigure(context, 0, Some(b"ro"), None).unwrap();
+        assert_eq!(v.fsconfigure(context, 7, None, None), Err(Errno(16)));
+        drop(writer);
+        v.fsconfigure(context, 7, None, None).unwrap();
+        assert_eq!(v.mkdir_at(AT_FDCWD, b"/mnt/blocked", 0o755), Err(Errno(30)));
+        assert_eq!(
+            v.mkdir_at(AT_FDCWD, b"/alias/blocked", 0o755),
+            Err(Errno(30))
+        );
+    }
 
     #[test]
     fn detached_layer_retains_its_user_namespace_after_close() {

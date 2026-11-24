@@ -686,6 +686,42 @@ impl DirectSyscalls {
         if self.file_prepared(number, a) {
             return None;
         }
+        if matches!(number, 61 | 62) {
+            let command = if number == 61 {
+                trames_vfs::FileCommand::ReadDirectory {
+                    count: crate::path_queries::dirent_count(a[2]),
+                }
+            } else {
+                trames_vfs::FileCommand::Seek {
+                    offset: a[1] as i64,
+                    whence: a[2] as u32,
+                }
+            };
+            if let Some(work) = paths.fuse_file_work(a[0] as u32, command) {
+                return match work {
+                    Ok(work) => self.prepare_filesystem_work(
+                        number,
+                        a,
+                        work,
+                        if number == 61 {
+                            FileOutput::Directory(a[1])
+                        } else {
+                            FileOutput::None
+                        },
+                        memory,
+                    ),
+                    Err(error) => Some(Err(error)),
+                };
+            }
+        }
+        if let Some(output) = crate::path_queries::file_output(number, a) {
+            return match crate::path_queries::prepare_output(paths, number, a, memory) {
+                Some(reply) => self.finish_file_reply(number, a, reply, output, memory),
+                None => {
+                    self.prepare_filesystem_work(number, a, paths.take_fuse_stat()?, output, memory)
+                }
+            };
+        }
         let result = if matches!(number, 56 | 437) {
             let parameters = (|| {
                 let (flags, mode, policy) = if number == 437 {
@@ -736,7 +772,7 @@ impl DirectSyscalls {
                         if matches!(number, 48 | 439) {
                             FileOutput::None
                         } else if number == 78 {
-                            FileOutput::Readlink(a[2], a[3])
+                            FileOutput::Readlink(a[2], a[3] as u32 as u64)
                         } else {
                             FileOutput::FuseStat(number, a)
                         },

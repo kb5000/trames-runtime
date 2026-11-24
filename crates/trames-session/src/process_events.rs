@@ -135,9 +135,10 @@ impl<C: Cpu> Kernel<C> {
             if !p.stopped()
                 && matches!(&p.state, State::Futex { wait, .. } if std::sync::Arc::ptr_eq(&wait.ticket, &ticket))
             {
+                let value = ticket.value();
                 p.state = State::Ready;
-                p.cpu.set_x(0, 0);
-                p.trace.record(0);
+                p.cpu.set_x(0, value);
+                p.trace.record(value);
                 progress = true;
             }
         }
@@ -146,6 +147,13 @@ impl<C: Cpu> Kernel<C> {
     }
     #[cfg(all(test, trames_interpreter_conformance))]
     pub(super) fn resume_event(&mut self, p: &mut Process<C>) -> bool {
+        if let State::Page(wait) = &p.state {
+            if wait.ready() {
+                p.state = State::Ready;
+                return true;
+            }
+            return false;
+        }
         if let State::Barrier(wait) = &p.state {
             if let Some(value) = wait.finish() {
                 p.cpu.set_x(0, value);
@@ -207,8 +215,9 @@ impl<C: Cpu> Kernel<C> {
         }
         match p.state {
             State::Futex { ref wait, .. } if wait.woken() => {
+                let value = wait.value();
                 p.state = State::Ready;
-                p.cpu.set_x(0, 0);
+                p.cpu.set_x(0, value);
                 p.trace.record(p.cpu.x(0));
                 true
             }
@@ -255,6 +264,35 @@ impl<C: Cpu> Kernel<C> {
         a: [u64; 6],
     ) -> Result<Option<u64>, Errno> {
         match number {
+            449 | 455 => {
+                let wait = crate::worker_syscalls::futex2_wait(
+                    &self.futexes,
+                    &p.memory,
+                    (p.vm_id, pid),
+                    number,
+                    a,
+                    self.started,
+                    None,
+                )?;
+                let crate::run_queue::WaitState::Futex { wait, deadline } = wait else {
+                    unreachable!()
+                };
+                p.state = State::Futex { wait, deadline };
+                Ok(None)
+            }
+            454 | 456 => {
+                let effect = crate::worker_syscalls::futex2_queue(
+                    &self.futexes,
+                    &p.memory,
+                    p.vm_id,
+                    number,
+                    a,
+                )?;
+                if effect.woken != 0 {
+                    self.resume_futex_ready();
+                }
+                Ok(Some(effect.total()))
+            }
             98 => {
                 if matches!(a[1] & 127, 0 | 9) {
                     let key = crate::worker_syscalls::futex_parameters(&p.memory, p.vm_id, a)?;

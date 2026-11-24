@@ -28,7 +28,7 @@ fn call(code: &mut Vec<u32>, nr: u32, args: [u64; 6], file: bool, result: u64) {
 
 #[test]
 fn accepted_task_memory_files_keep_live_original_mm_and_retire_without_pid_or_fd_donation() {
-    use trames_vfs::{FileCommand, FileOutcome, FileValue, FileWork};
+    use trames_vfs::{FileCommand, FileOutcome, FileWork};
     for path in [b"/proc/1/status".as_slice(), b"/proc/1/statm"] {
         let mut k = kernel();
         k.memory_limits = crate::MemoryLimits::host_managed();
@@ -62,10 +62,9 @@ fn accepted_task_memory_files_keep_live_original_mm_and_retire_without_pid_or_fd
         )
         .run()
         {
-            FileOutcome::Complete(reply) => reply.result.map(|value| match value {
-                FileValue::Bytes(bytes) => bytes,
-                _ => panic!("proc bytes"),
-            }),
+            FileOutcome::Complete(reply) => reply
+                .result
+                .map(|value| value.into_bytes().expect("proc bytes")),
             _ => panic!("original task metadata has no owner or disk wait"),
         };
         let rss = |bytes: Vec<u8>| {

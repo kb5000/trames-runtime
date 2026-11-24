@@ -5,8 +5,8 @@ use std::{
     cell::Cell,
     collections::{BTreeMap, VecDeque},
     sync::{
-        atomic::{AtomicU8, Ordering},
-        Arc, Mutex, Weak,
+        atomic::{AtomicU32, Ordering},
+        Arc, Mutex, OnceLock, Weak,
     },
 };
 
@@ -20,31 +20,83 @@ impl<C: trames_engine::Cpu> Wake for crate::run_queue::Epoch<C> {
 }
 pub(super) type Key = (u64, u64, u64);
 const SHARDS: usize = 64;
-const WAITING: u8 = 0;
-const WOKEN: u8 = 1;
-const CANCELLED: u8 = 2;
-const TIMED_OUT: u8 = 3;
+const WAITING: u32 = 0;
+const WOKEN: u32 = 1;
+const CANCELLED: u32 = 2;
+const TIMED_OUT: u32 = 3;
+const VECTOR: u32 = 4;
 type Queues = BTreeMap<Key, VecDeque<Arc<Ticket>>>;
 
 pub(super) struct Ticket {
     pub pid: u32,
     pi_tid: u32,
     bits: u32,
-    state: AtomicU8,
-    target: Mutex<Option<Weak<dyn Wake>>>,
+    decision: Decision,
+    index: Option<u32>,
     key: Mutex<Key>,
+}
+enum Decision {
+    Single(Outcome),
+    Vector(Arc<Outcome>),
+}
+struct Outcome {
+    // A single winner includes the vector index; wake/cancel/timeout cannot
+    // publish a result belonging to a different member of the same wait.
+    state: AtomicU32,
+    target: Mutex<Option<Weak<dyn Wake>>>,
+    original: OnceLock<Weak<Ticket>>,
+}
+impl Outcome {
+    fn new(target: Option<Weak<dyn Wake>>) -> Self {
+        Self {
+            state: AtomicU32::new(WAITING),
+            target: Mutex::new(target),
+            original: OnceLock::new(),
+        }
+    }
+}
+impl Decision {
+    fn new(target: Option<Weak<dyn Wake>>) -> Self {
+        Self::Single(Outcome::new(target))
+    }
+}
+impl std::ops::Deref for Decision {
+    type Target = Outcome;
+    fn deref(&self) -> &Outcome {
+        match self {
+            Self::Single(outcome) => outcome,
+            Self::Vector(outcome) => outcome,
+        }
+    }
 }
 impl Ticket {
     pub fn bind<C: trames_engine::Cpu>(&self, epoch: &Arc<crate::run_queue::Epoch<C>>) {
         let target = Arc::downgrade(epoch);
         let target: Weak<dyn Wake> = target;
-        *self.target.lock().unwrap() = Some(target);
+        *self.decision.target.lock().unwrap() = Some(target);
     }
-
-    fn claim(&self, next: u8) -> bool {
+    fn state(&self) -> u32 {
+        match self.decision.state.load(Ordering::Relaxed) {
+            state if state >= VECTOR => WOKEN,
+            state => state,
+        }
+    }
+    pub fn value(&self) -> u64 {
+        self.decision
+            .state
+            .load(Ordering::Relaxed)
+            .saturating_sub(VECTOR) as u64
+    }
+    fn claim(&self, next: u32) -> bool {
         // Only arbitrates the winner of wake/cancel/timeout. Guest data keeps
         // the interpreter's memory model; queue publication uses the mutexes.
-        self.state
+        let next = if next == WOKEN {
+            self.index.map_or(WOKEN, |index| VECTOR + index)
+        } else {
+            next
+        };
+        self.decision
+            .state
             .compare_exchange(WAITING, next, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
     }
@@ -148,11 +200,15 @@ pub(super) struct Futexes(Arc<Inner>);
 /// Wake notifies the scheduler only after releasing its futex bucket.
 pub(super) struct Wait {
     pub ticket: Arc<Ticket>,
+    members: Vec<Arc<Ticket>>,
     table: Futexes,
 }
 impl Wait {
     pub fn woken(&self) -> bool {
-        self.ticket.state.load(Ordering::Relaxed) == WOKEN
+        self.ticket.state() == WOKEN
+    }
+    pub fn value(&self) -> u64 {
+        self.ticket.value()
     }
     pub fn timeout(&self) -> bool {
         self.ticket.claim(TIMED_OUT)
@@ -162,20 +218,25 @@ impl Wait {
     /// can consume a later wake intended for the task's new wait.
     pub fn cancel(&self) {
         self.ticket.claim(CANCELLED);
-        if self.woken() {
-            return; // wake already unlinked it under the bucket lock
+        if self.members.is_empty() && self.woken() {
+            return;
         }
+        for ticket in std::iter::once(&self.ticket).chain(&self.members) {
+            self.unlink(ticket);
+        }
+    }
+    fn unlink(&self, ticket: &Arc<Ticket>) {
         loop {
-            let key = *self.ticket.key.lock().unwrap();
+            let key = *ticket.key.lock().unwrap();
             let mut queues = self.table.0.queues[shard(key)].lock().unwrap();
             // Requeue owns the old/new buckets before updating this key. A
             // cancellation that raced that move retries the new bucket; it
             // cannot strand a cancelled ticket there or invert key/bucket locks.
-            if *self.ticket.key.lock().unwrap() != key {
+            if *ticket.key.lock().unwrap() != key {
                 continue;
             }
             if let Some(queue) = queues.get_mut(&key) {
-                queue.retain(|ticket| !Arc::ptr_eq(ticket, &self.ticket));
+                queue.retain(|queued| !Arc::ptr_eq(queued, ticket));
                 if queue.is_empty() {
                     queues.remove(&key);
                 }
@@ -221,13 +282,66 @@ impl Futexes {
             pid,
             pi_tid: 0,
             bits,
-            state: AtomicU8::new(WAITING),
-            target: Mutex::new(target),
+            decision: Decision::new(target),
+            index: None,
             key: Mutex::new(key),
         });
         queues.entry(key).or_default().push_back(ticket.clone());
         Ok(Arc::new(Wait {
             ticket,
+            members: Vec::new(),
+            table: self.clone(),
+        }))
+    }
+    pub fn wait_vector<E>(
+        &self,
+        keys: &[Key],
+        pid: u32,
+        target: Option<Weak<dyn Wake>>,
+        compare: impl FnOnce() -> Result<(), E>,
+    ) -> Result<Arc<Wait>, E> {
+        assert!(!keys.is_empty() && keys.len() <= 128);
+        let mut shards: Vec<_> = keys.iter().map(|&key| shard(key)).collect();
+        shards.sort_unstable();
+        shards.dedup();
+        // Same ascending bucket order as requeue/wake-op. Only the actual
+        // address buckets are held, and no callback runs while they are held.
+        let mut queues: BTreeMap<_, _> = shards
+            .into_iter()
+            .map(|index| (index, self.0.queues[index].lock().unwrap()))
+            .collect();
+        compare()?;
+        let decision = Arc::new(Outcome::new(target));
+        let tickets: Vec<_> = keys
+            .iter()
+            .enumerate()
+            .map(|(index, &key)| {
+                Arc::new(Ticket {
+                    pid,
+                    pi_tid: 0,
+                    bits: u32::MAX,
+                    decision: Decision::Vector(decision.clone()),
+                    index: Some(index as u32),
+                    key: Mutex::new(key),
+                })
+            })
+            .collect();
+        let ticket = tickets[0].clone();
+        decision
+            .original
+            .set(Arc::downgrade(&ticket))
+            .expect("new vector wait");
+        for (&key, ticket) in keys.iter().zip(&tickets) {
+            queues
+                .get_mut(&shard(key))
+                .unwrap()
+                .entry(key)
+                .or_default()
+                .push_back(ticket.clone());
+        }
+        Ok(Arc::new(Wait {
+            ticket,
+            members: tickets.into_iter().skip(1).collect(),
             table: self.clone(),
         }))
     }
@@ -262,11 +376,7 @@ impl Futexes {
             let Some(queue) = queues.get_mut(&key) else {
                 return Ok(Effect::default());
             };
-            if ordinary
-                && queue
-                    .iter()
-                    .any(|t| t.pi_tid != 0 && t.state.load(Ordering::Relaxed) == WAITING)
-            {
+            if ordinary && queue.iter().any(|t| t.pi_tid != 0 && t.state() == WAITING) {
                 return Err(trames_vfs::Errno(22));
             }
             queue.retain(|ticket| {
@@ -301,7 +411,7 @@ impl Futexes {
         use trames_vfs::Errno;
         let mut queues = self.0.queues[shard(key)].lock().unwrap();
         let queue = queues.entry(key).or_default();
-        queue.retain(|t| t.state.load(Ordering::Relaxed) == WAITING);
+        queue.retain(|t| t.state() == WAITING);
         if queue.iter().any(|t| t.pi_tid == 0) {
             return Err(Errno(22));
         }
@@ -339,13 +449,14 @@ impl Futexes {
             pid,
             pi_tid: tid,
             bits: u32::MAX,
-            state: AtomicU8::new(WAITING),
-            target: Mutex::new(target),
+            decision: Decision::new(target),
+            index: None,
             key: Mutex::new(key),
         });
         queue.push_back(ticket.clone());
         Ok(Some(Arc::new(Wait {
             ticket,
+            members: Vec::new(),
             table: self.clone(),
         })))
     }
@@ -361,7 +472,7 @@ impl Futexes {
         {
             let mut queues = self.0.queues[shard(key)].lock().unwrap();
             let queue = queues.entry(key).or_default();
-            queue.retain(|t| t.state.load(Ordering::Relaxed) == WAITING);
+            queue.retain(|t| t.state() == WAITING);
             if queue.iter().any(|t| t.pi_tid == 0) {
                 return Err(Errno(22));
             }
@@ -396,7 +507,15 @@ impl Futexes {
         let woken = selected.len() as u64;
         let mut unbound = Vec::new();
         for ticket in selected {
+            let ticket = match ticket.decision.original.get() {
+                Some(original) => match original.upgrade() {
+                    Some(ticket) => ticket,
+                    None => continue,
+                },
+                None => ticket,
+            };
             let target = ticket
+                .decision
                 .target
                 .lock()
                 .unwrap()
@@ -545,10 +664,9 @@ impl Futexes {
             let comparison = update()?;
             if let Some(error) = invalid {
                 let pi = |queues: &Queues, key| {
-                    queues.get(&key).is_some_and(|q| {
-                        q.iter()
-                            .any(|t| t.pi_tid != 0 && t.state.load(Ordering::Relaxed) == WAITING)
-                    })
+                    queues
+                        .get(&key)
+                        .is_some_and(|q| q.iter().any(|t| t.pi_tid != 0 && t.state() == WAITING))
                 };
                 if pi(&low, first)
                     || pi(&low, second)
@@ -631,7 +749,7 @@ impl Futexes {
                 let Some(ticket) = source.pop_front() else {
                     break;
                 };
-                if ticket.state.load(Ordering::Relaxed) != WAITING {
+                if ticket.state() != WAITING {
                     continue;
                 }
                 *ticket.key.lock().unwrap() = new;
@@ -649,10 +767,9 @@ impl Futexes {
             let mut second = (a != b).then(|| self.0.queues[hi].lock().unwrap());
             if let Some(error) = invalid {
                 let pi = |queues: &Queues, key| {
-                    queues.get(&key).is_some_and(|q| {
-                        q.iter()
-                            .any(|t| t.pi_tid != 0 && t.state.load(Ordering::Relaxed) == WAITING)
-                    })
+                    queues
+                        .get(&key)
+                        .is_some_and(|q| q.iter().any(|t| t.pi_tid != 0 && t.state() == WAITING))
                 };
                 if pi(&first, old)
                     || pi(&first, new)
@@ -668,7 +785,7 @@ impl Futexes {
                     select(queue, wake, &mut selected);
                     queue
                         .iter()
-                        .filter(|t| t.state.load(Ordering::Relaxed) == WAITING)
+                        .filter(|t| t.state() == WAITING)
                         .take(count as usize)
                         .count() as u64
                 } else {
@@ -834,6 +951,76 @@ impl Authority {
 #[cfg(all(test, trames_interpreter_conformance))]
 mod tests {
     use super::*;
+    #[test]
+    fn vector_wait_keeps_one_original_wake_and_cancels_all_members_after_requeue() {
+        let table = Futexes::default();
+        let keys = [(0, 7, 0x1000), (0, 7, 0x2004)];
+        let destination = (0, 7, 0x3008);
+        let wait = table
+            .wait_vector(&keys, 11, None, || Ok::<_, ()>(()))
+            .unwrap();
+        assert_eq!(
+            table
+                .requeue_regular(keys[0], destination, 0, 1, || Ok(()))
+                .unwrap()
+                .moved,
+            1
+        );
+        assert_eq!(table.wake(keys[1], 1, u32::MAX), 1);
+        assert!(wait.woken());
+        assert_eq!(wait.value(), 1);
+        // A second member cannot consume a wake or publish another task.
+        assert_eq!(table.wake(destination, 1, u32::MAX), 0);
+        let mut ready = Vec::new();
+        table.take_ready(&mut ready);
+        assert_eq!(ready.len(), 1);
+        assert!(Arc::ptr_eq(&ready[0], &wait.ticket));
+        drop(wait);
+        empty(&table);
+    }
+    #[test]
+    fn vector_wake_race_reports_the_claimed_member_and_never_consumes_two_wakes() {
+        let table = Futexes::default();
+        let keys = [(0, 8, 0x1000), (0, 8, 0x2004)];
+        let wait = table
+            .wait_vector(&keys, 12, None, || Ok::<_, ()>(()))
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let peers: Vec<_> = keys
+            .into_iter()
+            .map(|key| {
+                let (table, barrier) = (table.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    table.wake(key, 1, u32::MAX)
+                })
+            })
+            .collect();
+        barrier.wait();
+        let results: Vec<_> = peers.into_iter().map(|peer| peer.join().unwrap()).collect();
+        assert_eq!(results.iter().sum::<u64>(), 1);
+        assert_eq!(results[wait.value() as usize], 1);
+        assert!(!wait.timeout());
+        drop(wait);
+        empty(&table);
+    }
+    #[test]
+    fn vector_compare_failure_and_timeout_leave_no_member_that_can_consume_a_wake() {
+        let table = Futexes::default();
+        let keys = [(0, 9, 0x1000), (0, 9, 0x2004)];
+        assert!(table.wait_vector(&keys, 13, None, || Err(())).is_err());
+        empty(&table);
+        let wait = table
+            .wait_vector(&keys, 13, None, || Ok::<_, ()>(()))
+            .unwrap();
+        assert!(wait.timeout());
+        wait.cancel();
+        for key in keys {
+            assert_eq!(table.wake(key, 1, u32::MAX), 0);
+        }
+        drop(wait);
+        empty(&table);
+    }
     use std::{
         sync::{mpsc, Barrier},
         thread,
@@ -1116,10 +1303,7 @@ mod tests {
             assert_eq!(table.wake(new, 1, 1), 1);
             assert!(next_wait.woken());
             assert!(!owner_checkpoint.woken());
-            assert_eq!(
-                owner_checkpoint.ticket.state.load(Ordering::Relaxed),
-                CANCELLED
-            );
+            assert_eq!(owner_checkpoint.ticket.state(), CANCELLED);
             drop(owner_checkpoint);
             assert_eq!(table.wake(new, 1, 1), 0);
             drop(next_wait);
@@ -1139,7 +1323,7 @@ mod tests {
             let wait = register(&table, (0, i, 0x1000 + i * 4), 1, 1);
             let ticket = wait.ticket.clone();
             drop(wait);
-            assert_eq!(ticket.state.load(Ordering::Relaxed), CANCELLED);
+            assert_eq!(ticket.state(), CANCELLED);
         }
         empty(&table);
         assert_eq!(table.wake(key, u32::MAX, u32::MAX), 0);

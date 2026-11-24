@@ -1080,7 +1080,7 @@ mod tests {
     fn unknown_entries_complete_on_sources_with_one_policy_decision_and_original_diagnostics() {
         // Robust-list calls 99/100 are implemented; retain five genuinely
         // unsupported entries to exercise the original ENOSYS/filter path.
-        for number in [293u32, 294, 295, 0x7fff_ffff, u32::MAX] {
+        for number in [294u32, 295, 10000, 0x7fff_ffff, u32::MAX] {
             for policy in [None, Some(ALLOW), Some(0x5002a)] {
                 let mut p = super::super::tests::process();
                 let log = p.linux.vfs.kernel_log_capability();

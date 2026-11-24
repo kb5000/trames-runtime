@@ -1723,6 +1723,89 @@ fn mapped_data_sync_flushes_pages_without_timestamp_checkpoint() {
 }
 
 #[test]
+fn failed_synchronous_writes_keep_the_original_position_and_preserve_written_bytes() {
+    for (explicit_sync, owner_fallback) in [(false, false), (true, false), (true, true)] {
+        for append in [false, true] {
+            let dir = Temp::new();
+            let mut v = dir.open();
+            v.import_file(b"/data", b"base".to_vec()).unwrap();
+            let flags =
+                2 | if append { 0x400 } else { 0 } | if explicit_sync { 0x1000 } else { 0x101000 };
+            let fd = v.open_at(AT_FDCWD, b"/data", flags, 0).unwrap();
+            v.seek(fd, 1, 0).unwrap();
+            let original = v.shared_files().lookup(fd).unwrap().unwrap();
+            let disk = v.fs.borrow().disk.clone().unwrap();
+            disk.fail_directory_syncs(2);
+            if explicit_sync {
+                let target = original.clone().file_target().unwrap();
+                let command = FileCommand::WriteSync {
+                    bytes: b"XX".to_vec(),
+                    offset: None,
+                    data_only: false,
+                };
+                let reply = if owner_fallback {
+                    FileOutcome::Complete(FileWork::descriptor_owned(&mut v, target, command))
+                } else {
+                    FileWork::run_owned(&mut v, target, command)
+                };
+                assert!(matches!(
+                    reply,
+                    FileOutcome::Complete(FileReply {
+                        result: Err(Errno(5)),
+                        ..
+                    })
+                ));
+            } else {
+                assert_eq!(v.write(fd, b"XX"), Err(Errno(5)));
+            }
+            assert_eq!(original.open.file_position.snapshot(), 1);
+            assert_eq!(
+                v.seek(fd, 0, 1),
+                Ok(1),
+                "failed sync releases the original position transaction"
+            );
+            assert_eq!(
+                v.pread(fd, 16, 0).unwrap(),
+                if append {
+                    b"baseXX".to_vec()
+                } else {
+                    b"bXXe".to_vec()
+                }
+            );
+            v.sync_fd(fd, false).unwrap();
+            assert_eq!(
+                v.seek(fd, 0, 1),
+                Ok(1),
+                "a later fsync cannot commit the failed syscall's end"
+            );
+            if explicit_sync {
+                let target = original.clone().file_target().unwrap();
+                let command = FileCommand::WriteSync {
+                    bytes: b"Z".to_vec(),
+                    offset: None,
+                    data_only: false,
+                };
+                let reply = if owner_fallback {
+                    FileOutcome::Complete(FileWork::descriptor_owned(&mut v, target, command))
+                } else {
+                    FileWork::run_owned(&mut v, target, command)
+                };
+                assert!(matches!(
+                    reply,
+                    FileOutcome::Complete(FileReply {
+                        result: Ok(FileValue::Count(1)),
+                        ..
+                    })
+                ));
+            } else {
+                assert_eq!(v.write(fd, b"Z"), Ok(1));
+            }
+            assert_eq!(v.seek(fd, 0, 1), Ok(if append { 7 } else { 2 }));
+        }
+    }
+}
+
+#[test]
 fn directory_flushes_follow_mutations_and_retry_post_rename_errors() {
     let dir = Temp::new();
     let mut v = dir.open();
@@ -2012,7 +2095,7 @@ fn persistent_guest_cwd_is_reported_by_the_source_worker() {
     let queries = owner.path_queries();
     assert!(matches!(
         queries.namespace_attempt(NamespaceCall::Cwd),
-        NamespaceAttempt::Complete(Ok(FileValue::Bytes(path))) if path == b"/work\0"
+        NamespaceAttempt::Complete(FileReply { result: Ok(FileValue::Bytes(path)), .. }) if path == b"/work\0"
     ));
 }
 
@@ -2035,7 +2118,10 @@ fn socket_chown_on_disk_root_completes_on_source_without_filesystem_handoff() {
         empty: false,
     });
     match reply {
-        NamespaceAttempt::Complete(Ok(FileValue::Count(0))) => {}
+        NamespaceAttempt::Complete(FileReply {
+            result: Ok(FileValue::Count(0)),
+            ..
+        }) => {}
         _ => panic!("socket metadata escaped the current execution worker"),
     }
     assert_eq!(owner.socket_fd(fd).unwrap().inode_owner(), [1073, 0]);

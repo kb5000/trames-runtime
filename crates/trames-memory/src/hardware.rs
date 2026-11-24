@@ -77,7 +77,8 @@ impl Memory {
                 .map_or(0, |b| b.object.version()),
             exclusive: Arc::strong_count(&page.bytes) == 1,
             writable: page.permissions.write
-                && page.charge.resident()
+                && page.write_fault(base).is_none()
+                && page.charge.write_ready()
                 && Arc::strong_count(&page.bytes) == 1
                 && page.backing.as_ref().is_none_or(|b| b.private_copy),
         })
@@ -122,7 +123,11 @@ impl Memory {
                     access: Access::Write,
                 });
             }
-            page.charge.ensure()?;
+            if let Some(error) = page.write_fault(base) {
+                return Err(error);
+            }
+            page.prepare_source(base)?;
+            page.charge.ensure_write()?;
         }
         let same = page
             .bytes

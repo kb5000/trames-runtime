@@ -2,6 +2,12 @@
 //! Source-worker file calls and direct completion from the existing disk pool.
 use super::*;
 use std::sync::Mutex;
+#[path = "file_copyout.rs"]
+mod copyout;
+pub(super) use copyout::FileCopyout;
+#[cfg(test)]
+#[path = "file_copyout_tests.rs"]
+pub(super) mod copyout_tests;
 
 pub trait FileExecutor: Send + Sync {
     fn submit_file(&self, job: trames_vfs::FileWork, result: Arc<FileResult>);
@@ -47,6 +53,7 @@ impl FileResult {
     }
     pub fn fail(&self, errno: u32) {
         self.complete(trames_vfs::FileOutcome::Complete(trames_vfs::FileReply {
+            resources: Default::default(),
             result: Err(Errno(errno)),
             file_size_signal: false,
             scratch: None,
@@ -75,6 +82,7 @@ impl FileResult {
 
 #[derive(Clone)]
 pub enum FileOutput {
+    Directory(u64),
     Readlink(u64, u64),
     FuseStat(u32, [u64; 6]),
     None,
@@ -103,94 +111,11 @@ impl FileOutput {
         result: Result<trames_vfs::FileValue, Errno>,
         memory: &mut impl CpuMemory,
     ) -> Result<u64, Errno> {
-        match result? {
-            trames_vfs::FileValue::Transfer { count, from, to } => {
-                let Self::CopyOffsets {
-                    from: input,
-                    to: output,
-                } = self
-                else {
-                    unreachable!("accepted copy output")
-                };
-                if *input != 0 {
-                    memory
-                        .write(*input, &from.to_le_bytes())
-                        .map_err(|_| Errno(14))?;
-                }
-                if let Some(to) = to.filter(|_| *output != 0) {
-                    memory
-                        .write(*output, &to.to_le_bytes())
-                        .map_err(|_| Errno(14))?;
-                }
-                Ok(count)
-            }
-            trames_vfs::FileValue::Count(count) => Ok(count),
-            trames_vfs::FileValue::Bytes(bytes) => {
-                match self {
-                    Self::Readlink(address, capacity) => {
-                        let count = bytes.len().min(*capacity as usize);
-                        Linux::check(memory, *address, count, Access::Write)?;
-                        memory
-                            .write(*address, &bytes[..count])
-                            .map_err(|_| Errno(14))?;
-                        return Ok(count as u64);
-                    }
-                    Self::Scalar(address) => {
-                        memory.write(*address, &bytes).map_err(|_| Errno(14))?
-                    }
-                    Self::MountQuery { address, list } => {
-                        if !bytes.is_empty() {
-                            memory.write(*address, &bytes).map_err(|_| Errno(14))?;
-                        }
-                        return Ok(if *list { (bytes.len() / 8) as u64 } else { 0 });
-                    }
-                    Self::Vectors(parts) => Linux::scatter(memory, parts, &bytes)?,
-                    Self::Buffer {
-                        address,
-                        capacity,
-                        query_size,
-                        zero,
-                    } => {
-                        if !(*query_size && *capacity == 0) {
-                            if *capacity < bytes.len() as u64 {
-                                return Err(Errno(34));
-                            }
-                            Linux::check(memory, *address, bytes.len(), Access::Write)?;
-                            memory.write(*address, &bytes).map_err(|_| Errno(14))?;
-                        }
-                        return Ok(if *zero { 0 } else { bytes.len() as u64 });
-                    }
-                    _ => unreachable!("accepted read output"),
-                }
-                Ok(bytes.len() as u64)
-            }
-            trames_vfs::FileValue::FuseStat(stat, mount) => {
-                if let Self::Stat(address) = self {
-                    Linux::check(memory, *address, 128, Access::Write)?;
-                    memory.write(*address, &stat).map_err(|_| Errno(14))?;
-                    return Ok(0);
-                }
-                let Self::FuseStat(number, args) = self else {
-                    unreachable!("FUSE metadata output")
-                };
-                if *number == 291 {
-                    Linux::finish_statx(*args, memory, stat, mount)
-                } else {
-                    let address = if *number == 80 { args[1] } else { args[2] };
-                    Linux::check(memory, address, 128, Access::Write)?;
-                    memory.write(address, &stat).map_err(|_| Errno(14))?;
-                    Ok(0)
-                }
-            }
-            trames_vfs::FileValue::Stat(stat) => {
-                let Self::Stat(address) = self else {
-                    unreachable!("accepted stat output")
-                };
-                Linux::check(memory, *address, 128, Access::Write)?;
-                memory.write(*address, &stat).map_err(|_| Errno(14))?;
-                Ok(0)
-            }
-        }
+        // Standalone synchronous embeddings retain their existing errno API.
+        // Scheduler paths use FilePending and retain the accepted copy cursor.
+        FileCopyout::new(self, result)
+            .progress(memory)
+            .unwrap_or(Err(Errno(14)))
     }
 }
 #[derive(Clone)]
@@ -199,8 +124,18 @@ pub struct FilePending {
     pub output: FileOutput,
     _target: Option<trames_vfs::FileTarget>,
     waiting: Option<Arc<Mutex<Option<trames_vfs::FileWork>>>>,
+    copyout: Option<Arc<Mutex<FileCopyout>>>,
 }
 impl FilePending {
+    fn copyout(copy: FileCopyout) -> Self {
+        Self {
+            result: Arc::default(),
+            output: FileOutput::None,
+            _target: None,
+            waiting: None,
+            copyout: Some(Arc::new(Mutex::new(copy))),
+        }
+    }
     pub fn fuse_interrupt_needed(&self) -> bool {
         self.waiting.as_ref().is_some_and(|w| {
             w.lock()
@@ -225,7 +160,7 @@ impl FilePending {
             w.lock()
                 .unwrap()
                 .as_ref()
-                .is_some_and(|w| !w.waits_for_fuse())
+                .is_some_and(trames_vfs::FileWork::interruptible_wait)
         })
     }
     pub(super) fn native_wait_fds(&self) -> Vec<trames_vfs::HostFd> {
@@ -246,6 +181,7 @@ impl FilePending {
             output,
             _target: target.into(),
             waiting: None,
+            copyout: None,
         }
     }
 }
@@ -293,6 +229,7 @@ pub(super) struct PreparedFileCall {
 }
 enum PreparedAction {
     Fifo(trames_vfs::FifoOpen),
+    Copyout(Box<FileCopyout>),
     Byte(RetainedByte),
     Socket(RetainedSocket),
     Owner {
@@ -329,7 +266,7 @@ impl DirectSyscalls {
     pub fn file_call(number: u32) -> bool {
         namespace::supported(number)
             || crate::file_advice::entry(number)
-            || matches!(number, 45..=47 | 56 | 62..=71 | 76..=77 | 80..=84 | 227 | 267 | 285..=287 | 437)
+            || matches!(number, 45..=47 | 56 | 61..=71 | 76..=77 | 80..=84 | 227 | 267 | 285..=287 | 437)
     }
     pub fn file_entry(number: u32, args: [u64; 6]) -> bool {
         number == 57 || Self::file_call(number) || number == 25 && matches!(args[1], 1033 | 1034)
@@ -407,6 +344,9 @@ impl DirectSyscalls {
             return self.start_prepared_file(number, args, memory, pid, target);
         }
         if number == 45 {
+            if args[1] > i64::MAX as u64 {
+                return Some(IoAttempt::Complete(Err(Errno(22))));
+            }
             if self.file_prepared(number, args) {
                 return self.start_prepared_file(number, args, memory, pid, target);
             }
@@ -426,7 +366,7 @@ impl DirectSyscalls {
         if let Some(value) = self.invoke_file_io(number, args, memory) {
             return Some(IoAttempt::Complete(value));
         }
-        if matches!(number, 56 | 437) {
+        if matches!(number, 56 | 61 | 437) {
             if let Some(value) = self.invoke_path(number, args, memory) {
                 return Some(IoAttempt::Complete(value));
             }
@@ -530,7 +470,7 @@ impl DirectSyscalls {
                         self.prepare_fifo_open(number, args, open);
                         return None;
                     }
-                    return Some(self.finish_file_reply(reply, output, memory));
+                    return self.finish_file_reply(number, args, reply, output, memory);
                 }
                 trames_vfs::FileOutcome::Complete(reply) => PreparedAction::Reply { reply, output },
                 trames_vfs::FileOutcome::Layout(work) => PreparedAction::Layout { work, output },
@@ -556,15 +496,18 @@ impl DirectSyscalls {
     ) -> Option<Result<u64, Errno>> {
         let paths = self.paths.as_ref()?;
         if let Some(result) = target.proc_io_local(&command, memory) {
-            return Some(self.finish_file_reply(
+            return self.finish_file_reply(
+                number,
+                args,
                 trames_vfs::FileReply {
+                    resources: trames_vfs::FileResources::file(&target),
                     result,
                     file_size_signal: false,
                     scratch: None,
                 },
                 output,
                 memory,
-            ));
+            );
         }
         let action = if target.host_work(&command) {
             PreparedAction::Host {
@@ -576,7 +519,7 @@ impl DirectSyscalls {
                 trames_vfs::FileOutcome::Complete(reply)
                     if !reply.file_size_signal || self.task_signal.is_some() =>
                 {
-                    return Some(self.finish_file_reply(reply, output, memory));
+                    return self.finish_file_reply(number, args, reply, output, memory);
                 }
                 trames_vfs::FileOutcome::Complete(reply) => PreparedAction::Reply { reply, output },
                 trames_vfs::FileOutcome::Layout(work) => PreparedAction::Layout { work, output },
@@ -591,26 +534,12 @@ impl DirectSyscalls {
         });
         None
     }
-    fn complete_file_attempt(
-        &self,
-        reply: trames_vfs::FileReply,
-        output: FileOutput,
-        memory: &mut impl CpuMemory,
-    ) -> IoAttempt {
-        let owner_signal = reply.file_size_signal && self.task_signal.is_none();
-        let value = self.finish_file_reply(reply, output, memory);
-        if owner_signal {
-            IoAttempt::FileCheckpoint(FileCheckpoint::new(FileBoundary::Signal { value }))
-        } else {
-            IoAttempt::Complete(value)
-        }
-    }
-    fn finish_file_reply(
+    fn accept_file_reply(
         &self,
         mut reply: trames_vfs::FileReply,
         output: FileOutput,
-        memory: &mut impl CpuMemory,
-    ) -> Result<u64, Errno> {
+    ) -> FileCopyout {
+        let signal_owner = reply.file_size_signal && self.task_signal.is_none();
         if reply.file_size_signal {
             if let Some(task) = &self.task_signal {
                 task.raise(25);
@@ -622,13 +551,105 @@ impl DirectSyscalls {
         self.completed.set(self.completed.get() + 1);
         self.file_completed.set(self.file_completed.get() + 1);
         let transfer = matches!(output, FileOutput::CopyOffsets { .. } | FileOutput::Write);
-        let result = output.apply(reply.result, memory);
-        if transfer && result == Err(Errno(32)) {
+        if transfer && matches!(&reply.result, Err(Errno(32))) {
             if let Some(task) = &self.task_signal {
                 task.raise(13);
             }
         }
-        result
+        let mut copy = FileCopyout::new(&output, reply.result).retain(reply.resources);
+        copy.signal_owner = signal_owner;
+        copy
+    }
+    #[allow(clippy::too_many_arguments)] // Original accepted ABI and source notification context.
+    fn complete_file_attempt(
+        &self,
+        reply: trames_vfs::FileReply,
+        output: FileOutput,
+        number: u32,
+        args: [u64; 6],
+        memory: &mut impl CpuMemory,
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+    ) -> IoAttempt {
+        self.deliver_copyout(
+            self.accept_file_reply(reply, output),
+            number,
+            args,
+            memory,
+            pid,
+            target,
+        )
+    }
+    fn copyout_value(signal_owner: bool, value: Result<u64, Errno>) -> IoAttempt {
+        if signal_owner {
+            IoAttempt::FileCheckpoint(FileCheckpoint::new(FileBoundary::Signal { value }))
+        } else {
+            IoAttempt::Complete(value)
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn deliver_copyout(
+        &self,
+        mut copy: FileCopyout,
+        number: u32,
+        args: [u64; 6],
+        memory: &mut impl CpuMemory,
+        pid: u32,
+        target: &Weak<dyn IoWake>,
+    ) -> IoAttempt {
+        match copy.progress(memory) {
+            Ok(value) => Self::copyout_value(copy.signal_owner, value),
+            Err(fault) => {
+                let signal = IoSignal::new(pid, target.clone());
+                Self::park_copyout(
+                    FilePending::copyout(copy),
+                    fault,
+                    number,
+                    args,
+                    signal,
+                    target,
+                )
+            }
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn park_copyout(
+        pending: FilePending,
+        fault: trames_memory::PageFault,
+        number: u32,
+        args: [u64; 6],
+        signal: Arc<IoSignal>,
+        target: &Weak<dyn IoWake>,
+    ) -> IoAttempt {
+        signal.reset();
+        let subscriptions = vec![fault.wait.subscribe(&signal)];
+        if fault.wait.ready() {
+            signal.notify();
+        }
+        Self::wait_file(pending, number, args, signal, subscriptions, target)
+    }
+    /// Immediate file entry can defer before handing its result to the event
+    /// path. Store the original result/cursor, never the operation to replay.
+    pub(super) fn finish_file_reply(
+        &self,
+        number: u32,
+        args: [u64; 6],
+        reply: trames_vfs::FileReply,
+        output: FileOutput,
+        memory: &mut impl CpuMemory,
+    ) -> Option<Result<u64, Errno>> {
+        let mut copy = self.accept_file_reply(reply, output);
+        match copy.progress(memory) {
+            Ok(value) => Some(value),
+            Err(_) => {
+                *self.file_prepared.borrow_mut() = Some(PreparedFileCall {
+                    number,
+                    args,
+                    action: PreparedAction::Copyout(Box::new(copy)),
+                });
+                None
+            }
+        }
     }
     pub(super) fn file_prepared(&self, number: u32, args: [u64; 6]) -> bool {
         self.file_prepared
@@ -649,6 +670,9 @@ impl DirectSyscalls {
         }
         let accepted = self.file_prepared.borrow_mut().take().unwrap();
         Some(match accepted.action {
+            PreparedAction::Copyout(copy) => {
+                self.deliver_copyout(*copy, number, args, memory, pid, target)
+            }
             PreparedAction::Fifo(open) => self.start_fifo_open(open, number, args, pid, target),
             PreparedAction::Socket(call) => self.start_retained_socket(call, memory, pid, target),
             PreparedAction::Byte(file) => {
@@ -664,7 +688,7 @@ impl DirectSyscalls {
                 if let Some(open) = self.fifo_reply(number, &reply) {
                     return Some(self.start_fifo_open(open, number, args, pid, target));
                 }
-                self.complete_file_attempt(reply, output, memory)
+                self.complete_file_attempt(reply, output, number, args, memory, pid, target)
             }
             PreparedAction::Owner { work, output } => {
                 IoAttempt::FileCheckpoint(FileCheckpoint::new(FileBoundary::Owner { work, output }))
@@ -766,7 +790,10 @@ impl DirectSyscalls {
             if !vfs.namespace_host_work() {
                 // All instruction views are joined here. Use the original
                 // caller VFS directly, as before worker admission existed.
-                return Some(IoAttempt::Complete(output.apply(call.execute(vfs), memory)));
+                let reply = trames_vfs::FileReply::capture(|| call.execute(vfs));
+                return Some(
+                    self.complete_file_attempt(reply, output, number, args, memory, pid, target),
+                );
             }
             let work = vfs.path_queries().namespace_work(call);
             if let Some(value) = self.prepare_filesystem_work(number, args, work, output, memory) {
@@ -775,6 +802,9 @@ impl DirectSyscalls {
             return self.start_prepared_file(number, args, memory, pid, target);
         }
         if number == 45 {
+            if args[1] > i64::MAX as u64 {
+                return Some(IoAttempt::Complete(Err(Errno(22))));
+            }
             let path = match Linux::path(memory, args[0]) {
                 Ok(path) => path,
                 Err(error) => return Some(IoAttempt::Complete(Err(error))),
@@ -870,7 +900,7 @@ impl DirectSyscalls {
                 Err(error) => return Some(IoAttempt::Complete(Err(fd_error(number, args, error)))),
             };
             if matches!(number, 63..=70 | 286 | 287) {
-                if let Some(target) = original.nonbyte_target() {
+                if let Some(file_target) = original.nonbyte_target() {
                     let (command, output) = match import(
                         number,
                         args,
@@ -883,9 +913,13 @@ impl DirectSyscalls {
                         Err(error) => return Some(IoAttempt::Complete(Err(error))),
                     };
                     return Some(self.complete_file_attempt(
-                        trames_vfs::FileWork::descriptor_owned(vfs, target, command),
+                        trames_vfs::FileWork::descriptor_owned(vfs, file_target, command),
                         output,
+                        number,
+                        args,
                         memory,
+                        pid,
+                        target,
                     ));
                 }
             }
@@ -925,12 +959,17 @@ impl DirectSyscalls {
         if let Some(result) = file.proc_io_local(&command, memory) {
             return Some(self.complete_file_attempt(
                 trames_vfs::FileReply {
+                    resources: trames_vfs::FileResources::file(&file),
                     result,
                     file_size_signal: false,
                     scratch: None,
                 },
                 output,
+                number,
+                args,
                 memory,
+                pid,
+                target,
             ));
         }
         Some(if file.host_work_owned(&command) {
@@ -946,7 +985,7 @@ impl DirectSyscalls {
         } else {
             match trames_vfs::FileWork::run_owned(vfs, file, command) {
                 trames_vfs::FileOutcome::Complete(reply) => {
-                    self.complete_file_attempt(reply, output, memory)
+                    self.complete_file_attempt(reply, output, number, args, memory, pid, target)
                 }
                 trames_vfs::FileOutcome::Waiting(work) => {
                     self.submit_file_work(work, output, number, args, memory, pid, target)
@@ -966,6 +1005,16 @@ impl DirectSyscalls {
         memory: &mut impl CpuMemory,
         target: &Weak<dyn IoWake>,
     ) -> IoAttempt {
+        if let Some(copy) = &pending.copyout {
+            let (value, signal_owner) = {
+                let mut copy = copy.lock().unwrap();
+                (copy.progress(memory), copy.signal_owner)
+            };
+            return match value {
+                Ok(value) => Self::copyout_value(signal_owner, value),
+                Err(fault) => Self::park_copyout(pending, fault, number, args, signal, target),
+            };
+        }
         let waiting = pending
             .waiting
             .as_ref()
@@ -995,7 +1044,15 @@ impl DirectSyscalls {
                 if let Some(open) = self.fifo_reply(number, &reply) {
                     return self.start_fifo_open(open, number, args, signal.pid, target);
                 }
-                self.complete_file_attempt(reply, pending.output, memory)
+                self.complete_file_attempt(
+                    reply,
+                    pending.output,
+                    number,
+                    args,
+                    memory,
+                    signal.pid,
+                    target,
+                )
             }
             Some(trames_vfs::FileOutcome::Owner(work)) => {
                 IoAttempt::FileCheckpoint(FileCheckpoint::new(FileBoundary::Owner {
@@ -1420,7 +1477,7 @@ impl DirectSyscalls {
                 };
                 let reply =
                     trames_vfs::FileWork::descriptor_reply(self.paths.as_ref()?, target, command);
-                return Some(self.finish_file_reply(reply, output, memory));
+                return self.finish_file_reply(number, a, reply, output, memory);
             }
         };
         let (mut command, output) = match import(
@@ -1441,9 +1498,9 @@ impl DirectSyscalls {
         let result = fast.as_ref().and_then(|file| {
             use trames_vfs::{FileCommand as Command, FileValue as Value};
             match &command {
-                Command::Read { count, offset } => file
-                    .read(*count, *offset, &mut self.disk_cache.borrow_mut())
-                    .map(|r| r.map(Value::Bytes)),
+                Command::Read { count, offset } => {
+                    file.read_reply(*count, *offset, &mut self.disk_cache.borrow_mut())
+                }
                 Command::Write { bytes, offset } => file
                     .write(bytes, *offset, &mut self.disk_cache.borrow_mut())
                     .map(|r| r.map(|n| Value::Count(n as u64))),
@@ -1463,15 +1520,20 @@ impl DirectSyscalls {
                 trames_vfs::FileCommand::Write { bytes, .. } => Some(std::mem::take(bytes)),
                 _ => None,
             };
-            return Some(self.finish_file_reply(
+            return self.finish_file_reply(
+                number,
+                a,
                 trames_vfs::FileReply {
+                    resources: fast
+                        .as_ref()
+                        .map_or_else(Default::default, |file| file.output_resources(&result)),
                     result,
                     file_size_signal: false,
                     scratch,
                 },
                 output,
                 memory,
-            ));
+            );
         }
         self.prepare_file_fallback(number, a, target?, command, output, memory)
     }

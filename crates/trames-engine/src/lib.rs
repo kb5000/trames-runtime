@@ -31,6 +31,17 @@ pub enum CpuFault {
         code: i32,
     },
 }
+impl CpuFault {
+    pub fn pending_page(&self) -> Option<&trames_memory::PageFault> {
+        match self {
+            Self::Memory {
+                error: MemoryError::Pending(fault),
+                ..
+            } => Some(fault),
+            _ => None,
+        }
+    }
+}
 impl fmt::Display for CpuFault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

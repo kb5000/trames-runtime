@@ -970,9 +970,29 @@ fn queued_file_read_reserves_its_selected_buffer_and_copies_out_on_the_source() 
     let (work, result) = receive.recv_timeout(Duration::from_secs(2)).unwrap();
     assert!(receive.try_recv().is_err());
     assert_eq!(m.read_array::<16>(0x3000).unwrap(), [0; 16]);
+    m.unmap(0x3000, trames_memory::PAGE_SIZE).unwrap();
+    let page = crate::direct::file::copyout_tests::install(&mut m, 0x3000);
     std::thread::spawn(move || result.complete(work.run()))
         .join()
         .unwrap();
+    assert!(matches!(
+        enter(&d, fd, 0, 0, &mut m, &t),
+        IoAttempt::Complete(Ok(0))
+    ));
+    assert_eq!(
+        r.state.lock().unwrap().tail,
+        r.load_queue(64),
+        "no CQ before output is ready"
+    );
+    assert!(
+        !r.state.lock().unwrap().busy_groups.is_empty(),
+        "selected buffer stays leased through its page wait"
+    );
+    assert!(
+        receive.try_recv().is_err(),
+        "copyout cannot submit another file read"
+    );
+    page.finish();
     assert!(matches!(
         enter(&d, fd, 0, 0, &mut m, &t),
         IoAttempt::Complete(Ok(0))

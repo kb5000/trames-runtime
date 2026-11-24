@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Persistent inode attributes, including the original guest POSIX ACL policy.
 use super::*;
-type AttributeNode = (NodeRef, FsHandle);
+enum AttributeNode {
+    Stored(NodeRef, FsHandle),
+    #[cfg(all(feature = "hostfs", unix))]
+    Host(hostfs::XattrTarget),
+}
 pub(super) const XATTR_BUDGET: usize = 1024 * 1024;
 pub(super) fn trusted_attribute(name: &[u8]) -> bool {
     name.strip_prefix(b"trusted.")
@@ -16,27 +20,90 @@ impl Vfs {
         fd: i32,
         path: Option<&[u8]>,
         follow: bool,
-        write: bool,
+        call: fuse::XattrCall<'_>,
     ) -> Result<AttributeNode> {
+        let write = matches!(call, fuse::XattrCall::Write { .. });
         if let Some(path) = path {
-            let at = self.resolve_final(fd, path, follow)?;
+            let target = self.metadata_target(fd, path, follow)?;
+            if !write {
+                crate::output_resources::OutputScope::path(&target.path);
+                crate::output_resources::OutputScope::retain(|| target.clone());
+            }
+            if let Some(mount) = target.path.mount.as_ref().filter(|m| m.fs.fuse.is_some()) {
+                self.defer_fuse_xattr(
+                    &mount.shared,
+                    target.node.clone(),
+                    None,
+                    call,
+                    self.event_link(&target.path, &target.node),
+                )?;
+                return Ok(AttributeNode::Stored(target.node, mount.fs.clone()));
+            }
+            let at = target.path;
             #[cfg(all(feature = "hostfs", unix))]
             if at.filesystem(self).host.is_some() {
-                return Err(Errno(95));
+                let file = target
+                    ._magic
+                    .as_ref()
+                    .and_then(|m| {
+                        m.host_file
+                            .clone()
+                            .or_else(|| m.file.as_ref()?.host_file.clone())
+                    })
+                    .or_else(|| at.host_position.as_ref()?.known_file())
+                    .map_or_else(|| target.node.host.get().ok_or(Errno(95))?.pin_path(), Ok)?;
+                let link = self.event_link(&at, &target.node);
+                return hostfs::XattrTarget::new(
+                    target.node,
+                    file,
+                    at.mount.as_ref().map(|m| m.shared.as_ref()),
+                    link,
+                    write,
+                )
+                .map(AttributeNode::Host);
             }
             if write {
                 at.writable()?;
             }
-            Ok((self.node(&at)?, at.filesystem(self)))
+            Ok(AttributeNode::Stored(target.node, at.filesystem(self)))
         } else {
-            let open_descriptor = self.descriptor(fd as u32)?;
-            let open = open_descriptor.open.borrow();
-            #[cfg(all(feature = "hostfs", unix))]
-            if open.mount.as_ref().is_some_and(|m| m.fs.host.is_some()) {
-                return Err(Errno(95));
+            let descriptor = self.descriptor(fd as u32)?;
+            if !write {
+                crate::output_resources::OutputScope::retain(|| descriptor.clone());
             }
+            let open = descriptor.open.borrow();
             if open.flags.get() & O_PATH != 0 {
                 return Err(Errno(9));
+            }
+            if let Some(mount) = open.mount.as_ref().filter(|m| m.fs.fuse.is_some()) {
+                let file = match &open.control {
+                    Some(events::SharedControl::FuseFile(file)) => Some(file.clone()),
+                    _ => None,
+                };
+                let node = open
+                    .node
+                    .clone()
+                    .or_else(|| file.as_ref()?.inode())
+                    .ok_or(Errno(95))?;
+                self.defer_fuse_xattr(
+                    mount,
+                    node.clone(),
+                    file,
+                    call,
+                    open.notification.as_ref().and_then(|n| n.link.clone()),
+                )?;
+                return Ok(AttributeNode::Stored(node, mount.fs.clone()));
+            }
+            #[cfg(all(feature = "hostfs", unix))]
+            if open.mount.as_ref().is_some_and(|m| m.fs.host.is_some()) {
+                return hostfs::XattrTarget::new(
+                    open.node.clone().ok_or(Errno(95))?,
+                    open.host_file.clone().ok_or(Errno(95))?,
+                    open.mount.as_deref(),
+                    open.notification.as_ref().and_then(|n| n.link.clone()),
+                    write,
+                )
+                .map(AttributeNode::Host);
             }
             if write
                 && open
@@ -46,7 +113,7 @@ impl Vfs {
             {
                 return Err(Errno(30));
             }
-            Ok((
+            Ok(AttributeNode::Stored(
                 open.node.clone().ok_or(Errno(95))?,
                 open.mount
                     .as_ref()
@@ -54,16 +121,17 @@ impl Vfs {
             ))
         }
     }
-    fn xattr_allowed(&self, node: &Node, name: &[u8], write: bool) -> Result<()> {
-        if name.is_empty() {
+    fn xattr_name(name: &[u8]) -> Result<()> {
+        if name.is_empty() || name.len() > 255 {
             return Err(Errno(34));
         }
         if name.contains(&0) {
             return Err(Errno(22));
         }
-        if name.len() > 255 {
-            return Err(Errno(34));
-        }
+        Ok(())
+    }
+    pub(super) fn xattr_allowed(&self, node: &Node, name: &[u8], write: bool) -> Result<()> {
+        // Public get/set import and validate the name before resolving an inode.
         if name == file_caps::NAME {
             if write
                 && !self
@@ -137,33 +205,71 @@ impl Vfs {
         follow: bool,
         name: &[u8],
     ) -> Result<Vec<u8>> {
-        let (node, _) = self.xattr_node(fd, path, follow, false)?;
-        let n = node.borrow();
-        self.xattr_allowed(&n, name, false)?;
-        if name == file_caps::NAME {
-            return n
-                .file_caps()
-                .ok_or(Errno(61))?
-                .encode(&self.credentials.user_namespace);
+        match self.read_xattrs(fd, path, follow, Some(name), 65536)? {
+            FileValue::Bytes(bytes) => Ok(bytes),
+            _ => unreachable!(),
         }
-        n.xattrs.get(name).cloned().ok_or(Errno(61))
     }
     pub fn list_xattrs(&self, fd: i32, path: Option<&[u8]>, follow: bool) -> Result<Vec<u8>> {
-        let (node, _) = self.xattr_node(fd, path, follow, false)?;
-        let n = node.borrow();
-        let mut names: Vec<u8> = n
-            .xattrs
-            .keys()
-            .filter(|name| {
-                !name.starts_with(b"trusted.") || self.credentials.has_cap(capabilities::SYS_ADMIN)
-            })
-            .flat_map(|k| k.iter().copied().chain([0]))
-            .collect();
-        if n.file_caps().is_some() {
-            names.extend(file_caps::NAME);
-            names.push(0);
+        match self.read_xattrs(fd, path, follow, None, 65536)? {
+            FileValue::Bytes(bytes) => Ok(bytes),
+            _ => unreachable!(),
         }
-        Ok(names)
+    }
+    pub(crate) fn read_xattrs(
+        &self,
+        fd: i32,
+        path: Option<&[u8]>,
+        follow: bool,
+        name: Option<&[u8]>,
+        capacity: u64,
+    ) -> Result<FileValue> {
+        if let Some(name) = name {
+            Self::xattr_name(name)?;
+        }
+        let node =
+            match self.xattr_node(fd, path, follow, fuse::XattrCall::Read { name, capacity })? {
+                AttributeNode::Stored(node, _) => node,
+                #[cfg(all(feature = "hostfs", unix))]
+                AttributeNode::Host(target) => {
+                    let value = target.read(self, name, capacity);
+                    crate::output_resources::OutputScope::retain(|| target);
+                    return value;
+                }
+            };
+        let n = node.borrow();
+        let bytes = if let Some(name) = name {
+            self.xattr_allowed(&n, name, false)?;
+            if name == file_caps::NAME {
+                n.file_caps()
+                    .ok_or(Errno(61))?
+                    .encode(&self.credentials.user_namespace)?
+            } else {
+                n.xattrs.get(name).cloned().ok_or(Errno(61))?
+            }
+        } else {
+            let mut names: Vec<u8> = n
+                .xattrs
+                .keys()
+                .filter(|name| {
+                    !name.starts_with(b"trusted.")
+                        || self.credentials.has_cap(capabilities::SYS_ADMIN)
+                })
+                .flat_map(|k| k.iter().copied().chain([0]))
+                .collect();
+            if n.file_caps().is_some() {
+                names.extend(file_caps::NAME);
+                names.push(0);
+            }
+            names
+        };
+        if capacity == 0 {
+            return Ok(FileValue::Count(bytes.len() as u64));
+        }
+        if bytes.len() as u64 > capacity.min(65536) {
+            return Err(Errno(34));
+        }
+        Ok(FileValue::Bytes(bytes))
     }
     pub fn set_xattr(
         &mut self,
@@ -180,7 +286,22 @@ impl Vfs {
         if value.is_some_and(|v| v.len() > 65536) {
             return Err(Errno(7));
         }
-        let (node, fs) = self.xattr_node(fd, path, follow, true)?;
+        Self::xattr_name(name)?;
+        let (node, fs) = match self.xattr_node(
+            fd,
+            path,
+            follow,
+            fuse::XattrCall::Write { name, value, flags },
+        )? {
+            AttributeNode::Stored(node, fs) => (node, fs),
+            #[cfg(all(feature = "hostfs", unix))]
+            AttributeNode::Host(target) => return target.write(self, name, value, flags),
+        };
+        // A successful FUSE return here is a validated default-ACL no-op.
+        // Real daemon requests return the internal deferred result above.
+        if fs.fuse.is_some() {
+            return Ok(());
+        }
         // This original filesystem-wide attribute budget and its checkpoint
         // must commit/roll back together. No ordinary byte/metadata read uses
         // this namespace transaction guard.

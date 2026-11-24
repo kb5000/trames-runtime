@@ -229,6 +229,7 @@ pub struct IoTask {
     lifecycle: std::sync::OnceLock<Arc<crate::task_control::Group>>,
     cgroup: std::sync::OnceLock<trames_vfs::CgroupTask>,
     thread_addresses: std::sync::OnceLock<Arc<trames_execution::ThreadAddresses>>,
+    pub rseq: crate::rseq::Rseq,
     parentage: std::sync::OnceLock<Arc<crate::task_parent::Parentage>>,
     family: std::sync::OnceLock<Arc<crate::family::Family>>,
     terminal_task: std::sync::OnceLock<Weak<dyn trames_vfs::TerminalTask>>,
@@ -276,6 +277,7 @@ impl Default for IoTask {
             lifecycle: Default::default(),
             cgroup: Default::default(),
             thread_addresses: Default::default(),
+            rseq: Default::default(),
             parentage: Default::default(),
             family: Default::default(),
             terminal_task: Default::default(),
@@ -569,10 +571,12 @@ impl IoTask {
         }
     }
     pub fn exit(&self) {
+        self.rseq.clear();
         self.trace_thread_exit(0);
         self.lifecycle()
             .retire(self.pid.load(Ordering::Relaxed), || {
-                self.live.store(false, Ordering::Relaxed)
+                self.live.store(false, Ordering::Relaxed);
+                self.proc_view.retire_perf();
             });
     }
     pub fn begin_exit(self: &Arc<Self>, pid: u32, status: i32) {
@@ -585,7 +589,8 @@ impl IoTask {
         let retired = self
             .lifecycle()
             .begin_exit(pid, self, status, true, || {
-                self.live.store(false, Ordering::Relaxed)
+                self.live.store(false, Ordering::Relaxed);
+                self.proc_view.retire_perf();
             })
             .is_some();
         if retired && pid != self.tgid() {
@@ -595,7 +600,8 @@ impl IoTask {
     }
     pub fn try_exit(self: &Arc<Self>, pid: u32, status: i32) -> Option<bool> {
         let last = self.lifecycle().begin_exit(pid, self, status, false, || {
-            self.live.store(false, Ordering::Relaxed)
+            self.live.store(false, Ordering::Relaxed);
+            self.proc_view.retire_perf();
         });
         if last.is_some() && pid != self.tgid() {
             self.trace_thread_exit(status);

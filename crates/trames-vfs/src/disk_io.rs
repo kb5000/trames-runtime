@@ -112,6 +112,7 @@ impl Drop for DiskRead {
     fn drop(&mut self) {
         if !self.positioned {
             self.position.lock().unwrap().pending -= 1;
+            self.position.notify_pending();
         }
     }
 }

@@ -135,6 +135,8 @@ impl Vfs {
                 label,
                 mount: self.mount_for_path(open.mount.as_ref()),
                 file: Some(open.shared.clone()),
+                #[cfg(all(feature = "hostfs", unix))]
+                host_file: open.host_file.clone(),
                 _image: None,
                 _directory: None,
             }
@@ -154,6 +156,8 @@ impl Vfs {
                             .unwrap_or_else(|_| resolved.key.clone()),
                         mount: resolved.mount,
                         file: None,
+                        #[cfg(all(feature = "hostfs", unix))]
+                        host_file: None,
                         _image: None,
                         _directory: None,
                     }

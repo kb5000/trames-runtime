@@ -6,7 +6,42 @@ use std::sync::atomic::AtomicUsize;
 
 #[derive(Clone)]
 pub struct FileTarget(pub(super) SharedFd);
+enum ProcReadOutcome {
+    Complete(Result<FileValue>),
+    Waiting(Vec<proc_file::ProcWait>),
+}
+impl ProcReadOutcome {
+    fn new(result: proc_file::ProcRead, position: Option<crate::read_reply::FileRead>) -> Self {
+        match result {
+            proc_file::ProcRead::Complete(result) => {
+                Self::Complete(result.map(|bytes| match position {
+                    Some(position) => FileValue::Read(ReadReply::new(bytes, position)),
+                    None => FileValue::Bytes(bytes),
+                }))
+            }
+            proc_file::ProcRead::Waiting(pages) => Self::Waiting(pages),
+        }
+    }
+}
 impl FileTarget {
+    /// Prepare one original FUSE file page for an embedding's PageBacking.
+    /// This retains its OFD and cache charge, but does not admit mmap or shared
+    /// writeback. First load needs the existing worker's FileActorScope.
+    pub fn page_source(&self, offset: u64) -> Result<Option<Arc<dyn trames_memory::PageSource>>> {
+        let Some(events::SharedControl::FuseFile(file)) = &self.0.open.control else {
+            return Ok(None);
+        };
+        file.page_source(self.0.clone(), offset).map(Some)
+    }
+
+    fn daemon_backed(&self) -> bool {
+        matches!(
+            self.0.open.control,
+            Some(events::SharedControl::FuseFile(_))
+        ) || self.0.open.node.as_ref().is_some_and(|node| {
+            node.fuse_directory.get().is_some() || node.fuse_leaf.get().is_some()
+        })
+    }
     fn proc_memory_command(&self, command: &FileCommand) -> bool {
         self.0
             .open
@@ -20,23 +55,23 @@ impl FileTarget {
                     | FileCommand::Read { .. }
             )
     }
-    fn proc_position_command(&self, command: &FileCommand) -> bool {
+    fn position_command(&self, command: &FileCommand) -> bool {
         matches!(
             command,
             FileCommand::Read { offset: None, .. }
                 | FileCommand::Write { offset: None, .. }
                 | FileCommand::WriteSync { offset: None, .. }
                 | FileCommand::Seek { .. }
-        ) && self
-            .0
-            .open
-            .runtime_file
-            .as_ref()
-            .is_some_and(|f| f.is_memory())
+        ) && (self.0.open.is_regular_file()
+            || self
+                .0
+                .open
+                .runtime_file
+                .as_ref()
+                .is_some_and(|f| f.is_memory()))
     }
-    fn proc_position_busy(&self, command: &FileCommand) -> bool {
-        self.proc_position_command(command)
-            && self.0.open.file_position.lock().unwrap().pending != 0
+    fn position_busy(&self, command: &FileCommand) -> bool {
+        self.position_command(command) && self.0.open.file_position.lock().unwrap().pending != 0
     }
 
     pub fn read_zero_device(&self, copy: impl FnOnce() -> Result<u64>) -> Option<Result<u64>> {
@@ -54,7 +89,7 @@ impl FileTarget {
         self.0.open.is_regular_file() && !self.unsigned_offsets()
     }
 
-    fn proc_read(&self, command: &FileCommand) -> Option<proc_file::ProcRead> {
+    fn proc_read(&self, command: &FileCommand) -> Option<ProcReadOutcome> {
         let FileCommand::Read { count, offset } = command else {
             return None;
         };
@@ -64,27 +99,30 @@ impl FileTarget {
             return None;
         }
         if !fd_can_read(open.flags.get()) {
-            return Some(proc_file::ProcRead::Complete(Err(Errno(9))));
+            return Some(ProcReadOutcome::Complete(Err(Errno(9))));
         }
         if let Some(offset) = offset {
-            return Some(if *offset > i64::MAX as u64 && !file.is_memory() {
-                proc_file::ProcRead::Complete(Err(Errno(22)))
-            } else {
-                file.read_payload(*offset, *count)
-            });
+            return Some(ProcReadOutcome::new(
+                if *offset > i64::MAX as u64 && !file.is_memory() {
+                    proc_file::ProcRead::Complete(Err(Errno(22)))
+                } else {
+                    file.read_payload(*offset, *count)
+                },
+                None,
+            ));
         }
-        let mut position = open.file_position.lock().unwrap();
-        if position.pending != 0 {
-            return Some(proc_file::ProcRead::Waiting(Vec::new()));
-        }
-        let result = file.read_payload(position.value, *count);
-        if let proc_file::ProcRead::Complete(Ok(bytes)) = &result {
-            position.value += bytes.len() as u64;
-        }
-        Some(result)
+        let position = match crate::read_reply::FileRead::begin(self.0.clone()) {
+            Ok(position) => position,
+            Err(Errno(11)) => return Some(ProcReadOutcome::Waiting(Vec::new())),
+            Err(error) => return Some(ProcReadOutcome::Complete(Err(error))),
+        };
+        Some(ProcReadOutcome::new(
+            file.read_payload(position.offset, *count),
+            Some(position),
+        ))
     }
     fn waits(&self, command: &FileCommand) -> bool {
-        if self.proc_position_command(command) {
+        if self.position_command(command) {
             return true;
         }
         if self.0.open.console.get().is_some()
@@ -172,16 +210,9 @@ impl FileTarget {
                 .read_local(*offset, *count, memory)
                 .map(|r| r.map(FileValue::Bytes));
         }
-        let mut position = open.file_position.lock().unwrap();
-        if position.pending != 0 {
-            return None;
-        }
-        file.read_local(position.value, *count, memory).map(|r| {
-            r.map(|bytes| {
-                position.value += bytes.len() as u64;
-                FileValue::Bytes(bytes)
-            })
-        })
+        let position = crate::read_reply::FileRead::begin(self.0.clone()).ok()?;
+        file.read_local(position.offset, *count, memory)
+            .map(|result| result.map(|bytes| FileValue::Read(ReadReply::new(bytes, position))))
     }
     pub fn status_flags(&self) -> u32 {
         self.0.open.flags.get()
@@ -281,7 +312,7 @@ impl FileTarget {
             FileCommand::Copy { .. } => true,
             FileCommand::Transfer(transfer) => transfer.borrow().host_work(),
             FileCommand::Seek { .. } => persistent,
-            FileCommand::Stat => false,
+            FileCommand::Stat | FileCommand::ReadDirectory { .. } => false,
             FileCommand::Seals(add) => add.is_some_and(|add| add & 8 != 0) && data.mapped_work(),
             FileCommand::Read { .. } => persistent,
             FileCommand::Write { .. } | FileCommand::WriteSync { .. } => persistent,
@@ -342,6 +373,9 @@ impl SharedFd {
 }
 
 pub enum FileCommand {
+    ReadDirectory {
+        count: usize,
+    },
     Seals(Option<u32>),
     Read {
         count: usize,
@@ -387,6 +421,8 @@ pub enum FileCommand {
     },
 }
 pub enum FileValue {
+    Read(ReadReply),
+    Directory(fuse::DirectoryReply),
     FuseStat([u8; 128], StatMount),
     Stat([u8; 128]),
     Transfer {
@@ -399,6 +435,7 @@ pub enum FileValue {
 }
 pub struct FileReply {
     pub result: Result<FileValue>,
+    pub resources: FileResources,
     pub file_size_signal: bool,
     pub scratch: Option<Vec<u8>>,
 }
@@ -409,8 +446,8 @@ pub enum FileOutcome {
     /// A mapping-layout boundary. A copy retains its committed prefix, current
     /// offsets and accepted input for the chunk awaiting the layout change.
     Layout(FileWork),
-    /// A namespace call met an original owner-only task/proc/mount resource,
-    /// before effects. Its copied operands and accepted shared FDs survive.
+    /// A namespace call or accepted pathname continuation reached an original
+    /// owner-only resource before effects. Its original operands/resources survive.
     Owner(FileWork),
 }
 pub struct FileWork {
@@ -444,11 +481,16 @@ impl ProcMemory {
         if self.writing {
             FileValue::Count(self.done as u64)
         } else {
-            FileValue::Bytes(std::mem::take(&mut self.output))
+            let bytes = std::mem::take(&mut self.output);
+            match self.position.take() {
+                Some(position) => FileValue::Read(ReadReply::new(bytes, position)),
+                None => FileValue::Bytes(bytes),
+            }
         }
     }
 }
 struct ProcPosition {
+    _file: SharedFd,
     position: Arc<file_data::FilePosition>,
     offset: u64,
     committed: AtomicUsize,
@@ -456,6 +498,11 @@ struct ProcPosition {
 impl ProcPosition {
     fn record(&self, count: usize) {
         self.committed.store(count, Ordering::Relaxed);
+    }
+}
+impl crate::read_reply::CommitRead for Arc<ProcPosition> {
+    fn commit(&self, copied: usize) {
+        self.record(copied);
     }
 }
 impl Drop for ProcPosition {
@@ -501,16 +548,27 @@ impl FileWork {
         target: FileTarget,
         mut command: FileCommand,
     ) -> FileReply {
+        let scope = crate::output_resources::OutputScope::enter();
+        command.retain_output_inputs();
+        let original = target.0.clone();
         let result = paths.retained_control(target.0, |vfs, fd| command.execute(vfs, fd));
         Self::descriptor_result(result, &mut command)
+            .retain_file(Some(original))
+            .retain_output(scope.finish())
     }
     pub fn descriptor_owned(
         vfs: &mut Vfs,
         target: FileTarget,
         mut command: FileCommand,
     ) -> FileReply {
-        let result = vfs.with_uring_fd(&target.0.retained(), |vfs, fd| command.execute(vfs, fd));
+        let scope = crate::output_resources::OutputScope::enter();
+        command.retain_output_inputs();
+        let result = vfs.with_uring_fd(&target.0.clone().retained(), |vfs, fd| {
+            command.execute(vfs, fd)
+        });
         Self::descriptor_result(result, &mut command)
+            .retain_file(Some(target.0))
+            .retain_output(scope.finish())
     }
     fn descriptor_result(result: Result<FileValue>, command: &mut FileCommand) -> FileReply {
         let scratch = match command {
@@ -520,6 +578,7 @@ impl FileWork {
             _ => None,
         };
         FileReply {
+            resources: Default::default(),
             result,
             file_size_signal: false,
             scratch,
@@ -532,21 +591,31 @@ impl FileWork {
             .or_else(|| self.namespace.as_ref().and_then(|ns| ns.fuse_request()))
     }
     pub fn waits_for_fuse(&self) -> bool {
-        self.fuse_request().is_some()
+        self.fuse_request()
+            .and_then(|p| p.daemon_request())
+            .is_some()
+    }
+    pub fn interruptible_wait(&self) -> bool {
+        // These are original inode/OFD mutex transactions. Caught handlers
+        // cannot cross their retained operation and replay its source inputs.
+        self.fuse_request().is_none()
+            && !self
+                .target
+                .as_ref()
+                .is_some_and(|target| target.position_busy(&self.command))
+            && !self
+                .position_wait()
+                .is_some_and(|file| file.waiting_for(&self.command))
     }
     pub fn fuse_interrupt_needed(&self) -> bool {
         self.fuse_request().is_some_and(|p| p.needs_interrupt())
     }
     pub fn fuse_signal_request(&self) -> Option<Arc<fuse::Request>> {
-        self.fuse_request().map(|p| p.request.clone())
+        self.fuse_request()
+            .and_then(|p| p.daemon_request())
+            .cloned()
     }
     fn position_wait(&self) -> Option<&fuse::File> {
-        if !matches!(
-            self.command,
-            FileCommand::Read { offset: None, .. } | FileCommand::Write { offset: None, .. }
-        ) {
-            return None;
-        }
         let target = self.target.as_ref()?;
         if let Some(events::SharedControl::FuseFile(file)) = &target.0.open.control {
             Some(file)
@@ -559,7 +628,7 @@ impl FileWork {
             || self
                 .target
                 .as_ref()
-                .is_some_and(|t| t.proc_position_busy(&self.command))
+                .is_some_and(|t| t.position_busy(&self.command))
         {
             return true;
         }
@@ -571,7 +640,7 @@ impl FileWork {
             return !p.ready();
         }
         if let Some(file) = self.position_wait() {
-            return file.busy();
+            return file.waiting_for(&self.command);
         }
         if self.console_wait().is_some() {
             return !self.ready();
@@ -587,7 +656,7 @@ impl FileWork {
         if self
             .target
             .as_ref()
-            .is_some_and(|t| t.proc_position_busy(&self.command))
+            .is_some_and(|t| t.position_busy(&self.command))
         {
             return false;
         }
@@ -599,7 +668,7 @@ impl FileWork {
             return p.ready();
         }
         if let Some(file) = self.position_wait() {
-            return !file.busy();
+            return !file.waiting_for(&self.command);
         }
         if let Some((console, writing)) = self.console_wait() {
             return console
@@ -624,11 +693,10 @@ impl FileWork {
                 deadline: None,
             });
         }
-        if let Some(target) = self
-            .target
-            .as_ref()
-            .filter(|t| t.proc_position_busy(&self.command))
-        {
+        if let Some(target) = self.target.as_ref().filter(|t| {
+            t.position_command(&self.command)
+                && !matches!(t.0.open.control, Some(events::SharedControl::FuseFile(_)))
+        }) {
             return Ok(TransferWait {
                 subscriptions: vec![target.0.open.file_position.subscribe_pending(signal)],
                 native: Vec::new(),
@@ -645,14 +713,14 @@ impl FileWork {
         }
         if let Some(p) = &self.fuse_stat {
             return Ok(TransferWait {
-                subscriptions: vec![p.subscribe(signal)],
+                subscriptions: p.subscribe(signal).into_iter().collect(),
                 native: vec![],
                 deadline: None,
             });
         }
         if let Some(file) = self.position_wait() {
             return Ok(TransferWait {
-                subscriptions: vec![file.subscribe_position(signal)],
+                subscriptions: file.subscribe_operation(&self.command, signal),
                 native: vec![],
                 deadline: None,
             });
@@ -690,14 +758,15 @@ impl FileWork {
             }),
         }
     }
-    fn proc_outcome(result: proc_file::ProcRead, work: impl FnOnce() -> Self) -> FileOutcome {
+    fn proc_outcome(result: ProcReadOutcome, work: impl FnOnce() -> Self) -> FileOutcome {
         match result {
-            proc_file::ProcRead::Complete(result) => FileOutcome::Complete(FileReply {
-                result: result.map(FileValue::Bytes),
+            ProcReadOutcome::Complete(result) => FileOutcome::Complete(FileReply {
+                resources: Default::default(),
+                result,
                 file_size_signal: false,
                 scratch: None,
             }),
-            proc_file::ProcRead::Waiting(pages) => {
+            ProcReadOutcome::Waiting(pages) => {
                 let mut work = work();
                 work.proc_wait = pages;
                 FileOutcome::Waiting(work)
@@ -742,17 +811,51 @@ impl FileWork {
             ..Self::sync_all(paths)
         }
     }
+    /// A pathname continuation rejoins its original published metadata at the
+    /// existing owner checkpoint, then returns to ordinary scheduling. It may
+    /// encounter another daemon or native stage and must keep the same work.
+    pub fn resume_owner(mut self, vfs: &mut Vfs) -> FileOutcome {
+        if self
+            .fuse_stat
+            .as_ref()
+            .is_some_and(|pending| pending.owner_work())
+            || self
+                .namespace
+                .as_ref()
+                .is_some_and(|pending| pending.owner_work())
+        {
+            self.paths
+                .view
+                .borrow_mut()
+                .query
+                .as_mut()
+                .unwrap()
+                .joined_owner = true;
+            if let Some(pending) = &mut self.fuse_stat {
+                pending.join_owner();
+            }
+            if let Some(pending) = &mut self.namespace {
+                pending.join_owner();
+            }
+            FileOutcome::Waiting(self)
+        } else {
+            FileOutcome::Complete(self.run_owner(vfs))
+        }
+    }
     pub fn run_owner(self, vfs: &mut Vfs) -> FileReply {
+        let scope = crate::output_resources::OutputScope::enter();
         let result = self
             .namespace
             .as_ref()
             .expect("retained namespace owner call")
             .run_owner(&self.paths, vfs);
         FileReply {
+            resources: Default::default(),
             result,
             file_size_signal: false,
             scratch: None,
         }
+        .retain_output(scope.finish())
     }
     pub fn sync_all(paths: PathQueries) -> Self {
         Self {
@@ -773,13 +876,18 @@ impl FileWork {
         }
     }
     pub fn host_work(&self) -> bool {
-        if self.target.as_ref().is_some_and(|t| {
-            t.proc_memory_command(&self.command) || t.proc_position_busy(&self.command)
-        }) {
+        if self
+            .target
+            .as_ref()
+            .is_some_and(|t| t.proc_memory_command(&self.command) || t.position_busy(&self.command))
+        {
             return false;
         }
 
-        if self.fuse_stat.is_some() || self.linger.is_some() {
+        if let Some(pending) = &self.fuse_stat {
+            return pending.host_work();
+        }
+        if self.linger.is_some() {
             return false;
         }
         if let Some(namespace) = &self.namespace {
@@ -874,8 +982,19 @@ impl FileWork {
     }
     /// Joined caller execution, with the same original VFS ownership contract.
     /// As for Vfs::truncate_fd, layout mutation requires joined execution Views.
-    pub fn run_owned(vfs: &mut Vfs, target: FileTarget, mut command: FileCommand) -> FileOutcome {
-        if target.proc_memory_command(&command) || target.proc_position_busy(&command) {
+    pub fn run_owned(vfs: &mut Vfs, target: FileTarget, command: FileCommand) -> FileOutcome {
+        let scope = crate::output_resources::OutputScope::enter();
+        let original = target.0.clone();
+        Self::run_owned_inner(vfs, target, command)
+            .retain_file(Some(original))
+            .retain_output(scope.finish())
+    }
+    fn run_owned_inner(vfs: &mut Vfs, target: FileTarget, mut command: FileCommand) -> FileOutcome {
+        command.retain_output_inputs();
+        if target.proc_memory_command(&command)
+            || target.position_busy(&command)
+            || target.daemon_backed()
+        {
             return Self::from_vfs(vfs, target, command).run();
         }
 
@@ -894,6 +1013,7 @@ impl FileWork {
             _ => None,
         };
         FileOutcome::Complete(FileReply {
+            resources: Default::default(),
             result,
             file_size_signal: signal,
             scratch,
@@ -902,15 +1022,24 @@ impl FileWork {
     pub fn run_inline(
         paths: &PathQueries,
         target: FileTarget,
+        command: FileCommand,
+    ) -> FileOutcome {
+        let scope = crate::output_resources::OutputScope::enter();
+        let original = target.0.clone();
+        Self::run_inline_inner(paths, target, command)
+            .retain_file(Some(original))
+            .retain_output(scope.finish())
+    }
+    fn run_inline_inner(
+        paths: &PathQueries,
+        target: FileTarget,
         mut command: FileCommand,
     ) -> FileOutcome {
-        if target.proc_memory_command(&command) || target.proc_position_busy(&command) {
+        command.retain_output_inputs();
+        if target.proc_memory_command(&command) || target.position_busy(&command) {
             return Self::new(paths, target, command).run();
         }
-        if matches!(
-            target.0.open.control,
-            Some(events::SharedControl::FuseFile(_))
-        ) {
+        if target.daemon_backed() {
             return Self::new(paths, target, command).run();
         }
         if let Some(result) = target.proc_read(&command) {
@@ -928,6 +1057,7 @@ impl FileWork {
                     _ => None,
                 };
                 FileOutcome::Complete(FileReply {
+                    resources: Default::default(),
                     result,
                     file_size_signal: signal,
                     scratch,
@@ -999,6 +1129,7 @@ impl FileWork {
             let position = if offset.is_none() {
                 state.pending += 1;
                 Some(Arc::new(ProcPosition {
+                    _file: target.0.clone(),
                     position: open.file_position.clone(),
                     offset: address,
                     committed: AtomicUsize::new(0),
@@ -1033,9 +1164,6 @@ impl FileWork {
             io.done += n;
             if !io.writing {
                 io.output.extend(data);
-                if let Some(position) = &io.position {
-                    position.record(io.done);
-                }
             }
             if n < io.expected || io.done == io.requested {
                 return Some(Ok(Some(io.value())));
@@ -1084,11 +1212,20 @@ impl FileWork {
             Err(_) => Some(Err(Errno(5))),
         }
     }
-    pub fn run(mut self) -> FileOutcome {
+    pub fn run(self) -> FileOutcome {
+        let scope = crate::output_resources::OutputScope::enter();
+        let original = self.target.as_ref().map(|target| target.0.clone());
+        self.run_inner()
+            .retain_file(original)
+            .retain_output(scope.finish())
+    }
+    fn run_inner(mut self) -> FileOutcome {
+        self.command.retain_output_inputs();
         if let Some(result) = self.proc_memory_step() {
             return match result {
                 Ok(None) => FileOutcome::Waiting(self),
                 result => FileOutcome::Complete(FileReply {
+                    resources: Default::default(),
                     result: result.map(Option::unwrap),
                     file_size_signal: false,
                     scratch: None,
@@ -1098,7 +1235,7 @@ impl FileWork {
         if self
             .target
             .as_ref()
-            .is_some_and(|t| t.proc_position_busy(&self.command))
+            .is_some_and(|t| t.position_busy(&self.command))
         {
             return FileOutcome::Waiting(self);
         }
@@ -1106,6 +1243,7 @@ impl FileWork {
         if let Some(wait) = &self.linger {
             return if wait.ready() {
                 FileOutcome::Complete(FileReply {
+                    resources: Default::default(),
                     result: Ok(FileValue::Count(0)),
                     file_size_signal: false,
                     scratch: None,
@@ -1114,11 +1252,50 @@ impl FileWork {
                 FileOutcome::Waiting(self)
             };
         }
+        if self
+            .fuse_stat
+            .as_ref()
+            .is_some_and(|pending| pending.owner_work())
+        {
+            return FileOutcome::Owner(self);
+        }
         if let Some(p) = &mut self.fuse_stat {
-            return match p.take() {
+            let value = p.take(&mut self.paths.view.borrow_mut());
+            if matches!(&value, Some(Err(_))) {
+                let open = {
+                    let view = self.paths.view.borrow();
+                    let query = view.query.as_ref().unwrap();
+                    query
+                        .take_deferred()
+                        .then(|| query.prepared.borrow_mut().open.take())
+                        .flatten()
+                };
+                if let Some(open) = open {
+                    if let FileCommand::Truncate(length) = self.command {
+                        // A daemon symlink/magic link reached an ordinary file.
+                        // Keep its accepted inode, drop the unused reservation,
+                        // and enter the ordinary layout-aware truncate path.
+                        return FileWork::new(
+                            &self.paths,
+                            open.target.clone(),
+                            FileCommand::Truncate(length),
+                        )
+                        .run();
+                    }
+                    let mut next =
+                        FileWork::new(&self.paths, open.target.clone(), FileCommand::TruncateOpen);
+                    next.open = Some(Box::new(open));
+                    return next.run();
+                }
+            }
+            if value.as_ref().is_some_and(FileResources::needed) {
+                p.retain_output();
+            }
+            return match value {
                 Some(result) => FileOutcome::Complete(FileReply {
+                    resources: Default::default(),
                     result,
-                    file_size_signal: false,
+                    file_size_signal: self.paths.view.borrow().take_file_size_signal(),
                     scratch: None,
                 }),
                 None => FileOutcome::Waiting(self),
@@ -1126,19 +1303,41 @@ impl FileWork {
         }
         if let Some(target) = &self.target {
             if let Some(events::SharedControl::FuseFile(file)) = &target.0.open.control {
-                let pending = file.operation(
-                    &self.paths.view.borrow(),
-                    &self.command,
-                    &target.0.open.file_position,
-                );
+                if let FileCommand::Seek { offset, whence } = self.command {
+                    return match file.seek(&target.0.open.file_position, offset, whence) {
+                        Ok(None) => FileOutcome::Waiting(self),
+                        result => FileOutcome::Complete(FileReply {
+                            resources: Default::default(),
+                            result: result.map(|value| FileValue::Count(value.unwrap())),
+                            file_size_signal: false,
+                            scratch: None,
+                        }),
+                    };
+                }
+                let pending = if matches!(
+                    self.command,
+                    FileCommand::Truncate(_) | FileCommand::TruncateOpen
+                ) && target.0.open.landlock_denied & landlock::TRUNCATE != 0
+                {
+                    Err(Errno(13))
+                } else {
+                    file.operation(&self.paths.view.borrow(), &self.command, &target.0)
+                };
                 return match pending {
                     Ok(op) => {
                         self.fuse_stat = op.map(Box::new);
-                        FileOutcome::Waiting(self)
+                        if self.fuse_stat.as_ref().is_some_and(|pending| {
+                            pending.daemon_request().is_none() && pending.ready()
+                        }) {
+                            self.run_inner()
+                        } else {
+                            FileOutcome::Waiting(self)
+                        }
                     }
                     Err(error) => FileOutcome::Complete(FileReply {
+                        resources: Default::default(),
                         result: Err(error),
-                        file_size_signal: false,
+                        file_size_signal: self.paths.view.borrow().take_file_size_signal(),
                         scratch: None,
                     }),
                 };
@@ -1155,6 +1354,7 @@ impl FileWork {
             return match namespace.run(&self.paths) {
                 namespace_work::NamespaceRun::Complete(result) => {
                     FileOutcome::Complete(FileReply {
+                        resources: Default::default(),
                         result,
                         file_size_signal: false,
                         scratch: None,
@@ -1185,10 +1385,35 @@ impl FileWork {
                 false,
             ))
         };
+        if reply.is_none() {
+            let pending = self
+                .paths
+                .view
+                .borrow()
+                .query
+                .as_ref()
+                .unwrap()
+                .prepared
+                .borrow_mut()
+                .fuse
+                .take();
+            if let Some(pending) = pending {
+                // An original descriptor can require daemon metadata without
+                // having an opened FUSE file handle (notably O_PATH roots).
+                // Keep this request; a layout retry would issue it again.
+                self.fuse_stat = Some(pending);
+                return FileOutcome::Waiting(self);
+            }
+        }
         match reply {
             Some((mut result, signal)) => {
                 if result.as_ref().is_err_and(|e| e.0 == 11)
-                    && (self.console_wait().is_some() || self.waiting())
+                    && (self.console_wait().is_some()
+                        || self.waiting()
+                        || self.target.as_ref().is_some_and(|target| {
+                            matches!(self.command, FileCommand::Read { offset: None, .. })
+                                && target.position_command(&self.command)
+                        }))
                 {
                     return FileOutcome::Waiting(self);
                 }
@@ -1206,6 +1431,7 @@ impl FileWork {
                     _ => None,
                 };
                 FileOutcome::Complete(FileReply {
+                    resources: Default::default(),
                     result,
                     file_size_signal: signal,
                     scratch,
@@ -1216,10 +1442,41 @@ impl FileWork {
     }
 }
 impl PathQueries {
+    pub fn fuse_file_work(&self, fd: u32, command: FileCommand) -> Option<Result<FileWork>> {
+        let view = self.view.borrow();
+        let descriptor = match view.descriptor(fd) {
+            Ok(descriptor) => descriptor,
+            Err(error) => return Some(Err(error)),
+        };
+        if !matches!(
+            descriptor.open.borrow().control,
+            Some(events::SharedControl::FuseFile(_))
+        ) {
+            return None;
+        }
+        let target = SharedFd::new(descriptor.open.borrow().shared.clone()).filesystem_target();
+        Some(Ok(FileWork::from_vfs(&view, target, command)))
+    }
     pub fn truncate_path_work(&self, path: &[u8], length: u64) -> Option<Result<FileWork>> {
+        if length > i64::MAX as u64 {
+            return Some(Err(Errno(22)));
+        }
         let mut view = self.view.borrow_mut();
         view.query.as_ref().unwrap().clear_deferred();
-        let result = view.open_at_resolve_published::<true>(AT_FDCWD, path, 1, 0, 0, None);
+        let result = view
+            .resolve_entry_operation(
+                AT_FDCWD,
+                path,
+                true,
+                true,
+                0,
+                true,
+                Some(ResolveOperation::Fuse(fuse::PathOperation::Truncate(
+                    length,
+                ))),
+                None,
+            )
+            .and_then(|entry| view.prepare_path_truncate(entry, length));
         let query = view.query.as_ref().unwrap();
         let accepted = query.prepared.borrow_mut().open.take();
         if let Some(open) = accepted {
@@ -1230,6 +1487,32 @@ impl PathQueries {
                 open.target.clone(),
                 FileCommand::Truncate(length),
             )));
+        }
+        let pending = {
+            let mut prepared = query.prepared.borrow_mut();
+            prepared
+                .fuse
+                .take()
+                .or_else(|| {
+                    prepared
+                        .owner_continuation
+                        .take()
+                        .map(|walk| Box::new(fuse::Metadata::continuation(&view, walk, true)))
+                })
+                .or_else(|| {
+                    prepared
+                        .continuation
+                        .take()
+                        .map(|walk| Box::new(fuse::Metadata::continuation(&view, walk, false)))
+                })
+        };
+        if let Some(pending) = pending {
+            query.take_deferred();
+            drop(view);
+            let mut work = FileWork::sync_all(self.retain_context());
+            work.command = FileCommand::Truncate(length);
+            work.fuse_stat = Some(pending);
+            return Some(Ok(work));
         }
         if query.take_deferred() {
             None
@@ -1334,7 +1617,12 @@ impl PathQueries {
             view.uts = original.uts.clone();
         }
         view.pid = original.pid;
-        if matches!(open.control, Some(events::SharedControl::FuseFile(_))) {
+        if matches!(open.control, Some(events::SharedControl::FuseFile(_)))
+            || open
+                .mount
+                .as_ref()
+                .is_some_and(|mount| mount.fs.fuse.is_some())
+        {
             view.pid_ns = original.pid_ns.clone();
         }
         view.lock_owner = original.lock_owner;
@@ -1365,8 +1653,59 @@ impl PathQueries {
         (!authority.take_deferred()).then_some((result, signal))
     }
 }
+impl Vfs {
+    /// One accepted pathname entry. FUSE needs SETATTR, not a temporary daemon
+    /// OPEN or an FD slot. Ordinary files retain their existing layout-aware
+    /// FileWork path and hidden OFD; no name is replayed after a daemon wait.
+    pub(super) fn prepare_path_truncate(
+        &mut self,
+        entry: ResolvedEntry,
+        length: u64,
+    ) -> Result<u32> {
+        let target = self.metadata_target_resolved(entry.clone())?;
+        if let Some((mount, fs)) = target
+            .path
+            .mount
+            .as_ref()
+            .and_then(|m| m.fs.fuse.as_ref().map(|fs| (m, fs)))
+        {
+            if self.landlock_denied(&target.path, Some(&target.node), landlock::TRUNCATE)? != 0 {
+                return Err(Errno(13));
+            }
+            let operation = fuse::Metadata::path_size(
+                self,
+                &mount.shared,
+                fs,
+                target.node.clone(),
+                length,
+                self.event_link(&target.path, &target.node),
+            )?;
+            let query = self.query.as_ref().ok_or(Errno(95))?;
+            query.prepared.borrow_mut().fuse = Some(Box::new(operation));
+            return query.defer();
+        }
+        let files = self
+            .query
+            .as_ref()
+            .map_or_else(|| self.shared_files(), |q| q.files.clone());
+        let reservation = files.reserve()?;
+        self.open_resolved::<true>(entry, 1, 0, None, reservation)
+    }
+}
 
 impl FileCommand {
+    fn retain_output_inputs(&self) {
+        match self {
+            Self::Copy { input, .. } => {
+                crate::output_resources::OutputScope::retain(|| input.0.clone())
+            }
+            Self::Transfer(transfer) => crate::output_resources::OutputScope::retain(|| {
+                let transfer = transfer.borrow();
+                (transfer.input.clone(), transfer.output.clone())
+            }),
+            _ => {}
+        }
+    }
     /// Data operations use the accepted OFD directly. In particular, a short
     /// joined call does not allocate/swap a private files_struct just to reach
     /// the same resource, and close/reuse cannot retarget an accepted call.
@@ -1406,6 +1745,17 @@ impl FileCommand {
             Self::Read {
                 count,
                 offset: None,
+            } if *count != 0 && target.regular_file() => {
+                if !fd_can_read(target.0.open.flags.get()) {
+                    return Err(Errno(9));
+                }
+                let position = crate::read_reply::FileRead::begin(target.0.clone())?;
+                v.pread_description(&descriptor, *count, position.offset)
+                    .map(|bytes| FileValue::Read(ReadReply::new(bytes, position)))
+            }
+            Self::Read {
+                count,
+                offset: None,
             } => v
                 .read_description(&descriptor, *count)
                 .map(FileValue::Bytes),
@@ -1425,10 +1775,11 @@ impl FileCommand {
                 {
                     return Err(Errno(22));
                 }
-                let count = v.file_write_description(&descriptor, bytes, *offset)?;
-                if let Self::WriteSync { data_only, .. } = self {
-                    v.sync_description(&descriptor, *data_only)?;
-                }
+                let count = if let Self::WriteSync { data_only, .. } = self {
+                    v.file_write_sync_description(&descriptor, bytes, *offset, *data_only)?
+                } else {
+                    v.file_write_description(&descriptor, bytes, *offset)?
+                };
                 Ok(FileValue::Count(count as u64))
             }
             Self::Seek { offset, whence } => {
@@ -1446,6 +1797,7 @@ impl FileCommand {
     fn execute(&self, v: &mut Vfs, fd: u32) -> Result<FileValue> {
         match self {
             FileCommand::Transfer(transfer) => transfer.borrow_mut().execute(v),
+            FileCommand::ReadDirectory { count } => v.getdents(fd, *count).map(FileValue::Bytes),
             FileCommand::Copy { input, transfer } => v.with_file_peer(input, |v, input| {
                 transfer.borrow_mut().execute(v, input, fd)
             }),
@@ -1476,6 +1828,21 @@ impl FileCommand {
                 offset,
                 data_only,
             } => {
+                let descriptor = v.descriptor(fd)?;
+                let ordinary = descriptor
+                    .open
+                    .borrow()
+                    .node
+                    .as_ref()
+                    .is_some_and(|node| matches!(node.borrow().content, Content::File(_)));
+                if ordinary {
+                    if offset.is_some_and(|offset| offset > i64::MAX as u64) {
+                        return Err(Errno(22));
+                    }
+                    return v
+                        .file_write_sync_description(&descriptor, bytes, *offset, *data_only)
+                        .map(|count| FileValue::Count(count as u64));
+                }
                 let n = if let Some(offset) = offset {
                     v.pwrite(fd, bytes, *offset)?
                 } else {
@@ -1701,6 +2068,7 @@ impl FileCopy {
                     v.file_write_description_inner::<true>(
                         &out,
                         bytes,
+                        None,
                         None,
                         (from, chunk),
                         &mut offered,

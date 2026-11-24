@@ -226,12 +226,16 @@ impl Vfs {
                         };
                         reply.u64(
                             64,
-                            (flags & 15) | atime | (u64::from(flags & MS_NODIRATIME != 0) << 7),
+                            (flags & 15)
+                                | atime
+                                | (u64::from(flags & MS_NODIRATIME != 0) << 7)
+                                | (u64::from(flags & MS_NOSYMFOLLOW != 0) << 21),
                         );
                         let shared = state.shared.as_ref().map_or(0, |g| g.id);
                         let master = state.master.as_ref().map_or(0, |g| g.id);
-                        let propagation =
-                            (u64::from(shared != 0) << 20) | (u64::from(master != 0) << 19);
+                        let propagation = (u64::from(shared != 0) << 20)
+                            | (u64::from(master != 0) << 19)
+                            | (u64::from(state.unbindable) << 17);
                         reply.u64(
                             72,
                             if propagation == 0 {

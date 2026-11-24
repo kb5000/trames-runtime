@@ -89,7 +89,7 @@ def main():
     subprocess.run(args,check=True)
     from run import SUITES
     if manifest:
-        targets=[s['target'] for s in manifest['suites']]+[s['target'] for s in manifest['runfiles'] if 'target' in s]
+        targets=[s['target'] for s in manifest['suites']]+[s.get('build_target',s['target']) for s in manifest['runfiles'] if 'target' in s]
         result=subprocess.run(['cmake','--build',str(root/'build'),'--parallel',str(a.jobs),'--target',*targets,'--','-k','0'])
         suites=[s['name'] for s in manifest['suites']]
     else:

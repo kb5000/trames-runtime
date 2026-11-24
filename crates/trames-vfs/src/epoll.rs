@@ -335,6 +335,7 @@ pub(super) fn control(
             t.anonymous,
             Some(
                 events::Anonymous::Event(_)
+                    | events::Anonymous::Perf(_)
                     | events::Anonymous::Timer(_)
                     | events::Anonymous::Inotify(_)
                     | events::Anonymous::Uring(_)

@@ -53,6 +53,7 @@ pub const MKNOD: u32 = 27;
 pub const SETFCAP: u32 = 31;
 pub const SYSLOG: u32 = 34;
 pub const WAKE_ALARM: u32 = 35;
+pub const PERFMON: u32 = 38;
 pub const LAST: u32 = 40;
 pub const ALL: u64 = (1 << (LAST + 1)) - 1;
 const FS: u64 = (1 << CHOWN)

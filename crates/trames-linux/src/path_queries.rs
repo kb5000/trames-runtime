@@ -5,6 +5,93 @@ use crate::Linux;
 use trames_memory::{Access, CpuMemory};
 use trames_vfs::{Errno, PathQueries, AT_FDCWD};
 type Result<T> = std::result::Result<T, Errno>;
+pub(super) fn readlink_capacity(raw: u64) -> Result<usize> {
+    let capacity = raw as u32 as i32;
+    if capacity <= 0 {
+        Err(Errno(22))
+    } else {
+        Ok(capacity as usize)
+    }
+}
+pub(super) fn file_output(number: u32, a: [u64; 6]) -> Option<crate::direct::FileOutput> {
+    use crate::direct::FileOutput;
+    Some(match number {
+        78 => FileOutput::Readlink(a[2], a[3] as u32 as u64),
+        79 => FileOutput::Stat(a[2]),
+        80 => FileOutput::Stat(a[1]),
+        291 => FileOutput::FuseStat(number, a),
+        _ => return None,
+    })
+}
+/// Resolve once without touching the output pages. The source worker retains
+/// the accepted result across page waits, including readlink's atime effect.
+pub(super) fn prepare_output(
+    q: &PathQueries,
+    number: u32,
+    a: [u64; 6],
+    memory: &impl CpuMemory,
+) -> Option<trames_vfs::FileReply> {
+    use trames_vfs::{FileReply, FileValue};
+    FileReply::capture_optional(|| match number {
+        78 => {
+            if let Err(error) = readlink_capacity(a[3]) {
+                return Some(Err(error));
+            }
+            let path = match Linux::path(memory, a[1]) {
+                Ok(path) => path,
+                Err(error) => return Some(Err(error)),
+            };
+            q.readlink_at(a[0] as i32, &path)
+                .map(|result| result.map(FileValue::Bytes))
+        }
+        79 => {
+            let path = match Linux::stat_parameters(a, memory) {
+                Ok(path) => path,
+                Err(error) => return Some(Err(error)),
+            };
+            let stat = if path.is_empty() && a[3] & 0x1000 != 0 {
+                q.stat_fd(a[0] as u32)
+            } else {
+                q.stat_at(a[0] as i32, &path, a[3] & 0x100 != 0)
+            };
+            stat.map(|result| result.map(FileValue::Stat))
+        }
+        80 => q
+            .stat_fd(a[0] as u32)
+            .map(|result| result.map(FileValue::Stat)),
+        291 => {
+            let flags = a[2] as u32;
+            if flags & !0x7900 != 0 || flags & 0x6000 == 0x6000 || a[3] as u32 & 0x80000000 != 0 {
+                return Some(Err(Errno(22)));
+            }
+            let path = if a[1] == 0 && flags & 0x1000 != 0 {
+                Vec::new()
+            } else {
+                match Linux::path(memory, a[1]) {
+                    Ok(path) => path,
+                    Err(error) => return Some(Err(error)),
+                }
+            };
+            let empty = path.is_empty() && flags & 0x1000 != 0;
+            let fd = a[0] as i32;
+            let metadata = if empty && fd != AT_FDCWD {
+                if flags & 0x4000 != 0 {
+                    q.statx_fd_cached(a[0] as u32)
+                } else {
+                    q.statx_fd(a[0] as u32)
+                }
+            } else {
+                q.statx_at(
+                    fd,
+                    if empty { b".".as_slice() } else { &path },
+                    flags & 0x100 != 0,
+                )
+            };
+            metadata.map(|result| result.map(|(stat, mount)| FileValue::FuseStat(stat, mount)))
+        }
+        _ => None,
+    })
+}
 pub(super) fn dirent_count(raw: u64) -> usize {
     let count = raw as u32 as usize;
     if count > i32::MAX as usize {
@@ -65,18 +152,17 @@ pub(super) fn call(
             }))
         }
         78 => {
-            let path = match (|| {
-                if a[3] == 0 {
-                    return Err(Errno(22));
-                }
-                Linux::path(memory, a[1])
-            })() {
+            let capacity = match readlink_capacity(a[3]) {
+                Ok(capacity) => capacity,
+                Err(error) => return Some(Err(error)),
+            };
+            let path = match Linux::path(memory, a[1]) {
                 Ok(p) => p,
                 Err(e) => return Some(Err(e)),
             };
             let target = q.readlink_at(a[0] as i32, &path)?;
             Some(target.and_then(|target| {
-                let count = (a[3] as usize).min(target.len());
+                let count = capacity.min(target.len());
                 Linux::check(memory, a[2], count, Access::Write)?;
                 memory
                     .write(a[2], &target[..count])
@@ -91,7 +177,7 @@ pub(super) fn call(
                     return Err(Errno(22));
                 }
                 let path = Linux::path(memory, a[1])?;
-                if flags & !0x300 != 0 {
+                if flags & !0x1300 != 0 {
                     return Err(Errno(22));
                 }
                 Ok(path)
@@ -100,12 +186,13 @@ pub(super) fn call(
                 Err(e) => return Some(Err(e)),
             };
             Some(
-                q.access_at(
+                q.access_at_empty(
                     a[0] as i32,
                     &path,
                     a[2] as u32,
                     flags & 0x200 != 0,
                     flags & 0x100 != 0,
+                    flags & 0x1000 != 0,
                 )?
                 .map(|()| 0),
             )
@@ -192,6 +279,16 @@ mod tests {
                 b"/alias\0",
             ),
             (48, [AT_FDCWD as i64 as u64, 0x1ffd, 4, 0, 0, 0], b"/file\0"),
+            (439, [fd, 0x1ffd, 4, 0x1000, 0, 0], b"\0"),
+            (439, [fd, 0x1ffd, 4, 0x1300, 0, 0], b"\0"),
+            (439, [999, 0x1ffd, 0, 0x1000, 0, 0], b"\0"),
+            (439, [fd, 0x1ffd, 0, 0, 0, 0], b"\0"),
+            (
+                439,
+                [AT_FDCWD as i64 as u64, 0x1ffd, 4, 0x1000, 0, 0],
+                b"\0",
+            ),
+            (439, [999, 0x1ffd, 4, 0x1000, 0, 0], b"/file\0"),
             (
                 439,
                 [AT_FDCWD as i64 as u64, 0x1ffd, 8, 0, 0, 0],
@@ -208,6 +305,7 @@ mod tests {
                 b"/file\0",
             ),
             (291, [fd, 0, 0x1000, 0, 0x1400, 0], b"\0"),
+            (291, [fd, 0x1ffd, 0x5000, 0, 0x1400, 0], b"\0"),
             (291, [fd, 0, 0x7000, 0, 0x1400, 0], b"\0"),
             (291, [fd, 0, 0x1000, 0x80000000, 0x1400, 0], b"\0"),
             (291, [fd, 0, 0x1000, 0, 0x9000, 0], b"\0"),

@@ -1387,6 +1387,7 @@ impl Vfs {
             .store(true, Ordering::Relaxed);
     }
     pub fn set_runtime_info(&mut self, pid: u32, mut runtime: RuntimeInfo) {
+        self.task_limit.snapshot(runtime.task_limit);
         self.begin_proc_query();
         self.pid = pid;
         if let Some(p) = runtime.processes.iter_mut().find(|p| p.pid == pid) {
@@ -1588,13 +1589,16 @@ impl Vfs {
         }
         self.proc_exe_node_normalized(path)
     }
-    pub(super) fn proc_open_node(
-        &self,
-        open: &OpenHandle,
-        path: &ResolvedPath,
-    ) -> Result<ResolvedInode> {
+    pub(super) fn proc_open_node(&self, open: &OpenHandle, path: &[u8]) -> Result<ResolvedInode> {
         let o = open.borrow();
-        let node = o.node.clone().ok_or(Errno(13))?;
+        let node = o
+            .node
+            .clone()
+            .or_else(|| match &o.control {
+                Some(events::SharedControl::FuseFile(file)) => file.inode(),
+                _ => None,
+            })
+            .ok_or(Errno(13))?;
         let label = match &o.kind {
             FdKind::Node(label) => label.clone(),
             _ => path.to_vec(),
@@ -1604,6 +1608,8 @@ impl Vfs {
             label,
             mount: self.mount_for_path(o.mount.as_ref()),
             file: Some(o.shared.clone()),
+            #[cfg(all(feature = "hostfs", unix))]
+            host_file: o.host_file.clone(),
             _image: None,
             _directory: None,
         })
@@ -1649,17 +1655,34 @@ impl Vfs {
             };
         };
         let mount = self.mount_for_path(Some(&OpenMount::Shared(directory.mount.clone())));
-        let label = self
-            .location(&directory.node, &mount)
-            .map(|p| p.key)
-            .unwrap_or_default();
+        // A final magic target must reach native scheduling before F_GETPATH
+        // or other host I/O. This name is only a hint; operations retain the
+        // inode and original capability, while readlink renders it separately.
+        let fallback = || {
+            self.location(&directory.node, &mount)
+                .map(|p| p.key)
+                .unwrap_or_default()
+        };
+        #[cfg(all(feature = "hostfs", unix))]
+        let label = directory
+            .node
+            .host
+            .get()
+            .map(|host| host.key_hint())
+            .unwrap_or_else(fallback);
+        #[cfg(not(all(feature = "hostfs", unix)))]
+        let label = fallback();
         Ok(Some(ResolvedInode {
             node: directory.node.clone(),
             label,
             mount,
             file: None,
+            #[cfg(all(feature = "hostfs", unix))]
+            host_file: directory.host_file.clone(),
             _image: None,
-            _directory: Some(mounts::MountUse::new(directory.mount.identity.clone())),
+            _directory: Some(Arc::new(mounts::MountUse::new(
+                directory.mount.identity.clone(),
+            ))),
         }))
     }
     pub(super) fn proc_exe_node_normalized(
@@ -1705,6 +1728,8 @@ impl Vfs {
                 .as_ref()
                 .and_then(|mount| self.mount_for_path(Some(&OpenMount::Shared(mount.clone())))),
             file: None,
+            #[cfg(all(feature = "hostfs", unix))]
+            host_file: None,
             _image: Some(file),
             _directory: None,
         }))
@@ -1795,14 +1820,41 @@ impl Vfs {
         reservation.publish(descriptor, self.query.is_none().then_some(&self.fds))
     }
     pub fn statfs_at(&self, path: &[u8]) -> Result<[u8; 120]> {
-        let path = self.resolve(AT_FDCWD, path)?;
-        self.node(&path)?;
-        self.mount_statfs(path.mount.as_ref().map(|m| &*m.shared))
+        let entry = self.resolve_entry_operation(
+            AT_FDCWD,
+            path,
+            true,
+            true,
+            0,
+            true,
+            Some(ResolveOperation::Fuse(fuse::PathOperation::Statfs)),
+            None,
+        )?;
+        self.statfs_resolved(entry)
+    }
+    pub(super) fn statfs_resolved(&self, (path, target): ResolvedEntry) -> Result<[u8; 120]> {
+        match target {
+            Some(ResolvedTarget::Descriptor(open)) => self.statfs_open(&open.borrow()),
+            Some(ResolvedTarget::Inode(file)) => {
+                self.mount_statfs(file.mount.as_ref().map(|m| &*m.shared), Some(file.node))
+            }
+            None => self.mount_statfs(
+                path.mount.as_ref().map(|m| &*m.shared),
+                Some(self.node(&path)?),
+            ),
+        }
     }
     pub fn statfs_fd(&self, fd: u32) -> Result<[u8; 120]> {
         let o_descriptor = self.descriptor(fd)?;
-        let o = o_descriptor.open.borrow();
-        let mut out = self.mount_statfs(o.mount.as_deref())?;
+        let open = o_descriptor.open.borrow();
+        self.statfs_open(&open)
+    }
+    fn statfs_open(&self, o: &OpenDescription) -> Result<[u8; 120]> {
+        let inode = o.node.clone().or_else(|| match &o.control {
+            Some(events::SharedControl::FuseFile(file)) => file.inode(),
+            _ => None,
+        });
+        let mut out = self.mount_statfs(o.mount.as_deref(), inode)?;
         if o.namespace_resource.is_some()
             || o.socket.is_some()
             || o.local.is_some()
@@ -1870,7 +1922,8 @@ impl Vfs {
             return Ok(None);
         }
         if let Some(query) = &self.query {
-            if path != b"/dev"
+            if !query.joined_owner
+                && path != b"/dev"
                 && !path.starts_with(b"/dev/")
                 && self.pseudo.borrow().source.is_none()
                 && self.published_global(path).is_none()
@@ -2012,7 +2065,8 @@ impl Vfs {
                 return Ok(None);
             }
             if let Some(query) = &self.query {
-                if self.terminal_task.get().is_none()
+                if !query.joined_owner
+                    && self.terminal_task.get().is_none()
                     && (path == b"/dev/tty"
                         || path == b"/dev/ptmx"
                         || path == b"/dev/pts"
@@ -2024,11 +2078,7 @@ impl Vfs {
         }
         let pseudo = self.pseudo.borrow();
         let r = self.proc_runtime(at, &pseudo.runtime);
-        let task_limit = if r.task_limit == 0 {
-            MAX_TASKS
-        } else {
-            r.task_limit
-        };
+        let task_limit = self.task_limit.get();
         let current = self.proc_namespace(at).local(self.pid);
         let own = r.processes.iter().find(|p| p.pid == current);
         let directory = || Some((Content::Directory, 0o40555));
@@ -2190,7 +2240,11 @@ impl Vfs {
             b"/proc/sys/kernel/msgmni" => return Ok(regular(format!("{}\n", sysv_message::MSGMNI).into_bytes())),
             name @ (b"/proc/sys/kernel/keys/maxkeys" | b"/proc/sys/kernel/keys/root_maxkeys") => return Ok(Some((file(format!("{}\n", self.key_registry().limit(name.ends_with(b"/root_maxkeys"))).into_bytes()), 0o100644))),
             b"/proc/sys/kernel/pid_max" => return Ok(regular(b"2147483647\n".to_vec())),
-            b"/proc/sys/kernel/threads-max" => return Ok(regular(format!("{task_limit}\n").into_bytes())),
+            b"/proc/sys/kernel/threads-max" => return Ok(Some((file(format!("{task_limit}\n").into_bytes()), 0o100644))),
+            name if perf::Setting::at(name).is_some() => {
+                let setting = perf::Setting::at(name).unwrap();
+                return Ok(Some((file(format!("{}\n", self.perf_settings().get(setting)).into_bytes()), 0o100644)));
+            }
             sysctl::PTRACE_SCOPE => return Ok(Some((file(format!("{}\n", self.pid_namespace().ptrace_scope()).into_bytes()), 0o100644))),
             sysctl::MAX_USER_NAMESPACES => return Ok(Some((file(format!("{}\n", self.user_namespace_limits().max()).into_bytes()), 0o100644))),
             name if name.starts_with(b"/proc/sys/fs/protected_") => {
@@ -3025,6 +3079,9 @@ impl Vfs {
                 "overflowuid",
                 "overflowgid",
                 "threads-max",
+                "perf_event_paranoid",
+                "perf_event_mlock_kb",
+                "perf_event_max_sample_rate",
                 "randomize_va_space",
                 "random",
             ]

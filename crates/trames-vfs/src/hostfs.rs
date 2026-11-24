@@ -10,8 +10,12 @@ use std::path::Path;
 use std::sync::{atomic::AtomicBool, Mutex};
 pub(super) mod native_wait;
 pub(super) mod notify;
+mod path;
 mod private_map;
+mod xattr;
+pub(super) use path::Position;
 pub(super) use private_map::pages as private_pages;
+pub(super) use xattr::XattrTarget;
 
 fn errno(error: std::io::Error) -> Errno {
     let code = match error.raw_os_error() {
@@ -41,6 +45,26 @@ fn component(name: &[u8]) -> Result<CString> {
         return Err(Errno(22));
     }
     CString::new(name).map_err(|_| Errno(22))
+}
+fn metadata_flags() -> i32 {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        libc::O_EVTONLY | libc::O_SYMLINK
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    {
+        libc::O_PATH
+    }
+}
+fn directory_flags() -> i32 {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        libc::O_SEARCH
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    {
+        libc::O_PATH | libc::O_DIRECTORY
+    }
 }
 fn open_at(parent: &File, name: &CString, flags: i32, mode: u32) -> Result<File> {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -83,9 +107,10 @@ pub(super) struct Root {
     uid: (u32, u32),
     gid: (u32, u32),
 }
-enum Parent<'a> {
+pub(super) enum Parent<'a> {
     Root(&'a File),
     Open(File),
+    Shared(Arc<OpenFile>),
 }
 impl std::ops::Deref for Parent<'_> {
     type Target = File;
@@ -93,6 +118,7 @@ impl std::ops::Deref for Parent<'_> {
         match self {
             Self::Root(file) => file,
             Self::Open(file) => file,
+            Self::Shared(file) => &file.file,
         }
     }
 }
@@ -200,11 +226,23 @@ pub(super) struct OpenFile {
     root: Arc<Root>,
 }
 impl OpenFile {
+    pub fn refresh_permissions(&self, node: &NodeRef) -> Result<()> {
+        let stat = self.stat()?;
+        let word = |offset| u32::from_le_bytes(stat[offset..offset + 4].try_into().unwrap());
+        let mut state = node.borrow_mut();
+        state.mode = word(16);
+        state.uid = word(24);
+        state.gid = word(28);
+        Ok(())
+    }
     pub fn stat(&self) -> Result<[u8; 128]> {
+        Ok(encode_stat(&self.root, &self.native_stat()?))
+    }
+    fn native_stat(&self) -> Result<libc::stat> {
         let mut native = std::mem::MaybeUninit::uninit();
         // SAFETY: retained original fd and space for one initialized native stat.
         status(unsafe { libc::fstat(self.file.as_raw_fd(), native.as_mut_ptr()) })?;
-        Ok(encode_stat(&self.root, &unsafe { native.assume_init() }))
+        Ok(unsafe { native.assume_init() })
     }
 }
 #[allow(clippy::unnecessary_cast)]
@@ -285,6 +323,9 @@ pub(super) struct HostFile {
     length_generation: AtomicU64,
 }
 impl HostFile {
+    pub fn key_hint(&self) -> Vec<u8> {
+        self.state.lock().unwrap().key.clone()
+    }
     pub(super) fn matches_stat(&self, stat: &[u8; 128]) -> bool {
         stat[..8] == self.identity.0.to_le_bytes() && stat[8..16] == self.identity.1.to_le_bytes()
     }
@@ -437,13 +478,16 @@ impl HostFile {
             None => self.acquire(0),
         }
     }
-    fn pin_path(&self) -> Result<Arc<OpenFile>> {
+    pub(super) fn pin_path(&self) -> Result<Arc<OpenFile>> {
         let (parent, name) = self.root.parent(&self.state.lock().unwrap().key)?;
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        let flags = libc::O_EVTONLY | libc::O_SYMLINK;
-        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-        let flags = libc::O_PATH;
-        let file = open_at(&parent, &name, flags, 0)?;
+        let file = if self.directory {
+            match open_at(&parent, &name, directory_flags(), 0) {
+                Err(Errno(13)) => open_at(&parent, &name, metadata_flags(), 0)?,
+                result => result?,
+            }
+        } else {
+            open_at(&parent, &name, metadata_flags(), 0)?
+        };
         let meta = file.metadata().map_err(errno)?;
         if (meta.dev(), meta.ino()) != self.identity {
             return Err(Errno(2));
@@ -484,6 +528,7 @@ impl HostFs {
     pub fn stat_at(&self, key: &[u8]) -> Result<[u8; 128]> {
         Ok(encode_stat(&self.root, &self.root.metadata(key)?))
     }
+    #[allow(clippy::unnecessary_cast)]
     pub fn key_of(&self, filesystem: &FsHandle, node: &NodeRef) -> Result<Vec<u8>> {
         let file = node.host.get().ok_or(Errno(2))?;
         let handle = file.any_file()?;
@@ -495,6 +540,19 @@ impl HostFs {
         let relative = path.strip_prefix(&root).map_err(|_| Errno(2))?;
         let mut key = b"/".to_vec();
         key.extend_from_slice(relative.as_os_str().as_bytes());
+        if file.directory {
+            // Darwin can keep a removed directory's old F_GETPATH spelling
+            // and a nonzero link count. Validate the name's inode, not just
+            // its text. Ancestor DAC failure must not add a getcwd policy.
+            match self.root.metadata(&key) {
+                Ok(meta) if (meta.st_dev as u64, meta.st_ino) != file.identity => {
+                    return Err(Errno(2))
+                }
+                Err(Errno(2)) => return Err(Errno(2)),
+                Err(Errno(13)) | Ok(_) => {}
+                Err(error) => return Err(error),
+            }
+        }
         let previous = file.state.lock().unwrap().key.clone();
         if key != previous {
             let mut fs = filesystem.borrow_mut();
@@ -563,6 +621,16 @@ impl HostFs {
                 return Err(error);
             }
         };
+        self.lookup_metadata(filesystem, key, meta, None)
+    }
+    #[allow(clippy::unnecessary_cast)]
+    fn lookup_metadata(
+        &self,
+        filesystem: &FsHandle,
+        key: &[u8],
+        meta: libc::stat,
+        relative: Option<(&File, &CString)>,
+    ) -> Result<NodeRef> {
         let kind = meta.st_mode as u32 & 0o170000;
         if !matches!(kind, 0o100000 | 0o40000 | 0o120000) {
             return Err(Errno(95));
@@ -594,7 +662,10 @@ impl HostFs {
                 let content = match kind {
                     0o40000 => Content::Directory,
                     0o120000 => {
-                        let (parent, name) = self.root.parent(key)?;
+                        let (parent, name) = match relative {
+                            Some((parent, name)) => (Parent::Root(parent), name.clone()),
+                            None => self.root.parent(key)?,
+                        };
                         let mut target = vec![0; MAX_PATH];
                         // SAFETY: retained parent, valid name and writable output buffer.
                         let count = unsafe {
@@ -740,12 +811,12 @@ impl HostFs {
     pub fn create(
         &self,
         filesystem: &FsHandle,
-        key: &[u8],
+        path: &ResolvedPath,
         content: &Content,
         mode: u32,
     ) -> Result<NodeRef> {
         self.root.writable()?;
-        let (parent, name) = self.root.parent(key)?;
+        let (parent, name) = self.parent_path(filesystem, path)?;
         match content {
             Content::Directory => {
                 // SAFETY: retained directory capability, valid final component.
@@ -774,17 +845,17 @@ impl HostFs {
             }
             _ => return Err(Errno(95)),
         }
-        self.lookup(filesystem, key)
+        self.lookup_path(filesystem, path)
     }
     pub fn create_open(
         &self,
         filesystem: &FsHandle,
-        key: &[u8],
+        path: &ResolvedPath,
         flags: u32,
         mode: u32,
     ) -> Result<(NodeRef, Arc<OpenFile>)> {
         self.root.writable()?;
-        let (parent, name) = self.root.parent(key)?;
+        let (parent, name) = self.parent_path(filesystem, path)?;
         let access = flags & 3;
         let native = match access {
             0 => libc::O_RDONLY,
@@ -797,13 +868,18 @@ impl HostFs {
             native | libc::O_CREAT | libc::O_EXCL,
             mode & 0o7777,
         )?;
-        let node = self.lookup(filesystem, key)?;
+        let node = self.lookup_path(filesystem, path)?;
         let lease = node.host.get().ok_or(Errno(2))?.retain(file, access)?;
         Ok((node, lease))
     }
-    pub fn unlink(&self, key: &[u8], directory: bool) -> Result<()> {
+    pub fn unlink(
+        &self,
+        filesystem: &FsHandle,
+        path: &ResolvedPath,
+        directory: bool,
+    ) -> Result<()> {
         self.root.writable()?;
-        let (parent, name) = self.root.parent(key)?;
+        let (parent, name) = self.parent_path(filesystem, path)?;
         // SAFETY: anchored directory and one component, no native link traversal.
         status(unsafe {
             libc::unlinkat(
@@ -813,10 +889,16 @@ impl HostFs {
             )
         })
     }
-    pub fn rename(&self, old: &[u8], new: &[u8], flags: u32) -> Result<()> {
+    pub fn rename(
+        &self,
+        filesystem: &FsHandle,
+        old: &ResolvedPath,
+        new: &ResolvedPath,
+        flags: u32,
+    ) -> Result<()> {
         self.root.writable()?;
-        let (old_dir, old_name) = self.root.parent(old)?;
-        let (new_dir, new_name) = self.root.parent(new)?;
+        let (old_dir, old_name) = self.parent_path(filesystem, old)?;
+        let (new_dir, new_name) = self.parent_path(filesystem, new)?;
         // SAFETY: both parents are anchored and both names are valid for this call.
         // Use one native operation so host observers also see an atomic exchange.
         let result = unsafe {
@@ -837,7 +919,10 @@ impl HostFs {
                 }
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 {
-                    libc::renameat2(
+                    // musl does not export renameat2; use the same kernel ABI
+                    // for both libc environments.
+                    libc::syscall(
+                        libc::SYS_renameat2,
                         old_dir.as_raw_fd(),
                         old_name.as_ptr(),
                         new_dir.as_raw_fd(),
@@ -847,7 +932,7 @@ impl HostFs {
                         } else {
                             libc::RENAME_NOREPLACE
                         },
-                    )
+                    ) as libc::c_int
                 }
                 #[cfg(not(any(
                     target_os = "macos",
@@ -883,10 +968,31 @@ impl HostFs {
         }
         Ok(())
     }
-    pub fn link(&self, old: &[u8], new: &[u8]) -> Result<()> {
+    pub fn link(
+        &self,
+        filesystem: &FsHandle,
+        old: &ResolvedPath,
+        new: &ResolvedPath,
+    ) -> Result<()> {
         self.root.writable()?;
-        let (old_dir, old_name) = self.root.parent(old)?;
-        let (new_dir, new_name) = self.root.parent(new)?;
+        // A retained regular/symlink inode is not a directory whose leaf is
+        // ".". Refresh its current name from the pinned native file while the
+        // caller holds the filesystem namespace transaction.
+        let original_key = old
+            .host_position
+            .as_ref()
+            .filter(|position| position.known_node().is_some_and(|node| !node.directory))
+            .map(|position| {
+                position
+                    .pin(self, filesystem, &old.key)
+                    .and_then(|pin| self.key_of(filesystem, &pin.node))
+            })
+            .transpose()?;
+        let (old_dir, old_name) = match &original_key {
+            Some(key) => self.root.parent(key)?,
+            None => self.parent_path(filesystem, old)?,
+        };
+        let (new_dir, new_name) = self.parent_path(filesystem, new)?;
         // SAFETY: both operations are relative to retained directory capabilities.
         status(unsafe {
             libc::linkat(
@@ -898,8 +1004,22 @@ impl HostFs {
             )
         })
     }
-    pub fn children(&self, key: &[u8]) -> Result<BTreeMap<Vec<u8>, (u64, u8)>> {
-        let directory = self.root.open(key, 0, true)?;
+    pub fn children(
+        &self,
+        filesystem: &FsHandle,
+        path: &ResolvedPath,
+    ) -> Result<BTreeMap<Vec<u8>, (u64, u8)>> {
+        let directory = if let Some(position) = &path.host_position {
+            let pin = position.pin(self, filesystem, &path.key)?;
+            open_at(
+                &pin.file.file,
+                &CString::new(".").unwrap(),
+                libc::O_RDONLY | libc::O_DIRECTORY,
+                0,
+            )?
+        } else {
+            self.root.open(&path.key, 0, true)?
+        };
         use std::os::fd::IntoRawFd;
         let fd = directory.into_raw_fd();
         // SAFETY: transfers ownership of this fresh fd on success.

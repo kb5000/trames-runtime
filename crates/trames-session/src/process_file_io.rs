@@ -57,9 +57,11 @@ impl<C: Cpu> Kernel<C> {
     ) -> Result<Option<u64>, Errno> {
         match p.file_checkpoint.take().unwrap().take() {
             trames_linux::FileBoundary::Owner { work, output } => {
-                let reply = work.run_owner(&mut p.linux.vfs);
-                p.file_entry = None;
-                output.apply(reply.result, &mut p.memory).map(Some)
+                let target = work.target().cloned();
+                let result = Arc::new(trames_linux::FileResult::wake_joined());
+                result.complete(work.resume_owner(&mut p.linux.vfs));
+                p.retained_file = Some(trames_linux::FilePending::new(result, output, target));
+                Ok(None)
             }
             trames_linux::FileBoundary::Signal { value } => {
                 trames_vfs::TaskSignal::raise(&*p.signals.io, 25);
@@ -100,6 +102,104 @@ mod tests {
     use super::*;
     use trames_execution::Registers;
     use trames_memory::{Permissions, PAGE_SIZE};
+    #[test]
+    fn owner_proc_continuation_returns_to_retained_file_scheduling() {
+        fn answer(v: &mut trames_vfs::Vfs, fd: u32, request: &[u8], payload: &[u8]) {
+            let mut bytes = Vec::new();
+            bytes.extend(((16 + payload.len()) as u32).to_le_bytes());
+            bytes.extend(0i32.to_le_bytes());
+            bytes.extend(&request[8..16]);
+            bytes.extend(payload);
+            assert_eq!(v.write(fd, &bytes).unwrap(), bytes.len());
+        }
+        let mut k = super::super::tests::kernel();
+        let mut p = super::super::tests::process();
+        let v = &mut p.linux.vfs;
+        v.set_runtime_info(1, Default::default());
+        v.mkdir_at(-100, b"/mnt", 0o755).unwrap();
+        let daemon = v.open_at(-100, b"/dev/fuse", 2, 0).unwrap();
+        let options = format!("fd={daemon},rootmode=40755,user_id=0,group_id=0");
+        v.mount(None, b"/mnt", Some(b"fuse"), 0, Some(options.as_bytes()))
+            .unwrap();
+        let init = v.read(daemon, 8192).unwrap();
+        let mut version = [0; 64];
+        version[..4].copy_from_slice(&7u32.to_le_bytes());
+        version[4..8].copy_from_slice(&31u32.to_le_bytes());
+        answer(v, daemon, &init, &version);
+        let original = v.memfd_create(b"original", 0).unwrap();
+        v.write(original, b"original bytes").unwrap();
+        v.set_runtime_info(
+            1,
+            trames_vfs::RuntimeInfo {
+                processes: vec![trames_vfs::ProcessInfo {
+                    pid: 1,
+                    tgid: 1,
+                    fds: v.fd_snapshot(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        p.memory.map(0x10000, PAGE_SIZE, Permissions::RW).unwrap();
+        p.memory.write(0x10000, b"/mnt/link\0").unwrap();
+        let args = [(-100i64) as u64, 0x10000, 0, 0, 0, 0];
+        let mut io = trames_linux::CapturedOutput::default();
+        let mut lookup = false;
+        let mut readlink = false;
+        let mut resumed = false;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            k.call(1, &mut p, 56, args, &mut io);
+            resumed |= p.retained_file.is_some();
+            while let Ok(request) = p.linux.vfs.read(daemon, 8192) {
+                let opcode = u32::from_le_bytes(request[4..8].try_into().unwrap());
+                match opcode {
+                    1 => {
+                        assert!(
+                            !lookup,
+                            "owner continuation must not repeat the FUSE lookup"
+                        );
+                        lookup = true;
+                        let mut entry = [0; 128];
+                        entry[..8].copy_from_slice(&71u64.to_le_bytes());
+                        entry[24..32].copy_from_slice(&1u64.to_le_bytes());
+                        entry[40..48].copy_from_slice(&171u64.to_le_bytes());
+                        entry[100..104].copy_from_slice(&0o120777u32.to_le_bytes());
+                        answer(&mut p.linux.vfs, daemon, &request, &entry);
+                    }
+                    5 => {
+                        assert!(!readlink);
+                        readlink = true;
+                        answer(
+                            &mut p.linux.vfs,
+                            daemon,
+                            &request,
+                            format!("/proc/self/fd/{original}").as_bytes(),
+                        );
+                    }
+                    2 => (),
+                    _ => panic!("unexpected FUSE opcode {opcode}"),
+                }
+            }
+            if lookup && readlink && p.file_entry.is_none() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "retained owner continuation did not complete"
+            );
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
+        assert!(
+            resumed,
+            "the owner checkpoint must return a retained continuation"
+        );
+        let fd = p.cpu.x(0) as u32;
+        assert_ne!(fd, original);
+        assert_eq!(p.linux.vfs.read(fd, 32).unwrap(), b"original bytes");
+        assert!(p.retained_file.is_none());
+    }
+
     #[test]
     fn host_export_uses_original_backing_on_four_and_twelve_cpu_sources() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -376,6 +476,7 @@ mod tests {
         assert_eq!(k.deliver(1, &mut p), Ok(false));
         assert!(p.file_entry.is_some());
         result.complete(trames_vfs::FileOutcome::Complete(trames_vfs::FileReply {
+            resources: Default::default(),
             result: Ok(trames_vfs::FileValue::Count(7)),
             file_size_signal: false,
             scratch: None,

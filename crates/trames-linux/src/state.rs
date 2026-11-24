@@ -691,7 +691,6 @@ impl Linux {
             return Err(Errno(22));
         }
         let path = Self::path(memory, a[1])?;
-        Self::check(memory, a[2], 128, Access::Write)?;
         Ok(path)
     }
     pub fn finish_stat(
@@ -975,6 +974,8 @@ impl Linux {
         let (stat, mount) = if path.is_empty() && flags & 0x1000 != 0 {
             if a[0] as i32 == -100 {
                 vfs.statx_at(-100, b".", false)?
+            } else if flags & 0x4000 != 0 {
+                vfs.statx_fd_cached(a[0] as u32)?
             } else {
                 vfs.statx_fd(a[0] as u32)?
             }
@@ -989,6 +990,15 @@ impl Linux {
         stat: [u8; 128],
         mount: trames_vfs::StatMount,
     ) -> Result<u64> {
+        let out = Self::statx_bytes(a, stat, mount);
+        memory.write(a[4], &out).map_err(|_| Errno(14))?;
+        Ok(0)
+    }
+    pub(crate) fn statx_bytes(
+        a: [u64; 6],
+        stat: [u8; 128],
+        mount: trames_vfs::StatMount,
+    ) -> [u8; 256] {
         let mut out = [0u8; 256];
         let unique = a[3] & 0x4000 != 0;
         let (mount_mask, id) = if unique {
@@ -1022,8 +1032,7 @@ impl Linux {
             out[offset + 4..offset + 8].copy_from_slice(&(minor as u32).to_le_bytes());
         }
         out[144..152].copy_from_slice(&id.to_le_bytes());
-        memory.write(a[4], &out).map_err(|_| Errno(14))?;
-        Ok(0)
+        out
     }
     pub(crate) fn page_length(len: u64) -> Result<u64> {
         if len == 0 {
@@ -1385,7 +1394,10 @@ impl Linux {
                     // must remain canonical shared bytes, never a file COW copy.
                     (pages?, true)
                 } else {
-                    (file.pages(offset, len, shared, permissions.write)?, shared)
+                    (
+                        file.pages_for_memory(offset, len, shared, permissions.write, memory)?,
+                        shared,
+                    )
                 };
             memory
                 .map_backed(address, objects, shared, permissions, flags & 0x10 != 0)
@@ -1494,6 +1506,9 @@ impl Linux {
             }
             // Linux 6.12 removes the destination before validating the surviving VMA.
             memory.unmap(dest, new_len).map_err(Self::memory_errno)?;
+        }
+        if new_len > old_len && !memory.mapping_expandable(old) {
+            return Err(Errno(14));
         }
         if old_len >= new_len {
             if old_len > new_len {
@@ -1634,7 +1649,7 @@ impl Linux {
     ) -> Result<u64>;
         pub fn has_syscall;
         {
-            5..=17 | 33..=41 | 43 | 44 | 49..=55 | 88 | 180 | 181 | 276 | 279 | 428..=432 | 442 | 452 | 457 | 458 => {
+            5..=17 | 33..=41 | 43 | 44 | 49..=55 | 88 | 180 | 181 | 276 | 279 | 428..=433 | 442 | 452 | 457 | 458 => {
                 crate::direct::namespace::owner(number as u32, a, memory, &mut self.vfs)
             },
             219 => crate::keyctl(&self.session_keys, &self.vfs.key_registry(), &self.vfs.credentials, a, memory),
@@ -1792,25 +1807,24 @@ impl Linux {
                 }
                 let path = Self::path(memory, a[1])?;
                 let flags = if number == 439 { a[3] } else { 0 };
-                if flags & !0x300 != 0 {
+                if flags & !0x1300 != 0 {
                     return Err(Errno(22));
                 }
-                self.vfs.access_at(
+                self.vfs.access_at_empty(
                     a[0] as i32,
                     &path,
                     a[2] as u32,
                     flags & 0x200 != 0,
                     flags & 0x100 != 0,
+                    flags & 0x1000 != 0,
                 )?;
                 Ok(0)
             },
             78 => {
-                if a[3] == 0 {
-                    return Err(Errno(22));
-                }
+                let capacity = crate::path_queries::readlink_capacity(a[3])?;
                 let path = Self::path(memory, a[1])?;
                 let target = self.vfs.readlink_at(a[0] as i32, &path)?;
-                let count = (a[3] as usize).min(target.len());
+                let count = capacity.min(target.len());
                 Self::check(memory, a[2], count, Access::Write)?;
                 memory
                     .write(a[2], &target[..count])

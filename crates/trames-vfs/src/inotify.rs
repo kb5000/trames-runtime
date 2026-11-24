@@ -530,6 +530,10 @@ impl Vfs {
         }
         Some((
             self.node(&ResolvedPath {
+                directory_inode: None,
+                indexed_position: None,
+                #[cfg(all(feature = "hostfs", unix))]
+                host_position: None,
                 retained_directory: None,
                 proc_binding: None,
                 key: path[..i.max(1)].to_vec(),

@@ -19,6 +19,7 @@ pub(super) const MS_RDONLY: u64 = 1;
 pub(super) const MS_NOSUID: u64 = 2;
 pub(super) const MS_NODEV: u64 = 4;
 pub(super) const MS_NOEXEC: u64 = 8;
+pub(super) const MS_NOSYMFOLLOW: u64 = 256;
 pub(super) const MS_NOATIME: u64 = 1 << 10;
 pub(super) const MS_NODIRATIME: u64 = 1 << 11;
 const MS_STRICTATIME: u64 = 1 << 24;
@@ -224,6 +225,7 @@ impl DirectoryPin {
 pub(super) struct MountUse {
     mount: Arc<MountIdentity>,
     _layers: Option<Arc<overlay::LayerUses>>,
+    _fuse: Option<Arc<fuse::ConnectionUse>>,
 }
 impl MountUse {
     pub(super) fn is_for(&self, mount: &Arc<MountIdentity>) -> bool {
@@ -231,10 +233,12 @@ impl MountUse {
     }
     pub(super) fn new(mount: Arc<MountIdentity>) -> Self {
         let layers = mount.fs.layer_uses();
+        let fuse = mount.fs.fuse.as_ref().and_then(|fs| fs.usage());
         mount.users.fetch_add(1, Ordering::Relaxed);
         Self {
             mount,
             _layers: layers,
+            _fuse: fuse,
         }
     }
 }
@@ -275,6 +279,12 @@ pub(super) struct MountFlags(AtomicU64, Option<Arc<std::sync::atomic::AtomicBool
 impl MountFlags {
     pub fn get(&self) -> u64 {
         self.local() | u64::from(self.1.as_ref().is_some_and(|ro| ro.load(Ordering::Relaxed)))
+    }
+    pub(super) fn statfs(&self) -> u64 {
+        let flags = self.get();
+        32 | (flags & (MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_NOATIME | MS_NODIRATIME))
+            | if flags & MS_RELATIME != 0 { 4096 } else { 0 }
+            | if flags & MS_NOSYMFOLLOW != 0 { 8192 } else { 0 }
     }
     fn local(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
@@ -341,6 +351,7 @@ pub(super) struct Mount {
     // An installed/detached owner topology uses its overlay layers. Read-only
     // Rc projections leave this empty; retaining their FsHandle is observation.
     _layers: Option<Arc<overlay::LayerUses>>,
+    _fuse: Option<Arc<fuse::ConnectionUse>>,
     pub shared: Arc<MountData>,
     pub namespace: Option<linux_namespace::NamespaceHandle>,
     pub parent: MountParent,
@@ -405,8 +416,10 @@ impl Mount {
         });
         let parent = shared.parent.clone();
         let layers = shared.fs.layer_uses();
+        let fuse = shared.fs.fuse.as_ref().and_then(|fs| fs.usage());
         Self {
             _layers: layers,
+            _fuse: fuse,
             shared,
             namespace: init.namespace,
             parent: MountParent {
@@ -421,6 +434,7 @@ impl Mount {
         let parent = Arc::new(SharedCell::new(None));
         Arc::new(Self {
             _layers: None,
+            _fuse: None,
             shared: Arc::new(MountData {
                 directory_users: Default::default(),
                 identity,
@@ -450,6 +464,7 @@ impl Mount {
         });
         let mount = Arc::new(Self {
             _layers: None,
+            _fuse: None,
             parent: MountParent {
                 owner: SharedCell::new(parent),
                 shared: shared.parent.clone(),
@@ -468,6 +483,7 @@ impl Mount {
         });
         Arc::new(Self {
             _layers: None,
+            _fuse: None,
             parent: MountParent {
                 owner: SharedCell::new(parent),
                 shared: shared.parent.clone(),
@@ -526,6 +542,11 @@ impl MountData {
         result
     }
     pub(super) fn root_path(&self) -> Vec<u8> {
+        if !self.root.directory && self.fs.fuse.is_some() {
+            // A daemon file has no entry in the local namespace index. The
+            // accepted mount key is a label; the retained inode selects I/O.
+            return self.root_key.clone();
+        }
         // Proc/sysfs inodes live in PseudoFs, never in the backing disk's path
         // map. Their immutable mount keys cannot be found by scanning that map.
         if matches!(self.kind, Kind::Proc | Kind::Sysfs) && self.root.borrow().volatile {
@@ -628,6 +649,10 @@ pub struct ResolvedPath {
     pub(super) mount: Option<Arc<Mount>>,
     pub(super) proc_binding: Option<Arc<proc_source::ProcPath>>,
     pub(super) retained_directory: Option<NodeRef>,
+    pub(super) directory_inode: Option<NodeRef>,
+    pub(super) indexed_position: Option<Arc<path_position::Position>>,
+    #[cfg(all(feature = "hostfs", unix))]
+    pub(super) host_position: Option<Arc<hostfs::Position>>,
 }
 impl std::fmt::Debug for ResolvedPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -645,6 +670,12 @@ impl std::ops::Deref for ResolvedPath {
 }
 impl std::ops::DerefMut for ResolvedPath {
     fn deref_mut(&mut self) -> &mut Vec<u8> {
+        self.directory_inode = None;
+        self.indexed_position = None;
+        #[cfg(all(feature = "hostfs", unix))]
+        {
+            self.host_position = None;
+        }
         &mut self.key
     }
 }
@@ -655,6 +686,30 @@ impl AsRef<[u8]> for ResolvedPath {
 }
 impl PartialEq for ResolvedPath {
     fn eq(&self, other: &Self) -> bool {
+        if let Some((left, right)) = self
+            .directory_inode
+            .as_ref()
+            .or_else(|| self.indexed_position.as_ref().and_then(|p| p.known_node()))
+            .zip(
+                other
+                    .directory_inode
+                    .as_ref()
+                    .or_else(|| other.indexed_position.as_ref().and_then(|p| p.known_node())),
+            )
+        {
+            return self.mount.as_ref().map(|m| m.id) == other.mount.as_ref().map(|m| m.id)
+                && Arc::ptr_eq(left, right);
+        }
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some((left, right)) = self
+            .host_position
+            .as_ref()
+            .and_then(|p| p.known_node())
+            .zip(other.host_position.as_ref().and_then(|p| p.known_node()))
+        {
+            return self.mount.as_ref().map(|m| m.id) == other.mount.as_ref().map(|m| m.id)
+                && Arc::ptr_eq(left, right);
+        }
         self.key == other.key
             && self.mount.as_ref().map(|m| m.id) == other.mount.as_ref().map(|m| m.id)
             && self.retained_directory.as_ref().map(Arc::as_ptr)
@@ -671,12 +726,42 @@ impl From<Vec<u8>> for ResolvedPath {
         Self {
             key,
             mount: None,
+            directory_inode: None,
+            indexed_position: None,
+            #[cfg(all(feature = "hostfs", unix))]
+            host_position: None,
             retained_directory: None,
             proc_binding: None,
         }
     }
 }
 impl ResolvedPath {
+    fn root_inode(mount: &Arc<Mount>) -> Option<NodeRef> {
+        if !mount.root.directory
+            || mount.root.borrow().volatile
+            || matches!(
+                mount.kind,
+                Kind::Proc | Kind::Sysfs | Kind::Devpts | Kind::Cgroup
+            )
+        {
+            return None;
+        }
+        #[cfg(all(feature = "hostfs", unix))]
+        if mount.fs.host.is_some() {
+            return None;
+        }
+        Some(mount.root.clone())
+    }
+    pub(super) fn host_position_present(&self) -> bool {
+        #[cfg(all(feature = "hostfs", unix))]
+        {
+            self.host_position.is_some()
+        }
+        #[cfg(not(all(feature = "hostfs", unix)))]
+        {
+            false
+        }
+    }
     pub fn into_bytes(self) -> Vec<u8> {
         self.key
     }
@@ -690,12 +775,32 @@ impl ResolvedPath {
     }
     pub(super) fn parent(&self) -> Self {
         let mut p = self.clone();
+        p.indexed_position = self
+            .indexed_position
+            .as_ref()
+            .and_then(|p| p.lookup_parent());
+        #[cfg(all(feature = "hostfs", unix))]
+        {
+            p.host_position = self.host_position.as_ref().and_then(|p| p.lookup_parent());
+        }
+        p.directory_inode = self
+            .directory_inode
+            .as_ref()
+            .and_then(|node| node.fuse_directory.get())
+            .and_then(|directory| directory.parent());
         p.key
             .truncate(p.key.iter().rposition(|b| *b == b'/').unwrap_or(0).max(1));
         p
     }
 }
 pub(super) trait PathArg {
+    fn indexed_position(&self) -> Option<&Arc<path_position::Position>> {
+        None
+    }
+    #[cfg(all(feature = "hostfs", unix))]
+    fn host_position(&self) -> Option<&Arc<hostfs::Position>> {
+        None
+    }
     fn key(&self) -> &[u8];
     fn mount(&self) -> Option<&Arc<Mount>> {
         None
@@ -704,6 +809,9 @@ pub(super) trait PathArg {
         None
     }
     fn retained_directory(&self) -> Option<&NodeRef> {
+        None
+    }
+    fn directory_inode(&self) -> Option<&NodeRef> {
         None
     }
 }
@@ -723,6 +831,16 @@ impl PathArg for Vec<u8> {
     }
 }
 impl PathArg for ResolvedPath {
+    fn indexed_position(&self) -> Option<&Arc<path_position::Position>> {
+        self.indexed_position.as_ref()
+    }
+    #[cfg(all(feature = "hostfs", unix))]
+    fn host_position(&self) -> Option<&Arc<hostfs::Position>> {
+        self.host_position.as_ref()
+    }
+    fn directory_inode(&self) -> Option<&NodeRef> {
+        self.directory_inode.as_ref()
+    }
     fn retained_directory(&self) -> Option<&NodeRef> {
         self.retained_directory.as_ref()
     }
@@ -845,15 +963,74 @@ impl Vfs {
         node: &NodeRef,
         mount: &Option<Arc<Mount>>,
     ) -> Result<ResolvedPath> {
+        if node.fuse_leaf.get().is_some() {
+            let mount = mount
+                .as_ref()
+                .filter(|m| Arc::ptr_eq(&m.root, node))
+                .ok_or(Errno(2))?;
+            return Ok(ResolvedPath {
+                key: mount.root_path(),
+                mount: Some(mount.clone()),
+                directory_inode: Some(node.clone()),
+                indexed_position: None,
+                #[cfg(all(feature = "hostfs", unix))]
+                host_position: None,
+                retained_directory: None,
+                proc_binding: None,
+            });
+        }
+        if let Some(directory) = node.fuse_directory.get() {
+            return Ok(ResolvedPath {
+                key: if directory.linked() {
+                    directory.path()?
+                } else {
+                    Vec::new()
+                },
+                mount: mount.clone(),
+                directory_inode: Some(node.clone()),
+                indexed_position: None,
+                #[cfg(all(feature = "hostfs", unix))]
+                host_position: None,
+                retained_directory: (!directory.linked()).then(|| node.clone()),
+                proc_binding: None,
+            });
+        }
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some((mount, host)) = mount
+            .as_ref()
+            .filter(|_| node.directory)
+            .and_then(|m| m.fs.host.as_ref().map(|host| (m, host)))
+        {
+            let file = node.host.get().ok_or(Errno(2))?.any_file()?;
+            let (key, removed) = match host.key_of(&mount.fs, node) {
+                Ok(key) => (key, false),
+                Err(Errno(2)) => (Vec::new(), true),
+                Err(error) => return Err(error),
+            };
+            return Ok(ResolvedPath {
+                key,
+                mount: Some(mount.clone()),
+                host_position: Some(hostfs::Position::inode(node.clone(), file)),
+                directory_inode: None,
+                indexed_position: None,
+                proc_binding: None,
+                retained_directory: removed.then(|| node.clone()),
+            });
+        }
         // Pseudo endpoints are stored separately. Looking in an unrelated disk
         // map first turns every proc FD snapshot into a full rootfs scan.
-        if node.borrow().volatile {
+        let volatile = node.borrow().volatile;
+        if volatile {
             if let Some(mount) = mount.as_ref().filter(|m| m.kind == Kind::Cgroup) {
                 // cgroup directories and control files have original shared
                 // filesystem identities; no process/proc snapshot is needed.
                 return Ok(ResolvedPath {
                     key: mount.key_of(node).ok_or(Errno(2))?,
                     mount: Some(mount.clone()),
+                    directory_inode: None,
+                    indexed_position: None,
+                    #[cfg(all(feature = "hostfs", unix))]
+                    host_position: None,
                     retained_directory: None,
                     proc_binding: None,
                 });
@@ -862,12 +1039,20 @@ impl Vfs {
                 return Ok(ResolvedPath {
                     key: proc.path.clone(),
                     mount: mount.clone(),
+                    directory_inode: None,
+                    indexed_position: None,
+                    #[cfg(all(feature = "hostfs", unix))]
+                    host_position: None,
                     retained_directory: None,
                     proc_binding: proc.binding.clone(),
                 });
             }
             if let Some(key) = self.pseudo.borrow().path_of(node) {
                 return Ok(ResolvedPath {
+                    directory_inode: None,
+                    indexed_position: None,
+                    #[cfg(all(feature = "hostfs", unix))]
+                    host_position: None,
                     retained_directory: None,
                     proc_binding: None,
                     key,
@@ -892,6 +1077,10 @@ impl Vfs {
             None => return Err(Errno(2)),
         };
         Ok(ResolvedPath {
+            directory_inode: (!volatile && node.directory).then(|| node.clone()),
+            indexed_position: None,
+            #[cfg(all(feature = "hostfs", unix))]
+            host_position: None,
             retained_directory,
             proc_binding: None,
             key,
@@ -914,6 +1103,10 @@ impl Vfs {
                 .root
                 .clone();
             Ok(ResolvedPath {
+                directory_inode: None,
+                indexed_position: None,
+                #[cfg(all(feature = "hostfs", unix))]
+                host_position: None,
                 retained_directory: None,
                 proc_binding: None,
                 key: root.root_path(),
@@ -944,22 +1137,58 @@ impl Vfs {
                 // false positive, which simply uses the existing full lookup.
                 return Ok(path);
             }
-            let next =
-                self.mount_registry
-                    .borrow()
-                    .iter()
-                    .rev()
-                    .filter_map(std::sync::Weak::upgrade)
-                    .find(|m| {
-                        (self.pseudo.borrow().enabled
-                            || !matches!(
-                                m.kind,
-                                Kind::Proc | Kind::Sysfs | Kind::Devpts | Kind::Cgroup
-                            ))
-                            && m.parent.borrow().as_ref().is_some_and(|a| {
-                                Arc::ptr_eq(&a.parent, current) && a.key() == path.key
-                            })
-                    });
+            let indexed_node = if path.indexed_position.is_some() {
+                match self.node(&path) {
+                    Ok(node) => Some(node),
+                    Err(Errno(2)) => None,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                None
+            };
+            #[cfg(all(feature = "hostfs", unix))]
+            let native_node = if current.fs.host.is_some() {
+                if path.host_position.is_none() && path.key == current.root_path() {
+                    Some(current.root.clone())
+                } else {
+                    match self.node(&path) {
+                        Ok(node) => Some(node),
+                        Err(Errno(2)) => None,
+                        Err(error) => return Err(error),
+                    }
+                }
+            } else {
+                None
+            };
+            let next = self
+                .mount_registry
+                .borrow()
+                .iter()
+                .rev()
+                .filter_map(std::sync::Weak::upgrade)
+                .find(|m| {
+                    (self.pseudo.borrow().enabled
+                        || !matches!(
+                            m.kind,
+                            Kind::Proc | Kind::Sysfs | Kind::Devpts | Kind::Cgroup
+                        ))
+                        && m.parent.borrow().as_ref().is_some_and(|a| {
+                            Arc::ptr_eq(&a.parent, current) && {
+                                if path.indexed_position.is_some() {
+                                    return indexed_node
+                                        .as_ref()
+                                        .is_some_and(|node| Arc::ptr_eq(node, &a.node));
+                                }
+                                #[cfg(all(feature = "hostfs", unix))]
+                                if current.fs.host.is_some() {
+                                    return native_node
+                                        .as_ref()
+                                        .is_some_and(|node| Arc::ptr_eq(node, &a.node));
+                                }
+                                a.key() == path.key
+                            }
+                        })
+                });
             let Some(next) = next else {
                 return Ok(path);
             };
@@ -969,6 +1198,10 @@ impl Vfs {
                 .get()
                 .and_then(|proc| proc.binding.clone());
             path = ResolvedPath {
+                directory_inode: ResolvedPath::root_inode(&next),
+                indexed_position: None,
+                #[cfg(all(feature = "hostfs", unix))]
+                host_position: None,
                 retained_directory: None,
                 proc_binding: binding,
                 key: next.root_path(),
@@ -978,8 +1211,53 @@ impl Vfs {
         Err(Errno(40))
     }
     pub(super) fn parent_location(&self, path: &ResolvedPath) -> Result<ResolvedPath> {
-        if *path == self.root_location()? {
+        self.parent_location_in(path, &self.root_location()?)
+    }
+    pub(super) fn parent_location_in(
+        &self,
+        path: &ResolvedPath,
+        root: &ResolvedPath,
+    ) -> Result<ResolvedPath> {
+        if path == root {
             return Ok(path.clone());
+        }
+        if let Some(position) = &path.indexed_position {
+            let root_node = path.mount.as_ref().map(|mount| &mount.root);
+            if !position
+                .known_node()
+                .zip(root_node)
+                .is_some_and(|(node, root)| Arc::ptr_eq(node, root))
+            {
+                let filesystem = path.filesystem(self);
+                let parent = position.parent(&filesystem)?;
+                let node = parent.node(&filesystem)?;
+                let mut location = self.location(&node, &path.mount)?;
+                location.indexed_position = Some(parent);
+                return Ok(location);
+            }
+        }
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(position) = &path.host_position {
+            let mount = path.mount.as_ref().ok_or(Errno(5))?;
+            if !position
+                .known_node()
+                .is_some_and(|node| Arc::ptr_eq(node, &mount.root))
+            {
+                let (key, position) = position.climb(
+                    mount.fs.host.as_ref().ok_or(Errno(5))?,
+                    &mount.fs,
+                    &path.key,
+                )?;
+                return Ok(ResolvedPath {
+                    key,
+                    mount: path.mount.clone(),
+                    host_position: Some(position),
+                    directory_inode: None,
+                    indexed_position: None,
+                    retained_directory: None,
+                    proc_binding: None,
+                });
+            }
         }
         if let Some(directory) = &path.retained_directory {
             let parent = directory.removed_directory_parent.get().ok_or(Errno(2))?;
@@ -991,6 +1269,14 @@ impl Vfs {
                 return Ok(at.parent());
             };
             if at.key != m.root_path() {
+                if let Some(parent) = at
+                    .directory_inode
+                    .as_ref()
+                    .and_then(|node| node.fuse_directory.get())
+                    .and_then(|directory| directory.parent())
+                {
+                    return self.location(&parent, &at.mount);
+                }
                 return Ok(at.parent());
             }
             let attachment = m.parent.borrow().clone();
@@ -998,18 +1284,32 @@ impl Vfs {
                 return Ok(at);
             };
             at = ResolvedPath {
+                directory_inode: None,
+                indexed_position: None,
+                #[cfg(all(feature = "hostfs", unix))]
+                host_position: None,
                 retained_directory: None,
                 proc_binding: None,
                 key: a.key(),
                 mount: Some(a.parent),
             };
-            if at == self.root_location()? {
+            if &at == root {
                 return Ok(at);
             }
         }
         Err(Errno(40))
     }
     pub(super) fn landlock_parent(&self, path: &ResolvedPath) -> Option<ResolvedPath> {
+        if path.host_position_present() || path.indexed_position.is_some() {
+            let parent = path.parent();
+            return if parent.host_position_present() || parent.indexed_position.is_some() {
+                Some(parent)
+            } else {
+                self.parent_location(path)
+                    .ok()
+                    .filter(|parent| parent != path)
+            };
+        }
         if let Some(directory) = &path.retained_directory {
             return self
                 .location(directory.removed_directory_parent.get()?, &path.mount)
@@ -1019,6 +1319,10 @@ impl Vfs {
             if path.key == mount.root_path() {
                 let attachment = mount.parent.borrow().clone()?;
                 return Some(ResolvedPath {
+                    directory_inode: None,
+                    indexed_position: None,
+                    #[cfg(all(feature = "hostfs", unix))]
+                    host_position: None,
                     retained_directory: None,
                     proc_binding: None,
                     key: attachment.key(),
@@ -1094,6 +1398,10 @@ impl Vfs {
                 return Err(Errno(2));
             };
             at = ResolvedPath {
+                directory_inode: None,
+                indexed_position: None,
+                #[cfg(all(feature = "hostfs", unix))]
+                host_position: None,
                 retained_directory: None,
                 proc_binding: None,
                 key: a.key(),
@@ -1146,7 +1454,7 @@ impl Vfs {
         }
         let shared_admin = mounts
             .iter()
-            .any(|m| m.propagation() != propagation::State::default())
+            .any(|m| m.propagation().has_relations())
             .then(|| old.admin.clone());
         for m in &mounts {
             if let Some(a) = m.parent.borrow().as_ref() {
@@ -1216,6 +1524,19 @@ impl Vfs {
         }
     }
     pub(super) fn is_mount_root(&self, path: &ResolvedPath) -> bool {
+        if path.indexed_position.is_some() {
+            return path.mount.as_ref().is_some_and(|mount| {
+                self.node(path)
+                    .is_ok_and(|node| Arc::ptr_eq(&node, &mount.root))
+            });
+        }
+        #[cfg(all(feature = "hostfs", unix))]
+        if path.host_position.is_some() {
+            return path.mount.as_ref().is_some_and(|mount| {
+                self.node(path)
+                    .is_ok_and(|node| Arc::ptr_eq(&node, &mount.root))
+            });
+        }
         path.mount
             .as_ref()
             .is_some_and(|m| path.key == m.root_path())
@@ -1266,19 +1587,26 @@ impl Vfs {
         self.mount_location_at(AT_FDCWD, path, follow)
     }
     fn mount_location_at(&self, fd: i32, path: &[u8], follow: bool) -> Result<ResolvedPath> {
-        let (path, magic) = self.resolve_entry_policy(fd, path, follow, true, 0, true)?;
+        self.mount_entry_location(self.resolve_entry_policy(fd, path, follow, true, 0, true)?)
+    }
+    fn mount_entry_location(&self, (path, magic): ResolvedEntry) -> Result<ResolvedPath> {
         match magic {
-            Some(ResolvedTarget::Inode(file)) => self.location(&file.node, &file.mount),
+            Some(ResolvedTarget::Inode(file)) => self.mount_inode_location(file),
             Some(ResolvedTarget::Descriptor(open)) => {
                 if open.borrow().namespace_resource.is_some() {
                     return Ok(path);
                 }
-                if open.borrow().node.is_none() {
+                if open.borrow().node.is_none()
+                    && !matches!(
+                        open.borrow().control,
+                        Some(events::SharedControl::FuseFile(_))
+                    )
+                {
                     // Anonymous inodes have no mountpoint in the caller's tree.
                     return Err(Errno(2));
                 }
                 let file = self.proc_open_node(&open, &path)?;
-                self.location(&file.node, &file.mount)
+                self.mount_inode_location(file)
             }
             // Mount syscalls select the top mount even when pathname walking
             // starts at a retained cwd and consumes only ".". In particular,
@@ -1286,6 +1614,23 @@ impl Vfs {
             // umount2(".", MNT_DETACH) reveals the new root.
             None => self.follow_mounts(path),
         }
+    }
+    fn mount_inode_location(&self, file: ResolvedInode) -> Result<ResolvedPath> {
+        if file.node.fuse_leaf.get().is_none() {
+            return self.location(&file.node, &file.mount);
+        }
+        // The original OFD carries its accepted spelling. A disposable inode
+        // path-search cache must never determine whether its capability exists.
+        Ok(ResolvedPath {
+            key: file.label,
+            mount: file.mount,
+            directory_inode: Some(file.node),
+            indexed_position: None,
+            #[cfg(all(feature = "hostfs", unix))]
+            host_position: None,
+            retained_directory: None,
+            proc_binding: None,
+        })
     }
     fn cgroup_mount_options(&self, data: Option<&[u8]>) -> Result<Option<bool>> {
         if !self.credentials.has_ns_cap(
@@ -1331,7 +1676,9 @@ impl Vfs {
         const PRIVATE: u64 = 1 << 18;
         const SLAVE: u64 = 1 << 19;
         const SHARED: u64 = 1 << 20;
-        const ATTRS: u64 = MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC | ATIME_FLAGS;
+        const UNBINDABLE: u64 = 1 << 17;
+        const ATTRS: u64 =
+            MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_NOSYMFOLLOW | ATIME_FLAGS;
         if !self.credentials.has_ns_cap(
             &self
                 .mounts
@@ -1370,11 +1717,12 @@ impl Vfs {
         {
             return Err(Errno(22));
         }
-        let _change = self.path_change();
-        if flags & (PRIVATE | SLAVE | SHARED) != 0 {
+        if flags & (PRIVATE | SLAVE | SHARED | UNBINDABLE) != 0 {
+            let _change = self.path_change();
             return self.change_propagation(&target, flags);
         }
         if flags & REMOUNT != 0 {
+            let _change = self.path_change();
             #[cfg(all(feature = "hostfs", unix))]
             if flags & MS_RDONLY == 0 && parent.fs.host.as_ref().is_some_and(|host| host.readonly())
             {
@@ -1410,6 +1758,10 @@ impl Vfs {
             if (attrs ^ parent.flags.get()) & locked != 0 {
                 return Err(Errno(1));
             }
+            let _super_writers =
+                (flags & BIND == 0 && attrs & MS_RDONLY != 0 && !parent.super_readonly())
+                    .then(|| parent.fs.hold_writers())
+                    .transpose()?;
             let _writers = (attrs & MS_RDONLY != 0 && !parent.readonly())
                 .then(|| parent.hold_mount_writers())
                 .transpose()?;
@@ -1419,6 +1771,11 @@ impl Vfs {
                         .borrow()
                         .nsdelegate
                         .store(value, Ordering::Relaxed);
+                }
+            }
+            if flags & BIND == 0 {
+                if let Some(readonly) = &parent.fs.super_readonly {
+                    readonly.store(attrs & MS_RDONLY != 0, Ordering::Relaxed);
                 }
             }
             parent.flags.set(attrs);
@@ -1431,6 +1788,7 @@ impl Vfs {
                 return Err(Errno(95));
             }
             let source = self.mount_location(source.ok_or(Errno(22))?, true)?;
+            let _change = self.path_change();
             return self.move_attached(&source, &target, parent, target_node);
         }
         if flags & !(ATTRS | BIND | REC) != 0 {
@@ -1442,18 +1800,26 @@ impl Vfs {
         let ns = self.mounts.as_ref().ok_or(Errno(22))?.clone();
         let mut additions = Vec::new();
         let mut devpts = None;
-        let mut namespace = None;
         let mut bind_origin = None;
         let mut fuse_binding = None;
         let mut tmpfs_mode = None;
         let mut cgroup_options = None;
-        if flags & BIND != 0 {
-            let (_, target) =
-                self.resolve_entry_policy(AT_FDCWD, source.ok_or(Errno(22))?, true, true, 0, true)?;
-            if let Some(ResolvedTarget::Descriptor(open)) = target {
-                namespace = open.borrow().namespace.clone();
-            }
-        }
+        let bind_source = if flags & BIND != 0 {
+            Some(self.resolve_entry_policy(
+                AT_FDCWD,
+                source.ok_or(Errno(22))?,
+                true,
+                true,
+                0,
+                true,
+            )?)
+        } else {
+            None
+        };
+        let namespace = bind_source.as_ref().and_then(|(_, target)| match target {
+            Some(ResolvedTarget::Descriptor(open)) => open.borrow().namespace.clone(),
+            _ => None,
+        });
         // Linux mnt_ns_loop: bindings point strictly toward newer namespaces.
         // This preserves actual ownership without a cycle collector/service.
         if let Some(linux_namespace::NamespaceHandle::Mount(target)) = &namespace {
@@ -1500,7 +1866,7 @@ impl Vfs {
                 MS_NOSUID | MS_NODEV | MS_NOEXEC,
             )
         } else if flags & BIND != 0 {
-            let source = self.mount_location(source.ok_or(Errno(22))?, true)?;
+            let source = self.mount_entry_location(bind_source.unwrap())?;
             let node = self.node(&source)?;
             if matches!(node.borrow().content, Content::Directory)
                 != matches!(target_node.borrow().content, Content::Directory)
@@ -1508,6 +1874,9 @@ impl Vfs {
                 return Err(Errno(20));
             }
             let m = source.mount.as_ref().ok_or(Errno(22))?;
+            if m.propagation().unbindable {
+                return Err(Errno(22));
+            }
             if !ns
                 .0
                 .borrow()
@@ -1529,6 +1898,12 @@ impl Vfs {
                     }
                     let mut at = child.clone();
                     for _ in 0..ns.0.borrow().mounts.len() {
+                        if at.propagation().unbindable {
+                            if at.inherited.load(Ordering::Relaxed) & LOCK_ATTACHMENT != 0 {
+                                return Err(Errno(1));
+                            }
+                            break;
+                        }
                         let Some(a) = at.parent.borrow().clone() else {
                             break;
                         };
@@ -1603,7 +1978,7 @@ impl Vfs {
                         self.pseudo.borrow().runtime.memory_limit as u64,
                     )?;
                     tmpfs_mode = (mode != 0o1777).then_some(mode);
-                    let fs = ram_filesystem(
+                    let mut fs = ram_filesystem(
                         limit,
                         nodes,
                         mode,
@@ -1611,6 +1986,10 @@ impl Vfs {
                         gid.unwrap_or(self.credentials.fsgid),
                         true,
                     )?;
+                    fs.owner = self.credentials.user_namespace.clone();
+                    fs.super_readonly = Some(Arc::new(std::sync::atomic::AtomicBool::new(
+                        flags & MS_RDONLY != 0,
+                    )));
                     let root = fs.borrow().paths[b"/".as_slice()].clone();
                     (fs, root, b"/".to_vec(), Kind::Tmpfs, flags & ATTRS)
                 }
@@ -1721,8 +2100,7 @@ impl Vfs {
         }
         let mut copies = BTreeMap::new();
         if !additions.is_empty() {
-            let source = self.mount_location(source.ok_or(Errno(22))?, true)?;
-            copies.insert(source.mount.as_ref().ok_or(Errno(22))?.id, root.clone());
+            copies.insert(bind_origin.as_ref().ok_or(Errno(22))?.id, root.clone());
             for m in &additions {
                 copies.insert(m.id, copy_mount(m)?);
             }
@@ -1737,6 +2115,7 @@ impl Vfs {
         }
         let mut added = vec![root];
         added.extend(additions.iter().map(|m| copies[&m.id].clone()));
+        let _change = self.path_change();
         self.publish_mounts(&ns, added, || {
             if let Some(value) = cgroup_options {
                 self.cgroups
@@ -1804,13 +2183,13 @@ impl Vfs {
         {
             return Err(Errno(22));
         }
-        if parent.propagation() != propagation::State::default()
-            || moved.propagation() != propagation::State::default()
+        if parent.propagation().has_relations()
+            || moved.propagation().has_relations()
             || moved
                 .parent
                 .borrow()
                 .as_ref()
-                .is_some_and(|a| a.parent.propagation() != propagation::State::default())
+                .is_some_and(|a| a.parent.propagation().has_relations())
         {
             return Err(Errno(95));
         }
@@ -1890,7 +2269,6 @@ impl Vfs {
             return Err(Errno(1));
         }
         self.landlock_check_mount()?;
-        let _change = self.path_change();
         let new = self.resolve(AT_FDCWD, new_root)?;
         if !matches!(self.node(&new)?.borrow().content, Content::Directory) {
             return Err(Errno(20));
@@ -1907,6 +2285,7 @@ impl Vfs {
         let original_link = previous.parent.borrow().clone();
         let source_link = new_mount.parent.borrow().clone();
         let shared_parent = |link: &Attachment| link.parent.propagation().shared.is_some();
+        let _change = self.path_change();
         let mut table = ns.0.borrow_mut();
         if old_mount.propagation().shared.is_some()
             || original_link.as_ref().is_some_and(shared_parent)
@@ -2266,6 +2645,7 @@ impl Mount {
             (MS_NOSUID, ",nosuid"),
             (MS_NODEV, ",nodev"),
             (MS_NOEXEC, ",noexec"),
+            (MS_NOSYMFOLLOW, ",nosymfollow"),
             (MS_NOATIME, ",noatime"),
             (MS_NODIRATIME, ",nodiratime"),
             (MS_RELATIME, ",relatime"),
@@ -2356,6 +2736,9 @@ pub(super) fn table_text(snapshot: &NamespaceSnapshot, info: bool, cgroup_root: 
                     if let Some(group) = p.master {
                         tags.push_str(&format!(" master:{}", group.id));
                     }
+                    if p.unbindable {
+                        tags.push_str(" unbindable");
+                    }
                     tags
                 },
                 m.fs_name(),
@@ -2379,14 +2762,15 @@ pub(super) fn table_text(snapshot: &NamespaceSnapshot, info: bool, cgroup_root: 
     text.into_bytes()
 }
 impl Vfs {
-    pub(super) fn mount_statfs(&self, mount: Option<&MountData>) -> Result<[u8; 120]> {
+    pub(super) fn mount_statfs(
+        &self,
+        mount: Option<&MountData>,
+        inode: Option<NodeRef>,
+    ) -> Result<[u8; 120]> {
         let Some(m) = mount else {
             return Ok(self.storage_stat());
         };
-        let flags = m.flags.get();
-        let stat_flags = (flags
-            & (MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_NOATIME | MS_NODIRATIME))
-            | if flags & MS_RELATIME != 0 { 4096 } else { 0 };
+        let stat_flags = m.flags.statfs();
         #[cfg(all(feature = "hostfs", unix))]
         if let Some(host) = &m.fs.host {
             return host.statfs(stat_flags);
@@ -2394,8 +2778,12 @@ impl Vfs {
         let mut out = [0; 120];
         if let Some(fs) = &m.fs.fuse {
             let query = self.query.as_ref().ok_or(Errno(95))?;
-            query.prepared.borrow_mut().fuse =
-                Some(Box::new(fuse::Metadata::statfs(self, m, fs, stat_flags)?));
+            query.prepared.borrow_mut().fuse = Some(Box::new(fuse::Metadata::statfs(
+                self,
+                m,
+                fs,
+                inode.unwrap_or_else(|| m.root.clone()),
+            )?));
             return query.defer();
         }
         let magic = m.kind.statfs_magic();
@@ -3172,7 +3560,8 @@ mod boundary_tests {
         )
         .unwrap();
         v.mount(Some(b"/a"), b"/b", None, 4096, None).unwrap();
-        v.mount(None, b"/a", None, 32 | MS_RDONLY, None).unwrap();
+        v.mount(None, b"/a", None, 4096 | 32 | MS_RDONLY, None)
+            .unwrap();
         let dir = v.open_at(AT_FDCWD, b"/b", O_DIRECTORY, 0).unwrap();
         let open = v.descriptor(dir).unwrap().open.clone();
         let node = open.borrow().node.clone().unwrap();
@@ -3203,7 +3592,9 @@ mod boundary_tests {
         let fd = v.open_at(AT_FDCWD, b"/a", O_DIRECTORY, 0).unwrap();
         let descriptor = v.descriptor(fd).unwrap();
         let open = descriptor.open.borrow();
-        let fs = v.mount_statfs(open.mount.as_deref()).unwrap();
+        let fs = v
+            .mount_statfs(open.mount.as_deref(), open.node.clone())
+            .unwrap();
         assert_eq!(u64::from_le_bytes(fs[..8].try_into().unwrap()), 0x19800202);
         drop(open);
         assert_eq!(v.open_at(AT_FDCWD, b"/a/queue", 0x42, 0o600), Err(Errno(1)));

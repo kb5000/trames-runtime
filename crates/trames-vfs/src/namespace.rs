@@ -4,6 +4,61 @@ use super::*;
 pub(super) const RENAME_NOREPLACE: u32 = 1;
 pub(super) const RENAME_EXCHANGE: u32 = 2;
 
+// Accepted source identity, independent of a later pathname or numeric FD.
+pub(crate) struct LinkSource {
+    pub(super) path: ResolvedPath,
+    pub(super) node: NodeRef,
+    pub(super) policy: Arc<sysctl::NameiPolicy>,
+    _usage: Option<mounts::MountUse>,
+    _original: Option<ResolvedInode>,
+}
+fn link_resource_path(key: Vec<u8>, mount: Option<Arc<Mount>>) -> ResolvedPath {
+    ResolvedPath {
+        key,
+        mount,
+        directory_inode: None,
+        indexed_position: None,
+        #[cfg(all(feature = "hostfs", unix))]
+        host_position: None,
+        retained_directory: None,
+        proc_binding: None,
+    }
+}
+pub(super) fn link_permission(
+    c: &Credentials,
+    policy: u32,
+    source: &Node,
+    delegated: bool,
+) -> Result<()> {
+    if c.fsuid == source.uid
+        || policy == 0
+        || c.inode_cap(capabilities::FOWNER, source.uid, source.gid)
+    {
+        return Ok(());
+    }
+    let safe = source.mode & 0o170000 == 0o100000
+        && source.mode & 0o4000 == 0
+        && source.mode & 0o2010 != 0o2010
+        && (delegated && matches!(source.content, Content::Fuse) || c.allows_node(source, 6));
+    if safe {
+        Ok(())
+    } else {
+        Err(Errno(1))
+    }
+}
+
+fn sticky_create_permission(c: &Credentials, level: u32, owner: u32, dir: &Node) -> Result<()> {
+    if level != 0
+        && owner != c.fsuid
+        && owner != dir.uid
+        && dir.mode & 0o1000 != 0
+        && (dir.mode & 2 != 0 || level == 2 && dir.mode & 0o020 != 0)
+    {
+        return Err(Errno(13));
+    }
+    Ok(())
+}
+
 impl Vfs {
     pub fn link_at(&mut self, oldfd: i32, old: &[u8], newfd: i32, new: &[u8]) -> Result<()> {
         self.link_at_follow(oldfd, old, newfd, new, false, false)
@@ -35,60 +90,91 @@ impl Vfs {
         } else {
             None
         };
-        let (source, retained) = if old.is_empty() && empty_path {
+        let source = if old.is_empty() && empty_path {
             match &accepted {
-                Some(descriptor) => {
-                    let open = descriptor.open.borrow();
-                    let node = open.node.clone().ok_or(Errno(2))?;
-                    (
-                        self.location(&node, &self.mount_for_path(open.mount.as_ref()))?,
-                        Some(node),
-                    )
+                Some(descriptor) => self.accept_link_source((
+                    link_resource_path(Vec::new(), None),
+                    Some(ResolvedTarget::Descriptor(descriptor.open.clone())),
+                ))?,
+                None => {
+                    let path = self.base(oldfd)?;
+                    self.accept_link_source((path, None))?
                 }
-                None => (self.base(oldfd)?, None),
             }
         } else {
-            (
-                self.resolve_entry_operation(
-                    oldfd,
-                    old,
-                    follow,
-                    false,
-                    0,
-                    false,
-                    None,
-                    accepted.as_ref(),
-                )?
-                .0,
+            let entry = self.resolve_entry_operation(
+                oldfd,
+                old,
+                follow,
+                true,
+                0,
+                true,
                 None,
-            )
+                accepted.as_ref(),
+            )?;
+            self.accept_link_source(entry)?
         };
-        let dest = self.resolve_final(newfd, new, false)?;
+        let (dest, fuse) = self.capture_fuse_path(newfd, new, false)?;
+        if let Some(plan) = fuse {
+            let rights = landlock::make(source.node.borrow().mode);
+            return self.defer_fuse_namespace(
+                plan,
+                fuse::NamespaceAction::Link(Box::new(source)),
+                None,
+                rights,
+            );
+        }
         if self.proc_directory_tree(&dest) {
-            self.node(&source)?;
             self.node(&dest)?;
             return Err(Errno(17));
         }
-        self.link_resolved(&source, &dest, retained.as_ref(), None)
+        self.link_resolved(&source.path, &dest, Some(&source.node), None)
+    }
+    fn accept_link_source(&self, (mut path, magic): ResolvedEntry) -> Result<LinkSource> {
+        let original = match magic {
+            Some(ResolvedTarget::Descriptor(open)) => Some(self.proc_open_node(&open, &path)?),
+            Some(ResolvedTarget::Inode(file)) => Some(file),
+            None => None,
+        };
+        let node = if let Some(file) = &original {
+            path = link_resource_path(file.label.clone(), file.mount.clone());
+            #[cfg(all(feature = "hostfs", unix))]
+            {
+                path.host_position = file
+                    .host_file
+                    .as_ref()
+                    .map(|f| hostfs::Position::inode(file.node.clone(), f.clone()));
+            }
+            file.node.clone()
+        } else {
+            self.node(&path)?
+        };
+        path.directory_inode = Some(node.clone());
+        #[cfg(all(feature = "hostfs", unix))]
+        if let Some(host) = &path.filesystem(self).host {
+            if let Some(file) = host.lease_path(&path.filesystem(self), &path, &node, O_PATH)? {
+                path.host_position = Some(hostfs::Position::inode(node.clone(), file));
+            }
+        }
+        let usage = path
+            .mount
+            .as_ref()
+            .map(|m| mounts::MountUse::new(m.identity.clone()));
+        Ok(LinkSource {
+            path,
+            node,
+            policy: self.namei_policy.clone(),
+            _usage: usage,
+            _original: original,
+        })
     }
     pub(super) fn check_link_source(&self, source: &Node) -> Result<()> {
-        if self.credentials.fsuid == source.uid
-            || self.namei_policy.get(sysctl::Protection::Hardlinks) == 0
-            || self
-                .credentials
-                .inode_cap(capabilities::FOWNER, source.uid, source.gid)
-        {
-            return Ok(());
-        }
-        let safe = matches!(source.content, Content::File(_))
-            && source.mode & 0o4000 == 0
-            && source.mode & 0o2010 != 0o2010
-            && self.allowed(source, 6);
-        if safe {
-            Ok(())
-        } else {
-            Err(Errno(1))
-        }
+        link_permission(
+            &self.credentials,
+            self.namei_policy.get(sysctl::Protection::Hardlinks),
+            source,
+            true,
+        )
     }
     pub(super) fn check_sticky_create(&self, path: &ResolvedPath, node: &NodeRef) -> Result<()> {
         let n = node.borrow();
@@ -107,13 +193,23 @@ impl Vfs {
         drop(n);
         let parent = self.node(&path.parent())?;
         let dir = parent.borrow();
-        if owner != dir.uid
-            && dir.mode & 0o1000 != 0
-            && (dir.mode & 2 != 0 || level == 2 && dir.mode & 0o020 != 0)
-        {
-            return Err(Errno(13));
+        sticky_create_permission(&self.credentials, level, owner, &dir)
+    }
+    pub(super) fn check_sticky_create_in(
+        &self,
+        mode: u32,
+        owner: u32,
+        parent: &NodeRef,
+    ) -> Result<()> {
+        let level = match mode & 0o170000 {
+            0o100000 => self.namei_policy.get(sysctl::Protection::Regular),
+            0o010000 => self.namei_policy.get(sysctl::Protection::Fifos),
+            _ => 0,
+        };
+        if level == 0 || owner == self.credentials.fsuid {
+            return Ok(());
         }
-        Ok(())
+        sticky_create_permission(&self.credentials, level, owner, &parent.borrow())
     }
     /// Move or exchange complete subtrees under one namespace transaction.
     pub fn rename_at(
@@ -127,14 +223,31 @@ impl Vfs {
         if !matches!(flags, 0 | RENAME_NOREPLACE | RENAME_EXCHANGE) {
             return Err(Errno(22));
         }
-        let source = self.resolve_final(oldfd, old, false)?;
-        let dest = self.resolve_final(newfd, new, false)?;
         let special_final = |path: &[u8]| {
             matches!(
                 path.rsplit(|b| *b == b'/').find(|part| !part.is_empty()),
                 None | Some(b"." | b"..")
             )
         };
+        let (source, source_fuse) = self.capture_fuse_path(oldfd, old, false)?;
+        if let Some(source_plan) = source_fuse {
+            // Capture only the destination's original base/root here. Its
+            // actual mount/parent traversal starts after the source parent.
+            let dest = fuse::NamespaceTarget::unresolved(self, newfd, new)?;
+            if special_final(old) {
+                return Err(Errno(16));
+            }
+            if special_final(new) {
+                return Err(Errno(if flags == RENAME_NOREPLACE { 17 } else { 16 }));
+            }
+            return self.defer_fuse_namespace(
+                source_plan,
+                fuse::NamespaceAction::Rename { flags },
+                Some(dest),
+                landlock::REMOVE_FILE | landlock::REMOVE_DIR | landlock::REFER,
+            );
+        }
+        let (dest, dest_fuse) = self.capture_fuse_path(newfd, new, false)?;
         if special_final(old) {
             return Err(Errno(16));
         }
@@ -144,14 +257,44 @@ impl Vfs {
         if self.is_mount_root(&source) || self.is_mount_root(&dest) {
             return Err(Errno(16));
         }
+        if let Some(dest_plan) = dest_fuse {
+            let source = fuse::NamespaceTarget::ordinary(source, old.ends_with(b"/"));
+            return self.defer_fuse_namespace(
+                source,
+                fuse::NamespaceAction::Rename { flags },
+                Some(dest_plan.into()),
+                landlock::REMOVE_FILE | landlock::REMOVE_DIR | landlock::REFER,
+            );
+        }
+        self.rename_resolved(
+            source,
+            dest,
+            flags,
+            old.ends_with(b"/"),
+            new.ends_with(b"/"),
+        )
+    }
+    pub(super) fn rename_resolved(
+        &mut self,
+        source: ResolvedPath,
+        dest: ResolvedPath,
+        flags: u32,
+        source_trailing: bool,
+        dest_trailing: bool,
+    ) -> Result<()> {
         if source.mount.as_ref().map(|m| m.id) != dest.mount.as_ref().map(|m| m.id) {
             return Err(Errno(18));
         }
         source.writable()?;
         let filesystem = source.filesystem(self);
         let _namespace = filesystem.namespace.lock().unwrap();
+        let source = self.rebase_indexed(source)?;
+        let dest = self.rebase_indexed(dest)?;
         let exchange = flags == RENAME_EXCHANGE;
         let src = self.node(&source)?;
+        if source_trailing && !matches!(src.borrow().content, Content::Directory) {
+            return Err(Errno(20));
+        }
         let target = match self.node(&dest) {
             Ok(node) => Some(node),
             Err(Errno(2)) if !exchange && !self.proc_directory_tree(&dest) => None,
@@ -159,6 +302,14 @@ impl Vfs {
         };
         if flags == RENAME_NOREPLACE && target.is_some() {
             return Err(Errno(17));
+        }
+        if dest_trailing
+            && (!matches!(src.borrow().content, Content::Directory)
+                || target
+                    .as_ref()
+                    .is_some_and(|node| !matches!(node.borrow().content, Content::Directory)))
+        {
+            return Err(Errno(20));
         }
         if target.as_ref().is_some_and(|n| Arc::ptr_eq(n, &src)) {
             return Ok(());
@@ -280,7 +431,7 @@ impl Vfs {
         }
         #[cfg(all(feature = "hostfs", unix))]
         if let Some(host) = &filesystem.host {
-            host.rename(&source.key, &dest.key, flags)?;
+            host.rename(&filesystem, &source, &dest, flags)?;
         }
         if let Some(n) = overwritten {
             n.borrow_mut().links -= 1;
@@ -419,7 +570,12 @@ impl Vfs {
         Ok(())
     }
     pub fn chmod_at(&mut self, dirfd: i32, path: &[u8], mode: u32) -> Result<()> {
-        let MetadataTarget { path, node, _magic } = self.metadata_target(dirfd, path, true)?;
+        let target = self.metadata_target(dirfd, path, true)?;
+        if let Some(result) = self.fuse_path_attributes(&target, fuse::AttributeChange::Mode(mode))
+        {
+            return result;
+        }
+        let MetadataTarget { path, node, _magic } = target;
         path.writable()?;
         let link = self.event_link(&path, &node);
         self.chmod_node(node, mode, true, link.as_ref())
@@ -431,7 +587,12 @@ impl Vfs {
         mode: u32,
         nofollow: bool,
     ) -> Result<()> {
-        let MetadataTarget { path, node, _magic } = self.metadata_target(dirfd, path, !nofollow)?;
+        let target = self.metadata_target(dirfd, path, !nofollow)?;
+        if let Some(result) = self.fuse_path_attributes(&target, fuse::AttributeChange::Mode(mode))
+        {
+            return result;
+        }
+        let MetadataTarget { path, node, _magic } = target;
         path.writable()?;
         if matches!(node.borrow().content, Content::Symlink(_)) {
             return Err(Errno(95));
@@ -447,6 +608,9 @@ impl Vfs {
     }
     /// AT_EMPTY_PATH operates on an inode reference, including O_PATH.
     pub fn chmod_fd_at(&mut self, fd: u32, mode: u32) -> Result<()> {
+        if let Some(result) = self.fuse_fd_attributes(fd, fuse::AttributeChange::Mode(mode)) {
+            return result;
+        }
         self.fd_writable(fd)?;
         let open_descriptor = self.descriptor(fd)?;
         let open = open_descriptor.open.borrow();
@@ -531,11 +695,21 @@ impl Vfs {
             if !empty_path && self.flags(dirfd as u32)? & O_PATH != 0 {
                 return Err(Errno(9));
             }
+            if let Some(result) =
+                self.fuse_fd_attributes(dirfd as u32, fuse::AttributeChange::Times(times))
+            {
+                return result;
+            }
             self.fd_writable(dirfd as u32)?;
         }
         let (node, link) = match path {
             Some(p) => {
                 let target = self.metadata_target(dirfd, p, flags & 0x100 == 0)?;
+                if let Some(result) =
+                    self.fuse_path_attributes(&target, fuse::AttributeChange::Times(times))
+                {
+                    return result;
+                }
                 target.path.writable()?;
                 let link = target
                     ._magic

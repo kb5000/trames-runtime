@@ -4,6 +4,53 @@ use std::sync::{
     atomic::{AtomicU32, AtomicU64, Ordering},
     Arc,
 };
+/// One original environment's task ceiling. Binding and the value share one
+/// relaxed atomic so proc snapshots cannot overwrite a live sysctl update.
+#[derive(Clone)]
+pub struct TaskLimit(Arc<AtomicU32>);
+impl Default for TaskLimit {
+    fn default() -> Self {
+        Self(Arc::new(AtomicU32::new(super::MAX_TASKS as u32)))
+    }
+}
+impl TaskLimit {
+    const BOUND: u32 = 1 << 31;
+    pub const MAX: u32 = 0x3fff_ffff;
+    pub fn new(value: usize) -> Self {
+        Self(Arc::new(AtomicU32::new(
+            Self::BOUND | value.clamp(1, Self::MAX as usize) as u32,
+        )))
+    }
+    pub fn get(&self) -> usize {
+        (self.0.load(Ordering::Relaxed) & Self::MAX) as usize
+    }
+    pub fn set(&self, value: u32) -> Result<(), super::Errno> {
+        if !(1..=Self::MAX).contains(&value) {
+            return Err(super::Errno(22));
+        }
+        self.0.store(Self::BOUND | value, Ordering::Relaxed);
+        Ok(())
+    }
+    pub fn bind_initial(&self, value: usize) {
+        let value = value.clamp(1, Self::MAX as usize) as u32;
+        let _ = self
+            .0
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                (old & Self::BOUND == 0).then_some(Self::BOUND | value)
+            });
+    }
+    pub(super) fn snapshot(&self, value: usize) {
+        if value == 0 {
+            return;
+        }
+        let value = value.min(Self::MAX as usize) as u32;
+        let _ = self
+            .0
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                (old & Self::BOUND == 0).then_some(value)
+            });
+    }
+}
 #[derive(Clone)]
 pub struct FileSizeLimit(Arc<AtomicU64>);
 impl Default for FileSizeLimit {

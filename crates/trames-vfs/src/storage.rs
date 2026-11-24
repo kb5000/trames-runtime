@@ -1012,7 +1012,7 @@ fn inode_metadata_bytes(n: &Node) -> Result<[u8; 64]> {
     bytes[4..8].copy_from_slice(&n.uid.to_le_bytes());
     bytes[8..12].copy_from_slice(&n.gid.to_le_bytes());
     bytes[12] = match n.content {
-        Content::MessageQueue(_) => return Err(Errno(95)),
+        Content::MessageQueue(_) | Content::Fuse => return Err(Errno(95)),
         Content::Directory => 0,
         Content::File(_) => 1,
         Content::Null => 2,

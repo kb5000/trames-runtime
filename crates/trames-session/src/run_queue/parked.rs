@@ -44,6 +44,7 @@ impl<C: Cpu> Parked<C> {
         // handles or substitute a queue timer/polling service for that protocol.
         if job.io.as_ref().is_some_and(|io| io.external_wait())
             || job.uring.as_ref().is_some_and(|ring| ring.external())
+            || matches!(job.waiting, Some(super::WaitState::Page(_)))
         {
             self.external.insert(pid);
         }

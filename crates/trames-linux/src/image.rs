@@ -96,6 +96,8 @@ pub fn build_initial_stack(
         (15, platform), // AT_PLATFORM points into the new image.
         (16, features.hwcap),
         (26, features.hwcap2),
+        (27, 28), // AT_RSEQ_FEATURE_SIZE: through mm_cid.
+        (28, 32), // AT_RSEQ_ALIGN.
         (9, elf.entry),
         (7, elf.interpreter_base),
         (11, credentials.uid as u64),

@@ -331,6 +331,10 @@ impl Vfs {
             let path = ResolvedPath {
                 key: key.clone(),
                 mount: file.mount.clone(),
+                directory_inode: None,
+                indexed_position: None,
+                #[cfg(all(feature = "hostfs", unix))]
+                host_position: None,
                 retained_directory: None,
                 proc_binding: file
                     .node

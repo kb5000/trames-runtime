@@ -363,6 +363,7 @@ impl Anonymous {
                 .executable
                 .store(r.permissions.execute, Ordering::Relaxed);
             Arc::new(Frame {
+                write_error: None,
                 base,
                 root_frame: usize::MAX,
                 permissions: r.permissions,

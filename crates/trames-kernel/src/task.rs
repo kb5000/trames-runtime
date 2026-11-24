@@ -32,23 +32,26 @@ impl Ids {
 /// Admission belongs to the original session resource, not its task table.
 /// Reserved construction, live tasks and unreaped zombies all consume a slot.
 pub struct Capacity {
-    limit: usize,
+    limit: trames_vfs::TaskLimit,
     used: AtomicUsize,
 }
 impl Capacity {
     pub fn new(limit: usize) -> Self {
+        Self::with_limit(trames_vfs::TaskLimit::new(limit))
+    }
+    pub fn with_limit(limit: trames_vfs::TaskLimit) -> Self {
         Self {
             limit,
             used: AtomicUsize::new(0),
         }
     }
     pub fn limit(&self) -> usize {
-        self.limit
+        self.limit.get()
     }
     pub fn reserve(self: &Arc<Self>) -> Option<Slot> {
         self.used
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                (used < self.limit).then(|| used + 1)
+                (used < self.limit.get()).then(|| used + 1)
             })
             .ok()?;
         Some(Slot(Some(self.clone())))
@@ -121,6 +124,26 @@ impl Drop for Presence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn live_limit_changes_reuse_existing_admission_without_revoking_tasks() {
+        let limit = trames_vfs::TaskLimit::new(3);
+        let capacity = Arc::new(Capacity::with_limit(limit.clone()));
+        let tasks: Vec<_> = (0..3)
+            .map(|_| capacity.reserve().unwrap().into_presence())
+            .collect();
+        assert!(capacity.reserve().is_none());
+        limit.set(1).unwrap();
+        assert!(tasks.iter().all(Presence::present));
+        assert!(capacity.reserve().is_none());
+        limit.set(4).unwrap();
+        let fourth = capacity.reserve().unwrap();
+        assert!(capacity.reserve().is_none());
+        drop(tasks);
+        limit.set(1).unwrap();
+        assert!(capacity.reserve().is_none());
+        drop(fourth);
+        assert!(capacity.reserve().is_some());
+    }
     #[test]
     fn concurrent_admission_reserves_capacity_before_publication() {
         let capacity = Arc::new(Capacity::new(7));

@@ -4,6 +4,7 @@
 //! io_submit may block for buffered I/O, as on Linux. It releases its CPU slot
 //! while waiting, and returns only after this batch's buffers are no longer in
 //! use. There are no detached guest pointers, memory-owner RPCs or new threads.
+use super::file::FileCopyout;
 use super::*;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -60,6 +61,7 @@ struct Request {
     data: u64,
     result: Arc<FileResult>,
     output: FileOutput,
+    copyout: Option<FileCopyout>,
     event: Option<trames_vfs::NativeEvent>,
 }
 struct Batch {
@@ -284,6 +286,7 @@ impl DirectSyscalls {
                 data: u64_at(0),
                 result: Arc::default(),
                 output,
+                copyout: None,
                 event,
             },
             work,
@@ -489,91 +492,115 @@ impl DirectSyscalls {
                 while remaining != 0 {
                     remaining -= 1;
                     let mut request = batch.requests.pop_front().unwrap();
-                    let outcome = if let Some(work) = request.waiting.take() {
-                        if context.state.lock().unwrap().dead {
+                    let completed = if request.copyout.is_some() {
+                        None
+                    } else {
+                        let outcome = if let Some(work) = request.waiting.take() {
+                            if context.state.lock().unwrap().dead {
+                                Some(trames_vfs::FileOutcome::Complete(trames_vfs::FileReply {
+                                    resources: Default::default(),
+                                    result: Err(Errno(125)),
+                                    file_size_signal: false,
+                                    scratch: None,
+                                }))
+                            } else if work.ready() {
+                                Some(work.run())
+                            } else {
+                                subscriptions.extend(
+                                    work.wait_sources(&signal)
+                                        .map_err(|_| Errno(5))?
+                                        .subscriptions,
+                                );
+                                if work.ready() {
+                                    remaining += 1;
+                                }
+                                request.waiting = Some(work);
+                                batch.requests.push_back(request);
+                                continue;
+                            }
+                        } else if let Some((pipe, command)) = &request.pipe {
+                            // Subscribe before checking the original pipe. A blocking
+                            // endpoint returns the slot while readers/writers progress.
+                            subscriptions.extend(pipe.subscribe(&signal));
+                            let result = if context.state.lock().unwrap().dead {
+                                Err(Errno(125))
+                            } else {
+                                match command {
+                                    trames_vfs::FileCommand::Read { count, .. } => {
+                                        pipe.read(*count).map(trames_vfs::FileValue::Bytes)
+                                    }
+                                    trames_vfs::FileCommand::Write { bytes, .. } => pipe
+                                        .write(bytes)
+                                        .map(|n| trames_vfs::FileValue::Count(n as u64)),
+                                    _ => unreachable!("pipe read/write"),
+                                }
+                            };
+                            if matches!(result, Err(Errno(11))) && !pipe.nonblocking() {
+                                batch.requests.push_back(request);
+                                continue;
+                            }
                             Some(trames_vfs::FileOutcome::Complete(trames_vfs::FileReply {
-                                result: Err(Errno(125)),
+                                resources: Default::default(),
+                                result,
                                 file_size_signal: false,
                                 scratch: None,
                             }))
-                        } else if work.ready() {
-                            Some(work.run())
                         } else {
-                            subscriptions.extend(
-                                work.wait_sources(&signal)
-                                    .map_err(|_| Errno(5))?
-                                    .subscriptions,
-                            );
-                            if work.ready() {
-                                remaining += 1;
-                            }
-                            request.waiting = Some(work);
-                            batch.requests.push_back(request);
-                            continue;
-                        }
-                    } else if let Some((pipe, command)) = &request.pipe {
-                        // Subscribe before checking the original pipe. A blocking
-                        // endpoint returns the slot while readers/writers progress.
-                        subscriptions.extend(pipe.subscribe(&signal));
-                        let result = if context.state.lock().unwrap().dead {
-                            Err(Errno(125))
-                        } else {
-                            match command {
-                                trames_vfs::FileCommand::Read { count, .. } => {
-                                    pipe.read(*count).map(trames_vfs::FileValue::Bytes)
-                                }
-                                trames_vfs::FileCommand::Write { bytes, .. } => pipe
-                                    .write(bytes)
-                                    .map(|n| trames_vfs::FileValue::Count(n as u64)),
-                                _ => unreachable!("pipe read/write"),
-                            }
+                            request.result.take()
                         };
-                        if matches!(result, Err(Errno(11))) && !pipe.nonblocking() {
-                            batch.requests.push_back(request);
-                            continue;
-                        }
-                        Some(trames_vfs::FileOutcome::Complete(trames_vfs::FileReply {
-                            result,
-                            file_size_signal: false,
-                            scratch: None,
-                        }))
-                    } else {
-                        request.result.take()
-                    };
-                    let Some(outcome) = outcome else {
-                        subscriptions.push(request.result.subscribe(&signal));
-                        if request.result.ready() {
-                            remaining += 1;
-                        }
-                        batch.requests.push_back(request);
-                        continue;
-                    };
-                    let result = match outcome {
-                        trames_vfs::FileOutcome::Waiting(work) => {
-                            subscriptions.extend(
-                                work.wait_sources(&signal)
-                                    .map_err(|_| Errno(5))?
-                                    .subscriptions,
-                            );
-                            if work.ready() {
+                        let Some(outcome) = outcome else {
+                            subscriptions.push(request.result.subscribe(&signal));
+                            if request.result.ready() {
                                 remaining += 1;
                             }
-                            request.waiting = Some(work);
                             batch.requests.push_back(request);
                             continue;
-                        }
-                        trames_vfs::FileOutcome::Complete(reply) => {
-                            if reply.file_size_signal {
-                                if let Some(task) = &self.task_signal {
-                                    task.raise(25);
+                        };
+                        match outcome {
+                            trames_vfs::FileOutcome::Waiting(work) => {
+                                subscriptions.extend(
+                                    work.wait_sources(&signal)
+                                        .map_err(|_| Errno(5))?
+                                        .subscriptions,
+                                );
+                                if work.ready() {
+                                    remaining += 1;
                                 }
+                                request.waiting = Some(work);
+                                batch.requests.push_back(request);
+                                continue;
                             }
-                            request.output.apply(reply.result, memory)
+                            trames_vfs::FileOutcome::Complete(reply) => {
+                                if reply.file_size_signal {
+                                    if let Some(task) = &self.task_signal {
+                                        task.raise(25);
+                                    }
+                                }
+                                request.copyout = Some(
+                                    FileCopyout::new(&request.output, reply.result)
+                                        .retain(reply.resources),
+                                );
+                                None
+                            }
+                            // An unsupported live mapped-file transition has made no
+                            // effects. Report it, rather than invoke an mm owner.
+                            trames_vfs::FileOutcome::Layout(_)
+                            | trames_vfs::FileOutcome::Owner(_) => Some(Err(Errno(95))),
                         }
-                        // An unsupported live mapped-file transition has made no
-                        // effects. Report it, rather than invoke an mm owner.
-                        trames_vfs::FileOutcome::Layout(_) | trames_vfs::FileOutcome::Owner(_) => {
-                            Err(Errno(95))
+                    };
+                    let result = if let Some(result) = completed {
+                        result
+                    } else {
+                        match request.copyout.as_mut().unwrap().progress(memory) {
+                            Ok(value) => value,
+                            Err(fault) => {
+                                subscriptions.push(fault.wait.subscribe(&signal));
+                                if fault.wait.ready() {
+                                    remaining += 1;
+                                }
+                                batch.requests.push_back(request);
+                                continue;
+                            }
                         }
                     };
                     let mut event = [0; 32];
@@ -703,6 +730,87 @@ mod tests {
             IoAttempt::Complete(value) => value,
             _ => panic!("expected completion"),
         }
+    }
+    #[test]
+    fn accepted_aio_bytes_wait_for_the_destination_before_cq_and_eventfd_publication() {
+        let mut v = trames_vfs::Vfs::default();
+        v.import_file(b"/data", b"payload".to_vec()).unwrap();
+        let fd = v.open_at(-100, b"/data", 0, 0).unwrap();
+        let event = v.eventfd(0, 0).unwrap();
+        let aio = Aio::default();
+        let disk = Arc::new(Disk::default());
+        let direct = DirectSyscalls::new(v.direct_descriptors())
+            .with_aio(aio.clone(), v.native_events())
+            .with_paths(v.path_queries())
+            .with_file_executor(disk.clone());
+        let wake: Arc<dyn IoWake> = Arc::new(Wake);
+        let target = Arc::downgrade(&wake);
+        let mut memory = Memory::default();
+        memory.map(0x1000, 0x5000, Permissions::RW).unwrap();
+        assert_eq!(
+            value(
+                direct
+                    .start(0, [8, 0x1000, 0, 0, 0, 0], &mut memory, 1, &target, None)
+                    .unwrap()
+            ),
+            Ok(0)
+        );
+        let context = u64::from_le_bytes(memory.read_array(0x1000).unwrap());
+        let mut cb = [0; 64];
+        cb[..8].copy_from_slice(&123u64.to_le_bytes());
+        cb[20..24].copy_from_slice(&fd.to_le_bytes());
+        cb[24..32].copy_from_slice(&0x3000u64.to_le_bytes());
+        cb[32..40].copy_from_slice(&7u64.to_le_bytes());
+        cb[56..60].copy_from_slice(&1u32.to_le_bytes());
+        cb[60..64].copy_from_slice(&event.to_le_bytes());
+        memory.write_array(0x2000, cb).unwrap();
+        memory.write_array(0x1800, 0x2000u64.to_le_bytes()).unwrap();
+        let IoAttempt::Blocked(pending) = direct
+            .start(
+                2,
+                [context, 1, 0x1800, 0, 0, 0],
+                &mut memory,
+                1,
+                &target,
+                None,
+            )
+            .unwrap()
+        else {
+            panic!("accepted disk request")
+        };
+        // The IO was accepted against the original buffer. Its later copyout
+        // must fault in the new destination without resubmitting that read.
+        memory.unmap(0x3000, trames_memory::PAGE_SIZE).unwrap();
+        let page = crate::direct::file::copyout_tests::install(&mut memory, 0x3000);
+        disk.complete();
+        let IoAttempt::Blocked(pending) = direct.resume(pending, &mut memory) else {
+            panic!("original bytes await destination")
+        };
+        assert_eq!(v.read(event, 8), Err(Errno(11)));
+        assert_eq!(
+            aio.context(context, &memory)
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .tail,
+            0
+        );
+        assert!(disk.0.lock().unwrap().is_empty(), "no second disk job");
+        page.finish();
+        assert!(pending.signal.ready());
+        assert_eq!(value(direct.resume(pending, &mut memory)), Ok(1));
+        assert_eq!(memory.read_array::<7>(0x3000).unwrap(), *b"payload");
+        assert_eq!(v.read(event, 8).unwrap(), 1u64.to_le_bytes());
+        assert_eq!(
+            aio.context(context, &memory)
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .tail,
+            1
+        );
     }
     #[test]
     fn buffered_submit_yields_slot_then_copies_bytes_before_cq_and_eventfd() {

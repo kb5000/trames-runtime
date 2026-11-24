@@ -19,6 +19,8 @@ pub(super) fn backing_revision() -> u64 {
 /// Thread-safe cold page-in capability. Namespace/OFD metadata stays in VFS;
 /// this handle retains only the byte resource needed by a reached CPU page.
 pub trait PageSource: Send + Sync {
+    /// A missing asynchronous page returns MemoryError::Pending with its
+    /// original PageWait. Never block a CPU worker or encode a guest errno.
     fn load(&self) -> Result<std::sync::Arc<SharedPage>, MemoryError>;
 }
 
@@ -76,6 +78,16 @@ pub trait PageBacking: Send + Sync {
     /// sharing the same mm keep the original mapping and never consult this.
     fn inherit_on_fork(&self) -> bool {
         true
+    }
+    /// Cold VMA growth policy (Linux VM_DONTEXPAND). Byte access is unaffected.
+    fn expandable(&self) -> bool {
+        true
+    }
+    /// Retained immutable Views of device pages may need the original VMA/OFD
+    /// lifetime even without writeback. Kept in cold snapshot metadata only;
+    /// ordinary CPU frames and accesses do not gain another backing lookup.
+    fn retain_in_view(&self) -> bool {
+        false
     }
     /// Publication admission for an original file's physical layout. Only
     /// mapping/snapshot construction consults this; CPU byte access does not.
@@ -185,6 +197,13 @@ pub trait PageBacking: Send + Sync {
         None
     }
     fn check(&self, address: u64) -> Result<(), MemoryError>;
+    /// Immutable shared-mapping write-fault policy, distinct from VMA access
+    /// permissions. Device control mappings can admit PROT_WRITE while some
+    /// pages fault with SIGBUS on stores. Translation preparation caches this;
+    /// changing it requires replacing the original backing/mapping.
+    fn write_fault(&self, _address: u64) -> Option<MemoryError> {
+        None
+    }
     fn read(&self, offset: usize, out: &mut [u8]) -> Result<(), MemoryError>;
     fn write(&self, offset: usize, bytes: &[u8]) -> Result<(), MemoryError>;
     /// Resident operations cannot perform fallible backing I/O after complete
@@ -240,7 +259,10 @@ pub trait PageBacking: Send + Sync {
 /// A physical backing page may appear in several guest page tables. Execution
 /// pins and file-cache references do not constitute additional mappings.
 #[derive(Default)]
-pub struct MappedResidents(parking_lot::Mutex<Members>);
+pub struct MappedResidents(
+    parking_lot::Mutex<Members>,
+    Arc<crate::cgroup_memory::SharedCharge>,
+);
 #[derive(Default)]
 enum Members {
     #[default]
@@ -249,7 +271,14 @@ enum Members {
     Several(Vec<std::sync::Weak<Charge>>),
 }
 impl MappedResidents {
-    fn attach(&self, charge: &Arc<Charge>) {
+    /// A non-mmap cache fill reserves its physical owner on the requesting
+    /// worker, before IO. Later aliases acquire only their own RSS tickets;
+    /// a daemon delivering the bytes cannot become the physical owner.
+    pub fn reserve_cache(&self) -> Result<(), MemoryError> {
+        self.1.get().map(|_| ())
+    }
+    fn attach(&self, charge: &Arc<Charge>, private: bool) {
+        charge.attach_cache(self.1.clone(), private);
         let mut owners = self.0.lock();
         let next = Arc::downgrade(charge);
         match &mut *owners {
@@ -294,7 +323,7 @@ impl Backed {
     fn attach(&self, charge: &Arc<Charge>) {
         if !self.private_copy {
             if let Some(owners) = self.object.mapped_residents() {
-                owners.attach(charge);
+                owners.attach(charge, !self.shared);
             }
         }
     }
@@ -312,6 +341,12 @@ impl Backed {
     }
 }
 impl Page {
+    pub(super) fn write_fault(&self, address: u64) -> Option<MemoryError> {
+        self.backing
+            .as_ref()
+            .filter(|backing| backing.shared)
+            .and_then(|backing| backing.object.write_fault(address))
+    }
     pub(super) fn register_backing(&self) {
         if let Some(b) = &self.backing {
             b.attach(&self.charge);
@@ -343,6 +378,25 @@ impl Page {
     pub(super) fn check_backing(&self, address: u64) -> Result<(), MemoryError> {
         if let Some(b) = &self.backing {
             b.object.check(address)?;
+        }
+        Ok(())
+    }
+    /// An asynchronous provider must finish page-in before this mm records a
+    /// resident page or starts COW. Resident/native providers keep their existing
+    /// byte path; ordinary anonymous RAM never enters this backing-only branch.
+    #[inline]
+    pub(super) fn prepare_source(&self, address: u64) -> Result<(), MemoryError> {
+        if let Some(b) = self
+            .backing
+            .as_ref()
+            .filter(|b| b.shared || !b.private_copy)
+        {
+            if !b.object.native_resident() {
+                if let Some(source) = b.object.page_source() {
+                    self.charge.check_available()?;
+                    source.load().map_err(|error| error.at_access(address))?;
+                }
+            }
         }
         Ok(())
     }
@@ -383,6 +437,7 @@ impl Page {
     pub(super) fn read_bytes(&self, offset: usize, out: &mut [u8]) -> Result<(), MemoryError> {
         if let Some(b) = &self.backing {
             if b.shared || !b.private_copy {
+                self.prepare_source(0)?;
                 if b.object.charge_reads() {
                     self.charge.ensure()?;
                 }
@@ -403,6 +458,16 @@ impl Page {
     }
 }
 impl Memory {
+    pub fn mapping_expandable(&self, address: u64) -> bool {
+        if let Some(shared) = &self.shared {
+            return shared.borrow().mapping_expandable(address);
+        }
+        self.page_for_access_unchecked(address).is_none_or(|page| {
+            page.backing
+                .as_ref()
+                .is_none_or(|backing| backing.object.expandable())
+        })
+    }
     pub fn map_backed(
         &mut self,
         address: u64,
@@ -424,6 +489,12 @@ impl Memory {
             .checked_mul(PAGE_SIZE)
             .ok_or(MemoryError::Limit)?;
         Self::mapping_end(address, len)?;
+        if permissions.execute && objects.iter().any(|backing| !backing.executable()) {
+            return Err(MemoryError::Permission {
+                address,
+                access: Access::Execute,
+            });
+        }
         if permissions.write
             && objects.iter().any(|b| {
                 if shared_mapping {
@@ -615,6 +686,9 @@ impl Memory {
             .as_ref()
             .filter(|b| b.shared)
             .ok_or(MemoryError::BackingIo(14))?;
+        if !source.object.expandable() {
+            return Err(MemoryError::BackingIo(14));
+        }
         if old == new {
             return Err(MemoryError::Overlap(new));
         }
@@ -703,6 +777,9 @@ impl Memory {
             return self.reserve(new, new_len, fixed);
         }
         self.check_mapped_range(old, old_end)?;
+        if new_len > old_len && !self.mapping_expandable(old) {
+            return Err(MemoryError::BackingIo(14));
+        }
         self.adopt_anonymous();
         let first = self
             .page_for_access_unchecked(old)

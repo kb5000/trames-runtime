@@ -50,6 +50,31 @@ pub(super) struct PositionGuard<'a> {
     state: std::sync::MutexGuard<'a, PositionState>,
     committed: &'a AtomicU64,
 }
+/// A synchronous write has changed data, but has not yet returned success.
+/// Keep dup/read/seek on the existing position readiness while sync runs with
+/// no position or inode lock held. Failure drops the candidate end unchanged.
+pub(super) struct WritePosition {
+    position: Arc<FilePosition>,
+    end: u64,
+    commit: bool,
+}
+impl WritePosition {
+    pub fn complete(mut self) {
+        self.commit = true;
+    }
+}
+impl Drop for WritePosition {
+    fn drop(&mut self) {
+        {
+            let mut position = self.position.lock().unwrap();
+            if self.commit {
+                position.value = self.end;
+            }
+            position.pending -= 1;
+        }
+        self.position.notify_pending();
+    }
+}
 impl std::ops::Deref for PositionGuard<'_> {
     type Target = PositionState;
     fn deref(&self) -> &Self::Target {
@@ -69,6 +94,14 @@ impl Drop for PositionGuard<'_> {
     }
 }
 impl FilePosition {
+    pub fn defer_write(self: &Arc<Self>, state: &mut PositionGuard<'_>, end: u64) -> WritePosition {
+        state.pending += 1;
+        WritePosition {
+            position: self.clone(),
+            end,
+            commit: false,
+        }
+    }
     pub fn subscribe_pending(&self, signal: &Arc<IoSignal>) -> IoSubscription {
         self.pending_ready
             .get_or_init(Default::default)

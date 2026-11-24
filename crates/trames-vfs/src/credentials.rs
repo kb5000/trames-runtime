@@ -155,6 +155,15 @@ impl CredentialState {
     pub fn check_trace_attach(&self, caller: &Credentials, require_cap: bool) -> Result<()> {
         self.with_pidfd_resources(caller, false, require_cap, |_| Ok(()))
     }
+    /// perf task monitoring uses real credentials without Yama ATTACH policy.
+    /// CAP_PERFMON/SYS_ADMIN apply in the initial user namespace.
+    pub fn check_perf(&self, caller: &Credentials, same_group: bool) -> Result<()> {
+        if caller.has_cap(capabilities::PERFMON) || caller.has_cap(capabilities::SYS_ADMIN) {
+            return Ok(());
+        }
+        self.with_pidfd_resources(caller, same_group, false, |_| Ok(()))
+            .map_err(|error| if error == Errno(1) { Errno(13) } else { error })
+    }
     fn with_pidfd_resources<T>(
         &self,
         caller: &Credentials,
@@ -373,33 +382,77 @@ impl Credentials {
     pub fn fs_identity(&self) -> [u32; 4] {
         [self.euid, self.egid, self.fsuid, self.fsgid]
     }
-    pub(super) fn allows_node(&self, node: &Node, bits: u32) -> bool {
-        let c = self;
-        let shift = if c.fsuid == node.uid {
+    fn mode_class(&self, uid: u32, gid: u32) -> u32 {
+        if self.fsuid == uid {
             6
-        } else if c.in_group(node.gid) {
+        } else if self.in_group(gid) {
             3
         } else {
             0
-        };
-        let mode = node.file_metadata().mode;
-        let permitted = if c.fsuid != node.uid {
-            node.xattrs
-                .get(acl::ACCESS)
-                .map_or((mode >> shift) & bits == bits, |value| {
-                    acl::allows(value, node, c, bits)
-                })
-        } else {
-            (mode >> shift) & bits == bits
-        };
+        }
+    }
+    fn allows_dac(
+        &self,
+        owner: (u32, u32),
+        mode: u32,
+        directory: bool,
+        bits: u32,
+        permitted: bool,
+    ) -> bool {
         permitted
-            || c.inode_cap(capabilities::DAC_OVERRIDE, node.uid, node.gid)
-                && (bits & 1 == 0
-                    || matches!(node.content, Content::Directory)
-                    || mode & 0o111 != 0)
-            || c.inode_cap(capabilities::DAC_READ_SEARCH, node.uid, node.gid)
+            || self.inode_cap(capabilities::DAC_OVERRIDE, owner.0, owner.1)
+                && (bits & 1 == 0 || directory || mode & 0o111 != 0)
+            || self.inode_cap(capabilities::DAC_READ_SEARCH, owner.0, owner.1)
                 && bits & 2 == 0
-                && (bits & 1 == 0 || matches!(node.content, Content::Directory))
+                && (bits & 1 == 0 || directory)
+    }
+    pub(super) fn allows_mode(
+        &self,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+        directory: bool,
+        bits: u32,
+    ) -> bool {
+        self.allows_dac(
+            (uid, gid),
+            mode,
+            directory,
+            bits,
+            (mode >> self.mode_class(uid, gid)) & bits == bits,
+        )
+    }
+    pub(super) fn allows_node(&self, node: &Node, bits: u32) -> bool {
+        let mode = node.file_metadata().mode;
+        let directory = matches!(node.content, Content::Directory);
+        if self.fsuid != node.uid {
+            if let Some(value) = node.xattrs.get(acl::ACCESS) {
+                return self.allows_dac(
+                    (node.uid, node.gid),
+                    mode,
+                    directory,
+                    bits,
+                    acl::allows(value, node, self, bits),
+                );
+            }
+        }
+        self.allows_mode(node.uid, node.gid, mode, directory, bits)
+    }
+    pub(super) fn allows_acl(&self, node: &Node, bits: u32, access: Option<&[u8]>) -> Result<bool> {
+        let mode = node.file_metadata().mode;
+        let directory = matches!(node.content, Content::Directory);
+        if self.fsuid != node.uid {
+            if let Some(value) = access {
+                return Ok(self.allows_dac(
+                    (node.uid, node.gid),
+                    mode,
+                    directory,
+                    bits,
+                    acl::permission(value, node, self, bits)?,
+                ));
+            }
+        }
+        Ok(self.allows_mode(node.uid, node.gid, mode, directory, bits))
     }
     pub fn can_read_proc_task(&self, same_group: bool, target: &ProcessInfo) -> bool {
         self.can_inspect_credentials(same_group, &target.credentials, !target.nondumpable)
@@ -691,6 +744,37 @@ impl Vfs {
         self.may_inspect_pid(self.proc_namespace(at).local(self.pid), runtime, target)
     }
 
+    /// proc_fd_permission permits a task's own thread group after setuid
+    /// made the proc directory root-owned. The FD target still has its usual
+    /// ptrace, mount and inode authorization checks.
+    #[cold]
+    pub(super) fn proc_fd_search_allowed(&self, at: &ResolvedPath) -> bool {
+        if !self.uses_pseudo(at) {
+            return false;
+        }
+        let Some(rest) = at.strip_prefix(b"/proc/") else {
+            return false;
+        };
+        let parts: Vec<_> = rest.split(|b| *b == b'/').collect();
+        let (target, group) = match parts.as_slice() {
+            [pid, b"fd"] => (proc_source::proc_task_id(pid), None),
+            [group, b"task", pid, b"fd"] => (
+                proc_source::proc_task_id(pid),
+                proc_source::proc_task_id(group),
+            ),
+            _ => return false,
+        };
+        let pseudo = self.pseudo.borrow();
+        let runtime = self.proc_runtime(at, &pseudo.runtime);
+        let own = self.proc_namespace(at).local(self.pid);
+        let Some(own) = runtime.processes.iter().find(|p| p.pid == own) else {
+            return false;
+        };
+        runtime.processes.iter().any(|p| {
+            Some(p.pid) == target && p.tgid == own.tgid && group.is_none_or(|g| p.tgid == g)
+        })
+    }
+
     pub(super) fn may_inspect_pid(
         &self,
         own: u32,
@@ -761,6 +845,17 @@ impl Vfs {
         effective: bool,
         nofollow: bool,
     ) -> Result<()> {
+        self.access_at_empty(dirfd, path, mode, effective, nofollow, false)
+    }
+    pub fn access_at_empty(
+        &self,
+        dirfd: i32,
+        path: &[u8],
+        mode: u32,
+        effective: bool,
+        nofollow: bool,
+        empty: bool,
+    ) -> Result<()> {
         if mode & !7 != 0 {
             return Err(Errno(22));
         }
@@ -777,27 +872,157 @@ impl Vfs {
                     };
             }
         }
-        let (path, _) = view.resolve_entry_operation(
+        if empty && path.is_empty() {
+            if dirfd == AT_FDCWD {
+                let (node, mount) = {
+                    let paths = view.context.paths.borrow();
+                    (
+                        paths.cwd_node.clone().ok_or(Errno(2))?,
+                        paths.cwd_mount.clone(),
+                    )
+                };
+                let path = ResolvedPath {
+                    key: view.cwd().unwrap_or_default(),
+                    mount,
+                    directory_inode: Some(node.clone()),
+                    proc_binding: None,
+                    indexed_position: None,
+                    retained_directory: None,
+                    #[cfg(all(feature = "hostfs", unix))]
+                    host_position: None,
+                };
+                return view.access_node(path, &node, mode);
+            }
+            let description = view.descriptor(dirfd as u32)?.open;
+            let path = ResolvedPath {
+                key: Vec::new(),
+                mount: None,
+                directory_inode: None,
+                proc_binding: None,
+                indexed_position: None,
+                retained_directory: None,
+                #[cfg(all(feature = "hostfs", unix))]
+                host_position: None,
+            };
+            return view
+                .access_resolved((path, Some(ResolvedTarget::Descriptor(description))), mode);
+        }
+        let entry = view.resolve_entry_operation(
             dirfd,
             path,
             !nofollow,
-            false,
+            !nofollow,
             0,
-            false,
-            Some(fuse::PathOperation::Access(mode)),
+            !nofollow,
+            Some(ResolveOperation::Fuse(fuse::PathOperation::Access(mode))),
             None,
         )?;
-        let node = view.node(&path)?;
+        view.access_resolved(entry, mode)
+    }
+    pub(super) fn access_resolved(&self, (path, target): ResolvedEntry, mode: u32) -> Result<()> {
+        match target {
+            Some(ResolvedTarget::Descriptor(open)) => {
+                let open = open.borrow();
+                if let Some(events::SharedControl::FuseFile(file)) = &open.control {
+                    let query = self.query.as_ref().ok_or(Errno(95))?;
+                    if let Some(pending) = fuse::Metadata::access_file(self, file, mode)? {
+                        query.prepared.borrow_mut().fuse = Some(Box::new(pending));
+                        return query.defer();
+                    }
+                    return Ok(());
+                }
+                let actual = ResolvedPath {
+                    key: if let FdKind::Node(label) = &open.kind {
+                        label.clone()
+                    } else {
+                        path.key
+                    },
+                    mount: self.mount_for_path(open.mount.as_ref()),
+                    proc_binding: None,
+                    directory_inode: None,
+                    indexed_position: None,
+                    #[cfg(all(feature = "hostfs", unix))]
+                    host_position: None,
+                    retained_directory: None,
+                };
+                if let Some(node) = open.metadata_node() {
+                    #[cfg(all(feature = "hostfs", unix))]
+                    if let Some(file) = &open.host_file {
+                        // This final inode was retained before native dispatch;
+                        // refresh through its fd even after unlink/replacement.
+                        file.refresh_permissions(&node)?;
+                    }
+                    return self.access_node(actual, &node, mode);
+                }
+                // Anonymous inodes have no filesystem ACL object. Read their
+                // original metadata and use the same DAC/capability decision.
+                let stat = self.stat_open(&open)?;
+                let value =
+                    |offset| u32::from_le_bytes(stat[offset..offset + 4].try_into().unwrap());
+                let inode_mode = value(16);
+                let kind = inode_mode & 0o170000;
+                if let Some(mount) = &actual.mount {
+                    if mode & 2 != 0 && !matches!(kind, 0o010000 | 0o020000 | 0o060000 | 0o140000) {
+                        mount.writable()?;
+                    }
+                    if mode & 1 != 0
+                        && kind == 0o100000
+                        && mount.flags.get() & mounts::MS_NOEXEC != 0
+                    {
+                        return Err(Errno(13));
+                    }
+                }
+                if self.credentials.allows_mode(
+                    value(24),
+                    value(28),
+                    inode_mode,
+                    kind == 0o040000,
+                    mode,
+                ) {
+                    Ok(())
+                } else {
+                    Err(Errno(13))
+                }
+            }
+            Some(ResolvedTarget::Inode(file)) => {
+                #[cfg(all(feature = "hostfs", unix))]
+                if let Some(host) = &file.host_file {
+                    host.refresh_permissions(&file.node)?;
+                }
+                let actual = ResolvedPath {
+                    key: file.label.clone(),
+                    mount: file.mount.clone(),
+                    proc_binding: None,
+                    directory_inode: None,
+                    indexed_position: None,
+                    #[cfg(all(feature = "hostfs", unix))]
+                    host_position: None,
+                    retained_directory: None,
+                };
+                self.access_node(actual, &file.node, mode)
+            }
+            None => {
+                let node = self.node(&path)?;
+                #[cfg(all(feature = "hostfs", unix))]
+                if let Some(position) = &path.host_position {
+                    let fs = path.filesystem(self);
+                    position
+                        .pin(fs.host.as_ref().ok_or(Errno(5))?, &fs, &path.key)?
+                        .file
+                        .refresh_permissions(&node)?;
+                }
+                self.access_node(path, &node, mode)
+            }
+        }
+    }
+    fn access_node(&self, path: ResolvedPath, node: &NodeRef, mode: u32) -> Result<()> {
         if let Some((m, fs)) = path
             .mount
             .as_ref()
             .and_then(|m| m.fs.fuse.as_ref().map(|fs| (m, fs)))
         {
-            if mode & 2 != 0 && m.readonly() {
-                return Err(Errno(30));
-            }
-            let query = view.query.as_ref().ok_or(Errno(95))?;
-            if let Some(request) = fuse::Metadata::access(&view, m, fs, mode)? {
+            let query = self.query.as_ref().ok_or(Errno(95))?;
+            if let Some(request) = fuse::Metadata::access_inode(self, m, fs, node.clone(), mode)? {
                 query.prepared.borrow_mut().fuse = Some(Box::new(request));
                 return query.defer();
             }
@@ -805,10 +1030,10 @@ impl Vfs {
         }
         if mode & 2 != 0 {
             if let Some(mount) = &path.mount {
-                mount.writable_data(Some(&node))?;
+                mount.writable_data(Some(node))?;
             }
         }
-        if mode & 2 != 0 && view.proc_task_directory(&path) {
+        if mode & 2 != 0 && self.proc_task_directory(&path) {
             return Err(Errno(1));
         }
         if mode & 1 != 0
@@ -820,14 +1045,14 @@ impl Vfs {
         {
             return Err(Errno(13));
         }
-        if mode & 2 != 0 && path.as_ref() == sysctl::MAX_USER_NAMESPACES && view.uses_pseudo(&path)
+        if mode & 2 != 0 && path.as_ref() == sysctl::MAX_USER_NAMESPACES && self.uses_pseudo(&path)
         {
-            if mode & 1 == 0 && view.credentials.has_local_cap(capabilities::SYS_RESOURCE) {
+            if mode & 1 == 0 && self.credentials.has_local_cap(capabilities::SYS_RESOURCE) {
                 return Ok(());
             }
             return Err(Errno(13));
         }
-        if view.allowed(&node.borrow(), mode) {
+        if self.allowed(&node.borrow(), mode) {
             Ok(())
         } else {
             Err(Errno(13))
@@ -921,7 +1146,13 @@ impl Vfs {
         } else {
             self.credentials.mapped_id(true, gid)?
         };
-        let MetadataTarget { path, node, _magic } = self.metadata_target(dirfd, path, !nofollow)?;
+        let target = self.metadata_target(dirfd, path, !nofollow)?;
+        if let Some(result) =
+            self.fuse_path_attributes(&target, fuse::AttributeChange::Owner(uid, gid))
+        {
+            return result;
+        }
+        let MetadataTarget { path, node, _magic } = target;
         path.writable()?;
         self.chown_node(node, uid, gid, true)
     }
@@ -943,6 +1174,9 @@ impl Vfs {
         } else {
             self.credentials.mapped_id(true, gid)?
         };
+        if let Some(result) = self.fuse_fd_attributes(fd, fuse::AttributeChange::Owner(uid, gid)) {
+            return result;
+        }
         self.fd_writable(fd)?;
         let open_descriptor = self.descriptor(fd)?;
         let open = open_descriptor.open.borrow();
@@ -969,6 +1203,40 @@ impl Vfs {
 #[cfg(test)]
 mod process_transfer_tests {
     use super::*;
+    #[test]
+    fn nondumpable_proc_fd_search_keeps_the_same_thread_group_exception() {
+        let mut v = Vfs::default();
+        v.import_file(b"/data", b"x".to_vec()).unwrap();
+        let fd = v.open_at(AT_FDCWD, b"/data", 0, 0).unwrap();
+        v.credentials = Credentials::user(1000, 1000);
+        let process = |pid, tgid| ProcessInfo {
+            pid,
+            tgid,
+            nondumpable: true,
+            credentials: v.credentials.clone(),
+            fds: v.fd_snapshot(),
+            ..ProcessInfo::default()
+        };
+        v.set_runtime_info(
+            1,
+            RuntimeInfo {
+                processes: vec![process(1, 1), process(2, 1), process(3, 3)],
+                ..RuntimeInfo::default()
+            },
+        );
+        for directory in ["/proc/1/fd", "/proc/1/task/2/fd"] {
+            let path = format!("{directory}/{fd}");
+            assert!(v.stat_at(AT_FDCWD, path.as_bytes()).is_ok(), "{path}");
+        }
+        for directory in ["/proc/3/fd", "/proc/1/fdinfo"] {
+            let path = format!("{directory}/{fd}");
+            assert_eq!(
+                v.stat_at(AT_FDCWD, path.as_bytes()),
+                Err(Errno(13)),
+                "{path}"
+            );
+        }
+    }
     #[test]
     fn nondumpable_mm_requires_a_capability_in_the_executable_owners_namespace() {
         let mut vfs = Vfs::default();

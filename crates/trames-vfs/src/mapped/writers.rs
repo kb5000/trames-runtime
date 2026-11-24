@@ -8,6 +8,27 @@ use std::sync::{
 
 #[derive(Default)]
 pub(crate) struct Writers(AtomicUsize);
+/// A retained metadata/data operation pins only its original mount's write
+/// admission. It does not serialize daemon operations or hold an inode lock.
+pub(crate) struct MountWrite(Arc<MountIdentity>);
+impl MountWrite {
+    pub(crate) fn new(mount: &Arc<MountIdentity>) -> super::super::Result<Self> {
+        let _super_admission = mount.fs.write_admission.lock().unwrap();
+        let _admission = mount.writer_admission.lock().unwrap();
+        if mount.flags.get() & super::super::mounts::MS_RDONLY != 0 {
+            return Err(super::super::Errno(30));
+        }
+        mount.writers.0.fetch_add(1, Ordering::Relaxed);
+        mount.fs.writers.0.fetch_add(1, Ordering::Relaxed);
+        Ok(Self(mount.clone()))
+    }
+}
+impl Drop for MountWrite {
+    fn drop(&mut self) {
+        self.0.writers.0.fetch_sub(1, Ordering::Relaxed);
+        self.0.fs.writers.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 impl Writers {
     pub(crate) fn active(&self) -> bool {
         self.0.load(Ordering::Relaxed) != 0
@@ -39,6 +60,7 @@ impl WriteLease {
         inode.0.fetch_add(1, Ordering::Relaxed);
         if let Some(mount) = mount {
             mount.writers.0.fetch_add(1, Ordering::Relaxed);
+            mount.fs.writers.0.fetch_add(1, Ordering::Relaxed);
         }
         Self {
             _lease: Arc::new(Lease {
@@ -54,6 +76,7 @@ impl Drop for Lease {
     fn drop(&mut self) {
         if let Some(mount) = &self.mount {
             mount.writers.0.fetch_sub(1, Ordering::Relaxed);
+            mount.fs.writers.0.fetch_sub(1, Ordering::Relaxed);
         }
         self.inode.0.fetch_sub(1, Ordering::Relaxed);
     }

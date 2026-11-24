@@ -28,6 +28,7 @@ pub(super) enum WaitState {
     Namespace(Arc<NamespaceWait>),
     Policy(Arc<PolicyWait>),
     Barrier(Arc<crate::barrier::Wait>),
+    Page(Arc<PageWait>),
     /// Retry the retained pending CPU syscall after original task/mm custody.
     /// This is not a completed guest wait and must not overwrite its arguments.
     Custody(Arc<crate::process::tasks::AdmissionWait>),
@@ -48,6 +49,28 @@ pub(super) enum WaitState {
 pub(super) struct NamespaceWait {
     work: Mutex<Option<trames_vfs::TaskNamespaceWork>>,
     subscription: Mutex<Option<trames_vfs::IoSubscription>>,
+}
+pub(super) struct PageWait {
+    pending: Arc<trames_memory::PageWait>,
+    subscription: Mutex<Option<(Arc<trames_vfs::IoSignal>, trames_vfs::IoSubscription)>>,
+}
+impl PageWait {
+    pub fn new(pending: Arc<trames_memory::PageWait>) -> Arc<Self> {
+        Arc::new(Self {
+            pending,
+            subscription: Default::default(),
+        })
+    }
+    pub fn ready(&self) -> bool {
+        self.pending.ready()
+    }
+    pub fn bind(&self, signal: &Arc<trames_vfs::IoSignal>) {
+        let subscription = self.pending.subscribe(signal);
+        *self.subscription.lock().unwrap() = Some((signal.clone(), subscription));
+        if self.pending.ready() {
+            signal.notify();
+        }
+    }
 }
 impl NamespaceWait {
     pub fn new(work: trames_vfs::TaskNamespaceWork) -> Arc<Self> {
@@ -192,12 +215,19 @@ impl WaitState {
             | Self::Namespace(_)
             | Self::Policy(_)
             | Self::Barrier(_)
+            | Self::Page(_)
             | Self::Custody(_) => None,
             Self::Signal(wait) => wait.request.deadline(),
         }
     }
     fn woken(&self) -> bool {
         matches!(self, Self::Futex { wait, .. } if wait.woken())
+    }
+    fn value(&self) -> u64 {
+        match self {
+            Self::Futex { wait, .. } => wait.value(),
+            _ => 0,
+        }
     }
     fn bind<C: Cpu>(&self, epoch: &Arc<Epoch<C>>) {
         if let Self::Futex { wait, .. } = self {
@@ -210,6 +240,7 @@ impl WaitState {
     fn expire(&self) -> u64 {
         match self {
             Self::Futex { wait, .. } if wait.timeout() => 0u64.wrapping_sub(110),
+            Self::Futex { wait, .. } => wait.value(),
             _ => 0,
         }
     }
@@ -598,7 +629,12 @@ impl<C: Cpu> Job<C> {
         Some(
             matches!(
                 self.waiting,
-                Some(WaitState::Namespace(_) | WaitState::Policy(_) | WaitState::Barrier(_))
+                Some(
+                    WaitState::Namespace(_)
+                        | WaitState::Policy(_)
+                        | WaitState::Barrier(_)
+                        | WaitState::Page(_)
+                )
             ) || matches!(self.waiting, Some(WaitState::Completion(ref wait)) if !wait.release.finished())
                 || self.pending_cpu.is_some()
                 || self.checkpoint.is_some()
@@ -686,6 +722,7 @@ impl<C: Cpu> Job<C> {
                 || (matches!(&self.waiting, Some(WaitState::Namespace(wait)) if wait.ready())
                     || matches!(&self.waiting, Some(WaitState::Policy(wait)) if wait.ready())
                     || matches!(&self.waiting, Some(WaitState::Barrier(wait)) if wait.ready()))
+                || matches!(&self.waiting, Some(WaitState::Page(wait)) if wait.ready())
                 || matches!(&self.waiting, Some(WaitState::Completion(wait)) if wait.release.finished() && !self.work.syscalls.as_ref().is_some_and(|s| s.io_signals.trace_stopped()))
                 || self.io.as_ref().is_some_and(|io| {
                     (io.number == 2 || io.file_pending().is_some_and(|f| !f.interruptible()))
@@ -696,6 +733,9 @@ impl<C: Cpu> Job<C> {
             || matches!(&self.waiting, Some(WaitState::Policy(wait)) if wait.ready())
             || matches!(&self.waiting, Some(WaitState::Barrier(wait)) if wait.ready()))
         {
+            return true;
+        }
+        if matches!(&self.waiting, Some(WaitState::Page(wait)) if wait.ready()) {
             return true;
         }
         if matches!(&self.waiting,Some(WaitState::ClockSleep(w)) if w.ready()) {
@@ -731,7 +771,7 @@ impl<C: Cpu> Job<C> {
                 (action.handler <= 1
                     && !(matches!(sig, 19..=22) && self.stop_hold() == Some(true)))
                     || action.handler > 1
-                        && !(matches!(&self.waiting, Some(WaitState::Namespace(_) | WaitState::Policy(_) | WaitState::Barrier(_)))
+                        && !(matches!(&self.waiting, Some(WaitState::Namespace(_) | WaitState::Policy(_) | WaitState::Barrier(_) | WaitState::Page(_)))
                             || matches!(&self.waiting, Some(WaitState::Completion(wait)) if !wait.release.finished())
                             || self.gpu_pending.is_some()
                             || self
@@ -779,6 +819,10 @@ impl<C: Cpu> Job<C> {
             .and_then(|s| s.vfork_release.clone());
         let mut done = self.finish(outcome, peer);
         if done.outcome.is_some() {
+            // A retired task never resumes this syscall. Drop its accepted
+            // wait before the parent can observe exit; the cold CPU return
+            // must not keep unread FUSE requests (or other waits) alive.
+            done.io = None;
             // The dying CPU can no longer access the old mm. Parent release
             // does not wait for unrelated FD/metadata destruction on its owner.
             if let Some(release) = vfork {
@@ -1321,6 +1365,9 @@ impl<C: Cpu> Epoch<C> {
             if let Some(WaitState::Policy(wait)) = &job.waiting {
                 wait.bind(&signal);
             }
+            if let Some(WaitState::Page(wait)) = &job.waiting {
+                wait.bind(&signal);
+            }
             snapshot.io_wake = Some(signal);
             if let Err(error) = snapshot.direct.bind_host_protocol(&self.io_target) {
                 self.fail_host_io(error);
@@ -1357,7 +1404,7 @@ impl<C: Cpu> Epoch<C> {
         if let Some(waiting) = &job.waiting {
             waiting.bind(self);
             if waiting.woken() {
-                job.work.trace.finish(&mut job.work.cpu, 0);
+                job.work.trace.finish(&mut job.work.cpu, waiting.value());
                 job.waiting = None;
             } else if job.uring.is_none() && !job.ring_ready() {
                 self.publish_deadline(waiting.deadline());
@@ -1788,8 +1835,9 @@ impl<C: Cpu> Epoch<C> {
         for mut job in jobs {
             job.rearm_signals();
             if job.waiting.as_ref().is_some_and(|w| w.woken()) {
+                let value = job.waiting.as_ref().unwrap().value();
                 job.waiting = None;
-                job.work.trace.finish(&mut job.work.cpu, 0);
+                job.work.trace.finish(&mut job.work.cpu, value);
                 job.stats.resumes += 1;
             }
             let pending = job.hardware_wait.as_ref().is_some_and(|w| !w.ready())
@@ -1823,7 +1871,7 @@ impl<C: Cpu> Epoch<C> {
                 .is_some_and(|w| w.matches_ticket(ticket))
         }) {
             let mut job = q.parked.remove(&ticket.pid).unwrap();
-            job.work.trace.finish(&mut job.work.cpu, 0);
+            job.work.trace.finish(&mut job.work.cpu, ticket.value());
             job.waiting = None;
             job.stats.resumes += 1;
             self.ready(&mut q, job);
@@ -2151,6 +2199,9 @@ impl<C: Cpu> Epoch<C> {
     pub fn park(&self, mut job: Box<Job<C>>, waiting: Option<WaitState>) {
         if let Some(snapshot) = &job.work.syscalls {
             snapshot.io_signals.proc_view.waiting(waiting.is_some());
+            if let (Some(WaitState::Page(wait)), Some(signal)) = (&waiting, &snapshot.io_wake) {
+                wait.bind(signal);
+            }
         }
         let mut q = self.queues.lock().unwrap();
         job.rearm_signals();
@@ -2170,7 +2221,7 @@ impl<C: Cpu> Epoch<C> {
         if let Some(waiting) = waiting {
             job.stats.waits += 1;
             if waiting.woken() {
-                job.work.trace.finish(&mut job.work.cpu, 0);
+                job.work.trace.finish(&mut job.work.cpu, waiting.value());
                 job.stats.resumes += 1;
                 self.ready(&mut q, job);
             } else {
@@ -2203,8 +2254,9 @@ impl<C: Cpu> Epoch<C> {
             q.domains.notify_ready();
         } else {
             if job.waiting.as_ref().is_some_and(WaitState::woken) {
+                let value = job.waiting.as_ref().unwrap().value();
                 job.waiting = None;
-                job.work.trace.finish(&mut job.work.cpu, 0);
+                job.work.trace.finish(&mut job.work.cpu, value);
             } else if job
                 .waiting
                 .as_ref()
@@ -2786,6 +2838,68 @@ mod tests {
             "resume must reannounce a previously ignored idle state"
         );
         assert!(epoch.idle());
+    }
+    #[test]
+    fn retired_job_drops_its_fuse_wait_before_publishing_the_cpu_return() {
+        let mut v = trames_vfs::Vfs::default();
+        v.set_runtime_info(1, trames_vfs::RuntimeInfo::default());
+        v.mkdir_at(trames_vfs::AT_FDCWD, b"/mnt", 0o755).unwrap();
+        let fd = v.open_at(trames_vfs::AT_FDCWD, b"/dev/fuse", 2, 0).unwrap();
+        let options = format!("fd={fd},rootmode=40755,user_id=0,group_id=0");
+        v.mount(None, b"/mnt", Some(b"fuse"), 0, Some(options.as_bytes()))
+            .unwrap();
+        let init = v.read(fd, 8192).unwrap();
+        let mut reply = [0u8; 80];
+        reply[..4].copy_from_slice(&80u32.to_le_bytes());
+        reply[8..16].copy_from_slice(&init[8..16]);
+        reply[16..20].copy_from_slice(&7u32.to_le_bytes());
+        reply[20..24].copy_from_slice(&31u32.to_le_bytes());
+        v.write(fd, &reply).unwrap();
+        let paths = v.path_queries();
+        let work = paths.namespace_work(trames_vfs::NamespaceCall::Statfs {
+            fd: trames_vfs::AT_FDCWD,
+            path: Some(b"/mnt".to_vec()),
+        });
+        let trames_vfs::FileOutcome::Waiting(work) = work.run() else {
+            panic!()
+        };
+        let epoch = Epoch::new(Arc::new(Control::new(1000)));
+        let mut current = job(1, &epoch);
+        let result = Arc::new(trames_linux::FileResult::default());
+        result.complete(trames_vfs::FileOutcome::Waiting(work));
+        current.retry = Some(IoCall {
+            file: Some(trames_linux::FilePending::new(
+                result,
+                trames_linux::FileOutput::None,
+                None,
+            )),
+            number: 43,
+            args: [0; 6],
+            deadline: None,
+            retained_poll: None,
+            retained_byte: None,
+            retained_socket: None,
+            flock: None,
+            record: None,
+            tcp_liveness: None,
+            uring: None,
+            file_checkpoint: None,
+            aio: None,
+            message: None,
+        });
+        let done = current.finish_retired(
+            Some(SliceOutcome::Yield { instructions: 0 }),
+            0,
+            crate::worker_syscalls::Exit {
+                status: 9,
+                groups: Vec::new(),
+            },
+        );
+        // Keep Done alive, just as the original parent runs after waitpid while
+        // its child's returned CPU is still awaiting cold resource retirement.
+        assert_eq!(v.read(fd, 8192), Err(trames_vfs::Errno(11)));
+        assert!(done.io.is_none());
+        assert_eq!(done.thread_exit, Some(9));
     }
     #[test]
     fn initially_parked_task_can_resume_while_its_old_cpu_is_occupied() {

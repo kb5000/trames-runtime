@@ -4,7 +4,7 @@
 //! exports pay on access. Worker frames retain the same per-page charge.
 use super::*;
 use std::sync::{
-    atomic::{AtomicU8, AtomicUsize},
+    atomic::{AtomicU64, AtomicU8, AtomicUsize},
     Arc,
 };
 
@@ -36,8 +36,16 @@ pub(super) struct Account {
     peak: AtomicUsize,
     total: Option<Arc<Budget>>,
     native: std::sync::OnceLock<NativeRanges>,
+    cow_epoch: AtomicU64,
 }
 impl Account {
+    pub(super) fn cow_epoch(&self) -> u64 {
+        self.cow_epoch.load(Ordering::Relaxed)
+    }
+    pub(super) fn publish_cow(&self) {
+        self.cow_epoch
+            .store(new_backing_identity(), Ordering::Relaxed);
+    }
     pub(super) fn resident_bytes(&self) -> usize {
         self.local.used.load(Ordering::Relaxed) + self.native_resident()
     }
@@ -112,6 +120,7 @@ impl Account {
             local: Budget::new(limit),
             total: None,
             native: Default::default(),
+            cow_epoch: AtomicU64::new(0),
         })
     }
     fn fork(&self) -> Arc<Self> {
@@ -120,6 +129,7 @@ impl Account {
             local: Budget::new(self.local.limit.load(Ordering::Relaxed)),
             total: self.total.clone(),
             native: Default::default(),
+            cow_epoch: AtomicU64::new(0),
         })
     }
     fn take(&self, bytes: usize) -> Result<(), MemoryError> {
@@ -144,64 +154,93 @@ impl Account {
 }
 pub(super) struct Charge {
     account: Arc<Account>,
-    // 0 = untouched, 1 = first charge, 2 = charged, 3 = native extent,\n    // 4 = moving a native page into ordinary backing. Region guards
-    // may be disjoint; this state serializes only the page's first allocation.
+    // 0 = untouched, 2 = resident, 3 = native extent, 5 = resident private
+    // mapping of the original cache page, 6 = fork-shared private page.
+    // The last two states need COW admission on first write.
+    // Cold transitions use the original page's object mutex. Ordinary accesses
+    // consult only relaxed residency bits and the existing byte/region guards.
     state: AtomicU8,
-    cgroup: std::sync::OnceLock<Arc<MemoryCgroup>>,
+    ownership: parking_lot::Mutex<Ownership>,
+}
+#[derive(Clone, Default)]
+struct Ownership {
+    physical: Option<Arc<crate::cgroup_memory::PhysicalCharge>>,
+    cache: Option<(Arc<crate::cgroup_memory::SharedCharge>, bool)>,
 }
 impl Charge {
     pub(super) fn new(account: &Arc<Account>) -> Arc<Self> {
         Arc::new(Self {
             account: account.clone(),
             state: AtomicU8::new(0),
-            cgroup: Default::default(),
+            ownership: Default::default(),
         })
     }
     /// A fresh fork charge has no concurrent consumers until task publication.
     /// Reserve against the actual shared budgets, then publish its final state;
     /// the first-touch state machine is only needed by already shared charges.
-    pub(super) fn fork(account: &Arc<Account>, resident: bool) -> Result<Arc<Self>, MemoryError> {
+    pub(super) fn fork(
+        account: &Arc<Account>,
+        old: &Self,
+        private: bool,
+    ) -> Result<Arc<Self>, MemoryError> {
+        let mut owner = old.ownership.lock();
+        let state = old.state.load(Ordering::Relaxed);
+        let resident = old.resident();
         if resident {
             account.take(PAGE_SIZE as usize)?;
         }
+        let cow = private && matches!(state, 2 | 6) && owner.cache.is_none();
+        if cow && owner.physical.is_none() {
+            owner.physical = Some(crate::cgroup_memory::PhysicalCharge::root());
+        }
         Ok(Arc::new(Self {
             account: account.clone(),
-            state: AtomicU8::new(if resident { 2 } else { 0 }),
-            cgroup: Default::default(),
+            state: AtomicU8::new(if cow {
+                6
+            } else if state == 5 {
+                5
+            } else if resident {
+                2
+            } else {
+                0
+            }),
+            ownership: parking_lot::Mutex::new(owner.clone()),
         }))
+    }
+    pub(super) fn fork_pending(&self) -> bool {
+        self.state.load(Ordering::Relaxed) == 6
+    }
+    /// Called only after all child RSS admissions and fork policies succeeded.
+    pub(super) fn commit_fork(&self) {
+        let owner = self.ownership.lock();
+        if owner.cache.is_none()
+            && owner.physical.is_some()
+            && self.state.load(Ordering::Relaxed) == 2
+        {
+            self.state.store(6, Ordering::Relaxed);
+        }
     }
     pub(super) fn native(account: &Arc<Account>) -> Arc<Self> {
         Arc::new(Self {
             account: account.clone(),
             state: AtomicU8::new(3),
-            cgroup: Default::default(),
+            ownership: Default::default(),
         })
     }
     pub(super) fn promote_native(&self) -> Result<(), MemoryError> {
-        if self.state.load(Ordering::Relaxed) == 2 {
-            return Ok(());
+        if self.state.load(Ordering::Relaxed) != 3 {
+            return self.ensure();
         }
-        loop {
-            match self
-                .state
-                .compare_exchange(3, 4, Ordering::Acquire, Ordering::Acquire)
-            {
-                Ok(_) => {
-                    let result = self.take();
-                    self.state
-                        .store(if result.is_ok() { 2 } else { 3 }, Ordering::Release);
-                    return result;
-                }
-                Err(4) => std::hint::spin_loop(),
-                Err(2) => return Ok(()),
-                Err(_) => return self.ensure(),
-            }
+        let mut owner = self.ownership.lock();
+        if self.state.load(Ordering::Relaxed) == 3 {
+            self.take(&mut owner, false)?;
         }
+        Ok(())
     }
     pub(super) fn page_resident(&self, bytes: Option<&SharedPage>) -> Result<u8, MemoryError> {
         match self.state.load(Ordering::Relaxed) {
             3 => bytes.map_or(Ok(1), SharedPage::native_page_resident),
-            2 => Ok(1),
+            2 | 5 | 6 => Ok(1),
             _ => Ok(0),
         }
     }
@@ -209,7 +248,38 @@ impl Charge {
         // Only quota membership: bytes are initialized before view publication
         // and shared CPU/native accesses use their own region/ARM ordering.
         // Do not turn accounting into a second acquire on ordinary accesses.
+        matches!(self.state.load(Ordering::Relaxed), 2 | 3 | 5 | 6)
+    }
+    pub(super) fn write_ready(&self) -> bool {
         matches!(self.state.load(Ordering::Relaxed), 2 | 3)
+    }
+    pub(super) fn attach_cache(
+        &self,
+        cache: Arc<crate::cgroup_memory::SharedCharge>,
+        private: bool,
+    ) {
+        let mut owner = self.ownership.lock();
+        if self.resident() {
+            owner.physical = cache.existing();
+        }
+        owner.cache = Some((cache, private));
+        if private && self.state.load(Ordering::Relaxed) == 2 {
+            self.state.store(5, Ordering::Relaxed);
+        }
+    }
+    /// Replacing an RSS budget is not a physical page allocation or cgroup
+    /// migration. Preserve the original page/cache lease through that rebinding.
+    fn reaccount(account: &Arc<Account>, old: &Self) -> Result<Arc<Self>, MemoryError> {
+        let owner = old.ownership.lock();
+        let state = old.state.load(Ordering::Relaxed);
+        if old.resident() {
+            account.take(PAGE_SIZE as usize)?;
+        }
+        Ok(Arc::new(Self {
+            account: account.clone(),
+            state: AtomicU8::new(if state == 3 { 2 } else { state }),
+            ownership: parking_lot::Mutex::new(owner.clone()),
+        }))
     }
     /// Cold I/O preflight only. The final atomic ensure remains authoritative;
     /// a peer already reserving this same page must not get a false quota error.
@@ -223,14 +293,35 @@ impl Charge {
             Err(MemoryError::Limit)
         }
     }
-    fn take(&self) -> Result<(), MemoryError> {
+    fn take(&self, owner: &mut Ownership, write: bool) -> Result<(), MemoryError> {
         self.account.take(PAGE_SIZE as usize)?;
-        match CgroupMemoryTarget::charge_page() {
-            Ok(Some(charge)) => {
-                let _ = self.cgroup.set(charge);
+        let private = owner.cache.as_ref().is_some_and(|(_, private)| *private);
+        let physical = if private && write {
+            // A private file fault first reaches the original cache page, then
+            // creates its own page. Use the same leases for direct software,
+            // native and worker/hardware paths, including a first-access write.
+            owner
+                .cache
+                .as_ref()
+                .unwrap()
+                .0
+                .get()
+                .and_then(|_| crate::cgroup_memory::PhysicalCharge::new())
+        } else if let Some((cache, _)) = &owner.cache {
+            cache.get()
+        } else {
+            crate::cgroup_memory::PhysicalCharge::new()
+        };
+        match physical {
+            Ok(charge) => {
+                owner.physical = charge;
+                if private && write {
+                    owner.cache = None;
+                }
+                self.state
+                    .store(if private && !write { 5 } else { 2 }, Ordering::Relaxed);
                 Ok(())
             }
-            Ok(None) => Ok(()),
             Err(error) => {
                 self.account.release(PAGE_SIZE as usize);
                 Err(error)
@@ -241,30 +332,49 @@ impl Charge {
         if self.resident() {
             return Ok(());
         }
-        loop {
-            match self
-                .state
-                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire)
+        let mut owner = self.ownership.lock();
+        if self.resident() {
+            return Ok(());
+        }
+        self.take(&mut owner, false)
+    }
+    pub(super) fn ensure_write(&self) -> Result<(), MemoryError> {
+        if self.write_ready() {
+            return Ok(());
+        }
+        let mut owner = self.ownership.lock();
+        if self.write_ready() {
+            return Ok(());
+        }
+        if self.state.load(Ordering::Relaxed) == 6 {
+            // An exclusive surviving page keeps its original ownership after
+            // task migration. Only an actual COW takes the writer's quota.
+            if owner
+                .physical
+                .as_ref()
+                .is_some_and(|page| Arc::strong_count(page) > 1)
             {
-                Ok(_) => {
-                    let result = self.take();
-                    self.state
-                        .store(if result.is_ok() { 2 } else { 0 }, Ordering::Release);
-                    return result;
-                }
-                Err(2 | 3) => return Ok(()),
-                Err(_) => std::hint::spin_loop(),
+                owner.physical = crate::cgroup_memory::PhysicalCharge::new()?;
             }
+            self.state.store(2, Ordering::Relaxed);
+            Ok(())
+        } else if self.state.load(Ordering::Relaxed) == 5 {
+            // The original file/shmem cache page keeps its first owner. COW
+            // allocates one new private physical lease against the actual writer.
+            let physical = crate::cgroup_memory::PhysicalCharge::new()?;
+            owner.physical = physical;
+            owner.cache = None;
+            self.state.store(2, Ordering::Relaxed);
+            Ok(())
+        } else {
+            self.take(&mut owner, true)
         }
     }
 }
 impl Drop for Charge {
     fn drop(&mut self) {
-        if self.state.load(Ordering::Relaxed) == 2 {
+        if matches!(self.state.load(Ordering::Relaxed), 2 | 5 | 6) {
             self.account.release(PAGE_SIZE as usize);
-            if let Some(group) = self.cgroup.get() {
-                group.release();
-            }
         }
     }
 }
@@ -316,6 +426,7 @@ impl Memory {
             local: Budget::new(self.limit),
             total: Some(Budget::new(limit)),
             native: Default::default(),
+            cow_epoch: AtomicU64::new(0),
         }))
     }
     /// An exec address space joins the old VM's aggregate accounting domain.
@@ -328,6 +439,7 @@ impl Memory {
             local: Budget::new(self.limit),
             total: old.account.total.clone(),
             native: Default::default(),
+            cow_epoch: AtomicU64::new(0),
         }))
     }
     fn bind_account(&mut self, account: Arc<Account>) -> Result<(), MemoryError> {
@@ -339,10 +451,7 @@ impl Memory {
         self.parallel_cache = None;
         let mut charges = Vec::new();
         for page in self.frames.iter().flatten() {
-            let charge = Charge::new(&account);
-            if page.charge.resident() {
-                charge.ensure()?;
-            }
+            let charge = Charge::reaccount(&account, &page.charge)?;
             charges.push(charge);
         }
         for (page, charge) in self.frames.iter_mut().flatten().zip(charges) {
@@ -371,6 +480,7 @@ impl Memory {
             local: Budget::new(limit),
             total: self.account.total.clone(),
             native: Default::default(),
+            cow_epoch: AtomicU64::new(0),
         }))?;
         Ok(true)
     }
@@ -405,8 +515,14 @@ impl Memory {
             let base = address & !(PAGE_SIZE - 1);
             let frame = self.frame(base).expect("validated write page");
             let page = self.frames[frame].as_ref().expect("mapped page");
-            page.charge.ensure()?;
-            if page.backing.is_some() || !page.bytes.is_zero() {
+            if page.backing.is_some() {
+                page.check_backing(address)?;
+                page.prepare_source(address)?;
+                page.charge.ensure_write()?;
+                return Ok(false);
+            }
+            page.charge.ensure_write()?;
+            if !page.bytes.is_zero() {
                 return Ok(false);
             }
             let bytes = self
@@ -419,12 +535,11 @@ impl Memory {
         let end = address + len as u64;
         // Reserve all reached pages before changing bytes, including native and
         // cross-page writes. Quota failure leaves guest data unchanged.
-        for (_, &frame) in self.pages.range(address & !(PAGE_SIZE - 1)..end) {
-            self.frames[frame]
-                .as_ref()
-                .expect("mapped page")
-                .charge
-                .ensure()?;
+        for (&base, &frame) in self.pages.range(address & !(PAGE_SIZE - 1)..end) {
+            let page = self.frames[frame].as_ref().expect("mapped page");
+            page.check_backing(base.max(address))?;
+            page.prepare_source(base.max(address))?;
+            page.charge.ensure_write()?;
         }
         let mut changed = false;
         for (&base, &frame) in self.pages.range(address & !(PAGE_SIZE - 1)..end) {

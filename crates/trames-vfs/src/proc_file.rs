@@ -332,6 +332,10 @@ impl ProcFile {
         let renderer = self.renderer.lock().unwrap();
         let view = renderer.view.borrow();
         let path = ResolvedPath {
+            directory_inode: None,
+            indexed_position: None,
+            #[cfg(all(feature = "hostfs", unix))]
+            host_position: None,
             retained_directory: None,
             proc_binding: None,
             key: self.path.clone(),
@@ -587,10 +591,7 @@ mod published_tests {
         let FileOutcome::Complete(reply) = outcome else {
             panic!("global metadata needs no owner/layout/byte wait")
         };
-        let FileValue::Bytes(bytes) = reply.result.unwrap() else {
-            panic!("metadata bytes")
-        };
-        bytes
+        reply.result.unwrap().into_bytes().expect("metadata bytes")
     }
     fn read(owner: &Vfs, file: FileTarget) -> Vec<u8> {
         bytes(

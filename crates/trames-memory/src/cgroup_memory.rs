@@ -222,6 +222,55 @@ impl CgroupMemoryTarget {
     }
 }
 
+/// One physical guest page's cgroup lease, independent of per-mm RSS tickets.
+/// Uncontrolled/root-owned pages need no extra allocation. A shared cache cell
+/// nevertheless remembers that first ownership so task migration cannot charge
+/// an existing root page to a later reader's cgroup.
+pub(super) struct PhysicalCharge(Option<Arc<MemoryCgroup>>);
+impl PhysicalCharge {
+    pub(super) fn new() -> Result<Option<Arc<Self>>, MemoryError> {
+        CgroupMemoryTarget::charge_page()
+            .map(|group| group.map(|group| Arc::new(Self(Some(group)))))
+    }
+    /// Fork needs an identity even for an uncharged root page. Ordinary root
+    /// first touches still avoid a lease allocation.
+    pub(super) fn root() -> Arc<Self> {
+        Arc::new(Self(None))
+    }
+}
+impl Drop for PhysicalCharge {
+    fn drop(&mut self) {
+        if let Some(group) = &self.0 {
+            group.release();
+        }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct SharedCharge(parking_lot::Mutex<Option<Option<Arc<PhysicalCharge>>>>);
+impl SharedCharge {
+    pub(super) fn get(&self) -> Result<Option<Arc<PhysicalCharge>>, MemoryError> {
+        let mut owner = self.0.lock();
+        if let Some(charge) = &*owner {
+            return Ok(charge.clone());
+        }
+        let charge = PhysicalCharge::new()?;
+        *owner = Some(charge.clone());
+        Ok(charge)
+    }
+    pub(super) fn existing(&self) -> Option<Arc<PhysicalCharge>> {
+        self.0.lock().as_ref().and_then(Clone::clone)
+    }
+}
+
+#[cfg(test)]
+#[path = "cgroup_cache_tests.rs"]
+mod cache_tests;
+
+#[cfg(test)]
+#[path = "cgroup_cow_tests.rs"]
+mod cow_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

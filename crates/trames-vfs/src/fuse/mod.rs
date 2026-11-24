@@ -4,7 +4,14 @@ use super::*;
 use std::sync::OnceLock;
 
 mod mount;
-pub(crate) use mount::{option_fd, prepare, File, Metadata, Mounted, PathOperation};
+pub(crate) use mount::ConnectionUse;
+pub use mount::DirectoryReply;
+pub(crate) use mount::Leaf;
+pub(super) use mount::ParentStep;
+pub(crate) use mount::{
+    option_fd, prepare, AttributeChange, Directory, File, Metadata, Mounted, PathOperation,
+};
+pub(crate) use mount::{NamespaceAction, NamespaceTarget, PathPlan, PendingNamespace, XattrCall};
 mod control;
 pub(super) use control::{Abort, Controller};
 mod transport;

@@ -360,10 +360,7 @@ mod tests {
             count: 128,
             offset: Some(0),
         };
-        let bytes = |value: FileValue| match value {
-            FileValue::Bytes(bytes) => bytes,
-            _ => panic!("proc bytes"),
-        };
+        let bytes = |value: FileValue| value.into_bytes().expect("proc bytes");
         assert_eq!(
             bytes(
                 env_target
@@ -998,9 +995,7 @@ mod tests {
         else {
             panic!("live proc read returned to owner")
         };
-        let FileValue::Bytes(status) = reply.result.unwrap() else {
-            panic!("status bytes")
-        };
+        let status = reply.result.unwrap().into_bytes().expect("status bytes");
         assert!(String::from_utf8_lossy(&status).contains("Name:\tproc-before\n"));
         drop(cpu);
         first.signals.io.begin_exit(1, 0);
@@ -1062,7 +1057,9 @@ mod tests {
                     let FileOutcome::Complete(reply) = read.run() else {
                         panic!("accepted proc read returned to owner")
                     };
-                    reply.result
+                    reply
+                        .result
+                        .map(|value| FileValue::Bytes(value.into_bytes().expect("proc read bytes")))
                 })
                 .collect::<Vec<_>>()
         })

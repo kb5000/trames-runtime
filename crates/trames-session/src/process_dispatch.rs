@@ -151,6 +151,8 @@ impl Dispatch {
             ))
         } else if let State::Barrier(wait) = &p.state {
             Some(crate::run_queue::WaitState::Barrier(wait.clone()))
+        } else if let State::Page(wait) = &p.state {
+            Some(crate::run_queue::WaitState::Page(wait.clone()))
         } else if let State::Policy(wait) = &p.state {
             Some(crate::run_queue::WaitState::Policy(wait.clone()))
         } else if let State::Namespace(wait) = &p.state {

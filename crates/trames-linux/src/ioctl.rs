@@ -13,6 +13,17 @@ pub(crate) fn call(vfs: &mut Vfs, a: [u64; 6], memory: &mut impl CpuMemory) -> R
         return Err(Errno(9));
     }
     vfs.check_device_ioctl(a[0] as u32, a[1] as u32)?;
+    if let Some(event) = vfs.perf_event(a[0] as u32)? {
+        if a[1] as u32 == 0x2405 {
+            let target = if a[2] == u64::MAX {
+                None
+            } else {
+                Some(vfs.perf_event(a[2] as u32)?.ok_or(Errno(9))?)
+            };
+            return event.set_output(target.as_ref());
+        }
+        return event.ioctl(a[1] as u32, a[2], memory);
+    }
     if a[1] as u32 == trames_vfs::fuse::CLONE {
         return vfs.fuse_clone(a[0] as u32, a[2], memory);
     }

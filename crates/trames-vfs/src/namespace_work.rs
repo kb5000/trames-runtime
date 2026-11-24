@@ -2,6 +2,29 @@
 //! Owned namespace calls over the original fs_struct, Files and filesystem.
 use super::*;
 
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct PathKey(usize, i32, Vec<u8>, bool, bool, u64, bool);
+impl PathKey {
+    pub(super) fn new(
+        operand: usize,
+        fd: i32,
+        path: &[u8],
+        follow: bool,
+        retain: bool,
+        policy: u64,
+        stop: bool,
+    ) -> Self {
+        Self(operand, fd, path.to_vec(), follow, retain, policy, stop)
+    }
+}
+#[derive(Default)]
+pub(super) struct AcceptedPaths {
+    pub accepted: BTreeMap<PathKey, ResolvedEntry>,
+    pub pending: Option<PathKey>,
+    pub cursor: usize,
+    pub native: bool,
+}
+
 pub enum NamespaceCall {
     MountFd(MountFdCall),
     MountQuery(MountQuery),
@@ -98,6 +121,7 @@ pub enum NamespaceCall {
         path: Option<Vec<u8>>,
         follow: bool,
         name: Option<Vec<u8>>,
+        capacity: u64,
     },
     Chdir(Vec<u8>),
     Fchdir(u32),
@@ -195,6 +219,28 @@ impl NamespaceCall {
                     | Self::PivotRoot { .. }
                     | Self::MountQuery(_)
             )
+    }
+    fn metadata(&self) -> bool {
+        matches!(
+            self,
+            Self::Chmod { .. }
+                | Self::Chown { .. }
+                | Self::Times { .. }
+                | Self::Xattr { .. }
+                | Self::GetXattr { .. }
+        )
+    }
+    fn retains_paths(&self) -> bool {
+        matches!(
+            self,
+            Self::Mount { .. }
+                | Self::Link { .. }
+                | Self::Umount { .. }
+                | Self::PivotRoot { .. }
+                | Self::MountFd(
+                    MountFdCall::Tree { .. } | MountFdCall::Move { .. } | MountFdCall::Pick { .. }
+                )
+        ) || matches!(self, Self::MountFd(MountFdCall::SetAttr { attrs, .. }) if !attrs.is_empty())
     }
     fn admin(&self, v: &Vfs) -> Result<Arc<mounts::admin::Admin>> {
         match self {
@@ -346,15 +392,8 @@ impl NamespaceCall {
                 path,
                 follow,
                 name,
-            } => {
-                return name
-                    .as_ref()
-                    .map_or_else(
-                        || v.list_xattrs(*fd, path.as_deref(), *follow),
-                        |name| v.get_xattr(*fd, path.as_deref(), *follow, name),
-                    )
-                    .map(FileValue::Bytes)
-            }
+                capacity,
+            } => return v.read_xattrs(*fd, path.as_deref(), *follow, name.as_deref(), *capacity),
             Self::Chdir(path) => v.chdir(path)?,
             Self::Fchdir(fd) => v.chdir_fd(*fd)?,
             Self::Chroot(path) => v.chroot(path)?,
@@ -374,6 +413,8 @@ pub(super) struct NamespaceWork {
     host_work: bool,
     waiting: Option<Arc<mounts::admin::Admin>>,
     fuse: Option<Box<fuse::Metadata>>,
+    parents: Option<Box<fuse::PendingNamespace>>,
+    paths: Option<Arc<SharedCell<AcceptedPaths>>>,
 }
 pub(super) enum NamespaceRun {
     Complete(Result<FileValue>),
@@ -381,11 +422,24 @@ pub(super) enum NamespaceRun {
     Owner,
 }
 pub enum NamespaceAttempt {
-    Complete(Result<FileValue>),
+    Complete(FileReply),
     Retained(FileWork),
 }
 impl Vfs {
     fn cwd_reply(&self, paths: &fs_context::Paths) -> Result<FileValue> {
+        crate::output_resources::OutputScope::retain(|| {
+            (
+                paths.clone(),
+                paths
+                    .cwd_mount
+                    .as_ref()
+                    .map(|mount| mounts::MountUse::new(mount.identity.clone())),
+                paths
+                    .root_mount
+                    .as_ref()
+                    .map(|mount| mounts::MountUse::new(mount.identity.clone())),
+            )
+        });
         let mut name = self.cwd_name::<true>(paths)?;
         if name.len() >= MAX_PATH {
             return Err(Errno(36));
@@ -493,6 +547,7 @@ impl PathQueries {
     /// The ordinary short path borrows only this caller's existing control
     /// view. No private VFS, namespace graph or descriptor table is copied.
     pub fn namespace_attempt(&self, call: NamespaceCall) -> NamespaceAttempt {
+        let scope = crate::output_resources::OutputScope::enter();
         if matches!(call, NamespaceCall::Cwd) {
             let reply = self.query(|view| {
                 // Both names in the private volume come from its in-memory
@@ -515,7 +570,15 @@ impl PathQueries {
                 }
             });
             if let Some(reply) = reply {
-                return NamespaceAttempt::Complete(reply);
+                return NamespaceAttempt::Complete(
+                    FileReply {
+                        result: reply,
+                        resources: Default::default(),
+                        file_size_signal: false,
+                        scratch: None,
+                    }
+                    .retain_output(scope.finish()),
+                );
             }
         }
         struct Restore<'a> {
@@ -535,11 +598,16 @@ impl PathQueries {
                 accepted,
             };
             let host_work = prepare_namespace(scope.view, &call);
+            let paths = call
+                .retains_paths()
+                .then(|| Arc::new(SharedCell::default()));
             let mut work = NamespaceWork {
                 call,
+                paths,
                 host_work,
                 waiting: None,
                 fuse: None,
+                parents: None,
             };
             let reply = if host_work {
                 NamespaceRun::Owner
@@ -550,7 +618,15 @@ impl PathQueries {
             (work, accepted, reply)
         };
         if let NamespaceRun::Complete(reply) = reply {
-            return NamespaceAttempt::Complete(reply);
+            return NamespaceAttempt::Complete(
+                FileReply {
+                    result: reply,
+                    resources: Default::default(),
+                    file_size_signal: false,
+                    scratch: None,
+                }
+                .retain_output(scope.finish()),
+            );
         }
         let paths = self.retain_context();
         paths.view.borrow_mut().query.as_mut().unwrap().accepted = accepted;
@@ -560,44 +636,147 @@ impl PathQueries {
         let paths = self.retain_context();
         let host_work = prepare_namespace(&mut paths.view.borrow_mut(), &call);
         paths.view.borrow().query.as_ref().unwrap().clear_deferred();
+        let accepted_paths = call
+            .retains_paths()
+            .then(|| Arc::new(SharedCell::default()));
         FileWork::namespace(
             paths,
             NamespaceWork {
                 call,
+                paths: accepted_paths,
                 host_work,
                 waiting: None,
                 fuse: None,
+                parents: None,
             },
         )
     }
 }
 impl NamespaceWork {
     pub(super) fn fuse_request(&self) -> Option<&fuse::Metadata> {
-        self.fuse.as_deref()
+        self.parents
+            .as_ref()
+            .and_then(|parents| parents.request())
+            .or(self.fuse.as_deref())
     }
     pub(super) fn host_work(&self) -> bool {
-        self.host_work
+        if let Some(pending) = &self.fuse {
+            return pending.host_work();
+        }
+        self.parents
+            .as_ref()
+            .map_or(self.host_work, |parents| parents.host_work())
+    }
+    pub(super) fn owner_work(&self) -> bool {
+        self.parents
+            .as_ref()
+            .is_some_and(|pending| pending.owner_work())
+            || self
+                .fuse
+                .as_ref()
+                .is_some_and(|pending| pending.owner_work())
+    }
+    pub(super) fn join_owner(&mut self) {
+        if let Some(parents) = &mut self.parents {
+            parents.join_owner();
+        }
+        if let Some(pending) = &mut self.fuse {
+            pending.join_owner();
+        }
     }
     pub(super) fn waiting(&self) -> bool {
-        self.waiting.is_some() || self.fuse.is_some()
+        self.waiting.is_some() || self.fuse.is_some() || self.parents.is_some()
     }
     pub(super) fn ready(&self) -> bool {
         self.waiting.as_ref().is_none_or(|admin| admin.ready())
             && self.fuse.as_ref().is_none_or(|f| f.ready())
+            && self.parents.as_ref().is_none_or(|parents| parents.ready())
     }
     pub(super) fn subscribe(&self, signal: &Arc<IoSignal>) -> Option<IoSubscription> {
         self.waiting
             .as_ref()
             .map(|admin| admin.subscribe(signal))
-            .or_else(|| self.fuse.as_ref().map(|f| f.subscribe(signal)))
+            .or_else(|| self.fuse_request().and_then(|f| f.subscribe(signal)))
     }
     pub(super) fn run(&mut self, paths: &PathQueries) -> NamespaceRun {
         self.execute(&mut paths.view.borrow_mut())
     }
     fn execute(&mut self, view: &mut Vfs) -> NamespaceRun {
+        let native = self.host_work();
+        if self.owner_work() {
+            return NamespaceRun::Owner;
+        }
+        if let Some(parents) = &mut self.parents {
+            return match parents.run(view) {
+                Ok(fuse::ParentStep::Waiting | fuse::ParentStep::Host) => NamespaceRun::Waiting,
+                Ok(fuse::ParentStep::Mutation(pending)) => {
+                    self.fuse = Some(pending);
+                    self.parents = None;
+                    self.host_work = false;
+                    NamespaceRun::Waiting
+                }
+                Ok(fuse::ParentStep::Complete(value)) => NamespaceRun::Complete(Ok(value)),
+                Err(error) => NamespaceRun::Complete(Err(error)),
+            };
+        }
         if let Some(f) = &mut self.fuse {
+            if let Some(paths) = &self.paths {
+                if paths.borrow().pending.is_some() {
+                    self.host_work |= f.host_work();
+                    let Some(value) = f.take(view) else {
+                        return NamespaceRun::Waiting;
+                    };
+                    if let Err(error) = value {
+                        return NamespaceRun::Complete(Err(error));
+                    }
+                    let Some(entry) = f.resolved_entry.take() else {
+                        return NamespaceRun::Complete(Err(Errno(5)));
+                    };
+                    let mut paths = paths.borrow_mut();
+                    let key = paths.pending.take().unwrap();
+                    let entry = match view.pin_topology_entry(*entry) {
+                        Ok(entry) => entry,
+                        Err(error) => return NamespaceRun::Complete(Err(error)),
+                    };
+                    paths.accepted.insert(key, entry);
+                    drop(paths);
+                    self.fuse = None;
+                    // A prior operand may have been accepted by the native
+                    // executor before this daemon wait. Re-enter it for the
+                    // final topology algorithm instead of doing its remaining
+                    // native path work on the worker that received the reply.
+                    if self.host_work && !native {
+                        return NamespaceRun::Waiting;
+                    }
+                    return self.execute(view);
+                }
+            }
+            if self.call.metadata() {
+                self.host_work |= f.host_work();
+                let Some(value) = f.take(view) else {
+                    return NamespaceRun::Waiting;
+                };
+                if value.is_ok() {
+                    if let Some(entry) = f.resolved_entry.take() {
+                        let entry = match view.pin_topology_entry(*entry) {
+                            Ok(entry) => Box::new(entry),
+                            Err(error) => return NamespaceRun::Complete(Err(error)),
+                        };
+                        *view.query.as_ref().unwrap().metadata_entry.borrow_mut() = Some(entry);
+                        self.fuse = None;
+                        if self.host_work && !native {
+                            return NamespaceRun::Waiting;
+                        }
+                        return self.execute(view);
+                    }
+                }
+                if FileResources::needed(&value) {
+                    f.retain_output();
+                }
+                return NamespaceRun::Complete(value);
+            }
             return f
-                .take()
+                .take(view)
                 .map_or(NamespaceRun::Waiting, NamespaceRun::Complete);
         }
         self.waiting = None;
@@ -624,7 +803,38 @@ impl NamespaceWork {
         if !self.call.topology() {
             view.query.as_ref().unwrap().namespace_uses.begin();
         }
-        let result = self.call.execute_locked(view);
+        let result = {
+            struct Restore<'a> {
+                view: &'a mut Vfs,
+                previous: Option<Arc<SharedCell<AcceptedPaths>>>,
+                metadata: bool,
+            }
+            impl Drop for Restore<'_> {
+                fn drop(&mut self) {
+                    self.view.query.as_mut().unwrap().metadata_call = self.metadata;
+                    self.view.query.as_mut().unwrap().topology_paths = self.previous.take();
+                }
+            }
+            let previous = std::mem::replace(
+                &mut view.query.as_mut().unwrap().topology_paths,
+                self.paths.clone(),
+            );
+            let previous_metadata = std::mem::replace(
+                &mut view.query.as_mut().unwrap().metadata_call,
+                self.call.metadata(),
+            );
+            let scope = Restore {
+                view,
+                previous,
+                metadata: previous_metadata,
+            };
+            if let Some(paths) = &self.paths {
+                let mut paths = paths.borrow_mut();
+                paths.cursor = 0;
+                paths.native = native;
+            }
+            self.call.execute_locked(scope.view)
+        };
         let query = view.query.as_ref().unwrap();
         let uses = query.namespace_uses.finish();
         let deferred = query.take_deferred();
@@ -632,11 +842,29 @@ impl NamespaceWork {
         if !deferred {
             return NamespaceRun::Complete(result);
         }
-        if let Some(f) = query.prepared.borrow_mut().fuse.take() {
+        let parents = query.prepared.borrow_mut().namespace.take();
+        if let Some(parents) = parents {
+            self.parents = Some(parents);
+            return self.execute(view);
+        }
+        let pending = query.prepared.borrow_mut().fuse.take();
+        if let Some(f) = pending {
             self.fuse = Some(f);
             NamespaceRun::Waiting
         } else {
-            NamespaceRun::Owner
+            let owner = query.prepared.borrow_mut().owner_continuation.take();
+            let needs_owner = owner.is_some();
+            let walk = owner.or_else(|| query.prepared.borrow_mut().continuation.take());
+            if let Some(walk) = walk {
+                self.fuse = Some(Box::new(fuse::Metadata::continuation(
+                    view,
+                    walk,
+                    needs_owner,
+                )));
+                NamespaceRun::Waiting
+            } else {
+                NamespaceRun::Owner
+            }
         }
     }
     pub(super) fn run_owner(&self, paths: &PathQueries, owner: &mut Vfs) -> Result<FileValue> {

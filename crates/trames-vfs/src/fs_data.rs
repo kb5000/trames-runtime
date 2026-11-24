@@ -6,9 +6,12 @@ use std::sync::{RwLockReadGuard, RwLockWriteGuard};
 
 #[derive(Clone)]
 pub(super) struct FsHandle {
+    pub owner: UserNamespace,
     pub fuse: Option<Arc<fuse::Mounted>>,
     pub shared: Arc<SharedCell<Filesystem>>,
     pub super_readonly: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pub write_admission: Arc<std::sync::Mutex<()>>,
+    pub writers: Arc<mapped::Writers>,
     pub quota: Arc<file_accounting::FileQuota>,
     pub namespace: Arc<std::sync::Mutex<()>>,
     #[cfg(all(feature = "hostfs", unix))]
@@ -36,10 +39,13 @@ impl FsHandle {
                 .expect("validated initial filesystem");
         }
         Self {
+            owner: UserNamespace::default(),
             #[cfg(all(feature = "hostfs", unix))]
             host: None,
             fuse: None,
             super_readonly: None,
+            write_admission: Arc::default(),
+            writers: Arc::default(),
             shared: Arc::new(SharedCell::new(data)),
             quota,
             namespace: Arc::default(),
@@ -53,10 +59,13 @@ impl FsHandle {
                 .expect("validated initial filesystem");
         }
         Self {
+            owner: UserNamespace::default(),
             #[cfg(all(feature = "hostfs", unix))]
             host: None,
             fuse: None,
             super_readonly: None,
+            write_admission: Arc::default(),
+            writers: Arc::default(),
             shared: Arc::new(SharedCell::new(data)),
             quota,
             namespace: Arc::default(),
@@ -79,6 +88,13 @@ impl FsHandle {
     }
     pub fn same_data(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.shared, &other.shared)
+    }
+    pub fn hold_writers(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
+        let guard = self.write_admission.lock().unwrap();
+        if self.writers.active() {
+            return Err(Errno(16));
+        }
+        Ok(guard)
     }
     pub fn identity(&self) -> usize {
         Arc::as_ptr(&self.shared) as usize

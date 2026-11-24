@@ -8,22 +8,29 @@ use super::*;
 pub(super) struct PreparedPath {
     pub open: Option<file_work::PreparedOpen>,
     pub fuse: Option<Box<fuse::Metadata>>,
+    pub namespace: Option<Box<fuse::PendingNamespace>>,
+    pub continuation: Option<Box<(PathWalk, fuse::PathOperation)>>,
+    pub owner_continuation: Option<Box<(PathWalk, fuse::PathOperation)>>,
 }
 #[derive(Clone)]
 pub(super) struct Authority {
     pub(super) files: SharedFiles,
     pub(super) devices: cgroup::DeviceAuthority,
     pub(super) namespace_io: bool,
+    pub(super) metadata_call: bool,
+    pub(super) metadata_entry: RefCell<Option<Box<ResolvedEntry>>>,
     pub(super) retained: Option<(u32, RetainedFd)>,
     pub(super) peer: Option<(u32, SharedFd)>,
     pub(super) accepted: Option<BTreeMap<u32, Option<Result<SharedFd>>>>,
     // A retained io_uring context owns the complete original resource graph.
     // This selects that graph, not a second permission or memory policy.
     pub(super) original: bool,
+    pub(super) joined_owner: bool,
     deferred: Arc<std::sync::atomic::AtomicBool>,
     pub(super) file_layout_exclusive: bool,
     pub(super) prepared: Arc<SharedCell<PreparedPath>>,
     pub(super) namespace_uses: ActiveMounts,
+    pub(super) topology_paths: Option<Arc<SharedCell<namespace_work::AcceptedPaths>>>,
 }
 #[derive(Default)]
 pub(super) struct ActiveMounts {
@@ -70,10 +77,14 @@ impl Authority {
             peer: None,
             accepted: None,
             original: false,
+            joined_owner: false,
             deferred: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             file_layout_exclusive: false,
             prepared: Default::default(),
             namespace_uses: ActiveMounts::default(),
+            metadata_call: false,
+            metadata_entry: Default::default(),
+            topology_paths: None,
         }
     }
     pub(super) fn file_projection(source: &Self) -> Self {
@@ -85,10 +96,14 @@ impl Authority {
             peer: None,
             accepted: None,
             original: false,
+            joined_owner: false,
             deferred: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             file_layout_exclusive: false,
             prepared: Default::default(),
             namespace_uses: ActiveMounts::default(),
+            metadata_call: false,
+            metadata_entry: Default::default(),
+            topology_paths: None,
         }
     }
     pub(super) fn clear_deferred(&self) {
@@ -178,6 +193,7 @@ impl Vfs {
         view.context.paths.registry = view.mount_registry.clone();
         view.credentials = self.credentials.clone();
         view.namei_policy = self.namei_policy.clone();
+        view.task_limit = self.task_limit.clone();
         view.dumpable = self.dumpable.clone();
         view.kernel_log = self.kernel_log.clone();
         view.binder = self.binder.clone();
@@ -230,6 +246,7 @@ impl Vfs {
             peer: None,
             accepted: None,
             original: false,
+            joined_owner: false,
             namespace_io: self.namespace_host_work(),
             devices: self
                 .query
@@ -239,10 +256,85 @@ impl Vfs {
             file_layout_exclusive: false,
             prepared: Default::default(),
             namespace_uses: ActiveMounts::default(),
+            metadata_call: false,
+            metadata_entry: Default::default(),
+            topology_paths: None,
         });
         PathQueries {
             view: RefCell::new(view),
         }
+    }
+}
+impl Vfs {
+    // The same original-resource scope serves io_uring and an accepted path
+    // continuation. It changes only private resolver caches/admission; all
+    // Files, credentials, namespace and byte providers remain original.
+    pub(super) fn with_original_resources<T>(
+        &mut self,
+        descriptors: Option<&DirectFds>,
+        operation: impl FnOnce(&mut Vfs) -> T,
+    ) -> (T, bool) {
+        struct Restore<'a> {
+            view: &'a mut Vfs,
+            files: DescriptorTable,
+            pseudo: Arc<SharedCell<pseudo::PseudoFs>>,
+            reader: Option<Arc<dyn SignalReader>>,
+            observed: Option<proc_source::Observation>,
+            original: bool,
+            file_size_signal: bool,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.view.fds = std::mem::take(&mut self.files);
+                self.view.pseudo = self.pseudo.clone();
+                *self.view.signal_reader.borrow_mut() = self.reader.take();
+                self.view.source_observed.set(self.observed);
+                self.view.query.as_mut().unwrap().original = self.original;
+                self.view.file_size_signal.set(self.file_size_signal);
+            }
+        }
+        let view = self;
+        let publication = view.pseudo.borrow().publication.clone().unwrap();
+        let pseudo = {
+            let root = publication.borrow();
+            Arc::new(SharedCell::new(pseudo::PseudoFs {
+                fuse_control: root.fuse_control.clone(),
+                boot_id: root.boot_id.clone(),
+                user_namespace_limits: Default::default(), // Resolved through publication.
+                keys: root.keys.clone(),
+                mount_policy: root.mount_policy.clone(),
+                nr_open: root.nr_open.clone(),
+                video_device: root.video_device.clone(),
+                enabled: root.enabled,
+                runtime: root.runtime.clone(),
+                source: root.source.clone(),
+                publication: Some(publication.clone()),
+                nodes: root.nodes.clone(),
+            }))
+        };
+        let query = view.query.as_mut().unwrap();
+        let original = std::mem::replace(&mut query.original, true);
+        let files = DescriptorTable::observe(query.files.clone());
+        let files = std::mem::replace(&mut view.fds, files);
+        let pseudo = std::mem::replace(&mut view.pseudo, pseudo);
+        let reader = std::mem::replace(
+            &mut *view.signal_reader.borrow_mut(),
+            descriptors.and_then(|fds| fds.2.clone()),
+        );
+        let observed = view.source_observed.replace(None);
+        let file_size_signal = view.file_size_signal.replace(false);
+        let guard = Restore {
+            view,
+            files,
+            pseudo,
+            reader,
+            observed,
+            original,
+            file_size_signal,
+        };
+        let result = operation(guard.view);
+        let signal = guard.view.file_size_signal.replace(false);
+        (result, signal)
     }
 }
 impl PathQueries {
@@ -433,70 +525,11 @@ impl PathQueries {
         descriptors: Option<&DirectFds>,
         operation: impl FnOnce(&mut Vfs) -> Result<T>,
     ) -> (Option<Result<T>>, bool) {
-        struct Restore<'a> {
-            view: &'a mut Vfs,
-            files: DescriptorTable,
-            pseudo: Arc<SharedCell<pseudo::PseudoFs>>,
-            reader: Option<Arc<dyn SignalReader>>,
-            observed: Option<proc_source::Observation>,
-            original: bool,
-            file_size_signal: bool,
-        }
-        impl Drop for Restore<'_> {
-            fn drop(&mut self) {
-                self.view.fds = std::mem::take(&mut self.files);
-                self.view.pseudo = self.pseudo.clone();
-                *self.view.signal_reader.borrow_mut() = self.reader.take();
-                self.view.source_observed.set(self.observed);
-                self.view.query.as_mut().unwrap().original = self.original;
-                self.view.file_size_signal.set(self.file_size_signal);
-            }
-        }
         let mut view = self.view.borrow_mut();
-        let publication = view.pseudo.borrow().publication.clone().unwrap();
-        let pseudo = {
-            let root = publication.borrow();
-            Arc::new(SharedCell::new(pseudo::PseudoFs {
-                fuse_control: root.fuse_control.clone(),
-                boot_id: root.boot_id.clone(),
-                user_namespace_limits: Default::default(), // Resolved through publication.
-                keys: root.keys.clone(),
-                mount_policy: root.mount_policy.clone(),
-                nr_open: root.nr_open.clone(),
-                video_device: root.video_device.clone(),
-                enabled: root.enabled,
-                runtime: root.runtime.clone(),
-                source: root.source.clone(),
-                publication: Some(publication.clone()),
-                nodes: root.nodes.clone(),
-            }))
-        };
-        let query = view.query.as_mut().unwrap();
-        let original = std::mem::replace(&mut query.original, true);
-        let deferred = query.deferred.clone();
-        deferred.store(false, Ordering::Relaxed);
-        let files = DescriptorTable::observe(query.files.clone());
-        let files = std::mem::replace(&mut view.fds, files);
-        let pseudo = std::mem::replace(&mut view.pseudo, pseudo);
-        let reader = std::mem::replace(
-            &mut *view.signal_reader.borrow_mut(),
-            descriptors.and_then(|fds| fds.2.clone()),
-        );
-        let observed = view.source_observed.replace(None);
-        let file_size_signal = view.file_size_signal.replace(false);
-        let guard = Restore {
-            view: &mut view,
-            files,
-            pseudo,
-            reader,
-            observed,
-            original,
-            file_size_signal,
-        };
-        let result = operation(guard.view);
-        let signal = guard.view.file_size_signal.replace(false);
+        view.query.as_ref().unwrap().clear_deferred();
+        let (result, signal) = view.with_original_resources(descriptors, operation);
         (
-            (!deferred.swap(false, Ordering::Relaxed)).then_some(result),
+            (!view.query.as_ref().unwrap().take_deferred()).then_some(result),
             signal,
         )
     }
@@ -647,17 +680,7 @@ impl PathQueries {
                 .files
                 .observation_descriptor(fd)?;
             let open = descriptor.open.borrow();
-            if CACHED {
-                if let Some(events::SharedControl::FuseFile(file)) = &open.control {
-                    return file.cached_stat(&view);
-                }
-            }
-            view.stat_open(&open).map(|stat| {
-                (
-                    view.credentials.user_namespace.stat(stat),
-                    StatMount::for_open(&open),
-                )
-            })
+            view.statx_open::<CACHED>(&open)
         })();
         if matches!(result, Err(Errno(95))) && view.query.as_ref().unwrap().take_deferred() {
             None
@@ -703,6 +726,17 @@ impl PathQueries {
         nofollow: bool,
     ) -> Option<Result<()>> {
         self.query(|v| v.access_at(dirfd, path, mode, effective, nofollow))
+    }
+    pub fn access_at_empty(
+        &self,
+        dirfd: i32,
+        path: &[u8],
+        mode: u32,
+        effective: bool,
+        nofollow: bool,
+        empty: bool,
+    ) -> Option<Result<()>> {
+        self.query(|v| v.access_at_empty(dirfd, path, mode, effective, nofollow, empty))
     }
 }
 
@@ -1196,6 +1230,56 @@ mod tests {
                 Some(owner.access_at(AT_FDCWD, b"/d/f\xff", mode, false, false))
             );
         }
+    }
+    #[test]
+    fn empty_access_uses_retained_inode_and_real_or_effective_ids_without_a_search_walk() {
+        let mut owner = Vfs::default();
+        owner.mkdir_at(AT_FDCWD, b"/private", 0o700).unwrap();
+        owner.import_file(b"/private/file", Vec::new()).unwrap();
+        owner.chmod_at(AT_FDCWD, b"/private/file", 0o600).unwrap();
+        owner
+            .chown_at(AT_FDCWD, b"/private/file", 1000, 1000, false)
+            .unwrap();
+        let fd = owner
+            .open_at(AT_FDCWD, b"/private/file", O_PATH, 0)
+            .unwrap();
+        owner.unlink_at(AT_FDCWD, b"/private/file", false).unwrap();
+        owner.chdir(b"/private").unwrap();
+        owner.credentials = Credentials::user(1000, 1000);
+        owner.credentials.uid = 2000;
+        let query = owner.path_queries();
+        assert_eq!(
+            query.access_at_empty(fd as i32, b"", 4, true, false, true),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            query.access_at_empty(fd as i32, b"", 4, false, false, true),
+            Some(Err(Errno(13)))
+        );
+        assert_eq!(
+            query.access_at_empty(fd as i32, b"", 0, true, false, false),
+            Some(Err(Errno(2)))
+        );
+        assert_eq!(
+            query.access_at_empty(999, b"", 0, true, false, true),
+            Some(Err(Errno(9)))
+        );
+        // F_OK on the cwd itself requires no search permission on that inode.
+        assert_eq!(
+            query.access_at_empty(AT_FDCWD, b"", 0, true, false, true),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            query.access_at_empty(AT_FDCWD, b"", 1, true, false, true),
+            Some(Err(Errno(13)))
+        );
+        owner.close(fd).unwrap();
+        let reused = owner.open_at(AT_FDCWD, b"/replacement", O_CREAT | 2, 0o600);
+        assert_eq!(reused, Err(Errno(13)));
+        assert_eq!(
+            query.access_at_empty(fd as i32, b"", 0, true, false, true),
+            Some(Err(Errno(9)))
+        );
     }
     #[test]
     fn live_inodes_and_dirfd_follow_rename_unlink_and_fd_reuse() {

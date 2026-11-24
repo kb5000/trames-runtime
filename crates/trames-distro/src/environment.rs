@@ -271,6 +271,7 @@ pub struct Manifest {
     pub environment: Identity,
     pub image: Image,
     pub resources: Resources,
+    pub kernel: Kernel,
     pub network: Network,
     pub components: Components,
     pub boot: Boot,
@@ -286,6 +287,7 @@ impl Default for Manifest {
             environment: Default::default(),
             image: Default::default(),
             resources: Default::default(),
+            kernel: Default::default(),
             network: Default::default(),
             components: Default::default(),
             boot: Default::default(),
@@ -353,6 +355,7 @@ impl Manifest {
         Ok(value)
     }
     pub fn validate(&self) -> Result<()> {
+        self.kernel.validate()?;
         if self.version != 1 {
             return Err("unsupported environment TOML version".into());
         }
@@ -424,6 +427,43 @@ impl Manifest {
                 );
             }
         }
+        Ok(())
+    }
+}
+/// Guest kernel policy initialized before task admission. These are the same
+/// resources exposed by proc sysctl; declaring them grants no native authority.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Kernel {
+    pub sysctl: BTreeMap<String, u32>,
+}
+impl Kernel {
+    pub fn validate(&self) -> Result<()> {
+        for (name, &value) in &self.sysctl {
+            if name != "kernel.threads-max" {
+                return Err(format!("unsupported kernel.sysctl key: {name}").into());
+            }
+            if !(1..=trames_vfs::TaskLimit::MAX).contains(&value) {
+                return Err("kernel.threads-max must be 1..=1073741823".into());
+            }
+        }
+        Ok(())
+    }
+    pub fn apply(&self, vfs: &trames_vfs::Vfs) -> Result<()> {
+        self.validate()?;
+        if let Some(&value) = self.sysctl.get("kernel.threads-max") {
+            vfs.task_limit_control().set(value)?;
+        }
+        Ok(())
+    }
+    pub fn argument(&mut self, text: &str) -> Result<()> {
+        let (name, value) = text.split_once('=').ok_or("--sysctl requires NAME=VALUE")?;
+        let value = value.parse::<u32>()?;
+        let declaration = Self {
+            sysctl: [(name.to_owned(), value)].into(),
+        };
+        declaration.validate()?;
+        self.sysctl.insert(name.to_owned(), value);
         Ok(())
     }
 }
@@ -759,6 +799,33 @@ mod tests {
         assert!(Manifest::parse("[network]\nmode='bridge'").is_err());
         assert!(Manifest::parse("[environment]\ntype='android'").is_err());
         assert!(Manifest::parse(&encode(&m).unwrap()).is_ok());
+    }
+    #[test]
+    fn task_capacity_manifest_and_cli_share_the_live_resource_and_reject_unknown_configuration() {
+        let m = Manifest::parse("[kernel.sysctl]\n'kernel.threads-max'=12345").unwrap();
+        let v = trames_vfs::Vfs::default();
+        m.kernel.apply(&v).unwrap();
+        v.task_limit_control().bind_initial(65536);
+        assert_eq!(v.task_limit_control().get(), 12345);
+        let encoded = encode(&m).unwrap();
+        assert_eq!(
+            Manifest::parse(&encoded).unwrap().kernel.sysctl,
+            m.kernel.sysctl
+        );
+        for declaration in [
+            "'kernel.threads-max'=0",
+            "'kernel.threads-max'=1073741824",
+            "'kernel.unknown'=2",
+        ] {
+            assert!(Manifest::parse(&format!("[kernel.sysctl]\n{declaration}")).is_err());
+        }
+        let mut kernel = Kernel::default();
+        kernel.argument("kernel.threads-max=1").unwrap();
+        kernel.argument("kernel.threads-max=7").unwrap();
+        kernel.apply(&v).unwrap();
+        assert_eq!(v.task_limit_control().get(), 7);
+        assert!(kernel.argument("kernel.unknown=3").is_err());
+        assert_eq!(v.task_limit_control().get(), 7);
     }
     #[test]
     fn guest_requests_never_grant_host_access() {

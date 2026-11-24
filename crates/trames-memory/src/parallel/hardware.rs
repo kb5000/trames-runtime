@@ -103,6 +103,9 @@ impl View {
             return false;
         };
         let mut guard = self.frame_guard(frame, offset, N);
+        if !frame.charge.write_ready() {
+            return false;
+        }
         // SAFETY: same guarded physical bytes back the protected alias. A failed
         // store leaves them unchanged and the checked path supplies the errno.
         if unsafe { entry.write(offset, bytes) } {

@@ -220,7 +220,8 @@ impl Vfs {
         // The compatibility devpts registry/cache are original shared objects
         // too. Capability-less views retain their explicit legacy boundary.
         if let Some(query) = &self.query {
-            if !mount.as_ref().is_some_and(|m| m.devpts.is_some())
+            if !query.joined_owner
+                && !mount.as_ref().is_some_and(|m| m.devpts.is_some())
                 && self.terminal_task.get().is_none()
             {
                 return query.defer();

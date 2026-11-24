@@ -63,6 +63,8 @@ impl Signals {
         child
     }
     pub fn exec(&mut self) {
+        self.io.rseq.clear();
+        self.io.proc_view.exec_perf();
         // Preserve the current mask, but no abandoned pselect/suspend restore
         // may later overwrite it in the new image.
         self.wait_mask = None;

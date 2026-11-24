@@ -735,10 +735,7 @@ mod tests {
                     let trames_vfs::FileOutcome::Complete(reply) = read.run() else {
                         panic!("proc read returned to owner")
                     };
-                    let trames_vfs::FileValue::Bytes(bytes) = reply.result.unwrap() else {
-                        panic!("read bytes")
-                    };
-                    bytes
+                    reply.result.unwrap().into_bytes().expect("read bytes")
                 })
                 .collect::<Vec<_>>()
         })
@@ -782,7 +779,12 @@ mod tests {
             panic!("fresh maps read returned to owner")
         };
         assert!(
-            matches!(reply.result, Ok(trames_vfs::FileValue::Bytes(bytes)) if !bytes.is_empty()),
+            !reply
+                .result
+                .unwrap()
+                .into_bytes()
+                .expect("maps bytes")
+                .is_empty(),
             "reopen uses the current mm rather than cloning the old open plan"
         );
         drop(retained_memory);

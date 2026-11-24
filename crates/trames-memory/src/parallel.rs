@@ -283,6 +283,7 @@ pub(super) struct Frame {
     native_live_private: std::sync::atomic::AtomicBool,
     proc_anonymous: std::sync::atomic::AtomicBool,
     error: Option<MemoryError>,
+    write_error: Option<MemoryError>,
     pub(super) bytes: Arc<ConcurrentPage>,
     pub(super) charge: Arc<Charge>,
     direct: bool,
@@ -325,11 +326,23 @@ fn shared_futex_page_key(page: &Page) -> Option<(u64, u64)> {
         .and_then(|b| b.object.parallel_key())
 }
 fn direct_matches(page: &Page, frame: &Frame) -> bool {
-    let storage = page
+    let backing = page
         .backing
         .as_ref()
-        .filter(|b| b.shared || !b.private_copy)
-        .and_then(|b| b.object.shared_page());
+        .filter(|b| b.shared || !b.private_copy);
+    // A deferred shared source may first become resident on a worker. The
+    // original root Page still owns that source, rather than a resident byte
+    // alias. Joining those writes must not demand a second materialization.
+    if !frame.bytes.private_source
+        && frame.bytes.source.as_ref().is_some_and(|source| {
+            backing
+                .and_then(|b| b.object.page_source())
+                .is_some_and(|original| Arc::ptr_eq(&original, source))
+        })
+    {
+        return true;
+    }
+    let storage = backing.and_then(|b| b.object.shared_page());
     storage
         .as_ref()
         .or_else(|| page.bytes.shared())
@@ -346,6 +359,7 @@ fn prepare_frame(
     registry: &mut Registry,
 ) -> Option<Frame> {
     let error = page.check_backing(base).err();
+    let write_error = page.write_fault(base);
     let backing_version = page.backing.as_ref().map_or(0, |b| b.object.version());
     let source = page
         .backing
@@ -375,6 +389,7 @@ fn prepare_frame(
         f.data_revision.load(Ordering::Relaxed) == page.data_revision
             && f.backing_version.load(Ordering::Relaxed) == backing_version
             && f.error == error
+            && f.write_error == write_error
     });
     let direct_owned = page
         .backing
@@ -568,6 +583,7 @@ fn prepare_frame(
                 .is_some_and(|b| !b.shared && !b.private_copy && !direct),
         ),
         error,
+        write_error,
         charge: page.charge.clone(),
         private_access: if private_unique {
             PrivateMode::Exclusive as u8
@@ -599,6 +615,7 @@ fn prepare_frame(
 }
 
 pub(super) struct Snapshot {
+    account: Arc<Account>,
     locks: locking::Locks,
     pub(super) anonymous: anonymous::Anonymous,
     hardware: bool,
@@ -869,7 +886,7 @@ impl View {
                     false,
                     0,
                 );
-                if frame.charge.resident() {
+                if frame.charge.write_ready() {
                     entry.tag |= Translation::RESIDENT;
                 }
                 self.translations[Translation::slot(base)].set(entry);
@@ -887,10 +904,19 @@ impl View {
                 other => other.clone(),
             });
         }
+        if access == Access::Write {
+            if let Some(error) = &frame.write_error {
+                return Err(error.clone().at_access(address));
+            }
+        }
+        let mut permissions = frame.permissions;
+        if frame.write_error.is_some() {
+            permissions.write = false;
+        }
         let mut entry = Translation::new(
             base,
             index,
-            frame.permissions,
+            permissions,
             false,
             if self.hardware_mode {
                 0
@@ -898,7 +924,7 @@ impl View {
                 self.snapshot.mmu.page_alias(&self.mmu_cache, base)
             },
         );
-        if frame.charge.resident() {
+        if frame.charge.write_ready() {
             entry.tag |= Translation::RESIDENT;
         }
         self.translations[Translation::slot(base)].set(entry);
@@ -968,16 +994,15 @@ impl View {
         frame.bytes.load().map_err(|e| e.at_access(address))
     }
     fn ensure_resident(&self, frame: &Frame, address: u64) -> Result<(), MemoryError> {
-        // Residency is monotonic for the lifetime of this immutable frame.
-        // CPU software stores and native chunks reuse the same paid TLB bit as
-        // hardware stores; no quota acquire is needed on each fragment.
+        // Fork can revoke write admission on a retained immutable View. Recheck
+        // the same relaxed page state before reusing its paid translation.
         let cell = &self.translations[Translation::slot(frame.base)];
         let mut entry = cell.get();
-        if entry.matches(frame.base, Translation::RESIDENT) {
+        if entry.matches(frame.base, Translation::RESIDENT) && frame.charge.write_ready() {
             return Ok(());
         }
         self.load_frame(frame, address)?;
-        frame.charge.ensure()?;
+        frame.charge.ensure_write()?;
         if entry.matches(frame.base, Translation::VALID) {
             entry.tag |= Translation::RESIDENT;
             cell.set(entry);
@@ -1238,9 +1263,9 @@ impl CpuMemory for View {
         for at in
             (address & !(PAGE_SIZE - 1)..address + input.len() as u64).step_by(PAGE_SIZE as usize)
         {
-            self.frame(at.max(address), Access::Write)?
-                .charge
-                .ensure()?;
+            let frame = self.frame(at.max(address), Access::Write)?;
+            self.load_frame(frame, at.max(address))?;
+            frame.charge.ensure_write()?;
         }
         let mut done = 0;
         while done < input.len() {
@@ -1640,6 +1665,7 @@ impl Memory {
             anonymous::Anonymous::freeze(self, registry.code_epoch.clone(), registry.hardware);
         let anonymous_executable = anonymous.executable();
         let mut snapshot = Snapshot {
+            account: self.account.clone(),
             anonymous,
             hardware: registry.hardware,
             hardware_generation,
@@ -1928,7 +1954,9 @@ impl View {
     /// token changes only at joined dirty publication, not at every CPU slice.
     pub fn hardware_view_version(&self) -> (u64, u64) {
         (
-            self.snapshot.hardware_generation,
+            self.snapshot
+                .hardware_generation
+                .max(self.snapshot.account.cow_epoch()),
             self.snapshot.hardware_writes.load(Ordering::Relaxed),
         )
     }
@@ -1948,7 +1976,13 @@ impl View {
         since: u64,
     ) -> Option<impl Iterator<Item = std::ops::Range<u64>> + '_> {
         let changes = &self.snapshot.hardware_changes;
-        let start = if since == self.snapshot.hardware_generation {
+        let cow = self.snapshot.account.cow_epoch();
+        let start = if cow > self.snapshot.hardware_generation {
+            if since != cow {
+                return None;
+            }
+            changes.len()
+        } else if since == self.snapshot.hardware_generation {
             changes.len()
         } else {
             changes.iter().position(|change| change.before == since)?
@@ -1967,6 +2001,10 @@ impl View {
     /// This is an invalidation hint only; page permissions/storage still come
     /// from hardware_page_info. No guest byte is loaded, allocated or charged.
     pub fn hardware_mapping_chunk_version(&self, address: u64) -> Option<u64> {
+        self.mapping_chunk_version(address)
+            .map(|version| version.max(self.snapshot.account.cow_epoch()))
+    }
+    fn mapping_chunk_version(&self, address: u64) -> Option<u64> {
         let chunk = address / crate::HARDWARE_MAPPING_CHUNK_SIZE;
         if let Some(&version) = self.snapshot.hardware_chunks.get(&chunk) {
             return Some(version);
@@ -2012,8 +2050,12 @@ impl View {
                 debug_assert_eq!(pointer & crate::anonymous::TOKEN, 0);
                 pointer | crate::anonymous::TOKEN
             });
-        let mut entry = Translation::new(address, token, frame.permissions, false, 0);
-        if frame.charge.resident() {
+        let mut permissions = frame.permissions;
+        if frame.write_error.is_some() {
+            permissions.write = false;
+        }
+        let mut entry = Translation::new(address, token, permissions, false, 0);
+        if frame.charge.write_ready() {
             entry.tag |= Translation::RESIDENT;
         }
         // Same frozen-snapshot ownership and permission bits as frame_slow.
@@ -2054,7 +2096,7 @@ impl View {
         address: u64,
     ) -> Result<crate::HardwareWriteFrame, MemoryError> {
         let frame = self.frame(address, Access::Write)?;
-        if !frame.charge.resident() {
+        if !frame.charge.write_ready() {
             return Err(MemoryError::InvalidRange);
         }
         Ok(crate::HardwareWriteFrame {
@@ -2180,7 +2222,9 @@ impl View {
             },
             backing_version: frame.backing_version.load(Ordering::Relaxed),
             exclusive: false,
-            writable: frame.permissions.write && frame.charge.resident(),
+            writable: frame.permissions.write
+                && frame.write_error.is_none()
+                && frame.charge.write_ready(),
         })
     }
     pub fn mark_hardware_write(&self, address: u64) -> Result<(), MemoryError> {
@@ -2287,7 +2331,11 @@ impl View {
         }
         // A hardware export binds a real physical slot even for a zero read.
         // Ordinary software zero reads remain allocation-free and uncharged.
-        self.ensure_resident(frame, address)?;
+        if access == Access::Write {
+            self.ensure_resident(frame, address)?;
+        } else {
+            frame.charge.ensure()?;
+        }
         let page = if let Some(page) = frame.bytes.mutable() {
             page
         } else {

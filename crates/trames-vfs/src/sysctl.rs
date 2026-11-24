@@ -3,6 +3,7 @@
 use super::*;
 pub(super) const PTRACE_SCOPE: &[u8] = b"/proc/sys/kernel/yama/ptrace_scope";
 pub(super) const MAX_USER_NAMESPACES: &[u8] = b"/proc/sys/user/max_user_namespaces";
+pub(super) const THREADS_MAX: &[u8] = b"/proc/sys/kernel/threads-max";
 
 #[derive(Clone, Copy)]
 pub(super) enum Protection {
@@ -44,6 +45,8 @@ pub(super) enum Control {
     FuseAbort(fuse::Abort),
     Network(network::Control),
     NrOpen(DescriptorCeiling),
+    ThreadsMax(TaskLimit),
+    Perf(perf::Setting, Arc<perf::Settings>),
     PtraceScope(PidNamespace),
     OverflowId(bool, Arc<user_namespace::OverflowIds>),
     UtsName(bool, Arc<readiness::ProcWatch>),
@@ -83,9 +86,12 @@ impl Control {
             Self::UserNamespaces(owner, _) => {
                 owner.capable(credentials, capabilities::SYS_RESOURCE)
             }
-            Self::KeyLimit(..) | Self::OverflowId(..) | Self::MountMax(_) | Self::Namei(..) => {
-                credentials.euid == 0 && credentials.user_namespace.is_initial()
-            }
+            Self::KeyLimit(..)
+            | Self::OverflowId(..)
+            | Self::MountMax(_)
+            | Self::Namei(..)
+            | Self::ThreadsMax(_)
+            | Self::Perf(..) => credentials.euid == 0 && credentials.user_namespace.is_initial(),
             Self::PtraceScope(_) => {
                 credentials.user_namespace.is_initial()
                     && credentials.has_cap(capabilities::SYS_PTRACE)
@@ -98,6 +104,16 @@ impl Control {
     }
     pub fn read(&self, offset: u64, count: usize, caller: &Vfs) -> Result<Vec<u8>> {
         let value = match self {
+            Self::Perf(setting, settings) => {
+                if offset != 0 {
+                    return Ok(Vec::new());
+                }
+                return Ok(slice(
+                    format!("{}\n", settings.get(*setting)).as_bytes(),
+                    offset,
+                    count,
+                ));
+            }
             Self::FuseAbort(_) => return Err(Errno(13)),
             Self::TaskIo { task, whole } => {
                 let text = task.io_text(*whole, caller.lock_owner, &caller.credentials)?;
@@ -133,6 +149,12 @@ impl Control {
             Self::MountMax(policy) => policy.get(),
             Self::OverflowId(group, ids) => ids.get(*group),
             Self::NrOpen(limit) => limit.get(),
+            Self::ThreadsMax(limit) => {
+                if offset != 0 {
+                    return Ok(Vec::new());
+                }
+                limit.get() as u32
+            }
             Self::UserNamespaces(_, limit) => limit.max(),
         };
         let bytes = format!("{value}\n").into_bytes();
@@ -174,6 +196,38 @@ impl Control {
             Self::PtraceScope(_) if !self.authorized(credentials, tgid) => return Err(Errno(1)),
             Self::UserMap(control) => control.write(bytes, offset, credentials),
             Self::Network(control) => control.write(bytes, offset, control.authorized(credentials)),
+            Self::ThreadsMax(limit) => {
+                if !self.authorized(credentials, tgid) {
+                    return Err(Errno(13));
+                }
+                if bytes.is_empty() {
+                    return Ok(0);
+                }
+                // proc_dointvec_minmax with the default strict write mode:
+                // a subsequent write is consumed without changing the value.
+                if offset != 0 {
+                    *position += bytes.len() as u64;
+                    return Ok(bytes.len());
+                }
+                let (value, consumed) = parse_sysctl_integer(bytes)?;
+                limit.set(value)?;
+                Ok(consumed)
+            }
+            Self::Perf(setting, settings) => {
+                if !self.authorized(credentials, tgid) {
+                    return Err(Errno(13));
+                }
+                if bytes.is_empty() {
+                    return Ok(0);
+                }
+                if offset != 0 {
+                    *position += bytes.len() as u64;
+                    return Ok(bytes.len());
+                }
+                let (value, consumed) = parse_sysctl_signed_integer(bytes)?;
+                settings.set(*setting, value)?;
+                Ok(consumed)
+            }
             Self::OverflowId(..)
             | Self::PtraceScope(_)
             | Self::Namei(..)
@@ -217,6 +271,32 @@ impl Control {
         *position += n as u64;
         Ok(n)
     }
+}
+fn parse_sysctl_integer(bytes: &[u8]) -> Result<(u32, usize)> {
+    let (value, consumed) = parse_sysctl_signed_integer(bytes)?;
+    Ok((u32::try_from(value).map_err(|_| Errno(22))?, consumed))
+}
+fn parse_sysctl_signed_integer(bytes: &[u8]) -> Result<(i32, usize)> {
+    let bytes = &bytes[..bytes.len().min(4095)];
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .ok_or(Errno(22))?;
+    let end = bytes[start..]
+        .iter()
+        .position(|byte| matches!(byte, b' ' | b'\t' | b'\n'))
+        .map_or(bytes.len(), |end| start + end);
+    let number = &bytes[start..end];
+    if number.starts_with(b"+") {
+        return Err(Errno(22));
+    }
+    let value = parse_kernel_i32(std::str::from_utf8(number).map_err(|_| Errno(22))?)
+        .map_err(|_| Errno(22))?;
+    let consumed = bytes[end..]
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .map_or(bytes.len(), |tail| end + tail);
+    Ok((value, consumed))
 }
 /// Linux kstrtoint with base zero, after the caller handles its input buffer.
 pub(super) fn parse_kernel_i32(input: &str) -> Result<i32> {
@@ -271,7 +351,13 @@ fn slice(bytes: &[u8], offset: u64, count: usize) -> Vec<u8> {
     bytes[start..start + count.min(bytes.len() - start)].to_vec()
 }
 impl Vfs {
+    pub fn task_limit_control(&self) -> TaskLimit {
+        self.task_limit.clone()
+    }
     pub(super) fn sysctl_control(&self, path: &ResolvedPath) -> Option<Control> {
+        if let Some(setting) = perf::Setting::at(path).filter(|_| self.uses_pseudo(path)) {
+            return Some(Control::Perf(setting, self.perf_settings()));
+        }
         if path
             .mount
             .as_ref()
@@ -350,6 +436,8 @@ impl Vfs {
             Some(Control::UserMap(Arc::new(control)))
         } else if path.as_ref() == PTRACE_SCOPE && self.uses_pseudo(path) {
             Some(Control::PtraceScope(self.pid_namespace().clone()))
+        } else if path.as_ref() == THREADS_MAX && self.uses_pseudo(path) {
+            Some(Control::ThreadsMax(self.task_limit.clone()))
         } else if path.as_ref() == MAX_USER_NAMESPACES && self.uses_pseudo(path) {
             Some(Control::UserNamespaces(
                 self.credentials.user_namespace.clone(),
@@ -379,6 +467,98 @@ impl Vfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn perf_controls_remain_live_across_descriptor_and_namespace_aliases() {
+        let mut root = Vfs::default();
+        root.set_runtime_info(1, RuntimeInfo::default());
+        let path = b"/proc/sys/kernel/perf_event_paranoid";
+        let fd = root.open_at(AT_FDCWD, path, 2, 0).unwrap();
+        let mut child = root.clone();
+        child.unshare_user().unwrap();
+        assert_eq!(child.pread(fd, 64, 0).unwrap(), b"2\n");
+        assert_eq!(root.pwrite(fd, b"-1\n", 0), Ok(3));
+        assert_eq!(child.pread(fd, 64, 0).unwrap(), b"-1\n");
+        assert_eq!(child.pwrite(fd, b"0", 0), Err(Errno(13)));
+        assert_eq!(root.write(fd, b"1"), Ok(1));
+        assert_eq!(root.write(fd, b"2"), Ok(1));
+        assert_eq!(
+            root.pread(fd, 64, 0).unwrap(),
+            b"1\n",
+            "strict subsequent writes consume without changing policy"
+        );
+        assert!(root.pread(fd, 64, 1).unwrap().is_empty());
+        let rate = root
+            .open_at(
+                AT_FDCWD,
+                b"/proc/sys/kernel/perf_event_max_sample_rate",
+                2,
+                0,
+            )
+            .unwrap();
+        assert_eq!(root.pwrite(rate, b"0", 0), Err(Errno(22)));
+        assert_eq!(root.pwrite(rate, b"200000", 0), Ok(6));
+        // Fork copied FD membership before rate was opened. The policy, not
+        // later descriptor-table insertions, is shared across these tasks.
+        assert_eq!(child.pread(rate, 64, 0), Err(Errno(9)));
+        let child_rate = child
+            .open_at(
+                AT_FDCWD,
+                b"/proc/sys/kernel/perf_event_max_sample_rate",
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(child.pread(child_rate, 64, 0).unwrap(), b"200000\n");
+    }
+
+    #[test]
+    fn task_limit_sysctl_retains_one_live_resource_across_fork_and_snapshots() {
+        let mut v = Vfs::default();
+        v.set_runtime_info(1, RuntimeInfo::default());
+        let limit = v.task_limit_control();
+        limit.bind_initial(3);
+        let fd = v.open_at(AT_FDCWD, THREADS_MAX, 2, 0).unwrap();
+        let mut peer = v.clone();
+        assert_eq!(peer.write(fd, b"0x20\n"), Ok(5));
+        assert_eq!(limit.get(), 32);
+        assert_eq!(v.write(fd, b"64"), Ok(2));
+        assert_eq!(
+            limit.get(),
+            32,
+            "strict numeric offset consumes without changing the value"
+        );
+        assert_eq!(peer.pwrite(fd, b"1\n", 0), Ok(2));
+        assert_eq!(v.pread(fd, 64, 0).unwrap(), b"1\n");
+        assert!(v.pread(fd, 64, 1).unwrap().is_empty());
+        v.set_runtime_info(
+            1,
+            RuntimeInfo {
+                task_limit: 65536,
+                ..RuntimeInfo::default()
+            },
+        );
+        limit.bind_initial(65536);
+        assert_eq!(limit.get(), 1);
+        // Source workers open through PathQueries, not the owner VFS. Their
+        // retained controls must bind the same policy, including later writes.
+        let paths = v.path_queries();
+        let files = FileEpoch::default().capture(&v, true);
+        let worker_fd = paths
+            .open_at_resolve(AT_FDCWD, THREADS_MAX, 2, 0, 0, &files)
+            .unwrap()
+            .unwrap();
+        assert_eq!(v.pread(worker_fd, 64, 0).unwrap(), b"1\n");
+        assert_eq!(v.pwrite(worker_fd, b"2", 0), Ok(1));
+        assert_eq!(limit.get(), 2);
+        assert_eq!(v.pread(fd, 64, 0).unwrap(), b"2\n");
+        limit.set(1).unwrap();
+        for value in [b"0".as_slice(), b"1073741824", b"-1", b"+2"] {
+            assert_eq!(peer.pwrite(fd, value, 0), Err(Errno(22)));
+        }
+        assert_eq!(limit.get(), 1);
+        peer.credentials.euid = 1000;
+        assert_eq!(peer.pwrite(fd, b"2", 0), Err(Errno(13)));
+    }
 
     #[test]
     fn dump_filter_inheritance_and_linux_integer_syntax() {

@@ -17,13 +17,28 @@ fn entries(bytes: &[u8]) -> impl Iterator<Item = (u16, u32, u32)> + '_ {
         )
     })
 }
-pub(super) fn validate(bytes: &[u8]) -> Result<()> {
-    if bytes.len() < 4 || (bytes.len() - 4) % 8 != 0 {
+/// Backing-store conversion, before setter-only semantic validation.
+pub(super) fn decode(bytes: &[u8]) -> Result<()> {
+    if bytes.len() < 4 {
         return Err(Errno(22));
     }
     if bytes[..4] != 2u32.to_le_bytes() {
         return Err(Errno(95));
     }
+    if (bytes.len() - 4) % 8 != 0 {
+        return Err(Errno(22));
+    }
+    for (tag, _, id) in entries(bytes) {
+        match tag {
+            1 | 4 | 16 | 32 => {}
+            2 | 8 if id != u32::MAX => {}
+            _ => return Err(Errno(22)),
+        }
+    }
+    Ok(())
+}
+pub(super) fn validate(bytes: &[u8]) -> Result<()> {
+    decode(bytes)?;
     if bytes.len() == 4 {
         return Ok(());
     }
@@ -136,6 +151,29 @@ pub(super) fn allows(bytes: &[u8], node: &Node, c: &Credentials, want: u32) -> b
         }
     }
     false
+}
+/// Daemon ACLs may decode successfully without satisfying setter invariants.
+/// Preserve entry order, the forward mask search and the incomplete-ACL error.
+pub(super) fn permission(bytes: &[u8], node: &Node, c: &Credentials, want: u32) -> Result<bool> {
+    let mut group = false;
+    let mut rest = entries(bytes);
+    while let Some((tag, perm, id)) = rest.next() {
+        let masked = match tag {
+            1 if c.fsuid == node.uid => return Ok(perm & want == want),
+            2 if c.fsuid == id => true,
+            4 | 8 if c.in_group(if tag == 4 { node.gid } else { id }) => {
+                group = true;
+                perm & want == want
+            }
+            32 => return Ok(!group && perm & want == want),
+            _ => false,
+        };
+        if masked {
+            let mask = rest.find(|(tag, _, _)| *tag == 16).map_or(7, |(_, p, _)| p);
+            return Ok(perm & mask & want == want);
+        }
+    }
+    Err(Errno(5))
 }
 #[cfg(test)]
 mod tests;

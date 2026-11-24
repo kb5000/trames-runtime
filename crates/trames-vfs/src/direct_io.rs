@@ -271,6 +271,7 @@ pub trait DirectPoll: Send + Sync {
 }
 #[derive(Clone)]
 enum ByteResource {
+    Perf(Arc<perf::Event>),
     Fuse(Arc<fuse::Device>),
     MessageQueue(Arc<posix_mq::Queue>),
     Tun(Arc<trames_net::tun::Connection>),
@@ -600,6 +601,7 @@ impl DirectFd {
             }
         } else {
             match &open.control {
+                Some(events::SharedControl::Perf(event)) => ByteResource::Perf(event.clone()),
                 Some(events::SharedControl::MessageQueue(q)) => {
                     ByteResource::MessageQueue(q.clone())
                 }
@@ -767,6 +769,7 @@ impl DirectFd {
                 })
             }
             (ByteResource::Signal(a, _), ByteResource::Signal(b, _)) => Arc::ptr_eq(a, b),
+            (ByteResource::Perf(a), ByteResource::Perf(b)) => Arc::ptr_eq(a, b),
             (ByteResource::Event(a), ByteResource::Event(b)) => Arc::ptr_eq(a, b),
             (ByteResource::Timer(a), ByteResource::Timer(b)) => Arc::ptr_eq(a, b),
             (ByteResource::Inotify(a), ByteResource::Inotify(b)) => Arc::ptr_eq(&a.queue, &b.queue),
@@ -861,6 +864,7 @@ impl DirectFd {
                 .into_iter()
                 .collect(),
             ByteResource::PollOnly(poll) => vec![poll.subscribe(signal)],
+            ByteResource::Perf(event) => vec![event.subscribe(signal)],
             ByteResource::Event(counter) => vec![counter.readiness.subscribe(signal)],
             ByteResource::Timer(timer) => timer.subscribe(signal),
             ByteResource::Signal(mask, reader) => {
@@ -930,6 +934,8 @@ impl DirectFd {
             ByteResource::Kmsg(log.clone())
         } else if let Some(bridge) = &open.bridge {
             ByteResource::Bridge(Arc::downgrade(bridge))
+        } else if let Some(events::Anonymous::Perf(event)) = &open.anonymous {
+            ByteResource::Perf(event.clone())
         } else if let Some(events::Anonymous::Event(counter)) = &open.anonymous {
             ByteResource::Event(counter.clone())
         } else if let Some(events::Anonymous::Timer(timer)) = &open.anonymous {
@@ -1323,6 +1329,9 @@ impl DirectFd {
         }
     }
     fn poll(&self, events: u16) -> (u16, [u64; 2]) {
+        if let ByteResource::Perf(event) = &self.resource {
+            return event.poll(events);
+        }
         if let ByteResource::ProcWatch(watch) = &self.resource {
             return watch.poll(events);
         }
@@ -1362,6 +1371,7 @@ impl DirectFd {
                 bridge.upgrade().map_or((16, [0; 2]), |b| b.peek(events))
             }
             ByteResource::PollOnly(poll) => poll.poll(events),
+            ByteResource::Perf(event) => event.peek(events),
             ByteResource::Event(counter) => (counter.poll(events), counter.epoch()),
             ByteResource::Timer(timer) => timer.poll(events),
             ByteResource::Signal(mask, reader) => {
@@ -1585,7 +1595,7 @@ impl DirectFd {
     pub fn readv_records(&self) -> bool {
         matches!(
             self.resource,
-            ByteResource::Event(_) | ByteResource::Inotify(_)
+            ByteResource::Event(_) | ByteResource::Inotify(_) | ByteResource::Perf(_)
         )
     }
     pub fn nonblocking(&self) -> bool {
@@ -1658,6 +1668,7 @@ impl DirectFd {
                 .map_or(Err(Errno(9)), |b| b.read(count).map_err(Errno)),
             ByteResource::SimpleDevice(_) => unreachable!("typed device read"),
             ByteResource::Event(counter) => counter.read(count),
+            ByteResource::Perf(event) => event.read(count),
             ByteResource::Timer(timer) => timer.read(count),
             ByteResource::Inotify(queue) => queue.read(count),
             ByteResource::Epoll(_)
@@ -1789,6 +1800,7 @@ impl DirectFd {
             | ByteResource::Bpf
             | ByteResource::Regular
             | ByteResource::Timer(_)
+            | ByteResource::Perf(_)
             | ByteResource::Signal(..)
             | ByteResource::UnixControl(_)
             | ByteResource::Inotify(_) => Err(Errno(22)),
@@ -2081,7 +2093,11 @@ impl Vfs {
     pub fn readv_records(&self, fd: u32) -> Result<bool> {
         Ok(matches!(
             self.descriptor(fd)?.open.borrow().anonymous,
-            Some(events::Anonymous::Event(_) | events::Anonymous::Inotify(_))
+            Some(
+                events::Anonymous::Event(_)
+                    | events::Anonymous::Inotify(_)
+                    | events::Anonymous::Perf(_)
+            )
         ))
     }
     pub fn is_eventfd(&self, fd: u32) -> Result<bool> {

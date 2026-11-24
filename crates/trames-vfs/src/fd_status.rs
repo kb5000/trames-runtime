@@ -1,6 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Shared OFD status and per-descriptor bits resolved through live membership.
 use super::*;
+/// The effective write synchronization mode; true requests only data durability.
+/// O_SYNC strengthens either RWF mode, while RWF_SYNC strengthens O_DSYNC.
+pub(super) fn write_sync(flags: u32, requested: Option<bool>) -> Option<bool> {
+    if flags & 0x100000 != 0 {
+        Some(false)
+    } else {
+        requested.or_else(|| (flags & 0x1000 != 0).then_some(true))
+    }
+}
 use std::sync::atomic::{AtomicBool, AtomicU32};
 
 #[derive(Clone)]
@@ -59,6 +68,16 @@ const CHANGEABLE: u32 = 0x400 | O_NONBLOCK | O_NOATIME | 0x2000 | O_DIRECT;
 /// This has no Files root and never resolves a numeric FD after acceptance.
 pub struct DescriptorControl(Descriptor);
 impl DescriptorControl {
+    pub fn perf_event(&self) -> Result<Option<Arc<perf::Event>>> {
+        let open = self.0.open.borrow();
+        if open.flags.get() & O_PATH != 0 {
+            return Err(Errno(9));
+        }
+        Ok(match &open.control {
+            Some(events::SharedControl::Perf(event)) => Some(event.clone()),
+            _ => None,
+        })
+    }
     pub(super) fn pidfd(&self) -> Result<(Arc<PidFd>, u32)> {
         let open = self.0.open.borrow();
         match &open.control {
@@ -136,6 +155,7 @@ impl DescriptorControl {
                     &open.control,
                     Some(
                         events::SharedControl::Pid(_)
+                            | events::SharedControl::Perf(_)
                             | events::SharedControl::Signal(_)
                             | events::SharedControl::Timer(_)
                             | events::SharedControl::Event(_)

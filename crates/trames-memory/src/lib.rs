@@ -6,6 +6,10 @@ mod backing;
 pub use attachments::SegmentAttachment;
 pub use backing::SharedAnonymousPages;
 mod cpu_memory;
+mod page_fault;
+#[cfg(test)]
+mod page_fault_tests;
+pub use page_fault::{PageFault, PageWait};
 mod hardware;
 pub use hardware::{HardwarePageInfo, HardwareWriteFrame};
 mod hardware_shared;
@@ -134,8 +138,13 @@ pub enum MemoryError {
     Limit,
     Unmapped(u64),
     Bus(u64),
+    /// The instruction has not completed; its original page source is waiting.
+    Pending(PageFault),
     BackingIo(u32),
-    Permission { address: u64, access: Access },
+    Permission {
+        address: u64,
+        access: Access,
+    },
 }
 
 impl MemoryError {
@@ -144,6 +153,7 @@ impl MemoryError {
     fn at_access(self, address: u64) -> Self {
         match self {
             Self::Bus(_) => Self::Bus(address),
+            Self::Pending(fault) => Self::Pending(fault.at(address)),
             error => error,
         }
     }
@@ -329,6 +339,7 @@ impl Memory {
         let account = self.fork_account();
         let identity = NEXT_SPACE.fetch_add(1, Ordering::Relaxed);
         let mut frames = Slots::new();
+        let mut cow_parents = Vec::new();
         let mut excluded = BTreeSet::new();
         if !self.vma_policy.nofork.is_empty() {
             excluded.extend(
@@ -379,7 +390,17 @@ impl Memory {
                     PageBytes::Zero
                 });
             }
-            page.charge = Charge::fork(&account, resident)?;
+            page.charge = Charge::fork(
+                &account,
+                &source.charge,
+                source
+                    .backing
+                    .as_ref()
+                    .is_none_or(|b| !b.shared && b.private_copy),
+            )?;
+            if page.charge.fork_pending() {
+                cow_parents.push(source.charge.clone());
+            }
             page.register_backing();
             page.parallel_dirty = false;
             frames.push(Some(page));
@@ -459,7 +480,10 @@ impl Memory {
                     PageBytes::Zero
                 });
             }
-            page.charge = Charge::fork(&cloned.account, resident)?;
+            page.charge = Charge::fork(&cloned.account, &source.charge, true)?;
+            if page.charge.fork_pending() {
+                cow_parents.push(source.charge.clone());
+            }
             page.parallel_dirty = false;
             cloned.anonymous.remove(base, base + PAGE_SIZE);
             cloned.insert_owned_page(base, page);
@@ -468,6 +492,12 @@ impl Memory {
         cloned.attachments = self.attachments.fork(&self.vma_policy.nofork, pid);
         // Commit only after every child charge succeeded. No tentative child
         // can execute while it shares a still-writable parent CPU alias.
+        if !cow_parents.is_empty() {
+            for charge in cow_parents {
+                charge.commit_fork();
+            }
+            self.account.publish_cow();
+        }
         self.invalidate_translations();
         if !retained {
             self.mmu.retire();
@@ -695,14 +725,18 @@ impl Memory {
             let page = self.anonymous.page(base)?;
             (anonymous::TOKEN | (base / PAGE_SIZE) as usize, page)
         };
+        let mut permissions = page.permissions;
+        if page.write_fault(base).is_some() {
+            permissions.write = false;
+        }
         let mut entry = Translation::new(
             base,
             frame,
-            page.permissions,
+            permissions,
             page.backing.is_some(),
             self.mmu.page_alias(base, &page.bytes),
         );
-        if page.charge.resident() {
+        if page.charge.write_ready() {
             entry.tag |= Translation::RESIDENT;
         }
         self.translations[Translation::slot(base)].set(entry);
@@ -741,6 +775,12 @@ impl Memory {
             .translation(address & !(PAGE_SIZE - 1))
             .ok_or_else(|| self.missing_page(address, access))?;
         if entry.tag & Translation::access_bit(access) == 0 {
+            let page = self.translated_page(entry);
+            if access == Access::Write && page.permissions.write {
+                if let Some(error) = page.write_fault(address) {
+                    return Err(error);
+                }
+            }
             return Err(MemoryError::Permission { address, access });
         }
         Ok(entry)
@@ -1243,14 +1283,8 @@ impl Memory {
             // Kernel/native output preflight must reserve capacity before a
             // read consumes a queue or advances an open-file description.
             if access == Access::Write {
-                page.charge.ensure()?;
-                if let Some(source) = page
-                    .backing
-                    .as_ref()
-                    .and_then(|backing| backing.object.page_source())
-                {
-                    source.load().map_err(|e| e.at_access(fault_address))?;
-                }
+                page.prepare_source(fault_address)?;
+                page.charge.ensure_write()?;
             }
             allowed &= eligible(page);
         }

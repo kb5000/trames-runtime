@@ -26,6 +26,10 @@ impl std::ops::Deref for LayerPath {
 impl LayerPath {
     fn resolved(&self) -> ResolvedPath {
         ResolvedPath {
+            directory_inode: None,
+            indexed_position: None,
+            #[cfg(all(feature = "hostfs", unix))]
+            host_position: None,
             retained_directory: None,
             proc_binding: None,
             key: self.key.clone(),
@@ -658,6 +662,7 @@ impl Vfs {
     fn overlay_lower_inode(source: &NodeRef, inode: u64) -> Result<NodeRef> {
         let n = source.borrow();
         let content = match &n.content {
+            Content::Fuse => return Err(Errno(95)),
             Content::Directory => Content::Directory,
             Content::File(_) => Content::File(storage::FileData::Lower(source.clone())),
             Content::Symlink(target) => Content::Symlink(target.clone()),
@@ -816,6 +821,10 @@ impl Vfs {
                 return Err(Errno(13));
             }
             let at = ResolvedPath {
+                directory_inode: None,
+                indexed_position: None,
+                #[cfg(all(feature = "hostfs", unix))]
+                host_position: None,
                 retained_directory: None,
                 proc_binding: None,
                 key: w.key(b"/work"),

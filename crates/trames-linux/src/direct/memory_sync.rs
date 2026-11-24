@@ -44,6 +44,7 @@ impl crate::HostFileTask for SyncTask {
                     }
                 } else {
                     result.complete(trames_vfs::FileOutcome::Complete(trames_vfs::FileReply {
+                        resources: Default::default(),
                         result: Ok(trames_vfs::FileValue::Count(0)),
                         file_size_signal: false,
                         scratch: None,

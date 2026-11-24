@@ -43,7 +43,14 @@ impl Signals {
         sme: Option<(SmeConfig, Option<&SmeState>, bool)>,
     ) -> Result<(), Errno> {
         let mut frame = self.frame_state();
-        frame.enter_sme_restoring(state, memory, sig, info, action, sme, self.wait_mask)?;
+        let original_pc = state.pc;
+        state.pc = self.io.rseq.signal(memory, state.pc)?;
+        if let Err(error) =
+            frame.enter_sme_restoring(state, memory, sig, info, action, sme, self.wait_mask)
+        {
+            state.pc = original_pc;
+            return Err(error);
+        }
         self.wait_mask = None;
         self.commit_frame(frame);
         Ok(())

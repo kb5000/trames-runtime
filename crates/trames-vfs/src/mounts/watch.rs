@@ -196,10 +196,7 @@ mod tests {
             let FileOutcome::Complete(reply) = work.run() else {
                 panic!("mount read must finish on its caller")
             };
-            let FileValue::Bytes(bytes) = reply.result.unwrap() else {
-                panic!("read bytes")
-            };
-            bytes
+            reply.result.unwrap().into_bytes().expect("read bytes")
         }
         let mut v = vfs();
         let fd = v.open_at(AT_FDCWD, b"/proc/self/mountinfo", 0, 0).unwrap();

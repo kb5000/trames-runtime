@@ -349,7 +349,8 @@ mod tests {
         );
         v.mount(None, b"/mounted", None, 32, None).unwrap();
         v.unshare_mounts().unwrap();
-        v.mount(None, b"/mounted", None, 32 | mounts::MS_RDONLY, None)
+        // Change the new namespace's mount flags, not the shared superblock.
+        v.mount(None, b"/mounted", None, 4096 | 32 | mounts::MS_RDONLY, None)
             .unwrap();
         assert_eq!(v.open_at(AT_FDCWD, b"/mounted/file", 2, 0), Err(Errno(30)));
         let reopened = v.open_at(AT_FDCWD, &path, 2, 0).unwrap();

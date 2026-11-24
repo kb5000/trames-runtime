@@ -4,6 +4,7 @@ use super::*;
 use std::time::{Duration, Instant};
 
 pub(super) enum Anonymous {
+    Perf(Arc<perf::Event>),
     Landlock(Arc<landlock::Ruleset>),
     Pid(Arc<PidFd>),
     FsContext(Arc<mounts::fd::FsContext>),
@@ -43,6 +44,7 @@ impl SignalMask {
     }
 }
 pub(super) enum SharedControl {
+    Perf(Arc<perf::Event>),
     Landlock(Arc<landlock::Ruleset>),
     Pid(Arc<PidFd>),
     FsContext(Arc<mounts::fd::FsContext>),
@@ -65,6 +67,7 @@ pub(super) enum SharedControl {
 impl SharedControl {
     fn capture(control: &Anonymous) -> Option<Self> {
         Some(match control {
+            Anonymous::Perf(event) => Self::Perf(event.clone()),
             Anonymous::Landlock(ruleset) => Self::Landlock(ruleset.clone()),
             Anonymous::Pid(pid) => Self::Pid(pid.clone()),
             Anonymous::FsContext(ctx) => Self::FsContext(ctx.clone()),
@@ -80,6 +83,7 @@ impl SharedControl {
     }
     pub(super) fn owner_projection(&self) -> Option<Anonymous> {
         Some(match self {
+            Self::Perf(event) => Anonymous::Perf(event.clone()),
             Self::Landlock(ruleset) => Anonymous::Landlock(ruleset.clone()),
             Self::Pid(pid) => Anonymous::Pid(pid.clone()),
             Self::MountTree(_) => return None,
@@ -152,6 +156,7 @@ impl WatchState {
 impl Anonymous {
     pub(super) fn name(&self) -> &'static [u8] {
         match self {
+            Self::Perf(_) => b"anon_inode:[perf_event]",
             Self::Landlock(_) => b"anon_inode:[landlock-ruleset]",
             Self::Pid(_) => b"anon_inode:[pidfd]",
             Self::FsContext(_) => b"anon_inode:[fscontext]",
@@ -172,6 +177,7 @@ impl Anonymous {
         reader: Option<&Arc<dyn SignalReader>>,
     ) -> u16 {
         match self {
+            Self::Perf(event) => event.poll(events).0,
             Self::Pid(pid) => pid.poll(events).0,
             Self::Sync(file) => file.poll(events).0,
             Self::Uring(ring) => {
@@ -221,6 +227,9 @@ impl Anonymous {
         }
     }
     pub(super) fn read(&mut self, count: usize) -> Result<Vec<u8>> {
+        if let Self::Perf(event) = self {
+            return event.read(count);
+        }
         if let Self::Inotify(i) = self {
             return i.queue.read(count);
         }
@@ -231,6 +240,7 @@ impl Anonymous {
             return Err(Errno(22));
         }
         match self {
+            Self::Perf(event) => event.read(count),
             Self::Event(counter) => counter.read(count),
             Self::Timer(timer) => timer.read(count),
             Self::Landlock(_)
@@ -357,6 +367,9 @@ impl Vfs {
         pending: u64,
         reader: Option<&Arc<dyn SignalReader>>,
     ) -> (u16, [u64; 2]) {
+        if let Some(SharedControl::Perf(event)) = &o.control {
+            return event.peek(events);
+        }
         o.proc_watch().map_or_else(
             || {
                 (
@@ -368,6 +381,9 @@ impl Vfs {
         )
     }
     fn poll_epoch_with(o: &OpenDescription, reader: Option<&Arc<dyn SignalReader>>) -> [u64; 2] {
+        if let Some(SharedControl::Perf(event)) = &o.control {
+            return event.peek(0).1;
+        }
         if let Some(SharedControl::MessageQueue(q)) = &o.control {
             return q.poll(0).1;
         }
@@ -732,6 +748,21 @@ pub(super) fn mounted_resource_descriptor(
     anonymous: Option<Anonymous>,
     mount: Option<OpenMount>,
 ) -> Descriptor {
+    mounted_resource_descriptor_with_link_credentials(
+        id, flags, kind, node, control, anonymous, mount, None,
+    )
+}
+#[allow(clippy::too_many_arguments)] // Complete immutable OFD initialization before any observer exists.
+pub(super) fn mounted_resource_descriptor_with_link_credentials(
+    id: u64,
+    flags: u32,
+    kind: FdKind,
+    node: Option<NodeRef>,
+    control: Option<SharedControl>,
+    anonymous: Option<Anonymous>,
+    mount: Option<OpenMount>,
+    link_credentials: Option<(u64, UserNamespace)>,
+) -> Descriptor {
     let descriptor = Descriptor {
         open: OpenHandle::new(OpenDescription {
             shared: Arc::new(SharedOpenDescription {
@@ -751,7 +782,7 @@ pub(super) fn mounted_resource_descriptor(
                 directory_mount: Default::default(),
                 namespace_resource: None,
                 landlock_denied: 0,
-                link_credentials: None,
+                link_credentials,
                 file_authority: Default::default(),
                 tcp_publication: Default::default(),
                 socket_control: None,

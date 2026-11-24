@@ -51,6 +51,8 @@ pub(super) struct ProcNode {
 pub struct ProcDirectory {
     pub(super) node: NodeRef,
     pub(super) mount: Arc<mounts::MountData>,
+    #[cfg(all(feature = "hostfs", unix))]
+    pub(super) host_file: Option<Arc<hostfs::OpenFile>>,
 }
 
 pub struct ProcQuery<'a> {
@@ -227,6 +229,10 @@ impl Vfs {
         };
         Some(ResolvedPath {
             key,
+            directory_inode: None,
+            indexed_position: None,
+            #[cfg(all(feature = "hostfs", unix))]
+            host_position: None,
             retained_directory: None,
             proc_binding: binding,
             mount: self.mount_for_path(open.mount.as_ref()),
@@ -239,6 +245,8 @@ impl Vfs {
         self.proc_directory_display(&ProcDirectory {
             node: file.node.clone(),
             mount: file.mount.as_ref().ok_or(Errno(2))?.shared.clone(),
+            #[cfg(all(feature = "hostfs", unix))]
+            host_file: file.host_file.clone(),
         })
         .map(Some)
     }
@@ -355,6 +363,38 @@ impl Vfs {
     pub(super) fn begin_proc_query(&self) {
         self.source_observed.set(None);
     }
+    pub(super) fn path_owner_work(&self, path: &ResolvedPath) -> bool {
+        let Some(query) = &self.query else {
+            return false;
+        };
+        if query.joined_owner || !self.uses_pseudo(path) || !self.pseudo.borrow().enabled {
+            return false;
+        }
+        let key = path.as_ref();
+        if self.terminal_task.get().is_none()
+            && (matches!(key, b"/dev/tty" | b"/dev/ptmx" | b"/dev/pts")
+                || key.starts_with(b"/dev/pts/"))
+        {
+            return true;
+        }
+        if !matches!(key, b"/proc" | b"/sys")
+            && !key.starts_with(b"/proc/")
+            && !key.starts_with(b"/sys/")
+        {
+            return false;
+        }
+        let pseudo = self.pseudo.borrow();
+        if !pseudo.enabled {
+            return false;
+        }
+        match &pseudo.source {
+            None => self.published_global(key).is_none(),
+            Some(source) => {
+                !source.available(ProcRefresh::for_path(key).lookup())
+                    && (!query.original || self.published_global(key).is_none())
+            }
+        }
+    }
     pub(super) fn refresh_proc_source<P: PathArg + ?Sized>(&self, path: &P) -> Result<()> {
         self.refresh_proc_source_with(path, false)
     }
@@ -409,7 +449,10 @@ impl Vfs {
         }
         if !source.available(demand) {
             return match &self.query {
-                Some(query) if !query.original || self.published_global(path.key()).is_none() => {
+                Some(query)
+                    if !query.joined_owner
+                        && (!query.original || self.published_global(path.key()).is_none()) =>
+                {
                     query.defer()
                 }
                 Some(_) => Ok(()), // Original published global accounting, not a guest-mm reader.
@@ -720,7 +763,9 @@ pub struct ProcessView {
     image: std::sync::RwLock<Option<Arc<ProcessImage>>>,
     identity: u64,
     cpu: AtomicU32,
-    time: Time,
+    time: Arc<Time>,
+    perf: std::sync::OnceLock<crate::perf::Clock>,
+    perf_retired: parking_lot::Mutex<bool>,
     state: AtomicU32,
     counters: std::sync::OnceLock<Arc<ProcCounters>>,
 }
@@ -732,12 +777,46 @@ impl Default for ProcessView {
             seccomp: Default::default(),
             cpu: Default::default(),
             time: Default::default(),
+            perf: Default::default(),
+            perf_retired: Default::default(),
             state: Default::default(),
             counters: Default::default(),
         }
     }
 }
 impl ProcessView {
+    /// The counting resource retains neither the process image nor its Files.
+    pub fn perf_clock(&self) -> crate::perf::Clock {
+        let clock = self
+            .perf
+            .get_or_init(|| crate::perf::Clock::new(&self.time))
+            .clone();
+        if *self.perf_retired.lock() {
+            clock.retire();
+        }
+        clock
+    }
+    pub fn retire_perf(&self) {
+        *self.perf_retired.lock() = true;
+        if let Some(clock) = self.perf.get() {
+            clock.retire();
+        }
+    }
+    pub fn sample_perf(&self, context: impl FnOnce(Instant) -> crate::perf::Sample) {
+        if let Some(clock) = self.perf.get() {
+            clock.sample(context);
+        }
+    }
+    pub fn exec_perf(&self) {
+        if let Some(clock) = self.perf.get() {
+            clock.exec();
+        }
+    }
+    pub fn inherit_perf(&self, parent: &Self, threaded: bool) {
+        if let Some(parent) = parent.perf.get() {
+            self.perf_clock().inherit(parent, threaded);
+        }
+    }
     pub fn identity(&self) -> u64 {
         self.identity
     }
@@ -1490,9 +1569,7 @@ mod tests {
                 let FileOutcome::Complete(reply) = result else {
                     panic!("proc metadata read deferred")
                 };
-                let FileValue::Bytes(bytes) = reply.result.unwrap() else {
-                    panic!("proc bytes")
-                };
+                let bytes = reply.result.unwrap().into_bytes().expect("proc bytes");
                 assert!(String::from_utf8(bytes.clone())
                     .unwrap()
                     .contains(&format!("pos:\t{offset}\n")));

@@ -3,7 +3,7 @@ use super::*;
 
 fn finish(paths: &PathQueries, call: NamespaceCall) -> Result<u64> {
     let result = match paths.namespace_attempt(call) {
-        NamespaceAttempt::Complete(result) => result,
+        NamespaceAttempt::Complete(reply) => reply.result,
         NamespaceAttempt::Retained(work) => match work.run() {
             FileOutcome::Complete(reply) => reply.result,
             _ => panic!("uncontended mount operation must complete without its owner"),

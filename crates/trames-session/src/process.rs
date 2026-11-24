@@ -14,6 +14,9 @@ use trames_linux::{OutputFd, TerminalEvent};
 mod host;
 /// The same guest fault classification is used by source and owner delivery.
 pub(super) fn fault_info(fault: &trames_engine::CpuFault) -> Option<trames_kernel::signal::Fault> {
+    if fault.pending_page().is_some() {
+        return None;
+    }
     use trames_engine::CpuFault as F;
     use trames_kernel::signal::Fault;
     Some(match fault {
@@ -112,6 +115,7 @@ enum State {
     Namespace(Arc<crate::run_queue::NamespaceWait>),
     Policy(Arc<crate::run_queue::PolicyWait>),
     Barrier(Arc<crate::barrier::Wait>),
+    Page(Arc<crate::run_queue::PageWait>),
     Futex {
         wait: std::sync::Arc<crate::futex::Wait>,
         deadline: Option<Instant>,
@@ -191,6 +195,7 @@ impl<C: Cpu> Process<C> {
                 | State::Namespace(_)
                 | State::Policy(_)
                 | State::Barrier(_)
+                | State::Page(_)
         ) || matches!(&self.state, State::Completion(release) if !release.finished())
             || self.exec_pending.is_some()
             || self.linux.has_pending_mmap()
@@ -218,6 +223,7 @@ impl<C: Cpu> Process<C> {
                 | State::Namespace(_)
                 | State::Policy(_)
                 | State::Barrier(_)
+                | State::Page(_)
                 | State::Blocked(95 | 260, _)
                 | State::PidfdWait(_)
         ) || self.worker_io_candidate(id)
@@ -350,7 +356,7 @@ impl<C: Cpu> Process<C> {
         }
         if matches!(
             self.state,
-            State::Namespace(_) | State::Policy(_) | State::Barrier(_)
+            State::Namespace(_) | State::Policy(_) | State::Barrier(_) | State::Page(_)
         ) {
             return true;
         }
@@ -1702,6 +1708,15 @@ impl<C: Cpu> Kernel<C> {
     }
     #[cfg(all(test, trames_interpreter_conformance))]
     fn synchronous_fault(&mut self, pid: u32, p: &mut Process<C>, fault: &trames_engine::CpuFault) {
+        if let Some(pending) = fault.pending_page() {
+            let wait = crate::run_queue::PageWait::new(pending.wait.clone());
+            wait.bind(&trames_shared::IoSignal::new(
+                pid,
+                Arc::downgrade(&self.byte_target),
+            ));
+            p.state = State::Page(wait);
+            return;
+        }
         p.linux.vfs.log(
             4,
             &format!(
@@ -1758,7 +1773,7 @@ impl<C: Cpu> Kernel<C> {
         if action.handler > 1
             && matches!(
                 p.state,
-                State::Namespace(_) | State::Policy(_) | State::Barrier(_)
+                State::Namespace(_) | State::Policy(_) | State::Barrier(_) | State::Page(_)
             )
         {
             return Ok(false);
@@ -2000,6 +2015,19 @@ impl<C: Cpu> Kernel<C> {
     ) -> Result<Option<u64>, Errno>;
         pub(super) fn has_session_syscall;
         {
+            241 => {
+                self.publish_io_tasks(Some((pid, p)));
+                trames_kernel::signal::IoRoutes {
+                    directory: p.signals.io_directory.clone(),
+                    namespace: p.linux.vfs.pid_namespace().clone(),
+                    uid: p.linux.vfs.credentials.uid,
+                    euid: p.linux.vfs.credentials.euid,
+                }.perf_event_open(
+                    &p.signals.io, &p.linux.vfs.fd_flags_snapshot(),
+                    &p.linux.vfs.descriptor_factory(), a, self.cpu_count,
+                    &mut p.memory).map(Some)
+            },
+            293 => p.signals.io.rseq.call(&mut p.memory, a).map(Some),
             @dynamic number if trames_linux::credential_entry(number, a) => self.credential_call(pid, p, number, a).map(Some),
             444..=446 => {
                 let result = p.linux.vfs.landlock_call(number, a, &p.memory)?;
@@ -2246,7 +2274,7 @@ impl<C: Cpu> Kernel<C> {
                 }
                 Ok(None)
             },
-            98 | 102 | 103 | 107..=111 | 137 => self.event_call(pid, p, number, a),
+            98 | 102 | 103 | 107..=111 | 137 | 449 | 454..=456 => self.event_call(pid, p, number, a),
             260 => self.wait(pid, p, a),
             95 => self.waitid(pid, p, a),
             167 if prctl::entry(a) => prctl::call(
@@ -3518,11 +3546,13 @@ impl<C: Cpu> Kernel<C> {
         }
     }
     fn parallel_candidate(&self, host_events: bool) -> bool {
-        if self
-            .processes
-            .iter()
-            .any(|(id, p)| !p.frozen(id) && matches!(p.state, State::Policy(_) | State::Barrier(_)))
-        {
+        if self.processes.iter().any(|(id, p)| {
+            !p.frozen(id)
+                && matches!(
+                    p.state,
+                    State::Policy(_) | State::Barrier(_) | State::Page(_)
+                )
+        }) {
             return true;
         }
         if self
@@ -3824,6 +3854,7 @@ impl<C: Cpu> Kernel<C> {
                             | State::Namespace(_)
                             | State::Policy(_)
                             | State::Barrier(_)
+                            | State::Page(_)
                     ))
                     || p.worker_io_candidate(id))
                 .then_some((id, 0))
@@ -3918,6 +3949,7 @@ impl<C: Cpu> Kernel<C> {
                         | State::Namespace(_)
                         | State::Policy(_)
                         | State::Barrier(_)
+                        | State::Page(_)
                 )
             })
             .collect();
@@ -4714,7 +4746,9 @@ pub(super) fn run<C: Cpu>(
     let mut linux = std::mem::replace(&mut runtime.linux, Linux::new(0));
     linux.vfs.reset_terminal_task();
     let limits = trames_kernel::limits::Limits::new(&linux.vfs);
-    let task_capacity = Arc::new(trames_kernel::task::Capacity::new(linux.task_limit.max(1)));
+    let task_limit = linux.vfs.task_limit_control();
+    task_limit.bind_initial(linux.task_limit.max(1));
+    let task_capacity = Arc::new(trames_kernel::task::Capacity::with_limit(task_limit));
     let root_presence = Arc::new(
         task_capacity
             .reserve()

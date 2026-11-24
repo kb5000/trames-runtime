@@ -54,9 +54,13 @@ impl Groups {
 pub(super) struct State {
     pub shared: Link,
     pub master: Link,
+    pub unbindable: bool,
     lineage: Vec<Arc<Group>>,
 }
 impl State {
+    pub(super) fn has_relations(&self) -> bool {
+        self.shared.is_some() || self.master.is_some()
+    }
     pub(super) fn inherited_slave(mut self) -> Self {
         if let Some(shared) = self.shared.take() {
             if let Some(master) = self.master.replace(shared) {
@@ -150,19 +154,84 @@ fn child_at(ns: &MountNamespace, parent: &Mount, node: &NodeRef) -> Option<Arc<M
 }
 
 impl Vfs {
-    pub(super) fn change_propagation(&self, target: &ResolvedPath, flags: u64) -> Result<()> {
-        const REC: u64 = 16384;
+    pub(super) fn plan_propagation(
+        &self,
+        selected: &[Arc<Mount>],
+        operation: u64,
+    ) -> Result<Vec<(Arc<Mount>, State)>> {
         const PRIVATE: u64 = 1 << 18;
         const SLAVE: u64 = 1 << 19;
         const SHARED: u64 = 1 << 20;
-        let operation = flags & !REC;
-        if !matches!(operation, PRIVATE | SLAVE | SHARED) || !self.is_mount_root(target) {
+        const UNBINDABLE: u64 = 1 << 17;
+        if !matches!(operation, PRIVATE | SLAVE | SHARED | UNBINDABLE) {
             return Err(Errno(22));
         }
         let namespace = self.mounts.as_ref().ok_or(Errno(22))?;
         let namespaces = namespace.0.borrow().admin.namespaces();
         let mounts = members(&namespaces);
-        normalize(&mounts);
+        let alive = mounts
+            .iter()
+            .filter_map(|m| Some(m.propagation().shared?.id))
+            .collect();
+        let mut updates = Vec::with_capacity(selected.len());
+        for mount in selected {
+            let mut state = mount.propagation().resolved(&alive);
+            match operation {
+                PRIVATE => state = State::default(),
+                UNBINDABLE => {
+                    state = State {
+                        unbindable: true,
+                        ..State::default()
+                    }
+                }
+                SHARED => {
+                    state.unbindable = false;
+                    if state.shared.is_none() {
+                        state.shared = Some(self.pseudo.borrow().mount_policy.groups.allocate()?);
+                    }
+                }
+                SLAVE => {
+                    if state.shared.is_some()
+                        && mounts
+                            .iter()
+                            .any(|m| m.id != mount.id && m.propagation().shared == state.shared)
+                    {
+                        if let Some(master) = state.master.take() {
+                            state.lineage.insert(0, master);
+                        }
+                        state.master = state.shared.take();
+                    }
+                    state.shared = None;
+                }
+                _ => unreachable!(),
+            }
+            updates.push((mount.clone(), state));
+        }
+        Ok(updates)
+    }
+    pub(super) fn normalize_propagation(&self) {
+        let Some(namespace) = self.mounts.as_ref() else {
+            return;
+        };
+        let namespaces = namespace.0.borrow().admin.namespaces();
+        normalize(&members(&namespaces));
+        for ns in namespaces {
+            ns.0.borrow().events.changed();
+        }
+    }
+    pub(super) fn change_propagation(&self, target: &ResolvedPath, flags: u64) -> Result<()> {
+        const REC: u64 = 16384;
+        const PRIVATE: u64 = 1 << 18;
+        const SLAVE: u64 = 1 << 19;
+        const SHARED: u64 = 1 << 20;
+        const UNBINDABLE: u64 = 1 << 17;
+        let operation = flags & !REC;
+        if !matches!(operation, PRIVATE | SLAVE | SHARED | UNBINDABLE)
+            || !self.is_mount_root(target)
+        {
+            return Err(Errno(22));
+        }
+        let namespace = self.mounts.as_ref().ok_or(Errno(22))?;
         let selected = target.mount.as_ref().ok_or(Errno(22))?;
         let mut ids = BTreeSet::from([selected.id]);
         if flags & REC != 0 {
@@ -183,36 +252,18 @@ impl Vfs {
                 }
             }
         }
-        for mount in mounts.iter().filter(|m| ids.contains(&m.id)) {
-            let mut state = mount.propagation();
-            match operation {
-                PRIVATE => state = State::default(),
-                SHARED => {
-                    if state.shared.is_none() {
-                        state.shared = Some(self.pseudo.borrow().mount_policy.groups.allocate()?);
-                    }
-                }
-                SLAVE => {
-                    if state.shared.is_some()
-                        && mounts
-                            .iter()
-                            .any(|m| m.id != mount.id && m.propagation().shared == state.shared)
-                    {
-                        if let Some(master) = state.master.take() {
-                            state.lineage.insert(0, master);
-                        }
-                        state.master = state.shared.take();
-                    }
-                    state.shared = None;
-                }
-                _ => unreachable!(),
-            }
+        let selected: Vec<_> = namespace
+            .0
+            .borrow()
+            .mounts
+            .iter()
+            .filter(|m| ids.contains(&m.id))
+            .cloned()
+            .collect();
+        for (mount, state) in self.plan_propagation(&selected, operation)? {
             mount.set_propagation(state);
         }
-        normalize(&mounts);
-        for ns in namespaces {
-            ns.0.borrow().events.changed();
-        }
+        self.normalize_propagation();
         Ok(())
     }
 
@@ -277,6 +328,9 @@ impl Vfs {
         let root = added.first().ok_or(Errno(22))?;
         let parents = self.propagation_parents(&attachment.parent)?;
         let parent_group = attachment.parent.propagation().shared.map_or(0, |g| g.id);
+        if parent_group != 0 && added.iter().any(|m| m.propagation().unbindable) {
+            return Err(Errno(22));
+        }
         let mut state = root.propagation();
         if parent_group != 0 && state.shared.is_none() {
             state.shared = Some(self.pseudo.borrow().mount_policy.groups.allocate()?);
@@ -375,6 +429,7 @@ impl Vfs {
                     shared: child_groups.get(&peer).cloned().flatten(),
                     master: Some(chain[0].clone()),
                     lineage: chain[1..].to_vec(),
+                    unbindable: false,
                 }
             });
             for mount in added.iter().skip(1) {

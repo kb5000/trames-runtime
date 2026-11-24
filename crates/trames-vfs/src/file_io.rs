@@ -31,7 +31,6 @@ pub struct DirectFile {
     locks: Arc<locks::Records>,
     prepared: PreparedFile,
     file: Option<SharedFd>,
-    local_inode: Option<NodeRef>,
     clear_setid: bool,
     unlimited: bool,
 }
@@ -40,12 +39,12 @@ pub struct DirectFile {
 #[derive(Clone)]
 pub struct PreparedFile(Arc<FileAuthority>, FileSizeLimit);
 struct FileAuthority {
+    original: std::sync::Weak<SharedOpenDescription>,
     data: std::sync::Weak<PlainFile>,
     position: std::sync::Weak<FilePosition>,
     locks: std::sync::Weak<locks::Records>,
     origin: OfdIdentity,
     flock: std::sync::Weak<flock::Owner>,
-    inode: std::sync::Weak<Inode>,
     device: u64,
     flags: u32,
     status: StatusFlags,
@@ -57,23 +56,22 @@ struct FileAuthority {
 }
 impl PreparedFile {
     fn accept(&self, file: Option<SharedFd>) -> Option<DirectFile> {
-        let local_inode = if file.is_none() {
-            Some(self.0.inode.upgrade()?)
-        } else {
-            None
-        };
-        let mut accepted = self.promote(local_inode)?;
-        accepted.file = file;
+        let mut accepted = self.promote()?;
+        if let Some(file) = file {
+            accepted.file = Some(file);
+        }
         Some(accepted)
     }
-    fn promote(&self, local_inode: Option<NodeRef>) -> Option<DirectFile> {
+    fn promote(&self) -> Option<DirectFile> {
+        // A prepared cache is weak. Actual admission retains the original OFD,
+        // including close/OFD-lock lifetime, even for a joined owner projection.
+        let file = SharedFd::new(self.0.original.upgrade()?);
         Some(DirectFile {
             data: self.0.data.upgrade()?,
             position: self.0.position.upgrade()?,
             locks: self.0.locks.upgrade()?,
             prepared: self.clone(),
-            local_inode,
-            file: None,
+            file: Some(file),
             clear_setid: self.0.clear_setid,
             unlimited: self.0.unlimited,
         })
@@ -190,7 +188,7 @@ impl DirectFiles {
             }
             (&published.prepared, Some(publication))
         };
-        let Some(mut accepted) = prepared.promote(None) else {
+        let Some(mut accepted) = prepared.promote() else {
             return Err(file);
         };
         accepted.file = Some(file);
@@ -352,12 +350,12 @@ impl FileEpoch {
         let write_error = Vfs::pseudo_immutable_node(&n).err();
         let prepared = PreparedFile(
             Arc::new(FileAuthority {
+                original: Arc::downgrade(&o.shared),
                 data: Arc::downgrade(&data),
                 position: Arc::downgrade(&o.file_position),
                 locks: Arc::downgrade(&vfs.inode_record_locks(&n)),
                 origin: OfdIdentity::new(&o.shared),
                 flock,
-                inode: Arc::downgrade(&node),
                 device,
                 flags: o.flags.get(),
                 status: o.flags.clone(),
@@ -376,6 +374,13 @@ impl FileEpoch {
     pub fn finish(self) {}
 }
 impl DirectFile {
+    pub fn output_resources(&self, result: &Result<FileValue>) -> FileResources {
+        let mut resources = FileResources::default();
+        if FileResources::needed(result) {
+            resources.retain_file(self.file.clone());
+        }
+        resources
+    }
     fn try_position(&self) -> Option<file_data::PositionGuard<'_>> {
         match self.position.try_lock() {
             Ok(position) => Some(position),
@@ -509,6 +514,30 @@ impl DirectFile {
         }
         Some(result)
     }
+    /// Guest copyout keeps the original position protected until its actual
+    /// copied prefix is known. Owned-byte callers retain read()'s eager commit.
+    pub fn read_reply(
+        &self,
+        count: usize,
+        offset: Option<u64>,
+        cache: &mut DiskReadCache,
+    ) -> Option<Result<FileValue>> {
+        if offset.is_some() || count == 0 || !fd_can_read(self.prepared.0.flags) {
+            return self
+                .read(count, offset, cache)
+                .map(|result| result.map(FileValue::Bytes));
+        }
+        let position = {
+            let mut state = self.try_position()?;
+            match crate::read_reply::FileRead::begin_locked(self.file.as_ref()?, &mut state) {
+                Ok(position) => position,
+                Err(Errno(11)) => return None,
+                Err(error) => return Some(Err(error)),
+            }
+        };
+        self.read(count, Some(position.offset), cache)
+            .map(|result| result.map(|bytes| FileValue::Read(ReadReply::new(bytes, position))))
+    }
     pub fn write(
         &self,
         bytes: &[u8],
@@ -601,7 +630,6 @@ impl DirectFile {
             .file
             .as_ref()
             .and_then(|fd| fd.open.node.as_ref())
-            .or(self.local_inode.as_ref())
             .expect("accepted ordinary file owns its inode");
         let mut out = Vfs::stat_node_fields(&inode.borrow(), self.prepared.0.device);
         out[64..72].copy_from_slice(&self.data.blocks()?.to_le_bytes());
@@ -613,6 +641,40 @@ impl DirectFile {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    fn owned_read_bytes(mut outcome: FileOutcome) -> Vec<u8> {
+        struct Wake(std::thread::Thread);
+        impl IoWake for Wake {
+            fn wake_io(&self, _: &Arc<IoSignal>) {
+                self.0.unpark();
+            }
+        }
+        let target: Arc<dyn IoWake> = Arc::new(Wake(std::thread::current()));
+        let signal = IoSignal::new(0, Arc::downgrade(&target));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match outcome {
+                FileOutcome::Complete(reply) => {
+                    return reply
+                        .result
+                        .unwrap()
+                        .into_bytes()
+                        .expect("owned read bytes")
+                }
+                FileOutcome::Waiting(work) => {
+                    signal.reset();
+                    let _subscriptions = work.wait_sources(&signal).unwrap();
+                    if !work.ready() {
+                        let remaining =
+                            deadline.saturating_duration_since(std::time::Instant::now());
+                        assert!(!remaining.is_zero(), "original OFD wait timed out");
+                        std::thread::park_timeout(remaining);
+                    }
+                    outcome = work.run();
+                }
+                _ => panic!("owned memory read must not require a layout or owner"),
+            }
+        }
+    }
     fn memory_file(bytes: Vec<u8>) -> (Vfs, u32) {
         let mut vfs = Vfs::default();
         vfs.import_file(b"/data", bytes).unwrap();
@@ -910,20 +972,14 @@ mod tests {
                     loop {
                         let bytes = match file.read(8, None, &mut cache) {
                             Some(result) => result.unwrap(),
-                            None => match FileWork::run_inline(
+                            None => owned_read_bytes(FileWork::run_inline(
                                 &paths,
                                 file.target().unwrap(),
                                 FileCommand::Read {
                                     count: 8,
                                     offset: None,
                                 },
-                            ) {
-                                FileOutcome::Complete(FileReply {
-                                    result: Ok(FileValue::Bytes(bytes)),
-                                    ..
-                                }) => bytes,
-                                _ => panic!("original OFD read transaction"),
-                            },
+                            )),
                         };
                         if bytes.is_empty() {
                             break;

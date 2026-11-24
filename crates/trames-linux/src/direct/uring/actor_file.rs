@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Original file operations, owned once from issue through source-side copyout.
 use super::*;
+use crate::direct::{file::FileCopyout, FileOutput};
 use trames_vfs::{FileCommand, FileOutcome, FileTarget, FileValue, FileWork};
 
 pub(super) struct FileIo {
@@ -10,6 +11,7 @@ pub(super) struct FileIo {
     parts: Vec<(u64, usize)>,
     buffer: Option<Arc<trames_memory::PinnedBuffer>>,
     address: u64,
+    copyout: Option<FileCopyout>,
 }
 enum FileDependency {
     Resource(FileWork),
@@ -38,6 +40,9 @@ impl Drop for SelectionLease {
 }
 impl FileIo {
     pub(super) fn subscribe(&self, signal: &Arc<IoSignal>) -> Vec<trames_vfs::IoSubscription> {
+        if let Some(copy) = &self.copyout {
+            return copy.subscribe(signal).into_iter().collect();
+        }
         match self.dependency.as_deref() {
             Some(FileDependency::Resource(work)) => {
                 work.wait_sources(signal)
@@ -53,7 +58,66 @@ impl FileIo {
         }
     }
     pub(super) fn pending_native(&self) -> bool {
-        self.dependency.is_none() && !self.result.ready()
+        self.copyout.is_some() || self.dependency.is_none() && !self.result.ready()
+    }
+    fn finish_copyout(
+        &mut self,
+        request: &Request,
+        memory: &mut impl CpuMemory,
+    ) -> Result<(i32, bool)> {
+        match self.copyout.as_mut().unwrap().progress(memory) {
+            Ok(value) => {
+                let n = value?;
+                self.copyout = None;
+                Ok((
+                    n as i32,
+                    !matches!(request.sqe.opcode(), 1 | 2 | 4 | 5 | 22 | 23)
+                        || n == request.requested,
+                ))
+            }
+            Err(_) => {
+                self.wait_revision = self.wait_revision.wrapping_add(1);
+                Err(Errno(11))
+            }
+        }
+    }
+    fn finish_read(
+        &mut self,
+        value: FileValue,
+        resources: trames_vfs::FileResources,
+        request: &Request,
+        memory: &mut impl CpuMemory,
+    ) -> Result<(i32, bool)> {
+        if let Some(buffer) = &self.buffer {
+            let (bytes, mut position) = match value {
+                FileValue::Bytes(bytes) => (bytes, None),
+                FileValue::Read(reply) => {
+                    let (bytes, position) = reply.into_parts();
+                    (bytes, Some(position))
+                }
+                _ => unreachable!("accepted read bytes"),
+            };
+            buffer
+                .range(self.address, bytes.len())
+                .and_then(|offset| buffer.write(offset, &bytes))
+                .map_err(|_| Errno(14))?;
+            if let Some(position) = &mut position {
+                position.record(bytes.len());
+            }
+            let n = bytes.len() as u64;
+            return Ok((
+                n as i32,
+                !matches!(request.sqe.opcode(), 1 | 2 | 4 | 5 | 22 | 23) || n == request.requested,
+            ));
+        }
+        self.copyout = Some(
+            FileCopyout::new(
+                &FileOutput::Vectors(std::mem::take(&mut self.parts)),
+                Ok(value),
+            )
+            .retain(resources),
+        );
+        self.finish_copyout(request, memory)
     }
     fn take_outcome(&mut self, execution: &Execution) -> Option<FileOutcome> {
         match self.dependency.as_deref_mut() {
@@ -135,18 +199,13 @@ impl FileIo {
                 }
                 let n = match reply.result? {
                     FileValue::Count(n) => n,
-                    FileValue::Bytes(bytes) => {
-                        if let Some(buffer) = &self.buffer {
-                            buffer
-                                .range(self.address, bytes.len())
-                                .and_then(|offset| buffer.write(offset, &bytes))
-                                .map_err(|_| Errno(14))?;
-                        } else {
-                            Linux::scatter(memory, &self.parts, &bytes)?;
-                        }
-                        bytes.len() as u64
+                    value @ (FileValue::Bytes(_) | FileValue::Read(_)) => {
+                        return self.finish_read(value, reply.resources, request, memory)
                     }
-                    FileValue::FuseStat(..) | FileValue::Stat(_) | FileValue::Transfer { .. } => {
+                    FileValue::FuseStat(..)
+                    | FileValue::Stat(_)
+                    | FileValue::Transfer { .. }
+                    | FileValue::Directory(_) => {
                         unreachable!("uring file operation")
                     }
                 };
@@ -230,6 +289,9 @@ pub(super) fn execute(
     ring: &Uring,
 ) -> Option<Result<(i32, bool)>> {
     if let Some(io) = &mut call.file {
+        if io.copyout.is_some() {
+            return Some(io.finish_copyout(request, memory));
+        }
         return Some(match io.take_outcome(execution) {
             Some(outcome) => io.finish(outcome, request, memory, actor, execution),
             None => Err(Errno(11)),
@@ -247,10 +309,12 @@ pub(super) fn execute(
         parts,
         buffer: request.buffer.clone(),
         address: request.sqe.address(),
+        copyout: None,
     };
     if let Some(result) = file.proc_io_local(&command, memory) {
-        return Some(io.finish(
+        let result = io.finish(
             FileOutcome::Complete(trames_vfs::FileReply {
+                resources: trames_vfs::FileResources::file(&file),
                 result,
                 file_size_signal: false,
                 scratch: None,
@@ -259,7 +323,11 @@ pub(super) fn execute(
             memory,
             actor,
             execution,
-        ));
+        );
+        if io.copyout.is_some() {
+            call.file = Some(io);
+        }
+        return Some(result);
     }
     let native = file.host_work(&command);
     if request.nowait() && native {
@@ -324,7 +392,11 @@ pub(super) fn execute(
         call.file = Some(io);
         Some(result)
     } else {
-        Some(io.finish(outcome.unwrap(), request, memory, actor, execution))
+        let result = io.finish(outcome.unwrap(), request, memory, actor, execution);
+        if io.copyout.is_some() {
+            call.file = Some(io);
+        }
+        Some(result)
     }
 }
 
@@ -384,6 +456,7 @@ pub(super) fn open(
         parts: Vec::new(),
         buffer: None,
         address: 0,
+        copyout: None,
     };
     if let Some(executor) = execution.disk.as_ref().filter(|_| work.host_work()) {
         executor.submit_file(work, io.result.clone());

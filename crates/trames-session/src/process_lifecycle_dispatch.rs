@@ -447,9 +447,25 @@ impl<C: Cpu> Lifecycle<C> {
         args: [u64; 6],
     ) -> IoAttempt {
         match file.take() {
-            FileBoundary::Owner { work, output } => IoAttempt::Complete(
-                output.apply(work.run_owner(&mut p.linux.vfs).result, &mut p.memory),
-            ),
+            FileBoundary::Owner { work, output } => {
+                let target = work.target().cloned();
+                let result = Arc::new(trames_linux::FileResult::wake_joined());
+                result.complete(work.resume_owner(&mut p.linux.vfs));
+                let pending = trames_linux::FilePending::new(result, output, target);
+                job.work
+                    .syscalls
+                    .as_ref()
+                    .unwrap()
+                    .direct
+                    .start_retained_file(
+                        pending,
+                        number,
+                        args,
+                        &mut p.memory,
+                        job.work.pid,
+                        &epoch.io_target,
+                    )
+            }
             FileBoundary::Signal { value } => {
                 trames_vfs::TaskSignal::raise(&*p.signals.io, 25);
                 IoAttempt::Complete(value)

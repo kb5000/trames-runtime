@@ -4,7 +4,7 @@ use super::*;
 use trames_vfs::NamespaceCall as Call;
 
 pub(crate) fn supported(number: u32) -> bool {
-    matches!(number, 5..=17 | 33..=41 | 43 | 44 | 49..=55 | 88 | 180 | 181 | 276 | 279 | 428..=432 | 442 | 452 | 457 | 458)
+    matches!(number, 5..=17 | 33..=41 | 43 | 44 | 49..=55 | 88 | 180 | 181 | 276 | 279 | 428..=433 | 442 | 452 | 457 | 458)
 }
 
 fn mount_query(
@@ -85,7 +85,7 @@ pub(super) fn import(
     let output = FileOutput::None;
     let call = match number {
         457 | 458 => return mount_query(number == 458, a, memory),
-        428..=432 => {
+        428..=433 => {
             use trames_vfs::MountFdCall as M;
             let opt = |address| {
                 if address == 0 {
@@ -110,6 +110,11 @@ pub(super) fn import(
                 430 => M::Open {
                     kind: Linux::path(memory, a[0])?,
                     flags: a[1] as u32,
+                },
+                433 => M::Pick {
+                    fd: a[0] as i32,
+                    path: Linux::path(memory, a[1])?,
+                    flags: a[2] as u32,
                 },
                 431 => {
                     let cmd = a[1] as u32;
@@ -411,6 +416,9 @@ pub(super) fn import(
                     }
                 })?
             };
+            if !list && name.is_empty() {
+                return Err(Errno(34));
+            }
             if number <= 7 {
                 if a[3] > 65536 {
                     return Err(Errno(7));
@@ -434,6 +442,7 @@ pub(super) fn import(
                         path,
                         follow,
                         name: (!list).then_some(name),
+                        capacity,
                     },
                     FileOutput::Buffer {
                         address,
@@ -473,10 +482,8 @@ impl DirectSyscalls {
             Err(error) => return Some(Err(error)),
         };
         match paths.namespace_attempt(call) {
-            trames_vfs::NamespaceAttempt::Complete(result) => {
-                self.completed.set(self.completed.get() + 1);
-                self.file_completed.set(self.file_completed.get() + 1);
-                Some(output.apply(result, memory))
+            trames_vfs::NamespaceAttempt::Complete(reply) => {
+                self.finish_file_reply(number, args, reply, output, memory)
             }
             trames_vfs::NamespaceAttempt::Retained(work) => {
                 self.prepare_filesystem_work(number, args, work, output, memory)

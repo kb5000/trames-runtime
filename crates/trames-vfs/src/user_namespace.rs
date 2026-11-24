@@ -13,10 +13,16 @@ enum Namespace {
     Initial(Arc<OverflowIds>),
     Child(Arc<UserSpace>),
 }
-pub(super) struct OverflowIds([std::sync::atomic::AtomicU32; 2]);
+pub(super) struct OverflowIds(
+    [std::sync::atomic::AtomicU32; 2],
+    pub(super) Arc<perf::Accounts>,
+);
 impl Default for OverflowIds {
     fn default() -> Self {
-        Self([65534, 65534].map(std::sync::atomic::AtomicU32::new))
+        Self(
+            [65534, 65534].map(std::sync::atomic::AtomicU32::new),
+            Arc::default(),
+        )
     }
 }
 impl OverflowIds {

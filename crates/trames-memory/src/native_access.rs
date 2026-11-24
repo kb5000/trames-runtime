@@ -314,6 +314,7 @@ impl Memory {
             .as_ref()
             .is_some_and(|backing| backing.object.charge_reads())
         {
+            page.prepare_source(address)?;
             page.charge.ensure()?;
         }
         let mut operation = Some(operation);

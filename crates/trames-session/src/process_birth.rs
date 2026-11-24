@@ -466,10 +466,16 @@ impl Birth {
                 child.signals.alt_stack = AltStack::default();
             }
         } else {
+            child.signals.io.rseq.inherit(&p.signals.io.rseq);
             child.vm_id = resource;
             child.linux.vfs.unshare_dumpable();
         }
         child.tgid = if threaded { p.tgid } else { id };
+        child
+            .signals
+            .io
+            .proc_view
+            .inherit_perf(&p.signals.io.proc_view, threaded);
         if threaded {
             child.children = p.children.clone();
             child.wait_event = p.wait_event.clone();

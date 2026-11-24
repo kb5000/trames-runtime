@@ -76,6 +76,8 @@ impl Umask {
 pub(super) struct Paths {
     #[cfg(all(feature = "hostfs", unix))]
     pub host_cwd: Option<Arc<hostfs::OpenFile>>,
+    #[cfg(all(feature = "hostfs", unix))]
+    pub host_root: Option<Arc<hostfs::OpenFile>>,
     pub cwd_node: Option<NodeRef>,
     pub root_node: Option<NodeRef>,
     pub cwd_mount: Option<Arc<Mount>>,
@@ -91,6 +93,8 @@ struct SharedPaths {
     retired: bool,
     #[cfg(all(feature = "hostfs", unix))]
     host_cwd: Option<Arc<hostfs::OpenFile>>,
+    #[cfg(all(feature = "hostfs", unix))]
+    host_root: Option<Arc<hostfs::OpenFile>>,
     cwd_node: Option<NodeRef>,
     root_node: Option<NodeRef>,
     cwd_mount: Option<Arc<mounts::MountData>>,
@@ -123,12 +127,23 @@ impl SharedPaths {
             Some(ProcDirectory {
                 node: node.as_ref().unwrap_or(&mount.root).clone(),
                 mount: mount.clone(),
+                #[cfg(all(feature = "hostfs", unix))]
+                host_file: None,
             })
         };
-        (
-            directory(&self.cwd_mount, &self.cwd_node),
-            directory(&self.root_mount, &self.root_node),
-        )
+        let cwd = directory(&self.cwd_mount, &self.cwd_node);
+        #[cfg(all(feature = "hostfs", unix))]
+        let cwd = cwd.map(|mut directory| {
+            directory.host_file = self.host_cwd.clone();
+            directory
+        });
+        let root = directory(&self.root_mount, &self.root_node);
+        #[cfg(all(feature = "hostfs", unix))]
+        let root = root.map(|mut directory| {
+            directory.host_file = self.host_root.clone();
+            directory
+        });
+        (cwd, root)
     }
     fn from_paths(paths: &Paths, retired: bool) -> Self {
         let cwd_mount = paths.cwd_mount.as_ref().map(|m| m.shared.clone());
@@ -137,6 +152,8 @@ impl SharedPaths {
             retired,
             #[cfg(all(feature = "hostfs", unix))]
             host_cwd: paths.host_cwd.clone(),
+            #[cfg(all(feature = "hostfs", unix))]
+            host_root: paths.host_root.clone(),
             cwd_node: paths.cwd_node.clone(),
             root_node: paths.root_node.clone(),
             _cwd_pin: cwd_mount
@@ -162,8 +179,10 @@ impl SharedPaths {
 }
 pub(super) struct PathStore {
     shared: Arc<SharedCell<SharedPaths>>,
-    // Cache only the current cwd/root mount handles, never the complete table.
-    projections: RefCell<Vec<Arc<Mount>>>,
+    // Cache only cwd/root projections. Real namespace, OFD and fs_struct
+    // directory users retain topology; a stale observer must not keep an
+    // unmounted filesystem (and its daemon connection) alive.
+    projections: RefCell<Vec<std::sync::Weak<Mount>>>,
     pub(super) registry: mounts::Registry,
     contexts: Arc<std::sync::Mutex<Contexts>>,
     users: Arc<AtomicUsize>,
@@ -212,8 +231,8 @@ impl PathStore {
                 None => Some(None),
                 Some(mount) => cached
                     .iter()
+                    .filter_map(std::sync::Weak::upgrade)
                     .find(|m| Arc::ptr_eq(&m.shared, mount))
-                    .cloned()
                     .map(Some),
             };
             if let (Some(cwd_mount), Some(root_mount)) =
@@ -222,6 +241,8 @@ impl PathStore {
                 return Paths {
                     #[cfg(all(feature = "hostfs", unix))]
                     host_cwd: state.host_cwd.clone(),
+                    #[cfg(all(feature = "hostfs", unix))]
+                    host_root: state.host_root.clone(),
                     cwd_node: state.cwd_node.clone(),
                     root_node: state.root_node.clone(),
                     cwd_mount,
@@ -240,16 +261,23 @@ impl PathStore {
         {
             cache.insert(Arc::as_ptr(&mount.shared) as usize, mount);
         }
-        for mount in self.projections.borrow().iter() {
+        for mount in self
+            .projections
+            .borrow()
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+        {
             cache
                 .entry(Arc::as_ptr(&mount.shared) as usize)
-                .or_insert_with(|| mount.clone());
+                .or_insert(mount);
         }
         let mut project =
             |mount: &Arc<mounts::MountData>| Mount::query_projection(mount.clone(), &mut cache);
         let paths = Paths {
             #[cfg(all(feature = "hostfs", unix))]
             host_cwd: state.host_cwd.clone(),
+            #[cfg(all(feature = "hostfs", unix))]
+            host_root: state.host_root.clone(),
             cwd_node: state.cwd_node.clone(),
             root_node: state.root_node.clone(),
             cwd_mount: state.cwd_mount.as_ref().map(&mut project),
@@ -263,7 +291,7 @@ impl PathStore {
             .cwd_mount
             .iter()
             .chain(paths.root_mount.iter())
-            .cloned()
+            .map(Arc::downgrade)
             .collect();
     }
     pub fn borrow(&self) -> Paths {
@@ -332,6 +360,10 @@ impl PathStore {
             if matches(&paths.root_mount, &paths.root_node) {
                 paths.root_mount = Some(new.clone());
                 paths.root_node = Some(new.root.clone());
+                #[cfg(all(feature = "hostfs", unix))]
+                {
+                    paths.host_root = None;
+                }
                 paths._root_pin = Some(mounts::DirectoryPin::new(new.clone()));
                 paths._root_use = Some(mounts::MountUse::new(new.identity.clone()));
             }
@@ -374,6 +406,28 @@ pub(super) struct ContextPublication {
     owner: Option<FsOwner>,
 }
 impl ContextPublication {
+    pub(super) fn set_root(&self, node: NodeRef, mount: Arc<mounts::MountData>) {
+        let mut paths = self.shared.borrow_mut();
+        paths._root_pin = (!paths.retired).then(|| mounts::DirectoryPin::new(mount.clone()));
+        paths._root_use = (!paths.retired).then(|| mounts::MountUse::new(mount.identity.clone()));
+        paths.root_mount = Some(mount);
+        paths.root_node = Some(node);
+        #[cfg(all(feature = "hostfs", unix))]
+        {
+            paths.host_root = None;
+        }
+    }
+    pub(super) fn set_cwd(&self, node: NodeRef, mount: Arc<mounts::MountData>) {
+        let mut paths = self.shared.borrow_mut();
+        paths._cwd_pin = (!paths.retired).then(|| mounts::DirectoryPin::new(mount.clone()));
+        paths._cwd_use = (!paths.retired).then(|| mounts::MountUse::new(mount.identity.clone()));
+        paths.cwd_mount = Some(mount);
+        paths.cwd_node = Some(node);
+        #[cfg(all(feature = "hostfs", unix))]
+        {
+            paths.host_cwd = None;
+        }
+    }
     pub(super) fn observe(&self, registry: mounts::Registry) -> FsContext {
         FsContext {
             paths: PathStore {

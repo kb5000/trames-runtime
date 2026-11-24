@@ -7,6 +7,7 @@ pub(super) struct BackingIndex {
     /// Cold msync selection over original MAP_SHARED writeback resources.
     /// No extra field or lookup is added to CPU frames or byte translation.
     pub(super) syncs: BTreeMap<u64, Arc<dyn PageBacking>>,
+    leases: BTreeMap<u64, Arc<dyn PageBacking>>,
     layouts: BTreeMap<u64, (Arc<layout::Layout>, usize)>,
     layout_pages: BTreeMap<u64, u64>,
     domains: BTreeMap<u64, BackingDomain>,
@@ -41,6 +42,11 @@ impl BackingIndex {
         futex: Option<(u64, u64)>,
     ) {
         let object = backing.object.as_ref();
+        if object.retain_in_view() {
+            self.leases.insert(base, backing.object.clone());
+        } else {
+            self.leases.remove(&base);
+        }
         if backing.shared && object.sync_required() {
             self.syncs.insert(base, backing.object.clone());
         }
@@ -80,6 +86,7 @@ impl BackingIndex {
         }
     }
     fn remove(&mut self, base: u64, domain: Option<(u64, u64)>, physical: u64) {
+        self.leases.remove(&base);
         if let Some(identity) = self.layout_pages.remove(&base) {
             let entry = self.layouts.get_mut(&identity).expect("indexed layout");
             entry.1 -= 1;

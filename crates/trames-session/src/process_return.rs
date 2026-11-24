@@ -97,6 +97,7 @@ pub(super) fn publish<C: Cpu>(
             crate::run_queue::WaitState::Namespace(wait) => State::Namespace(wait),
             crate::run_queue::WaitState::Policy(wait) => State::Policy(wait),
             crate::run_queue::WaitState::Barrier(wait) => State::Barrier(wait),
+            crate::run_queue::WaitState::Page(wait) => State::Page(wait),
             crate::run_queue::WaitState::Custody(_) | crate::run_queue::WaitState::Cgroup(_) => {
                 State::Ready
             }

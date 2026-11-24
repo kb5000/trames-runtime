@@ -11,6 +11,7 @@ mod concurrency;
 mod writers;
 use storage::FileData;
 use trames_memory::{MemoryError, PageBacking, SharedPage, PAGE_SIZE};
+pub(crate) use writers::MountWrite;
 use writers::WriteLease;
 pub(super) use writers::Writers;
 pub(super) struct FilePage {
@@ -668,6 +669,8 @@ impl MappingWriter {
         writers: &Arc<Writers>,
         mount: Option<&MappingMount>,
     ) -> Result<Self> {
+        let _super_admission =
+            mount.map(|mount| mount.identity().fs.write_admission.lock().unwrap());
         let _admission = if let Some(mount) = mount {
             let mount = mount.identity();
             let guard = mount.writer_admission.lock().unwrap();
@@ -997,7 +1000,7 @@ pub(super) fn uring_pages(node: &Arc<Inode>, length: u64) -> Result<UringPages> 
 /// Original mmap open description. Retain before yielding for file layout
 /// admission; descriptor close/reuse cannot redirect the accepted mapping.
 #[derive(Clone)]
-pub struct MappingFile(Descriptor);
+pub struct MappingFile(Descriptor, Option<perf::Policy>);
 impl MappingFile {
     pub fn anonymous_zero(&self, shared: bool, writable: bool) -> Result<bool> {
         let o = self.0.open.borrow();
@@ -1043,7 +1046,10 @@ impl MappingFile {
         let open = self.0.open.borrow();
         open.native_image.is_none()
             && open.socket.is_none()
-            && !matches!(open.anonymous, Some(events::Anonymous::Uring(_)))
+            && !matches!(
+                open.anonymous,
+                Some(events::Anonymous::Uring(_) | events::Anonymous::Perf(_))
+            )
             && !matches!(open.control, Some(events::SharedControl::Binder(_)))
             && open
                 .mount
@@ -1057,6 +1063,32 @@ impl MappingFile {
         shared: bool,
         writable: bool,
     ) -> Result<Vec<Arc<dyn PageBacking>>> {
+        self.pages_inner(offset, len, shared, writable, None)
+    }
+    /// Perf pinned accounting belongs to the original mm, including all its
+    /// thread aliases. Ordinary mappings retain their existing resource path.
+    pub fn pages_for_memory(
+        &self,
+        offset: u64,
+        len: u64,
+        shared: bool,
+        writable: bool,
+        memory: &trames_memory::Memory,
+    ) -> Result<Vec<Arc<dyn PageBacking>>> {
+        if self.1.is_none() {
+            return self.pages(offset, len, shared, writable);
+        }
+        use trames_memory::CpuMemory;
+        self.pages_inner(offset, len, shared, writable, memory.proc_address_space())
+    }
+    fn pages_inner(
+        &self,
+        offset: u64,
+        len: u64,
+        shared: bool,
+        writable: bool,
+        context: Option<u64>,
+    ) -> Result<Vec<Arc<dyn PageBacking>>> {
         let o = self.0.open.borrow();
         let offset = if let Some(events::Anonymous::Uring(ring)) = &o.anonymous {
             ring.mapping_offset(offset, len, shared)?
@@ -1068,6 +1100,16 @@ impl MappingFile {
         }
         if !fd_can_read(o.flags.get()) {
             return Err(Errno(13));
+        }
+        if let Some(events::SharedControl::Perf(event)) = &o.control {
+            return event.pages(
+                o.shared.clone(),
+                (offset, len),
+                shared,
+                writable,
+                self.1.as_ref().ok_or(Errno(22))?,
+                context.ok_or(Errno(22))?,
+            );
         }
         if shared && writable && o.flags.get() & 3 != 2 {
             return Err(Errno(13));
@@ -1173,7 +1215,14 @@ impl MappingFile {
 }
 impl Vfs {
     pub fn mapping_file(&self, fd: u32) -> Result<MappingFile> {
-        self.descriptor(fd).map(MappingFile)
+        self.descriptor(fd).map(|descriptor| {
+            let policy = matches!(
+                descriptor.open.borrow().control,
+                Some(events::SharedControl::Perf(_))
+            )
+            .then(|| perf::Policy::new(self));
+            MappingFile(descriptor, policy)
+        })
     }
     pub fn mapping_pages(
         &self,

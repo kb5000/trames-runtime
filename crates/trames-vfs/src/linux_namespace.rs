@@ -851,18 +851,17 @@ impl Vfs {
         if !self.credentials.has_local_cap(capabilities::SYS_CHROOT) {
             return Err(Errno(1));
         }
-        let path = self.resolve(AT_FDCWD, path)?;
-        let node = self.node(&path)?;
-        if !matches!(node.borrow().content, Content::Directory) {
-            return Err(Errno(20));
-        }
-        if !self.allowed(&node.borrow(), 1) {
-            return Err(Errno(13));
-        }
-        let mut paths = self.context.paths.borrow_mut();
-        paths.root_mount = path.mount;
-        paths.root_node = Some(node);
-        Ok(())
+        let entry = self.resolve_entry_operation(
+            AT_FDCWD,
+            path,
+            true,
+            true,
+            0,
+            true,
+            Some(ResolveOperation::Fuse(fuse::PathOperation::Chroot)),
+            None,
+        )?;
+        self.change_directory_resolved(entry, true)
     }
 }
 

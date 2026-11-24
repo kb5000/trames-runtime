@@ -201,7 +201,10 @@ fn unlink_keeps_the_original_byte_charge_until_the_last_accepted_description_dro
     v.unlink_at(AT_FDCWD, b"/unlink", false).unwrap();
     v.close(fd).unwrap();
     assert_eq!(v.capacity().used_bytes, base);
-    assert!(matches!(value(accepted), Ok(FileValue::Bytes(bytes)) if bytes == vec![9; 1024]));
+    assert_eq!(
+        value(accepted).unwrap().into_bytes().unwrap(),
+        vec![9; 1024]
+    );
     assert_eq!(v.capacity().used_bytes, base - 1024);
 }
 #[test]

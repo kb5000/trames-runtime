@@ -3,7 +3,7 @@ use super::*;
 
 fn finish(paths: &PathQueries, call: NamespaceCall) -> Result<FileValue> {
     match paths.namespace_attempt(call) {
-        NamespaceAttempt::Complete(result) => result,
+        NamespaceAttempt::Complete(reply) => reply.result,
         NamespaceAttempt::Retained(work) => match work.run() {
             FileOutcome::Complete(reply) => reply.result,
             _ => panic!("uncontended original namespace must complete on its caller"),

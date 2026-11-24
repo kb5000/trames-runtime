@@ -18,6 +18,217 @@ impl IoWake for Target {
 fn t() -> Arc<dyn IoWake> {
     Arc::new(Target::default())
 }
+
+fn fuse_reply(v: &mut trames_vfs::Vfs, fd: u32, request: &[u8], payload: &[u8]) {
+    let mut bytes = Vec::new();
+    bytes.extend(((16 + payload.len()) as u32).to_le_bytes());
+    bytes.extend(0i32.to_le_bytes());
+    bytes.extend(&request[8..16]);
+    bytes.extend(payload);
+    assert_eq!(v.write(fd, &bytes), Ok(bytes.len()));
+}
+fn fuse_receive(v: &mut trames_vfs::Vfs, fd: u32, opcode: u32) -> Vec<u8> {
+    let bytes = v.read(fd, 128 * 1024).unwrap();
+    assert_eq!(&bytes[4..8], &opcode.to_le_bytes());
+    bytes
+}
+fn resume_fuse(
+    attempt: IoAttempt,
+    number: u32,
+    args: [u64; 6],
+    memory: &mut Memory,
+    target: &Arc<dyn IoWake>,
+) -> IoAttempt {
+    let IoAttempt::Blocked(wait) = attempt else {
+        panic!("daemon request must park the source")
+    };
+    let pending = wait.file_pending().unwrap();
+    drop(wait);
+    DirectSyscalls::default().start_retained_file(
+        pending,
+        number,
+        args,
+        memory,
+        1,
+        &Arc::downgrade(target),
+    )
+}
+
+#[test]
+fn fuse_path_only_bind_fstat_parks_one_original_request_across_fd_reuse() {
+    let mut v = trames_vfs::Vfs::default();
+    v.set_runtime_info(1, trames_vfs::RuntimeInfo::default());
+    v.mkdir_at(-100, b"/mnt", 0o755).unwrap();
+    v.import_file(b"/bound", Vec::new()).unwrap();
+    let daemon = v.open_at(-100, b"/dev/fuse", 2, 0).unwrap();
+    v.mount(
+        None,
+        b"/mnt",
+        Some(b"fuse"),
+        0,
+        Some(format!("fd={daemon},rootmode=40755,user_id=0,group_id=0").as_bytes()),
+    )
+    .unwrap();
+    let init = fuse_receive(&mut v, daemon, 26);
+    let mut version = [0; 64];
+    version[..4].copy_from_slice(&7u32.to_le_bytes());
+    version[4..8].copy_from_slice(&31u32.to_le_bytes());
+    fuse_reply(&mut v, daemon, &init, &version);
+    let paths = v.path_queries();
+    let work = paths.namespace_work(trames_vfs::NamespaceCall::Mount {
+        source: Some(b"/mnt/file".to_vec()),
+        target: b"/bound".to_vec(),
+        kind: None,
+        flags: 4096,
+        data: None,
+    });
+    let trames_vfs::FileOutcome::Waiting(work) = work.run() else {
+        panic!("lookup")
+    };
+    let lookup = fuse_receive(&mut v, daemon, 1);
+    let mut entry = [0; 128];
+    entry[..8].copy_from_slice(&10u64.to_le_bytes());
+    entry[40..48].copy_from_slice(&210u64.to_le_bytes());
+    entry[100..104].copy_from_slice(&0o100644u32.to_le_bytes());
+    fuse_reply(&mut v, daemon, &lookup, &entry);
+    let trames_vfs::FileOutcome::Complete(reply) = work.run() else {
+        panic!("bind")
+    };
+    assert!(matches!(reply.result, Ok(trames_vfs::FileValue::Count(0))));
+    let fd = v.open_at(-100, b"/bound", trames_vfs::O_PATH, 0).unwrap();
+    let files = v.shared_files();
+    let direct = DirectSyscalls::default()
+        .with_paths(v.path_queries())
+        .with_membership(files.clone());
+    let mut memory = Memory::default();
+    memory.map(0x1000, PAGE_SIZE, Permissions::RW).unwrap();
+    let target = t();
+    let args = [fd as u64, 0x1000, 0, 0, 0, 0];
+    let attempt = direct
+        .start_file_call(80, args, &mut memory, 1, &Arc::downgrade(&target))
+        .unwrap();
+    assert!(
+        matches!(&attempt, IoAttempt::Blocked(_)),
+        "daemon metadata must park, not request file layout"
+    );
+    let getattr = fuse_receive(&mut v, daemon, 3);
+    assert_eq!(&getattr[16..24], &10u64.to_le_bytes());
+    assert_eq!(&getattr[32..36], &1u32.to_le_bytes());
+    files.close_range(fd, fd, 0, 1).unwrap();
+    assert_eq!(v.open_at(-100, b"/replacement", 0x42, 0o600).unwrap(), fd);
+    let mut attr = [0; 104];
+    attr[16..].copy_from_slice(&entry[40..]);
+    fuse_reply(&mut v, daemon, &getattr, &attr);
+    assert!(matches!(
+        resume_fuse(attempt, 80, args, &mut memory, &target),
+        IoAttempt::Complete(Ok(0))
+    ));
+    assert_eq!(memory.read_u64(0x1008).unwrap(), 210);
+    assert_eq!(
+        v.read(daemon, 8192),
+        Err(trames_vfs::Errno(11)),
+        "no replayed GETATTR"
+    );
+}
+
+#[test]
+fn fuse_getdents_parks_and_preserves_original_ofd_through_fd_reuse_and_partial_copy() {
+    let mut v = trames_vfs::Vfs::default();
+    v.set_runtime_info(1, trames_vfs::RuntimeInfo::default());
+    v.mkdir_at(-100, b"/mnt", 0o755).unwrap();
+    let daemon = v.open_at(-100, b"/dev/fuse", 2, 0).unwrap();
+    v.mount(
+        None,
+        b"/mnt",
+        Some(b"fuse"),
+        0,
+        Some(format!("fd={daemon},rootmode=40755,user_id=0,group_id=0").as_bytes()),
+    )
+    .unwrap();
+    let init = fuse_receive(&mut v, daemon, 26);
+    let mut version = [0; 64];
+    version[..4].copy_from_slice(&7u32.to_le_bytes());
+    version[4..8].copy_from_slice(&31u32.to_le_bytes());
+    fuse_reply(&mut v, daemon, &init, &version);
+    let mut memory = Memory::default();
+    memory.map(0x1000, 2 * PAGE_SIZE, Permissions::RW).unwrap();
+    memory.write(0x1000, b"/mnt\0").unwrap();
+    let target = t();
+    let files = v.shared_files();
+    let direct = DirectSyscalls::default()
+        .with_paths(v.path_queries())
+        .with_membership(files.clone());
+    let open_args = [
+        (-100i64) as u64,
+        0x1000,
+        trames_vfs::O_DIRECTORY as u64,
+        0,
+        0,
+        0,
+    ];
+    let open = direct
+        .start_file_call(56, open_args, &mut memory, 1, &Arc::downgrade(&target))
+        .unwrap();
+    let getattr = fuse_receive(&mut v, daemon, 3);
+    let mut attr = [0; 104];
+    attr[16..24].copy_from_slice(&1u64.to_le_bytes());
+    attr[76..80].copy_from_slice(&0o40755u32.to_le_bytes());
+    fuse_reply(&mut v, daemon, &getattr, &attr);
+    let open = resume_fuse(open, 56, open_args, &mut memory, &target);
+    match &open {
+        IoAttempt::Blocked(_) => {}
+        IoAttempt::Complete(value) => panic!("opendir returned early: {value:?}"),
+        _ => panic!("opendir requested unexpected boundary"),
+    }
+    let opendir = fuse_receive(&mut v, daemon, 27);
+    let mut handle = [0; 16];
+    handle[..8].copy_from_slice(&123u64.to_le_bytes());
+    fuse_reply(&mut v, daemon, &opendir, &handle);
+    let IoAttempt::Complete(Ok(fd)) = resume_fuse(open, 56, open_args, &mut memory, &target) else {
+        panic!("directory publication")
+    };
+    let fd = fd as u32;
+    let dup = files.duplicate(fd, 0, false).unwrap().unwrap();
+    let args = [fd as u64, 0x3000 - 24, 64, 0, 0, 0];
+    let read = direct
+        .start_file_call(61, args, &mut memory, 1, &Arc::downgrade(&target))
+        .unwrap();
+    let readdir = fuse_receive(&mut v, daemon, 28);
+    assert_eq!(&readdir[40..48], &123u64.to_le_bytes());
+    files.close_range(fd, fd, 0, 1).unwrap();
+    assert_eq!(v.open_at(-100, b"/replacement", 0x42, 0o600).unwrap(), fd);
+    let mut entries = Vec::new();
+    for (ino, cookie) in [(42u64, 9u64), (43, 777)] {
+        let mut entry = vec![0; 32];
+        entry[..8].copy_from_slice(&ino.to_le_bytes());
+        entry[8..16].copy_from_slice(&cookie.to_le_bytes());
+        entry[16..20].copy_from_slice(&1u32.to_le_bytes());
+        entry[20..24].copy_from_slice(&8u32.to_le_bytes());
+        entry[24] = b'a';
+        entries.extend(entry);
+    }
+    fuse_reply(&mut v, daemon, &readdir, &entries);
+    assert!(matches!(
+        resume_fuse(read, 61, args, &mut memory, &target),
+        IoAttempt::Complete(Ok(24))
+    ));
+    assert_eq!(memory.read_u64(0x3000 - 24 + 8).unwrap(), 9);
+    assert!(matches!(
+        direct.start_file_call(
+            62,
+            [dup as u64, 0, 1, 0, 0, 0],
+            &mut memory,
+            1,
+            &Arc::downgrade(&target)
+        ),
+        Some(IoAttempt::Complete(Ok(9)))
+    ));
+    assert_eq!(
+        v.seek(fd, 0, 1),
+        Ok(0),
+        "replacement description must stay untouched"
+    );
+}
 #[test]
 fn original_copy_range_validates_requested_overflow_before_shortening_or_advancing() {
     let mut l = Linux::new(0x100000);

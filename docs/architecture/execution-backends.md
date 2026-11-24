@@ -108,8 +108,63 @@ Native create/open also retains the creation descriptor, including when a new
 file has read-only mode bits; cached weak handles preserve older open files
 when the newest same-access description closes.
 
-Current limits are explicit: host MAP_SHARED returns ENODEV, extended attributes
-and special host files are unsupported. Resident private pages do not monitor
+FUSE default_permissions mode checks share the existing credential model. Stale
+or denied cached attributes refresh through GETATTR while the original inode,
+path walk, open reservation and mutation writer stay retained. Attribute-validity
+deadlines use relaxed atomics; metadata keeps its existing object synchronization.
+Permission waits use existing FileWork/readiness workers and yield execution slots.
+Sticky O_CREAT retains the accepted pathname parent, including a file bind's outer
+parent; proc magic reopening retains its inode capability independently.
+
+FUSE metadata requests retain a relaxed connection epoch. Canonical attributes
+and their version use the existing inode attribute mutex: stale GETATTR/LOOKUP
+cannot replace a newer cache observation, while concurrent SETATTR still applies
+and expires that cache. Stat may return its own older reply independently.
+Accepted attributes normalize nanoseconds and retain unmapped IDs until reader
+projection. Invalid type/size replies persistently mark that inode bad; nodeid
+generation/type reuse retires the old identity while allowing a new one. Retained
+references outlive the existing identity-table guard, and final RELEASE remains
+unconditional. No guard crosses a daemon wait; no new thread or global lock is
+introduced. Empty-FD access uses the original OFD/cwd inode and selected real or
+effective credentials, without a replacement pathname search. See the
+[metadata checkpoint](../validation/fuse-complete-progress-20261123.md#metadata-request-epochs-and-bad-inode-checkpoint-2026-11-24)
+for the exact native metadata cases. Valid LOOKUP replies publish canonical
+identity and attributes before later EEXIST, ENOTDIR or symlink-follow outcomes.
+A same-identity LOOKUP preserves badness while allowing namei's O_PATH/exclusive
+create precedence; actual inode operations retain their bad-state checks. See the
+[LOOKUP lifetime checkpoint](../validation/fuse-complete-progress-20261123.md#lookup-early-return-publication-checkpoint-2026-11-24)
+for the native cases and remaining protocol/error-ordering audit.
+
+Negotiated FUSE POSIX_ACL enables local permissions and shares the existing ACL,
+credential and namespace mapping model. Original inode capabilities and callers
+survive INIT, GETATTR and ACL waits on the same execution path. The FUSE
+inode's ACL cache and invalidation version use an object lock; no guard crosses a
+daemon wait. GETATTR and attribute/ACL mutations invalidate cached observations,
+and late replies cannot repopulate an invalidated cache. The pre-INIT root remains
+uncached. Public access/default ACL reads share that inode cache with permission
+checks. Cached IDs stay global and are converted only for the requesting namespace.
+Each cache kind has one request-owned fill claim. Concurrent readers still issue
+independent daemon requests and use their own replies; only the claiming request
+may publish a cached observation. Error/cancellation retires that claim without
+promoting an already pending reader or clearing a replacement claim. Claim and
+invalidation state use the same inode-local lock, released before request waits.
+Backing ACL decoding preserves Linux's entry order and permission error behavior;
+strict setter validation follows ownership checks. DONT_MASK and extended SETXATTR carry creation umask and ACL SGID intent
+to the daemon. Further protocol/error and metadata concurrency audits, real FUSE
+applications and the remaining complete acceptance gates are pending; see the
+[checkpoint](../validation/fuse-complete-progress-20261123.md#concurrent-acl-fill-and-cancellation-ownership-checkpoint-2026-11-24).
+
+Native data xattrs use the accepted file capability and the existing native
+executor. Their values stay in the host filesystem, with guest user/trusted
+permissions and trusted-name filtering. Metadata/OFD handles retain the original
+inode across rename, unlink and descriptor reuse; mutations retain their original
+mount's writer admission. Darwin metadata and symlink descriptors use f*xattr
+directly. Linux O_PATH regular/directory handles use an internal proc magic link
+to that retained inode, never a pathname imported from guest text.
+
+Current limits are explicit: host MAP_SHARED returns ENODEV; Linux POSIX ACL and
+security.capability translation, Linux O_PATH symlink attributes and special host
+files remain unsupported. Resident private pages do not monitor
 external native changes/truncation. A coherent MAP_SHARED backend additionally
 needs bounded host-fault handling for external truncate and aliases usable by
 both executors; simply exposing a raw file mapping is insufficient.
