@@ -4216,11 +4216,25 @@ mod tests {
                             trames_memory::Permissions::RX,
                         )
                         .unwrap();
+                    p.cpu.set_x(19, u64::MAX);
                     k.processes.insert(1, p);
                     k.processes.insert(2, peer);
-                    assert!(k
-                        .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
-                        .unwrap());
+                    // A peer can consume the cohort's first budget before the
+                    // observed task runs. Await its stored result, granting a
+                    // fresh cumulative limit to each bounded fixture epoch.
+                    for _ in 0..8 {
+                        let limit = k.instructions + 100_000;
+                        assert!(k
+                            .parallel_epoch(
+                                &mut trames_linux::CapturedOutput::default(),
+                                limit,
+                                true,
+                            )
+                            .unwrap());
+                        if k.processes.read(&1).cpu.x(19) != u64::MAX {
+                            break;
+                        }
+                    }
                     assert!(k.worker_syscalls > 0);
                     assert_eq!(k.syscalls, k.worker_syscalls);
                     assert_eq!(
@@ -4395,8 +4409,9 @@ mod tests {
                 // first slice before this task is dispatched. Await real work
                 // with bounded epochs, preserving every accounting assertion.
                 for _ in 0..8 {
+                    let limit = k.instructions + 100_000;
                     assert!(k
-                        .parallel_epoch(&mut trames_linux::CapturedOutput::default(), 100_000, true)
+                        .parallel_epoch(&mut trames_linux::CapturedOutput::default(), limit, true)
                         .unwrap());
                     if k.worker_syscalls != 0 {
                         break;

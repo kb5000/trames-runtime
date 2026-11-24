@@ -28,3 +28,16 @@
 首次计数误把 4 个内存测试子进程小结重复相加，已按 Cargo target 最终小结修正；失败清单和对照结论不受影响。未因文档或计数修正重复执行已通过行为测试。
 
 完整 254 组 gVisor、原版新增 futex2／rseq guest runfile、实际 HVF、原版调试工具、release／真实包安装与容器吞吐、物理 iPad 等验收仍按完整清单保留。
+
+
+## 后续 CI 修正
+
+推送后 Linux CI 暴露了网络命名空间初始化的栈溢出；本地 Linux ARM64 复现并取得回溯，指向含 smoltcp 大缓冲区的 Node 按值进入 B-tree 插入帧。将普通节点及 gateway 节点独立分配，B-tree 只保留 Box；原资源归属、同步与调用线程保持不变。新增 16 个命名空间跨树分裂、删除并继续隔离 UDP 收发的回归。
+
+产品 Linux CI 的 sysinfo／结构性调用 3 项失败及本地复查的同类内存观察失败来自测试完成条件：累计指令上限没有随重试增加，或要求在 10ms bounded 夹具窗口内完成。观察测试等待真实结果并逐轮增加累计额度；结构性序列使用真实 guest 退出的 source completion，保留单 epoch、返回值、seccomp 计数及零宿主接管断言。没有放宽错误结果或添加跳过。
+
+证据在产品 `target/local-ci/io/candidate-stack-20261124`。网络／VFS：Linux 1239 通过、0 失败、1 忽略，Mac 1242 通过、0 失败、1 忽略。网络／VFS 严格 Clippy、格式及执行边界通过。首次将测试栈变量误传给 rustc 的编译器栈溢出、沙箱拒绝本机套接字的 EPERM 均保留为无效尝试，未用于通过结论。未提高测试线程栈上限。
+
+按测试身份合并未受修改影响的通过结果及 seccomp 58 项复查后，Linux／Mac 的进程 conformance 各为 509 通过、0 失败、3 忽略；没有把复查的同一身份重复计数。Linux 原溢出用例及新增树分裂回归另外直接用已编译可执行文件在显式 2 MiB 测试线程栈下运行通过。
+
+最终受影响产品 core 的 all-targets／all-features 严格 Clippy、Runtime 执行边界和格式检查通过。隔离 Linux CI VM 已恢复停止状态，现有 Stable／Dev 应用及 guest 环境保持原状。

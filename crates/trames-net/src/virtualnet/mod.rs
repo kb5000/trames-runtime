@@ -92,7 +92,8 @@ struct Inner {
     ethernet_switch: crate::ethernet::Switch,
     started: Instant,
     next_node: u64,
-    nodes: BTreeMap<u64, Node>,
+    // Keep large smoltcp interface buffers out of B-tree insertion/split frames.
+    nodes: BTreeMap<u64, Box<Node>>,
     gateway: gateway::Gateway,
     stats: NetworkStats,
     drop_every: u32,
@@ -608,7 +609,7 @@ fn udp_socket_with_buffers(receive: usize, send: usize) -> udp::Socket<'static> 
     }
     socket
 }
-fn make_node(id: u8, now: smoltcp::time::Instant) -> Result<Node> {
+fn make_node(id: u8, now: smoltcp::time::Instant) -> Result<Box<Node>> {
     let mut port = Port::default();
     let mut config = Config::new(HardwareAddress::Ip);
     let mut seed = [0; 8];
@@ -630,7 +631,7 @@ fn make_node(id: u8, now: smoltcp::time::Instant) -> Result<Node> {
     if id == 1 {
         iface.set_any_ip(true);
     }
-    Ok(Node {
+    Ok(Box::new(Node {
         tcp_binds: BTreeMap::new(),
         udp_bind_order: 0,
         udp_readers: BTreeMap::new(),
@@ -653,7 +654,7 @@ fn make_node(id: u8, now: smoltcp::time::Instant) -> Result<Node> {
         #[cfg(test)]
         polls: 0,
         configuration_lo: false,
-    })
+    }))
 }
 impl Fabric {
     pub fn new() -> Result<Self> {
@@ -2135,6 +2136,27 @@ impl Drop for Socket {
 #[cfg(test)]
 mod shared_lifetime_tests {
     use super::*;
+    #[test]
+    fn namespace_nodes_survive_tree_splits_and_removals() {
+        let fabric = Fabric::new().unwrap();
+        let mut networks: Vec<_> = (2..18)
+            .map(|id| fabric.environment(id, NetworkMode::Full).unwrap())
+            .collect();
+        assert_eq!(fabric.stats().environments, 16);
+        networks.retain(|network| network.0.info.id % 2 != 0);
+        assert_eq!(fabric.stats().environments, 8);
+        for network in &networks {
+            let rx = network.socket(2, 2, 0).unwrap();
+            let tx = network.socket(2, 2, 0).unwrap();
+            let address = "127.0.0.1:34373".parse().unwrap();
+            rx.bind(address).unwrap();
+            let data = [network.0.info.id];
+            assert_eq!(tx.send(&data, 0, Some(address)), Ok(1));
+            assert_eq!(rx.recv(1, 0).unwrap().data, data);
+        }
+        drop(networks);
+        assert_eq!(fabric.stats().environments, 0);
+    }
     #[test]
     fn abortive_close_reaches_the_virtual_peer() {
         let fabric = Fabric::new().unwrap();

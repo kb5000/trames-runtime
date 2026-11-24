@@ -16,7 +16,7 @@ impl Gateway {
         key: u64,
         p: &[u8],
         h: &packet::Header,
-        nodes: &BTreeMap<u64, Node>,
+        nodes: &BTreeMap<u64, Box<Node>>,
     ) -> bool {
         let data = &p[h.offset..];
         let v4 = h.protocol == 1;
@@ -129,7 +129,7 @@ impl Gateway {
         }
         true
     }
-    pub(super) fn icmp_service(&mut self, nodes: &BTreeMap<u64, Node>) {
+    pub(super) fn icmp_service(&mut self, nodes: &BTreeMap<u64, Box<Node>>) {
         let mut replies = Vec::new();
         self.icmp.retain_mut(|flow| {
             if !nodes.contains_key(&flow.node)

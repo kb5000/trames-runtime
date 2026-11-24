@@ -149,6 +149,9 @@ fn complete_structural_family_and_ring_controls_share_one_original_dispatch_cont
             [ring as u64, 42, 0, 0, 0, 0],
             if filter { -7 } else { -22 },
         ));
+        // Observe descriptor ownership before source exit closes the table.
+        calls.push((25, [6, 1, 0, 0, 0, 0], -9));
+        calls.push((25, [file as u64, 1, 0, 0, 0, 0], 0));
         let mut words = Vec::new();
         mov(&mut words, 24, 0x3000);
         for (i, (nr, args, _)) in calls.iter().enumerate() {
@@ -158,7 +161,7 @@ fn complete_structural_family_and_ring_controls_share_one_original_dispatch_cont
         mov(&mut words, 0, 0x3800);
         mov(&mut words, 1, 1);
         words.push(0xb9000001);
-        park(&mut words);
+        call(&mut words, 93, [0, 0, 0, 0, 0, 0]);
         code(&mut root, 0x4000, &words);
         let mut peer_code = Vec::new();
         park(&mut peer_code);
@@ -172,9 +175,14 @@ fn complete_structural_family_and_ring_controls_share_one_original_dispatch_cont
         k.publish_task(100, &peer);
         k.processes.insert(1, root);
         k.processes.insert(100, peer);
-        assert!(k
-            .parallel_round(&mut trames_linux::CapturedOutput::default(), 1_000_000)
-            .unwrap());
+        // Source completion keeps the entire sequence in one epoch even when
+        // the host takes longer than the bounded fixture's 10 ms timeslice.
+        assert_eq!(
+            k.drive(&mut trames_linux::CapturedOutput::default(), 1_000_000)
+                .unwrap()
+                .code,
+            0
+        );
         let p = k.processes.read(&1);
         assert_eq!(
             p.memory.read_array::<4>(0x3800).unwrap(),
@@ -203,8 +211,6 @@ fn complete_structural_family_and_ring_controls_share_one_original_dispatch_cont
                 "one BPF decision per accepted entry, including both original CPUs"
             );
         }
-        assert!(p.linux.vfs.flags(6).is_err());
-        assert!(p.linux.vfs.flags(file).is_ok());
     }
 }
 fn image(words: &[u32]) -> Vec<u8> {
@@ -263,7 +269,7 @@ fn valid_clone_and_both_exec_forms_keep_the_original_structural_call_through_rep
             mov(&mut words, 0, 0x3800);
             mov(&mut words, 1, 1);
             words.push(0xb9000001);
-            park(&mut words);
+            call(&mut words, 93, [0, 0, 0, 0, 0, 0]);
             let child = words.len();
             words[branch] = 0xb4000000 | (((child - branch) as u32) << 5);
             call(
@@ -289,9 +295,12 @@ fn valid_clone_and_both_exec_forms_keep_the_original_structural_call_through_rep
             k.publish_task(100, &peer);
             k.processes.insert(1, root);
             k.processes.insert(100, peer);
-            assert!(k
-                .parallel_round(&mut trames_linux::CapturedOutput::default(), 2_000_000)
-                .unwrap());
+            assert_eq!(
+                k.drive(&mut trames_linux::CapturedOutput::default(), 2_000_000)
+                    .unwrap()
+                    .code,
+                0
+            );
             let p = k.processes.read(&1);
             assert_eq!(
                 p.memory.read_array::<4>(0x3800).unwrap(),

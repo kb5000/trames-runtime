@@ -66,7 +66,7 @@ struct Published {
     peers: BTreeMap<SocketAddr, SocketHandle>,
 }
 pub(super) struct Gateway {
-    pub node: Node,
+    pub node: Box<Node>,
     published: Vec<Published>,
     next_port: u16,
     pub mappings: BTreeMap<IpAddr, IpAddr>,
@@ -159,7 +159,7 @@ impl Gateway {
     }
     fn owner(
         &self,
-        nodes: &BTreeMap<u64, Node>,
+        nodes: &BTreeMap<u64, Box<Node>>,
         key: u64,
         tuple: Tuple,
         kind: u32,
@@ -191,7 +191,7 @@ impl Gateway {
         key: u64,
         p: Vec<u8>,
         h: &packet::Header,
-        nodes: &BTreeMap<u64, Node>,
+        nodes: &BTreeMap<u64, Box<Node>>,
         now: smoltcp::time::Instant,
     ) -> bool {
         let Some(ns) = nodes.get(&key).and_then(|n| n.owner.upgrade()) else {
@@ -375,7 +375,7 @@ impl Gateway {
         }
         Ok(())
     }
-    fn service_published(&mut self, now: smoltcp::time::Instant, nodes: &BTreeMap<u64, Node>) {
+    fn service_published(&mut self, now: smoltcp::time::Instant, nodes: &BTreeMap<u64, Box<Node>>) {
         for port in &mut self.published {
             let Some((&key, node)) = nodes.iter().find(|(_, n)| {
                 port.guest.ip() == IpAddr::V4(v4(n.id)) || port.guest.ip() == IpAddr::V6(v6(n.id))
@@ -503,7 +503,7 @@ impl Gateway {
         }
         let _ = now;
     }
-    pub fn service(&mut self, now: smoltcp::time::Instant, nodes: &BTreeMap<u64, Node>) {
+    pub fn service(&mut self, now: smoltcp::time::Instant, nodes: &BTreeMap<u64, Box<Node>>) {
         self.routed.retain(|_, r| {
             nodes.contains_key(&r.node) && r.last.elapsed() < Duration::from_secs(600)
         });
@@ -859,7 +859,7 @@ impl Gateway {
             }
         }
     }
-    fn dns_query(&mut self, packet: Vec<u8>, to: ReplyTo, nodes: &BTreeMap<u64, Node>) {
+    fn dns_query(&mut self, packet: Vec<u8>, to: ReplyTo, nodes: &BTreeMap<u64, Box<Node>>) {
         let limit = if matches!(to, ReplyTo::Udp { .. }) {
             512
         } else {
@@ -919,7 +919,7 @@ impl Gateway {
             self.dns_reply(&to, dns::answer(&packet, &[], 2, limit));
         }
     }
-    fn dns_service(&mut self, nodes: &BTreeMap<u64, Node>) {
+    fn dns_service(&mut self, nodes: &BTreeMap<u64, Box<Node>>) {
         let mut queries = Vec::new();
         for &h in &self.dns_udp {
             for _ in 0..16 {
