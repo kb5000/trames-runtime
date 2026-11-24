@@ -435,6 +435,33 @@ impl Endpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // libc/NSS may synthesize localhost families not present in /etc/hosts;
+    // musl follows its actual configuration. Compare the wire reply with the
+    // original family-specific native resolver rather than requiring IPv6.
+    fn localhost_rcode(kind: u16) -> u8 {
+        use nix::libc;
+        let mut hints: libc::addrinfo = unsafe { std::mem::zeroed() };
+        hints.ai_family = if kind == 1 {
+            libc::AF_INET
+        } else {
+            libc::AF_INET6
+        };
+        hints.ai_socktype = libc::SOCK_STREAM;
+        let mut result = std::ptr::null_mut();
+        let code = unsafe {
+            libc::getaddrinfo(c"localhost".as_ptr(), std::ptr::null(), &hints, &mut result)
+        };
+        if code == 0 && !result.is_null() {
+            unsafe { libc::freeaddrinfo(result) }
+        }
+        if code == 0 {
+            0
+        } else if code == libc::EAI_NONAME {
+            3
+        } else {
+            2
+        }
+    }
     #[test]
     fn completion_notifies_the_original_endpoint_without_a_guest_tick() {
         use std::os::fd::AsFd;
@@ -644,6 +671,7 @@ mod tests {
     }
     #[test]
     fn shared_resolver_dispatches_concurrent_endpoints_and_reclaims_dead_requests() {
+        let native = [localhost_rcode(1), localhost_rcode(28)];
         let service = Service::new(NetworkMode::Full);
         std::thread::scope(|scope| {
             for worker in 0..8u16 {
@@ -659,7 +687,7 @@ mod tests {
                         ready(&e);
                         let answer = e.recv(512, 0).unwrap().data;
                         assert_eq!(&answer[..2], &q[..2]);
-                        assert_eq!(answer[3] & 15, 0);
+                        assert_eq!(answer[3] & 15, native[(worker % 2) as usize]);
                     }
                 });
             }
@@ -711,6 +739,7 @@ mod tests {
     }
     #[test]
     fn dns_only_udp_preserves_ids_datagrams_peek_and_truncation() {
+        let native = [localhost_rcode(1), localhost_rcode(28)];
         let e = Endpoint::new(Service::new(NetworkMode::Full), false).unwrap();
         for (id, kind) in [(0x1234, 1), (0x5678, 28)] {
             let q = query(id, b"localhost", kind);
@@ -723,7 +752,13 @@ mod tests {
             let answer = e.recv(4096, 0).unwrap();
             assert_eq!(peek.data, answer.data[..2]);
             assert_eq!(answer.address, Some(ADDRESS));
-            assert_eq!(answer.data[3] & 15, 0);
+            let id = u16::from_be_bytes(answer.data[..2].try_into().unwrap());
+            let family = match id {
+                0x1234 => 0,
+                0x5678 => 1,
+                _ => panic!("unexpected DNS id"),
+            };
+            assert_eq!(answer.data[3] & 15, native[family]);
         }
         assert!(matches!(e.recv(1, 0), Err(NetError(11))));
     }

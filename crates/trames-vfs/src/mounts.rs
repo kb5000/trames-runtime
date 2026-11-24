@@ -1366,6 +1366,11 @@ impl Vfs {
             {
                 let cut = if root.key == b"/" { 0 } else { root.key.len() };
                 let mut out = at.key[cut..].to_vec();
+                // Crossing a mount installed at / joins two absolute pieces.
+                // Keep one separator, including for getcwd and proc FD names.
+                if out.last() == Some(&b'/') && suffix.first() == Some(&b'/') {
+                    out.pop();
+                }
                 out.extend(suffix);
                 return Ok(if out.is_empty() { b"/".to_vec() } else { out });
             }

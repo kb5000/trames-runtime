@@ -16,5 +16,13 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --all-features --locked
+      - name: Verify musl DNS ABI with a GNU C frontend
+        if: matrix.os == 'ubuntu-24.04'
+        env:
+          CC_x86_64_unknown_linux_musl: cc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: cc
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          cargo test -p trames-net --target x86_64-unknown-linux-musl --lib --locked
       - run: cargo build --workspace --all-features --release --locked
       - run: cargo run --release -p trames-memory --example reclaim-footprint --locked

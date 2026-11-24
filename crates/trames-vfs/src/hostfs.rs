@@ -1204,6 +1204,18 @@ mod tests {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+    #[test]
+    fn host_root_mount_renders_one_separator_for_cwd_and_descriptor_names() {
+        let root = Fixture::new();
+        std::fs::create_dir(root.0.join("tree")).unwrap();
+        let mut v = Vfs::default();
+        v.mount_host(b"/", &root.0, false).unwrap();
+        assert_eq!(v.cwd().unwrap(), b"/");
+        v.chdir(b"/tree").unwrap();
+        assert_eq!(v.cwd().unwrap(), b"/tree");
+        let paths = v.context.paths.borrow();
+        assert_eq!(v.cwd_name::<true>(&paths).unwrap(), b"/tree");
+    }
     fn size(stat: [u8; 128]) -> u64 {
         u64::from_le_bytes(stat[48..56].try_into().unwrap())
     }
