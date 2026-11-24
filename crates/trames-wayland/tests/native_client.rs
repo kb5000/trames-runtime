@@ -313,8 +313,8 @@ fn producer_readiness_fifo_and_external_image_leases_survive_server_teardown() {
         fn dimensions(&self) -> (u32, u32) {
             (self.width, 64)
         }
-        fn metal_texture(&self) -> usize {
-            0
+        fn native_handle(&self) -> trames_graphics::NativeHandle {
+            trames_graphics::NativeHandle::Empty
         }
         fn ready(&self) -> io::Result<bool> {
             Ok(self.ready.load(Ordering::Acquire))

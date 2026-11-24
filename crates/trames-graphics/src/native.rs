@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#[cfg(not(target_os = "linux"))]
 use super::*;
 #[cfg(target_vendor = "apple")]
 mod apple {
@@ -68,7 +69,7 @@ mod apple {
                 return Err(io::Error::from_raw_os_error(95));
             }
             // SAFETY: native code retains its default device for process life.
-            unsafe { image.metal_texture(device) }
+            unsafe { image.native_texture(NativeDevice::Metal(device)) }
         }
         fn adopt(&self, raw: *mut c_void) -> io::Result<Arc<dyn Image>> {
             if raw.is_null() {
@@ -161,7 +162,10 @@ mod apple {
             }
             self.cpu.get().unwrap().pages(offset, length)
         }
-        unsafe fn metal_texture(&self, device: usize) -> io::Result<Arc<Texture>> {
+        unsafe fn native_texture(&self, device: NativeDevice) -> io::Result<Arc<Texture>> {
+            let NativeDevice::Metal(device) = device else {
+                return Err(io::Error::from_raw_os_error(95));
+            };
             let mut textures = self.textures.lock().unwrap();
             if let Some(texture) = textures.get(&device) {
                 return Ok(texture.clone());
@@ -193,7 +197,8 @@ mod apple {
                 _image: self.native.clone(),
                 _cache: cache,
             });
-            let texture = Arc::new(unsafe { Texture::retained(handle, owner) });
+            let texture =
+                Arc::new(unsafe { Texture::retained(NativeHandle::MetalTexture(handle), owner) });
             textures.insert(device, texture.clone());
             Ok(texture)
         }
@@ -201,10 +206,10 @@ mod apple {
 }
 #[cfg(target_vendor = "apple")]
 pub use apple::Context;
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
 #[derive(Clone, Default)]
 pub struct Context;
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
 impl Context {
     pub fn display_texture(_: &dyn Image) -> io::Result<Arc<Texture>> {
         Err(io::Error::from_raw_os_error(95))
@@ -242,7 +247,7 @@ mod tests {
             assert_eq!(bytes, [13, 37, 91, 255]);
             image.cpu_access(false).unwrap();
             let texture = Context::display_texture(image.as_ref()).unwrap();
-            assert_ne!(texture.handle(), 0);
+            assert_ne!(texture.metal_handle().unwrap(), 0);
             drop(image);
             let mut bytes = [0; 4];
             first[0].read(0, &mut bytes).unwrap();
@@ -251,3 +256,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+pub use crate::linux::Context;

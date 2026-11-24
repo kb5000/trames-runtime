@@ -14,6 +14,7 @@ pub(super) struct Plane {
     offset: usize,
     size: usize,
     owner: Arc<dyn Send + Sync>,
+    mapping: Option<trames_memory::SharedMapping>,
     identity: u64,
     epoch: Arc<AtomicU64>,
     pages: Mutex<Vec<Weak<SharedPage>>>,
@@ -35,6 +36,7 @@ impl Plane {
             offset,
             size,
             owner,
+            mapping: None,
             identity: trames_memory::new_backing_identity(),
             epoch: Arc::default(),
             pages: Mutex::new(
@@ -43,6 +45,23 @@ impl Plane {
                     .collect(),
             ),
         }
+    }
+    /// # Safety
+    /// The retained resource owns initialized bytes under SharedMapping's
+    /// original foreign-access and FD alias contract.
+    #[cfg(target_os = "linux")]
+    pub(super) unsafe fn from_mapping(mapping: trames_memory::SharedMapping, size: usize) -> Self {
+        let mut plane = unsafe {
+            Self::new(
+                mapping.allocation_pointer() as usize,
+                mapping.allocation_len(),
+                mapping.allocation_offset(),
+                size,
+                Arc::new(mapping.clone()),
+            )
+        };
+        plane.mapping = Some(mapping);
+        plane
     }
     pub(super) fn pages(
         self: &Arc<Self>,
@@ -65,14 +84,21 @@ impl Plane {
             let page = slot.upgrade().unwrap_or_else(|| {
                 // SAFETY: the native allocation and plane geometry were checked
                 // at adoption; all aliases use this one canonical page cache.
-                let page = Arc::new(unsafe {
-                    SharedPage::from_shared_mapping(
-                        self.address as *mut u8,
-                        self.length,
-                        self.offset + offset as usize,
-                        self.owner.clone(),
-                    )
-                });
+                let page = if let Some(mapping) = &self.mapping {
+                    mapping
+                        .with_offset(self.offset + offset as usize)
+                        .unwrap()
+                        .shared_page()
+                } else {
+                    Arc::new(unsafe {
+                        SharedPage::from_shared_mapping(
+                            self.address as *mut u8,
+                            self.length,
+                            self.offset + offset as usize,
+                            self.owner.clone(),
+                        )
+                    })
+                };
                 *slot = Arc::downgrade(&page);
                 page
             });

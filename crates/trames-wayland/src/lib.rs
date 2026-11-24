@@ -14,6 +14,7 @@ pub use selection::HostClipboard;
 pub use wsi::WsiConnection;
 mod scene;
 pub use gpu::{GpuBudget, GpuImage, GpuPermit};
+pub use trames_graphics::NativeHandle;
 mod text;
 pub use input::InputEvent;
 pub use text::{TextContext, TextEdit};
@@ -437,8 +438,8 @@ mod tests {
             fn dimensions(&self) -> (u32, u32) {
                 (16, 16)
             }
-            fn metal_texture(&self) -> usize {
-                0
+            fn native_handle(&self) -> trames_graphics::NativeHandle {
+                trames_graphics::NativeHandle::Empty
             }
             fn ready(&self) -> io::Result<bool> {
                 Ok(true)

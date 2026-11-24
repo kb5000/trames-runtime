@@ -119,14 +119,11 @@ impl Memory {
             .map(|offset| {
                 // SAFETY: SharedMapping owns the complete stable initialized resource.
                 // Every exported page uses the existing shared-region/hardware gate.
-                let page = unsafe {
-                    SharedPage::from_resource_mapping(
-                        mapping
-                            .with_offset(mapping.allocation_offset() + offset)
-                            .unwrap(),
-                    )
-                };
-                Arc::new(ImportedPage(Arc::new(page), domain)) as Arc<dyn PageBacking>
+                let page = mapping
+                    .with_offset(mapping.allocation_offset() + offset)
+                    .unwrap()
+                    .shared_page();
+                Arc::new(ImportedPage(page, domain)) as Arc<dyn PageBacking>
             })
             .collect();
         self.map_backed(address, objects, true, Permissions::RW, true)
@@ -167,6 +164,29 @@ mod tests {
                 },
             )
         }
+    }
+    #[test]
+    fn safe_mapping_clones_share_one_borrow_domain_across_memories() {
+        let mapping = mapping(Arc::new(AtomicUsize::new(0)));
+        let page = mapping.shared_page();
+        let mut first = Memory::default();
+        let mut second = Memory::default();
+        for memory in [&mut first, &mut second] {
+            memory.map(0x10000, PAGE_SIZE, Permissions::RW).unwrap();
+            memory
+                .import_mapping(0x10000, PAGE_SIZE, mapping.clone())
+                .unwrap();
+        }
+        let mut registry = crate::parallel::Registry::default();
+        let a = first.parallel_view(&mut registry).unwrap();
+        let b = second.parallel_view(&mut Default::default()).unwrap();
+        assert_eq!(
+            a.hardware_page_info(0x10000).unwrap().storage_id,
+            b.hardware_page_info(0x10000).unwrap().storage_id
+        );
+        assert!(Arc::ptr_eq(&mapping.shared_page(), &page));
+        first.write(0x10000, &[43]).unwrap();
+        assert_eq!(second.read_array::<1>(0x10000).unwrap(), [43]);
     }
     #[test]
     fn imported_bytes_are_canonical_for_cpu_views_fork_and_retained_lifetimes() {

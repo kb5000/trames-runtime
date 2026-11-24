@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Owned native image planes shared by video, Vulkan and guest FD resources.
 use std::{io, sync::Arc};
+mod resource;
+pub use resource::*;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Format {
@@ -44,32 +46,46 @@ pub struct ImageInfo {
     pub size: u64,
 }
 pub struct Texture {
-    handle: usize,
+    handle: NativeHandle,
     _owner: Arc<dyn Send + Sync>,
 }
 impl Texture {
     /// # Safety
-    /// `handle` is a live MTLTexture. `owner` retains its storage and device;
+    /// `handle` is a live, correctly tagged native texture capability. `owner` retains its storage and device;
     /// both outlive every GPU use for which this Texture is retained.
-    pub unsafe fn retained(handle: usize, owner: Arc<dyn Send + Sync>) -> Self {
+    pub unsafe fn retained(handle: NativeHandle, owner: Arc<dyn Send + Sync>) -> Self {
         Self {
             handle,
             _owner: owner,
         }
     }
-    pub fn handle(&self) -> usize {
-        self.handle
+    pub fn native_handle(&self) -> NativeHandle {
+        self.handle.clone()
+    }
+    pub fn metal_handle(&self) -> io::Result<usize> {
+        self.handle.metal_texture()
     }
 }
 /// # Safety
 /// Implementations own all native storage. Info describes the actual row-linear
-/// plane, and textures alias that storage on the supplied retained Metal device.
+/// plane. Native exports alias the same owned bytes on the requested platform;
+/// unsupported formats/devices fail explicitly, without pointer reinterpretation.
 /// No guest pointer or descriptor-table borrow may be retained by an Image.
 pub unsafe trait Image: Send + Sync {
     fn info(&self) -> ImageInfo;
     /// # Safety
-    /// `device` is a live id<MTLDevice> for the duration of this call.
-    unsafe fn metal_texture(&self, device: usize) -> io::Result<Arc<Texture>>;
+    /// `device` contains live platform handles retained by the caller throughout
+    /// this call. A successful result independently retains its native resources.
+    unsafe fn native_texture(&self, _device: NativeDevice) -> io::Result<Arc<Texture>> {
+        Err(io::Error::from_raw_os_error(95))
+    }
+    fn shared_mapping(&self) -> Option<trames_memory::SharedMapping> {
+        None
+    }
+    #[cfg(unix)]
+    fn dma_buf(&self) -> io::Result<Arc<DmaBuf>> {
+        Err(io::Error::from_raw_os_error(95))
+    }
     fn cpu_pages(
         &self,
         _offset: u64,
@@ -90,8 +106,10 @@ pub trait ImageFds: Send + Sync {
     fn insert(&self, image: Arc<dyn Image>) -> io::Result<u32>;
     fn close(&self, fd: u32);
 }
-#[cfg(target_vendor = "apple")]
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
 mod cpu;
+#[cfg(target_os = "linux")]
+mod linux;
 mod native;
 pub use native::Context;
 #[cfg(target_vendor = "apple")]

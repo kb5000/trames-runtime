@@ -83,6 +83,8 @@ impl Drop for Instance {
     }
 }
 struct Device {
+    #[cfg_attr(target_vendor = "apple", allow(dead_code))]
+    physical: vk::PhysicalDevice,
     queue_families: Vec<u32>,
     metal_device: usize,
     external_image_memory_types: u32,
@@ -173,6 +175,7 @@ impl Drop for ObjectLease {
     }
 }
 struct Object {
+    host_import: Cell<bool>,
     external: RefCell<Option<Box<external::Resource>>>,
     host_allocation: RefCell<Option<Arc<shared_memory::Allocation>>>,
     kind: Kind,
@@ -631,6 +634,7 @@ impl Backend {
     }
     fn put(&mut self, kind: Kind, raw: u64, deps: Vec<Rc<Object>>, size: u64, flags: u32) -> u64 {
         let object = Rc::new(Object {
+            host_import: Cell::new(false),
             external: RefCell::new(None),
             host_allocation: Default::default(),
             kind,
@@ -944,6 +948,7 @@ impl Backend {
         let d = &device.native;
         let raw = unsafe { d.create_fence(&vk::FenceCreateInfo::default(), None) }?;
         let fence = Rc::new(Object {
+            host_import: Cell::new(false),
             external: RefCell::new(None),
             host_allocation: Default::default(),
             kind: Kind::Fence,
@@ -1887,6 +1892,7 @@ impl Backend {
                 }
                 .limits;
                 self.device = Some(Arc::new(Device {
+                    physical: self.physical,
                     queue_families: families,
                     metal_device,
                     external_image_memory_types,
@@ -2115,13 +2121,21 @@ impl Backend {
                 } else {
                     return unsupported();
                 };
-                let info = vk::BufferCreateInfo::default()
+                let usage = vk::BufferUsageFlags::from_raw(a[2] as u32);
+                let host_import = shared_memory::host_buffer_importable(&dev, usage);
+                let mut external = vk::ExternalMemoryBufferCreateInfo::default()
+                    .handle_types(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
+                let mut info = vk::BufferCreateInfo::default()
                     .size(a[1])
                     .usage(vk::BufferUsageFlags::from_raw(a[2] as u32))
                     .sharing_mode(vk::SharingMode::from_raw(a[4] as i32))
                     .queue_family_indices(&families);
+                if host_import {
+                    info = info.push_next(&mut external);
+                }
                 let raw = unsafe { d.create_buffer(&info, None) }?;
                 let id = self.put(Kind::Buffer, raw.as_raw(), vec![], a[1], a[2] as u32);
+                self.objects[&id].host_import.set(host_import);
                 write(m, a[3], &id.to_le_bytes())?;
             }
             12 => {
@@ -2191,6 +2205,9 @@ impl Backend {
                     vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
                 ) && (a[5] == 0
                     || dev.host_alignment != 0 && a[1].is_multiple_of(dev.host_alignment))
+                    && dedicated_object
+                        .as_ref()
+                        .is_some_and(|o| o.host_import.get())
                 {
                     if let Some(Ok((raw, owner))) =
                         self.allocate_shared(&dev, a[1], a[2] as u32, a[4] as u32, shared_dedicated)

@@ -58,6 +58,7 @@ impl Bytes {
     }
 }
 pub struct MutablePage {
+    resource: Option<std::sync::Arc<crate::SharedMapping>>,
     external_revision: Option<std::sync::Arc<AtomicU64>>,
     pub(crate) identity: u64,
     pub(crate) version: AtomicU64,
@@ -230,6 +231,13 @@ impl MutablePage {
                 _owner,
                 mapping: Some((base, length)),
             } => Some(crate::SharedMapping {
+                pages: self
+                    .resource
+                    .as_ref()
+                    .map(|m| m.pages.clone())
+                    .unwrap_or_default(),
+                #[cfg(unix)]
+                file_alias: self.resource.as_ref().and_then(|m| m.file_alias.clone()),
                 external_revision: self.external_revision.clone(),
                 base: *base,
                 length: *length,
@@ -306,15 +314,18 @@ impl MutablePage {
     /// Same initialized-storage and foreign-access contract as from_shared_mapping.
     pub unsafe fn from_resource_mapping(mapping: crate::SharedMapping) -> Self {
         let revision = mapping.external_revision.clone();
-        let mut page = unsafe {
-            Self::from_shared_mapping(
-                mapping.allocation_pointer(),
-                mapping.allocation_len(),
-                mapping.allocation_offset(),
-                mapping,
-            )
-        };
+        let resource = std::sync::Arc::new(mapping);
+        assert!(resource
+            .allocation_offset()
+            .checked_add(PAGE)
+            .is_some_and(|end| end <= resource.allocation_len()));
+        let mut page = Self::with_storage(Bytes::External {
+            pointer: resource.pointer() as usize,
+            _owner: resource.clone(),
+            mapping: Some((resource.base, resource.length)),
+        });
         page.external_revision = revision;
+        page.resource = Some(resource);
         page
     }
     /// Move a coordinator allocation into the shared byte domain without copying.
@@ -460,6 +471,7 @@ impl MutablePage {
     fn with_storage(bytes: Bytes) -> Self {
         let unmaterialized = matches!(&bytes, Bytes::Zero(storage) if storage.get().is_none());
         Self {
+            resource: None,
             external_revision: None,
             unmaterialized: AtomicBool::new(unmaterialized),
             bytes: UnsafeCell::new(bytes),

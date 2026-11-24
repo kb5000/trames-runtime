@@ -128,7 +128,10 @@ mod tests {
                 size: 64,
             }
         }
-        unsafe fn metal_texture(&self, _: usize) -> io::Result<Arc<trames_graphics::Texture>> {
+        unsafe fn native_texture(
+            &self,
+            _: trames_graphics::NativeDevice,
+        ) -> io::Result<Arc<trames_graphics::Texture>> {
             Err(io::Error::from_raw_os_error(95))
         }
     }

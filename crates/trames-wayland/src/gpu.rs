@@ -6,13 +6,13 @@ use std::{io, sync::Arc};
 
 /// # Safety
 /// Implementors own the native image, memory and completion primitive through
-/// final GPU/UI use. A nonzero Metal pointer is a live MTLTexture until the last
-/// Arc is released. ready() is nonblocking and safe on the compositor thread;
+/// final GPU/UI use. Native handles retain their actual platform type; native
+/// storage remains live until the final scene/UI lease is released. ready() is nonblocking and safe on the compositor thread;
 /// it proves producer writes complete before the UI submits any texture reads.
 /// Dropping a queued capability must not destroy in-flight native resources.
 pub unsafe trait GpuImage: Send + Sync {
     fn dimensions(&self) -> (u32, u32);
-    fn metal_texture(&self) -> usize;
+    fn native_handle(&self) -> trames_graphics::NativeHandle;
     fn ready(&self) -> io::Result<bool>;
     /// Whether the native plane carries premultiplied alpha. RGBX producers
     /// remain opaque even when their native texture has an unused alpha lane.

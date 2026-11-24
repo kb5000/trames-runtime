@@ -10,6 +10,11 @@ use std::sync::{
 /// import complete host granules without moving bytes observed by a presenter.
 #[derive(Clone)]
 pub struct SharedMapping {
+    pub(crate) pages: std::sync::Arc<
+        Mutex<std::collections::BTreeMap<usize, std::sync::Weak<crate::SharedPage>>>,
+    >,
+    #[cfg(unix)]
+    pub(crate) file_alias: Option<FileAlias>,
     pub(crate) external_revision: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     pub(crate) base: usize,
     pub(crate) length: usize,
@@ -30,6 +35,9 @@ impl SharedMapping {
     ) -> Self {
         assert!(!base.is_null() && length >= crate::PAGE_SIZE as usize);
         Self {
+            pages: Default::default(),
+            #[cfg(unix)]
+            file_alias: None,
             external_revision: None,
             base: base as usize,
             length,
@@ -37,8 +45,27 @@ impl SharedMapping {
             _owner: std::sync::Arc::new(owner),
         }
     }
+    /// Retain an additional native API lease without replacing byte ownership.
+    pub fn retaining(mut self, owner: impl Send + Sync + 'static) -> Self {
+        self._owner = std::sync::Arc::new((self._owner, owner));
+        self
+    }
     pub fn allocation_pointer(&self) -> *mut u8 {
         self.base as *mut u8
+    }
+    /// Reuse the original byte-borrow domain across resource aliases and mms.
+    /// The cache holds only weak pages; page owners retain the allocation.
+    pub fn shared_page(&self) -> std::sync::Arc<crate::SharedPage> {
+        assert!(self.offset.is_multiple_of(crate::PAGE_SIZE as usize));
+        let mut pages = self.pages.lock().unwrap();
+        if let Some(page) = pages.get(&self.offset).and_then(std::sync::Weak::upgrade) {
+            return page;
+        }
+        // SAFETY: this capability already retains a complete initialized page.
+        let page =
+            std::sync::Arc::new(unsafe { crate::SharedPage::from_resource_mapping(self.clone()) });
+        pages.insert(self.offset, std::sync::Arc::downgrade(&page));
+        page
     }
     /// Optional code-version publication by an external device at its original
     /// synchronization boundaries. Data loads/stores never inspect this token.
@@ -68,6 +95,70 @@ impl SharedMapping {
         })
     }
 }
+
+#[cfg(unix)]
+#[derive(Clone)]
+pub(crate) struct FileAlias {
+    pub(crate) descriptor: std::sync::Arc<std::os::fd::OwnedFd>,
+    pub(crate) offset: u64,
+}
+#[cfg(unix)]
+impl SharedMapping {
+    /// Attach an independently retained, byte-identical shared-file mapping.
+    /// The offset describes allocation_pointer(), before allocation_offset().
+    ///
+    /// # Safety
+    /// MAP_SHARED at descriptor/offset denotes exactly these original bytes.
+    /// The owner prevents shrink/replacement for every retained alias. Original
+    /// page/backing identity and foreign-device synchronization remain shared;
+    /// this capability never authorizes guest descriptors or opaque GPU handles.
+    pub unsafe fn with_file_descriptor(
+        mut self,
+        descriptor: std::sync::Arc<std::os::fd::OwnedFd>,
+        offset: u64,
+    ) -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd;
+        if self
+            .pages
+            .lock()
+            .unwrap()
+            .values()
+            .any(|page| page.strong_count() != 0)
+        {
+            return Err(std::io::Error::from_raw_os_error(libc::EBUSY));
+        }
+        let granule = crate::host_mapping_granule();
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if !self.base.is_multiple_of(granule)
+            || !self.length.is_multiple_of(granule)
+            || !offset.is_multiple_of(granule as u64)
+        {
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        if unsafe { libc::fstat(descriptor.as_raw_fd(), &mut stat) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if stat.st_size < 0
+            || offset
+                .checked_add(self.length as u64)
+                .is_none_or(|end| end > stat.st_size as u64)
+        {
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        self.file_alias = Some(FileAlias { descriptor, offset });
+        Ok(self)
+    }
+    pub fn file_descriptor(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        use std::os::fd::AsFd;
+        self.file_alias.as_ref().map(|file| file.descriptor.as_fd())
+    }
+    pub fn file_offset(&self) -> Option<u64> {
+        self.file_alias.as_ref().map(|file| file.offset)
+    }
+}
+#[cfg(target_os = "linux")]
+#[path = "hardware_shared/file.rs"]
+mod file;
 
 /// A complete stable initialized RW guest page, with scoped host ownership.
 ///

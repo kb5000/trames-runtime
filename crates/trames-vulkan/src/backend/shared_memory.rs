@@ -3,7 +3,9 @@
 //! Generic Vulkan memory stays driver-owned so image/buffer aliases keep their
 //! original layout and storage. Guest views retain the actual native owner.
 use super::*;
-use std::alloc::{alloc_zeroed, dealloc, Layout};
+use std::alloc::Layout;
+#[cfg(not(target_os = "linux"))]
+use std::alloc::{alloc_zeroed, dealloc};
 pub(super) const MAP_SHARED: u64 = 0x5348_4152_4544;
 
 /// Only generic coherent driver allocations can acquire implementation padding.
@@ -35,7 +37,10 @@ pub(super) struct Allocation {
     budget: crate::Budget,
 }
 enum Storage {
+    #[cfg(not(target_os = "linux"))]
     Host(Layout),
+    #[cfg(target_os = "linux")]
+    File(trames_memory::SharedMapping),
     Native {
         memory: vk::DeviceMemory,
         device: Arc<Device>,
@@ -50,25 +55,44 @@ impl Allocation {
             .ok()
             .and_then(|n| n.checked_next_multiple_of(align))
             .ok_or(Failure::Vk(vk::Result::ERROR_OUT_OF_HOST_MEMORY))?;
-        let layout = Layout::from_size_align(size, align)
+        let _layout = Layout::from_size_align(size, align)
             .map_err(|_| Failure::Vk(vk::Result::ERROR_OUT_OF_HOST_MEMORY))?;
         if !budget.reserve(size as u64) {
             return Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY.into());
         }
-        // SAFETY: a valid bounded layout; zero initialization supplies every
-        // exported padding page as well as the guest-visible allocation bytes.
-        let pointer = unsafe { alloc_zeroed(layout) } as usize;
-        if pointer == 0 {
-            budget.release(size as u64);
-            return Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY.into());
+        #[cfg(target_os = "linux")]
+        {
+            let mapping = match trames_memory::SharedMapping::anonymous_file(size, align) {
+                Ok(m) => m,
+                Err(_) => {
+                    budget.release(size as u64);
+                    return Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY.into());
+                }
+            };
+            Ok(Arc::new(Self {
+                revision: Arc::default(),
+                pointer: mapping.allocation_pointer() as usize,
+                length: mapping.allocation_len(),
+                storage: Storage::File(mapping),
+                budget: budget.clone(),
+            }))
         }
-        Ok(Arc::new(Self {
-            revision: Arc::default(),
-            pointer,
-            length: layout.size(),
-            storage: Storage::Host(layout),
-            budget: budget.clone(),
-        }))
+        #[cfg(not(target_os = "linux"))]
+        {
+            // SAFETY: valid bounded native allocation; initialized padding remains owned.
+            let pointer = unsafe { alloc_zeroed(_layout) } as usize;
+            if pointer == 0 {
+                budget.release(size as u64);
+                return Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY.into());
+            }
+            Ok(Arc::new(Self {
+                revision: Arc::default(),
+                pointer,
+                length: _layout.size(),
+                storage: Storage::Host(_layout),
+                budget: budget.clone(),
+            }))
+        }
     }
     /// Transfer the original allocation/mapping and its existing budget charge.
     ///
@@ -102,6 +126,14 @@ impl Allocation {
         self.length
     }
     pub(super) fn mapping(self: &Arc<Self>, offset: usize) -> Option<trames_memory::SharedMapping> {
+        #[cfg(target_os = "linux")]
+        if let Storage::File(mapping) = &self.storage {
+            return mapping
+                .clone()
+                .retaining(self.clone())
+                .with_external_revision(self.revision.clone())
+                .with_offset(offset);
+        }
         // SAFETY: the allocation is initialized stable host storage. Both native
         // Vulkan objects and all guest mappings retain its Arc. Vulkan keeps its
         // original application-owned CPU/GPU synchronization requirements.
@@ -118,7 +150,10 @@ impl Drop for Allocation {
         // Native mappings keep both device and instance alive until this point.
         unsafe {
             match &self.storage {
+                #[cfg(not(target_os = "linux"))]
                 Storage::Host(layout) => dealloc(self.pointer(), *layout),
+                #[cfg(target_os = "linux")]
+                Storage::File(_) => {}
                 Storage::Native { memory, device } => {
                     device.native.unmap_memory(*memory);
                     device.native.free_memory(*memory, None);
@@ -127,6 +162,29 @@ impl Drop for Allocation {
         }
         self.budget.release(self.length as u64);
     }
+}
+
+pub(super) fn host_buffer_importable(dev: &Device, usage: vk::BufferUsageFlags) -> bool {
+    if dev.host_alignment == 0 {
+        return false;
+    }
+    let info = vk::PhysicalDeviceExternalBufferInfo::default()
+        .usage(usage)
+        .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
+    let mut props = vk::ExternalBufferProperties::default();
+    unsafe {
+        dev.instance
+            .native
+            .get_physical_device_external_buffer_properties(dev.physical, &info, &mut props)
+    };
+    props
+        .external_memory_properties
+        .external_memory_features
+        .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+        && props
+            .external_memory_properties
+            .compatible_handle_types
+            .contains(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT)
 }
 
 impl Backend {

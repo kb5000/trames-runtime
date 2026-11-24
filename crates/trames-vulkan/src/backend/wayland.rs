@@ -44,6 +44,7 @@ struct NativeImage {
     device: Arc<Device>,
     image: vk::Image,
     memory: vk::DeviceMemory,
+    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     texture: usize,
     width: u32,
     height: u32,
@@ -96,8 +97,22 @@ unsafe impl GpuImage for Frame {
     fn dimensions(&self) -> (u32, u32) {
         (self.image.width, self.image.height)
     }
-    fn metal_texture(&self) -> usize {
-        self.image.texture
+    fn native_handle(&self) -> trames_graphics::NativeHandle {
+        #[cfg(target_vendor = "apple")]
+        {
+            trames_graphics::NativeHandle::MetalTexture(self.image.texture)
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            trames_graphics::NativeHandle::VulkanImage(trames_graphics::VulkanImage {
+                instance: self.image.device.instance.native.handle().as_raw(),
+                physical: self.image.device.physical.as_raw(),
+                device: self.image.device.native.handle().as_raw(),
+                image: self.image.image.as_raw(),
+                format: self.image.format.as_raw() as u32,
+                layout: vk::ImageLayout::GENERAL.as_raw() as u32,
+            })
+        }
     }
     fn ready(&self) -> io::Result<bool> {
         self.completion

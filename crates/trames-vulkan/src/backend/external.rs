@@ -239,11 +239,18 @@ impl Backend {
         let raw = {
             // SAFETY: Device owns this MTLDevice throughout the call; the image
             // creates an independently retained texture/storage/device lease.
-            let texture = unsafe { native.metal_texture(device.metal_device) }
-                .map_err(|_| vk::Result::ERROR_INVALID_EXTERNAL_HANDLE)?;
+            let texture = unsafe {
+                native.native_texture(trames_graphics::NativeDevice::Metal(device.metal_device))
+            }
+            .map_err(|_| vk::Result::ERROR_INVALID_EXTERNAL_HANDLE)?;
             let mut import = vk::ImportMetalTextureInfoEXT::default()
                 .plane(vk::ImageAspectFlags::COLOR)
-                .mtl_texture(texture.handle() as _);
+                .mtl_texture(
+                    texture
+                        .metal_handle()
+                        .map_err(|_| vk::Result::ERROR_INVALID_EXTERNAL_HANDLE)?
+                        as _,
+                );
             let mut list = vk::ImageFormatListCreateInfo::default();
             let mut create = vk::ImageCreateInfo::default()
                 .push_next(&mut import)

@@ -50,8 +50,8 @@ unsafe impl GpuImage for Lease {
         let info = self.image.info();
         (info.width, info.height)
     }
-    fn metal_texture(&self) -> usize {
-        self.texture.handle()
+    fn native_handle(&self) -> trames_graphics::NativeHandle {
+        self.texture.native_handle()
     }
     fn ready(&self) -> io::Result<bool> {
         Ok(true)
