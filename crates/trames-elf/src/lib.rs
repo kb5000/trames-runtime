@@ -366,7 +366,11 @@ fn map_image(
             }
             if start < end {
                 memory.write(s.base, &bytes[start..end])?;
-                if start <= phoff && phend <= end {
+                // Keep the first surviving complete header mapping. Later
+                // PT_LOADs can expose the same file-page prefix at another
+                // virtual address; that alias has a different load bias and
+                // must not replace the main image's AT_PHDR.
+                if phdr.is_none() && start <= phoff && phend <= end {
                     phdr = Some(s.base + (phoff - start) as u64);
                 }
             }
@@ -459,6 +463,66 @@ mod tests {
         assert_eq!(u64::from_str_radix(start, 16), Ok(0x1000));
         assert_eq!(u64::from_str_radix(end, 16), Ok(0x2000));
         assert_eq!(maps.matches("/image").count(), 1);
+    }
+
+    #[test]
+    fn pie_program_headers_keep_the_original_mapping_with_file_page_aliases() {
+        const DYNAMIC_BASE: u64 = 0x4000_0000;
+        let mut main = image();
+        main.resize(0x1000, 0);
+        main[16..18].copy_from_slice(&3u16.to_le_bytes());
+        main[24..32].copy_from_slice(&0x4600u64.to_le_bytes());
+        main[56..58].copy_from_slice(&6u16.to_le_bytes());
+        // Like the Android HAL launcher: distinct 16-KiB-aligned PT_LOADs
+        // all have file offsets in the first 4-KiB page. Their page prefixes
+        // contain complete aliases of the program header table.
+        let headers = [
+            (
+                6u32,
+                4u32,
+                0x40u64,
+                0x40u64,
+                6 * PH_SIZE as u64,
+                6 * PH_SIZE as u64,
+                8u64,
+            ),
+            (3, 4, 0x300, 0x300, 16, 16, 1),
+            (1, 4, 0, 0, 0x600, 0x600, 0x4000),
+            (1, 5, 0x600, 0x4600, 0x200, 0x200, 0x4000),
+            (1, 6, 0x800, 0x8800, 0x200, 0x1800, 0x4000),
+            (2, 6, 0x800, 0x8800, 0x100, 0x100, 8),
+        ];
+        for (i, (kind, flags, offset, address, filesz, memsz, align)) in
+            headers.into_iter().enumerate()
+        {
+            let pos = EH_SIZE + i * PH_SIZE;
+            main[pos..pos + 4].copy_from_slice(&kind.to_le_bytes());
+            main[pos + 4..pos + 8].copy_from_slice(&flags.to_le_bytes());
+            for (field, value) in [
+                (8, offset),
+                (16, address),
+                (24, address),
+                (32, filesz),
+                (40, memsz),
+                (48, align),
+            ] {
+                main[pos + field..pos + field + 8].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        main[0x300..0x310].copy_from_slice(b"/lib/ld-test.so\0");
+        main[0x800..0x808].copy_from_slice(&1u64.to_le_bytes());
+        let mut loader = image();
+        loader[16..18].copy_from_slice(&3u16.to_le_bytes());
+        let loaded =
+            load_with_interpreter(&main, 16 * PAGE_SIZE as usize, |_| Ok(loader.clone())).unwrap();
+        assert_eq!(loaded.phdr, Some(DYNAMIC_BASE + 0x40));
+        // Preserve the mmap-visible prefixes: fixing auxv must not remove them.
+        for address in [DYNAMIC_BASE, DYNAMIC_BASE + 0x4000, DYNAMIC_BASE + 0x8000] {
+            assert_eq!(loaded.memory.read_array::<4>(address).unwrap(), *b"\x7fELF");
+        }
+        let load_bias = loaded.phdr.unwrap() - 0x40;
+        assert_eq!(load_bias, DYNAMIC_BASE);
+        assert_eq!(loaded.memory.read_u64(load_bias + 0x8800).unwrap(), 1);
     }
 
     #[test]
