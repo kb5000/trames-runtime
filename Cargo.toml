@@ -29,7 +29,7 @@ version = "1.3.0"
 edition = "2021"
 rust-version = "1.101"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/kb5000/trames-runtime"
+repository = "https://github.com/project-trames/trames-runtime"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
