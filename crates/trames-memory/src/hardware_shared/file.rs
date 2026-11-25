@@ -95,7 +95,8 @@ mod tests {
         let file = trames_shared::SharedFile::anonymous().unwrap();
         file.set_len(8192).unwrap();
         let mapping = file.map(4096, 4096).unwrap();
-        let mapping = SharedMapping::from_shared_file(mapping);
+        // SAFETY: this test owns the inode and uses only logical SharedFile resize.
+        let mapping = unsafe { SharedMapping::from_shared_file(mapping) };
         assert!(mapping.file_geometry_owned());
         assert_eq!(
             mapping.file_offset().unwrap() + mapping.allocation_offset() as u64,

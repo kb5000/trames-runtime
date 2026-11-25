@@ -822,6 +822,32 @@ mod tests {
         );
     }
     #[test]
+    fn physical_aliases_keep_high_window_offsets_and_reject_composite_or_foreign_files() {
+        let page = host_page();
+        let file = SharedFile::anonymous().unwrap();
+        file.write_at((WINDOW + page + 19) as u64, b"x").unwrap();
+        let high = file.map(WINDOW + page, page).unwrap();
+        let (fd, offset) = high.file_alias().unwrap();
+        let original = File::from(fd.try_clone_to_owned().unwrap());
+        assert_eq!(offset + high.allocation_offset() as u64, page as u64);
+        let mut byte = [0];
+        original.read_exact_at(&mut byte, page as u64 + 19).unwrap();
+        assert_eq!(byte, *b"x");
+        let composite = file.map(WINDOW - page, 2 * page).unwrap();
+        assert!(composite.file_alias().is_none());
+        drop(file);
+        drop(original);
+        // The actual distant inode outlives the logical file handle.
+        let original = File::from(high.file_alias().unwrap().0.try_clone_to_owned().unwrap());
+        original.read_exact_at(&mut byte, page as u64 + 19).unwrap();
+        assert_eq!(byte, *b"x");
+        let foreign = anonymous_file().unwrap();
+        foreign.set_len(page as u64).unwrap();
+        let imported = SharedFile::import(foreign.into()).unwrap();
+        assert!(imported.map(0, page).unwrap().file_alias().is_none());
+    }
+
+    #[test]
     fn sparse_charges_coalesce_overlaps_and_failed_operations_refund_quota() {
         let page = host_page();
         let budget = SharedBudget::new(7 * page);

@@ -113,7 +113,13 @@ impl SharedMapping {
     /// Retain the original mapped file's bytes and its typed physical-lifetime
     /// guarantee. Mapping construction already proves geometry; no new syscall,
     /// descriptor duplication or file-size validation is needed per guest page.
-    pub fn from_shared_file(mapping: trames_shared::Mapping) -> Self {
+    ///
+    /// # Safety
+    /// Native consumers of exported descriptors must not physically shrink the
+    /// inode for this capability's lifetime. SharedFile's logical set_len keeps
+    /// that invariant; arbitrary host ftruncate calls do not. Original byte
+    /// access and native device synchronization remain the provider's duty.
+    pub unsafe fn from_shared_file(mapping: trames_shared::Mapping) -> Self {
         let alias = mapping.file_alias().map(|(_, offset)| FileAlias {
             descriptor: FileDescriptor::Shared(mapping.clone()),
             offset,

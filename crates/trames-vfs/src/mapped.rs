@@ -51,7 +51,10 @@ impl PageStorage {
         // Keep the original file/offset contract as well as its byte ownership.
         // CPU and hardware executors share this same SharedPage guard domain.
         Self::Published {
-            bytes: trames_memory::SharedMapping::from_shared_file(map).shared_page(),
+            // SAFETY: the VFS owns physical geometry. Guest truncate changes
+            // logical EOF through SharedFile. Native descriptor consumers keep
+            // their existing no-physical-shrink and device synchronization duty.
+            bytes: unsafe { trames_memory::SharedMapping::from_shared_file(map) }.shared_page(),
             shared: true,
         }
     }
