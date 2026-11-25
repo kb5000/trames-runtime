@@ -21,6 +21,9 @@ zip = { version = "=9.5.1", default-features = false, features = ["deflate-flate
 [lints]
 workspace = true
 
+[dev-dependencies]
+trames-vfs = { path = "../trames-vfs", features = ["hostfs"] }
+
 [build-dependencies]
 sha2 = "=0.10.9"
 serde_json = "=1.0.151"

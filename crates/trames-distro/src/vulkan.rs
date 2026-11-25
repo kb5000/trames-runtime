@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Install app-owned graphics/video libraries before guest startup.
-use crate::{Error, Vfs, AT_FDCWD};
+use crate::{Errno, Error, Vfs, AT_FDCWD};
 use std::{
     io::Read,
     sync::atomic::{AtomicU64, Ordering},
@@ -112,6 +112,17 @@ fn replace(vfs: &mut Vfs, path: &[u8], bytes: &[u8]) -> Result<bool, Error> {
             return Ok(false);
         }
     }
+    // SDK paths belong to the caller's current mount/chroot namespace. The
+    // embedding import API addresses private storage and cannot install into a
+    // host grant, mounted filesystem or directory alias.
+    for index in 1..path.len() {
+        if path[index] == b'/' {
+            match vfs.mkdir_at(AT_FDCWD, &path[..index], 0o755) {
+                Ok(()) | Err(Errno(17)) => (),
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
     let mut staging = None;
     for _ in 0..128 {
         let mut candidate = path.to_vec();
@@ -122,19 +133,33 @@ fn replace(vfs: &mut Vfs, path: &[u8], bytes: &[u8]) -> Result<bool, Error> {
             )
             .as_bytes(),
         );
-        match vfs.stat_at_flags(AT_FDCWD, &candidate, true) {
-            Err(error) if error.0 == 2 => {
-                staging = Some(candidate);
+        match vfs.open_at(AT_FDCWD, &candidate, 0xc1, 0o644) {
+            Ok(fd) => {
+                staging = Some((candidate, fd));
                 break;
             }
+            Err(Errno(17)) => (),
             Err(error) => return Err(error.into()),
-            Ok(_) => {}
         }
     }
-    let staging = staging.ok_or(Error::Invalid("Vulkan staging names exhausted"))?;
-    let mut reader = bytes;
-    vfs.import_reader(&staging, &mut reader, false)?;
-    let result = vfs.rename_at(AT_FDCWD, &staging, AT_FDCWD, path, 0);
+    let (staging, fd) = staging.ok_or(Error::Invalid("Vulkan staging names exhausted"))?;
+    let written: Result<(), Errno> = (|| {
+        for chunk in bytes.chunks(65536) {
+            let mut remaining = chunk;
+            while !remaining.is_empty() {
+                let count = vfs.write(fd, remaining)?;
+                if count == 0 {
+                    return Err(Errno(5));
+                }
+                remaining = &remaining[count..];
+            }
+        }
+        vfs.sync_fd(fd, false)
+    })();
+    let closed = vfs.close(fd);
+    let result = written
+        .and(closed)
+        .and_then(|()| vfs.rename_at(AT_FDCWD, &staging, AT_FDCWD, path, 0));
     if result.is_err() {
         let _ = vfs.unlink_at(AT_FDCWD, &staging, false);
     }
@@ -156,6 +181,60 @@ mod tests {
         let mut bytes = Vec::new();
         vfs.export_writer(path, &mut bytes).unwrap();
         bytes
+    }
+    #[test]
+    fn sdk_installers_follow_host_mount_chroot_and_directory_aliases() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Scratch(std::env::temp_dir().join(format!(
+            "trames-sdk-namespace-{}-{}",
+            std::process::id(),
+            NEXT_STAGING.fetch_add(1, Ordering::Relaxed)
+        )));
+        std::fs::create_dir(&root.0).unwrap();
+        std::fs::create_dir_all(root.0.join("assets/lib")).unwrap();
+        std::fs::write(root.0.join("assets/lib/user-data"), b"keep").unwrap();
+        symlink("assets", root.0.join("usr")).unwrap();
+        let mut vfs = Vfs::default();
+        vfs.mkdir_at(AT_FDCWD, b"/guest", 0o755).unwrap();
+        vfs.mount_host(b"/guest", &root.0, false).unwrap();
+        vfs.chroot(b"/guest").unwrap();
+        vfs.chdir(b"/").unwrap();
+        let bytes = library();
+        assert!(install_vulkan_icd(&mut bytes.as_slice(), &mut vfs).unwrap());
+        let path = root.0.join("assets/lib/libtrames_vulkan_icd.so");
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read(root.0.join("assets/share/vulkan/icd.d/trames.json")).unwrap(),
+            JSON
+        );
+        assert!(!install_vulkan_icd(&mut bytes.as_slice(), &mut vfs).unwrap());
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        assert!(install_zink_egl(&mut bytes.as_slice(), &mut vfs).unwrap());
+        assert!(install_vaapi_driver(&mut bytes.as_slice(), &mut vfs).unwrap());
+        assert!(install_video_codec(&mut bytes.as_slice(), &mut vfs, "libavcodec.so.61").unwrap());
+        assert_eq!(
+            std::fs::read(root.0.join("assets/local/lib/libEGL.so.1")).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            std::fs::read(root.0.join("assets/local/lib/dri/trames_drv_video.so")).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            std::fs::read(root.0.join("assets/local/lib/libavcodec.so.61")).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            std::fs::read(root.0.join("assets/lib/user-data")).unwrap(),
+            b"keep"
+        );
     }
     #[test]
     fn refreshes_old_instance_manifest_without_replacing_identical_library() {
