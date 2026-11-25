@@ -91,6 +91,35 @@ impl SharedMapping {
 mod tests {
     use super::*;
     #[test]
+    fn owned_file_alias_retains_original_bytes_across_logical_truncate() {
+        let file = trames_shared::SharedFile::anonymous().unwrap();
+        file.set_len(8192).unwrap();
+        let mapping = file.map(4096, 4096).unwrap();
+        let mapping = SharedMapping::from_shared_file(mapping);
+        assert!(mapping.file_geometry_owned());
+        assert_eq!(
+            mapping.file_offset().unwrap() + mapping.allocation_offset() as u64,
+            4096
+        );
+        let page = mapping.shared_page();
+        let exported = unsafe {
+            page.export_hardware_with_mapping(
+                |_| panic!("owned file bytes must not move"),
+                |mapping| {
+                    assert!(mapping.file_descriptor().is_some() && mapping.file_geometry_owned());
+                    Err(crate::MemoryError::BackingIo(95))
+                },
+            )
+        };
+        assert!(exported.is_err());
+        page.copy_write(19, &[0x29]);
+        assert_eq!(file.read_at(4115, 1).unwrap(), [0x29]);
+        file.set_len(4096).unwrap();
+        let mut out = [0x77];
+        page.copy_read(19, &mut out);
+        assert_eq!(out, [0]);
+    }
+    #[test]
     fn fd_survives_page_capabilities_and_device_alignment_keeps_cpu_granules() {
         for alignment in [4096, 65536, 2 << 20] {
             let mapping = SharedMapping::anonymous_file(8192, alignment).unwrap();

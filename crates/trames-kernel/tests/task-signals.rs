@@ -5,6 +5,30 @@ use trames_memory::{Memory, Permissions, PAGE_SIZE};
 use trames_vfs::Errno;
 
 #[test]
+fn nonlocal_stack_unwinds_do_not_limit_later_signal_delivery() {
+    let mut memory = Memory::default();
+    memory.map(0x1000, 8 * PAGE_SIZE, Permissions::RW).unwrap();
+    let original = Aarch64State {
+        pc: 0x10000,
+        sp: 0x9000,
+        ..Default::default()
+    };
+    let action = Action {
+        handler: 0x20000,
+        ..Default::default()
+    };
+    let mut signals = Signals::default();
+    for _ in 0..32 {
+        // siglongjmp restores the caller stack without executing rt_sigreturn.
+        let mut state = original.clone();
+        signals
+            .enter(&mut state, &mut memory, 10, Info::default(), action)
+            .unwrap();
+        assert_eq!(state.pc, action.handler);
+    }
+}
+
+#[test]
 fn fork_and_exec_preserve_task_ownership_without_copying_pending_signals() {
     let parent = Signals {
         mask: 1 << 11,

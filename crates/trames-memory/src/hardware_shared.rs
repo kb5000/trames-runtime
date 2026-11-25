@@ -99,11 +99,45 @@ impl SharedMapping {
 #[cfg(unix)]
 #[derive(Clone)]
 pub(crate) struct FileAlias {
-    pub(crate) descriptor: std::sync::Arc<std::os::fd::OwnedFd>,
+    pub(crate) descriptor: FileDescriptor,
     pub(crate) offset: u64,
 }
 #[cfg(unix)]
+#[derive(Clone)]
+pub(crate) enum FileDescriptor {
+    Owned(std::sync::Arc<std::os::fd::OwnedFd>),
+    Shared(trames_shared::Mapping),
+}
+#[cfg(unix)]
 impl SharedMapping {
+    /// Retain the original mapped file's bytes and its typed physical-lifetime
+    /// guarantee. Mapping construction already proves geometry; no new syscall,
+    /// descriptor duplication or file-size validation is needed per guest page.
+    pub fn from_shared_file(mapping: trames_shared::Mapping) -> Self {
+        let alias = mapping.file_alias().map(|(_, offset)| FileAlias {
+            descriptor: FileDescriptor::Shared(mapping.clone()),
+            offset,
+        });
+        let offset = mapping.allocation_offset();
+        // SAFETY: Mapping retains the complete stable, initialized allocation.
+        let mut resource = unsafe {
+            Self::from_allocation(
+                mapping.allocation_pointer(),
+                mapping.allocation_len(),
+                mapping,
+            )
+        };
+        resource.offset = offset;
+        resource.file_alias = alias;
+        resource
+    }
+    /// The typed SharedFile owner controls physical size for the whole lease;
+    /// logical truncate cannot invalidate any retained hardware alias.
+    pub fn file_geometry_owned(&self) -> bool {
+        self.file_alias
+            .as_ref()
+            .is_some_and(|alias| matches!(&alias.descriptor, FileDescriptor::Shared(_)))
+    }
     /// Attach an independently retained, byte-identical shared-file mapping.
     /// The offset describes allocation_pointer(), before allocation_offset().
     ///
@@ -145,12 +179,20 @@ impl SharedMapping {
         {
             return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
         }
-        self.file_alias = Some(FileAlias { descriptor, offset });
+        self.file_alias = Some(FileAlias {
+            descriptor: FileDescriptor::Owned(descriptor),
+            offset,
+        });
         Ok(self)
     }
     pub fn file_descriptor(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
         use std::os::fd::AsFd;
-        self.file_alias.as_ref().map(|file| file.descriptor.as_fd())
+        self.file_alias.as_ref().map(|file| match &file.descriptor {
+            FileDescriptor::Owned(descriptor) => descriptor.as_fd(),
+            FileDescriptor::Shared(mapping) => {
+                mapping.file_alias().expect("retained physical alias").0
+            }
+        })
     }
     pub fn file_offset(&self) -> Option<u64> {
         self.file_alias.as_ref().map(|file| file.offset)

@@ -588,6 +588,8 @@ impl AsFd for SharedFile {
 struct Region {
     pointer: NonNull<u8>,
     length: usize,
+    file_offset: Option<u64>,
+    window: Option<Arc<File>>,
     _owner: Arc<Inner>,
 }
 // SAFETY: metadata is immutable; raw mapped bytes have no Rust references here.
@@ -626,6 +628,18 @@ impl Mapping {
     }
     pub fn allocation_offset(&self) -> usize {
         self.offset
+    }
+    /// Physical alias for an owned file whose retained storage never shrinks.
+    /// Logical EOF remains independent. Foreign files and composite windows do
+    /// not acquire this capability merely because they have a descriptor.
+    pub fn file_alias(&self) -> Option<(BorrowedFd<'_>, u64)> {
+        let offset = self.region.file_offset?;
+        let file = self
+            .region
+            .window
+            .as_deref()
+            .unwrap_or(&self.region._owner.file);
+        Some((file.as_fd(), offset))
     }
     /// # Safety
     /// The caller excludes overlapping CPU writers for the callback. No borrowed
@@ -739,7 +753,17 @@ mod tests {
         let file = SharedFile::anonymous().unwrap();
         file.write_at(0, &vec![9; 8192]).unwrap();
         let lease = file.map(0, 8192).unwrap();
+        let (physical, offset) = lease.file_alias().unwrap();
+        assert_eq!(offset, 0);
+        let physical_length = unsafe {
+            let mut stat: libc::stat = std::mem::zeroed();
+            assert_eq!(libc::fstat(physical.as_raw_fd(), &mut stat), 0);
+            stat.st_size
+        };
         file.set_len(3).unwrap();
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(physical.as_raw_fd(), &mut stat) }, 0);
+        assert_eq!(stat.st_size, physical_length);
         assert_eq!(file.len(), 3);
         assert!(file.capacity() >= 8192);
         assert_eq!(file.read_at(3, 8).unwrap(), []);

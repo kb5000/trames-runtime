@@ -48,18 +48,10 @@ impl PageStorage {
         }
     }
     fn mapped(map: trames_shared::Mapping) -> Self {
-        // SAFETY: the retained mapping covers one initialized guest page. CPU
-        // access uses SharedPage guards; raw GPU access retains its existing
-        // display-buffer ownership protocol.
+        // Keep the original file/offset contract as well as its byte ownership.
+        // CPU and hardware executors share this same SharedPage guard domain.
         Self::Published {
-            bytes: Arc::new(unsafe {
-                SharedPage::from_shared_mapping(
-                    map.allocation_pointer(),
-                    map.allocation_len(),
-                    map.allocation_offset(),
-                    map,
-                )
-            }),
+            bytes: trames_memory::SharedMapping::from_shared_file(map).shared_page(),
             shared: true,
         }
     }

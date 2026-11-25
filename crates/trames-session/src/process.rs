@@ -1848,10 +1848,6 @@ impl<C: Cpu> Kernel<C> {
         if disposition == trames_kernel::signal::Disposition::Ignore {
             return Ok(true);
         }
-        if p.signals.frames >= 8 {
-            self.exit(pid, p, 11);
-            return Ok(true);
-        }
         let interrupted = match p.state.clone() {
             State::PidfdWait(wait) => State::Blocked(wait.number, wait.args),
             other => other,

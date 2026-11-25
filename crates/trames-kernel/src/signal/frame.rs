@@ -122,7 +122,9 @@ impl FrameState {
         let size = records
             .as_ref()
             .map_or(FRAME_SIZE, |r| FRAME_SIZE.max(start + r.len()));
-        if self.frames >= 8 || !(1..=64).contains(&sig) {
+        // A nonlocal unwind can bypass rt_sigreturn. This diagnostic count is
+        // not a stack limit; the actual frame copy enforces guest stack access.
+        if !(1..=64).contains(&sig) {
             return Err(Errno(14));
         }
         let old_alt = self.alt_stack;
@@ -197,7 +199,7 @@ impl FrameState {
         );
         state.sp = sp;
         state.pc = action.handler;
-        self.frames += 1;
+        self.frames = self.frames.saturating_add(1);
         Ok(())
     }
     /// Validate optional extension records before the existing atomic base

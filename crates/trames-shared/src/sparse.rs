@@ -142,6 +142,8 @@ impl SharedFile {
         let region = Region {
             pointer: NonNull::new(ptr.cast()).expect("non-null mmap"),
             length: len,
+            file_offset: (self.0.owned && !across).then_some(at as u64),
+            window: backing,
             _owner: self.0.clone(),
         };
         if across {

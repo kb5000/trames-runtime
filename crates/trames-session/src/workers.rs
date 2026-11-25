@@ -1240,6 +1240,7 @@ trames_linux::IoAttempt::SocketCheckpoint(socket) => {
                             vm_checkpoint = true;
                         } else if let Some(epoch) = epoch.as_ref().filter(|epoch| epoch.source_session()) {
                             if matches!(outcome, Some(SliceOutcome::Yield { .. })) { yielded = true; }
+                            else if let Some(SliceOutcome::Fault(trames_engine::CpuFault::Host(error))) = &outcome { epoch.fail_execution(crate::RuntimeError::Backend(error.clone())); }
                             else { epoch.fail_execution(crate::RuntimeError::Arguments("unclassified source CPU failure")); }
                         } else {
                             #[cfg(all(test, trames_interpreter_conformance))]

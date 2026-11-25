@@ -197,7 +197,15 @@ fn signal_frame_failures_and_bad_sigreturn_finish_on_source_without_stopping_pee
             };
             words(&mut root, 0x4000, &code);
             if kind == 1 {
-                root.signals.frames = 8;
+                // Actual frame-copy failure, independent of nonlocal unwinds.
+                let page = (root.cpu.sp - 1) & !(trames_memory::PAGE_SIZE - 1);
+                root.memory
+                    .protect(
+                        page,
+                        trames_memory::PAGE_SIZE,
+                        trames_memory::Permissions::R,
+                    )
+                    .unwrap();
             } else if kind != 4 {
                 root.cpu.sp = 0;
             }
