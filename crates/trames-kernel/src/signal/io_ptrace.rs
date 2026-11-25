@@ -316,8 +316,9 @@ fn write_regset(
         for (value, src) in state.vectors.iter_mut().zip(bytes.chunks_exact(16)) {
             *value = u128::from_le_bytes(src.try_into().unwrap());
         }
-        state.fpsr = u32::from_le_bytes(bytes[512..516].try_into().unwrap()) & 0xf800009f;
-        state.fpcr = u32::from_le_bytes(bytes[516..520].try_into().unwrap()) & 0x07f79f00;
+        // Match Linux's complete FPSIMD user regset, including newer FP controls.
+        state.fpsr = u32::from_le_bytes(bytes[512..516].try_into().unwrap());
+        state.fpcr = u32::from_le_bytes(bytes[516..520].try_into().unwrap());
     }
     memory
         .write_array(
@@ -1561,6 +1562,16 @@ mod tests {
         assert_eq!(write_regset(&cpu, 1, 0x1000, &mut memory), Err(Errno(22)));
         memory.write_array(0x1008, 7u64.to_le_bytes()).unwrap();
         assert_eq!(write_regset(&cpu, 1, 0x1000, &mut memory), Err(Errno(22)));
+        memory.write_array(0x1008, 528u64.to_le_bytes()).unwrap();
+        memory
+            .write_array(0x1300, 0x0800009fu32.to_le_bytes())
+            .unwrap();
+        memory
+            .write_array(0x1304, 0x03c02007u32.to_le_bytes())
+            .unwrap();
+        let changed = write_regset(&cpu, 2, 0x1000, &mut memory).unwrap();
+        assert_eq!(changed.fpsr, 0x0800009f);
+        assert_eq!(changed.fpcr, 0x03c02007); // rounding, DN/FZ, EBF16 and AFP
     }
 
     #[test]

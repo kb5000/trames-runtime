@@ -49,8 +49,8 @@ fn failed_frame_publication_and_malformed_return_leave_complete_task_state_intac
         nzcv: 0x60000000,
         registers: [0x1234; 31],
         vectors: [0x0123456789abcdef; 32],
-        fpcr: 1 << 22,
-        fpsr: 0x10,
+        fpcr: 0x03c02007, // rounding, DN/FZ, EBF16 and AFP
+        fpsr: 0x0800009f,
         tpidr_el0: 0xaabb,
         tpidr2_el0: 0xccdd,
     };

@@ -256,8 +256,10 @@ impl FrameState {
         state.sp = new_sp;
         state.pc = new_pc;
         state.nzcv = (word(576) as u32) & 0xf0000000;
-        state.fpsr = field(600) & 0x0800009f;
-        state.fpcr = field(604) & 0x03c00000;
+        // Linux copies both complete user registers. The execution backend handles
+        // architectural RES0 bits; an old mask here would discard AFP/EBF16 state.
+        state.fpsr = field(600);
+        state.fpcr = field(604);
         for r in 0..32 {
             state.vectors[r] =
                 u128::from_le_bytes(frame[608 + r * 16..624 + r * 16].try_into().unwrap());
