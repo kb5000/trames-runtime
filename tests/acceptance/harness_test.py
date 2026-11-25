@@ -124,5 +124,16 @@ class HarnessTests(unittest.TestCase):
             with patch.object(common.os,'getxattr',return_value=b'one',create=True):before=tree_digest(root)
             with patch.object(common.os,'getxattr',return_value=b'two',create=True):self.assertNotEqual(tree_digest(root),before)
 
+    @unittest.skipUnless(sys.platform=='linux','bundle preparation/archive contract is Linux-only')
+    def test_bundle_archive_roundtrip_preserves_metadata_fingerprint(self):
+        import os
+        source=self.root/'source';source.mkdir();p=source/'file';p.write_bytes(b'payload')
+        os.utime(p,ns=(1234567890123456789,1234567890123456789))
+        os.setxattr(p,'user.acceptance',b'fingerprint')
+        before=tree_digest(source);archive=self.root/'bundle.tar.gz';restored=self.root/'restored';restored.mkdir()
+        subprocess.run(['tar','--format=pax','--xattrs','--xattrs-include=*','--acls','--numeric-owner','-czf',str(archive),'-C',str(source),'.'],check=True)
+        subprocess.run(['tar','--xattrs','--xattrs-include=*','--acls','-xzf',str(archive),'-C',str(restored)],check=True)
+        self.assertEqual(tree_digest(restored),before)
+
 
 if __name__=='__main__':unittest.main()

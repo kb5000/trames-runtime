@@ -29,7 +29,7 @@ jobs:
       - name: Install reference programs, outside the immutable test bundle
         run: sudo apt-get update -qq && sudo apt-get install -y build-essential python3 git curl openssh-client nodejs gzip bzip2 xz-utils
       - run: python3 tests/acceptance/prepare.py --output target/acceptance-bundle
-      - run: tar --xattrs --numeric-owner -czf target/acceptance-bundle.tar.gz -C target acceptance-bundle
+      - run: tar --format=pax --xattrs --xattrs-include='*' --acls --numeric-owner -czf target/acceptance-bundle.tar.gz -C target acceptance-bundle
       - name: Run each workflow in a fresh native namespace/rootfs
         run: sudo python3 tests/acceptance/run.py --backend native --bundle target/acceptance-bundle --output target/acceptance-native
       - name: Produce JUnit and coverage table

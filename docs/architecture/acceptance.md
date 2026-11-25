@@ -69,7 +69,8 @@ rootfs 导入、原始结果导出与 teardown API，不操作用户日常环境
 
 glibc 与 musl、Debian/Ubuntu 与 Alpine 应使用不同镜像 profile。首批由
 已安装的发行版程序构造冻结 bundle，记录所有复制字节、路径、模式、UID/GID、mtime、xattr（包括 capability/ACL）、
-链接及宿主包版本。正式验收保存 bundle 本身并按 SHA256 取回；不能假定
+链接及宿主包版本。正式验收保存 bundle 本身并按 SHA256 取回（PAX、numeric owner、xattr/ACL 保留；
+可信镜像恢复时使用 `sudo tar --same-owner --xattrs --xattrs-include='*' --acls -xf`）；不能假定
 未来再次从同名 apt 包准备就能获得相同版本。执行阶段不下载或安装包。
 
 ## 结果、证据与门禁
