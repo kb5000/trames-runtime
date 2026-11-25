@@ -108,5 +108,21 @@ class HarnessTests(unittest.TestCase):
         path=self.root/'manifest.json';save(path,dict(schema_version=1,cases=[dict(self.case,requires_hardware=['gpu'])]))
         with self.assertRaises(ValueError):load_manifest(path)
 
+    def test_owner_changes_cannot_reuse_a_byte_identical_bundle(self):
+        from types import SimpleNamespace
+        root=self.root/'owner';root.mkdir();p=root/'file';p.write_bytes(b'payload')
+        before=tree_digest(root);info=p.lstat()
+        changed=SimpleNamespace(st_mode=info.st_mode,st_uid=info.st_uid+1,st_gid=info.st_gid,st_mtime_ns=info.st_mtime_ns)
+        original=Path.lstat
+        with patch.object(Path,'lstat',lambda path:changed if path==p else original(path)):
+            self.assertNotEqual(tree_digest(root),before)
+
+    def test_capabilities_or_acl_xattrs_are_bundle_inputs(self):
+        import common
+        root=self.root/'xattrs';root.mkdir();(root/'file').write_bytes(b'payload')
+        with patch.object(common.os,'listxattr',return_value=['user.acceptance'],create=True):
+            with patch.object(common.os,'getxattr',return_value=b'one',create=True):before=tree_digest(root)
+            with patch.object(common.os,'getxattr',return_value=b'two',create=True):self.assertNotEqual(tree_digest(root),before)
+
 
 if __name__=='__main__':unittest.main()

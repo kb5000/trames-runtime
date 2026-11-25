@@ -32,15 +32,30 @@ def save(path, value):
     temporary.replace(path)
 
 
+def extended_attributes(path):
+    if hasattr(os, 'listxattr'):
+        return {name:os.getxattr(path,name,follow_symlinks=False).hex()
+                for name in sorted(os.listxattr(path,follow_symlinks=False))}
+    # macOS Python has no os xattr API. This path is test tooling only.
+    if __import__('sys').platform == 'darwin':
+        names=subprocess.check_output(['/usr/bin/xattr','-s',str(path)],text=True).splitlines()
+        return {name:''.join(subprocess.check_output(['/usr/bin/xattr','-p','-s','-x',name,str(path)],text=True).split()).lower()
+                for name in sorted(names)}
+    raise ValueError('no extended-attribute reader for this acceptance host')
+
+
 def tree_digest(root):
-    """Hash bytes, paths, symlink targets and modes; do not follow symlinks."""
+    """Hash bytes and permission-relevant metadata without following symlinks."""
     root = Path(root)
     h = hashlib.sha256()
+    info=root.lstat()
+    h.update(canonical(['.',stat.S_IMODE(info.st_mode),info.st_uid,info.st_gid,info.st_mtime_ns,extended_attributes(root)]))
     for directory, names, files in os.walk(root, followlinks=False):
         names.sort()
         for name in sorted(names + files):
             p = Path(directory) / name
-            mode = p.lstat().st_mode
+            info = p.lstat()
+            mode = info.st_mode
             if stat.S_ISLNK(mode):
                 value = ['link', os.readlink(p)]
             elif stat.S_ISDIR(mode):
@@ -49,7 +64,8 @@ def tree_digest(root):
                 value = ['file', digest(p)]
             else:
                 raise ValueError(f'unsupported bundle entry: {p}')
-            h.update(canonical([str(p.relative_to(root)), stat.S_IMODE(mode), value]))
+            attributes = extended_attributes(p)
+            h.update(canonical([str(p.relative_to(root)), stat.S_IMODE(mode), info.st_uid, info.st_gid, info.st_mtime_ns, attributes, value]))
             h.update(b'\0')
     return h.hexdigest()
 
