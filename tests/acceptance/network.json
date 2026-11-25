@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "description": "Real iproute2 configuration and namespace data plane; no version-only probes.",
+  "cases": [
+    {
+      "id": "ip.address-route",
+      "domain": "network",
+      "tier": "apps",
+      "requires": [
+        "/usr/bin/ip",
+        "/usr/bin/python3"
+      ],
+      "stdout": "ip-address-route: ok\n",
+      "script": "ip link set lo up\nip link add acceptance0 type dummy\nip link set acceptance0 mtu 1400 up\nip address add 192.0.2.1/24 dev acceptance0\nip -6 address add 2001:db8:1::1/64 dev acceptance0 nodad\nip route add 198.51.100.0/24 dev acceptance0 metric 42\nip -j link show dev acceptance0 > links.json\nip -j address show dev acceptance0 > addresses.json\nip -j route show 198.51.100.0/24 > routes.json\npython3 - <<'CHECK'\nimport json\nl=json.load(open('links.json'))[0]; assert l['ifname']=='acceptance0' and l['mtu']==1400 and 'UP' in l['flags']\na=json.load(open('addresses.json'))[0]['addr_info']; assert any(x['local']=='192.0.2.1' and x['prefixlen']==24 for x in a); assert any(x['local']=='2001:db8:1::1' for x in a)\nr=json.load(open('routes.json')); assert any(x['dst']=='198.51.100.0/24' and x['dev']=='acceptance0' and x['metric']==42 for x in r)\nCHECK\nip route del 198.51.100.0/24 dev acceptance0 metric 42\nip address del 192.0.2.1/24 dev acceptance0\nip link del acceptance0\nprintf 'ip-address-route: ok\\n' "
+    },
+    {
+      "id": "ip.namespace-bridge",
+      "domain": "network",
+      "tier": "apps",
+      "timeout": 60,
+      "requires": [
+        "/usr/bin/ip",
+        "/usr/bin/ping",
+        "/usr/bin/bridge",
+        "/usr/bin/grep"
+      ],
+      "stdout": "ip-namespace-bridge: ok\n",
+      "script": "mkdir -p /var/run/netns\nip netns add acceptance-ns\nip link add acceptance-br type bridge\nip link set acceptance-br up\nip address add 192.0.2.1/24 dev acceptance-br\nip link add acceptance-veth type veth peer name acceptance-peer\nip link set acceptance-veth master acceptance-br\nip link set acceptance-veth up\nip link set acceptance-peer netns acceptance-ns\nip netns exec acceptance-ns /usr/bin/ip link set lo up\nip netns exec acceptance-ns /usr/bin/ip link set acceptance-peer up\nip netns exec acceptance-ns /usr/bin/ip address add 192.0.2.2/24 dev acceptance-peer\nbridge link show dev acceptance-veth | grep -q 'master acceptance-br'\nip netns exec acceptance-ns /usr/bin/ping -n -c 3 -W 2 192.0.2.1 > ping.log\nip netns exec acceptance-ns /usr/bin/ip route get 192.0.2.1 | grep -q 'dev acceptance-peer'\nip link del acceptance-veth\nip netns delete acceptance-ns\nip link del acceptance-br\nprintf 'ip-namespace-bridge: ok\\n' "
+    }
+  ]
+}

@@ -126,6 +126,9 @@ fn snapshot_directory(source: &Path, file: &mut File, limit: u64) -> Result<()> 
         remaining: limit,
     });
     builder.follow_symlinks(false);
+    // import_tar uses contiguous file offsets. The tar builder defaults to
+    // GNU sparse output, even for ordinary linker-produced sparse ELF files.
+    builder.sparse(false);
     let mut pending = vec![(source.to_path_buf(), std::path::PathBuf::from("."))];
     let mut files = BTreeMap::new();
     while let Some((host, guest)) = pending.pop() {
@@ -419,4 +422,28 @@ pub fn validate_command(vfs: &mut Vfs, argv: &[String]) -> Result<()> {
         );
     }
     Err("rootfs command interpreter loop".into())
+}
+
+#[cfg(test)]
+mod directory_tests {
+    use super::*;
+    #[test]
+    fn directory_snapshot_imports_sparse_files_as_contiguous_payloads() {
+        let path =
+            std::env::temp_dir().join(format!("trames-rootfs-sparse-{}", std::process::id()));
+        fs::create_dir(&path).unwrap();
+        let mut source = File::create(path.join("sparse")).unwrap();
+        source.set_len(65536).unwrap();
+        source.seek(SeekFrom::Start(65535)).unwrap();
+        source.write_all(b"x").unwrap();
+        drop(source);
+        let mut vfs = Vfs::default();
+        install(&path, &mut vfs, None).unwrap();
+        let fd = vfs.open_at(AT_FDCWD, b"/sparse", 0, 0).unwrap();
+        let bytes = vfs.read(fd, 65536).unwrap();
+        assert_eq!(bytes.len(), 65536);
+        assert!(bytes[..65535].iter().all(|b| *b == 0));
+        assert_eq!(bytes[65535], b'x');
+        fs::remove_dir_all(path).unwrap();
+    }
 }

@@ -2134,7 +2134,14 @@ impl Vfs {
     fn pin_topology_entry(&self, mut entry: ResolvedEntry) -> Result<ResolvedEntry> {
         if entry.1.is_none() {
             let node = self.node(&entry.0)?;
-            if node.fuse_leaf.get().is_none() {
+            #[cfg(all(feature = "hostfs", unix))]
+            let native = entry.0.filesystem(self).host.is_some();
+            #[cfg(not(all(feature = "hostfs", unix)))]
+            let native = false;
+            // A named host walk already retains its accepted native position.
+            // Its projected cache need not exist in the mount's owner index.
+            // Reconstructing that path loses the operand with ENOENT.
+            if node.fuse_leaf.get().is_none() && !native {
                 entry.0 = self.location(&node, &entry.0.mount)?;
             }
             // This is an accepted mount operand, which may also name an

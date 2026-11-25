@@ -20,7 +20,10 @@ impl DiskReadCache {
         // Do not leave dead/orphan handles behind a frequently hit live entry.
         self.entries.retain(|(key, _, _)| key.strong_count() != 0);
         if let Some(index) = self.entries.iter().position(|(key, writable, _)| {
-            key.as_ptr() == Arc::as_ptr(backing) && (!write || *writable)
+            // Host directory grants can retain O_WRONLY descriptors. A write
+            // handle is not a read capability, even though owned store files
+            // happen to open their writable handles with O_RDWR.
+            key.as_ptr() == Arc::as_ptr(backing) && write == *writable
         }) {
             // The retained Weak prevents address reuse while an entry exists.
             let entry = self.entries.remove(index);
@@ -273,5 +276,72 @@ impl Vfs {
         {
             o.notify_file_io(notification_node, inotify::ACCESS);
         }
+    }
+}
+
+#[cfg(all(test, feature = "hostfs", unix))]
+mod tests {
+    use super::*;
+    #[test]
+    fn host_write_only_cache_does_not_supply_a_read_capability() {
+        use std::os::{fd::AsRawFd, unix::fs::FileExt};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "trames-cache-access-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let mut vfs = Vfs::default();
+        vfs.mkdir_at(AT_FDCWD, b"/host", 0o755).unwrap();
+        vfs.mount_host(b"/host", &root, false).unwrap();
+        let writer = vfs
+            .open_at(AT_FDCWD, b"/host/data", 1 | O_CREAT, 0o600)
+            .unwrap();
+        let reader = vfs.open_at(AT_FDCWD, b"/host/data", 0, 0).unwrap();
+        let node = vfs
+            .descriptor(reader)
+            .unwrap()
+            .open
+            .borrow()
+            .node
+            .clone()
+            .unwrap();
+        let (backing, _) = match &node.borrow().content {
+            Content::File(file) => file.disk_source().unwrap(),
+            _ => panic!("ordinary host file"),
+        };
+        let mut cache = DiskReadCache::default();
+        for value in 0..64u8 {
+            let output = cache.file(&backing, true).unwrap();
+            assert_eq!(
+                unsafe { libc::fcntl(output.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE,
+                libc::O_WRONLY
+            );
+            output.write_at(&[value; 8], 0).unwrap();
+            let input = cache.file(&backing, false).unwrap();
+            let mut bytes = [0; 8];
+            assert_eq!(input.read_at(&mut bytes, 0).unwrap(), 8);
+            assert_eq!(bytes, [value; 8]);
+        }
+        // Retain the original read authority across namespace removal; the
+        // cached write FD must still never stand in for that authority.
+        vfs.unlink_at(AT_FDCWD, b"/host/data", false).unwrap();
+        let mut bytes = [0; 8];
+        assert_eq!(
+            cache
+                .file(&backing, false)
+                .unwrap()
+                .read_at(&mut bytes, 0)
+                .unwrap(),
+            8
+        );
+        assert_eq!(bytes, [63; 8]);
+        drop(cache);
+        drop(vfs);
+        drop(node);
+        drop(backing);
+        std::fs::remove_dir_all(root).unwrap();
+        let _ = writer;
     }
 }

@@ -10,14 +10,14 @@ import shutil
 import subprocess
 from common import digest, save, tree_digest
 
-TOOLS = '''sh bash env printf cat cmp diff mkdir rmdir rm cp mv ln stat find wc tr sort uniq grep sed awk cut tar gzip bzip2 xz sha256sum base64 python3 git git-upload-pack git-receive-pack curl ssh-keygen node gcc make as ld'''.split()
+TOOLS = '''sh bash env printf cat cmp diff mkdir rmdir rm cp mv ln stat find wc tr sort uniq grep sed awk cut tar gzip bzip2 xz sha256sum base64 python3 git git-upload-pack git-receive-pack curl ssh-keygen node gcc make as ld ip bridge ping mount umount sleep seq touch chmod head tail readlink'''.split()
 
 
 def prepare(output):
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=False)
     root = output / 'rootfs'
-    for name in ['bin', 'usr/bin', 'tmp', 'work', 'dev', 'proc', 'sys', 'acceptance']:
+    for name in ['bin', 'usr/bin', 'tmp', 'work', 'dev', 'proc', 'sys', 'acceptance', 'run', 'var/run']:
         (root / name).mkdir(parents=True, exist_ok=True)
     (root / 'tmp').chmod(0o1777)
     copied = set()

@@ -71,6 +71,7 @@ pub enum DeviceKind {
     Tun,
     Tap,
     Ethernet,
+    Dummy,
 }
 impl DeviceKind {
     pub(crate) fn hardware_type(self) -> u16 {
@@ -83,6 +84,7 @@ impl DeviceKind {
     pub(crate) fn link_kind(self) -> Option<&'static std::ffi::CStr> {
         match self {
             Self::Bridge => Some(c"bridge"),
+            Self::Dummy => Some(c"dummy"),
             Self::Veth { .. } => Some(c"veth"),
             Self::Tun | Self::Tap => Some(c"tun"),
             _ => None,
@@ -836,6 +838,9 @@ impl Topology {
         );
         Ok(index)
     }
+    pub fn create_dummy(&mut self, id: u64, name: &[u8]) -> Result<u32> {
+        self.new_device(id, name, DeviceKind::Dummy)
+    }
     pub fn create_bridge(&mut self, id: u64, name: &[u8]) -> Result<u32> {
         self.new_device(id, name, DeviceKind::Bridge)
     }
@@ -893,6 +898,7 @@ impl Topology {
                 return Err(NetError(22));
             }
             match old.kind {
+                DeviceKind::Dummy => {} // Linux dummy has no min/max MTU.
                 DeviceKind::Loopback if self.spaces[&id].lo.is_some() => {}
                 DeviceKind::Tun | DeviceKind::Tap => {
                     let max = if old.kind == DeviceKind::Tap {
@@ -988,7 +994,10 @@ impl Topology {
         if let Some(master) = master.filter(|m| *m != 0) {
             if !matches!(
                 old.kind,
-                DeviceKind::Veth { .. } | DeviceKind::Tap | DeviceKind::Ethernet
+                DeviceKind::Veth { .. }
+                    | DeviceKind::Tap
+                    | DeviceKind::Ethernet
+                    | DeviceKind::Dummy
             ) || self.device(target, master)?.kind != DeviceKind::Bridge
             {
                 return Err(NetError(22));

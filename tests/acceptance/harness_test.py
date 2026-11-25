@@ -11,7 +11,7 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
-from common import digest, identity, load_manifest, save, tree_digest
+from common import guest_path, digest, identity, load_manifest, save, tree_digest
 import run
 
 
@@ -32,6 +32,44 @@ class HarnessTests(unittest.TestCase):
                  artifacts={'/work/out':digest(artifact)},logs={name:digest(folder/name) for name in ['stdout','stderr']})
         save(folder/'result.json',row)
         return output,folder,row
+
+    def test_image_absolute_symlinks_never_resolve_against_host_root(self):
+        root=(self.root/'image').resolve();(root/'usr/bin').mkdir(parents=True)
+        (root/'usr/bin/tool').write_bytes(b'image tool')
+        (root/'bin').symlink_to('/usr/bin')
+        self.assertEqual(guest_path(root,'/bin/tool'),root/'usr/bin/tool')
+        (root/'usr/bin/up').symlink_to('../../../../usr/bin/tool')
+        self.assertEqual(guest_path(root,'/bin/up'),root/'usr/bin/tool')
+        (root/'loop').symlink_to('/loop')
+        with self.assertRaises(ValueError):guest_path(root,'/loop')
+
+    def test_declared_console_is_preserved_and_reaudited_as_raw_evidence(self):
+        output,folder,row=self.evidence()
+        case=dict(self.case,console='diagnostic',stdout='')
+        (folder/'stdout').write_bytes(b'');(folder/'console').write_bytes(b'raw boot\r\n')
+        row['logs']={name:digest(folder/name) for name in ['stdout','stderr','console']}
+        save(folder/'result.json',row)
+        self.assertTrue(run.verified_evidence(output,row,case,'fp'))
+        (folder/'console').write_bytes(b'changed boot')
+        self.assertFalse(run.verified_evidence(output,row,case,'fp'))
+        (folder/'console').unlink()
+        self.assertFalse(run.verified_evidence(output,row,case,'fp'))
+
+    def test_runner_is_frozen_before_a_later_build_replaces_its_path(self):
+        original=self.root/'built';original.write_bytes(b'validated binary')
+        expected=digest(original)
+        output=self.root/'run';output.mkdir()
+        frozen=run.freeze_runner(original,expected,output)
+        original.write_bytes(b'later build')
+        self.assertEqual(digest(frozen),expected)
+        other=self.root/'other';other.mkdir()
+        with self.assertRaises(ValueError):run.freeze_runner(original,expected,other)
+
+    def test_global_infrastructure_failure_invalidates_otherwise_passing_rows(self):
+        output,folder,row=self.evidence()
+        self.assertTrue(run.verified_evidence(output,row,self.case,'fp'))
+        save(output/'infrastructure-error.json',dict(error='base changed during execution'))
+        self.assertFalse(run.verified_evidence(output,row,self.case,'fp'))
 
     def test_stale_or_nonpassing_results_and_forged_output_are_not_reused(self):
         output,folder,row=self.evidence()

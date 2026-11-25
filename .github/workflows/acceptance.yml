@@ -27,14 +27,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install reference programs, outside the immutable test bundle
-        run: sudo apt-get update -qq && sudo apt-get install -y build-essential python3 git curl openssh-client nodejs gzip bzip2 xz-utils
+        run: sudo apt-get update -qq && sudo apt-get install -y build-essential python3 git curl openssh-client nodejs gzip bzip2 xz-utils iproute2 iputils-ping
       - run: python3 tests/acceptance/prepare.py --output target/acceptance-bundle
       - run: tar --format=pax --xattrs --xattrs-include='*' --acls --numeric-owner -czf target/acceptance-bundle.tar.gz -C target acceptance-bundle
       - name: Run each workflow in a fresh native namespace/rootfs
         run: sudo python3 tests/acceptance/run.py --backend native --bundle target/acceptance-bundle --output target/acceptance-native
+      - name: Run real native IP address, route, bridge and namespace workflows
+        run: sudo python3 tests/acceptance/run.py --backend native --manifest tests/acceptance/network.json --bundle target/acceptance-bundle --output target/network-native
       - name: Produce JUnit and coverage table
         if: always()
         run: python3 tests/acceptance/report.py --input native=target/acceptance-native --output target/acceptance-report
+      - name: Produce network reference evidence
+        if: always()
+        run: python3 tests/acceptance/report.py --input native=target/network-native --output target/network-report
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -42,6 +47,8 @@ jobs:
           path: |
             target/acceptance-native/
             target/acceptance-report/
+            target/network-native/
+            target/network-report/
             target/acceptance-bundle/bundle.json
             target/acceptance-bundle.tar.gz
           if-no-files-found: error

@@ -162,3 +162,33 @@ python3 scripts/validate-applications.py \
 `--reference DIR` 可使用同输入的原生结果；`--reuse OLD_MATRIX` 仅复用其
 严格核验的通过项，其他项继续运行。输出目录必须全新。软件流程有失败时
 入口非零退出，但仍汇总其他配置；不能把已生成报告当作验收通过。
+
+## IP、systemd 与 Docker profile
+
+`network.json` 验证原版 iproute2：dummy 链路、MTU、IPv4/IPv6 地址、带 metric
+的路由创建/查询/删除，以及 veth、bridge、netns、命名空间内 ping 和清理。
+使用原生结果验证脚本自身；缺包、权限不足、原生失败和 guest 失败分别记录。
+
+`services.json` 使用同一个完整发行版镜像，验证原版 systemd PID 1、oneshot、
+Type=notify、journal、服务停止/重启和关机；Docker 保持默认 runc、overlay2、
+bridge 与 seccomp，导入离线原版 busybox 镜像，检查 exec、命名容器 DNS、
+发布端口、named volume、daemon 重启后的容器与卷，以及最终清理。服务启动
+控制台是显式声明的原始诊断流；退出码和确定性结果文件仍严格断言，并与
+原生比较，不用全局日志归一化制造通过。daemon 重启不等于整个环境重启；
+后者仍需独立的多次 runtime 启停验收。
+
+Linux 产品的 `scripts/prepare-services.py` 只在一次性 PID/mount namespace 的
+chroot 内安装软件；`policy-rc.d` 阻止安装阶段启动服务，不在宿主安装或运行
+Docker。冻结并保存所有镜像字节及包版本后，执行阶段离线。原生服务基准使用
+独立 systemd-nspawn scope、PID/mount/net/IPC/UTS namespace 和委派 cgroup；
+所需外层 capability/syscall 由测试适配器显式记录，不修改 Docker 默认安全策略。
+
+私有 VFS 模式通过 `--filesystem store` 选择。每例在全新 store 中导入同一镜像，
+停止后用产品的 `read-file` 接口导出声明产物，不直接解码内部 manifest。
+`diagnostics` 允许保留失败日志，缺失诊断不能代替必需产物通过。目录镜像快照
+禁用 tar 默认 GNU sparse 编码；稀疏文件的逻辑字节保持不变，符合普通 tar 的
+连续 payload 导入契约。
+
+每次矩阵先冻结 runner、build receipt、manifest 和测试工具。后续构建或修改
+不能在不同配置之间替换已接受的输入；整组基础设施错误使已有 passing row
+失去缓存/参考资格。独立报告重新核验控制台、stdout/stderr 与产物摘要。

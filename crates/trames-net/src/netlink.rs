@@ -1102,6 +1102,33 @@ mod tests {
         assert!(weak.upgrade().is_none());
     }
     #[test]
+    fn packet_family_getlink_by_index_uses_rtnetlink_without_a_dump() {
+        let socket = Socket::new(Arc::new(Namespace::default()), None, 3, 0).unwrap();
+        let mut data = [0; 16];
+        data[0] = 17;
+        data[4..8].copy_from_slice(&1u32.to_le_bytes());
+        socket
+            .send_bytes(&message(18, 1, 43, 0, &data), 0, None)
+            .unwrap();
+        let reply = socket.recv(4096, 0).unwrap();
+        assert_eq!(&reply.data[4..6], &16u16.to_le_bytes());
+        assert!(reply.data.windows(3).any(|v| v == b"lo\0"));
+    }
+    #[test]
+    fn unnamed_newlink_probe_reports_missing_device_without_mutation() {
+        let network = Network::default();
+        let s = Socket::new(network.1.clone(), None, 3, 0).unwrap();
+        let before = network.devices();
+        s.send_bytes_authorized(&message(16, 5, 42, 0, &[0; 16]), 0, None, true)
+            .unwrap();
+        let reply = s.recv(4096, 0).unwrap();
+        assert_eq!(
+            i32::from_le_bytes(reply.data[16..20].try_into().unwrap()),
+            -19
+        );
+        assert_eq!(network.devices().len(), before.len());
+    }
+    #[test]
     fn loopback_up_requires_authority_and_never_accepts_real_interface_changes() {
         let s = Socket::new(Arc::new(Namespace::default()), None, 3, 0).unwrap();
         let mut data = vec![0; 16];

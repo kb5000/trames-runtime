@@ -21,6 +21,7 @@ impl Topology {
                 | DeviceKind::Bridge
                 | DeviceKind::Tap
                 | DeviceKind::Ethernet
+                | DeviceKind::Dummy
         ) {
             return vec![];
         }

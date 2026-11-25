@@ -67,6 +67,7 @@ fn octets(ip: IpAddr) -> Vec<u8> {
 fn link_flags(d: &Device, carrier: bool) -> u32 {
     match d.kind {
         DeviceKind::Loopback => 8 | if d.up { 0x41 } else { 0 },
+        DeviceKind::Dummy => 0x82 | if d.up { 0x10041 } else { 0 },
         DeviceKind::Tun => 0x1090 | u32::from(d.up) | if carrier { 0x10040 } else { 0 },
         DeviceKind::Direct => 0x90 | if d.up { 0x41 } else { 0 },
         _ => 0x1002 | u32::from(d.up) | if carrier { 0x10040 } else { 0 },
@@ -116,7 +117,7 @@ pub(crate) fn link_data(g: &Topology, d: &Device) -> Vec<u8> {
         16,
         &[if !carrier {
             2
-        } else if d.kind == DeviceKind::Loopback {
+        } else if matches!(d.kind, DeviceKind::Loopback | DeviceKind::Dummy) {
             0
         } else {
             6
@@ -438,8 +439,7 @@ pub(crate) fn request(
                 if request.len() < 32 {
                     return Err(NetError(22));
                 }
-                if !matches!(request[16], 0 | 2 | 10) && !(kind == 18 && dump && request[16] == 17)
-                {
+                if !matches!(request[16], 0 | 2 | 10) && !(kind == 18 && request[16] == 17) {
                     return Err(NetError(97));
                 }
                 let a = attrs(&request[32..])?;
@@ -515,6 +515,12 @@ pub(crate) fn request(
                     // Prepare the entire pair/update before publishing it.
                     let mut next = graph.clone();
                     let index = match link_kind {
+                        b"dummy" => {
+                            if get(&info, 2).is_some_and(|data| !data.is_empty()) {
+                                return Err(NetError(95));
+                            }
+                            next.create_dummy(ns, name.ok_or(NetError(22))?)?
+                        }
                         b"bridge" => {
                             if target.is_some() {
                                 return Err(NetError(95));
@@ -634,7 +640,10 @@ pub(crate) fn request(
                     *graph = next;
                 } else {
                     let d = if index == 0 {
-                        graph.named(ns, name.ok_or(NetError(22))?)?
+                        // Linux returns ENODEV for an unnamed NEWLINK update.
+                        // Older iproute2 uses this request to detect rtnetlink;
+                        // EINVAL incorrectly sends it down the ioctl fallback.
+                        graph.named(ns, name.ok_or(NetError(19))?)?
                     } else {
                         graph.device(ns, index)?
                     };
@@ -883,7 +892,7 @@ pub(crate) fn request(
                     route_kind = 1;
                 }
                 if request[18..20] != [0; 2]
-                    || !matches!(request[22], 0 | 253)
+                    || !(matches!(request[22], 0 | 253) || kind == 25 && request[22] == 255)
                     || kind == 24 && family == 2 && !matches!(route_kind, 1 | 6 | 7 | 8 | 9)
                     || u32v(&request[24..28])? & !4 != 0
                     || a.iter().any(|(k, _)| !matches!(k, 1 | 4 | 5 | 6 | 7 | 15))

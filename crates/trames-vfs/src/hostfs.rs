@@ -332,8 +332,23 @@ impl HostFile {
     pub fn chmod(&self, _node: &NodeRef, mode: u32) -> Result<()> {
         self.root.writable()?;
         let file = self.any_file()?;
+        #[cfg(target_vendor = "apple")]
         // SAFETY: retained original native file, no path resolution.
-        status(unsafe { libc::fchmod(file.file.as_raw_fd(), (mode & 0o7777) as libc::mode_t) })
+        return status(unsafe {
+            libc::fchmod(file.file.as_raw_fd(), (mode & 0o7777) as libc::mode_t)
+        });
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            // Linux O_PATH directory/metadata capabilities reject fchmod.
+            // A proc magic link addresses the retained inode after rename or
+            // unlink, on old and new kernels, without another native open.
+            // Symlink chmod must never follow a host target through this link.
+            if matches!(_node.borrow().content, Content::Symlink(_)) {
+                return Err(Errno(95));
+            }
+            let path = CString::new(format!("/proc/self/fd/{}", file.file.as_raw_fd())).unwrap();
+            status(unsafe { libc::chmod(path.as_ptr(), (mode & 0o7777) as libc::mode_t) })
+        }
     }
     pub fn chown(&self, node: &NodeRef, uid: u32, gid: u32) -> Result<()> {
         self.root.writable()?;
@@ -362,7 +377,18 @@ impl HostFile {
         } else {
             let file = self.any_file()?;
             // SAFETY: retained original inode and scalar ownership ids.
-            status(unsafe { libc::fchown(file.file.as_raw_fd(), uid, gid) })
+            #[cfg(target_vendor = "apple")]
+            return status(unsafe { libc::fchown(file.file.as_raw_fd(), uid, gid) });
+            #[cfg(not(target_vendor = "apple"))]
+            status(unsafe {
+                libc::fchownat(
+                    file.file.as_raw_fd(),
+                    c"".as_ptr(),
+                    uid,
+                    gid,
+                    libc::AT_EMPTY_PATH,
+                )
+            })
         }
     }
     pub fn times(&self, node: &NodeRef, values: [Option<storage::Timestamp>; 2]) -> Result<()> {
@@ -391,7 +417,17 @@ impl HostFile {
         } else {
             let file = self.any_file()?;
             // SAFETY: two initialized timespecs and the retained file descriptor.
-            status(unsafe { libc::futimens(file.file.as_raw_fd(), times.as_ptr()) })
+            #[cfg(target_vendor = "apple")]
+            return status(unsafe { libc::futimens(file.file.as_raw_fd(), times.as_ptr()) });
+            #[cfg(not(target_vendor = "apple"))]
+            status(unsafe {
+                libc::utimensat(
+                    file.file.as_raw_fd(),
+                    c"".as_ptr(),
+                    times.as_ptr(),
+                    libc::AT_EMPTY_PATH,
+                )
+            })
         }
     }
 
@@ -1288,6 +1324,61 @@ mod tests {
         v.unlink_at(AT_FDCWD, b"/host/file", false).unwrap();
         assert_eq!(v.pread(old, 8, 0).unwrap(), b"original");
         v.close(old).unwrap();
+    }
+    #[test]
+    fn named_host_mount_operand_keeps_its_accepted_position() {
+        let fixture = Fixture::new();
+        let mut v = fixture.vfs(false);
+        v.import_file(b"/source", b"payload".to_vec()).unwrap();
+        let fd = v
+            .open_at(AT_FDCWD, b"/host/target", O_CREAT | 0x80, 0)
+            .unwrap();
+        v.close(fd).unwrap();
+        let work = v
+            .path_queries()
+            .namespace_work(crate::NamespaceCall::Mount {
+                source: Some(b"/source".to_vec()),
+                target: b"/host/target".to_vec(),
+                kind: None,
+                flags: 4096,
+                data: None,
+            });
+        let result = match work.run() {
+            crate::FileOutcome::Complete(reply) => reply.result,
+            crate::FileOutcome::Owner(work) => work.run_owner(&mut v).result,
+            _ => panic!("unexpected wait"),
+        };
+        assert_eq!(
+            result.map(|v| matches!(v, crate::FileValue::Count(0))),
+            Ok(true)
+        );
+        let fd = v.open_at(AT_FDCWD, b"/host/target", 0, 0).unwrap();
+        assert_eq!(v.read(fd, 16).unwrap(), b"payload");
+    }
+    #[test]
+    fn directory_metadata_uses_retained_inode_after_rename_and_unlink() {
+        let fixture = Fixture::new();
+        let mut v = fixture.vfs(false);
+        v.mkdir_at(AT_FDCWD, b"/host/original", 0o700).unwrap();
+        let dir = v
+            .open_at(AT_FDCWD, b"/host/original", O_DIRECTORY, 0)
+            .unwrap();
+        v.rename_at(AT_FDCWD, b"/host/original", AT_FDCWD, b"/host/moved", 0)
+            .unwrap();
+        v.chown_fd(dir, 0, 0).unwrap();
+        v.chmod_fd(dir, 0o750).unwrap();
+        v.set_times(dir as i32, None, Some([[123, 0], [456, 0]]))
+            .unwrap();
+        let meta = std::fs::metadata(fixture.0.join("moved")).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o750);
+        assert_eq!(meta.mtime(), 456);
+        v.unlink_at(AT_FDCWD, b"/host/moved", true).unwrap();
+        v.chmod_fd(dir, 0o700).unwrap();
+        v.chown_fd(dir, 0, 0).unwrap();
+        v.set_times(dir as i32, None, Some([[567, 0], [678, 0]]))
+            .unwrap();
+        let stat = v.stat_fd(dir).unwrap();
+        assert_eq!(i64::from_le_bytes(stat[88..96].try_into().unwrap()), 678);
     }
     #[test]
     fn namespace_metadata_append_and_directory_refresh() {

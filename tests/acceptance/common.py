@@ -98,6 +98,28 @@ def source_identity(root):
     )
 
 
+def guest_path(root, name):
+    """Resolve image symlinks using guest /, never the host filesystem's /."""
+    from collections import deque
+    root = Path(root).resolve()
+    pending = deque(Path(name).parts); parts = []; hops = 0
+    while pending:
+        part = pending.popleft()
+        if part in ('/', '.', ''): continue
+        if part == '..':
+            if parts: parts.pop()
+            continue
+        candidate = root.joinpath(*parts, part)
+        if candidate.is_symlink():
+            hops += 1
+            if hops > 40: raise ValueError('image symlink loop: ' + name)
+            target = Path(os.readlink(candidate))
+            if target.is_absolute(): parts.clear()
+            pending.extendleft(reversed(target.parts))
+        else: parts.append(part)
+    return root.joinpath(*parts)
+
+
 def load_manifest(path):
     data = json.loads(Path(path).read_text())
     if data.get('schema_version') != 1 or not isinstance(data.get('cases'), list) or not data['cases']:
@@ -107,7 +129,7 @@ def load_manifest(path):
     seen = set()
     import re
     for case in data['cases']:
-        if set(case)-{'id','domain','tier','requires','script','stdout','stderr','exit_code','timeout','artifacts'}:
+        if set(case)-{'id','domain','tier','requires','script','stdout','stderr','exit_code','timeout','artifacts','diagnostics','pty','console'}:
             raise ValueError('unknown case fields')
         if not isinstance(case.get('domain'),str) or not case['domain'] or case.get('tier') not in ('smoke','apps'):
             raise ValueError('invalid case domain/tier')
@@ -120,13 +142,15 @@ def load_manifest(path):
             raise ValueError(f'{case["id"]}: expected exact text output')
         if not isinstance(case.get('exit_code', 0), int):
             raise ValueError(f'{case["id"]}: invalid exit code')
+        if case.get('console') not in (None,'diagnostic') or case.get('console') and (case.get('stdout') != '' or not case.get('artifacts')): raise ValueError('diagnostic console requires empty asserted stdout')
+        if not isinstance(case.get('pty',False),bool): raise ValueError('invalid pty flag')
         timeout = case.get('timeout', 30)
         if not isinstance(timeout, (float, int)) or not 0 < timeout <= 600:
             raise ValueError(f'{case["id"]}: invalid timeout')
-        for key in ('requires', 'artifacts'):
+        for key in ('requires', 'artifacts', 'diagnostics'):
             values = case.get(key, [])
             if not isinstance(values, list) or not all(isinstance(v, str) and v.startswith('/') and '..' not in Path(v).parts for v in values):
                 raise ValueError(f'{case["id"]}: invalid {key}')
-        if any(not p.startswith('/work/') for p in case.get('artifacts', [])):
+        if any(not p.startswith('/work/') for p in case.get('artifacts', []) + case.get('diagnostics', [])):
             raise ValueError(f'{case["id"]}: artifacts must be under /work')
     return data

@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "description": "Stock systemd PID1/services/journal and Docker default runc/overlay2/bridge/seccomp with offline image, exec, DNS, volumes and daemon restart.",
+  "cases": [
+    {
+      "id": "systemd.pid1-services",
+      "domain": "systemd",
+      "tier": "apps",
+      "timeout": 240,
+      "requires": [
+        "/usr/lib/systemd/systemd",
+        "/usr/bin/systemctl",
+        "/usr/bin/journalctl",
+        "/acceptance/systemd-boot"
+      ],
+      "script": "exec /acceptance/systemd-boot --exercise",
+      "stdout": "",
+      "artifacts": [
+        "/work/systemd.result"
+      ],
+      "diagnostics": [
+        "/work/systemd.log",
+        "/work/systemd-controller.log"
+      ],
+      "pty": true,
+      "console": "diagnostic"
+    },
+    {
+      "id": "docker.lifecycle",
+      "domain": "containers",
+      "tier": "apps",
+      "timeout": 360,
+      "requires": [
+        "/usr/sbin/dockerd",
+        "/usr/bin/docker",
+        "/acceptance/docker-lifecycle.sh",
+        "/acceptance/container.tar"
+      ],
+      "script": "exec /bin/sh /acceptance/docker-lifecycle.sh",
+      "stdout": "",
+      "artifacts": [
+        "/work/docker.result"
+      ],
+      "diagnostics": [
+        "/work/docker.log",
+        "/work/dockerd.log",
+        "/work/docker-info.log"
+      ]
+    }
+  ]
+}
