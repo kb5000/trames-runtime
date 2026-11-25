@@ -10,7 +10,10 @@ mod multicast;
 mod wire;
 pub use wire::WireWait;
 mod gateway;
+#[cfg(test)]
+mod icmp_tests;
 pub(crate) mod packet;
+mod raw_errors;
 mod sockets;
 mod udp_errors;
 use super::native::{
@@ -339,7 +342,7 @@ struct State {
     keep_interval: u32,
     keep_count: u32,
     backlog: usize,
-    icmp_pending: Option<(Vec<u8>, IpAddr)>,
+    icmp_pending: Option<(Vec<u8>, IpAddr, u64)>,
     hop_limit: u8,
     receive_hops: bool,
     ipv4_pmtu: Ipv4Pmtu,
@@ -349,6 +352,7 @@ struct State {
     multicast: Option<Box<multicast::Options>>,
     last_hop: Option<u8>,
     broadcast: bool,
+    icmp_filter: [u8; 4],
     icmp6_filter: [u8; 32],
     raw_checksum: i32,
     header_included: bool,
@@ -1524,6 +1528,13 @@ impl Node {
             .filter(|s| matches(s))
         {
             let state = socket.state.borrow();
+            if protocol == 1
+                && packet.get(header.offset).is_some_and(|kind| {
+                    *kind < 32 && u32::from_le_bytes(state.icmp_filter) & (1u32 << *kind) != 0
+                })
+            {
+                continue;
+            }
             if protocol == 58
                 && packet.get(header.offset).is_none_or(|kind| {
                     state.icmp6_filter[*kind as usize / 8] & (1 << (*kind % 8)) != 0
@@ -1991,7 +2002,7 @@ impl Network {
                 udp_readable: None,
                 listener_ready: None,
                 receive_filter: None,
-                udp_errors: (kind == 2).then(|| Arc::new(udp_errors::Errors::default())),
+                udp_errors: matches!(kind, 2..=4).then(|| Arc::new(udp_errors::Errors::default())),
                 udp_group: None,
                 nodelay: false,
                 cork: false,
@@ -2025,6 +2036,7 @@ impl Network {
                 last_hop: None,
                 broadcast: false,
                 multicast: None,
+                icmp_filter: [0; 4],
                 icmp6_filter: [0; 32],
                 raw_ingress: 0,
                 header_included: protocol == 255,

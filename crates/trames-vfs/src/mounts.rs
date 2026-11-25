@@ -6,6 +6,7 @@ pub(crate) mod fd;
 mod propagation;
 pub(crate) mod query;
 mod registry;
+mod special;
 pub(super) use registry::Registry;
 #[cfg(test)]
 mod propagation_tests;
@@ -102,6 +103,8 @@ static NEXT_NAMESPACE: AtomicU64 = AtomicU64::new(0xe000_0000);
 pub(super) enum Kind {
     Root,
     Tmpfs,
+    Ramfs,
+    Debugfs,
     Fuse,
     FuseControl,
     Proc,
@@ -119,6 +122,8 @@ impl Kind {
         match self {
             Kind::Root => 0x5452414d4553u64,
             Kind::Tmpfs => 0x01021994,
+            Kind::Ramfs => 0x858458f6,
+            Kind::Debugfs => 0x64626720,
             Kind::Fuse => 0x65735546,
             Kind::FuseControl => 0x65735543,
             Kind::Proc => 0x9fa0,
@@ -1510,6 +1515,8 @@ impl Vfs {
         match path.mount().map(|m| m.kind) {
             Some(
                 Kind::Tmpfs
+                | Kind::Ramfs
+                | Kind::Debugfs
                 | Kind::Fuse
                 | Kind::FuseControl
                 | Kind::Cgroup
@@ -1778,6 +1785,23 @@ impl Vfs {
                         .store(value, Ordering::Relaxed);
                 }
             }
+            if parent.kind == Kind::Debugfs
+                && flags & BIND == 0
+                && data.is_some_and(|d| !d.is_empty())
+            {
+                if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
+                    return Err(Errno(1));
+                }
+                let mut root = parent.root.borrow_mut();
+                let (mode, uid, gid) = special::options(data.unwrap(), root.mode & 0o7777, true)?;
+                root.mode = 0o40000 | mode;
+                if let Some(uid) = uid {
+                    root.uid = uid;
+                }
+                if let Some(gid) = gid {
+                    root.gid = gid;
+                }
+            }
             if flags & BIND == 0 {
                 if let Some(readonly) = &parent.fs.super_readonly {
                     readonly.store(attrs & MS_RDONLY != 0, Ordering::Relaxed);
@@ -1997,6 +2021,20 @@ impl Vfs {
                     )));
                     let root = fs.borrow().paths[b"/".as_slice()].clone();
                     (fs, root, b"/".to_vec(), Kind::Tmpfs, flags & ATTRS)
+                }
+                b"ramfs" => {
+                    let fs = special::ramfs(
+                        &self.credentials,
+                        data.unwrap_or_default(),
+                        flags & MS_RDONLY != 0,
+                    )?;
+                    let root = fs.borrow().paths[b"/".as_slice()].clone();
+                    (fs, root, b"/".to_vec(), Kind::Ramfs, flags & ATTRS)
+                }
+                b"debugfs" => {
+                    let fs = self.debug_filesystem(data.unwrap_or_default())?;
+                    let root = fs.borrow().paths[b"/".as_slice()].clone();
+                    (fs, root, b"/".to_vec(), Kind::Debugfs, flags & ATTRS)
                 }
                 b"cgroup" if self.cgroup_v1_conflicts(data.unwrap_or_default()) => {
                     return Err(Errno(16));
@@ -2580,6 +2618,8 @@ impl Mount {
         match self.kind {
             Kind::Root => "rootfs",
             Kind::Tmpfs => "tmpfs",
+            Kind::Ramfs => "ramfs",
+            Kind::Debugfs => "debugfs",
             Kind::Fuse => "fuse",
             Kind::FuseControl => "fusectl",
             Kind::Proc => "proc",
@@ -2603,6 +2643,27 @@ impl Mount {
         })
     }
     fn super_options(&self) -> String {
+        if matches!(self.kind, Kind::Ramfs | Kind::Debugfs) {
+            let root = self.root.borrow();
+            let mut options = Vec::new();
+            if self.kind == Kind::Debugfs {
+                if root.uid != 0 {
+                    options.push(format!("uid={}", root.uid));
+                }
+                if root.gid != 0 {
+                    options.push(format!("gid={}", root.gid));
+                }
+            }
+            let default = if self.kind == Kind::Ramfs {
+                0o755
+            } else {
+                0o700
+            };
+            if root.mode & 0o7777 != default {
+                options.push(format!("mode={:o}", root.mode & 0o7777));
+            }
+            return options.join(",");
+        }
         if self
             .display
             .nsdelegate

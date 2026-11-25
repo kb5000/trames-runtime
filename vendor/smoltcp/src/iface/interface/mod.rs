@@ -1034,6 +1034,8 @@ impl InterfaceInner {
             .filter_map(|i| raw::Socket::downcast_mut(&mut i.socket))
         {
             if raw_socket.accepts(ip_repr) {
+                handled_by_raw_socket = true;
+                if !raw_socket.accepts_payload(ip_payload) { continue; }
                 if let Some(packet) = wire_packet {
                     raw_socket.enqueue_ip_packet(packet, meta.ingress_index);
                 } else {

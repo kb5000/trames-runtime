@@ -359,6 +359,7 @@ impl InterfaceInner {
                     (*header).into(),
                     (*reason).into(),
                     data,
+                    meta.ingress_index,
                 );
             }
             _ => {}

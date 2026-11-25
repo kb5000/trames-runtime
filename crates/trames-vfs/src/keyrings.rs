@@ -6,7 +6,11 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
+mod links;
 const VIEW: u32 = 1;
+const READ: u32 = 2;
+const WRITE: u32 = 4;
+const LINK: u32 = 16;
 const SEARCH: u32 = 8;
 const SETATTR: u32 = 32;
 const PERMISSIONS: u32 = 0x3f3f3f3f;
@@ -20,6 +24,7 @@ pub(super) struct Ring {
     namespace: u64,
     user_session: bool,
     permissions: Mutex<u32>,
+    links: Mutex<BTreeMap<Vec<u8>, Arc<Ring>>>,
 }
 
 impl Ring {
@@ -40,7 +45,7 @@ struct Index {
     last_id: i32,
     by_id: BTreeMap<i32, Weak<Ring>>,
 }
-pub(super) type UserSessions = Mutex<BTreeMap<u32, Arc<Ring>>>;
+pub(super) type UserSessions = Mutex<BTreeMap<(u32, bool), Arc<Ring>>>;
 pub struct KeyRegistry {
     initial_sessions: UserSessions,
     index: Mutex<Index>,
@@ -62,17 +67,29 @@ impl KeyRegistry {
     pub(super) fn set_limit(&self, root: bool, limit: u32) {
         self.limits[root as usize].store(limit, Ordering::Relaxed);
     }
-    fn user_session(&self, c: &Credentials) -> Result<Arc<Ring>> {
-        let mut sessions = c
+    fn user_ring(&self, c: &Credentials, session: bool) -> Result<Arc<Ring>> {
+        let mut rings = c
             .user_namespace
             .key_sessions(&self.initial_sessions)
             .lock()
             .unwrap();
-        if let Some(ring) = sessions.get(&c.uid) {
+        if let Some(ring) = rings.get(&(c.uid, session)) {
             return Ok(ring.clone());
         }
+        let user = match rings.get(&(c.uid, false)) {
+            Some(ring) => ring.clone(),
+            None => {
+                let ring = self.obtain(c, Kind::User, false)?;
+                rings.insert((c.uid, false), ring.clone());
+                ring
+            }
+        };
+        if !session {
+            return Ok(user);
+        }
         let ring = self.obtain(c, Kind::UserSession, false)?;
-        sessions.insert(c.uid, ring.clone());
+        ring.links.lock().unwrap().insert(user.name.clone(), user);
+        rings.insert((c.uid, true), ring.clone());
         Ok(ring)
     }
     fn obtain(&self, c: &Credentials, kind: Kind, overrun: bool) -> Result<Arc<Ring>> {
@@ -101,6 +118,11 @@ impl KeyRegistry {
         let (name, gid, permissions) = match kind {
             Kind::Named(name) => (name, c.gid, 0x3f130000),
             Kind::Anonymous => (b"_ses".to_vec(), c.gid, 0x3f030000),
+            Kind::User => (
+                format!("_uid.{}", c.user_namespace.visible(false, uid)).into_bytes(),
+                u32::MAX,
+                0x1f3f0000,
+            ),
             Kind::UserSession => (
                 format!("_uid_ses.{}", c.user_namespace.visible(false, uid)).into_bytes(),
                 u32::MAX,
@@ -116,6 +138,7 @@ impl KeyRegistry {
             namespace: c.user_namespace.id(),
             user_session,
             permissions: Mutex::new(permissions),
+            links: Mutex::default(),
         });
         index.last_id = id;
         index.by_id.insert(id, Arc::downgrade(&ring));
@@ -123,6 +146,7 @@ impl KeyRegistry {
     }
 }
 enum Kind {
+    User,
     UserSession,
     Anonymous,
     Named(Vec<u8>),
@@ -167,28 +191,27 @@ impl SessionKeys {
         *selection = Some(ring);
         Ok(id as u64)
     }
-    pub fn access(
+    fn resolve(
         &self,
         registry: &KeyRegistry,
         c: &Credentials,
         id: i32,
-        op: KeyOperation,
-    ) -> Result<KeyResult> {
-        let (ring, possessed) = {
+        create: bool,
+    ) -> Result<(Arc<Ring>, bool)> {
+        Ok({
             let mut selection = self.slot().lock().unwrap();
             match id {
                 -3 => {
                     if selection.is_none() {
-                        *selection = Some(registry.user_session(c)?);
+                        *selection = Some(registry.user_ring(c, true)?);
                     }
-                    if matches!(op, KeyOperation::Lookup(true))
-                        && selection.as_ref().is_some_and(|r| r.user_session)
-                    {
+                    if create && selection.as_ref().is_some_and(|r| r.user_session) {
                         *selection = Some(registry.obtain(c, Kind::Anonymous, false)?);
                     }
                     (selection.as_ref().unwrap().clone(), true)
                 }
-                -5 => (registry.user_session(c)?, true),
+                -4 => (registry.user_ring(c, false)?, true),
+                -5 => (registry.user_ring(c, true)?, true),
                 id if id > 0 => {
                     if let Some(ring) = selection.as_ref().filter(|r| r.id == id) {
                         (ring.clone(), true)
@@ -201,16 +224,30 @@ impl SessionKeys {
                             .get(&id)
                             .and_then(Weak::upgrade)
                             .ok_or(Errno(126))?;
-                        (ring, false)
+                        let possessed = selection
+                            .as_ref()
+                            .is_some_and(|root| links::possessed(root, c, id));
+                        (ring, possessed)
                     }
                 }
                 _ => return Err(Errno(126)),
             }
-        };
+        })
+    }
+    pub fn access(
+        &self,
+        registry: &KeyRegistry,
+        c: &Credentials,
+        id: i32,
+        op: KeyOperation,
+    ) -> Result<KeyResult> {
+        let (ring, possessed) =
+            self.resolve(registry, c, id, matches!(op, KeyOperation::Lookup(true)))?;
         let mut mask = ring.permissions.lock().unwrap();
         let need = match op {
             KeyOperation::Lookup(_) => SEARCH,
             KeyOperation::Describe => VIEW,
+            KeyOperation::Read => READ,
             KeyOperation::SetPermissions(value) => {
                 if value & !PERMISSIONS != 0 {
                     return Err(Errno(22));
@@ -223,6 +260,14 @@ impl SessionKeys {
         }
         Ok(match op {
             KeyOperation::Lookup(_) => KeyResult::Number(ring.id as u64),
+            KeyOperation::Read => KeyResult::Bytes(
+                ring.links
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .flat_map(|r| r.id.to_le_bytes())
+                    .collect(),
+            ),
             KeyOperation::Describe => {
                 let uid = c.user_namespace.visible(false, ring.uid);
                 let gid = c.user_namespace.visible(true, ring.gid);
@@ -244,11 +289,13 @@ impl SessionKeys {
 pub enum KeyOperation {
     Lookup(bool),
     Describe,
+    Read,
     SetPermissions(u32),
 }
 pub enum KeyResult {
     Number(u64),
     Description(Vec<u8>),
+    Bytes(Vec<u8>),
 }
 impl Vfs {
     pub fn key_registry(&self) -> Arc<KeyRegistry> {

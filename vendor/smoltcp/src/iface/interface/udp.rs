@@ -15,13 +15,22 @@ impl InterfaceInner {
         quoted: IpRepr,
         code: u8,
         data: &[u8],
+        interface: u32,
     ) {
-        if quoted.next_header() != IpProtocol::Udp
-            || quoted.src_addr() != outer.dst_addr()
-            || data.len() < 8
-        {
-            return;
+        if quoted.src_addr() != outer.dst_addr() || data.len() < 8 { return; }
+        #[cfg(feature = "socket-raw")]
+        for (_, item) in sockets.iter_mut() {
+            if let Some(raw) = crate::socket::raw::Socket::downcast_mut(item) {
+                raw.unreachable(&outer, &quoted, code, &data[..data.len().min(quoted.payload_len())], interface);
+            }
+            #[cfg(feature = "socket-icmp")]
+            if matches!(quoted.next_header(), IpProtocol::Icmp | IpProtocol::Icmpv6) {
+                if let Some(icmp) = crate::socket::icmp::Socket::downcast_mut(item) {
+                    icmp.unreachable(&outer, &quoted, code, &data[..data.len().min(quoted.payload_len())], interface);
+                }
+            }
         }
+        if quoted.next_header() != IpProtocol::Udp { return; }
         let len = usize::from(u16::from_be_bytes([data[4], data[5]]));
         if len < 8 || quoted.payload_len() < 8 {
             return;

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "Stock systemd PID1/services/journal and Docker default runc/overlay2/bridge/seccomp with offline image, exec, DNS, volumes and daemon restart.",
+  "description": "Stock systemd PID1/services/journal, repeated original containerd shim startup, and Docker default runc/overlay2/bridge/seccomp with offline image, exec, DNS, volumes and daemon restart.",
   "cases": [
     {
       "id": "systemd.pid1-services",
@@ -24,6 +24,24 @@
       ],
       "pty": true,
       "console": "diagnostic"
+    },
+    {
+      "id": "containerd.shim-startup",
+      "domain": "containers",
+      "tier": "apps",
+      "timeout": 600,
+      "requires": [
+        "/usr/bin/python3",
+        "/usr/bin/containerd-shim-runc-v2"
+      ],
+      "script": "exec /usr/bin/python3 - <<'CHECK'\nimport json, os, signal, socket, subprocess, time\nfrom pathlib import Path\nos.makedirs('/run/containerd', exist_ok=True)\nrows = []\nfor i in range(20):\n    ident = 'trames-shim-' + str(i)\n    work = Path('/work') / ident\n    work.mkdir()\n    (work/'config.json').write_text('{\"annotations\":{}}')\n    os.mkfifo(work/'log')\n    log = os.open(work/'log', os.O_RDWR | os.O_NONBLOCK)\n    result = subprocess.run(['/usr/bin/containerd-shim-runc-v2', '-namespace', 'moby', '-id', ident,\n                             '-address', '/run/containerd/containerd.sock', 'start'],\n                            cwd=work, input=b'', capture_output=True, timeout=20)\n    row = dict(iteration=i, starter=result.returncode, stderr=result.stderr.decode(errors='replace'))\n    try:\n        assert result.returncode == 0, row\n        address = result.stdout.decode().strip().removeprefix('unix://')\n        def connect():\n            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:\n                peer.settimeout(2)\n                peer.connect(address)\n        connect()\n        data = b''\n        deadline = time.monotonic() + 10\n        while b'io.containerd.ttrpc.v1.task' not in data:\n            try: data += os.read(log, 65536)\n            except BlockingIOError: pass\n            assert time.monotonic() < deadline, 'shim initialization did not complete: ' + data.decode(errors='replace')\n            connect()\n            time.sleep(.01)\n        connect()\n        children = []\n        for proc in Path('/proc').iterdir():\n            if not proc.name.isdecimal(): continue\n            try:\n                args = (proc/'cmdline').read_bytes().split(b'\\0')\n                if ident.encode() in args and b'start' not in args: children.append(int(proc.name))\n            except (OSError, ValueError): pass\n        assert len(children) == 1, ('live shim process', children)\n        os.kill(children[0], signal.SIGTERM)\n        pid, status = os.waitpid(children[0], 0)\n        assert pid == children[0] and status in (0, signal.SIGTERM), ('shim exit', pid, status)\n        row.update(initialized=True, status=status)\n    finally:\n        os.close(log)\n        rows.append(row)\n        Path('/work/shim-startup.log').write_text(json.dumps(rows, indent=2) + '\\n')\nPath('/work/shim-startup.result').write_text('shim-startup: ok\\n')\nCHECK",
+      "stdout": "",
+      "artifacts": [
+        "/work/shim-startup.result"
+      ],
+      "diagnostics": [
+        "/work/shim-startup.log"
+      ]
     },
     {
       "id": "docker.lifecycle",

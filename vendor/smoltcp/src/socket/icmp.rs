@@ -105,6 +105,7 @@ pub struct MessageMetadata {
     pub peer: IpAddress,
     pub local: Option<IpAddress>,
     pub ip: crate::phy::PacketMeta,
+    pub received_ns: u64,
 }
 impl From<IpAddress> for MessageMetadata {
     fn from(peer: IpAddress) -> Self {
@@ -112,6 +113,7 @@ impl From<IpAddress> for MessageMetadata {
             peer,
             local: None,
             ip: Default::default(),
+            received_ns: 0,
         }
     }
 }
@@ -139,6 +141,8 @@ pub struct Socket<'a> {
     endpoint: Endpoint,
     /// The time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
     hop_limit: Option<u8>,
+    #[cfg(all(feature = "std", feature = "socket-raw"))]
+    error_receiver: Option<std::sync::Arc<dyn crate::socket::raw::ErrorReceiver>>,
     #[cfg(feature = "async")]
     rx_waker: WakerRegistration,
     #[cfg(feature = "async")]
@@ -153,10 +157,25 @@ impl<'a> Socket<'a> {
             tx_buffer,
             endpoint: Default::default(),
             hop_limit: None,
+            #[cfg(all(feature = "std", feature = "socket-raw"))]
+            error_receiver: None,
             #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
             #[cfg(feature = "async")]
             tx_waker: WakerRegistration::new(),
+        }
+    }
+
+    #[cfg(all(feature = "std", feature = "socket-raw"))]
+    pub fn observe_errors(&mut self, receiver: std::sync::Arc<dyn crate::socket::raw::ErrorReceiver>) {
+        self.error_receiver = Some(receiver);
+    }
+    #[cfg(all(feature = "std", feature = "socket-raw"))]
+    pub(crate) fn unreachable(&self, outer: &IpRepr, quoted: &IpRepr, code: u8, data: &[u8], interface: u32) {
+        if let Endpoint::Ident(id) = self.endpoint {
+            if data.len() >= 8 && u16::from_be_bytes([data[4],data[5]]) == id {
+                if let Some(receiver) = &self.error_receiver { receiver.unreachable(outer,quoted,code,data,interface); }
+            }
         }
     }
 
@@ -551,7 +570,14 @@ impl<'a> Socket<'a> {
 
         match self
             .rx_buffer
-            .enqueue(icmp_repr.buffer_len(), MessageMetadata { peer: ip_repr.src_addr.into(), local: Some(ip_repr.dst_addr.into()), ip: meta })
+            .enqueue(icmp_repr.buffer_len(), MessageMetadata { peer: ip_repr.src_addr.into(), local: Some(ip_repr.dst_addr.into()), ip: meta,
+                received_ns: {
+                    #[cfg(feature = "std")]
+                    { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64 }
+                    #[cfg(not(feature = "std"))]
+                    { 0 }
+                }
+            })
         {
             Ok(packet_buf) => {
                 icmp_repr.emit(
@@ -578,7 +604,14 @@ impl<'a> Socket<'a> {
 
         match self
             .rx_buffer
-            .enqueue(icmp_repr.buffer_len(), MessageMetadata { peer: ip_repr.src_addr.into(), local: Some(ip_repr.dst_addr.into()), ip: meta })
+            .enqueue(icmp_repr.buffer_len(), MessageMetadata { peer: ip_repr.src_addr.into(), local: Some(ip_repr.dst_addr.into()), ip: meta,
+                received_ns: {
+                    #[cfg(feature = "std")]
+                    { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64 }
+                    #[cfg(not(feature = "std"))]
+                    { 0 }
+                }
+            })
         {
             Ok(packet_buf) => icmp_repr.emit(
                 &ip_repr.src_addr,

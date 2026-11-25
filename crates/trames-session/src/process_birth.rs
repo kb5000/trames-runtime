@@ -516,15 +516,16 @@ impl Birth {
         // executor. Joined/bootstrap callers use the same short transaction.
         // Fork Files first: only CLONE_FILES children share the returned descriptor.
         let pidfd = if a[0] & CLONE_PIDFD != 0 {
+            let target = child.wait_event.pidfd(id);
             let slot = p
                 .linux
                 .vfs
                 .descriptor_factory()
-                .reserve_pidfd(child.wait_event.pidfd(id), 0)?;
+                .reserve_pidfd(target.clone(), 0)?;
             p.memory
                 .write(pidfd_address, &slot.number().to_le_bytes())
                 .map_err(|_| Errno(14))?;
-            Some(slot)
+            Some((slot, target))
         } else {
             None
         };
@@ -557,7 +558,8 @@ impl Birth {
             inherit_parent.then_some(&*p),
             target,
         )?;
-        if let Some(slot) = pidfd {
+        if let Some((slot, target)) = pidfd {
+            target.bind_namespace(child.linux.vfs.pid_namespace());
             slot.publish()?;
         }
         // Linux stores these user TIDs after task birth and ignores

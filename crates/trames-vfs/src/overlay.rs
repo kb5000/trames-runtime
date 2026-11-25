@@ -15,6 +15,7 @@ struct Layer {
 #[derive(Clone)]
 struct LayerPath {
     key: Vec<u8>,
+    root: NodeRef,
     identity: Arc<mounts::MountIdentity>,
 }
 impl std::ops::Deref for LayerPath {
@@ -45,32 +46,44 @@ impl LayerPath {
     }
 }
 impl Layer {
-    fn key(&self, relative: &[u8]) -> Vec<u8> {
+    fn current_root(&self, fs: &Filesystem) -> Option<Vec<u8>> {
+        self.at.root.borrow().path_in(&fs.paths, b"/")
+    }
+    fn relative(root: &[u8], relative: &[u8]) -> Vec<u8> {
         if relative == b"/" {
-            return self.at.key.clone();
+            return root.to_vec();
         }
-        let mut key = self.at.key.clone();
-        if key == b"/" {
-            key.clear();
-        }
+        let mut key = if root == b"/" {
+            Vec::new()
+        } else {
+            root.to_vec()
+        };
         key.extend_from_slice(relative);
         key
     }
+    fn key(&self, relative: &[u8]) -> Vec<u8> {
+        let root = self
+            .current_root(&self.fs.borrow())
+            .unwrap_or_else(|| self.at.key.clone());
+        Self::relative(&root, relative)
+    }
     fn tree(&self) -> Tree {
-        self.fs
-            .borrow()
-            .paths
+        let fs = self.fs.borrow();
+        let Some(root) = self.current_root(&fs) else {
+            return Tree::from([(b"/".to_vec(), self.at.root.clone())]);
+        };
+        fs.paths
             .iter()
             .filter_map(|(p, n)| {
-                if !below(p, &self.at.key) {
+                if !below(p, &root) {
                     return None;
                 }
-                let relative = if p == &self.at.key {
+                let relative = if p == &root {
                     b"/".to_vec()
-                } else if self.at.key == b"/" {
+                } else if root == b"/" {
                     p.clone()
                 } else {
-                    p[self.at.len()..].to_vec()
+                    p[root.len()..].to_vec()
                 };
                 Some((relative, n.clone()))
             })
@@ -80,7 +93,18 @@ impl Layer {
     /// opaque directory prevents a lookup in the remaining lower layers.
     fn lookup(&self, relative: &[u8], userxattr: bool) -> (Option<NodeRef>, bool) {
         let paths = self.fs.borrow();
-        if let Some(node) = paths.paths.get(&self.key(relative)) {
+        let Some(root) = self.current_root(&paths) else {
+            return (
+                if relative == b"/" {
+                    Some(self.at.root.clone())
+                } else {
+                    None
+                },
+                false,
+            );
+        };
+
+        if let Some(node) = paths.paths.get(&Self::relative(&root, relative)) {
             return if whiteout(&node.borrow(), userxattr) {
                 (None, true)
             } else {
@@ -90,11 +114,15 @@ impl Layer {
         let mut parent = relative;
         while parent != b"/" {
             parent = &parent[..parent.iter().rposition(|b| *b == b'/').unwrap().max(1)];
-            if paths.paths.get(&self.key(parent)).is_some_and(|n| {
-                let node = n.borrow();
-                !matches!(node.content, Content::Directory)
-                    || attribute(&node, b"opaque", userxattr)
-            }) {
+            if paths
+                .paths
+                .get(&Self::relative(&root, parent))
+                .is_some_and(|n| {
+                    let node = n.borrow();
+                    !matches!(node.content, Content::Directory)
+                        || attribute(&node, b"opaque", userxattr)
+                })
+            {
                 return (None, true);
             }
         }
@@ -405,12 +433,12 @@ impl Overlay {
             .is_some_and(|n| matches!(n.borrow().content, Content::Directory));
         lower
             && !self.upper.as_ref().is_some_and(|upper| {
-                upper
-                    .fs
-                    .borrow()
-                    .paths
-                    .get(&upper.key(path))
-                    .is_some_and(|n| attribute(&n.borrow(), b"opaque", self.userxattr))
+                let fs = upper.fs.borrow();
+                upper.current_root(&fs).is_some_and(|root| {
+                    fs.paths
+                        .get(&Layer::relative(&root, path))
+                        .is_some_and(|n| attribute(&n.borrow(), b"opaque", self.userxattr))
+                })
             })
     }
     fn attr_name(&self, tail: &[u8]) -> Vec<u8> {
@@ -426,6 +454,13 @@ impl Overlay {
         let Some(upper) = &self.upper else {
             return Ok(());
         };
+        // A layer is an accepted directory inode, not its old spelling. A
+        // detached upper has no namespace to checkpoint; never resurrect it
+        // beneath a removed/replaced Docker layer directory.
+        let Some(root) = upper.current_root(&upper.fs.borrow()) else {
+            return Ok(());
+        };
+        let key = |p: &[u8]| Layer::relative(&root, p);
         let baseline = self.baseline.borrow();
         let mut changed = BTreeSet::new();
         for (p, n) in &fs.paths {
@@ -449,7 +484,7 @@ impl Overlay {
             while parent != b"/" {
                 parent.truncate(parent.iter().rposition(|b| *b == b'/').unwrap().max(1));
                 if fs.paths.contains_key(&parent)
-                    && !upper.fs.borrow().paths.contains_key(&upper.key(&parent))
+                    && !upper.fs.borrow().paths.contains_key(&key(&parent))
                 {
                     changed.insert(parent.clone());
                 }
@@ -466,8 +501,8 @@ impl Overlay {
                 let mut parent = p.clone();
                 while parent != b"/" {
                     parent.truncate(parent.iter().rposition(|b| *b == b'/').unwrap().max(1));
-                    let key = upper.key(&parent);
-                    if !upper.fs.borrow().paths.contains_key(&key) {
+                    let at = key(&parent);
+                    if !upper.fs.borrow().paths.contains_key(&at) {
                         changed.insert(parent.clone());
                     }
                 }
@@ -483,6 +518,12 @@ impl Overlay {
             }
         }
         let mut backing = upper.fs.borrow_mut();
+        // Rebase again under the actual backing namespace write guard: an
+        // independent task may have renamed/unlinked the upper during copy-up.
+        let Some(root) = upper.current_root(&backing) else {
+            return Ok(());
+        };
+        let key = |p: &[u8]| Layer::relative(&root, p);
         let old_paths = backing.paths.clone();
         let old_inodes = backing.inodes.clone();
         let mut paths = old_paths.clone();
@@ -493,8 +534,8 @@ impl Overlay {
             if removed.iter().any(|parent| parent != p && below(p, parent)) {
                 continue;
             }
-            let key = upper.key(p);
-            paths.retain(|path, _| !below(path, &key));
+            let at = key(p);
+            paths.retain(|path, _| !below(path, &at));
             if self.lower.borrow().contains_key(p) {
                 let inode = backing.next_inode;
                 backing.next_inode = inode.checked_add(1).ok_or(Errno(28))?;
@@ -516,7 +557,7 @@ impl Overlay {
                     xattrs: BTreeMap::new(),
                     seals: None,
                 }));
-                paths.insert(key, n);
+                paths.insert(at, n);
             }
         }
         for p in &changed {
@@ -526,8 +567,8 @@ impl Overlay {
                     !Arc::ptr_eq(&old, n) && matches!(old.borrow().content, Content::Directory)
                 })
             }) {
-                let key = upper.key(p);
-                paths.retain(|path, _| !below(path, &key));
+                let at = key(p);
+                paths.retain(|path, _| !below(path, &at));
             }
             // A newly created/replaced directory must not reveal old lower
             // children after remount; ordinary copy-up keeps directory merging.
@@ -541,7 +582,7 @@ impl Overlay {
                 let old = n.borrow_mut().xattrs.insert(name.clone(), b"y".to_vec());
                 attrs_restore.push((n.clone(), name, old));
             }
-            paths.insert(upper.key(p), n.clone());
+            paths.insert(key(p), n.clone());
         }
         let mut all = BTreeMap::new();
         for n in old_paths.values().chain(paths.values()) {
@@ -746,7 +787,7 @@ impl Vfs {
             mounts::fd::check_overlay_layer(self, &at)?;
             let fs = at.filesystem(self);
             match at.mount.as_ref().map(|m| m.kind) {
-                Some(mounts::Kind::Root | mounts::Kind::Tmpfs) => {}
+                Some(mounts::Kind::Root | mounts::Kind::Tmpfs | mounts::Kind::Ramfs) => {}
                 Some(mounts::Kind::Overlay) if lower_layer => {
                     if fs.overlay_depth() >= 2 {
                         return Err(Errno(40));
@@ -765,6 +806,7 @@ impl Vfs {
             Ok(Layer {
                 at: LayerPath {
                     key: at.key,
+                    root: n,
                     identity,
                 },
                 fs,
@@ -1673,6 +1715,65 @@ mod tests {
         )
         .unwrap();
         assert_eq!(v.mount(None, b"/merged", None, 32, None), Err(Errno(30)));
+    }
+    #[test]
+    fn retained_overlay_upper_does_not_resurrect_deleted_or_replaced_layer_paths() {
+        let path = std::env::temp_dir().join(format!(
+            "trames-overlay-detached-upper-{}",
+            std::process::id()
+        ));
+        {
+            let mut v = Vfs::open_disk(&path, DiskOptions::default()).unwrap();
+            dirs(&mut v);
+            v.mkdir_at(AT_FDCWD, b"/layer", 0o755).unwrap();
+            v.mkdir_at(AT_FDCWD, b"/layer/diff", 0o755).unwrap();
+            v.mount(
+                None,
+                b"/merged",
+                Some(b"overlay"),
+                0,
+                Some(b"lowerdir=/lower,upperdir=/layer/diff,workdir=/work"),
+            )
+            .unwrap();
+            let directory = v.open_at(AT_FDCWD, b"/merged", O_DIRECTORY, 0).unwrap();
+            v.umount(b"/merged", 2).unwrap();
+            v.unlink_at(AT_FDCWD, b"/layer/diff", true).unwrap();
+            v.unlink_at(AT_FDCWD, b"/layer", true).unwrap();
+            v.chmod_fd(directory, 0o700).unwrap();
+            v.sync().unwrap();
+            assert_eq!(v.stat_at(AT_FDCWD, b"/layer/diff"), Err(Errno(2)));
+            v.mkdir_at(AT_FDCWD, b"/layer", 0o755).unwrap();
+            v.mkdir_at(AT_FDCWD, b"/layer/diff", 0o755).unwrap();
+            write(&mut v, b"/layer/diff/replacement", b"new inode");
+            v.chmod_fd(directory, 0o711).unwrap();
+            v.sync().unwrap();
+            assert_eq!(
+                v.stat_at(AT_FDCWD, b"/layer/diff").unwrap()[16..20],
+                0o40755u32.to_le_bytes()
+            );
+            v.close(directory).unwrap();
+        }
+        let mut reopened = Vfs::open_disk(&path, DiskOptions::default()).unwrap();
+        assert_eq!(
+            read(&mut reopened, b"/layer/diff/replacement"),
+            b"new inode"
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+    #[test]
+    fn overlay_copy_up_tracks_a_renamed_upper_directory_inode() {
+        let mut v = Vfs::default();
+        dirs(&mut v);
+        write(&mut v, b"/lower/file", b"lower");
+        mount(&mut v);
+        v.rename_at(AT_FDCWD, b"/upper", AT_FDCWD, b"/moved", 0)
+            .unwrap();
+        v.mkdir_at(AT_FDCWD, b"/upper", 0o755).unwrap();
+        write(&mut v, b"/merged/file", b"modified");
+        v.sync().unwrap();
+        assert_eq!(read(&mut v, b"/moved/file"), b"modified");
+        assert_eq!(v.stat_at(AT_FDCWD, b"/upper/file"), Err(Errno(2)));
     }
     #[test]
     fn failed_manifest_commit_rolls_back_whiteout_and_visible_namespace() {

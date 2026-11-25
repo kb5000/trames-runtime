@@ -308,6 +308,13 @@ impl Vfs {
         }
         let kind = match kind {
             b"tmpfs" => Kind::Tmpfs,
+            b"ramfs" => Kind::Ramfs,
+            b"debugfs" => {
+                if !self.credentials.has_cap(capabilities::SYS_ADMIN) {
+                    return Err(Errno(1));
+                }
+                Kind::Debugfs
+            }
             b"proc" => Kind::Proc,
             b"sysfs" => Kind::Sysfs,
             b"cgroup2" | b"mqueue" | b"devpts" | b"overlay" => return Err(Errno(95)),
@@ -396,6 +403,15 @@ impl Vfs {
             {
                 state.source = Some(src.to_vec())
             }
+            (1, Some(key), Some(value)) if matches!(ctx.kind, Kind::Ramfs | Kind::Debugfs) => {
+                if value.contains(&b',') {
+                    return Err(Errno(22));
+                }
+                let option = [key, b"=", value].concat();
+                special::options(&option, 0o755, ctx.kind == Kind::Debugfs)?;
+                state.parameters.insert(key.to_vec(), option);
+            }
+            (0, Some(_), None) if matches!(ctx.kind, Kind::Ramfs | Kind::Debugfs) => (),
             (1, Some(key), Some(value))
                 if ctx.kind == Kind::Tmpfs
                     && matches!(
@@ -440,7 +456,20 @@ impl Vfs {
                 let options: Vec<_> = state.parameters.values().map(Vec::as_slice).collect();
                 let data = options.join(&b',');
                 let (limit, nodes, mode, uid, gid) =
-                    tmpfs_options(&data, self.pseudo.borrow().runtime.memory_limit as u64)?;
+                    if matches!(ctx.kind, Kind::Ramfs | Kind::Debugfs) {
+                        let (mode, uid, gid) = special::options(
+                            &data,
+                            if ctx.kind == Kind::Ramfs {
+                                0o755
+                            } else {
+                                0o700
+                            },
+                            ctx.kind == Kind::Debugfs,
+                        )?;
+                        (u64::MAX, usize::MAX, mode, uid, gid)
+                    } else {
+                        tmpfs_options(&data, self.pseudo.borrow().runtime.memory_limit as u64)?
+                    };
                 if cmd == 7 {
                     let fs = match &state.phase {
                         Phase::Mounted(fs) | Phase::Reconfigure(fs) => fs,
@@ -484,6 +513,15 @@ impl Vfs {
                     return Ok(());
                 }
                 let (fs, root, root_key) = match ctx.kind {
+                    Kind::Ramfs | Kind::Debugfs => {
+                        let fs = if ctx.kind == Kind::Ramfs {
+                            special::ramfs(&ctx.creator, &data, state.readonly.unwrap_or(false))?
+                        } else {
+                            self.debug_filesystem(&data)?
+                        };
+                        let root = fs.borrow().paths[b"/".as_slice()].clone();
+                        (fs, root, b"/".to_vec())
+                    }
                     Kind::Tmpfs => {
                         let mut fs = ram_filesystem(
                             limit,
@@ -529,7 +567,7 @@ impl Vfs {
                                 .filter(|s| !s.is_empty())
                                 .unwrap_or(b"none"),
                         )),
-                        tmpfs_mode: (mode != 0o1777).then_some(mode),
+                        tmpfs_mode: (ctx.kind == Kind::Tmpfs && mode != 0o1777).then_some(mode),
                     },
                     namespace: None,
                     pid_namespace: (ctx.kind == Kind::Proc).then(|| ctx.pid.clone()),

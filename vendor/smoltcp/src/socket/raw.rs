@@ -72,11 +72,34 @@ impl core::fmt::Display for RecvError {
 #[cfg(feature = "std")]
 impl std::error::Error for RecvError {}
 
-/// Raw packet metadata holding the ingress interface index.
-pub type PacketMetadata = crate::storage::PacketMetadata<u32>;
+pub(super) fn arrival_ns() -> u64 {
+    #[cfg(feature = "std")]
+    { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64 }
+    #[cfg(not(feature = "std"))]
+    { 0 }
+}
+
+/// Original ingress metadata retained with each raw IP datagram.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IpMetadata {
+    pub interface: u32,
+    pub received_ns: u64,
+}
+impl IpMetadata {
+    fn received(interface: u32) -> Self {
+        Self { interface, received_ns: arrival_ns() }
+    }
+}
+pub type PacketMetadata = crate::storage::PacketMetadata<IpMetadata>;
 
 /// A raw IP packet ring buffer.
-pub type PacketBuffer<'a> = crate::storage::PacketBuffer<'a, u32>;
+pub type PacketBuffer<'a> = crate::storage::PacketBuffer<'a, IpMetadata>;
+
+/// Original ICMP error notification, separate from the raw data filter/queue.
+#[cfg(feature = "std")]
+pub trait ErrorReceiver: core::fmt::Debug + Send + Sync {
+    fn unreachable(&self, outer: &IpRepr, quoted: &IpRepr, code: u8, data: &[u8], interface: u32) -> bool;
+}
 
 /// A raw IP socket.
 ///
@@ -91,6 +114,9 @@ pub struct Socket<'a> {
     tx_buffer: PacketBuffer<'a>,
     #[cfg(feature = "std")]
     linux_receive: bool,
+    #[cfg(feature = "std")]
+    error_receiver: Option<std::sync::Arc<dyn ErrorReceiver>>,
+    icmp_filter: u32,
     icmp6_filter: [u8; 32],
     #[cfg(feature = "async")]
     rx_waker: WakerRegistration,
@@ -115,6 +141,9 @@ impl<'a> Socket<'a> {
             tx_buffer,
             #[cfg(feature = "std")]
             linux_receive: false,
+            #[cfg(feature = "std")]
+            error_receiver: None,
+            icmp_filter: 0,
             icmp6_filter: [0; 32],
             #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
@@ -220,7 +249,7 @@ impl<'a> Socket<'a> {
     pub fn send(&mut self, size: usize) -> Result<&mut [u8], SendError> {
         let packet_buf = self
             .tx_buffer
-            .enqueue(size, 0)
+            .enqueue(size, IpMetadata::default())
             .map_err(|_| SendError::BufferFull)?;
 
         net_trace!(
@@ -242,7 +271,7 @@ impl<'a> Socket<'a> {
     {
         let size = self
             .tx_buffer
-            .enqueue_with_infallible(max_size, 0, f)
+            .enqueue_with_infallible(max_size, IpMetadata::default(), f)
             .map_err(|_| SendError::BufferFull)?;
 
         net_trace!(
@@ -275,6 +304,10 @@ impl<'a> Socket<'a> {
 
     /// Dequeue the complete IP packet together with its ingress interface.
     pub fn recv_with_interface(&mut self) -> Result<(u32, &[u8]), RecvError> {
+        self.recv_with_metadata().map(|(meta, data)| (meta.interface, data))
+    }
+
+    pub fn recv_with_metadata(&mut self) -> Result<(IpMetadata, &[u8]), RecvError> {
         let (interface, packet_buf) = self.rx_buffer.dequeue().map_err(|_| RecvError::Exhausted)?;
 
         net_trace!(
@@ -350,8 +383,35 @@ impl<'a> Socket<'a> {
         self.rx_buffer.payload_bytes_count()
     }
 
+    #[cfg(feature = "std")]
+    pub fn observe_errors(&mut self, receiver: std::sync::Arc<dyn ErrorReceiver>) {
+        self.error_receiver = Some(receiver);
+    }
+    #[cfg(feature = "std")]
+    pub(crate) fn unreachable(&self, outer: &IpRepr, quoted: &IpRepr, code: u8, data: &[u8], interface: u32) {
+        if self.accepts(&quoted) {
+            if let Some(receiver) = &self.error_receiver {
+                receiver.unreachable(outer, quoted, code, data, interface);
+            }
+        }
+    }
+
+    pub fn set_icmp_filter(&mut self, filter: u32) {
+        self.icmp_filter = filter;
+    }
+
     pub fn set_icmp6_filter(&mut self, filter: [u8; 32]) {
         self.icmp6_filter = filter;
+    }
+
+    pub(crate) fn accepts_payload(&self, payload: &[u8]) -> bool {
+        if self.ip_protocol == IpProtocol::Icmp {
+            return payload.first().is_none_or(|kind| *kind >= 32 || self.icmp_filter & (1u32 << *kind) == 0);
+        }
+        if self.ip_protocol == IpProtocol::Icmpv6 {
+            return payload.first().is_some_and(|kind| self.icmp6_filter[*kind as usize / 8] & (1 << (*kind % 8)) == 0);
+        }
+        true
     }
 
     pub(crate) fn accepts(&self, ip_repr: &IpRepr) -> bool {
@@ -393,11 +453,12 @@ impl<'a> Socket<'a> {
         size: usize,
         interface: u32,
     ) -> Result<&mut [u8], crate::storage::Full> {
+        let metadata = IpMetadata::received(interface);
         #[cfg(feature = "std")]
         if self.linux_receive && size > self.rx_buffer.payload_capacity() {
-            return self.rx_buffer.enqueue_oversized_datagram(size, interface);
+            return self.rx_buffer.enqueue_oversized_datagram(size, metadata);
         }
-        self.rx_buffer.enqueue(size, interface)
+        self.rx_buffer.enqueue(size, metadata)
     }
 
     /// Queue a complete IP packet after the enclosing interface has selected
@@ -418,13 +479,8 @@ impl<'a> Socket<'a> {
         meta: crate::phy::PacketMeta,
     ) {
         debug_assert!(self.accepts(ip_repr));
-        if self.ip_protocol == IpProtocol::Icmpv6
-            && payload
-                .first()
-                .is_none_or(|kind| self.icmp6_filter[*kind as usize / 8] & (1 << (*kind % 8)) != 0)
-        {
-            return;
-        }
+        if !self.accepts_payload(payload) { return; }
+
 
 
         let header_len = ip_repr.header_len();

@@ -54,6 +54,7 @@ pub struct FdInfo {
     pub mount_id: u64,
     pub socket: Option<trames_net::SocketInfo>,
     pub signal_mask: Option<u64>,
+    pub(super) pidfd: Option<Arc<PidFd>>,
     pub(super) open: OpenWeak,
 }
 
@@ -1017,6 +1018,7 @@ pub struct RuntimeInfo {
 }
 #[derive(Default)]
 pub(super) struct PseudoFs {
+    pub(super) debug_fs: Arc<std::sync::Mutex<Option<FsHandle>>>,
     pub(super) fuse_control: Arc<fuse::Controller>,
     pub(super) user_namespace_limits: std::sync::OnceLock<Arc<user_namespace::UserNamespaceLimits>>,
     pub(super) keys: Arc<KeyRegistry>,
@@ -2204,7 +2206,7 @@ impl Vfs {
             b"/proc/cmdline" => return Ok(regular(b"selinux=0\n".to_vec())),
             b"/proc/bootconfig" => return Ok(regular(Vec::new())),
             b"/proc/cgroups" => return Ok(regular(self.cgroup_subsystems())),
-            b"/proc/filesystems" => return Ok(regular(b"nodev\tproc\nnodev\tsysfs\nnodev\tdevpts\nnodev\trootfs\nnodev\ttmpfs\nnodev\tcgroup2\nnodev\tmqueue\nnodev\toverlay\nnodev\tfuse\n".to_vec())),
+            b"/proc/filesystems" => return Ok(regular(b"nodev\tproc\nnodev\tsysfs\nnodev\tdevpts\nnodev\trootfs\nnodev\ttmpfs\nnodev\tramfs\nnodev\tdebugfs\nnodev\tcgroup2\nnodev\tmqueue\nnodev\toverlay\nnodev\tfuse\n".to_vec())),
             b"/proc/stat" => {
                 let user = r.cpu_user_ticks;
                 let idle = r.idle.as_millis() / 10;
@@ -2553,16 +2555,24 @@ impl Vfs {
                     if key == b"fd" {
                         return Ok(link(fd.target.clone()));
                     }
+                    let mut extra = fd
+                        .signal_mask
+                        .map(|mask| format!("sigmask:\t{mask:016x}\n"))
+                        .unwrap_or_default();
+                    if let Some(pidfd) = &fd.pidfd {
+                        let ids = pidfd.proc_ids(self.proc_namespace(at));
+                        let pid = ids[0];
+                        let ids = ids
+                            .iter()
+                            .map(i64::to_string)
+                            .collect::<Vec<_>>()
+                            .join("\t");
+                        extra.push_str(&format!("Pid:\t{pid}\nNSpid:\t{ids}\n"));
+                    }
                     return Ok(regular(
                         format!(
                             "pos:\t{}\nflags:\t0{:o}\nmnt_id:\t{}\nino:\t{}\n{}",
-                            fd.position,
-                            fd.flags,
-                            fd.mount_id,
-                            fd.inode,
-                            fd.signal_mask
-                                .map(|mask| format!("sigmask:\t{mask:016x}\n"))
-                                .unwrap_or_default()
+                            fd.position, fd.flags, fd.mount_id, fd.inode, extra
                         )
                         .into_bytes(),
                     ));

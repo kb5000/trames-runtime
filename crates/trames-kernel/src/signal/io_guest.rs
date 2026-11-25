@@ -114,11 +114,15 @@ impl IoRoutes {
     }
 
     fn task_pidfd(task: &IoTask, id: u32) -> Option<Arc<trames_vfs::PidFd>> {
-        if id == task.tgid() {
+        let target = if id == task.tgid() {
             task.lifecycle().pidfd()
         } else {
             task.thread_wait(id).map(|source| source.pidfd(id))
+        }?;
+        if let Some(namespace) = task.inbox.namespace.get() {
+            target.bind_namespace(namespace);
         }
+        Some(target)
     }
 
     pub fn pidfd_getfd(

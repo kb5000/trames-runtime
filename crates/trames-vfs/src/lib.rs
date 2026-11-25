@@ -1408,7 +1408,10 @@ impl Vfs {
         if Self::cgroup_mount(path)
             || path.mount.as_ref().is_some_and(|m| {
                 m.devpts.is_some()
-                    || matches!(m.kind, mounts::Kind::Mqueue | mounts::Kind::FuseControl)
+                    || matches!(
+                        m.kind,
+                        mounts::Kind::Mqueue | mounts::Kind::FuseControl | mounts::Kind::Debugfs
+                    )
             })
         {
             return Err(Errno(1));

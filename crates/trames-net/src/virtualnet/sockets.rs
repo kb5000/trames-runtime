@@ -550,6 +550,7 @@ impl Socket {
             raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 16], vec![0; BUFFER]),
         );
         socket.set_mark(self.mark.get());
+        socket.observe_errors(Arc::new(raw_errors::Receiver(Arc::downgrade(&self.meta))));
         socket.set_linux_receive(self.raw_transport());
         self.state.borrow_mut().handles = vec![n.sockets.add(socket)];
         Ok(())
@@ -570,7 +571,7 @@ impl Socket {
         if self.kind == 3 {
             match a.ip() {
                 IpAddr::V6(ip) if ip.is_multicast() || ip.to_ipv4_mapped().is_some() => {
-                    return Err(NetError(22))
+                    return Err(NetError(22));
                 }
                 IpAddr::V4(ip) if self.udp_group(ip.into()) => return Err(NetError(99)),
                 _ => {}
@@ -605,6 +606,7 @@ impl Socket {
                 icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 16], vec![0; BUFFER]),
                 icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 16], vec![0; BUFFER]),
             );
+            s.observe_errors(Arc::new(raw_errors::Receiver(Arc::downgrade(&self.meta))));
             s.set_hop_limit(Some(self.state.borrow().hop_limit));
             s.bind(icmp::Endpoint::Ident(a.port()))
                 .map_err(|_| NetError(22))?;
@@ -845,6 +847,7 @@ impl Socket {
             last_hop: None,
             broadcast: state.broadcast,
             multicast: None,
+            icmp_filter: state.icmp_filter,
             icmp6_filter: state.icmp6_filter,
             raw_ingress: 0,
             raw_checksum: state.raw_checksum,
@@ -1140,7 +1143,7 @@ impl Socket {
                         tcp::State::Closed | tcp::State::TimeWait
                     ) =>
                 {
-                    return Err(NetError(107))
+                    return Err(NetError(107));
                 }
                 _ => {}
             }
@@ -1410,7 +1413,7 @@ impl Socket {
         let wait_all = flags & 0x100 != 0;
         let ignored = MSG_NOSIGNAL | 8 | if matches!(self.kind, 1 | 2) { 0x100 } else { 0 };
         let flags = flags & !ignored;
-        if self.kind == 2 && flags & crate::MSG_ERRQUEUE != 0 {
+        if matches!(self.kind, 2..=4) && flags & crate::MSG_ERRQUEUE != 0 {
             if flags & !(crate::MSG_ERRQUEUE | MSG_DONTWAIT | MSG_TRUNC | MSG_PEEK) != 0 {
                 return Err(NetError(95));
             }
@@ -1882,6 +1885,9 @@ impl Socket {
         Ok((ready & events) | (ready & 24))
     }
     pub fn set_option(&self, level: u32, name: u32, value: i32) -> Result<()> {
+        if (level, name) == (255, 1) && self.family == 2 && self.kind == 4 {
+            return self.set_option_bytes(level, name, &value.to_le_bytes());
+        }
         if (level, name) == (1, 36) {
             let mut fabric = self.network.0.fabric.0.borrow_mut();
             self.mark.set(value as u32);
@@ -1934,7 +1940,10 @@ impl Socket {
                 state.ipv4_pmtu = policy;
                 return Ok(());
             }
-            (0, 11) | (41, 25) if self.kind == 2 && (level == 0 || self.family == 10) => {
+            (0, 11) | (41, 25)
+                if self.kind == 2 && (level == 0 || self.family == 10)
+                    || matches!(self.kind, 3 | 4) && (level == 0) == (self.family == 2) =>
+            {
                 state
                     .udp_errors
                     .as_ref()
@@ -1979,10 +1988,10 @@ impl Socket {
                 return Ok(());
             }
             (41, 18 | 19 | 29) if self.family == 10 && self.kind == 2 => {
-                return state.multicast_scalar(name, value)
+                return state.multicast_scalar(name, value);
             }
             (0, 33 | 34 | 49) if self.kind == 2 || self.raw_udp() => {
-                return state.multicast_scalar(name, value)
+                return state.multicast_scalar(name, value);
             }
             (1, 2) => {
                 state.reuse = value != 0;
@@ -1997,7 +2006,7 @@ impl Socket {
                     state.udp_group = state.reuse_port.then(|| self.reuse_port_group());
                 }
             }
-            (1, 29 | 35 | 63 | 64) if matches!(self.kind, 1 | 2) => {
+            (1, 29 | 35 | 63 | 64) if matches!(self.kind, 1..=4) => {
                 state.timestamp_option = if value == 0 { 0 } else { name };
             }
             (1, 10) => state.oob_inline = value != 0,
@@ -2321,6 +2330,12 @@ impl Socket {
         Ok(out)
     }
     pub fn get_option(&self, level: u32, name: u32) -> Result<i32> {
+        if (level, name) == (255, 1) && self.family == 2 && self.kind == 4 {
+            if self.protocol != 1 {
+                return Err(NetError(95));
+            }
+            return Ok(i32::from_le_bytes(self.state.borrow().icmp_filter));
+        }
         if self.family == 2 && self.kind == 2 && level == 41 {
             return Err(NetError(95));
         }
@@ -2384,23 +2399,31 @@ impl Socket {
                 _ => {}
             }
         }
+        if matches!(self.kind, 3 | 4)
+            && ((level, name) == (0, 11) && self.family == 2
+                || (level, name) == (41, 25) && self.family == 10)
+        {
+            return Ok(i32::from(
+                state.udp_errors.as_ref().unwrap().enabled(level == 41),
+            ));
+        }
         if self.kind == 2 && (level == 0 || level == 41 && self.family == 10)
             || self.kind == 3 && level == if self.family == 2 { 0 } else { 41 }
         {
             let options = state.udp_options[usize::from(level == 41)];
             match (level, name) {
                 (0, 1) | (41, 67) => {
-                    return Ok(i32::from(options.fields.traffic_class.unwrap_or(0)))
+                    return Ok(i32::from(options.fields.traffic_class.unwrap_or(0)));
                 }
                 (0, 2) | (41, 16) => return Ok(i32::from(options.fields.hop_limit.unwrap_or(64))),
-                (0, 11) | (41, 25) if self.kind == 2 => {
+                (0, 11) | (41, 25) if matches!(self.kind, 2..=4) => {
                     return Ok(i32::from(
                         state.udp_errors.as_ref().unwrap().enabled(level == 41),
-                    ))
+                    ));
                 }
                 (0, 8) | (41, 49) => return Ok(i32::from(options.receive_info)),
                 (0, 20) | (41, 74) if self.kind == 2 => {
-                    return Ok(i32::from(options.original_destination))
+                    return Ok(i32::from(options.original_destination));
                 }
                 (0, 13) | (41, 66) => return Ok(i32::from(options.receive_class)),
                 (0, 12) | (41, 51) => return Ok(i32::from(options.receive_hops)),
@@ -2430,7 +2453,7 @@ impl Socket {
             }
             (1, 2) => Ok(i32::from(state.reuse)),
             (1, 15) if matches!(self.kind, 1 | 2) => Ok(i32::from(state.reuse_port)),
-            (1, 29 | 35 | 63 | 64) if matches!(self.kind, 1 | 2) => {
+            (1, 29 | 35 | 63 | 64) if matches!(self.kind, 1..=4) => {
                 Ok(i32::from(state.timestamp_option == name))
             }
             (1, 11) if matches!(self.kind, 1 | 2) => Ok(i32::from(state.no_check)),
@@ -2482,7 +2505,7 @@ impl Socket {
 
 impl Socket {
     pub fn last_packet_ns(&self) -> Result<u64> {
-        if self.kind != 2 {
+        if !matches!(self.kind, 2..=4) {
             return Err(NetError(25));
         }
         self.state.borrow().last_packet_ns.ok_or(NetError(2))
@@ -2669,6 +2692,23 @@ impl Socket {
     }
 
     pub fn set_option_bytes(&self, level: u32, name: u32, value: &[u8]) -> Result<()> {
+        if (level, name) == (255, 1) && self.family == 2 && self.kind == 4 {
+            if self.protocol != 1 {
+                return Err(NetError(95));
+            }
+            let mut fabric = self.network.0.fabric.0.borrow_mut();
+            let mut state = self.state.borrow_mut();
+            let length = value.len().min(4);
+            state.icmp_filter[..length].copy_from_slice(&value[..length]);
+            let node = fabric
+                .nodes
+                .get_mut(&self.network.0.key)
+                .ok_or(NetError(100))?;
+            node.sockets
+                .get_mut::<raw::Socket>(state.handles[0])
+                .set_icmp_filter(u32::from_le_bytes(state.icmp_filter));
+            return Ok(());
+        }
         if (level, name) == (1, 27) {
             return self.set_filter(None);
         }
@@ -2914,6 +2954,7 @@ impl Socket {
         }
         let mut fabric = self.network.0.fabric.0.borrow_mut();
         let mut state = self.state.borrow_mut();
+        state.udp_errors.as_ref().unwrap().check_pending()?;
         if let Some(errno) = state.error.take() {
             return Err(NetError(errno));
         }
@@ -2937,10 +2978,10 @@ impl Socket {
                 .get_mut(&self.network.0.key)
                 .ok_or(NetError(100))?;
             for _ in 0..16 {
-                let (ingress, data) = n
+                let (metadata, data) = n
                     .sockets
                     .get_mut::<raw::Socket>(state.handles[0])
-                    .recv_with_interface()
+                    .recv_with_metadata()
                     .map_err(|_| NetError(11))?;
                 let Some(header) = packet::header(data) else {
                     continue;
@@ -2953,14 +2994,14 @@ impl Socket {
                 {
                     continue;
                 }
-                let ingress = if ingress == 0 {
+                let ingress = if metadata.interface == 0 {
                     if header.tuple.destination.ip().is_loopback() {
                         1
                     } else {
                         2
                     }
                 } else {
-                    ingress
+                    metadata.interface
                 };
                 if state.device.is_some_and(|index| index != ingress) {
                     continue;
@@ -2983,11 +3024,11 @@ impl Socket {
                 }
                 state.last_hop = Some(if self.family == 2 { data[8] } else { data[7] });
                 state.raw_ingress = ingress;
-                state.icmp_pending = Some((data.to_vec(), peer));
+                state.icmp_pending = Some((data.to_vec(), peer, metadata.received_ns));
                 break;
             }
         }
-        let (packet, peer) = state.icmp_pending.as_ref().ok_or(NetError(11))?;
+        let (packet, peer, stamp) = state.icmp_pending.as_ref().ok_or(NetError(11))?;
         let header = packet::header(packet).ok_or(NetError(22))?;
         let ipv6 = self.family == 10;
         let data = if ipv6 {
@@ -2998,6 +3039,8 @@ impl Socket {
         let length = data.len();
         let options = state.udp_options[usize::from(ipv6)];
         let destination = header.tuple.destination.ip();
+        let stamp = *stamp;
+        let timestamp = (state.timestamp_option != 0).then_some((state.timestamp_option, stamp));
         let received = Received {
             stream_minimum: 0,
             packet_address: None,
@@ -3005,6 +3048,7 @@ impl Socket {
             credentials: None,
             ip: crate::ReceivedIp {
                 ipv6,
+                timestamp,
                 fields: crate::IpFields {
                     traffic_class: options.receive_class.then(|| {
                         if ipv6 {
@@ -3026,6 +3070,9 @@ impl Socket {
             length,
             truncated: count < length,
         };
+        if state.timestamp_option == 0 {
+            state.last_packet_ns = Some(stamp);
+        }
         if flags & MSG_PEEK == 0 {
             state.icmp_pending = None;
         }
@@ -3090,6 +3137,7 @@ impl Socket {
     fn recv_icmp(&self, count: usize, flags: u32) -> Result<Received> {
         let mut i = self.network.0.fabric.0.borrow_mut();
         let mut state = self.state.borrow_mut();
+        state.udp_errors.as_ref().unwrap().check_pending()?;
         if let Some(errno) = state.error.take() {
             return Err(NetError(errno));
         }
@@ -3126,6 +3174,9 @@ impl Socket {
                 continue;
             }
             let length = data.len();
+            let stamp = meta.received_ns;
+            let timestamp =
+                (state.timestamp_option != 0).then_some((state.timestamp_option, stamp));
             let received = Received {
                 stream_minimum: 0,
                 packet_address: None,
@@ -3133,6 +3184,7 @@ impl Socket {
                 credentials: None,
                 ip: crate::ReceivedIp {
                     ipv6,
+                    timestamp,
                     spec_destination: Some(Ipv4Addr::UNSPECIFIED),
                     fields: crate::IpFields {
                         traffic_class: options.receive_class.then_some(meta.ip.traffic_class),
@@ -3159,6 +3211,9 @@ impl Socket {
                 },
                 truncated: count < length,
             };
+            if state.timestamp_option == 0 {
+                state.last_packet_ns = Some(stamp);
+            }
             if flags & MSG_PEEK == 0 {
                 socket.recv().map_err(|_| NetError(11))?;
             }

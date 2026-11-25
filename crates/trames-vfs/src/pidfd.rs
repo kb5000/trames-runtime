@@ -9,6 +9,7 @@ pub struct PidFd {
     pid: u32,
     state: AtomicU8,
     changed: Arc<Readiness>,
+    namespace: std::sync::OnceLock<(PidNamespace, Option<PidReference>)>,
 }
 
 impl PidFd {
@@ -17,11 +18,35 @@ impl PidFd {
             pid,
             state: AtomicU8::new(if reaped { 2 } else { u8::from(exited) }),
             changed: Arc::default(),
+            namespace: Default::default(),
         }
     }
 
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// Retain only original PID translations, never the target's task or Files.
+    /// CLONE_PIDFD binds after successful birth; pidfd_open binds the live target.
+    pub fn bind_namespace(&self, namespace: &PidNamespace) {
+        self.namespace
+            .get_or_init(|| (namespace.clone(), namespace.retain(self.pid)));
+    }
+
+    pub(super) fn proc_ids(&self, observer: &PidNamespace) -> Vec<i64> {
+        if self.state.load(Ordering::Relaxed) == 2 {
+            return vec![-1];
+        }
+        self.namespace.get().map_or_else(
+            || vec![i64::from(observer.local(self.pid))],
+            |(namespace, _)| {
+                namespace
+                    .relative_hierarchy(observer, self.pid)
+                    .into_iter()
+                    .map(i64::from)
+                    .collect()
+            },
+        )
     }
 
     pub fn publish(&self, reaped: bool) {

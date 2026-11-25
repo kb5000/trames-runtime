@@ -152,6 +152,16 @@ impl PidNamespace {
         ids.push(self.local(global));
         ids
     }
+    pub(super) fn relative_hierarchy(&self, observer: &Self, global: u32) -> Vec<u32> {
+        if observer.contains(self) {
+            self.hierarchy(global)
+                .into_iter()
+                .skip(observer.0.depth)
+                .collect()
+        } else {
+            vec![0]
+        }
+    }
     pub fn id(&self) -> u64 {
         self.0.inode
     }
@@ -414,6 +424,55 @@ impl Vfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pidfd_fdinfo_uses_the_proc_mount_namespace_and_live_reap_state() {
+        let mut vfs = Vfs::default();
+        let root = vfs.pid_namespace().clone();
+        let nested = PidNamespace::new(Some(root.clone()), root.0.registry.clone()).unwrap();
+        let identity = nested.allocate(42).unwrap();
+        let target = Arc::new(PidFd::new(42, false, false));
+        target.bind_namespace(&nested);
+        drop(identity);
+        assert_eq!(target.proc_ids(&root), vec![42, 1]);
+        assert_eq!(target.proc_ids(&nested), vec![1]);
+        let other = PidNamespace::new(Some(root.clone()), root.0.registry.clone()).unwrap();
+        assert_eq!(target.proc_ids(&other), vec![0]);
+        let fd = vfs
+            .descriptor_factory()
+            .reserve_pidfd(target.clone(), 0)
+            .unwrap()
+            .publish()
+            .unwrap();
+        vfs.set_runtime_info(
+            1,
+            RuntimeInfo {
+                processes: vec![ProcessInfo {
+                    pid: 1,
+                    tgid: 1,
+                    fds: vfs.fd_snapshot(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let info = vfs
+            .open_at(AT_FDCWD, format!("/proc/self/fdinfo/{fd}").as_bytes(), 0, 0)
+            .unwrap();
+        let read = |vfs: &mut Vfs| {
+            vfs.seek(info, 0, 0).unwrap();
+            String::from_utf8(vfs.read(info, 4096).unwrap()).unwrap()
+        };
+        assert!(read(&mut vfs).ends_with("Pid:\t42\nNSpid:\t42\t1\n"));
+        target.publish(false);
+        assert!(read(&mut vfs).ends_with("Pid:\t42\nNSpid:\t42\t1\n"));
+        target.publish(true);
+        assert!(read(&mut vfs).ends_with("Pid:\t-1\nNSpid:\t-1\n"));
+        vfs.close(info).unwrap();
+        vfs.close(fd).unwrap();
+        vfs.set_runtime_info(1, RuntimeInfo::default());
+        drop(target);
+    }
+
     #[test]
     fn ptrace_scope_is_guest_wide_and_mode_three_is_irreversible() {
         let root = PidNamespace::default();

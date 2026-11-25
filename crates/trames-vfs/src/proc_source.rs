@@ -663,6 +663,10 @@ impl Vfs {
             }
         };
         FdInfo {
+            pidfd: match &o.control {
+                Some(events::SharedControl::Pid(pid)) => Some(pid.clone()),
+                _ => None,
+            },
             signal_mask: match o.anonymous {
                 Some(events::Anonymous::Signal(ref mask)) => Some(mask.get()),
                 _ => None,
